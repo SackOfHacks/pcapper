@@ -16,6 +16,7 @@ from .protocols import ProtocolSummary
 from .services import ServiceSummary
 from .smb import SmbSummary
 from .nfs import NfsSummary
+from .strings import StringsSummary
 from .http import HttpSummary
 from .sizes import SizeSummary, render_size_sparkline
 from .ips import IpSummary
@@ -1860,6 +1861,107 @@ def render_nfs_summary(summary: NfsSummary) -> str:
             lines.append(f"  {a.description}")
             lines.append(muted(f"  Src: {a.src} -> Dst: {a.dst}"))
             lines.append("")
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
+def render_strings_summary(summary: StringsSummary) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"STRINGS ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Strings Found", str(summary.strings_found)))
+    lines.append(_format_kv("Unique Strings", str(summary.unique_strings)))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Top Cleartext Strings"))
+    if not summary.top_strings:
+        lines.append(muted("No cleartext strings extracted."))
+    else:
+        rows = [["String", "Count"]]
+        for item in summary.top_strings:
+            rows.append([item.value, str(item.count)])
+        lines.append(_format_table(rows))
+
+    if summary.urls or summary.emails or summary.domains:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts"))
+        if summary.urls:
+            rows = [["URL", "Count"]]
+            for item in summary.urls:
+                rows.append([item.value, str(item.count)])
+            lines.append(_format_table(rows))
+        if summary.emails:
+            rows = [["Email", "Count"]]
+            for item in summary.emails:
+                rows.append([item.value, str(item.count)])
+            lines.append(_format_table(rows))
+        if summary.domains:
+            rows = [["Domain", "Count"]]
+            for item in summary.domains:
+                rows.append([item.value, str(item.count)])
+            lines.append(_format_table(rows))
+
+    if summary.suspicious_strings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Suspicious or Malicious Indicators"))
+        rows = [["String", "Count", "Reason", "Top Sources", "Top Destinations"]]
+        if summary.suspicious_details:
+            for item in summary.suspicious_details:
+                reasons = ", ".join(item.get("reasons", [])) or "-"
+                top_src = ", ".join(f"{ip}({count})" for ip, count in item.get("top_sources", [])) or "-"
+                top_dst = ", ".join(f"{ip}({count})" for ip, count in item.get("top_destinations", [])) or "-"
+                rows.append([
+                    str(item.get("value", "-")),
+                    str(item.get("count", "-")),
+                    reasons,
+                    top_src,
+                    top_dst,
+                ])
+        else:
+            for item in summary.suspicious_strings:
+                rows.append([item.value, str(item.count), "-", "-", "-"])
+        lines.append(_format_table(rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Client Cleartext Highlights"))
+    if not summary.client_strings:
+        lines.append(muted("No client-attributed strings."))
+    else:
+        for ip, items in summary.client_strings.items():
+            lines.append(label(f"Client {ip}"))
+            rows = [["String", "Count"]]
+            for item in items:
+                rows.append([item.value, str(item.count)])
+            lines.append(_format_table(rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Server Cleartext Highlights"))
+    if not summary.server_strings:
+        lines.append(muted("No server-attributed strings."))
+    else:
+        for ip, items in summary.server_strings.items():
+            lines.append(label(f"Server {ip}"))
+            rows = [["String", "Count"]]
+            for item in items:
+                rows.append([item.value, str(item.count)])
+            lines.append(_format_table(rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Strings Anomalies"))
+    if not summary.anomalies:
+        lines.append(ok("No string-specific anomalies detected."))
+    else:
+        for item in summary.anomalies:
+            lines.append(warn(f"[WARN] {item}"))
 
     lines.append(SECTION_BAR)
     return "\n".join(lines)

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import re
+import struct
 import gzip
 import zlib
 import email
 from email import policy
-from collections import defaultdict
+from collections import defaultdict, Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any, Set
@@ -404,6 +405,98 @@ def _scan_filenames(data: bytes) -> List[str]:
     
     return list(found)
 
+
+def _iter_smb_records(payload: bytes) -> Tuple[List[bytes], bool]:
+    records: List[bytes] = []
+    netbios_present = False
+    if len(payload) >= 4 and payload[0] == 0x00:
+        offset = 0
+        while offset + 4 <= len(payload):
+            if payload[offset] != 0x00:
+                break
+            length = int.from_bytes(payload[offset + 1:offset + 4], "big")
+            if length <= 0:
+                break
+            end = offset + 4 + length
+            if end > len(payload):
+                break
+            records.append(payload[offset + 4:end])
+            offset = end
+            netbios_present = True
+    if records:
+        return records, netbios_present
+
+    # Fallback: scan for SMB magic headers in the raw stream
+    for magic in (b"\xfeSMB", b"\xffSMB"):
+        start = 0
+        while True:
+            idx = payload.find(magic, start)
+            if idx == -1:
+                break
+            records.append(payload[idx:])
+            start = idx + len(magic)
+    return records, netbios_present
+
+
+def _parse_smb2_create_filename(record: bytes) -> Optional[str]:
+    if len(record) < 120:
+        return None
+    if not record.startswith(b"\xfeSMB"):
+        return None
+    cmd = int.from_bytes(record[12:14], "little")
+    flags = int.from_bytes(record[16:20], "little")
+    is_response = (flags & 0x00000001) != 0
+    if cmd != 0x05 or is_response:
+        return None
+    data = record[64:]
+    if len(data) < 56:
+        return None
+    name_offset = int.from_bytes(data[48:50], "little")
+    name_length = int.from_bytes(data[50:52], "little")
+    real_off = name_offset - 64
+    if name_length <= 0 or real_off < 0 or real_off + name_length > len(data):
+        return None
+    try:
+        return data[real_off:real_off + name_length].decode("utf-16le", errors="ignore")
+    except Exception:
+        return None
+
+
+def _extract_smb1_filename(record: bytes) -> Optional[str]:
+    if len(record) < 32:
+        return None
+    if not record.startswith(b"\xffSMB"):
+        return None
+    # Attempt to find filename candidates within the SMB1 record
+    candidates = _scan_filenames(record)
+    if candidates:
+        return candidates[0]
+    return None
+
+
+def _parse_ntlm_type3(payload: bytes) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    signature = b"NTLMSSP\x00"
+    idx = payload.find(signature)
+    if idx == -1 or len(payload) < idx + 64:
+        return None, None, None
+    try:
+        msg_type = struct.unpack("<I", payload[idx + 8:idx + 12])[0]
+        if msg_type != 3:
+            return None, None, None
+        def _read_field(offset: int) -> Tuple[int, int]:
+            length = struct.unpack("<H", payload[offset:offset + 2])[0]
+            field_offset = struct.unpack("<I", payload[offset + 4:offset + 8])[0]
+            return length, field_offset
+        domain_len, domain_off = _read_field(idx + 28)
+        user_len, user_off = _read_field(idx + 36)
+        workstation_len, workstation_off = _read_field(idx + 44)
+        domain = payload[idx + domain_off:idx + domain_off + domain_len].decode("utf-16le", errors="ignore") if domain_len else None
+        user = payload[idx + user_off:idx + user_off + user_len].decode("utf-16le", errors="ignore") if user_len else None
+        workstation = payload[idx + workstation_off:idx + workstation_off + workstation_len].decode("utf-16le", errors="ignore") if workstation_len else None
+        return user or None, domain or None, workstation or None
+    except Exception:
+        return None, None, None
+
 # --- Main Class ---
 
 class FileExtractor:
@@ -416,6 +509,16 @@ class FileExtractor:
         self.artifacts: List[FileArtifact] = []
         self.candidates: List[FileTransfer] = []
         self.errors: List[str] = []
+        self.detections: List[Dict[str, object]] = []
+        self.smb_versions: Counter[str] = Counter()
+        self.netbios_sources: Counter[str] = Counter()
+        self.netbios_destinations: Counter[str] = Counter()
+        self.ntlm_users: Counter[str] = Counter()
+        self.ntlm_domains: Counter[str] = Counter()
+        self.ntlm_sources: Counter[str] = Counter()
+        self.ntlm_destinations: Counter[str] = Counter()
+        self.http_ntlm_sources: Counter[str] = Counter()
+        self.http_ntlm_destinations: Counter[str] = Counter()
         self.flows: Dict[Tuple[str, str, str, int, int], Dict[str, Any]] = defaultdict(lambda: {
             "packets": 0, "bytes": 0, "first_seen": None, "last_seen": None
         })
@@ -631,6 +734,54 @@ class FileExtractor:
 
         self.artifacts.sort(key=artifact_score)
 
+        if self.smb_versions:
+            smb_versions = ", ".join(f"{k}({v})" for k, v in self.smb_versions.items())
+            self.detections.append({
+                "severity": "info",
+                "summary": "SMB traffic detected",
+                "details": f"Versions observed: {smb_versions}",
+                "source": "Files",
+            })
+            if self.smb_versions.get("SMB1"):
+                self.detections.append({
+                    "severity": "critical",
+                    "summary": "SMBv1 detected",
+                    "details": "Legacy SMBv1 traffic observed; susceptible to known exploits.",
+                    "source": "Files",
+                })
+
+        if self.netbios_sources or self.netbios_destinations:
+            self.detections.append({
+                "severity": "warning",
+                "summary": "NetBIOS/SMB over port 139 detected",
+                "details": "NetBIOS session traffic observed in SMB streams.",
+                "source": "Files",
+                "top_sources": self.netbios_sources.most_common(5),
+                "top_destinations": self.netbios_destinations.most_common(5),
+            })
+
+        if self.ntlm_users or self.ntlm_domains:
+            user_text = ", ".join(f"{u}({c})" for u, c in self.ntlm_users.most_common(5)) or "-"
+            domain_text = ", ".join(f"{d}({c})" for d, c in self.ntlm_domains.most_common(5)) or "-"
+            self.detections.append({
+                "severity": "info",
+                "summary": "NTLM authentication observed",
+                "details": f"Users: {user_text}; Domains: {domain_text}",
+                "source": "Files",
+                "top_sources": self.ntlm_sources.most_common(5),
+                "top_destinations": self.ntlm_destinations.most_common(5),
+            })
+
+        if self.http_ntlm_sources or self.http_ntlm_destinations:
+            self.detections.append({
+                "severity": "info",
+                "summary": "HTTP NTLM authentication observed",
+                "details": "NTLM headers seen in HTTP authentication exchange.",
+                "source": "Files",
+                "top_sources": self.http_ntlm_sources.most_common(5),
+                "top_destinations": self.http_ntlm_destinations.most_common(5),
+            })
+
 
     def _extract_http(self, stream: bytes, src: str, dst: str, sport: int, dport: int, idx: int, known_filenames: List[str] = None):
         msgs = _parse_http_stream(stream)
@@ -640,9 +791,18 @@ class FileExtractor:
             if m["is_request"]:
                 fn = _extract_request_filename(m["start_line"])
                 if fn: pending_names.append(fn)
+                auth_header = m["headers"].get("authorization", "")
+                if "ntlm" in auth_header.lower():
+                    self.http_ntlm_sources[src] += 1
+                    self.http_ntlm_destinations[dst] += 1
             else:
                 # Response
                 body = m.get("body", b"")
+
+                auth_header = m["headers"].get("www-authenticate", "")
+                if "ntlm" in auth_header.lower():
+                    self.http_ntlm_sources[src] += 1
+                    self.http_ntlm_destinations[dst] += 1
                 
                 fname = "http_response.bin"
                 # Robust Content-Disposition Parsing
@@ -707,6 +867,48 @@ class FileExtractor:
                     pass
 
     def _extract_smb(self, stream: bytes, src: str, dst: str, sport: int, dport: int, idx: int, flow_total_bytes: int = 0):
+        records, netbios_present = _iter_smb_records(stream)
+        if netbios_present or sport == 139 or dport == 139:
+            self.netbios_sources[src] += 1
+            self.netbios_destinations[dst] += 1
+
+        if not records:
+            records = [stream]
+
+        for record in records:
+            if record.startswith(b"\xfeSMB"):
+                self.smb_versions["SMB2/3"] += 1
+                filename = _parse_smb2_create_filename(record)
+                if filename:
+                    self.artifacts.append(FileArtifact(
+                        protocol="SMB2", src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
+                        filename=_normalize_filename(filename), size_bytes=None, packet_index=idx,
+                        note="SMB2 Create", file_type="UNKNOWN", payload=None
+                    ))
+                user, domain, _ = _parse_ntlm_type3(record)
+                if user:
+                    self.ntlm_users[user] += 1
+                    self.ntlm_sources[src] += 1
+                    self.ntlm_destinations[dst] += 1
+                if domain:
+                    self.ntlm_domains[domain] += 1
+            elif record.startswith(b"\xffSMB"):
+                self.smb_versions["SMB1"] += 1
+                filename = _extract_smb1_filename(record)
+                if filename:
+                    self.artifacts.append(FileArtifact(
+                        protocol="SMB1", src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
+                        filename=_normalize_filename(filename), size_bytes=None, packet_index=idx,
+                        note="SMB1 Create/Open", file_type="UNKNOWN", payload=None
+                    ))
+                user, domain, _ = _parse_ntlm_type3(record)
+                if user:
+                    self.ntlm_users[user] += 1
+                    self.ntlm_sources[src] += 1
+                    self.ntlm_destinations[dst] += 1
+                if domain:
+                    self.ntlm_domains[domain] += 1
+
         # Scan for filenames
         names = _scan_filenames(stream)
         
@@ -934,6 +1136,6 @@ def analyze_files(
         artifacts=extractor.artifacts,
         extracted=extracted_paths,
         views=view_data,
-        detections=[],
+        detections=extractor.detections,
         errors=extractor.errors
     )

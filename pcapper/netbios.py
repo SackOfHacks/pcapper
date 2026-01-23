@@ -69,6 +69,7 @@ class NetbiosAnalysis:
     name_conflicts: int = 0
     browser_elections: int = 0
     unique_names: Set[str] = field(default_factory=set)
+    errors: List[str] = field(default_factory=list)
 
 def decode_netbios_name(encoded_name: bytes) -> str:
     """
@@ -210,8 +211,8 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                             # Observing "Name Conflict" or "Negative Registration Response" (WACK?)
                             pass
 
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            analysis.errors.append(str(exc))
 
                     if pkt.haslayer("NBNSQueryResponse"):
                         # Name Query Response, Node Status Response, etc.

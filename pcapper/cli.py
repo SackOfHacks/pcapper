@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from .reporting import (
     render_http_summary,
     render_sizes_summary,
     render_nfs_summary,
+    render_strings_summary,
 )
 from .vlan import analyze_vlans
 from .icmp import analyze_icmp
@@ -45,12 +47,32 @@ from .ips import analyze_ips
 from .http import analyze_http
 from .sizes import analyze_sizes
 from .nfs import analyze_nfs
+from .strings import analyze_strings
+
+
+def _build_banner() -> str:
+    compile_date = datetime.now(timezone.utc).date().isoformat()
+    banner = [
+        "======================================================================",
+        "   ██████╗  ██████╗  █████╗ ██████╗ ██████╗ ███████╗██████╗  ",
+        "   ██╔══██╗██╔════╝ ██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗ ",
+        "   ██████╔╝██║      ███████║██████╔╝██████╔╝█████╗  ██████╔╝ ",
+        "   ██╔═══╝ ██║      ██╔══██║██╔═══╝ ██╔═══╝ ██╔══╝  ██╔══██╗ ",
+        "   ██║     ╚██████╗ ██║  ██║██║     ██║     ███████╗██║  ██║ ",
+        "   ╚═╝      ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝     ╚══════╝╚═╝  ╚═╝ ",
+        "======================================================================",
+        f"  PCAPPER v{__version__}  ::  Compile Date {compile_date}",
+        "======================================================================",
+    ]
+    return "\n".join(banner)
 
 
 def build_parser() -> argparse.ArgumentParser:
+    banner = _build_banner()
     parser = argparse.ArgumentParser(
         prog="pcapper",
-        description="Modular PCAP analyzer for fast triage and reporting.",
+        description=f"{banner}\n\nModular PCAP analyzer for fast triage and reporting.",
+        formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
         "target",
@@ -142,6 +164,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include NFS protocol analysis (RPC, Clients, Servers, Files, Anomalies).",
     )
     parser.add_argument(
+        "--strings",
+        action="store_true",
+        help="Include cleartext strings extraction and anomaly analysis.",
+    )
+    parser.add_argument(
         "--ntlm",
         action="store_true",
         help="Include NTLM authentication analysis (Users, Domains, Versions).",
@@ -201,6 +228,7 @@ def _analyze_paths(
     show_services: bool,
     show_smb: bool,
     show_nfs: bool,
+    show_strings: bool,
     show_ntlm: bool,
     show_netbios: bool,
     show_modbus: bool,
@@ -254,6 +282,9 @@ def _analyze_paths(
         if show_nfs:
             nfs_summary = analyze_nfs(path, show_status=show_status)
             print(render_nfs_summary(nfs_summary))
+        if show_strings:
+            strings_summary = analyze_strings(path, show_status=show_status)
+            print(render_strings_summary(strings_summary))
         if show_ntlm:
             ntlm_summary = analyze_ntlm(path, show_status=show_status)
             print(render_ntlm_summary(ntlm_summary))
@@ -273,21 +304,13 @@ def _analyze_paths(
 
 def main() -> int:
     parser = build_parser()
+    if len(sys.argv) == 1:
+        print(_build_banner())
+        print("Usage: pcapper <target> [options]")
+        print("Run with -h for full help and options.")
+        return 0
     args = parser.parse_args()
-
-    compile_date = datetime.now(timezone.utc).date().isoformat()
-    banner = [
-        "============================================================",
-        "  _____   _____   _____   _____   _____   _____ ",
-        " |  _  | |  _  | |  _  | |  _  | |  _  | |  _  |",
-        " | |_| | | |_| | | |_| | | |_| | | |_| | | |_| |",
-        " |_____| |_____| |_____| |_____| |_____| |_____|",
-        "     P  C  A  P  P  E  R",
-        "============================================================",
-        f"  PCAPPER v{__version__}  ::  Compile Date {compile_date}",
-        "============================================================",
-    ]
-    print("\n".join(banner))
+    print(_build_banner())
 
     if args.no_color:
         set_color_override(False)
@@ -318,6 +341,7 @@ def main() -> int:
             show_services=args.services,
             show_smb=args.smb,
             show_nfs=args.nfs,
+            show_strings=args.strings,
             show_ntlm=args.ntlm,
             show_netbios=args.netbios,
             show_modbus=args.modbus,
@@ -349,6 +373,7 @@ def main() -> int:
         show_services=args.services,
         show_smb=args.smb,
         show_nfs=args.nfs,
+        show_strings=args.strings,
         show_ntlm=args.ntlm,
         show_netbios=args.netbios,
         show_modbus=args.modbus,
