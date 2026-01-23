@@ -15,6 +15,7 @@ from .files import FileTransferSummary
 from .protocols import ProtocolSummary
 from .services import ServiceSummary
 from .smb import SmbSummary
+from .nfs import NfsSummary
 from .http import HttpSummary
 from .sizes import SizeSummary, render_size_sparkline
 from .ips import IpSummary
@@ -1515,10 +1516,26 @@ def render_smb_summary(summary: SmbSummary) -> str:
             lines.append(danger(f"- {err}"))
 
     lines.append(_format_kv("SMB Packets", str(summary.smb_packets)))
-    lines.append(_format_kv("SMB Versions", ", ".join([f"{k} ({v})" for k, v in summary.versions.items()])))
+    versions_text = ", ".join([f"{k} ({v})" for k, v in summary.versions.items()]) if summary.versions else "-"
+    lines.append(_format_kv("SMB Versions", versions_text))
+    lines.append(_format_kv("Unique Clients", str(len(summary.clients))))
+    lines.append(_format_kv("Unique Servers", str(len(summary.servers))))
+    lines.append(_format_kv("Sessions", str(len(summary.sessions))))
     
     if summary.versions.get("SMB1"):
         lines.append(danger(f"SMBv1 DETECTED: {summary.versions['SMB1']} packets! Legacy/Insecure."))
+
+    # 0. Request/Response Summary
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("SMB Requests vs Responses"))
+    if not summary.requests and not summary.responses:
+        lines.append(muted("No SMB command directionality captured."))
+    else:
+        rows = [["Command", "Requests", "Responses"]]
+        all_cmds = set(summary.requests.keys()).union(summary.responses.keys())
+        for cmd in sorted(all_cmds):
+            rows.append([cmd, str(summary.requests.get(cmd, 0)), str(summary.responses.get(cmd, 0))])
+        lines.append(_format_table(rows))
 
     # 1. Top Commands
     lines.append(SUBSECTION_BAR)
@@ -1565,7 +1582,115 @@ def render_smb_summary(summary: SmbSummary) -> str:
             rows.append([code, str(count)])
         lines.append(_format_table(rows))
 
-    # 5. Anomalies
+    # 5. Conversations
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("SMB Conversations"))
+    if not summary.conversations:
+        lines.append(muted("No SMB conversations summarized."))
+    else:
+        rows = [["Client", "Server", "Packets", "Bytes", "Requests", "Responses", "First Seen", "Last Seen"]]
+        for convo in sorted(summary.conversations, key=lambda c: c.packets, reverse=True)[:10]:
+            rows.append([
+                convo.client_ip,
+                convo.server_ip,
+                str(convo.packets),
+                format_bytes_as_mb(convo.bytes),
+                str(convo.requests),
+                str(convo.responses),
+                format_ts(convo.first_seen),
+                format_ts(convo.last_seen),
+            ])
+        lines.append(_format_table(rows))
+
+    # 6. Server Inventory
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("SMB Servers"))
+    if not summary.servers:
+        lines.append(muted("No SMB servers identified."))
+    else:
+        rows = [["Server", "Dialects", "Signing Required", "Shares", "Capabilities"]]
+        for srv in summary.servers:
+            dialects = ", ".join(sorted(srv.dialects)) if srv.dialects else "-"
+            signing = "Yes" if srv.signing_required else ("No" if srv.signing_required is not None else "-")
+            shares = ", ".join(sorted(srv.shares)) if srv.shares else "-"
+            caps = ", ".join(sorted(srv.capabilities)) if srv.capabilities else "-"
+            rows.append([srv.ip, dialects, signing, shares, caps])
+        lines.append(_format_table(rows))
+
+    # 7. Client Inventory
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("SMB Clients"))
+    if not summary.clients:
+        lines.append(muted("No SMB clients identified."))
+    else:
+        rows = [["Client", "Dialects", "Client GUID", "Users", "Domains"]]
+        for cli in summary.clients:
+            dialects = ", ".join(sorted(cli.dialects)) if cli.dialects else "-"
+            guid = cli.client_guid or "-"
+            users = ", ".join(sorted(cli.usernames)) if cli.usernames else "-"
+            domains = ", ".join(sorted(cli.domains)) if cli.domains else "-"
+            rows.append([cli.ip, dialects, guid, users, domains])
+        lines.append(_format_table(rows))
+
+    # 8. Sessions
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("SMB Sessions"))
+    if not summary.sessions:
+        lines.append(muted("No SMB sessions decoded."))
+    else:
+        rows = [["Client", "Server", "Session", "User", "Domain", "Auth", "Signing", "Packets", "First Seen", "Last Seen"]]
+        for sess in summary.sessions:
+            rows.append([
+                sess.client_ip,
+                sess.server_ip,
+                str(sess.session_id) if sess.session_id is not None else "-",
+                sess.username or "-",
+                sess.domain or "-",
+                sess.auth_type or "-",
+                "Yes" if sess.signing_required else ("No" if sess.signing_required is not None else "-"),
+                str(sess.packets),
+                format_ts(sess.start_ts if sess.start_ts else None),
+                format_ts(sess.last_seen if sess.last_seen else None),
+            ])
+        lines.append(_format_table(rows))
+
+    # 9. Files and Artifacts
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("SMB Files & Artifacts"))
+    if summary.files:
+        rows = [["Action", "File", "Share", "Size", "Client", "Server"]]
+        for item in summary.files[:20]:
+            rows.append([
+                item.action,
+                item.filename,
+                item.share or "-",
+                format_bytes_as_mb(item.size) if item.size else "-",
+                item.client_ip or "-",
+                item.server_ip or "-",
+            ])
+        lines.append(_format_table(rows))
+    else:
+        lines.append(muted("No SMB file operations extracted."))
+
+    if summary.artifacts:
+        lines.append(muted("Artifacts: " + ", ".join(summary.artifacts[:25])))
+
+    # 10. Users & Domains
+    if summary.observed_users or summary.observed_domains:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Users & Domains"))
+        if summary.observed_users:
+            rows = [["User", "Count"]]
+            for user, count in summary.observed_users.most_common(10):
+                rows.append([user, str(count)])
+            lines.append(_format_table(rows))
+        if summary.observed_domains:
+            rows = [["Domain", "Count"]]
+            for domain, count in summary.observed_domains.most_common(10):
+                rows.append([domain, str(count)])
+            lines.append(_format_table(rows))
+
+    # 11. Anomalies
     lines.append(SUBSECTION_BAR)
     lines.append(header("SMB Anomalies & Risks"))
     if not summary.anomalies:
@@ -1591,6 +1716,150 @@ def render_smb_summary(summary: SmbSummary) -> str:
                 str(item.get("score", "-")),
             ])
         lines.append(_format_table(rows))
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
+def render_nfs_summary(summary: NfsSummary) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"NFS PROTOCOL ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("NFS Packets", str(summary.nfs_packets)))
+    versions_text = ", ".join([f"{k} ({v})" for k, v in summary.versions.items()]) if summary.versions else "-"
+    lines.append(_format_kv("NFS Versions", versions_text))
+    lines.append(_format_kv("Unique Clients", str(len(summary.clients))))
+    lines.append(_format_kv("Unique Servers", str(len(summary.servers))))
+    lines.append(_format_kv("RPC Sessions", str(len(summary.sessions))))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("NFS Requests vs Responses"))
+    if not summary.requests and not summary.responses:
+        lines.append(muted("No NFS request/response counts."))
+    else:
+        rows = [["Procedure", "Requests", "Responses"]]
+        all_cmds = set(summary.requests.keys()).union(summary.responses.keys())
+        for cmd in sorted(all_cmds):
+            rows.append([cmd, str(summary.requests.get(cmd, 0)), str(summary.responses.get(cmd, 0))])
+        lines.append(_format_table(rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Top NFS Procedures"))
+    if not summary.procedures:
+        lines.append(muted("No NFS procedures decoded."))
+    else:
+        rows = [["Procedure", "Count"]]
+        for proc, count in summary.procedures.most_common(12):
+            rows.append([proc, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.status_codes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("NFS Status Codes"))
+        rows = [["Status", "Count"]]
+        for code, count in summary.status_codes.most_common(12):
+            rows.append([code, str(count)])
+        lines.append(_format_table(rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("NFS Conversations"))
+    if not summary.conversations:
+        lines.append(muted("No NFS conversations summarized."))
+    else:
+        rows = [["Client", "Server", "Packets", "Bytes", "Requests", "Responses", "First Seen", "Last Seen"]]
+        for convo in sorted(summary.conversations, key=lambda c: c.packets, reverse=True)[:10]:
+            rows.append([
+                convo.client_ip,
+                convo.server_ip,
+                str(convo.packets),
+                format_bytes_as_mb(convo.bytes),
+                str(convo.requests),
+                str(convo.responses),
+                format_ts(convo.first_seen),
+                format_ts(convo.last_seen),
+            ])
+        lines.append(_format_table(rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("NFS Servers"))
+    if not summary.servers:
+        lines.append(muted("No NFS servers identified."))
+    else:
+        rows = [["Server", "Versions", "Packets", "First Seen", "Last Seen"]]
+        for srv in summary.servers:
+            rows.append([
+                srv.ip,
+                ", ".join(sorted(srv.versions)) if srv.versions else "-",
+                str(srv.packets),
+                format_ts(srv.first_seen),
+                format_ts(srv.last_seen),
+            ])
+        lines.append(_format_table(rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("NFS Clients"))
+    if not summary.clients:
+        lines.append(muted("No NFS clients identified."))
+    else:
+        rows = [["Client", "Versions", "Users", "UIDs", "Packets"]]
+        for cli in summary.clients:
+            users = ", ".join(sorted(cli.usernames)) if cli.usernames else "-"
+            uids = ", ".join(str(uid) for uid in sorted(cli.uids)) if cli.uids else "-"
+            rows.append([
+                cli.ip,
+                ", ".join(sorted(cli.versions)) if cli.versions else "-",
+                users,
+                uids,
+                str(cli.packets),
+            ])
+        lines.append(_format_table(rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("NFS Files & Artifacts"))
+    if summary.files:
+        rows = [["Action", "Name", "Client", "Server", "Time"]]
+        for item in summary.files[:20]:
+            rows.append([
+                item.action,
+                item.name,
+                item.client_ip,
+                item.server_ip,
+                format_ts(item.ts),
+            ])
+        lines.append(_format_table(rows))
+    else:
+        lines.append(muted("No file operations decoded."))
+
+    if summary.artifacts:
+        lines.append(muted("Artifacts: " + ", ".join(summary.artifacts[:25])))
+
+    if summary.observed_users:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Users"))
+        rows = [["User", "Count"]]
+        for user, count in summary.observed_users.most_common(10):
+            rows.append([user, str(count)])
+        lines.append(_format_table(rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("NFS Anomalies & Risks"))
+    if not summary.anomalies:
+        lines.append(ok("No NFS-specific anomalies detected."))
+    else:
+        for a in summary.anomalies:
+            sev_color = danger if a.severity in ("CRITICAL", "HIGH") else warn
+            lines.append(sev_color(f"[{a.severity}] {a.title}"))
+            lines.append(f"  {a.description}")
+            lines.append(muted(f"  Src: {a.src} -> Dst: {a.dst}"))
+            lines.append("")
 
     lines.append(SECTION_BAR)
     return "\n".join(lines)

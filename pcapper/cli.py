@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 
+from . import __version__
 from .analyzer import analyze_pcap
 from .coloring import set_color_override
 from .discovery import find_pcaps, is_supported_pcap
@@ -24,6 +26,7 @@ from .reporting import (
     render_ips_summary,
     render_http_summary,
     render_sizes_summary,
+    render_nfs_summary,
 )
 from .vlan import analyze_vlans
 from .icmp import analyze_icmp
@@ -41,6 +44,7 @@ from .dnp3 import analyze_dnp3
 from .ips import analyze_ips
 from .http import analyze_http
 from .sizes import analyze_sizes
+from .nfs import analyze_nfs
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -133,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include SMB protocol analysis (Versioning, Shares, Anomalies).",
     )
     parser.add_argument(
+        "--nfs",
+        action="store_true",
+        help="Include NFS protocol analysis (RPC, Clients, Servers, Files, Anomalies).",
+    )
+    parser.add_argument(
         "--ntlm",
         action="store_true",
         help="Include NTLM authentication analysis (Users, Domains, Versions).",
@@ -191,6 +200,7 @@ def _analyze_paths(
     show_protocols: bool,
     show_services: bool,
     show_smb: bool,
+    show_nfs: bool,
     show_ntlm: bool,
     show_netbios: bool,
     show_modbus: bool,
@@ -241,6 +251,9 @@ def _analyze_paths(
         if show_smb:
             smb_summary = analyze_smb(path, show_status=show_status)
             print(render_smb_summary(smb_summary))
+        if show_nfs:
+            nfs_summary = analyze_nfs(path, show_status=show_status)
+            print(render_nfs_summary(nfs_summary))
         if show_ntlm:
             ntlm_summary = analyze_ntlm(path, show_status=show_status)
             print(render_ntlm_summary(ntlm_summary))
@@ -261,6 +274,20 @@ def _analyze_paths(
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    compile_date = datetime.now(timezone.utc).date().isoformat()
+    banner = [
+        "============================================================",
+        "  _____   _____   _____   _____   _____   _____ ",
+        " |  _  | |  _  | |  _  | |  _  | |  _  | |  _  |",
+        " | |_| | | |_| | | |_| | | |_| | | |_| | | |_| |",
+        " |_____| |_____| |_____| |_____| |_____| |_____|",
+        "     P  C  A  P  P  E  R",
+        "============================================================",
+        f"  PCAPPER v{__version__}  ::  Compile Date {compile_date}",
+        "============================================================",
+    ]
+    print("\n".join(banner))
 
     if args.no_color:
         set_color_override(False)
@@ -290,6 +317,7 @@ def main() -> int:
             show_protocols=args.protocols,
             show_services=args.services,
             show_smb=args.smb,
+            show_nfs=args.nfs,
             show_ntlm=args.ntlm,
             show_netbios=args.netbios,
             show_modbus=args.modbus,
@@ -320,6 +348,7 @@ def main() -> int:
         show_protocols=args.protocols,
         show_services=args.services,
         show_smb=args.smb,
+        show_nfs=args.nfs,
         show_ntlm=args.ntlm,
         show_netbios=args.netbios,
         show_modbus=args.modbus,
