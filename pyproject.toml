@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcapper"
+version = "0.1.0"
+description = "Modular PCAP analysis CLI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = [
+    "scapy>=2.5.0",
+]
+
+[project.scripts]
+pcapper = "pcapper.cli:main"
+
+[tool.setuptools]
+packages = ["pcapper"]

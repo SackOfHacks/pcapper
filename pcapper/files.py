@@ -1,0 +1,939 @@
+from __future__ import annotations
+
+import re
+import gzip
+import zlib
+import email
+from email import policy
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, List, Dict, Tuple, Any, Set
+from urllib.parse import unquote
+
+from scapy.utils import PcapReader, PcapNgReader
+from scapy.packet import Raw, Packet
+
+from .progress import build_statusbar
+from .utils import safe_float, detect_file_type, detect_file_type_bytes
+
+try:
+    from scapy.layers.inet import IP, TCP, UDP
+    from scapy.layers.inet6 import IPv6
+except Exception:
+    IP = TCP = UDP = IPv6 = None
+
+# --- Dataclasses ---
+
+@dataclass
+class FileArtifact:
+    protocol: str
+    src_ip: str
+    dst_ip: str
+    src_port: Optional[int]
+    dst_port: Optional[int]
+    filename: str
+    size_bytes: Optional[int]
+    packet_index: int
+    note: Optional[str]
+    file_type: str = "UNKNOWN"
+    payload: Optional[bytes] = None
+
+@dataclass
+class FileTransfer:
+    protocol: str
+    src_ip: str
+    dst_ip: str
+    src_port: Optional[int]
+    dst_port: Optional[int]
+    packets: int
+    bytes: int
+    first_seen: Optional[float]
+    last_seen: Optional[float]
+    note: Optional[str]
+
+@dataclass
+class FileTransferSummary:
+    path: Path
+    total_candidates: int
+    candidates: List[FileTransfer]
+    artifacts: List[FileArtifact]
+    extracted: List[Path]
+    views: List[Any]
+    detections: List[Dict[str, str]]
+    errors: List[str]
+
+# --- Helper Functions ---
+
+def _flow_protocol(sport: Optional[int], dport: Optional[int]) -> str:
+    ports = set(filter(None, [sport, dport]))
+    if 80 in ports or 8080 in ports or 8000 in ports:
+        return "HTTP"
+    if 443 in ports or 8443 in ports:
+        return "HTTPS/SSL"
+    if 21 in ports:
+        return "FTP"
+    if 22 in ports:
+        return "SSH"
+    if 23 in ports:
+        return "TELNET"
+    if 25 in ports:
+        return "SMTP"
+    if 53 in ports:
+        return "DNS"
+    if 69 in ports:
+        return "TFTP"
+    if 445 in ports or 139 in ports:
+        return "SMB"
+    if 110 in ports:
+        return "POP3"
+    if 143 in ports:
+        return "IMAP"
+    if 3389 in ports:
+        return "RDP"
+    if 3306 in ports:
+        return "MYSQL"
+    return "UNKNOWN"
+
+def _normalize_filename(name: str) -> str:
+    try:
+        # Strip path traversal
+        clean = Path(name).name
+        # Remove nulls and suspicious chars
+        clean = re.sub(r'[^\w\-.()\[\] ]', '_', clean)
+        return clean if clean else "unknown_file"
+    except Exception:
+        return "unknown_file"
+
+def _extract_tftp(payload: bytes) -> Optional[str]:
+    if len(payload) < 4:
+        return None
+    opcode = int.from_bytes(payload[0:2], "big")
+    if opcode not in {1, 2}:
+        return None
+    rest = payload[2:]
+    if b"\x00" not in rest:
+        return None
+    name_bytes = rest.split(b"\x00", 1)[0]
+    try:
+        return name_bytes.decode("latin-1", errors="ignore")
+    except Exception:
+        return None
+
+def _decode_chunked(body: bytes) -> bytes:
+    out = bytearray()
+    idx = 0
+    while idx < len(body):
+        line_end = body.find(b"\r\n", idx)
+        if line_end == -1:
+            break
+        size_line = body[idx:line_end].split(b";", 1)[0]
+        try:
+            size_val = int(size_line.strip(), 16)
+        except Exception:
+            break
+        idx = line_end + 2
+        if size_val == 0:
+            break
+        if idx + size_val > len(body):
+            out.extend(body[idx:]) # Partial
+            break
+        out.extend(body[idx:idx + size_val])
+        idx += size_val + 2
+    return bytes(out)
+
+def _extract_request_filename(start_line: str, host: Optional[str] = None) -> Optional[str]:
+    try:
+        parts = start_line.split(" ")
+        if len(parts) < 2:
+            return None
+        path_part = parts[1]
+        
+        path_part = path_part.split('?')[0].split('#')[0]
+        if path_part == "/":
+            return None
+            
+        name = path_part.split("/")[-1]
+        
+        # Check query params in original
+        if '?' in parts[1]:
+            query = parts[1].split('?', 1)[1]
+            for param in query.split('&'):
+                if '=' in param:
+                    key, val = param.split('=', 1)
+                    if key.lower() in ('file', 'filename', 'download', 'name'):
+                        fval = unquote(val)
+                        if fval and '.' in fval:
+                            return fval
+        
+        if name and '.' in name:
+            return name
+        
+        return None
+    except Exception:
+        return None
+
+def _assemble_stream(chunks: List[Tuple[int, bytes, int]], limit: int = 50_000_000) -> Tuple[bytes, int]:
+    if not chunks:
+        return b"", 0
+    # Sort by seq
+    chunks.sort(key=lambda item: item[0])
+    
+    assembled = bytearray()
+    first_packet = min(item[2] for item in chunks)
+    
+    expected_seq = chunks[0][0] # Start with first available
+    
+    for seq, payload, _ in chunks:
+        if not payload:
+            continue
+        
+        if seq > expected_seq:
+            # GAP - Pad with zeros to preserve offsets (important for PE extraction etc)
+            gap = seq - expected_seq
+            # Safety cap on gap size to prevent OOM on weird sequence jumps
+            if gap < 1_000_000:
+                assembled.extend(b"\x00" * gap)
+            expected_seq = seq
+        
+        if seq < expected_seq:
+            # Overlap
+            overlap = expected_seq - seq
+            if overlap >= len(payload):
+                continue
+            payload = payload[overlap:]
+        
+        assembled.extend(payload)
+        expected_seq = seq + len(payload)
+        
+        if len(assembled) > limit:
+            break
+            
+    return bytes(assembled), first_packet
+
+def _detect_protocol_from_stream(stream: bytes, sport: int, dport: int) -> str:
+    proto = _flow_protocol(sport, dport)
+    if proto != "UNKNOWN":
+        return proto
+    
+    # Heuristics
+    if b"HTTP/1." in stream[:100] or b"HTTP/2" in stream[:20]:
+        return "HTTP"
+    if b"\xfeSMB" in stream[:64] or b"\xffSMB" in stream[:64]:
+        return "SMB"
+    if b"Exif" in stream[:100] or b"\xff\xd8\xff" in stream[:20]:
+        # Likely raw image transfer? Keep as binary.
+        pass
+    return "UNKNOWN"
+
+# --- Protocol Parsers ---
+
+def _parse_http_stream(stream: bytes) -> List[Dict[str, Any]]:
+    messages = []
+    idx = 0
+    # Simple parser looking for methods
+    methods = [b"GET ", b"POST ", b"PUT ", b"HEAD ", b"DELETE ", b"HTTP/1."]
+    
+    while idx < len(stream):
+        # Find next potential start
+        indices = [stream.find(m, idx) for m in methods]
+        indices = [i for i in indices if i != -1]
+        
+        # If we are strictly parsing, we should trust our position. 
+        # But for reassembled streams with potential drops, scanning is safer.
+        # However, if we just parsed a body, we should be at the start of the next message.
+        if not indices:
+            break
+        start = min(indices)
+        
+        # header end
+        header_end = stream.find(b"\r\n\r\n", start)
+        if header_end == -1:
+            break
+            
+        header_bytes = stream[start:header_end]
+        try:
+            header_str = header_bytes.decode("latin-1")
+        except:
+            idx = start + 1
+            continue
+            
+        lines = header_str.split("\r\n")
+        start_line = lines[0]
+        headers = {}
+        for ln in lines[1:]:
+            if ":" in ln:
+                k, v = ln.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+                
+        is_request = not start_line.startswith("HTTP/1.")
+        
+        # Body
+        body_start = header_end + 4
+        content_len = None
+        is_chunked = False
+        
+        if "content-length" in headers:
+            try:
+                content_len = int(headers["content-length"])
+            except: pass
+        
+        transfer_enc = headers.get("transfer-encoding", "").lower()
+        if "chunked" in transfer_enc:
+            is_chunked = True
+            # RFC 7230: Transfer-Encoding overrides Content-Length
+            content_len = None
+            
+        body = b""
+        next_idx = body_start
+        
+        if content_len is not None and content_len >= 0:
+            if body_start + content_len <= len(stream):
+                body = stream[body_start:body_start + content_len]
+                next_idx = body_start + content_len
+            else:
+                body = stream[body_start:] # Truncated
+                next_idx = len(stream)
+        elif is_chunked:
+            raw_body = stream[body_start:]
+            body = _decode_chunked(raw_body)
+            # Advance index logic...
+            # Since we can't easily know exactly how many raw bytes were consumed 
+            # without complex parsing of chunk headers in _decode_chunked,
+            # we will try to find the "0\r\n\r\n" terminator.
+            terminator = raw_body.find(b"0\r\n\r\n")
+            if terminator != -1:
+                consumed = terminator + 5
+                next_idx = body_start + consumed
+            else:
+                # Fallback: assume rest of stream was chunks
+                next_idx = len(stream) 
+        else:
+             # Identity encoding, no length specified.
+             # For requests (GET/HEAD), implies no body.
+             # For responses, implies read-until-close (rest of stream).
+             # We previously scanned for next method, but that causes false truncation 
+             # if the binary body contains bytes resembling "GET " or "HTTP/1.".
+             
+             if is_request:
+                 # RFC 7230: Request without Content-Length or Transfer-Encoding => 0 length body 
+                 # (unless it's an old HTTP/1.0 style, but extremely rare for requests to rely on close)
+                 next_idx = body_start
+                 body = b""
+             else:
+                 # Response: Consume everything
+                 body = stream[body_start:]
+                 next_idx = len(stream)
+
+        # Handle compression
+        if headers.get("content-encoding") == "gzip":
+            try:
+                body = gzip.decompress(body)
+            except: pass
+        elif headers.get("content-encoding") == "deflate":
+            try:
+                body = zlib.decompress(body)
+            except: pass
+
+        messages.append({
+            "is_request": is_request,
+            "start_line": start_line,
+            "headers": headers,
+            "body": body
+        })
+        
+        if is_chunked:
+             # Because our chunk decoder doesn't return consumed bytes, we have to re-scan
+             idx = max(body_start + 1, next_idx)
+             # But if next_idx wasn't updated (pass block), we force scan forward
+             if idx == body_start + 1:
+                  # Look for next method
+                  sub_indices = [stream.find(m, body_start + 10) for m in methods] 
+                  sub_indices = [i for i in sub_indices if i != -1]
+                  if sub_indices:
+                      idx = min(sub_indices)
+                  else:
+                      idx = len(stream)
+        else:
+             idx = max(idx + 1, next_idx)
+             
+    return messages
+
+def _parse_smb2(stream: bytes) -> Tuple[Dict[bytes, str], Dict[bytes, bytes]]:
+    # Partial SMB2 parser for file constructs
+    file_map = {} # GUID/Handle -> Name
+    file_data = defaultdict(bytearray)
+    
+    offset = 0
+    while offset + 64 < len(stream):
+        if stream[offset:offset+4] == b'\xfeSMB':
+            # Header
+            try:
+                cmd = int.from_bytes(stream[offset+12:offset+14], "little")
+                # flags = int.from_bytes(stream[offset+16:offset+20], "little")
+                # Structure size = 64
+                pass
+            except: pass
+            
+        # Brute force scan for \xfeSMB since alignment varies
+        next_sig = stream.find(b'\xfeSMB', offset + 1)
+        
+        offset = next_sig if next_sig != -1 else len(stream)
+
+    return file_map, file_data
+
+def _scan_filenames(data: bytes) -> List[str]:
+    # Extract likely filenames from binary blob
+    found = set()
+    # Expanded regex to capture more file types and characters (spaces, brackets, parens)
+    pattern = r'[\w\-.()\[\]]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|txt|bat|ps1|mkv|mp4|avi|mov|wmv|flv|webm|jpg|jpeg|png|gif|bmp|tiff|iso|img|tar|gz|7z|rar)'
+
+    # UTF-16 strings
+    try:
+        text = data.decode("utf-16-le", errors="ignore")
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        found.update(matches)
+    except: pass
+    
+    # ASCII
+    try:
+        text = data.decode("latin-1", errors="ignore")
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        found.update(matches)
+    except: pass
+    
+    return list(found)
+
+# --- Main Class ---
+
+class FileExtractor:
+    def __init__(self, path: Path):
+        self.path = path
+        self.tcp_streams: Dict[Tuple[str, str, int, int], List[Tuple[int, bytes, int]]] = defaultdict(list)
+        self.tftp_sessions: Dict[frozenset[str], Dict[str, Any]] = defaultdict(lambda: {
+            "filename": None, "blocks": {}, "first_packet": 0, "sport": 0, "dport": 0
+        })
+        self.artifacts: List[FileArtifact] = []
+        self.candidates: List[FileTransfer] = []
+        self.errors: List[str] = []
+        self.flows: Dict[Tuple[str, str, str, int, int], Dict[str, Any]] = defaultdict(lambda: {
+            "packets": 0, "bytes": 0, "first_seen": None, "last_seen": None
+        })
+
+    def process_packet(self, pkt: Packet, idx: int):
+        # IP/IPv6
+        if IP and pkt.haslayer(IP):
+            src, dst = pkt[IP].src, pkt[IP].dst
+        elif IPv6 and pkt.haslayer(IPv6):
+            src, dst = pkt[IPv6].src, pkt[IPv6].dst
+        else:
+            return
+
+        proto = "IP"
+        sport = 0
+        dport = 0
+        
+        # Statistics
+        ts = safe_float(getattr(pkt, "time", 0))
+        
+        if TCP and pkt.haslayer(TCP):
+            tcp = pkt[TCP]
+            proto = "TCP"
+            sport, dport = int(tcp.sport), int(tcp.dport)
+            if Raw in pkt:
+                payload = bytes(pkt[Raw])
+                if payload:
+                    seq = int(tcp.seq)
+                    self.tcp_streams[(src, dst, sport, dport)].append((seq, payload, idx))
+
+        elif UDP and pkt.haslayer(UDP):
+            udp = pkt[UDP]
+            proto = "UDP"
+            sport, dport = int(udp.sport), int(udp.dport)
+            
+            # TFTP
+            if sport == 69 or dport == 69:
+               if Raw in pkt:
+                   load = bytes(pkt[Raw])
+                   self._handle_tftp(load, src, dst, sport, dport, idx)
+        
+        if proto != "IP":
+            key = (src, dst, proto, sport, dport)
+            f = self.flows[key]
+            f["packets"] += 1
+            f["bytes"] += len(pkt)
+            if f["first_seen"] is None or ts < f["first_seen"]:
+                f["first_seen"] = ts
+            if f["last_seen"] is None or ts > f["last_seen"]:
+                f["last_seen"] = ts
+
+    def _handle_tftp(self, payload: bytes, src: str, dst: str, sport: int, dport: int, idx: int):
+        if len(payload) < 4: return
+        key = frozenset({src, dst})
+        sess = self.tftp_sessions[key]
+        if sess["first_packet"] == 0:
+            sess["first_packet"] = idx
+            sess["sport"] = sport
+            sess["dport"] = dport
+
+        opcode = int.from_bytes(payload[:2], 'big')
+        if opcode in {1, 2}:
+            fn = _extract_tftp(payload)
+            if fn: sess["filename"] = fn
+        elif opcode == 3:
+            blk = int.from_bytes(payload[2:4], 'big')
+            sess["blocks"][blk] = payload[4:]
+
+
+    def finalize(self):
+        # We need a two-pass approach for HTTP to correlate Requests with Responses
+        # Pass 1: Scan for HTTP Requests and build pending_requests map
+        pending_requests: Dict[Tuple[str, str, int, int], List[str]] = defaultdict(list)
+        
+        # Pre-assemble all streams once to avoid double work?
+        # No, memory is tight, we iterate self.tcp_streams.
+        # But we need to correlate.
+        
+        # Let's iterate over ALL streams for Pass 1 (Request Collection)
+        for (src, dst, sport, dport), chunks in self.tcp_streams.items():
+            # Check just the first chunk or two to see if it's HTTP Request
+            if not chunks: continue
+            
+            # Optimization: Don't assemble everything yet, just peek
+            head_payload = chunks[0][1]
+            if b"HTTP/" in head_payload or any(m in head_payload for m in [b"GET ", b"POST ", b"HEAD "]):
+                 # Likely HTTP
+                 stream, _ = _assemble_stream(chunks, limit=5_000_000) # Smaller check limit
+                 msgs = _parse_http_stream(stream)
+                 for m in msgs:
+                     if m["is_request"]:
+                         fn = _extract_request_filename(m["start_line"])
+                         if fn:
+                             # Store for the REVERSE direction
+                             # Key: (Dst(Server), DstPort, Src(Client), SrcPort)
+                             key = (dst, dst, src, sport) 
+                             # Wait, my keys in tcp_streams are (src, dst, sport, dport)
+                             # So from Client->Server.
+                             # Response will be Server->Client.
+                             # Response Key will be (dst, src, dport, sport)
+                             # Wait, tcp_streams key is (src, dst, sport, dport)
+                             # So I should store it under (dst, src, dport, sport)
+                             pending_requests[(dst, src, dport, sport)].append(fn)
+
+        # Pass 2: Process Everything
+        for (src, dst, sport, dport), chunks in self.tcp_streams.items():
+            stream, first_pkt = _assemble_stream(chunks)
+            if not stream:
+                continue
+
+            protocol = _detect_protocol_from_stream(stream, sport, dport)
+            
+            # Lookup Flow Stats for size estimation in SMB
+            # Key used in flows: (src, dst, proto, sport, dport)
+            # protocol variable here is "SMB" or "HTTP", but flows key uses "TCP" usually
+            # But the flows dictate the transport.
+            # Let's try to find the flow with matching tuples
+            flow_bytes = 0
+            # Try TCP
+            f_info = self.flows.get((src, dst, "TCP", sport, dport))
+            if f_info: flow_bytes = f_info["bytes"]
+            
+            # Protocol Handlers
+            if protocol == "HTTP":
+                # Check if we have pending filenames for this stream (Client <- Server)
+                # Key matching current stream: (src, dst, sport, dport)
+                # Because we stored it using that key.
+                names = pending_requests.get((src, dst, sport, dport), [])
+                self._extract_http(stream, src, dst, sport, dport, first_pkt, names)
+            elif protocol == "SMB":
+                self._extract_smb(stream, src, dst, sport, dport, first_pkt, flow_bytes)
+            elif protocol in ("SMTP", "POP3", "IMAP"):
+                self._extract_email(stream, protocol, src, dst, sport, dport, first_pkt)
+            
+            # Generic binary/PE extraction
+            self._extract_pe(stream, protocol, src, dst, sport, dport, first_pkt)
+
+            # Heuristic raw file
+            if protocol == "FTP" and len(stream) > 1000:
+                self.artifacts.append(FileArtifact(
+                    protocol="FTP_DATA", src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
+                    filename=f"ftp_transfer_{first_pkt}.bin", size_bytes=len(stream), packet_index=first_pkt,
+                    note="FTP Data Stream", file_type="BINARY", payload=stream
+                ))
+
+        # 2. Process TFTP
+        for endpts, sess in self.tftp_sessions.items():
+            if sess["filename"] and sess["blocks"]:
+                ordered = sorted(sess["blocks"].items())
+                data = b"".join(v for k, v in ordered)
+                e_list = list(endpts)
+                s = e_list[0]
+                d = e_list[1] if len(e_list)>1 else s
+                
+                ftype = "BINARY"
+                if sess["filename"].lower().endswith(".exe"): ftype = "EXE/DLL"
+                elif sess["filename"].lower().endswith(".txt"): ftype = "TEXT"
+                
+                self.artifacts.append(FileArtifact(
+                    protocol="TFTP", src_ip=s, dst_ip=d, src_port=sess["sport"], dst_port=sess["dport"],
+                    filename=_normalize_filename(sess["filename"]), size_bytes=len(data),
+                    packet_index=sess["first_packet"], note="TFTP Transfer", file_type=ftype, payload=data
+                ))
+
+        # 3. Candidates
+        for (s, d, p, sp, dp), info in self.flows.items():
+            # Check if this flow produced artifacts
+            # This is O(N*M), maybe optimize later
+            
+            # Determine protocol
+            proto = _flow_protocol(sp, dp)
+            
+            self.candidates.append(FileTransfer(
+                protocol=proto, src_ip=s, dst_ip=d, src_port=sp, dst_port=dp,
+                packets=info["packets"], bytes=info["bytes"],
+                first_seen=info["first_seen"], last_seen=info.get("last_seen"),
+                note=None
+            ))
+        
+        self.candidates.sort(key=lambda x: x.bytes, reverse=True)
+        
+        # Sort artifacts to surface interesting files first
+        # 1. Non generic filenames (not http_response.bin, not extracted_pe_N.exe if possible, but PEs are good)
+        # 2. Known Extensions (exe, zip, pdf, etc)
+        # 3. Size (Largest first)
+        def artifact_score(a: FileArtifact) -> tuple:
+            name_score = 0
+            if "http_response" in a.filename: name_score = 3
+            elif "extracted_" in a.filename: name_score = 2
+            else: name_score = 1 # Specific name is best
+            
+            ext_score = 0
+            # Priorities: Executables, Documents, Archives, Media
+            priority_exts = (
+                ".exe", ".dll", ".zip", ".pdf", ".docx", ".xlsx",
+                ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm",
+                ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff",
+                ".tar", ".gz", ".7z", ".rar", ".iso"
+            )
+            if a.filename.lower().endswith(priority_exts):
+                ext_score = 2
+            elif a.filename.lower().endswith(".bin"):
+                ext_score = 0
+            else:
+                ext_score = 1
+                
+            size_val = a.size_bytes or 0
+            
+            # Sort Key: (NameQuality Desc, ExtQuality Desc, Size Desc)
+            # Python sorts Ascending by default. We want descending quality.
+            # So negate scores.
+            return (name_score, -ext_score, -size_val)
+
+        self.artifacts.sort(key=artifact_score)
+
+
+    def _extract_http(self, stream: bytes, src: str, dst: str, sport: int, dport: int, idx: int, known_filenames: List[str] = None):
+        msgs = _parse_http_stream(stream)
+        pending_names = list(known_filenames) if known_filenames else []
+        
+        for m in msgs:
+            if m["is_request"]:
+                fn = _extract_request_filename(m["start_line"])
+                if fn: pending_names.append(fn)
+            else:
+                # Response
+                body = m.get("body", b"")
+                
+                fname = "http_response.bin"
+                # Robust Content-Disposition Parsing
+                disp = m["headers"].get("content-disposition", "")
+                if disp:
+                    # Look for filename* (RFC 5987)
+                    match_star = re.search(r'filename\*=UTF-8\'\'(.+?)(?:;|$)', disp, re.IGNORECASE)
+                    if match_star:
+                        try:
+                            fname = unquote(match_star.group(1))
+                        except: pass
+                    else:
+                        # Look for filename="foo" or filename=foo
+                        match = re.search(r'filename=["\']?([^"\';]+)["\']?', disp, re.IGNORECASE)
+                        if match:
+                            fname = match.group(1)
+                
+                # Check pending names (Sync logic: Consume regardless of body size/existence to keep order)
+                if fname == "http_response.bin" and pending_names:
+                    fname = pending_names.pop(0)
+
+                if not body:
+                    continue
+
+                # Determine File Type (Early)
+                ft = detect_file_type_bytes(body)
+                if fname == "http_response.bin" and ft != "UNKNOWN":
+                    ext = ft.lower().split("/")[0]
+                    fname = f"extracted_{ext}.bin"
+
+                # Check Size - Filter out noise unless we have a specific filename or valid type
+                is_specific_name = fname != "http_response.bin" and not fname.startswith("extracted_")
+                
+                if len(body) < 16 and not is_specific_name:
+                    # Allow tiny magic-detected files? (e.g. tiny gif)
+                    # If it has a detected type (not UNKNOWN), maybe keep it?
+                    if ft == "UNKNOWN":
+                        continue
+
+                # Fix for Procmon or other PEs inside HTTP (Size > 1MB usually)
+                # But keep check small for speed, just header signature
+                if len(body) > 64 and body.startswith(b"MZ"):
+                     # Double check PE signature
+                     try:
+                         pe_off = int.from_bytes(body[60:64], 'little')
+                         if pe_off < len(body) and body[pe_off:pe_off+4] == b"PE\x00\x00":
+                             if fname == "http_response.bin" or fname.endswith(".bin"):
+                                 fname = "extracted_pe_http.exe"
+                             ft = "EXE/DLL" # Detected
+                     except: pass
+                
+                self.artifacts.append(FileArtifact(
+                    protocol="HTTP", src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
+                    filename=_normalize_filename(fname), size_bytes=len(body), packet_index=idx,
+                    note="HTTP Response Body", file_type=ft, payload=body
+                ))
+                
+                # Double check for PEs inside HTTP bodies that might be wrapped or just to be sure
+                # (although _extract_pe runs on the full stream, sometimes having it isolated in the body is better)
+                if len(body) > 64 and body.startswith(b"MZ"):
+                    # Already handled above
+                    pass
+
+    def _extract_smb(self, stream: bytes, src: str, dst: str, sport: int, dport: int, idx: int, flow_total_bytes: int = 0):
+        # Scan for filenames
+        names = _scan_filenames(stream)
+        
+        # If we have a huge stream and one "likely large" file, assign the size.
+        # Heuristic: If flow > 1MB and we have a video/archive/iso, assume it's the file.
+        # If multiple candidates, we can't be sure, so leave as None or assign to all (which is misleading).
+        # We will assign to the *best* candidate if unique.
+        
+        candidates = []
+        for n in names:
+            ftype = "UNKNOWN"
+            priority = 0
+            if n.lower().endswith((".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm")): 
+                ftype = "VIDEO"
+                priority = 3
+            elif n.lower().endswith((".zip", ".tar", ".gz", ".7z", ".rar", ".iso", ".img")): 
+                ftype = "ARCHIVE"
+                priority = 3
+            elif n.lower().endswith(".exe"): 
+                ftype = "EXE/DLL"
+                priority = 2
+            elif n.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff")):
+                ftype = "IMAGE"
+                priority = 1
+            elif n.lower().endswith(".pdf"): 
+                ftype = "PDF"
+                priority = 1
+                
+            candidates.append({
+                "name": n,
+                "type": ftype,
+                "priority": priority
+            })
+
+        # Find best candidate for size attribution
+        size_assigned = False
+        target_name = None
+        if flow_total_bytes > 1_000_000 and candidates:
+             # Get highest priority items
+             max_p = max(c["priority"] for c in candidates)
+             if max_p >= 2: # Only for likely large files
+                 best_cands = [c for c in candidates if c["priority"] == max_p]
+                 if len(best_cands) == 1:
+                     target_name = best_cands[0]["name"]
+        
+        for cand in candidates:
+            # Estimate size: If this is the target, use flow bytes.
+            # Otherwise use None (unknown)
+            sz = None
+            if cand["name"] == target_name:
+                sz = flow_total_bytes
+                
+            self.artifacts.append(FileArtifact(
+                protocol="SMB", src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
+                filename=_normalize_filename(cand["name"]), size_bytes=sz, packet_index=idx,
+                note="Filename seen in SMB stream", file_type=cand["type"], payload=None
+            ))
+
+    def _extract_email(self, stream: bytes, proto: str, src: str, dst: str, sport: int, dport: int, idx: int):
+        try:
+            msg = email.message_from_bytes(stream, policy=policy.default)
+            for part in msg.walk():
+                fn = part.get_filename()
+                if fn:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                         ft = detect_file_type_bytes(payload)
+                         self.artifacts.append(FileArtifact(
+                            protocol=proto, src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
+                            filename=_normalize_filename(fn), size_bytes=len(payload), packet_index=idx,
+                            note=f"{proto} Attachment", file_type=ft, payload=payload
+                        ))
+        except: pass
+
+    def _extract_pe(self, stream: bytes, protocol: str, src: str, dst: str, sport: int, dport: int, idx: int):
+        # Look for MZ...PE
+        pos = 0
+        found_count = 0
+        while True:
+            mz = stream.find(b"MZ", pos)
+            if mz == -1: break
+            
+            # Sanity check: if we found seemingly infinite MZs (e.g. ZMZMZMZM), break
+            if found_count > 10: break
+
+            if mz + 64 > len(stream): break
+            
+            try:
+                pe_off = int.from_bytes(stream[mz+60:mz+64], 'little')
+                # PE header must be within reasonable distance (e.g. < 4096 bytes usually)
+                if 0 < pe_off < 4096 and mz + pe_off + 4 <= len(stream):
+                    if stream[mz + pe_off : mz + pe_off + 4] == b"PE\x00\x00":
+                        # Found one
+                        # Determine size (Optional Header -> SizeOfImage)
+                        # Optional Header starts at PE + 24
+                        # SizeOfImage is at offset 56 in Optional Header (Std+Win specific)
+                        # PE(4) + FileHeader(20) + OptionalHeader(Standard fields...)
+                        # Magic number in Optional Header determines PE32 vs PE32+
+                        
+                        # Just grab to end of stream or next large block of nulls for now
+                        # Ideally we parse the SizeOfImage
+                        
+                        data = stream[mz:]
+                        fname = f"extracted_pe_{found_count}.exe"
+                        
+                        # Check if we can parse SizeOfImage
+                        opt_header_start = mz + pe_off + 24
+                        if opt_header_start + 60 < len(stream):
+                            # Magic: 0x10b (PE32), 0x20b (PE32+)
+                            magic = int.from_bytes(stream[opt_header_start:opt_header_start+2], "little")
+                            size_of_image = 0
+                            if magic == 0x10b:
+                                # Offset 56
+                                size_of_image = int.from_bytes(stream[opt_header_start+56:opt_header_start+60], "little")
+                            elif magic == 0x20b:
+                                # Offset 56
+                                size_of_image = int.from_bytes(stream[opt_header_start+56:opt_header_start+60], "little")
+                            
+                            if size_of_image > 0 and size_of_image < 100_000_000:
+                                # If we have enough data, slice it
+                                if len(data) >= size_of_image:
+                                    data = data[:size_of_image]
+                        
+                        self.artifacts.append(FileArtifact(
+                            protocol=protocol, src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
+                            filename=fname, size_bytes=len(data), packet_index=idx,
+                            note="PE Signature Detection", file_type="EXE/DLL", payload=data
+                        ))
+                        found_count += 1
+                        # Advance past the PE header to avoid tiny loop
+                        pos = mz + pe_off + 4
+                        continue
+            except: 
+                pass
+                
+            pos = mz + 2
+
+
+# --- Entry Point ---
+
+def analyze_files(
+    path: Path,
+    extract_name: Optional[str] = None,
+    output_dir: Optional[Path] = None,
+    view_name: Optional[str] = None,
+    show_status: bool = True,
+) -> FileTransferSummary:
+    
+    if IP is None:
+        return FileTransferSummary(path, 0, [], [], [], [], [], ["Scapy NoneType error"])
+
+    extractor = FileExtractor(path)
+    ftype = detect_file_type(path)
+    
+    size_bytes = 0
+    try:
+        size_bytes = path.stat().st_size
+    except Exception:
+        pass
+        
+    status = build_statusbar(path, enabled=show_status)
+
+    try:
+        reader = PcapNgReader(str(path)) if ftype == "pcapng" else PcapReader(str(path))
+        
+        stream = None
+        for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
+            candidate = getattr(reader, attr, None)
+            if candidate is not None:
+                stream = candidate
+                break
+
+        i = 0
+        for pkt in reader:
+            if stream is not None and size_bytes:
+                try:
+                    pos = stream.tell()
+                    percent = int(min(100, (pos / size_bytes) * 100))
+                    status.update(percent)
+                except Exception:
+                    pass
+
+            i += 1
+            extractor.process_packet(pkt, i)
+        reader.close()
+    except Exception as e:
+        extractor.errors.append(str(e))
+    finally:
+        status.finish()
+        
+    extractor.finalize()
+    
+    # Handle Extraction and View
+    extracted_paths = []
+    view_data = []
+    
+    if extract_name:
+        out_root = output_dir or Path.cwd() / "files"
+        out_root.mkdir(parents=True, exist_ok=True)
+        search = extract_name.lower()
+        for art in extractor.artifacts:
+            if art.payload and search in art.filename.lower():
+                out_p = out_root / art.filename
+                # unique naming
+                if out_p.exists():
+                    out_p = out_root / f"{art.packet_index}_{art.filename}"
+                with out_p.open("wb") as f:
+                    f.write(art.payload)
+                extracted_paths.append(out_p)
+                
+    if view_name:
+        search = view_name.lower()
+        for art in extractor.artifacts:
+            if art.payload and search in art.filename.lower():
+                view_data.append({
+                    "filename": art.filename,
+                    "payload": art.payload,
+                    "size": len(art.payload)
+                })
+                
+    return FileTransferSummary(
+        path=path,
+        total_candidates=len(extractor.candidates),
+        candidates=extractor.candidates,
+        artifacts=extractor.artifacts,
+        extracted=extracted_paths,
+        views=view_data,
+        detections=[],
+        errors=extractor.errors
+    )
