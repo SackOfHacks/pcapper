@@ -9,7 +9,7 @@ import re
 from scapy.utils import PcapReader, PcapNgReader
 
 from .progress import build_statusbar
-from .utils import safe_float, detect_file_type
+from .utils import safe_float, detect_file_type, detect_file_type_bytes
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -58,6 +58,11 @@ class HttpSummary:
     content_types: Counter[str]
     file_artifacts: Counter[str]
     session_tokens: Counter[str]
+    client_counts: Counter[str]
+    server_counts: Counter[str]
+    version_counts: Counter[str]
+    post_payloads: list[dict[str, object]]
+    downloads: list[dict[str, object]]
     conversations: list[HttpConversation]
     detections: list[dict[str, object]]
     errors: list[str]
@@ -128,6 +133,11 @@ def analyze_http(path: Path, show_status: bool = True) -> HttpSummary:
             content_types=Counter(),
             file_artifacts=Counter(),
             session_tokens=Counter(),
+            client_counts=Counter(),
+            server_counts=Counter(),
+            version_counts=Counter(),
+            post_payloads=[],
+            downloads=[],
             conversations=[],
             detections=[],
             errors=errors,
@@ -166,6 +176,11 @@ def analyze_http(path: Path, show_status: bool = True) -> HttpSummary:
     content_types: Counter[str] = Counter()
     file_artifacts: Counter[str] = Counter()
     session_tokens: Counter[str] = Counter()
+    client_counts: Counter[str] = Counter()
+    server_counts: Counter[str] = Counter()
+    version_counts: Counter[str] = Counter()
+    post_payloads: list[dict[str, object]] = []
+    downloads: list[dict[str, object]] = []
 
     conversations: dict[tuple[str, str], dict[str, object]] = defaultdict(lambda: {
         "requests": 0,
@@ -176,6 +191,7 @@ def analyze_http(path: Path, show_status: bool = True) -> HttpSummary:
         "first_seen": None,
         "last_seen": None,
     })
+    pending_requests: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
 
     clients: set[str] = set()
     servers: set[str] = set()
@@ -243,6 +259,9 @@ def analyze_http(path: Path, show_status: bool = True) -> HttpSummary:
                 if len(parts) >= 2:
                     method = parts[0]
                     uri = parts[1]
+                    version = parts[2] if len(parts) >= 3 else "HTTP/1.1"
+                    if version.startswith("HTTP/"):
+                        version_counts[version] += 1
                     host = headers.get("host", "")
                     url = _extract_url(host, uri)
 
@@ -263,6 +282,10 @@ def analyze_http(path: Path, show_status: bool = True) -> HttpSummary:
                     filename = _extract_filename(headers, uri)
                     if filename:
                         file_artifacts[filename] += 1
+                    pending_requests[(src_ip, dst_ip)].append({
+                        "uri": uri,
+                        "filename": filename or "",
+                    })
 
                     conv = conversations[(src_ip, dst_ip)]
                     conv["requests"] = int(conv["requests"]) + 1
@@ -275,10 +298,35 @@ def analyze_http(path: Path, show_status: bool = True) -> HttpSummary:
 
                     clients.add(src_ip)
                     servers.add(dst_ip)
+                    client_counts[src_ip] += 1
+                    server_counts[dst_ip] += 1
+
+                    if method == "POST":
+                        body = b""
+                        if b"\r\n\r\n" in payload:
+                            body = payload.split(b"\r\n\r\n", 1)[1]
+                        if body:
+                            content_length = headers.get("content-length", "")
+                            content_type = headers.get("content-type", "")
+                            sample = body[:160]
+                            sample_text = sample.decode("latin-1", errors="ignore").replace("\r", " ").replace("\n", " ")
+                            post_payloads.append({
+                                "src": src_ip,
+                                "dst": dst_ip,
+                                "host": host,
+                                "uri": uri,
+                                "bytes": len(body),
+                                "content_type": content_type,
+                                "content_length": content_length,
+                                "sample": sample_text,
+                            })
 
             elif start.startswith("HTTP/"):
                 parts = start.split(" ")
                 if len(parts) >= 2 and parts[1].isdigit():
+                    version = parts[0]
+                    if version.startswith("HTTP/"):
+                        version_counts[version] += 1
                     status_code = parts[1]
                     total_responses += 1
                     status_counts[status_code] += 1
@@ -312,6 +360,69 @@ def analyze_http(path: Path, show_status: bool = True) -> HttpSummary:
 
                     servers.add(src_ip)
                     clients.add(dst_ip)
+                    server_counts[src_ip] += 1
+                    client_counts[dst_ip] += 1
+
+                    body = b""
+                    if b"\r\n\r\n" in payload:
+                        body = payload.split(b"\r\n\r\n", 1)[1]
+                    if body:
+                        detected_type = detect_file_type_bytes(body)
+                        fname = _extract_filename(headers, "")
+                        pending_key = (dst_ip, src_ip)
+                        if not fname and pending_requests.get(pending_key):
+                            req_info = pending_requests[pending_key].pop(0)
+                            fname = req_info.get("filename") or fname
+                            if not fname:
+                                uri = req_info.get("uri", "")
+                                fname = _extract_filename({}, uri) or fname
+                        ext = ""
+                        if fname and "." in fname:
+                            ext = "." + fname.lower().split(".")[-1]
+                        expected_type = None
+                        if ext in {".exe", ".dll", ".sys", ".scr"}:
+                            expected_type = "EXE/DLL"
+                        elif ext in {".zip", ".rar", ".7z", ".iso", ".img"}:
+                            expected_type = "ZIP/Office"
+                        elif ext in {".pdf"}:
+                            expected_type = "PDF"
+                        elif ext in {".png"}:
+                            expected_type = "PNG"
+                        elif ext in {".jpg", ".jpeg"}:
+                            expected_type = "JPG"
+                        elif ext in {".gif"}:
+                            expected_type = "GIF"
+                        elif not expected_type:
+                            ctype = headers.get("content-type", "").lower()
+                            if "pdf" in ctype:
+                                expected_type = "PDF"
+                            elif "zip" in ctype:
+                                expected_type = "ZIP/Office"
+                            elif "msword" in ctype or "word" in ctype:
+                                expected_type = "DOC"
+                            elif "excel" in ctype:
+                                expected_type = "XLS"
+                            elif "powerpoint" in ctype:
+                                expected_type = "PPT"
+                            elif "png" in ctype:
+                                expected_type = "PNG"
+                            elif "jpeg" in ctype or "jpg" in ctype:
+                                expected_type = "JPG"
+                            elif "gif" in ctype:
+                                expected_type = "GIF"
+                        mismatch = bool(expected_type and detected_type not in ("BINARY", expected_type))
+                        if fname or detected_type not in ("BINARY", "HTML"):
+                            downloads.append({
+                                "src": src_ip,
+                                "dst": dst_ip,
+                                "filename": fname or "-",
+                                "detected_type": detected_type,
+                                "expected_type": expected_type or "-",
+                                "bytes": len(body),
+                                "content_type": headers.get("content-type", ""),
+                                "status": status_code,
+                                "mismatch": mismatch,
+                            })
     finally:
         status.finish()
         reader.close()
@@ -374,6 +485,21 @@ def analyze_http(path: Path, show_status: bool = True) -> HttpSummary:
             "details": ", ".join(suspicious_files[:5]),
         })
 
+    mismatch_downloads = [item for item in downloads if item.get("mismatch")]
+    if mismatch_downloads:
+        detections.append({
+            "severity": "critical",
+            "summary": "HTTP file type discrepancies",
+            "details": f"{len(mismatch_downloads)} downloads where filename/type mismatched (possible masquerading).",
+        })
+
+    if post_payloads:
+        detections.append({
+            "severity": "info",
+            "summary": "HTTP POST payloads observed",
+            "details": f"{len(post_payloads)} POST payload(s) captured.",
+        })
+
     return HttpSummary(
         path=path,
         total_packets=total_packets,
@@ -391,6 +517,11 @@ def analyze_http(path: Path, show_status: bool = True) -> HttpSummary:
         content_types=content_types,
         file_artifacts=file_artifacts,
         session_tokens=session_tokens,
+        client_counts=client_counts,
+        server_counts=server_counts,
+        version_counts=version_counts,
+        post_payloads=post_payloads,
+        downloads=downloads,
         conversations=conversation_rows,
         detections=detections,
         errors=errors,

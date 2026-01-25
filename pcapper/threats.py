@@ -12,6 +12,7 @@ from .utils import safe_float, detect_file_type
 from .icmp import analyze_icmp
 from .dns import analyze_dns
 from .beacon import analyze_beacons
+from .files import analyze_files
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -38,6 +39,7 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     icmp_summary = analyze_icmp(path, show_status=show_status)
     dns_summary = analyze_dns(path, show_status=show_status)
     beacon_summary = analyze_beacons(path, show_status=show_status)
+    files_summary = analyze_files(path, show_status=show_status)
 
     for item in icmp_summary.detections:
         detections.append({
@@ -55,16 +57,123 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             **item,
         })
 
+    smb1_sources: Counter[str] = Counter()
+    smb1_destinations: Counter[str] = Counter()
+    for item in files_summary.detections:
+        detections.append({
+            "source": "Files",
+            **item,
+        })
+        if str(item.get("summary", "")).lower().startswith("smbv1 detected"):
+            for ip, count in item.get("top_sources", []) or []:
+                smb1_sources[ip] += count
+            for ip, count in item.get("top_destinations", []) or []:
+                smb1_destinations[ip] += count
+
     if beacon_summary.candidates:
         for candidate in beacon_summary.candidates[:10]:
+            duration = 0.0
+            if candidate.first_seen is not None and candidate.last_seen is not None:
+                duration = max(0.0, candidate.last_seen - candidate.first_seen)
+            if candidate.src_port and candidate.dst_port:
+                proto_label = f"{candidate.proto}:{candidate.src_port}->{candidate.dst_port}"
+            elif candidate.dst_port:
+                proto_label = f"{candidate.proto}:{candidate.dst_port}"
+            else:
+                proto_label = candidate.proto
             detections.append({
                 "source": "Beacon",
                 "severity": "info",
                 "summary": "Beacon candidate flow",
-                "details": f"{candidate.src_ip} -> {candidate.dst_ip} ({candidate.proto}) {candidate.count} events, mean {candidate.mean_interval:.2f}s, jitter {candidate.jitter:.2f}",
+                "details": f"{candidate.src_ip} -> {candidate.dst_ip} ({proto_label}) {candidate.count} events, "
+                           f"mean {candidate.mean_interval:.2f}s, jitter {candidate.jitter:.2f}, duration {duration:.0f}s, "
+                           f"top interval {candidate.top_interval}s, avg bytes {candidate.avg_bytes:.0f}",
                 "top_sources": [(candidate.src_ip, candidate.count)],
                 "top_destinations": [(candidate.dst_ip, candidate.count)],
             })
+
+    # Suspicious file download detection
+    suspicious_exts = {
+        ".exe", ".dll", ".ps1", ".bat", ".vbs", ".js", ".scr",
+        ".sys", ".lnk", ".zip", ".rar", ".7z", ".iso", ".img",
+    }
+    suspicious_artifacts: list[dict[str, object]] = []
+    src_counts_files: Counter[str] = Counter()
+    dst_counts_files: Counter[str] = Counter()
+    for art in files_summary.artifacts:
+        fname = art.filename.lower()
+        ext = f".{fname.split('.')[-1]}" if "." in fname else ""
+        is_suspicious = ext in suspicious_exts
+        if not is_suspicious and "extracted_pe" in fname:
+            is_suspicious = True
+        ftype = getattr(art, "file_type", "UNKNOWN")
+        if ftype in ("EXE/DLL", "ARCHIVE"):
+            is_suspicious = True
+        if is_suspicious:
+            suspicious_artifacts.append({
+                "filename": art.filename,
+                "protocol": art.protocol,
+                "file_type": ftype,
+                "src": art.src_ip,
+                "dst": art.dst_ip,
+                "size": art.size_bytes,
+            })
+            if art.src_ip:
+                src_counts_files[art.src_ip] += 1
+            if art.dst_ip:
+                dst_counts_files[art.dst_ip] += 1
+
+    if suspicious_artifacts:
+        detections.append({
+            "source": "Files",
+            "severity": "warning",
+            "summary": "Potential malicious file downloads detected",
+            "details": f"{len(suspicious_artifacts)} suspicious file(s) observed (executables/scripts/archives).",
+            "top_sources": src_counts_files.most_common(3),
+            "top_destinations": dst_counts_files.most_common(3),
+        })
+        for item in suspicious_artifacts[:10]:
+            fname = str(item.get("filename", ""))
+            ftype = str(item.get("file_type", "UNKNOWN"))
+            ext = f".{fname.lower().split('.')[-1]}" if "." in fname else ""
+            expected_type = None
+            if ext in {".exe", ".dll", ".sys", ".scr"}:
+                expected_type = "EXE/DLL"
+            elif ext in {".zip", ".rar", ".7z", ".iso", ".img"}:
+                expected_type = "ARCHIVE"
+            elif ext in {".pdf"}:
+                expected_type = "PDF"
+            elif ext in {".doc", ".docx"}:
+                expected_type = "DOC"
+            elif ext in {".xls", ".xlsx"}:
+                expected_type = "XLS"
+            elif ext in {".ppt", ".pptx"}:
+                expected_type = "PPT"
+            elif ext in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff"}:
+                expected_type = "IMAGE"
+            elif ext in {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm"}:
+                expected_type = "VIDEO"
+
+            mismatch = False
+            if expected_type and ftype not in ("UNKNOWN", expected_type):
+                mismatch = True
+
+            detections.append({
+                "source": "Files",
+                "severity": "high" if mismatch else "info",
+                "summary": "Suspicious file artifact" + (" (type mismatch)" if mismatch else ""),
+                "details": f"{item['protocol']} {item['filename']} ({item['file_type']}) {item['src']} -> {item['dst']}",
+            })
+
+    if smb1_sources or smb1_destinations:
+        detections.append({
+            "source": "Files",
+            "severity": "critical",
+            "summary": "SMBv1 hosts detected",
+            "details": "Hosts observed communicating with legacy SMBv1.",
+            "top_sources": smb1_sources.most_common(10),
+            "top_destinations": smb1_destinations.most_common(10),
+        })
 
     file_type = detect_file_type(path)
     reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))

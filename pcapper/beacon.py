@@ -37,6 +37,15 @@ class BeaconCandidate:
     mean_interval: float
     std_interval: float
     jitter: float
+    median_interval: float
+    mad_interval: float
+    median_bytes: float
+    mad_bytes: float
+    duration_seconds: float
+    periodicity_score: float
+    size_score: float
+    duration_score: float
+    count_score: float
     score: float
     first_seen: Optional[float]
     last_seen: Optional[float]
@@ -49,7 +58,7 @@ class BeaconSummary:
     total_packets: int
     candidate_count: int
     candidates: list[BeaconCandidate]
-    detections: list[dict[str, str]]
+    detections: list[dict[str, object]]
     errors: list[str]
 
 
@@ -176,6 +185,8 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
 
     session_conn_times: dict[tuple[str, str, str, Optional[int]], list[float]] = defaultdict(list)
     session_conn_sizes: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)
+    udp_session_times: dict[tuple[str, str, str, Optional[int]], list[float]] = defaultdict(list)
+    udp_session_sizes: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)
     conn_first_ts: dict[tuple[str, str, str, Optional[int], Optional[int]], float] = {}
     conn_syn_ts: dict[tuple[str, str, str, Optional[int], Optional[int]], float] = {}
     conn_bytes: dict[tuple[str, str, str, Optional[int], Optional[int]], int] = defaultdict(int)
@@ -192,24 +203,22 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                     pass
 
             total_packets += 1
-            if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                continue
-
-            tcp_layer = pkt[TCP]  # type: ignore[index]
-            flags = getattr(tcp_layer, "flags", None)
-            is_syn = False
-            if isinstance(flags, str):
-                is_syn = "S" in flags and "A" not in flags
-            elif isinstance(flags, int):
-                is_syn = (flags & 0x02) != 0 and (flags & 0x10) == 0
-            key = _flow_key(pkt)
-            if not key:
-                continue
             ts = safe_float(getattr(pkt, "time", None))
             if ts is None:
                 continue
             pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
-            if key:
+
+            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+                tcp_layer = pkt[TCP]  # type: ignore[index]
+                flags = getattr(tcp_layer, "flags", None)
+                is_syn = False
+                if isinstance(flags, str):
+                    is_syn = "S" in flags and "A" not in flags
+                elif isinstance(flags, int):
+                    is_syn = (flags & 0x02) != 0 and (flags & 0x10) == 0
+                key = _flow_key(pkt)
+                if not key:
+                    continue
                 src_ip, dst_ip, proto, sport, dport = key
                 ports = [p for p in (sport, dport) if p is not None]
                 if not ports:
@@ -225,6 +234,21 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                 conn_bytes[conn_key] += pkt_len
                 if is_syn:
                     conn_syn_ts[conn_key] = ts
+            elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+                key = _flow_key(pkt)
+                if not key:
+                    continue
+                src_ip, dst_ip, proto, sport, dport = key
+                ports = [p for p in (sport, dport) if p is not None]
+                if not ports:
+                    continue
+                server_port = min(ports)
+                client_ip, server_ip = _normalize_pair(src_ip, dst_ip)
+                session_key = (client_ip, server_ip, proto, server_port)
+                udp_session_times[session_key].append(ts)
+                udp_session_sizes[session_key].append(pkt_len)
+            else:
+                continue
     finally:
         status.finish()
         reader.close()
@@ -242,25 +266,52 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
     for (client, server, proto, server_port), times in session_conn_times.items():
         sizes = session_conn_sizes.get((client, server, proto, server_port), [])
         combined_flows.append(((client, server, proto, server_port, None), times, sizes))
+    for (client, server, proto, server_port), times in udp_session_times.items():
+        sizes = udp_session_sizes.get((client, server, proto, server_port), [])
+        combined_flows.append(((client, server, proto, server_port, None), times, sizes))
     seen_keys: set[tuple[str, str, str, Optional[int], Optional[int]]] = set()
+
+    benign_service_ports = {
+        53, 123, 137, 138, 139, 135, 389, 445, 464, 3268, 3269, 593, 88
+    }
+
+    def _is_public(ip_text: str) -> bool:
+        try:
+            return ipaddress.ip_address(ip_text).is_global
+        except Exception:
+            return False
+
+    def _is_private(ip_text: str) -> bool:
+        try:
+            return ipaddress.ip_address(ip_text).is_private
+        except Exception:
+            return False
 
     for (src_ip, dst_ip, proto, sport, dport), times, sizes in combined_flows:
         key_id = (src_ip, dst_ip, proto, sport, dport)
         if key_id in seen_keys:
             continue
         seen_keys.add(key_id)
-        long_duration = (times[-1] - times[0]) if len(times) >= 2 else 0.0
-        if len(times) < min_events and long_duration < 1800:
+
+        has_public = _is_public(src_ip) or _is_public(dst_ip)
+        if not has_public:
             continue
-        times.sort()
-        mean, std, jitter = _compute_stats(times)
+        times_sorted = sorted(times)
+        long_duration = (times_sorted[-1] - times_sorted[0]) if len(times_sorted) >= 2 else 0.0
+        if len(times_sorted) < min_events and long_duration < 1800:
+            continue
+        mean, std, jitter = _compute_stats(times_sorted)
         if mean <= 0:
             continue
-        deltas = [b - a for a, b in zip(times, times[1:]) if b >= a]
+        deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b >= a]
         interval_range = (max(deltas) - min(deltas)) if deltas else 0.0
+        median_interval = _median(deltas)
+        mad_interval = _mad(deltas, median_interval)
 
         avg_bytes = (sum(sizes) / len(sizes)) if sizes else 0.0
         size_range = (max(sizes) - min(sizes)) if sizes else 0
+        median_bytes = _median([float(val) for val in sizes]) if sizes else 0.0
+        mad_bytes = _mad([float(val) for val in sizes], median_bytes) if sizes else 0.0
         top_interval = 0
         if deltas:
             interval_counts = Counter(int(round(delta)) for delta in deltas)
@@ -269,13 +320,31 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
         if sizes:
             top_size = Counter(sizes).most_common(1)[0][0]
 
-        regularity = max(0.0, min(1.0, 1.0 - (std / mean))) if mean > 0 else 0.0
-        score = regularity
+        duration_seconds = long_duration
+        periodicity_score = 0.0
+        if median_interval > 0:
+            periodicity_score = max(0.0, 1.0 - min(1.0, mad_interval / median_interval))
+        size_score = 0.0
+        if median_bytes > 0:
+            size_score = max(0.0, 1.0 - min(1.0, mad_bytes / median_bytes))
+        duration_score = min(1.0, duration_seconds / 3600.0) if duration_seconds > 0 else 0.0
+        count_score = min(1.0, len(times_sorted) / 50.0)
+        score = (
+            (0.5 * periodicity_score)
+            + (0.2 * size_score)
+            + (0.2 * duration_score)
+            + (0.1 * count_score)
+        )
 
         if mean < 1.0 or mean > 86400.0:
             continue
-        if score < 0.4 and not (len(times) >= (min_events * 2) and regularity >= 0.2):
+        if score < 0.35 and len(times_sorted) < (min_events * 2):
             continue
+        if proto == "UDP" and (len(times_sorted) < max(min_events, 15) or periodicity_score < 0.6):
+            continue
+        if sport in benign_service_ports or dport in benign_service_ports:
+            if score < 0.8 and periodicity_score < 0.8:
+                continue
 
         candidates.append(
             BeaconCandidate(
@@ -284,7 +353,7 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                 proto=proto,
                 src_port=sport,
                 dst_port=dport,
-                count=len(times),
+                count=len(times_sorted),
                 avg_bytes=avg_bytes,
                 interval_range=interval_range,
                 size_range=size_range,
@@ -293,29 +362,76 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                 mean_interval=mean,
                 std_interval=std,
                 jitter=jitter,
+                median_interval=median_interval,
+                mad_interval=mad_interval,
+                median_bytes=median_bytes,
+                mad_bytes=mad_bytes,
+                duration_seconds=duration_seconds,
+                periodicity_score=periodicity_score,
+                size_score=size_score,
+                duration_score=duration_score,
+                count_score=count_score,
                 score=score,
-                first_seen=times[0],
-                last_seen=times[-1],
-                timeline=_timeline(times),
+                first_seen=times_sorted[0],
+                last_seen=times_sorted[-1],
+                timeline=_timeline(times_sorted),
             )
         )
 
     candidates.sort(key=lambda item: (item.score, item.count), reverse=True)
 
-    detections: list[dict[str, str]] = []
+    def _format_duration(seconds: float) -> str:
+        if seconds <= 0:
+            return "0s"
+        if seconds >= 3600:
+            return f"{seconds / 3600:.2f}h"
+        if seconds >= 60:
+            return f"{seconds / 60:.2f}m"
+        return f"{seconds:.1f}s"
+
+    detections: list[dict[str, object]] = []
     if candidates:
+        src_counts: Counter[str] = Counter()
+        dst_counts: Counter[str] = Counter()
+        flow_details: list[str] = []
+        for item in candidates[:3]:
+            duration = 0.0
+            if item.first_seen is not None and item.last_seen is not None:
+                duration = max(0.0, item.last_seen - item.first_seen)
+            if item.src_port and item.dst_port:
+                proto_label = f"{item.proto}:{item.src_port}->{item.dst_port}"
+            elif item.dst_port:
+                proto_label = f"{item.proto}:{item.dst_port}"
+            else:
+                proto_label = item.proto
+            flow_details.append(
+                f"{item.src_ip}->{item.dst_ip} {proto_label}, {item.count} beacons, mean {item.mean_interval:.2f}s, "
+                f"median {item.median_interval:.2f}s, MAD {item.mad_interval:.2f}s, duration {_format_duration(duration)}, "
+                f"avg bytes {item.avg_bytes:.0f}, size MAD {item.mad_bytes:.0f}, score {item.score:.2f}"
+            )
+            src_counts[item.src_ip] += item.count
+            dst_counts[item.dst_ip] += item.count
         detections.append({
             "type": "beaconing",
             "severity": "warning",
             "summary": f"{len(candidates)} beacon-like flows detected",
-            "details": "Periodic communication patterns may indicate C2 or scheduled tasks.",
+            "details": "Periodic communication patterns may indicate C2 or scheduled tasks. "
+                       f"Top flows: {'; '.join(flow_details)}",
+            "top_sources": src_counts.most_common(5),
+            "top_destinations": dst_counts.most_common(5),
         })
         for item in candidates[:3]:
+            duration = 0.0
+            if item.first_seen is not None and item.last_seen is not None:
+                duration = max(0.0, item.last_seen - item.first_seen)
             detections.append({
                 "type": "beacon_candidate",
                 "severity": "info",
                 "summary": f"Beacon candidate {item.src_ip} -> {item.dst_ip}",
-                "details": f"{item.count} events, mean {item.mean_interval:.2f}s, avg bytes {item.avg_bytes:.0f}, interval range {item.interval_range:.0f}, score {item.score:.2f}",
+                "details": f"{item.count} events, mean {item.mean_interval:.2f}s, median {item.median_interval:.2f}s, "
+                           f"MAD {item.mad_interval:.2f}s, duration {_format_duration(duration)}, avg bytes {item.avg_bytes:.0f}, "
+                           f"size MAD {item.mad_bytes:.0f}, periodicity {item.periodicity_score:.2f}, size {item.size_score:.2f}, "
+                           f"duration {item.duration_score:.2f}, count {item.count_score:.2f}, score {item.score:.2f}",
             })
     else:
         detections.append({

@@ -33,6 +33,26 @@ class NtlmSession:
     message_type: str = "Unknown"
     ts: float = 0.0
 
+
+@dataclass
+class NtlmConversation:
+    src_ip: str
+    dst_ip: str
+    src_port: int
+    dst_port: int
+    packets: int = 0
+    first_seen: Optional[float] = None
+    last_seen: Optional[float] = None
+    requests: int = 0
+    responses: int = 0
+    messages: Counter[str] = field(default_factory=Counter)
+
+
+@dataclass
+class NtlmArtifact:
+    value: str
+    description: str
+
 @dataclass
 class NtlmAnomaly:
     severity: str # CRITICAL, HIGH, MEDIUM, LOW
@@ -53,6 +73,14 @@ class NtlmAnalysis:
     raw_domains: Counter[str] = field(default_factory=Counter)
     raw_workstations: Counter[str] = field(default_factory=Counter)
     sessions: List[NtlmSession] = field(default_factory=list)
+    conversations: List[NtlmConversation] = field(default_factory=list)
+    request_counts: Counter[str] = field(default_factory=Counter)
+    response_counts: Counter[str] = field(default_factory=Counter)
+    status_codes: Counter[str] = field(default_factory=Counter)
+    src_counts: Counter[str] = field(default_factory=Counter)
+    dst_counts: Counter[str] = field(default_factory=Counter)
+    services: Counter[str] = field(default_factory=Counter)
+    artifacts: List[NtlmArtifact] = field(default_factory=list)
     anomalies: List[NtlmAnomaly] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
@@ -114,6 +142,125 @@ NTLMSSP_REQUEST_TARGET = 0x00000004
 NTLMSSP_NEGOTIATE_OEM = 0x00000002
 NTLMSSP_NEGOTIATE_UNICODE = 0x00000001
 
+NTSTATUS_MAP = {
+    0x00000000: "STATUS_SUCCESS",
+    0xC0000001: "STATUS_UNSUCCESSFUL",
+    0xC0000002: "STATUS_NOT_IMPLEMENTED",
+    0xC0000005: "STATUS_ACCESS_VIOLATION",
+    0xC0000008: "STATUS_INVALID_HANDLE",
+    0xC0000022: "STATUS_ACCESS_DENIED",
+    0xC0000034: "STATUS_OBJECT_NAME_NOT_FOUND",
+    0xC0000035: "STATUS_OBJECT_NAME_COLLISION",
+    0xC000003A: "STATUS_OBJECT_PATH_NOT_FOUND",
+    0xC0000043: "STATUS_SHARING_VIOLATION",
+    0xC0000048: "STATUS_OBJECT_NAME_INVALID",
+    0xC000005E: "STATUS_NO_LOGON_SERVERS",
+    0xC000006D: "STATUS_LOGON_FAILURE",
+    0xC000006E: "STATUS_ACCOUNT_RESTRICTION",
+    0xC000006F: "STATUS_INVALID_LOGON_HOURS",
+    0xC0000070: "STATUS_INVALID_WORKSTATION",
+    0xC0000071: "STATUS_PASSWORD_EXPIRED",
+    0xC0000072: "STATUS_ACCOUNT_DISABLED",
+    0xC0000073: "STATUS_NONE_MAPPED",
+    0xC0000074: "STATUS_INVALID_ACCOUNT_NAME",
+    0xC0000075: "STATUS_USER_EXISTS",
+    0xC0000076: "STATUS_NO_SUCH_USER",
+    0xC0000077: "STATUS_GROUP_EXISTS",
+    0xC0000078: "STATUS_NO_SUCH_GROUP",
+    0xC0000079: "STATUS_MEMBER_IN_GROUP",
+    0xC000007A: "STATUS_MEMBER_NOT_IN_GROUP",
+    0xC000007B: "STATUS_LAST_ADMIN",
+    0xC000007C: "STATUS_WRONG_PASSWORD",
+    0xC000007D: "STATUS_ILL_FORMED_PASSWORD",
+    0xC000007E: "STATUS_PASSWORD_RESTRICTION",
+    0xC000007F: "STATUS_LOGON_FAILURE",
+    0xC00000A2: "STATUS_PIPE_NOT_AVAILABLE",
+    0xC00000AC: "STATUS_PIPE_BUSY",
+    0xC00000B0: "STATUS_PIPE_DISCONNECTED",
+    0xC00000B5: "STATUS_INSUFF_SERVER_RESOURCES",
+    0xC00000BA: "STATUS_FILE_IS_A_DIRECTORY",
+    0xC00000BB: "STATUS_NOT_SUPPORTED",
+    0xC00000CC: "STATUS_BAD_NETWORK_NAME",
+    0xC00000D0: "STATUS_NOT_A_REPARSE_POINT",
+    0xC00000D4: "STATUS_IO_REPARSE_TAG_NOT_HANDLED",
+    0xC00000DE: "STATUS_NO_MORE_ENTRIES",
+    0xC00000FB: "STATUS_NO_SUCH_FILE",
+    0xC0000101: "STATUS_DIRECTORY_NOT_EMPTY",
+    0xC0000120: "STATUS_CANCELLED",
+    0xC0000135: "STATUS_DLL_NOT_FOUND",
+    0xC0000139: "STATUS_ENTRYPOINT_NOT_FOUND",
+    0xC0000142: "STATUS_DLL_INIT_FAILED",
+    0xC000015B: "STATUS_LOGON_TYPE_NOT_GRANTED",
+    0xC000018D: "STATUS_TRUST_FAILURE",
+    0xC0000193: "STATUS_ACCOUNT_EXPIRED",
+    0xC000019C: "STATUS_INVALID_ACCOUNT_NAME",
+    0xC0000203: "STATUS_STACK_OVERFLOW",
+    0xC0000234: "STATUS_ACCOUNT_LOCKED_OUT",
+    0xC00002EF: "STATUS_SMB_NO_PREAUTH_INTEGRITY_HASH_OVERLAP",
+    0xC00002FD: "STATUS_SMB_GUEST_LOGON_BLOCKED",
+    0xC000A003: "STATUS_NETWORK_ACCESS_DENIED",
+    0xC000A004: "STATUS_BAD_NETWORK_PATH",
+    0xC000A005: "STATUS_NETWORK_BUSY",
+    0xC000A006: "STATUS_NETWORK_ACCESS_DENIED",
+    0xC000A00D: "STATUS_BAD_NETWORK_NAME",
+}
+
+
+def _parse_smb2_status(payload: bytes) -> Optional[str]:
+    idx = payload.find(b"\xfeSMB")
+    if idx == -1 or len(payload) < idx + 12:
+        return None
+    status = struct.unpack("<I", payload[idx + 8:idx + 12])[0]
+    name = NTSTATUS_MAP.get(status)
+    if name:
+        return f"SMB2_{name}"
+    return f"SMB2_STATUS_0x{status:08X}"
+
+
+def _parse_smb1_status(payload: bytes) -> Optional[str]:
+    idx = payload.find(b"\xffSMB")
+    if idx == -1 or len(payload) < idx + 13:
+        return None
+    status = struct.unpack("<I", payload[idx + 5:idx + 9])[0]
+    name = NTSTATUS_MAP.get(status)
+    if name:
+        return f"SMB1_{name}"
+    return f"SMB1_STATUS_0x{status:08X}"
+
+
+def _parse_smb2_ids(payload: bytes) -> Tuple[Optional[int], Optional[int]]:
+    idx = payload.find(b"\xfeSMB")
+    if idx == -1 or len(payload) < idx + 48:
+        return None, None
+    message_id = struct.unpack("<Q", payload[idx + 24:idx + 32])[0]
+    session_id = struct.unpack("<Q", payload[idx + 40:idx + 48])[0]
+    return int(message_id), int(session_id)
+
+
+def _parse_smb1_ids(payload: bytes) -> Tuple[Optional[int], Optional[int]]:
+    idx = payload.find(b"\xffSMB")
+    if idx == -1 or len(payload) < idx + 32:
+        return None, None
+    uid = struct.unpack("<H", payload[idx + 28:idx + 30])[0]
+    mid = struct.unpack("<H", payload[idx + 30:idx + 32])[0]
+    return int(uid), int(mid)
+
+
+def _parse_http_status(payload: bytes) -> Optional[str]:
+    if not payload.startswith(b"HTTP/"):
+        return None
+    line_end = payload.find(b"\r\n")
+    if line_end == -1:
+        return None
+    try:
+        line = payload[:line_end].decode("latin-1", errors="ignore")
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            return f"HTTP_{parts[1]}"
+    except Exception:
+        return None
+    return None
+
 # --- Helpers ---
 
 def _read_sec_buffer(data: bytes, offset: int) -> Tuple[int, int, int]:
@@ -168,8 +315,21 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
     workstations = Counter()
     
     sessions: List[NtlmSession] = []
+    conversations: Dict[Tuple[str, str, int, int], NtlmConversation] = {}
+    handshake_state: Dict[Tuple[str, str, int, int], Dict[str, Optional[float]]] = defaultdict(lambda: {
+        "negotiate": None,
+        "challenge": None,
+        "authenticate": None,
+    })
     anomalies: List[NtlmAnomaly] = []
+    artifacts: List[NtlmArtifact] = []
     errors: List[str] = []
+    src_counts = Counter()
+    dst_counts = Counter()
+    request_counts = Counter()
+    response_counts = Counter()
+    status_codes = Counter()
+    services = Counter()
 
     start_time = None
     last_time = None
@@ -218,6 +378,36 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                     sport = pkt[UDP].sport
                     dport = pkt[UDP].dport    
 
+                src_counts[src] += 1
+                dst_counts[dst] += 1
+
+                if dport in (445, 139):
+                    services["SMB"] += 1
+                elif dport in (80, 8080, 8000):
+                    services["HTTP"] += 1
+                elif dport in (389, 636):
+                    services["LDAP"] += 1
+                elif dport in (5985, 5986):
+                    services["WinRM"] += 1
+
+                smb2_msg, smb2_sess = _parse_smb2_ids(payload)
+                smb1_uid, smb1_mid = _parse_smb1_ids(payload)
+                if smb2_msg is not None or smb2_sess is not None:
+                    convo_key = (src, dst, int(sport), int(dport), smb2_sess, smb2_msg)
+                elif smb1_uid is not None or smb1_mid is not None:
+                    convo_key = (src, dst, int(sport), int(dport), smb1_uid, smb1_mid)
+                else:
+                    convo_key = (src, dst, int(sport), int(dport))
+                convo = conversations.get(convo_key)
+                if convo is None:
+                    convo = NtlmConversation(src_ip=src, dst_ip=dst, src_port=int(sport), dst_port=int(dport))
+                    conversations[convo_key] = convo
+                convo.packets += 1
+                if convo.first_seen is None or (ts is not None and ts < convo.first_seen):
+                    convo.first_seen = ts
+                if convo.last_seen is None or (ts is not None and ts > convo.last_seen):
+                    convo.last_seen = ts
+
                 if msg_type == MSG_TYPE_AUTHENTICATE:
                     # Message Type 3
                     # Sig(8), Type(4), LmResp(8), NtResp(8), Domain(8), User(8), Workstation(8), SessionKey(8), Flags(4)
@@ -265,14 +455,54 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                         username=user, domain=domain, workstation=workstation, 
                         version=ver, message_type="Authenticate", ts=ts
                     ))
+
+                    request_counts["Authenticate"] += 1
+                    convo.requests += 1
+                    convo.messages["Authenticate"] += 1
+                    handshake_state[convo_key]["authenticate"] = ts
+                    if handshake_state[convo_key]["negotiate"] or handshake_state[convo_key]["challenge"]:
+                        artifacts.append(NtlmArtifact(
+                            value=f"{src}->{dst}",
+                            description="NTLM handshake completed (Type1/2/3)"
+                        ))
+                    status = _parse_smb2_status(payload) or _parse_smb1_status(payload) or _parse_http_status(payload)
+                    if status:
+                        status_codes[status] += 1
                     
                 elif msg_type == MSG_TYPE_CHALLENGE:
                      # Message Type 2 (Server Challenge)
-                     pass
+                     response_counts["Challenge"] += 1
+                     convo.responses += 1
+                     convo.messages["Challenge"] += 1
+                     handshake_state[convo_key]["challenge"] = ts
+                     if len(ntlm_data) >= 32:
+                         target_name_len = struct.unpack("<H", ntlm_data[12:14])[0]
+                         target_name_off = struct.unpack("<I", ntlm_data[16:20])[0]
+                         if target_name_len and target_name_off + target_name_len <= len(ntlm_data):
+                             target_name = ntlm_data[target_name_off:target_name_off + target_name_len].decode("utf-16le", errors="ignore")
+                             artifacts.append(NtlmArtifact(value=target_name, description="NTLM Target Name"))
+                     if len(ntlm_data) >= 20:
+                         flags = struct.unpack("<I", ntlm_data[20:24])[0]
+                         if flags & NTLMSSP_NEGOTIATE_NTLM:
+                             versions["NTLMv1"] += 1
+                         if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+                             artifacts.append(NtlmArtifact(value="Extended Session Security", description="NTLM Challenge Flag"))
+                     status = _parse_smb2_status(payload) or _parse_smb1_status(payload) or _parse_http_status(payload)
+                     if status:
+                         status_codes[status] += 1
                      
                 elif msg_type == MSG_TYPE_NEGOTIATE:
                      # Message Type 1
-                     pass
+                     request_counts["Negotiate"] += 1
+                     convo.requests += 1
+                     convo.messages["Negotiate"] += 1
+                     handshake_state[convo_key]["negotiate"] = ts
+                     if len(ntlm_data) >= 16:
+                         flags = struct.unpack("<I", ntlm_data[12:16])[0]
+                         if flags & NTLMSSP_NEGOTIATE_NTLM:
+                             versions["NTLMv1"] += 1
+                         if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+                             artifacts.append(NtlmArtifact(value="Extended Session Security", description="NTLM Negotiate Flag"))
 
             except Exception:
                 pass
@@ -297,6 +527,14 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
         raw_domains=domains,
         raw_workstations=workstations,
         sessions=sessions,
+        conversations=list(conversations.values()),
+        request_counts=request_counts,
+        response_counts=response_counts,
+        status_codes=status_codes,
+        src_counts=src_counts,
+        dst_counts=dst_counts,
+        services=services,
+        artifacts=artifacts,
         anomalies=anomalies,
         errors=errors
     )

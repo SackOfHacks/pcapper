@@ -519,9 +519,13 @@ class FileExtractor:
         self.ntlm_destinations: Counter[str] = Counter()
         self.http_ntlm_sources: Counter[str] = Counter()
         self.http_ntlm_destinations: Counter[str] = Counter()
+        self.smb1_sources: Counter[str] = Counter()
+        self.smb1_destinations: Counter[str] = Counter()
         self.flows: Dict[Tuple[str, str, str, int, int], Dict[str, Any]] = defaultdict(lambda: {
             "packets": 0, "bytes": 0, "first_seen": None, "last_seen": None
         })
+        self.smb_encrypted: Counter[str] = Counter()
+        self.smb_signed: Counter[str] = Counter()
 
     def process_packet(self, pkt: Packet, idx: int):
         # IP/IPv6
@@ -543,11 +547,17 @@ class FileExtractor:
             tcp = pkt[TCP]
             proto = "TCP"
             sport, dport = int(tcp.sport), int(tcp.dport)
+            payload = b""
             if Raw in pkt:
                 payload = bytes(pkt[Raw])
-                if payload:
-                    seq = int(tcp.seq)
-                    self.tcp_streams[(src, dst, sport, dport)].append((seq, payload, idx))
+            else:
+                try:
+                    payload = bytes(tcp.payload)
+                except Exception:
+                    payload = b""
+            if payload:
+                seq = int(tcp.seq)
+                self.tcp_streams[(src, dst, sport, dport)].append((seq, payload, idx))
 
         elif UDP and pkt.haslayer(UDP):
             udp = pkt[UDP]
@@ -748,6 +758,8 @@ class FileExtractor:
                     "summary": "SMBv1 detected",
                     "details": "Legacy SMBv1 traffic observed; susceptible to known exploits.",
                     "source": "Files",
+                    "top_sources": self.smb1_sources.most_common(5),
+                    "top_destinations": self.smb1_destinations.most_common(5),
                 })
 
         if self.netbios_sources or self.netbios_destinations:
@@ -780,6 +792,23 @@ class FileExtractor:
                 "source": "Files",
                 "top_sources": self.http_ntlm_sources.most_common(5),
                 "top_destinations": self.http_ntlm_destinations.most_common(5),
+            })
+
+        if self.smb_encrypted:
+            self.detections.append({
+                "severity": "info",
+                "summary": "SMB encryption observed",
+                "details": "SMB3 encrypted sessions can hide filenames and payloads.",
+                "source": "Files",
+                "top_sources": self.smb_encrypted.most_common(5),
+            })
+        if self.smb_signed:
+            self.detections.append({
+                "severity": "info",
+                "summary": "SMB signing observed",
+                "details": "SMB signing is enabled on observed sessions.",
+                "source": "Files",
+                "top_sources": self.smb_signed.most_common(5),
             })
 
 
@@ -892,8 +921,16 @@ class FileExtractor:
                     self.ntlm_destinations[dst] += 1
                 if domain:
                     self.ntlm_domains[domain] += 1
+                if len(record) >= 20:
+                    flags = int.from_bytes(record[16:20], "little")
+                    if flags & 0x00000008:
+                        self.smb_signed[src] += 1
+                    if flags & 0x00004000:
+                        self.smb_encrypted[src] += 1
             elif record.startswith(b"\xffSMB"):
                 self.smb_versions["SMB1"] += 1
+                self.smb1_sources[src] += 1
+                self.smb1_destinations[dst] += 1
                 filename = _extract_smb1_filename(record)
                 if filename:
                     self.artifacts.append(FileArtifact(

@@ -29,6 +29,9 @@ from .reporting import (
     render_sizes_summary,
     render_nfs_summary,
     render_strings_summary,
+    render_certificates_summary,
+    render_health_summary,
+    render_timeline_summary,
 )
 from .vlan import analyze_vlans
 from .icmp import analyze_icmp
@@ -48,6 +51,9 @@ from .http import analyze_http
 from .sizes import analyze_sizes
 from .nfs import analyze_nfs
 from .strings import analyze_strings
+from .certificates import analyze_certificates
+from .health import analyze_health
+from .timeline import analyze_timeline
 
 
 def _build_banner() -> str:
@@ -169,6 +175,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include cleartext strings extraction and anomaly analysis.",
     )
     parser.add_argument(
+        "--certificates",
+        action="store_true",
+        help="Include TLS certificate extraction and analysis.",
+    )
+    parser.add_argument(
+        "--timeline",
+        action="store_true",
+        help="Include a threat-hunting timeline for a specific IP (use with -ip).",
+    )
+    parser.add_argument(
+        "-ip",
+        dest="timeline_ip",
+        help="Target IP for timeline analysis (use with --timeline).",
+    )
+    parser.add_argument(
+        "--health",
+        action="store_true",
+        help="Include overall traffic health assessment (retransmissions, TTL, QoS, SNMP, certs).",
+    )
+    parser.add_argument(
         "--ntlm",
         action="store_true",
         help="Include NTLM authentication analysis (Users, Domains, Versions).",
@@ -229,6 +255,10 @@ def _analyze_paths(
     show_smb: bool,
     show_nfs: bool,
     show_strings: bool,
+    show_certificates: bool,
+    show_health: bool,
+    show_timeline: bool,
+    timeline_ip: str | None,
     show_ntlm: bool,
     show_netbios: bool,
     show_modbus: bool,
@@ -285,6 +315,15 @@ def _analyze_paths(
         if show_strings:
             strings_summary = analyze_strings(path, show_status=show_status)
             print(render_strings_summary(strings_summary))
+        if show_certificates:
+            cert_summary = analyze_certificates(path, show_status=show_status)
+            print(render_certificates_summary(cert_summary))
+        if show_health:
+            health_summary = analyze_health(path, show_status=show_status)
+            print(render_health_summary(health_summary))
+        if show_timeline and timeline_ip:
+            timeline_summary = analyze_timeline(path, timeline_ip, show_status=show_status)
+            print(render_timeline_summary(timeline_summary))
         if show_ntlm:
             ntlm_summary = analyze_ntlm(path, show_status=show_status)
             print(render_ntlm_summary(ntlm_summary))
@@ -315,6 +354,10 @@ def main() -> int:
     if args.no_color:
         set_color_override(False)
 
+    if args.timeline and not args.timeline_ip:
+        print("Timeline analysis requires a target IP. Use -ip <address> with --timeline.")
+        return 2
+
     target: Path = args.target
     if not target.exists():
         print(f"Target not found: {target}")
@@ -342,6 +385,10 @@ def main() -> int:
             show_smb=args.smb,
             show_nfs=args.nfs,
             show_strings=args.strings,
+            show_certificates=args.certificates,
+            show_health=args.health,
+            show_timeline=args.timeline,
+            timeline_ip=args.timeline_ip,
             show_ntlm=args.ntlm,
             show_netbios=args.netbios,
             show_modbus=args.modbus,
@@ -374,6 +421,10 @@ def main() -> int:
         show_smb=args.smb,
         show_nfs=args.nfs,
         show_strings=args.strings,
+        show_certificates=args.certificates,
+        show_health=args.health,
+        show_timeline=args.timeline,
+        timeline_ip=args.timeline_ip,
         show_ntlm=args.ntlm,
         show_netbios=args.netbios,
         show_modbus=args.modbus,

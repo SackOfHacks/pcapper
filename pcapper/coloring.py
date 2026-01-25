@@ -70,6 +70,10 @@ def danger(text: str, enabled: bool | None = None) -> str:
     return colorize(text, ANSI_RED, enabled, bold=True)
 
 
+def orange(text: str, enabled: bool | None = None) -> str:
+    return colorize(text, ANSI_YELLOW, enabled, bold=True)
+
+
 def muted(text: str, enabled: bool | None = None) -> str:
     return colorize(text, ANSI_WHITE, enabled, dim=True)
 
