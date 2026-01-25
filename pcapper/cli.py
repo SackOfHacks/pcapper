@@ -32,6 +32,8 @@ from .reporting import (
     render_certificates_summary,
     render_health_summary,
     render_timeline_summary,
+    render_domain_summary,
+    render_ldap_summary,
 )
 from .vlan import analyze_vlans
 from .icmp import analyze_icmp
@@ -54,6 +56,8 @@ from .strings import analyze_strings
 from .certificates import analyze_certificates
 from .health import analyze_health
 from .timeline import analyze_timeline
+from .domain import analyze_domain
+from .ldap import analyze_ldap
 
 
 def _build_banner() -> str:
@@ -185,6 +189,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include a threat-hunting timeline for a specific IP (use with -ip).",
     )
     parser.add_argument(
+        "--domain",
+        action="store_true",
+        help="Include MS AD and domain analysis (services, users, DCs, artifacts).",
+    )
+    parser.add_argument(
+        "--ldap",
+        action="store_true",
+        help="Include LDAP analysis (queries, users, servers, anomalies, secrets).",
+    )
+    parser.add_argument(
         "-ip",
         dest="timeline_ip",
         help="Target IP for timeline analysis (use with --timeline).",
@@ -266,6 +280,8 @@ def _analyze_paths(
     verbose: bool,
     extract_name: str | None,
     view_name: str | None,
+    show_domain: bool,
+    show_ldap: bool,
 ) -> int:
     if not paths:
         return 1
@@ -298,7 +314,13 @@ def _analyze_paths(
             threat_summary = analyze_threats(path, show_status=show_status)
             print(render_threats_summary(threat_summary))
         if show_files:
-            files_summary = analyze_files(path, extract_name=extract_name, view_name=view_name, show_status=show_status)
+            files_summary = analyze_files(
+                path,
+                extract_name=extract_name,
+                view_name=view_name,
+                show_status=show_status,
+                include_x509=verbose,
+            )
             print(render_files_summary(files_summary))
         if show_protocols:
             proto_summary = analyze_protocols(path, show_status=show_status)
@@ -324,6 +346,12 @@ def _analyze_paths(
         if show_timeline and timeline_ip:
             timeline_summary = analyze_timeline(path, timeline_ip, show_status=show_status)
             print(render_timeline_summary(timeline_summary))
+        if show_domain:
+            domain_summary = analyze_domain(path, show_status=show_status)
+            print(render_domain_summary(domain_summary))
+        if show_ldap:
+            ldap_summary = analyze_ldap(path, show_status=show_status)
+            print(render_ldap_summary(ldap_summary))
         if show_ntlm:
             ntlm_summary = analyze_ntlm(path, show_status=show_status)
             print(render_ntlm_summary(ntlm_summary))
@@ -396,6 +424,8 @@ def main() -> int:
             verbose=args.verbose,
             extract_name=args.extract,
             view_name=args.view,
+            show_domain=args.domain,
+            show_ldap=args.ldap,
         )
 
     paths = find_pcaps(target, recursive=args.recursive)
@@ -432,4 +462,6 @@ def main() -> int:
         verbose=args.verbose,
         extract_name=args.extract,
         view_name=args.view,
+        show_domain=args.domain,
+        show_ldap=args.ldap,
     )

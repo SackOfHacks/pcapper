@@ -1,1 +1,4 @@
 scapy>=2.5.0
+dpkt>=1.9.8
+pydicom>=2.4.4
+cryptography>=42.0.0

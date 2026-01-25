@@ -59,16 +59,26 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
 
     smb1_sources: Counter[str] = Counter()
     smb1_destinations: Counter[str] = Counter()
+    smb1_detected = False
     for item in files_summary.detections:
         detections.append({
             "source": "Files",
             **item,
         })
         if str(item.get("summary", "")).lower().startswith("smbv1 detected"):
+            smb1_detected = True
             for ip, count in item.get("top_sources", []) or []:
                 smb1_sources[ip] += count
             for ip, count in item.get("top_destinations", []) or []:
                 smb1_destinations[ip] += count
+
+    for art in files_summary.artifacts:
+        if str(getattr(art, "protocol", "")).upper() == "SMB1":
+            smb1_detected = True
+            if art.src_ip:
+                smb1_sources[art.src_ip] += 1
+            if art.dst_ip:
+                smb1_destinations[art.dst_ip] += 1
 
     if beacon_summary.candidates:
         for candidate in beacon_summary.candidates[:10]:
@@ -165,7 +175,7 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
                 "details": f"{item['protocol']} {item['filename']} ({item['file_type']}) {item['src']} -> {item['dst']}",
             })
 
-    if smb1_sources or smb1_destinations:
+    if smb1_detected:
         detections.append({
             "source": "Files",
             "severity": "critical",

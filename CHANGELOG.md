@@ -4,6 +4,14 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 0.4.0 — 2026-01-24
+### Added
+- LDAP analysis module with conversations, queries, users, systems, secrets, and anomalies.
+- Enhanced domain analysis with discovered domains, credentials, and service naming.
+
+### Changed
+- Reporting improvements across LDAP/Domain summaries for threat-hunting context.
+
 ## 0.3.0 — 2026-01-24
 ### Added
 - Clearer public-facing documentation and guidance to help new users get started.

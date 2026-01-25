@@ -15,7 +15,7 @@ from .beacon import BeaconSummary
 from .threats import ThreatSummary
 from .files import FileTransferSummary
 from .protocols import ProtocolSummary
-from .services import ServiceSummary
+from .services import ServiceSummary, COMMON_PORTS
 from .smb import SmbSummary
 from .nfs import NfsSummary
 from .strings import StringsSummary
@@ -193,6 +193,352 @@ def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = F
             if top_destinations:
                 dst_text = ", ".join(f"{ip}({count})" for ip, count in top_destinations)
                 lines.append(muted(f"  Destinations: {dst_text}"))
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+def render_domain_summary(summary: "DomainAnalysis", limit: int = 25) -> str:
+    from .domain import DomainAnalysis
+
+    if not summary:
+        return ""
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"MS AD & DOMAIN ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Duration", f"{summary.duration:.2f}s"))
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
+
+    if summary.domains:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Domain Names"))
+        rows = [["Domain", "Count"]]
+        for name, count in summary.domains.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.dc_hosts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Domain Controllers (NetBIOS/DNS)"))
+        rows = [["IP", "Count"]]
+        for ip, count in summary.dc_hosts.most_common(limit):
+            rows.append([ip, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.service_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Domain Services"))
+        rows = [["Service", "Name", "Count"]]
+        for svc, count in summary.service_counts.most_common(limit):
+            svc_name = "-"
+            try:
+                _proto, port_str = svc.split("/", 1)
+                port = int(port_str)
+                svc_name = COMMON_PORTS.get(port, "-")
+            except Exception:
+                svc_name = "-"
+            rows.append([svc, svc_name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.servers or summary.clients:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Domain Servers & Clients"))
+        rows = [["Servers", "Clients"]]
+        server_text = ", ".join(f"{ip}({count})" for ip, count in summary.servers.most_common(10)) or "-"
+        client_text = ", ".join(f"{ip}({count})" for ip, count in summary.clients.most_common(10)) or "-"
+        rows.append([server_text, client_text])
+        lines.append(_format_table(rows))
+
+    if summary.conversations:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Domain Conversations"))
+        rows = [["Src", "Dst", "Port", "Proto", "Packets"]]
+        for convo in summary.conversations[:limit]:
+            rows.append([convo.src_ip, convo.dst_ip, str(convo.dst_port), convo.proto, str(convo.packets)])
+        lines.append(_format_table(rows))
+
+    if summary.urls:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed URLs"))
+        rows = [["URL", "Count"]]
+        for url, count in summary.urls.most_common(limit):
+            rows.append([url, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.user_agents:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed User Agents"))
+        rows = [["User Agent", "Count"]]
+        for ua, count in summary.user_agents.most_common(limit):
+            rows.append([ua, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.users:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Users"))
+        rows = [["User", "Count"]]
+        for user, count in summary.users.most_common(limit):
+            rows.append([user, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.credentials:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Credentials"))
+        rows = [["Credential", "Count"]]
+        for cred, count in summary.credentials.most_common(limit):
+            rows.append([cred, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.computer_names:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Computer Names"))
+        rows = [["Computer", "Count"]]
+        for name, count in summary.computer_names.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.response_codes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Response Codes"))
+        rows = [["Code", "Count"]]
+        for code, count in summary.response_codes.most_common(limit):
+            rows.append([code, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.request_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Request Summary"))
+        rows = [["Request", "Count"]]
+        for name, count in summary.request_counts.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.files:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Files Discovered"))
+        for name in summary.files[:limit]:
+            lines.append(f"- {name}")
+
+    if summary.anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies"))
+        for item in summary.anomalies[:limit]:
+            lines.append(warn(f"- {item}"))
+
+    if summary.detections:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Detections"))
+        for item in summary.detections:
+            severity = item.get("severity", "info")
+            summary_text = str(item.get("summary", ""))
+            details = str(item.get("details", ""))
+            if severity == "warning":
+                marker = warn("[WARN]")
+            elif severity == "critical":
+                marker = danger("[CRIT]")
+            else:
+                marker = ok("[INFO]")
+            lines.append(f"{marker} {summary_text}")
+            if details:
+                lines.append(muted(f"  {details}"))
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
+def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25) -> str:
+    from .ldap import LdapAnalysis
+
+    if not summary:
+        return ""
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"LDAP ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Duration", f"{summary.duration:.2f}s"))
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
+    if summary.session_stats:
+        lines.append(_format_kv("LDAP Sessions", str(summary.session_stats.get("total_sessions", 0))))
+        lines.append(_format_kv("Unique Clients", str(summary.session_stats.get("unique_clients", 0))))
+        lines.append(_format_kv("Unique Servers", str(summary.session_stats.get("unique_servers", 0))))
+
+    if summary.ldap_domains:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("LDAP-Related DNS"))
+        rows = [["Domain", "Count"]]
+        for name, count in summary.ldap_domains.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.servers or summary.clients:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top LDAP Servers & Clients"))
+        rows = [["Servers", "Clients"]]
+        server_text = ", ".join(f"{ip}({count})" for ip, count in summary.servers.most_common(10)) or "-"
+        client_text = ", ".join(f"{ip}({count})" for ip, count in summary.clients.most_common(10)) or "-"
+        rows.append([server_text, client_text])
+        lines.append(_format_table(rows))
+
+    if summary.service_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("LDAP Service Ports"))
+        rows = [["Service", "Name", "Count"]]
+        for svc, count in summary.service_counts.most_common(limit):
+            svc_name = "-"
+            try:
+                _proto, port_str = svc.split("/", 1)
+                port = int(port_str)
+                svc_name = COMMON_PORTS.get(port, "-")
+            except Exception:
+                svc_name = "-"
+            rows.append([svc, svc_name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.conversations:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("LDAP Conversations"))
+        rows = [["Src", "Dst", "Port", "Proto", "Packets"]]
+        for convo in summary.conversations[:limit]:
+            rows.append([convo.src_ip, convo.dst_ip, str(convo.dst_port), convo.proto, str(convo.packets)])
+        lines.append(_format_table(rows))
+
+    if summary.ldap_queries:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("LDAP Queries"))
+        rows = [["Query", "Count"]]
+        for query, count in summary.ldap_queries.most_common(limit):
+            rows.append([query, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.ldap_users:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("LDAP Users"))
+        rows = [["User", "Count"]]
+        for user, count in summary.ldap_users.most_common(limit):
+            rows.append([user, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.ldap_domains:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("LDAP Domains"))
+        rows = [["Domain", "Count"]]
+        for name, count in summary.ldap_domains.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.ldap_systems:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("LDAP Systems"))
+        rows = [["System", "Count"]]
+        for system, count in summary.ldap_systems.most_common(limit):
+            rows.append([system, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.urls:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed URLs"))
+        rows = [["URL", "Count"]]
+        for url, count in summary.urls.most_common(limit):
+            rows.append([url, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.user_agents:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed User Agents"))
+        rows = [["User Agent", "Count"]]
+        for ua, count in summary.user_agents.most_common(limit):
+            rows.append([ua, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.http_methods:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Request Summary"))
+        rows = [["Method", "Count"]]
+        for name, count in summary.http_methods.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.http_clients:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Clients"))
+        rows = [["Client", "Count"]]
+        for client, count in summary.http_clients.most_common(limit):
+            rows.append([client, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.response_codes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("LDAP Response Codes"))
+        rows = [["Code", "Count"]]
+        for code, count in summary.response_codes.most_common(limit):
+            rows.append([code, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.request_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("LDAP Requests"))
+        rows = [["Request", "Count"]]
+        for name, count in summary.request_counts.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.secrets:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Secrets/Passwords"))
+        rows = [["Value", "Count"]]
+        for secret, count in summary.secrets.most_common(limit):
+            rows.append([secret, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.files:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Files Discovered"))
+        for name in summary.files[:limit]:
+            lines.append(f"- {name}")
+
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts"))
+        lines.append(muted(", ".join(summary.artifacts[:limit])))
+
+    if summary.anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies"))
+        for item in summary.anomalies[:limit]:
+            lines.append(warn(f"- {item}"))
+
+    if summary.detections:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Detections"))
+        for item in summary.detections:
+            severity = item.get("severity", "info")
+            summary_text = str(item.get("summary", ""))
+            details = str(item.get("details", ""))
+            if severity == "warning":
+                marker = warn("[WARN]")
+            elif severity == "critical":
+                marker = danger("[CRIT]")
+            else:
+                marker = ok("[INFO]")
+            lines.append(f"{marker} {summary_text}")
+            if details:
+                lines.append(muted(f"  {details}"))
 
     lines.append(SECTION_BAR)
     return "\n".join(lines)
@@ -1445,7 +1791,7 @@ def render_threats_summary(summary: ThreatSummary) -> str:
     return "\n".join(lines)
 
 
-def render_files_summary(summary: FileTransferSummary, limit: int = 15) -> str:
+def render_files_summary(summary: FileTransferSummary, limit: int | None = None) -> str:
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"FILES OVERVIEW :: {summary.path.name}"))
@@ -1459,11 +1805,13 @@ def render_files_summary(summary: FileTransferSummary, limit: int = 15) -> str:
         for err in summary.errors:
             lines.append(danger(f"- {err}"))
 
+    effective_limit = limit if limit is not None else max(len(summary.candidates), len(summary.artifacts), 0)
+
     if summary.candidates:
         lines.append(SUBSECTION_BAR)
         lines.append(header("File Transfer Candidates"))
         rows = [["Protocol", "Src", "Dst", "Ports", "Packets", "Bytes", "Note"]]
-        for item in summary.candidates[:limit]:
+        for item in summary.candidates[:effective_limit]:
             ports = "-"
             if item.src_port is not None and item.dst_port is not None:
                 ports = f"{item.src_port}->{item.dst_port}"
@@ -1484,7 +1832,7 @@ def render_files_summary(summary: FileTransferSummary, limit: int = 15) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Discovered Files"))
         rows = [["Protocol", "Filename", "Type", "Size", "Packet", "Src", "Dst", "Note"]]
-        for item in summary.artifacts[:limit]:
+        for item in summary.artifacts[:effective_limit]:
             size = format_bytes_as_mb(item.size_bytes) if item.size_bytes is not None else "-"
             # Fallback for old artifacts without file_type
             ftype = getattr(item, "file_type", "UNKNOWN")
