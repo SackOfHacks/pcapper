@@ -126,6 +126,7 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
         for pkt in reader:
             src: Optional[str] = None
             dst: Optional[str] = None
+            ts = safe_float(getattr(pkt, "time", None))
             if stream is not None and size_bytes:
                 try:
                     pos = stream.tell()
@@ -349,7 +350,6 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                 except Exception:
                     pass
 
-            ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:
                 if first_seen is None or ts < first_seen:
                     first_seen = ts
