@@ -16,7 +16,7 @@ try:
 except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
 
-from .progress import build_statusbar
+from .pcap_cache import get_reader
 from .utils import detect_file_type, safe_float
 
 # --- Dataclasses ---
@@ -122,25 +122,13 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
     if IP is None:
          return ServiceSummary(path, 0, [], [], {}, ["Scapy unavailable"])
 
-    ftype = detect_file_type(path)
     try:
-        reader = PcapNgReader(str(path)) if ftype == "pcapng" else PcapReader(str(path))
-    except Exception as e:
+        reader, status, stream, size_bytes, _file_type = get_reader(
+            path, show_status=show_status
+        )
+    except Exception as exc:
         return ServiceSummary(path, 0, [], [], {}, [f"Error: {e}"])
-
-    size_bytes = 0
-    try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        pass
-        
-    status = build_statusbar(path, enabled=show_status)
-    stream = None
-    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-        candidate = getattr(reader, attr, None)
-        if candidate is not None:
-            stream = candidate
-            break
+    size_bytes = size_bytes
 
     # Map: (IP, Port, Proto) -> ServiceAsset
     services: Dict[Tuple[str, int, str], ServiceAsset] = {}

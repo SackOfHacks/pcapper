@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import base64
 import hashlib
 import struct
 import gzip
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any, Set
 from urllib.parse import unquote
 
-from scapy.utils import PcapReader, PcapNgReader
+from .pcap_cache import get_cached_packets, get_reader
 from scapy.packet import Raw, Packet
 
 try:
@@ -25,8 +26,7 @@ try:
 except Exception:  # pragma: no cover
     dpkt = None
 
-from .progress import build_statusbar
-from .utils import safe_float, detect_file_type, detect_file_type_bytes
+from .utils import safe_float, detect_file_type_bytes
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
@@ -75,6 +75,18 @@ class FileTransferSummary:
     errors: List[str]
 
 # --- Helper Functions ---
+
+FILE_TRANSFER_PROTOCOLS = {
+    "HTTP",
+    "HTTPS/SSL",
+    "FTP",
+    "TFTP",
+    "SMB",
+    "IMAP",
+    "POP3",
+    "SMTP",
+    "NFS",
+}
 
 def _flow_protocol(sport: Optional[int], dport: Optional[int]) -> str:
     ports = set(filter(None, [sport, dport]))
@@ -810,6 +822,9 @@ class FileExtractor:
             
             # Determine protocol
             proto = _flow_protocol(sp, dp)
+
+            if proto not in FILE_TRANSFER_PROTOCOLS:
+                continue
             
             self.candidates.append(FileTransfer(
                 protocol=proto, src_ip=s, dst_ip=d, src_port=sp, dst_port=dp,
@@ -958,6 +973,11 @@ class FileExtractor:
                         match = re.search(r'filename=["\']?([^"\';]+)["\']?', disp, re.IGNORECASE)
                         if match:
                             fname = match.group(1)
+
+                if fname == "http_response.bin":
+                    content_location = m["headers"].get("content-location", "")
+                    if content_location:
+                        fname = content_location
                 
                 # Check pending names (Sync logic: Consume regardless of body size/existence to keep order)
                 if fname == "http_response.bin" and pending_names:
@@ -968,18 +988,34 @@ class FileExtractor:
 
                 # Determine File Type (Early)
                 ft = detect_file_type_bytes(body)
-                if fname == "http_response.bin" and ft != "UNKNOWN":
+                content_type = m["headers"].get("content-type", "")
+
+                if fname == "http_response.bin":
+                    ext = _guess_extension_from_content_type(content_type)
+                    if ext:
+                        fname = f"http_{idx}.{ext}"
+
+                if fname == "http_response.bin":
+                    host = m["headers"].get("host", "")
+                    req = m.get("request_line") or m.get("start_line", "")
+                    candidate = _extract_request_filename(req, host)
+                    if candidate:
+                        fname = candidate
+
+                if fname == "http_response.bin" and ft not in ("UNKNOWN", "BINARY"):
                     ext = ft.lower().split("/")[0]
                     fname = f"extracted_{ext}.bin"
+
+                fname = _append_extension_if_missing(fname, content_type)
+
+                if fname == "http_response.bin":
+                    fname = f"http_{idx}.bin"
 
                 # Check Size - Filter out noise unless we have a specific filename or valid type
                 is_specific_name = fname != "http_response.bin" and not fname.startswith("extracted_")
                 
                 if len(body) < 16 and not is_specific_name:
-                    # Allow tiny magic-detected files? (e.g. tiny gif)
-                    # If it has a detected type (not UNKNOWN), maybe keep it?
-                    if ft == "UNKNOWN":
-                        continue
+                    pass
 
                 # Fix for Procmon or other PEs inside HTTP (Size > 1MB usually)
                 # But keep check small for speed, just header signature
@@ -1247,102 +1283,133 @@ def _extract_der_blobs(data: bytes) -> List[bytes]:
     return blobs
 
 
+def _normalize_x509_payload(payload: bytes) -> bytes:
+    if not payload:
+        return b""
+    if b"BEGIN CERTIFICATE" in payload:
+        try:
+            text = payload.decode("ascii", errors="ignore")
+            lines = [line.strip() for line in text.splitlines()]
+            b64_lines = []
+            in_cert = False
+            for line in lines:
+                if "BEGIN CERTIFICATE" in line:
+                    in_cert = True
+                    continue
+                if "END CERTIFICATE" in line:
+                    break
+                if in_cert:
+                    b64_lines.append(line)
+            if b64_lines:
+                return base64.b64decode("".join(b64_lines), validate=False)
+        except Exception:
+            return payload
+    return payload
+
+
 def _export_with_dpkt(
     path: Path,
     extract_name: Optional[str],
     output_dir: Optional[Path],
     view_name: Optional[str],
     show_status: bool,
+    packets: Optional[List[Packet]] = None,
 ) -> Optional[FileTransferSummary]:
-    if dpkt is None:
-        return None
-
     artifacts: List[FileArtifact] = []
     extracted_paths: List[Path] = []
     views: List[Any] = []
     detections: List[Dict[str, str]] = []
     errors: List[str] = []
     need_payload = bool(extract_name or view_name)
-    seen_artifacts: Set[Tuple[str, str, str, str, int]] = set()
-
-    def _artifact_key(artifact: FileArtifact) -> Tuple[str, str, str, str, int]:
-        payload = artifact.payload or b""
-        digest = hashlib.md5(payload).hexdigest() if payload else ""
-        return (
-            artifact.protocol,
-            artifact.filename,
-            artifact.src_ip,
-            artifact.dst_ip,
-            len(payload),
-        ) if digest == "" else (
-            artifact.protocol,
-            artifact.filename,
-            artifact.src_ip,
-            artifact.dst_ip,
-            int(digest[:8], 16),
-        )
+    seen_x509: set[str] = set()
+    seen_x509_meta: set[tuple[str, str, str, int]] = set()
 
     def _add_artifact(artifact: FileArtifact) -> None:
-        key = _artifact_key(artifact)
-        if key in seen_artifacts:
-            return
-        seen_artifacts.add(key)
         artifacts.append(artifact)
 
     tcp_streams: Dict[Tuple[str, str, int, int], List[Tuple[int, bytes, int]]] = defaultdict(list)
     udp_packets: List[Tuple[str, str, int, int, bytes, int]] = []
 
-    try:
-        with path.open("rb") as handle:
-            try:
-                reader = dpkt.pcapng.Reader(handle)
-                packets = list(reader)
-            except Exception:
-                handle.seek(0)
-                reader = dpkt.pcap.Reader(handle)
-                packets = list(reader)
-    except Exception as exc:
-        return FileTransferSummary(path, 0, [], [], [], [], [], [str(exc)])
-
-    idx = 0
-    for ts, buf in packets:
-        idx += 1
-        ip = None
+    if packets is None:
+        if dpkt is None:
+            return None
         try:
-            eth = dpkt.ethernet.Ethernet(buf)
-            if isinstance(eth.data, dpkt.ip.IP) or isinstance(eth.data, dpkt.ip6.IP6):
-                ip = eth.data
-        except Exception:
-            ip = None
-
-        if ip is None:
-            try:
-                ip = dpkt.ip.IP(buf)
-            except Exception:
+            with path.open("rb") as handle:
                 try:
-                    ip = dpkt.ip6.IP6(buf)
+                    reader = dpkt.pcapng.Reader(handle)
+                    packets = list(reader)
                 except Exception:
-                    continue
+                    handle.seek(0)
+                    reader = dpkt.pcap.Reader(handle)
+                    packets = list(reader)
+        except Exception as exc:
+            return FileTransferSummary(path, 0, [], [], [], [], [], [str(exc)])
 
-        if isinstance(ip, dpkt.ip.IP):
-            src_ip = _dpkt_ip_to_str(ip.src)
-            dst_ip = _dpkt_ip_to_str(ip.dst)
-        elif isinstance(ip, dpkt.ip6.IP6):
-            src_ip = _dpkt_ip_to_str(ip.src)
-            dst_ip = _dpkt_ip_to_str(ip.dst)
-        else:
-            continue
+        idx = 0
+        for ts, buf in packets:
+            idx += 1
+            ip = None
+            try:
+                eth = dpkt.ethernet.Ethernet(buf)
+                if isinstance(eth.data, dpkt.ip.IP) or isinstance(eth.data, dpkt.ip6.IP6):
+                    ip = eth.data
+            except Exception:
+                ip = None
 
-        if isinstance(ip.data, dpkt.tcp.TCP):
-            tcp = ip.data
-            payload = bytes(tcp.data or b"")
-            if payload:
-                tcp_streams[(src_ip, dst_ip, int(tcp.sport), int(tcp.dport))].append((int(tcp.seq), payload, idx))
-        elif isinstance(ip.data, dpkt.udp.UDP):
-            udp = ip.data
-            payload = bytes(udp.data or b"")
-            if payload:
-                udp_packets.append((src_ip, dst_ip, int(udp.sport), int(udp.dport), payload, idx))
+            if ip is None:
+                try:
+                    ip = dpkt.ip.IP(buf)
+                except Exception:
+                    try:
+                        ip = dpkt.ip6.IP6(buf)
+                    except Exception:
+                        continue
+
+            if isinstance(ip, dpkt.ip.IP):
+                src_ip = _dpkt_ip_to_str(ip.src)
+                dst_ip = _dpkt_ip_to_str(ip.dst)
+            elif isinstance(ip, dpkt.ip6.IP6):
+                src_ip = _dpkt_ip_to_str(ip.src)
+                dst_ip = _dpkt_ip_to_str(ip.dst)
+            else:
+                continue
+
+            if isinstance(ip.data, dpkt.tcp.TCP):
+                tcp = ip.data
+                payload = bytes(tcp.data or b"")
+                if payload:
+                    tcp_streams[(src_ip, dst_ip, int(tcp.sport), int(tcp.dport))].append((int(tcp.seq), payload, idx))
+            elif isinstance(ip.data, dpkt.udp.UDP):
+                udp = ip.data
+                payload = bytes(udp.data or b"")
+                if payload:
+                    udp_packets.append((src_ip, dst_ip, int(udp.sport), int(udp.dport), payload, idx))
+    else:
+        idx = 0
+        for pkt in packets:
+            idx += 1
+            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
+                ip_layer = pkt[IP]  # type: ignore[index]
+                src_ip = str(getattr(ip_layer, "src", ""))
+                dst_ip = str(getattr(ip_layer, "dst", ""))
+            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
+                ip_layer = pkt[IPv6]  # type: ignore[index]
+                src_ip = str(getattr(ip_layer, "src", ""))
+                dst_ip = str(getattr(ip_layer, "dst", ""))
+            else:
+                continue
+
+            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+                tcp = pkt[TCP]  # type: ignore[index]
+                payload = bytes(getattr(tcp, "payload", b""))
+                if payload:
+                    seq = int(getattr(tcp, "seq", 0) or 0)
+                    tcp_streams[(src_ip, dst_ip, int(tcp.sport), int(tcp.dport))].append((seq, payload, idx))
+            elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+                udp = pkt[UDP]  # type: ignore[index]
+                payload = bytes(getattr(udp, "payload", b""))
+                if payload:
+                    udp_packets.append((src_ip, dst_ip, int(udp.sport), int(udp.dport), payload, idx))
 
     # FTP control parsing
     ftp_transfers: List[Dict[str, Any]] = []
@@ -1447,9 +1514,13 @@ def _export_with_dpkt(
                     content_type = m["headers"].get("content-type", "")
                     ext = _guess_extension_from_content_type(content_type) or "bin"
                     fname = f"http_{first_pkt}.{ext}"
+                if fname == "http_response.bin":
+                    fname = f"http_{first_pkt}.bin"
                 ftype = detect_file_type_bytes(body) if body else "UNKNOWN"
                 content_type = m["headers"].get("content-type", "")
                 fname = _append_extension_if_missing(fname, content_type)
+                if fname == "http_response.bin":
+                    fname = f"http_{first_pkt}.bin"
                 _add_artifact(FileArtifact(
                     protocol="HTTP",
                     src_ip=src,
@@ -1558,6 +1629,12 @@ def _export_with_dpkt(
 
         # X509AF
         for pem in _extract_pem_certs(stream):
+            digest = hashlib.sha256(_normalize_x509_payload(pem)).hexdigest()
+            meta_key = (src, dst, f"x509_{first_pkt}.pem", len(pem))
+            if digest in seen_x509 or meta_key in seen_x509_meta:
+                continue
+            seen_x509.add(digest)
+            seen_x509_meta.add(meta_key)
             _add_artifact(FileArtifact(
                 protocol="X509AF",
                 src_ip=src,
@@ -1572,6 +1649,12 @@ def _export_with_dpkt(
                 payload=pem if need_payload else None,
             ))
         for der in _extract_der_blobs(stream):
+            digest = hashlib.sha256(_normalize_x509_payload(der)).hexdigest()
+            meta_key = (src, dst, f"x509_{first_pkt}.cer", len(der))
+            if digest in seen_x509 or meta_key in seen_x509_meta:
+                continue
+            seen_x509.add(digest)
+            seen_x509_meta.add(meta_key)
             _add_artifact(FileArtifact(
                 protocol="X509AF",
                 src_ip=src,
@@ -1701,6 +1784,25 @@ def _export_with_dpkt(
     return None
 
 
+def _dedupe_x509_artifacts(artifacts: List[FileArtifact]) -> List[FileArtifact]:
+    seen: set[str] = set()
+    unique: List[FileArtifact] = []
+    for art in artifacts:
+        if art.protocol != "X509AF":
+            unique.append(art)
+            continue
+        payload = art.payload or b""
+        if payload:
+            key = hashlib.sha256(_normalize_x509_payload(payload)).hexdigest()
+        else:
+            key = f"{art.filename}|{art.src_ip}|{art.dst_ip}|{art.size_bytes}|{art.packet_index}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(art)
+    return unique
+
+
 # --- Entry Point ---
 
 def analyze_files(
@@ -1712,50 +1814,48 @@ def analyze_files(
     include_x509: bool = False,
 ) -> FileTransferSummary:
 
+    packets, _meta = get_cached_packets(path, show_status=show_status)
+
     dpkt_summary = _export_with_dpkt(
         path,
         extract_name=extract_name,
         output_dir=output_dir,
         view_name=view_name,
         show_status=show_status,
+        packets=packets,
     )
     if dpkt_summary is not None:
-        if not include_x509:
+        if include_x509:
             dpkt_summary = FileTransferSummary(
                 path=dpkt_summary.path,
                 total_candidates=dpkt_summary.total_candidates,
                 candidates=dpkt_summary.candidates,
-                artifacts=[a for a in dpkt_summary.artifacts if a.protocol != "X509AF"],
+                artifacts=_dedupe_x509_artifacts(dpkt_summary.artifacts),
                 extracted=dpkt_summary.extracted,
                 views=dpkt_summary.views,
                 detections=dpkt_summary.detections,
                 errors=dpkt_summary.errors,
             )
-        return dpkt_summary
+            return dpkt_summary
+        return FileTransferSummary(
+            path=dpkt_summary.path,
+            total_candidates=dpkt_summary.total_candidates,
+            candidates=dpkt_summary.candidates,
+            artifacts=[a for a in _dedupe_x509_artifacts(dpkt_summary.artifacts) if a.protocol != "X509AF"],
+            extracted=dpkt_summary.extracted,
+            views=dpkt_summary.views,
+            detections=dpkt_summary.detections,
+            errors=dpkt_summary.errors,
+        )
     
     if IP is None:
         return FileTransferSummary(path, 0, [], [], [], [], [], ["Scapy NoneType error"])
 
     extractor = FileExtractor(path)
-    ftype = detect_file_type(path)
-    
-    size_bytes = 0
     try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        pass
-        
-    status = build_statusbar(path, enabled=show_status)
-
-    try:
-        reader = PcapNgReader(str(path)) if ftype == "pcapng" else PcapReader(str(path))
-        
-        stream = None
-        for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-            candidate = getattr(reader, attr, None)
-            if candidate is not None:
-                stream = candidate
-                break
+        reader, status, stream, size_bytes, _file_type = get_reader(
+            path, show_status=show_status
+        )
 
         i = 0
         for pkt in reader:
@@ -1776,6 +1876,7 @@ def analyze_files(
         status.finish()
         
     extractor.finalize()
+    extractor.artifacts = _dedupe_x509_artifacts(extractor.artifacts)
     
     # Handle Extraction and View
     extracted_paths = []

@@ -6,9 +6,7 @@ from pathlib import Path
 from typing import Optional
 import ipaddress
 
-from scapy.utils import PcapReader, PcapNgReader
-
-from .progress import build_statusbar
+from .pcap_cache import get_reader
 from .utils import safe_float, detect_file_type
 
 try:
@@ -166,22 +164,9 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
         errors.append("Scapy IP layers unavailable; install scapy for beacon analysis.")
         return BeaconSummary(path=path, total_packets=0, candidate_count=0, candidates=[], detections=[], errors=errors)
 
-    file_type = detect_file_type(path)
-    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
-
-    size_bytes = 0
-    try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        pass
-        
-    status = build_statusbar(path, enabled=show_status)
-    stream = None
-    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-        candidate = getattr(reader, attr, None)
-        if candidate is not None:
-            stream = candidate
-            break
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
 
     session_conn_times: dict[tuple[str, str, str, Optional[int]], list[float]] = defaultdict(list)
     session_conn_sizes: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)

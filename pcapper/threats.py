@@ -5,10 +5,8 @@ from pathlib import Path
 from typing import Optional
 from collections import Counter, defaultdict
 
-from scapy.utils import PcapReader, PcapNgReader
-
-from .progress import build_statusbar
-from .utils import safe_float, detect_file_type
+from .pcap_cache import get_reader
+from .utils import safe_float
 from .icmp import analyze_icmp
 from .dns import analyze_dns
 from .beacon import analyze_beacons
@@ -185,22 +183,9 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             "top_destinations": smb1_destinations.most_common(10),
         })
 
-    file_type = detect_file_type(path)
-    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
-
-    size_bytes = 0
-    try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        pass
-        
-    status = build_statusbar(path, enabled=show_status)
-    stream = None
-    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-        candidate = getattr(reader, attr, None)
-        if candidate is not None:
-            stream = candidate
-            break
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
 
     dst_port_counts: Counter[tuple[str, str]] = Counter()
     syn_counts: Counter[str] = Counter()

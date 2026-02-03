@@ -9,17 +9,10 @@ import struct
 try:
     from scapy.layers.inet import TCP, UDP
     from scapy.packet import Raw
-    from scapy.all import rdpcap
 except ImportError:
-    try:
-        from scapy.layers.inet import TCP, UDP
-        from scapy.packet import Raw
-        from scapy.utils import rdpcap
-    except ImportError:
-        TCP = UDP = Raw = None
-        rdpcap = None
+    TCP = UDP = Raw = None
 
-from .progress import build_statusbar
+from .pcap_cache import get_reader
 from .utils import detect_file_type, safe_float
 
 # --- Constants ---
@@ -113,23 +106,15 @@ class Dnp3Analysis:
 
 
 def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
-    if TCP is None or rdpcap is None:
-        return Dnp3Analysis(path, 0.0, 0, 0, Counter(), Counter(), Counter(), Counter(), [], [], ["Scapy unavailable (rdpcap/TCP missing)"])
+    if TCP is None:
+        return Dnp3Analysis(path, 0.0, 0, 0, Counter(), Counter(), Counter(), Counter(), [], [], ["Scapy unavailable (TCP missing)"])
 
-    ftype = detect_file_type(path)
     try:
-        reader = rdpcap(str(path))
+        reader, status, _stream, _size_bytes, _file_type = get_reader(
+            path, show_status=show_status
+        )
     except Exception as e:
         return Dnp3Analysis(path, 0.0, 0, 0, Counter(), Counter(), Counter(), Counter(), [], [], [f"Error: {e}"])
-
-    size_bytes = 0
-    try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        pass
-        
-    status = build_statusbar(path, enabled=show_status, desc="DNP3 Analysis")
-    stream = None
     # Attempt to find file handle for progress
     # for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
     #    candidate = getattr(reader, attr, None)
@@ -156,8 +141,11 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
         with status as pbar:
             total_count = len(reader)
             for i, pkt in enumerate(reader):
-                if i % 10 == 0 and total_count > 0:
-                   pbar.update(int((i / total_count) * 100))
+                if i % 10 == 0:
+                    try:
+                        pbar.update(int((i / max(1, total_count)) * 100))
+                    except Exception:
+                        pass
 
                 total_packets += 1
                 ts = safe_float(getattr(pkt, "time", 0))

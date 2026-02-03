@@ -11,14 +11,13 @@ try:
     from scapy.layers.inet6 import IPv6
     from scapy.layers.l2 import Ether
     from scapy.packet import Raw, Packet
-    from scapy.utils import PcapReader
     from scapy.layers.netbios import NBNSQueryRequest, NBNSQueryResponse, NBNSNodeStatusResponse
 except ImportError:
     # Use raw parsing if imports fail or layers missing
     TCP = UDP = Raw = None
     NBNSQueryRequest = NBNSQueryResponse = NBNSNodeStatusResponse = None
 
-from .progress import build_statusbar
+from .pcap_cache import get_reader
 from .utils import detect_file_type
 
 # NetBIOS Suffix Types commonly seen
@@ -217,7 +216,6 @@ def _scan_filenames(data: bytes) -> List[str]:
     return list(found)
 
 def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysis:
-    from scapy.all import PcapReader, Raw, PcapNgReader
     # Try importing NBNS layers from scapy
     try:
         from scapy.layers.netbios import NBNSQueryRequest, NBNSQueryResponse, NBNSNodeStatusResponse, NBNSRequest, NBNSResponse
@@ -268,18 +266,10 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
         return sess
 
     try:
-        ftype = detect_file_type(pcap_path)
-        reader = PcapNgReader(str(pcap_path)) if ftype == "pcapng" else PcapReader(str(pcap_path))
-        stream = None
-        for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-            candidate = getattr(reader, attr, None)
-            if candidate is not None:
-                stream = candidate
-                break
+        reader, status_bar, stream, _size_bytes, _file_type = get_reader(
+            pcap_path, show_status=show_status
+        )
         try:
-            # We assume regular file status bar
-            status_bar = build_statusbar(pcap_path, show_status, "NetBIOS")
-            
             with status_bar as pbar:
                 for pkt in reader:
                     if not pkt:

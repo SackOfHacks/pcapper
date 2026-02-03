@@ -5,7 +5,7 @@ from numbers import Real
 from pathlib import Path
 from typing import Iterable, Optional
 
-from scapy.utils import PcapReader, PcapNgReader
+from .pcap_cache import PcapMeta, get_reader
 
 try:
     from scapy.layers.l2 import Dot1Q  # type: ignore
@@ -13,7 +13,6 @@ except Exception:  # pragma: no cover
     Dot1Q = None  # type: ignore
 
 from .models import InterfaceStat, PcapSummary
-from .progress import build_statusbar
 from .utils import detect_file_type
 
 
@@ -39,14 +38,14 @@ def _get_iface_key(pkt) -> Optional[object]:
     if iface:
         return iface
 
-    for attr in ("interface", "iface", "ifname", "if_name", "ifindex", "if_id", "ifid"):
+    for attr in ("interface", "iface", "ifname", "if_name", "ifindex", "if_index", "if_id", "ifid"):
         value = getattr(pkt, attr, None)
         if value is not None:
             return value
 
     metadata = getattr(pkt, "metadata", None)
     if isinstance(metadata, dict):
-        for key in ("ifname", "interface", "iface", "if_name", "ifindex", "if_id", "ifid"):
+        for key in ("ifname", "interface", "iface", "if_name", "ifindex", "if_index", "if_id", "ifid"):
             if key in metadata and metadata[key] is not None:
                 return metadata[key]
     return None
@@ -56,9 +55,42 @@ def _normalize_iface_name(value: object) -> str:
     return str(value) if value is not None else "unknown"
 
 
-def analyze_pcap(path: Path, show_status: bool = True) -> PcapSummary:
-    file_type = detect_file_type(path)
-    size_bytes = path.stat().st_size
+def _as_text(value: object | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _iface_get(iface: object, *keys: str) -> object | None:
+    for key in keys:
+        if isinstance(iface, dict) and key in iface:
+            return iface.get(key)
+        if hasattr(iface, key):
+            return getattr(iface, key)
+    return None
+
+
+def _as_int(value: object | None) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def analyze_pcap(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> PcapSummary:
+    file_type = meta.file_type if meta else detect_file_type(path)
+    size_bytes = meta.size_bytes if meta else path.stat().st_size
     packet_count = 0
     start_ts: Optional[float] = None
     end_ts: Optional[float] = None
@@ -66,14 +98,9 @@ def analyze_pcap(path: Path, show_status: bool = True) -> PcapSummary:
     iface_counts = defaultdict(int)
     iface_vlans = defaultdict(set)
 
-    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
-    status = build_statusbar(path, enabled=show_status)
-    stream = None
-    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-        candidate = getattr(reader, attr, None)
-        if candidate is not None:
-            stream = candidate
-            break
+    reader, status, stream, _size_bytes, _file_type = get_reader(
+        path, packets=packets, meta=meta, show_status=show_status
+    )
 
     try:
         for pkt in reader:
@@ -138,19 +165,36 @@ def analyze_pcap(path: Path, show_status: bool = True) -> PcapSummary:
             vlan_ids.update(iface_vlans.get(key, set()))
         return total, sorted(vlan_ids)
 
-    interfaces = getattr(reader, "interfaces", None)
+    interfaces = meta.interfaces if meta else getattr(reader, "interfaces", None)
     if interfaces and len(interfaces) > 0:
+        all_vlan_ids: set[int] = set()
+        for vlan_set in iface_vlans.values():
+            all_vlan_ids.update(vlan_set)
         for idx, iface in enumerate(interfaces):
-            name = getattr(iface, "name", None) or getattr(iface, "if_name", None) or f"if{idx}"
-            linktype = getattr(iface, "linktype", None)
-            snaplen = getattr(iface, "snaplen", None)
-            description = getattr(iface, "description", None) or getattr(iface, "if_description", None)
-            speed = getattr(iface, "speed", None) or getattr(iface, "if_speed", None)
-            mac = getattr(iface, "mac", None) or getattr(iface, "if_macaddr", None) or getattr(iface, "if_mac", None)
-            os = getattr(iface, "os", None) or getattr(iface, "if_os", None)
+            name = _iface_get(iface, "name", "if_name")
+            description = _iface_get(iface, "description", "if_description")
+            if not name and description:
+                name = description
+            if not name:
+                name = f"if{idx}"
+            linktype = _iface_get(iface, "linktype", "if_linktype")
+            snaplen = _iface_get(iface, "snaplen", "if_snaplen")
+            speed = _iface_get(iface, "speed", "if_speed")
+            mac = _iface_get(iface, "mac", "if_macaddr", "if_mac")
+            os = _iface_get(iface, "os", "if_os")
+            dropcount = _iface_get(iface, "dropcount", "if_dropcount", "if_drops", "if_drop")
+            capture_filter = _iface_get(iface, "filter", "if_filter")
 
+            iface_id = _iface_get(iface, "id", "if_id", "ifid", "if_index", "ifindex")
             iface_keys = [name, str(name), idx, str(idx)]
+            if iface_id is not None:
+                iface_keys.extend([iface_id, str(iface_id)])
             iface_count, vlan_ids = _collect_iface_counts(iface_keys)
+            if len(interfaces) == 1:
+                if iface_count is None:
+                    iface_count = packet_count if packet_count else None
+                if not vlan_ids and all_vlan_ids:
+                    vlan_ids = sorted(all_vlan_ids)
             speed_bps: Optional[int] = None
             if isinstance(speed, Real):
                 try:
@@ -166,19 +210,21 @@ def analyze_pcap(path: Path, show_status: bool = True) -> PcapSummary:
             interface_stats.append(
                 InterfaceStat(
                     name=_normalize_iface_name(name),
-                    linktype=str(linktype) if linktype is not None else None,
-                    snaplen=snaplen,
+                    linktype=_as_text(linktype) or _as_text(meta.linktype if meta else None),
+                    snaplen=snaplen if snaplen is not None else (meta.snaplen if meta else None),
                     packet_count=iface_count,
-                    description=str(description) if description else None,
+                    dropped_packets=_as_int(dropcount),
+                    capture_filter=_as_text(capture_filter),
+                    description=_as_text(description),
                     speed_bps=speed_bps,
-                    mac=str(mac) if mac else None,
-                    os=str(os) if os else None,
+                    mac=_as_text(mac),
+                    os=_as_text(os),
                     vlan_ids=vlan_ids,
                 )
             )
     else:
-        linktype = getattr(reader, "linktype", None)
-        snaplen = getattr(reader, "snaplen", None)
+        linktype = meta.linktype if meta else getattr(reader, "linktype", None)
+        snaplen = meta.snaplen if meta else getattr(reader, "snaplen", None)
         observed_ifaces = list(iface_counts.keys()) or ["unknown"]
         for iface_key in sorted(observed_ifaces, key=lambda value: str(value)):
             iface_count, vlan_ids = _collect_iface_counts([iface_key])
@@ -188,6 +234,8 @@ def analyze_pcap(path: Path, show_status: bool = True) -> PcapSummary:
                     linktype=str(linktype) if linktype is not None else None,
                     snaplen=snaplen,
                     packet_count=iface_count or (packet_count if packet_count else None),
+                    dropped_packets=None,
+                    capture_filter=None,
                     description=None,
                     speed_bps=None,
                     mac=None,

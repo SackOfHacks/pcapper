@@ -6,9 +6,8 @@ from pathlib import Path
 from typing import Optional
 import math
 
-from scapy.utils import PcapReader, PcapNgReader
+from .pcap_cache import PcapMeta, get_reader
 
-from .progress import build_statusbar
 from .utils import safe_float, detect_file_type
 
 try:
@@ -76,7 +75,12 @@ def _base_domain(name: str) -> str:
     return name.strip(".")
 
 
-def analyze_dns(path: Path, show_status: bool = True) -> DnsSummary:
+def analyze_dns(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> DnsSummary:
     errors: list[str] = []
     if DNS is None:
         errors.append("Scapy DNS layers unavailable; install scapy for DNS analysis.")
@@ -115,22 +119,11 @@ def analyze_dns(path: Path, show_status: bool = True) -> DnsSummary:
             errors=errors,
         )
 
-    file_type = detect_file_type(path)
-    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, packets=packets, meta=meta, show_status=show_status
+    )
 
-    size_bytes = 0
-    try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        pass
-        
-    status = build_statusbar(path, enabled=show_status)
-    stream = None
-    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-        candidate = getattr(reader, attr, None)
-        if candidate is not None:
-            stream = candidate
-            break
+    size_bytes = size_bytes
 
     total_packets = 0
     total_bytes = 0

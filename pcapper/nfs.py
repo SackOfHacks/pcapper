@@ -14,7 +14,7 @@ try:
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
 
-from .progress import build_statusbar
+from .pcap_cache import get_reader
 from .utils import detect_file_type, safe_float
 
 
@@ -267,10 +267,11 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
             ["Scapy not available"],
         )
 
-    ftype = detect_file_type(path)
     try:
-        reader = PcapNgReader(str(path)) if ftype == "pcapng" else PcapReader(str(path))
-    except Exception as e:
+        reader, status, stream, size_bytes, _file_type = get_reader(
+            path, show_status=show_status
+        )
+    except Exception as exc:
         return NfsSummary(
             path,
             0,
@@ -293,19 +294,7 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
             [f"Error opening pcap: {e}"],
         )
 
-    size_bytes = 0
-    try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        pass
-
-    status = build_statusbar(path, enabled=show_status)
-    stream = None
-    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-        candidate = getattr(reader, attr, None)
-        if candidate is not None:
-            stream = candidate
-            break
+    size_bytes = size_bytes
 
     total_packets = 0
     nfs_packets = 0

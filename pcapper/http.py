@@ -6,9 +6,8 @@ from pathlib import Path
 from typing import Optional
 import re
 
-from scapy.utils import PcapReader, PcapNgReader
+from .pcap_cache import PcapMeta, get_reader
 
-from .progress import build_statusbar
 from .utils import safe_float, detect_file_type, detect_file_type_bytes
 
 try:
@@ -112,7 +111,12 @@ def _extract_tokens(text: str) -> list[str]:
     return tokens
 
 
-def analyze_http(path: Path, show_status: bool = True) -> HttpSummary:
+def analyze_http(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> HttpSummary:
     errors: list[str] = []
     if IP is None and IPv6 is None:
         errors.append("Scapy IP layers unavailable; install scapy for HTTP analysis.")
@@ -146,22 +150,9 @@ def analyze_http(path: Path, show_status: bool = True) -> HttpSummary:
             duration_seconds=None,
         )
 
-    file_type = detect_file_type(path)
-    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
-
-    size_bytes = 0
-    try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        pass
-
-    status = build_statusbar(path, enabled=show_status)
-    stream = None
-    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-        candidate = getattr(reader, attr, None)
-        if candidate is not None:
-            stream = candidate
-            break
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, packets=packets, meta=meta, show_status=show_status
+    )
 
     total_packets = 0
     total_bytes = 0

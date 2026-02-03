@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from pathlib import Path
 import ipaddress
 import re
 from typing import Iterable
@@ -8,7 +9,7 @@ from typing import Iterable
 from .models import PcapSummary
 from .utils import format_bytes_as_mb, format_duration, format_speed_bps, format_ts, sparkline, hexdump
 from .coloring import danger, header, label, muted, ok, warn, highlight, orange
-from .vlan import VlanSummary
+from .vlan import VlanSummary, VlanStat
 from .icmp import IcmpSummary
 from .dns import DnsSummary
 from .beacon import BeaconSummary
@@ -29,6 +30,40 @@ from .health import HealthSummary
 
 SECTION_BAR = "=" * 72
 SUBSECTION_BAR = "-" * 72
+
+
+def _format_linktype(value: object | None) -> str:
+    if value is None:
+        return "-"
+    try:
+        if isinstance(value, str) and value.isdigit():
+            value = int(value)
+        if isinstance(value, int):
+            common = {
+                0: "Null/Loopback",
+                1: "Ethernet",
+                6: "802.5 Token Ring",
+                7: "ARCnet",
+                8: "SLIP",
+                9: "PPP",
+                101: "Raw IP",
+                105: "IEEE 802.11",
+                113: "Linux cooked capture",
+            }
+            if value in common:
+                return common[value]
+            try:
+                from scapy.data import l2types  # type: ignore
+
+                mapped = l2types.get(value)
+                if mapped is not None:
+                    return str(mapped)
+            except Exception:
+                pass
+            return f"LINKTYPE_{value}"
+        return str(value)
+    except Exception:
+        return str(value)
 
 
 def _format_kv(label_text: str, value: str, width: int = 24, color: bool | None = None) -> str:
@@ -55,6 +90,82 @@ def _format_table(rows: Iterable[list[str]]) -> str:
     return "\n".join(lines)
 
 
+def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
+    summary_list = list(summaries)
+    if not summary_list:
+        return ""
+
+    totals: dict[str, float] = {}
+    counters: dict[str, Counter[str]] = {}
+    unions: dict[str, set[object]] = {}
+
+    preferred_numeric = {
+        "total_packets": "Total Packets",
+        "total_bytes": "Total Bytes",
+        "packet_count": "Total Packets",
+        "packets": "Total Packets",
+        "duration_seconds": "Combined Duration",
+        "duration": "Combined Duration",
+        "modbus_packets": "Modbus Packets",
+        "dnp3_packets": "DNP3 Packets",
+        "total_requests": "Total Requests",
+        "total_responses": "Total Responses",
+        "total_tagged_packets": "Tagged Packets",
+        "total_tagged_bytes": "Tagged Bytes",
+    }
+
+    preferred_sets = {
+        "src_ips": "Unique Source IPs",
+        "dst_ips": "Unique Destination IPs",
+        "clients": "Unique Clients",
+        "servers": "Unique Servers",
+    }
+
+    for summary in summary_list:
+        for name, value in vars(summary).items():
+            if isinstance(value, Counter):
+                counters.setdefault(name, Counter()).update(value)
+            elif isinstance(value, set):
+                unions.setdefault(name, set()).update(value)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                if name in preferred_numeric:
+                    totals[name] = totals.get(name, 0.0) + float(value)
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"{title} :: ALL PCAPS ({len(summary_list)})"))
+    lines.append(SECTION_BAR)
+    lines.append(_format_kv("PCAPs Analyzed", str(len(summary_list))))
+
+    for key, label_text in preferred_numeric.items():
+        if key in totals:
+            value = totals[key]
+            if key.endswith("bytes"):
+                lines.append(_format_kv(label_text, format_bytes_as_mb(int(value))))
+            elif "duration" in key:
+                lines.append(_format_kv(label_text, format_duration(value)))
+            else:
+                lines.append(_format_kv(label_text, str(int(value))))
+
+    for key, label_text in preferred_sets.items():
+        if key in unions:
+            lines.append(_format_kv(label_text, str(len(unions[key]))))
+
+    if counters:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Aggregated Counters"))
+        ordered_counters = sorted(counters.items(), key=lambda item: sum(item[1].values()), reverse=True)
+        for name, counter in ordered_counters[:4]:
+            lines.append(label(name.replace("_", " ").title()))
+            rows = [["Item", "Count"]]
+            for item, count in counter.most_common(10):
+                rows.append([str(item), str(count)])
+            lines.append(_format_table(rows))
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
 def _protocol_rows(protocol_counts: Counter[str], packet_count: int, limit: int) -> list[list[str]]:
     rows = [["Protocol", "Packets", "Presence"]]
     for name, count in protocol_counts.most_common(limit):
@@ -78,34 +189,50 @@ def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
     lines.append(_format_kv("Start", format_ts(summary.start_ts)))
     lines.append(_format_kv("End", format_ts(summary.end_ts)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+    lines.append(_format_kv("Interfaces", str(len(summary.interface_stats))))
+    linktypes = sorted({iface.linktype for iface in summary.interface_stats if iface.linktype})
+    snaplens = sorted({iface.snaplen for iface in summary.interface_stats if iface.snaplen is not None})
+    if linktypes:
+        lines.append(_format_kv("LinkTypes", ", ".join(linktypes)))
+    if snaplens:
+        lines.append(_format_kv("SnapLen", ", ".join(str(val) for val in snaplens)))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Interface Statistics"))
-    rows = [["Interface", "LinkType", "SnapLen", "Speed", "Packets", "VLANs", "Details"]]
+    rows = [["Interface Name", "Dropped Packets", "Capture Filter", "Link Type", "Packet Size Limit"]]
     for iface in summary.interface_stats:
-        vlan_display = ",".join(str(vlan) for vlan in iface.vlan_ids) if iface.vlan_ids else "-"
-        details_parts = []
-        if iface.description:
-            details_parts.append(iface.description)
-        if iface.mac:
-            details_parts.append(f"mac {iface.mac}")
-        if iface.os:
-            details_parts.append(f"os {iface.os}")
-        details = "; ".join(details_parts) if details_parts else "-"
+        if summary.file_type == "pcap":
+            dropped = str(iface.dropped_packets) if iface.dropped_packets is not None else "not recorded"
+            capture_filter = iface.capture_filter or "not recorded"
+        else:
+            dropped = str(iface.dropped_packets) if iface.dropped_packets is not None else "-"
+            capture_filter = iface.capture_filter or "-"
+        link_type = _format_linktype(iface.linktype)
+        snaplen = str(iface.snaplen) if iface.snaplen is not None else "-"
         rows.append([
             iface.name,
-            iface.linktype or "-",
-            str(iface.snaplen) if iface.snaplen is not None else "-",
-            format_speed_bps(iface.speed_bps),
-            str(iface.packet_count) if iface.packet_count is not None else "-",
-            vlan_display,
-            details,
+            dropped,
+            capture_filter,
+            link_type,
+            snaplen,
         ])
     lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Protocol Summary (presence across packets)"))
     lines.append(_format_table(_protocol_rows(summary.protocol_counts, summary.packet_count, protocol_limit)))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("VLAN Summary"))
+    vlan_ids: set[int] = set()
+    for iface in summary.interface_stats:
+        vlan_ids.update(iface.vlan_ids)
+    if vlan_ids:
+        vlan_list = ", ".join(str(vlan) for vlan in sorted(vlan_ids))
+        lines.append(_format_kv("VLANs Observed", str(len(vlan_ids))))
+        lines.append(_format_kv("VLAN IDs", vlan_list))
+    else:
+        lines.append(muted("No VLAN-tagged traffic detected."))
     lines.append(SECTION_BAR)
 
     return "\n".join(lines)
@@ -143,6 +270,23 @@ def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = F
                 format_ts(vlan.last_seen),
             ])
         lines.append(_format_table(rows))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("IPs Per VLAN"))
+        ip_rows = [["VLAN", "IP Count", "IPs"]]
+        for vlan in summary.vlan_stats[:limit]:
+            ip_list = sorted(vlan.src_ips.union(vlan.dst_ips))
+            preview = ip_list[:10]
+            if len(ip_list) > 10:
+                preview_text = ", ".join(preview) + f" (+{len(ip_list) - 10} more)"
+            else:
+                preview_text = ", ".join(preview) if preview else "-"
+            ip_rows.append([
+                str(vlan.vlan_id),
+                str(len(ip_list)),
+                preview_text,
+            ])
+        lines.append(_format_table(ip_rows))
 
         if verbose:
             lines.append(SUBSECTION_BAR)
@@ -196,6 +340,106 @@ def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = F
 
     lines.append(SECTION_BAR)
     return "\n".join(lines)
+
+
+def render_vlan_rollup(summaries: Iterable[VlanSummary], limit: int = 20, verbose: bool = False) -> str:
+    summary_list = list(summaries)
+    if not summary_list:
+        return ""
+
+    combined: dict[int, dict[str, object]] = {}
+    total_tagged_packets = 0
+    total_tagged_bytes = 0
+    errors: set[str] = set()
+
+    for summary in summary_list:
+        total_tagged_packets += summary.total_tagged_packets
+        total_tagged_bytes += summary.total_tagged_bytes
+        errors.update(summary.errors)
+        for stat in summary.vlan_stats:
+            info = combined.setdefault(stat.vlan_id, {
+                "packets": 0,
+                "bytes": 0,
+                "src_macs": set(),
+                "dst_macs": set(),
+                "src_ips": set(),
+                "dst_ips": set(),
+                "protocols": Counter(),
+                "first_seen": None,
+                "last_seen": None,
+            })
+            info["packets"] = int(info["packets"]) + stat.packets
+            info["bytes"] = int(info["bytes"]) + stat.bytes
+            info["src_macs"].update(stat.src_macs)
+            info["dst_macs"].update(stat.dst_macs)
+            info["src_ips"].update(stat.src_ips)
+            info["dst_ips"].update(stat.dst_ips)
+            info["protocols"].update(stat.protocols)
+            if stat.first_seen is not None:
+                if info["first_seen"] is None or stat.first_seen < info["first_seen"]:
+                    info["first_seen"] = stat.first_seen
+            if stat.last_seen is not None:
+                if info["last_seen"] is None or stat.last_seen > info["last_seen"]:
+                    info["last_seen"] = stat.last_seen
+
+    stats_list: list[VlanStat] = []
+    for vlan_id, info in combined.items():
+        stats_list.append(
+            VlanStat(
+                vlan_id=vlan_id,
+                packets=int(info["packets"]),
+                bytes=int(info["bytes"]),
+                src_macs=set(info["src_macs"]),
+                dst_macs=set(info["dst_macs"]),
+                src_ips=set(info["src_ips"]),
+                dst_ips=set(info["dst_ips"]),
+                protocols=Counter(info["protocols"]),
+                first_seen=info["first_seen"],
+                last_seen=info["last_seen"],
+            )
+        )
+
+    stats_list.sort(key=lambda item: item.packets, reverse=True)
+
+    detections: list[dict[str, str]] = []
+    if stats_list:
+        vlan_ids = sorted(v.vlan_id for v in stats_list)
+        if 1 in vlan_ids:
+            detections.append({
+                "type": "vlan_default_used",
+                "severity": "warning",
+                "summary": "VLAN 1 (default) observed",
+                "details": "Default VLAN is in use; consider verifying network segmentation policy.",
+            })
+
+        total_packets = sum(v.packets for v in stats_list)
+        for stat in stats_list:
+            if total_packets > 0:
+                ratio = stat.packets / total_packets
+                if ratio > 0.8 and stat.packets > 1000:
+                    detections.append({
+                        "type": "vlan_traffic_concentration",
+                        "severity": "warning",
+                        "summary": f"VLAN {stat.vlan_id} carries {ratio:.1%} of tagged traffic",
+                        "details": "Check for misconfiguration or single-VLAN dependency.",
+                    })
+                if stat.packets < 10:
+                    detections.append({
+                        "type": "vlan_low_activity",
+                        "severity": "info",
+                        "summary": f"VLAN {stat.vlan_id} has low activity ({stat.packets} packets)",
+                        "details": "Low activity VLANs can be normal; validate against expectations.",
+                    })
+
+    rollup_summary = VlanSummary(
+        path=Path("ALL_PCAPS"),
+        total_tagged_packets=total_tagged_packets,
+        total_tagged_bytes=total_tagged_bytes,
+        vlan_stats=stats_list,
+        detections=detections,
+        errors=sorted(errors),
+    )
+    return render_vlan_summary(rollup_summary, limit=limit, verbose=verbose)
 
 def render_domain_summary(summary: "DomainAnalysis", limit: int = 25) -> str:
     from .domain import DomainAnalysis
@@ -3161,7 +3405,7 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
     lines.append(SECTION_BAR)
     return "\n".join(lines)
 
-def render_modbus_summary(summary: "ModbusAnalysis") -> str:
+def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> str:
     """
     Render Modbus analysis results.
     """
@@ -3247,19 +3491,159 @@ def render_modbus_summary(summary: "ModbusAnalysis") -> str:
     if summary.anomalies:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Anomalies & Threats"))
-        
-        # Sort by severity
-        sev_map = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-        sorted_anoms = sorted(summary.anomalies, key=lambda x: sev_map.get(x.severity, 99))
-        
-        for a in sorted_anoms:
-            sev_color = danger if a.severity in ("CRITICAL", "HIGH") else warn
-            if a.severity == "LOW": sev_color = muted
+
+        if not verbose:
+            lines.append(_format_kv("Total Anomalies", str(len(summary.anomalies))))
+            sev_counts = Counter(a.severity for a in summary.anomalies)
+            sev_rows = [["Severity", "Count"]]
+            for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+                if sev_counts.get(severity):
+                    sev_rows.append([severity, str(sev_counts[severity])])
+            if len(sev_rows) > 1:
+                lines.append(_format_table(sev_rows))
+            title_counts = Counter(a.title for a in summary.anomalies)
+            if title_counts:
+                lines.append(SUBSECTION_BAR)
+                lines.append(header("Top Anomaly Types"))
+                rows = [["Type", "Count"]]
+                for title, count in title_counts.most_common(10):
+                    rows.append([title, str(count)])
+                lines.append(_format_table(rows))
+            lines.append(muted("Use -v for detailed anomaly listings."))
+        else:
+            # Sort by severity
+            sev_map = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+            sorted_anoms = sorted(summary.anomalies, key=lambda x: sev_map.get(x.severity, 99))
             
-            lines.append(sev_color(f"[{a.severity}] {a.title}"))
-            lines.append(f"  {a.description}")
-            lines.append(muted(f"  Src: {a.src} -> Dst: {a.dst}"))
-            lines.append("")
+            for a in sorted_anoms:
+                sev_color = danger if a.severity in ("CRITICAL", "HIGH") else warn
+                if a.severity == "LOW": sev_color = muted
+                
+                lines.append(sev_color(f"[{a.severity}] {a.title}"))
+                lines.append(f"  {a.description}")
+                lines.append(muted(f"  Src: {a.src} -> Dst: {a.dst}"))
+                lines.append("")
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
+def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
+    """
+    Render Modbus rollup results across multiple pcaps.
+    """
+    from .modbus import ModbusAnalysis
+
+    summary_list = list(summaries)
+    if not summary_list:
+        return ""
+
+    total_pcaps = len(summary_list)
+    total_duration = 0.0
+    total_modbus_packets = 0
+    total_messages = 0
+    total_exceptions = 0
+    func_counts = Counter()
+    unit_ids = Counter()
+    src_ips = Counter()
+    dst_ips = Counter()
+    all_anomalies = []
+    errors = Counter()
+
+    for summary in summary_list:
+        total_duration += summary.duration
+        total_modbus_packets += summary.modbus_packets
+        func_counts.update(summary.func_counts)
+        unit_ids.update(summary.unit_ids)
+        src_ips.update(summary.src_ips)
+        dst_ips.update(summary.dst_ips)
+        total_messages += len(summary.messages)
+        total_exceptions += sum(1 for msg in summary.messages if msg.is_exception)
+        all_anomalies.extend(summary.anomalies)
+        for err in summary.errors:
+            errors[err] += 1
+
+    error_rate = (total_exceptions / total_messages) * 100 if total_messages else 0.0
+
+    lines = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"MODBUS ANALYSIS :: ALL PCAPS ({total_pcaps})"))
+    lines.append(SECTION_BAR)
+
+    if errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err, count in errors.most_common(10):
+            suffix = f" (x{count})" if count > 1 else ""
+            lines.append(danger(f"- {err}{suffix}"))
+
+    lines.append(_format_kv("PCAPs Analyzed", str(total_pcaps)))
+    lines.append(_format_kv("Combined Duration", f"{total_duration:.2f}s"))
+    lines.append(_format_kv("Modbus Packets", str(total_modbus_packets)))
+    lines.append(_format_kv("Total Messages", str(total_messages)))
+    lines.append(_format_kv("Unique Clients", str(len(src_ips))))
+    lines.append(_format_kv("Unique Servers", str(len(dst_ips))))
+    lines.append(_format_kv("Error Rate", f"{error_rate:.2f}%"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Function Code Usage"))
+    if not func_counts:
+        lines.append(muted("No Modbus functions detected."))
+    else:
+        for func, count in func_counts.most_common():
+            is_write = "Write" in func
+            c = danger if is_write else lambda x: x
+            lines.append(c(f"{func:<40} : {count}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Active Unit IDs"))
+    if not unit_ids:
+        lines.append(muted("No Unit IDs found."))
+    else:
+        top_units = unit_ids.most_common(10)
+        u_strs = [f"ID {uid} ({cnt})" for uid, cnt in top_units]
+        lines.append("  " + ", ".join(u_strs))
+        if len(unit_ids) > 10:
+            lines.append(muted(f"  ... and {len(unit_ids) - 10} more"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Modbus Endpoints"))
+    col_width = 45
+    lines.append(highlight(f"{'Clients (Controllers)':<{col_width}} | {'Servers (PLCs/Sensors)'}"))
+    lines.append(muted("-" * 90))
+    clients = src_ips.most_common(10)
+    servers = dst_ips.most_common(10)
+    max_rows = max(len(clients), len(servers))
+    for i in range(max_rows):
+        c_str = ""
+        s_str = ""
+        if i < len(clients):
+            ip, cnt = clients[i]
+            c_str = f"{ip} ({cnt})"
+        if i < len(servers):
+            ip, cnt = servers[i]
+            s_str = f"{ip} ({cnt})"
+        lines.append(f"{c_str:<{col_width}} | {s_str}")
+
+    if all_anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies & Threats (Aggregated)"))
+        lines.append(_format_kv("Total Anomalies", str(len(all_anomalies))))
+        sev_counts = Counter(a.severity for a in all_anomalies)
+        sev_rows = [["Severity", "Count"]]
+        for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+            if sev_counts.get(severity):
+                sev_rows.append([severity, str(sev_counts[severity])])
+        if len(sev_rows) > 1:
+            lines.append(_format_table(sev_rows))
+        title_counts = Counter(a.title for a in all_anomalies)
+        if title_counts:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Top Anomaly Types"))
+            rows = [["Type", "Count"]]
+            for title, count in title_counts.most_common(10):
+                rows.append([title, str(count)])
+            lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return "\n".join(lines)
@@ -3326,6 +3710,100 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
             lines.append(f"  {a.description}")
             lines.append(muted(f"  Src: {a.src} -> Dst: {a.dst}"))
             lines.append("")
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
+def render_dnp3_rollup(summaries: Iterable["Dnp3Analysis"]) -> str:
+    """
+    Render DNP3 rollup results across multiple pcaps.
+    """
+    from .dnp3 import Dnp3Analysis
+
+    summary_list = list(summaries)
+    if not summary_list:
+        return ""
+
+    total_pcaps = len(summary_list)
+    total_duration = 0.0
+    total_dnp3_packets = 0
+    func_counts = Counter()
+    src_addrs = Counter()
+    dst_addrs = Counter()
+    ip_endpoints = Counter()
+    all_anomalies = []
+    errors = Counter()
+
+    for summary in summary_list:
+        total_duration += summary.duration
+        total_dnp3_packets += summary.dnp3_packets
+        func_counts.update(summary.func_counts)
+        src_addrs.update(summary.src_addrs)
+        dst_addrs.update(summary.dst_addrs)
+        ip_endpoints.update(summary.ip_endpoints)
+        all_anomalies.extend(summary.anomalies)
+        for err in summary.errors:
+            errors[err] += 1
+
+    lines = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"DNP3 ANALYSIS :: ALL PCAPS ({total_pcaps})"))
+    lines.append(SECTION_BAR)
+
+    if errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err, count in errors.most_common(10):
+            suffix = f" (x{count})" if count > 1 else ""
+            lines.append(danger(f"- {err}{suffix}"))
+
+    lines.append(_format_kv("PCAPs Analyzed", str(total_pcaps)))
+    lines.append(_format_kv("Combined Duration", f"{total_duration:.2f}s"))
+    lines.append(_format_kv("DNP3 Packets", str(total_dnp3_packets)))
+    lines.append(_format_kv("Active TCP/UDP IPs", str(len(ip_endpoints))))
+    unique_addrs = len(set(list(src_addrs.keys()) + list(dst_addrs.keys())))
+    lines.append(_format_kv("DNP3 Addresses", str(unique_addrs)))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Function Code Usage"))
+    if not func_counts:
+        lines.append(muted("No DNP3 functions detected."))
+    else:
+        for func, count in func_counts.most_common():
+            is_risk = any(x in func for x in ["Write", "Restart", "File", "Freeze"])
+            c = danger if is_risk else lambda x: x
+            lines.append(c(f"{func:<40} : {count}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Top DNP3 Addresses (Data Link)"))
+    if not src_addrs and not dst_addrs:
+        lines.append(muted("No DNP3 addresses found."))
+    else:
+        all_addrs = src_addrs + dst_addrs
+        top_units = all_addrs.most_common(10)
+        u_strs = [f"Addr {addr} ({cnt})" for addr, cnt in top_units]
+        lines.append("  " + ", ".join(u_strs))
+
+    if all_anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies & Threats (Aggregated)"))
+        lines.append(_format_kv("Total Anomalies", str(len(all_anomalies))))
+        sev_counts = Counter(a.severity for a in all_anomalies)
+        sev_rows = [["Severity", "Count"]]
+        for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+            if sev_counts.get(severity):
+                sev_rows.append([severity, str(sev_counts[severity])])
+        if len(sev_rows) > 1:
+            lines.append(_format_table(sev_rows))
+        title_counts = Counter(a.title for a in all_anomalies)
+        if title_counts:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Top Anomaly Types"))
+            rows = [["Type", "Count"]]
+            for title, count in title_counts.most_common(10):
+                rows.append([title, str(count)])
+            lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return "\n".join(lines)

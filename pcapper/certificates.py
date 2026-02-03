@@ -7,9 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from scapy.utils import PcapReader, PcapNgReader
-
-from .progress import build_statusbar
+from .pcap_cache import get_reader
 from .utils import detect_file_type, safe_float
 
 try:
@@ -119,22 +117,9 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
             errors=errors,
         )
 
-    file_type = detect_file_type(path)
-    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
-
-    size_bytes = 0
-    try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        pass
-
-    status = build_statusbar(path, enabled=show_status)
-    stream = None
-    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-        candidate = getattr(reader, attr, None)
-        if candidate is not None:
-            stream = candidate
-            break
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
 
     total_packets = 0
     tls_packets = 0

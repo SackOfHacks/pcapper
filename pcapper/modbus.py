@@ -1,25 +1,18 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import struct
 
 try:
-    from scapy.layers.inet import TCP
+    from scapy.layers.inet import TCP, IP
     from scapy.packet import Raw
-    from scapy.all import rdpcap
 except ImportError:
-    try:
-        from scapy.layers.inet import TCP
-        from scapy.packet import Raw
-        from scapy.utils import rdpcap
-    except ImportError:
-        TCP = Raw = None
-        rdpcap = None
+    TCP = IP = Raw = None
 
-from .progress import build_statusbar
+from .pcap_cache import get_reader
 from .utils import detect_file_type, safe_float
 
 # --- Constants ---
@@ -120,23 +113,15 @@ class ModbusAnalysis:
         return (errs / len(self.messages)) * 100
 
 def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
-    if TCP is None or rdpcap is None:
-         return ModbusAnalysis(path, 0.0, 0, 0, Counter(), Counter(), Counter(), Counter(), [], [], ["Scapy unavailable (rdpcap/TCP missing)"])
+    if TCP is None:
+         return ModbusAnalysis(path, 0.0, 0, 0, Counter(), Counter(), Counter(), Counter(), [], [], ["Scapy unavailable (TCP missing)"])
 
-    ftype = detect_file_type(path)
     try:
-        reader = rdpcap(str(path))
+        reader, status, _stream, _size_bytes, _file_type = get_reader(
+            path, show_status=show_status
+        )
     except Exception as e:
         return ModbusAnalysis(path, 0.0, 0, 0, Counter(), Counter(), Counter(), Counter(), [], [], [f"Error: {e}"])
-
-    size_bytes = 0
-    try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        pass
-        
-    status = build_statusbar(path, enabled=show_status, desc="Modbus Analysis")
-    stream = None
     # Attempt to find file handle for progress
     # for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
     #    candidate = getattr(reader, attr, None)
@@ -159,16 +144,20 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     start_time = None
     last_time = None
     
-    # State tracking for unauthorized write detection (simple)
-    write_attempts = defaultdict(int)
+    # Aggregate noisy anomalies
+    write_events = Counter()
+    exception_events = Counter()
+    diagnostic_events = Counter()
 
     try:
-        # reader is a list of packets now
         with status as pbar:
-             total_count = len(reader)
-             for i, pkt in enumerate(reader):
+            total_count = len(reader)
+            for i, pkt in enumerate(reader):
                 if i % 10 == 0:
-                   pbar.update(int((i / total_count) * 100))
+                    try:
+                        pbar.update(int((i / max(1, total_count)) * 100))
+                    except Exception:
+                        pass
 
                 total_packets += 1
                 ts = safe_float(getattr(pkt, "time", 0))
@@ -280,51 +269,36 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                         if len(pdu) > 1:
                             exception_code = pdu[1]
                             exception_desc = EXCEPTION_CODES.get(exception_code, "Unknown Exception")
-                            anomalies.append(ModbusAnomaly(
-                                severity="MEDIUM",
-                                title="Modbus Exception",
-                                description=f"Exception {exception_code} ({exception_desc}) for Function {original_func}",
-                                src=pkt[0].src if hasattr(pkt[0], 'src') else "?",
-                                dst=pkt[0].dst if hasattr(pkt[0], 'dst') else "?",
-                                ts=ts
-                            ))
                             
                     func_name = FUNC_NAMES.get(original_func, f"Unknown ({original_func})")
                     func_counts[func_name] += 1
                     unit_ids[unit_id] += 1
                     
                     is_server_response = (sport == MODBUS_TCP_PORT)
-                    
-                    src_ip = pkt[0].src if hasattr(pkt[0], 'src') else "0.0.0.0"
-                    dst_ip = pkt[0].dst if hasattr(pkt[0], 'dst') else "0.0.0.0"
+
+                    if IP is not None and pkt.haslayer(IP):
+                        src_ip = pkt[IP].src
+                        dst_ip = pkt[IP].dst
+                    else:
+                        src_ip = pkt[0].src if hasattr(pkt[0], 'src') else "0.0.0.0"
+                        dst_ip = pkt[0].dst if hasattr(pkt[0], 'dst') else "0.0.0.0"
                     
                     if not is_server_response:
                         src_ips[src_ip] += 1
-                        
+
                         # Check for Write Operations (Risk)
                         if original_func in (5, 6, 15, 16, 21, 22, 23):
-                            anomalies.append(ModbusAnomaly(
-                                severity="HIGH",
-                                title="Modbus Write Operation",
-                                description=f"Write command ({func_name}) sent to Unit ID {unit_id}",
-                                src=src_ip,
-                                dst=dst_ip,
-                                ts=ts
-                            ))
-                        
+                            write_events[(func_name, unit_id, src_ip, dst_ip)] += 1
+
                         # Diagnostic functions can be risky
                         if original_func in (8, 43):
-                            anomalies.append(ModbusAnomaly(
-                                severity="LOW",
-                                title="Modbus Diagnostic/Info",
-                                description=f"Diagnostic or Identity request ({func_name})",
-                                src=src_ip,
-                                dst=dst_ip,
-                                ts=ts
-                            ))
+                            diagnostic_events[(func_name, src_ip, dst_ip)] += 1
 
                     else:
                         dst_ips[src_ip] += 1 # Server is source
+
+                    if is_exception:
+                        exception_events[(exception_code, exception_desc, original_func, src_ip, dst_ip)] += 1
                         
                     # Store message (limit to reasonable number if memory constraint, but user wants details)
                     messages.append(ModbusMessage(
@@ -356,6 +330,40 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     duration = 0.0
     if start_time and last_time:
         duration = last_time - start_time
+
+    for (func_name, unit_id, src_ip, dst_ip), count in write_events.items():
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(ModbusAnomaly(
+            severity="HIGH",
+            title="Modbus Write Operation",
+            description=f"Write command ({func_name}) sent to Unit ID {unit_id}{suffix}",
+            src=src_ip,
+            dst=dst_ip,
+            ts=0.0,
+        ))
+
+    for (func_name, src_ip, dst_ip), count in diagnostic_events.items():
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(ModbusAnomaly(
+            severity="LOW",
+            title="Modbus Diagnostic/Info",
+            description=f"Diagnostic or Identity request ({func_name}){suffix}",
+            src=src_ip,
+            dst=dst_ip,
+            ts=0.0,
+        ))
+
+    for (exc_code, exc_desc, original_func, src_ip, dst_ip), count in exception_events.items():
+        suffix = f" (x{count})" if count > 1 else ""
+        desc_text = f"Exception {exc_code} ({exc_desc}) for Function {original_func}{suffix}"
+        anomalies.append(ModbusAnomaly(
+            severity="MEDIUM",
+            title="Modbus Exception",
+            description=desc_text,
+            src=src_ip,
+            dst=dst_ip,
+            ts=0.0,
+        ))
 
     return ModbusAnalysis(
         path=path,

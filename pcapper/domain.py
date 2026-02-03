@@ -6,9 +6,8 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from scapy.utils import PcapReader, PcapNgReader
+from .pcap_cache import PcapMeta, get_reader
 
-from .progress import build_statusbar
 from .utils import detect_file_type, safe_float
 from .dns import analyze_dns
 from .netbios import analyze_netbios
@@ -153,12 +152,17 @@ def _parse_http_request(payload: bytes) -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
 
-def analyze_domain(path: Path, show_status: bool = True) -> DomainAnalysis:
+def analyze_domain(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> DomainAnalysis:
     errors: List[str] = []
     detections: List[Dict[str, object]] = []
     anomalies: List[str] = []
 
-    dns_summary = analyze_dns(path, show_status=False)
+    dns_summary = analyze_dns(path, show_status=False, packets=packets, meta=meta)
     netbios_summary = analyze_netbios(path, show_status=False)
     ntlm_summary = analyze_ntlm(path, show_status=False)
     files_summary = analyze_files(path, show_status=False)
@@ -194,22 +198,9 @@ def analyze_domain(path: Path, show_status: bool = True) -> DomainAnalysis:
 
     files = [art.filename for art in files_summary.artifacts]
 
-    file_type = detect_file_type(path)
-    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
-
-    size_bytes = 0
-    try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        pass
-
-    status = build_statusbar(path, enabled=show_status)
-    stream = None
-    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-        candidate = getattr(reader, attr, None)
-        if candidate is not None:
-            stream = candidate
-            break
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, packets=packets, meta=meta, show_status=show_status
+    )
 
     total_packets = 0
     first_seen: Optional[float] = None

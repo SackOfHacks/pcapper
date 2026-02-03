@@ -12,6 +12,8 @@ class InterfaceStat:
     linktype: Optional[str]
     snaplen: Optional[int]
     packet_count: Optional[int]
+    dropped_packets: Optional[int]
+    capture_filter: Optional[str]
     description: Optional[str]
     speed_bps: Optional[int]
     mac: Optional[str]
