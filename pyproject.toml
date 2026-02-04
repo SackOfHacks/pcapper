@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pcapper"
-version = "0.6.0"
+version = "0.6.5"
 description = "Modular PCAP analysis CLI"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,6 +14,7 @@ dependencies = [
     "dpkt>=1.9.8",
     "pydicom>=2.4.4",
     "cryptography>=42.0.0",
+    "geoip2>=4.7.0",
 ]
 
 [project.scripts]
