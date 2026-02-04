@@ -8,9 +8,6 @@ import gzip
 import zlib
 import email
 import socket
-import shutil
-import subprocess
-import tempfile
 from email import policy
 from collections import defaultdict, Counter
 from dataclasses import dataclass
@@ -159,6 +156,19 @@ def _normalize_filename(name: str) -> str:
         return clean if clean else "unknown_file"
     except Exception:
         return "unknown_file"
+
+
+def _unique_output_path(base_dir: Path, filename: str) -> Path:
+    candidate = base_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    for idx in range(1, 10000):
+        alt = base_dir / f"{stem}_{idx}{suffix}"
+        if not alt.exists():
+            return alt
+    return base_dir / f"{stem}_{hashlib.sha256(filename.encode('utf-8', errors='ignore')).hexdigest()[:8]}{suffix}"
 
 def _extract_tftp(payload: bytes) -> Optional[str]:
     if len(payload) < 4:
@@ -1583,53 +1593,52 @@ def _export_with_dpkt(
             with path.open("rb") as handle:
                 try:
                     reader = dpkt.pcapng.Reader(handle)
-                    packets = list(reader)
                 except Exception:
                     handle.seek(0)
                     reader = dpkt.pcap.Reader(handle)
-                    packets = list(reader)
-        except Exception as exc:
-            return FileTransferSummary(path, 0, [], [], [], [], [], [str(exc)])
-
-        idx = 0
-        for ts, buf in packets:
-            idx += 1
-            ip = None
-            try:
-                eth = dpkt.ethernet.Ethernet(buf)
-                if isinstance(eth.data, dpkt.ip.IP) or isinstance(eth.data, dpkt.ip6.IP6):
-                    ip = eth.data
-            except Exception:
-                ip = None
-
-            if ip is None:
-                try:
-                    ip = dpkt.ip.IP(buf)
-                except Exception:
+                idx = 0
+                for ts, buf in reader:
+                    idx += 1
+                    ip = None
                     try:
-                        ip = dpkt.ip6.IP6(buf)
+                        eth = dpkt.ethernet.Ethernet(buf)
+                        if isinstance(eth.data, dpkt.ip.IP) or isinstance(eth.data, dpkt.ip6.IP6):
+                            ip = eth.data
                     except Exception:
+                        ip = None
+
+                    if ip is None:
+                        try:
+                            ip = dpkt.ip.IP(buf)
+                        except Exception:
+                            try:
+                                ip = dpkt.ip6.IP6(buf)
+                            except Exception:
+                                continue
+
+                    if isinstance(ip, dpkt.ip.IP):
+                        src_ip = _dpkt_ip_to_str(ip.src)
+                        dst_ip = _dpkt_ip_to_str(ip.dst)
+                    elif isinstance(ip, dpkt.ip6.IP6):
+                        src_ip = _dpkt_ip_to_str(ip.src)
+                        dst_ip = _dpkt_ip_to_str(ip.dst)
+                    else:
                         continue
 
-            if isinstance(ip, dpkt.ip.IP):
-                src_ip = _dpkt_ip_to_str(ip.src)
-                dst_ip = _dpkt_ip_to_str(ip.dst)
-            elif isinstance(ip, dpkt.ip6.IP6):
-                src_ip = _dpkt_ip_to_str(ip.src)
-                dst_ip = _dpkt_ip_to_str(ip.dst)
-            else:
-                continue
-
-            if isinstance(ip.data, dpkt.tcp.TCP):
-                tcp = ip.data
-                payload = bytes(tcp.data or b"")
-                if payload:
-                    tcp_streams[(src_ip, dst_ip, int(tcp.sport), int(tcp.dport))].append((int(tcp.seq), payload, idx))
-            elif isinstance(ip.data, dpkt.udp.UDP):
-                udp = ip.data
-                payload = bytes(udp.data or b"")
-                if payload:
-                    udp_packets.append((src_ip, dst_ip, int(udp.sport), int(udp.dport), payload, idx))
+                    if isinstance(ip.data, dpkt.tcp.TCP):
+                        tcp = ip.data
+                        payload = bytes(tcp.data or b"")
+                        if payload:
+                            tcp_streams[(src_ip, dst_ip, int(tcp.sport), int(tcp.dport))].append(
+                                (int(tcp.seq), payload, idx)
+                            )
+                    elif isinstance(ip.data, dpkt.udp.UDP):
+                        udp = ip.data
+                        payload = bytes(udp.data or b"")
+                        if payload:
+                            udp_packets.append((src_ip, dst_ip, int(udp.sport), int(udp.dport), payload, idx))
+        except Exception as exc:
+            return FileTransferSummary(path, 0, [], [], [], [], [], [str(exc)])
     else:
         idx = 0
         for pkt in packets:
@@ -2024,7 +2033,7 @@ def _export_with_dpkt(
             search = extract_name.lower()
             for art in artifacts:
                 if art.payload and search in art.filename.lower():
-                    out_p = out_root / art.filename
+                    out_p = _unique_output_path(out_root, art.filename)
                     try:
                         out_p.write_bytes(art.payload)
                     except Exception:

@@ -111,18 +111,26 @@ class LdapAnalysis:
     clients: Counter[str]
     service_counts: Counter[str]
     response_codes: Counter[str]
+    ldap_error_codes: Counter[str]
     request_counts: Counter[str]
     http_methods: Counter[str]
     http_clients: Counter[str]
     urls: Counter[str]
     user_agents: Counter[str]
     ldap_queries: Counter[str]
+    ldap_filter_types: Counter[str]
     ldap_users: Counter[str]
     ldap_systems: Counter[str]
+    ldap_binds: Counter[str]
+    suspicious_attributes: Counter[str]
     secrets: Counter[str]
     files: List[str]
     conversations: List[LdapConversation]
     session_stats: Dict[str, int]
+    cleartext_packets: int
+    ldaps_packets: int
+    public_endpoints: Counter[str]
+    bind_bursts: Counter[str]
     artifacts: List[str]
     anomalies: List[str]
     detections: List[Dict[str, object]]
@@ -211,6 +219,44 @@ def _extract_ldap_strings(payload: bytes) -> List[str]:
     return tokens
 
 
+def _ldap_filter_type(query: str) -> Optional[str]:
+    q = query.lower()
+    if "(objectclass=" in q:
+        return "objectClass"
+    if "(objectcategory=" in q:
+        return "objectCategory"
+    if "(samaccountname=" in q or "samaccountname=" in q:
+        return "sAMAccountName"
+    if "(userprincipalname=" in q or "userprincipalname=" in q:
+        return "userPrincipalName"
+    if "(member=" in q or "member=" in q:
+        return "member"
+    if "(memberof=" in q or "memberof=" in q:
+        return "memberOf"
+    if "mail=" in q:
+        return "mail"
+    if "dnshostname=" in q:
+        return "dNSHostName"
+    if "serviceprincipalname=" in q:
+        return "servicePrincipalName"
+    if "(cn=" in q or "cn=" in q:
+        return "cn"
+    if "(uid=" in q or "uid=" in q:
+        return "uid"
+    return None
+
+
+def _extract_bind_identities(text: str) -> list[str]:
+    identities: list[str] = []
+    for match in DN_TOKEN_RE.findall(text):
+        identities.append(match)
+    if not identities:
+        lower = text.lower()
+        if lower.startswith("cn=") or lower.startswith("uid=") or lower.startswith("dn="):
+            identities.append(text)
+    return identities
+
+
 def _is_public_ip(value: str) -> bool:
     try:
         addr = ipaddress.ip_address(value)
@@ -251,15 +297,23 @@ def analyze_ldap(
     clients = Counter()
     service_counts = Counter()
     response_codes = Counter()
+    ldap_error_codes = Counter()
     request_counts = Counter()
     http_methods = Counter()
     http_clients = Counter()
     urls = Counter()
     user_agents = Counter()
     ldap_queries = Counter()
+    ldap_filter_types = Counter()
     ldap_users = Counter()
     ldap_systems = Counter()
     secrets = Counter()
+    ldap_binds = Counter()
+    suspicious_attributes = Counter()
+    public_endpoints = Counter()
+    bind_buckets: dict[tuple[str, int], int] = defaultdict(int)
+    cleartext_packets = 0
+    ldaps_packets = 0
     convos: Dict[Tuple[str, str, int, str], int] = defaultdict(int)
     artifacts: set[str] = set()
     cleartext_ldap_seen = False
@@ -309,6 +363,13 @@ def analyze_ldap(
                     convos[(src_ip, dst_ip, dport or sport, "TCP")] += 1
                     if dport in LDAP_CLEAR_PORTS or sport in LDAP_CLEAR_PORTS:
                         cleartext_ldap_seen = True
+                        cleartext_packets += 1
+                    if dport in {636, 3269} or sport in {636, 3269}:
+                        ldaps_packets += 1
+                    if _is_public_ip(src_ip):
+                        public_endpoints[src_ip] += 1
+                    if _is_public_ip(dst_ip):
+                        public_endpoints[dst_ip] += 1
 
                 payload = bytes(getattr(tcp_layer, "payload", b""))
                 if payload and payload.startswith((b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ")):
@@ -325,6 +386,16 @@ def analyze_ldap(
                     for token in _extract_ldap_strings(payload):
                         if token:
                             ldap_queries[token] += 1
+                            filter_type = _ldap_filter_type(token)
+                            if filter_type:
+                                ldap_filter_types[filter_type] += 1
+                            lower_token = token.lower()
+                            if "unicodepwd" in lower_token:
+                                suspicious_attributes["unicodePwd"] += 1
+                            if "ms-mcs-admpwd" in lower_token:
+                                suspicious_attributes["ms-Mcs-AdmPwd"] += 1
+                            if "userpassword" in lower_token:
+                                suspicious_attributes["userPassword"] += 1
                             if token.lower().startswith("cn="):
                                 ldap_users[token] += 1
                                 artifacts.add(token)
@@ -337,6 +408,15 @@ def analyze_ldap(
                         if any(hint in lower for hint in FILTER_HINTS) or "(objectclass" in lower:
                             ldap_queries[value] += 1
                             artifacts.add(value)
+                            filter_type = _ldap_filter_type(value)
+                            if filter_type:
+                                ldap_filter_types[filter_type] += 1
+                            if "unicodepwd" in lower:
+                                suspicious_attributes["unicodePwd"] += 1
+                            if "ms-mcs-admpwd" in lower:
+                                suspicious_attributes["ms-Mcs-AdmPwd"] += 1
+                            if "userpassword" in lower:
+                                suspicious_attributes["userPassword"] += 1
 
                         for match in DN_TOKEN_RE.findall(value):
                             ldap_queries[match] += 1
@@ -357,6 +437,12 @@ def analyze_ldap(
                         if any(word in lower for word in ("bind", "search", "modify", "add", "delete", "compare", "extended", "unbind")):
                             if "bind" in lower:
                                 request_counts["Bind"] += 1
+                                for identity in _extract_bind_identities(value):
+                                    if identity:
+                                        ldap_binds[identity] += 1
+                                if ts is not None:
+                                    minute_bucket = int(ts // 60)
+                                    bind_buckets[(src_ip, minute_bucket)] += 1
                             if "search" in lower:
                                 request_counts["Search"] += 1
                             if "modify" in lower:
@@ -382,11 +468,15 @@ def analyze_ldap(
                             for name_lower, name in LDAP_RESULT_NAMES.items():
                                 if name_lower in lower:
                                     response_codes[name] += 1
+                                    if name_lower in {"invalidcredentials", "insufficientaccessrights"}:
+                                        ldap_error_codes[name] += 1
                             numeric_match = re.search(r"resultcode\s*[:=]\s*(\d+)", lower)
                             if numeric_match:
                                 code = int(numeric_match.group(1))
                                 name = LDAP_RESULT_CODES.get(code, str(code))
                                 response_codes[f"{code} ({name})"] += 1
+                                if code != 0:
+                                    ldap_error_codes[f"{code} ({name})"] += 1
 
             if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                 udp_layer = pkt[UDP]  # type: ignore[index]
@@ -399,6 +489,11 @@ def analyze_ldap(
                     service_counts[f"UDP/{dport or sport}"] += 1
                     convos[(src_ip, dst_ip, dport or sport, "UDP")] += 1
                     udp_ldap_seen = True
+                    cleartext_packets += 1
+                    if _is_public_ip(src_ip):
+                        public_endpoints[src_ip] += 1
+                    if _is_public_ip(dst_ip):
+                        public_endpoints[dst_ip] += 1
 
     finally:
         status.finish()
@@ -469,6 +564,48 @@ def analyze_ldap(
             "source": "LDAP",
         })
 
+    if ldap_binds:
+        anonymous_binds = [name for name in ldap_binds.keys() if "anonymous" in name.lower() or "guest" in name.lower()]
+        if anonymous_binds:
+            detections.append({
+                "severity": "warning",
+                "summary": "Anonymous/guest LDAP binds observed",
+                "details": ", ".join(anonymous_binds[:10]),
+                "source": "LDAP",
+            })
+
+    search_count = request_counts.get("Search", 0)
+    if search_count >= 50 or len(ldap_queries) >= 50:
+        detections.append({
+            "severity": "warning",
+            "summary": "LDAP enumeration indicators",
+            "details": f"Search requests: {search_count}, unique queries: {len(ldap_queries)}.",
+            "source": "LDAP",
+        })
+
+    invalid_creds = ldap_error_codes.get("invalidcredentials", 0) or ldap_error_codes.get("49 (invalidCredentials)", 0)
+    if invalid_creds and len(ldap_binds) >= 10:
+        detections.append({
+            "severity": "warning",
+            "summary": "Potential LDAP password spraying",
+            "details": f"Invalid credentials: {invalid_creds}, unique bind identities: {len(ldap_binds)}.",
+            "source": "LDAP",
+        })
+
+    bind_bursts = Counter()
+    for (client_ip, _minute), count in bind_buckets.items():
+        if count > bind_bursts.get(client_ip, 0):
+            bind_bursts[client_ip] = count
+    if bind_bursts:
+        top_burst = max(bind_bursts.values())
+        if top_burst >= 20:
+            detections.append({
+                "severity": "warning",
+                "summary": "Potential LDAP brute-force (high bind rate)",
+                "details": f"Peak binds/min observed: {top_burst}",
+                "source": "LDAP",
+            })
+
     return LdapAnalysis(
         path=path,
         duration=duration,
@@ -478,18 +615,26 @@ def analyze_ldap(
         clients=clients,
         service_counts=service_counts,
         response_codes=response_codes,
+        ldap_error_codes=ldap_error_codes,
         request_counts=request_counts,
         http_methods=http_methods,
         http_clients=http_clients,
         urls=urls,
         user_agents=user_agents,
         ldap_queries=ldap_queries,
+        ldap_filter_types=ldap_filter_types,
         ldap_users=ldap_users,
         ldap_systems=ldap_systems,
+        ldap_binds=ldap_binds,
+        suspicious_attributes=suspicious_attributes,
         secrets=secrets,
         files=files,
         conversations=conversations,
         session_stats=session_stats,
+        cleartext_packets=cleartext_packets,
+        ldaps_packets=ldaps_packets,
+        public_endpoints=public_endpoints,
+        bind_bursts=bind_bursts,
         artifacts=sorted(artifacts),
         anomalies=anomalies,
         detections=detections,

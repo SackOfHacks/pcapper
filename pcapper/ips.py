@@ -963,6 +963,13 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
     abuse_key = os.environ.get("PCAPPER_ABUSEIPDB_KEY")
     otx_key = os.environ.get("PCAPPER_OTX_KEY")
     vt_key = os.environ.get("PCAPPER_VT_KEY")
+    opt_in_raw = os.environ.get("PCAPPER_INTEL_OPT_IN", "0").strip().lower()
+    opt_in = opt_in_raw in {"1", "true", "yes", "y"}
+    if not opt_in and (abuse_key or otx_key or vt_key):
+        errors.append("External IP intelligence lookups disabled; set PCAPPER_INTEL_OPT_IN=1 to enable.")
+        abuse_key = None
+        otx_key = None
+        vt_key = None
     try:
         intel_limit = int(os.environ.get("PCAPPER_IP_INTEL_LIMIT", "10"))
     except Exception:

@@ -21,6 +21,10 @@ from .smb import SmbSummary
 from .nfs import NfsSummary
 from .strings import StringsSummary
 from .certificates import CertificateSummary
+from .tls import TlsSummary
+from .tcp import TcpSummary
+from .udp import UdpSummary
+from .exfil import ExfilSummary
 from .http import HttpSummary
 from .sizes import SizeSummary, render_size_sparkline
 from .ips import IpSummary
@@ -676,20 +680,28 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25) -> str:
             rows.append([query, str(count)])
         lines.append(_format_table(rows))
 
+    if summary.ldap_filter_types:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top LDAP Queries by Filter Type"))
+        rows = [["Filter Type", "Count"]]
+        for name, count in summary.ldap_filter_types.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.ldap_binds:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Binds"))
+        rows = [["Bind Identity", "Count"]]
+        for name, count in summary.ldap_binds.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
     if summary.ldap_users:
         lines.append(SUBSECTION_BAR)
         lines.append(header("LDAP Users"))
         rows = [["User", "Count"]]
         for user, count in summary.ldap_users.most_common(limit):
             rows.append([user, str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.ldap_domains:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("LDAP Domains"))
-        rows = [["Domain", "Count"]]
-        for name, count in summary.ldap_domains.most_common(limit):
-            rows.append([name, str(count)])
         lines.append(_format_table(rows))
 
     if summary.ldap_systems:
@@ -700,43 +712,19 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25) -> str:
             rows.append([system, str(count)])
         lines.append(_format_table(rows))
 
-    if summary.urls:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed URLs"))
-        rows = [["URL", "Count"]]
-        for url, count in summary.urls.most_common(limit):
-            rows.append([url, str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.user_agents:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed User Agents"))
-        rows = [["User Agent", "Count"]]
-        for ua, count in summary.user_agents.most_common(limit):
-            rows.append([ua, str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.http_methods:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("HTTP Request Summary"))
-        rows = [["Method", "Count"]]
-        for name, count in summary.http_methods.most_common(limit):
-            rows.append([name, str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.http_clients:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("HTTP Clients"))
-        rows = [["Client", "Count"]]
-        for client, count in summary.http_clients.most_common(limit):
-            rows.append([client, str(count)])
-        lines.append(_format_table(rows))
-
     if summary.response_codes:
         lines.append(SUBSECTION_BAR)
         lines.append(header("LDAP Response Codes"))
         rows = [["Code", "Count"]]
         for code, count in summary.response_codes.most_common(limit):
+            rows.append([code, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.ldap_error_codes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top LDAP Errors by Code"))
+        rows = [["Error", "Count"]]
+        for code, count in summary.ldap_error_codes.most_common(limit):
             rows.append([code, str(count)])
         lines.append(_format_table(rows))
 
@@ -748,6 +736,17 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25) -> str:
             rows.append([name, str(count)])
         lines.append(_format_table(rows))
 
+    if summary.cleartext_packets or summary.ldaps_packets:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("LDAP Cleartext vs LDAPS Ratio"))
+        total = summary.cleartext_packets + summary.ldaps_packets
+        clear_pct = (summary.cleartext_packets / total * 100.0) if total else 0.0
+        ldaps_pct = (summary.ldaps_packets / total * 100.0) if total else 0.0
+        rows = [["Type", "Packets", "Percent"]]
+        rows.append(["Cleartext", str(summary.cleartext_packets), f"{clear_pct:.1f}%"])
+        rows.append(["LDAPS", str(summary.ldaps_packets), f"{ldaps_pct:.1f}%"])
+        lines.append(_format_table(rows))
+
     if summary.secrets:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Secrets/Passwords"))
@@ -756,11 +755,29 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25) -> str:
             rows.append([secret, str(count)])
         lines.append(_format_table(rows))
 
-    if summary.files:
+    if summary.public_endpoints:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Files Discovered"))
-        for name in summary.files[:limit]:
-            lines.append(f"- {name}")
+        lines.append(header("Top Public IP LDAP Endpoints"))
+        rows = [["Endpoint", "Count"]]
+        for ip, count in summary.public_endpoints.most_common(limit):
+            rows.append([ip, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.suspicious_attributes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Suspicious Attributes Queried"))
+        rows = [["Attribute", "Count"]]
+        for name, count in summary.suspicious_attributes.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.bind_bursts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Burst Activity / Brute Force Indicators"))
+        rows = [["Client", "Peak Binds/Min"]]
+        for client, count in summary.bind_bursts.most_common(limit):
+            rows.append([client, str(count)])
+        lines.append(_format_table(rows))
 
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
@@ -782,6 +799,161 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25) -> str:
             details = str(item.get("details", ""))
             if "extension/type mismatch" in summary_text.lower():
                 severity = "high"
+            if severity == "warning":
+                marker = warn("[WARN]")
+            elif severity == "critical":
+                marker = danger("[CRIT]")
+            elif severity == "high":
+                marker = danger("[HIGH]")
+                summary_text = danger(summary_text)
+            else:
+                marker = ok("[INFO]")
+            lines.append(f"{marker} {summary_text}")
+            if details:
+                lines.append(muted(f"  {details}"))
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
+def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25) -> str:
+    from .kerberos import KerberosAnalysis
+
+    if not summary:
+        return ""
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"KERBEROS ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Duration", f"{summary.duration:.2f}s"))
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
+    if summary.session_stats:
+        lines.append(_format_kv("Kerberos Sessions", str(summary.session_stats.get("total_sessions", 0))))
+        lines.append(_format_kv("Unique Clients", str(summary.session_stats.get("unique_clients", 0))))
+        lines.append(_format_kv("Unique Servers", str(summary.session_stats.get("unique_servers", 0))))
+
+    if summary.servers or summary.clients:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Kerberos Servers & Clients"))
+        rows = [["Servers", "Clients"]]
+        server_text = ", ".join(f"{ip}({count})" for ip, count in summary.servers.most_common(10)) or "-"
+        client_text = ", ".join(f"{ip}({count})" for ip, count in summary.clients.most_common(10)) or "-"
+        rows.append([server_text, client_text])
+        lines.append(_format_table(rows))
+
+    if summary.service_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Kerberos Service Ports"))
+        rows = [["Service", "Name", "Count"]]
+        for svc, count in summary.service_counts.most_common(limit):
+            svc_name = "-"
+            try:
+                _proto, port_str = svc.split("/", 1)
+                port = int(port_str)
+                svc_name = COMMON_PORTS.get(port, "-")
+            except Exception:
+                svc_name = "-"
+            rows.append([svc, svc_name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.conversations:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Kerberos Conversations"))
+        rows = [["Src", "Dst", "Port", "Proto", "Packets"]]
+        for convo in summary.conversations[:limit]:
+            rows.append([convo.src_ip, convo.dst_ip, str(convo.dst_port), convo.proto, str(convo.packets)])
+        lines.append(_format_table(rows))
+
+    if summary.request_types:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Kerberos Request Types"))
+        rows = [["Type", "Count"]]
+        for name, count in summary.request_types.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.error_codes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Kerberos Errors by Code"))
+        rows = [["Error", "Count"]]
+        for name, count in summary.error_codes.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.realms:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Kerberos Realms"))
+        rows = [["Realm", "Count"]]
+        for name, count in summary.realms.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.principals:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Kerberos Principals"))
+        rows = [["Principal", "Count"]]
+        for name, count in summary.principals.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.spns:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Service Principals (SPNs)"))
+        rows = [["SPN", "Count"]]
+        for name, count in summary.spns.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.public_endpoints:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Public IP Kerberos Endpoints"))
+        rows = [["Endpoint", "Count"]]
+        for ip, count in summary.public_endpoints.most_common(limit):
+            rows.append([ip, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.suspicious_attributes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Suspicious Kerberos Indicators"))
+        rows = [["Indicator", "Count"]]
+        for name, count in summary.suspicious_attributes.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.bind_bursts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Burst Activity / Brute Force Indicators"))
+        rows = [["Client", "Peak AS/TGS Requests/Min"]]
+        for client, count in summary.bind_bursts.most_common(limit):
+            rows.append([client, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts"))
+        lines.append(muted(", ".join(summary.artifacts[:limit])))
+
+    if summary.anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies"))
+        for item in summary.anomalies[:limit]:
+            lines.append(warn(f"- {item}"))
+
+    if summary.detections:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Detections"))
+        for item in summary.detections:
+            severity = str(item.get("severity", "info")).lower()
+            summary_text = str(item.get("summary", ""))
+            details = str(item.get("details", ""))
             if severity == "warning":
                 marker = warn("[WARN]")
             elif severity == "critical":
@@ -1774,6 +1946,593 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
             lines.append(f"{marker} {summary_text}")
             if details:
                 lines.append(muted(f"  {details}"))
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
+def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = False) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"TLS/HTTPS ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("TLS Packets", str(summary.tls_packets)))
+    lines.append(_format_kv("Client Hellos", str(summary.client_hellos)))
+    lines.append(_format_kv("Server Hellos", str(summary.server_hellos)))
+    lines.append(_format_kv("Unique Clients", str(len(summary.client_counts))))
+    lines.append(_format_kv("Unique Servers", str(len(summary.server_counts))))
+    lines.append(_format_kv("Conversations", str(len(summary.conversations))))
+    lines.append(_format_kv("Start", format_ts(summary.first_seen)))
+    lines.append(_format_kv("End", format_ts(summary.last_seen)))
+    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+
+    if summary.versions:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TLS Versions"))
+        rows = [["Version", "Count"]]
+        for version, count in summary.versions.most_common(limit):
+            rows.append([version, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.cipher_suites:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Cipher Suites (Server Selected)"))
+        rows = [["Cipher", "Count"]]
+        for cipher, count in summary.cipher_suites.most_common(limit):
+            rows.append([cipher, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.sni_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Server Name Indication (SNI)"))
+        rows = [["SNI", "Count"]]
+        for sni, count in summary.sni_counts.most_common(limit):
+            rows.append([sni, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.alpn_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("ALPN Protocols"))
+        rows = [["ALPN", "Count"]]
+        for alpn, count in summary.alpn_counts.most_common(limit):
+            rows.append([alpn, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.ja3_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("JA3 Fingerprints"))
+        rows = [["JA3", "Count"]]
+        for ja3, count in summary.ja3_counts.most_common(limit):
+            rows.append([ja3, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.ja4_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("JA4 Fingerprints"))
+        rows = [["JA4", "Count"]]
+        for ja4, count in summary.ja4_counts.most_common(limit):
+            rows.append([ja4, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.ja4s_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("JA4S Fingerprints"))
+        rows = [["JA4S", "Count"]]
+        for ja4s, count in summary.ja4s_counts.most_common(limit):
+            rows.append([ja4s, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.conversations:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TLS Conversations"))
+        rows = [["Client", "Server", "Port", "Packets", "Bytes", "First Seen", "Last Seen", "SNI"]]
+        for convo in summary.conversations[:limit]:
+            rows.append([
+                convo.client_ip,
+                convo.server_ip,
+                str(convo.server_port),
+                str(convo.packets),
+                format_bytes_as_mb(convo.bytes),
+                format_ts(convo.first_seen),
+                format_ts(convo.last_seen),
+                convo.sni or "-",
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.client_counts or summary.server_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top TLS Clients & Servers"))
+        rows = [["Clients", "Servers"]]
+        client_text = ", ".join(f"{ip}({count})" for ip, count in summary.client_counts.most_common(10)) or "-"
+        server_text = ", ".join(f"{ip}({count})" for ip, count in summary.server_counts.most_common(10)) or "-"
+        rows.append([client_text, server_text])
+        lines.append(_format_table(rows))
+
+    if summary.server_ports:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TLS Service Ports"))
+        rows = [["Port", "Count"]]
+        for port, count in summary.server_ports.most_common(limit):
+            rows.append([str(port), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.http_requests or summary.http_responses:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Observations (Plaintext)"))
+        lines.append(muted("Note: HTTPS payloads are encrypted; HTTP data shown here is plaintext traffic only."))
+        lines.append(_format_kv("HTTP Requests", str(summary.http_requests)))
+        lines.append(_format_kv("HTTP Responses", str(summary.http_responses)))
+
+        if summary.http_methods:
+            rows = [["Method", "Count"]]
+            for method, count in summary.http_methods.most_common(limit):
+                rows.append([method, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_statuses:
+            rows = [["Status", "Count"]]
+            for status, count in summary.http_statuses.most_common(limit):
+                rows.append([status, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_urls:
+            rows = [["URL", "Count"]]
+            for url, count in summary.http_urls.most_common(limit):
+                rows.append([url, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_user_agents:
+            rows = [["User-Agent", "Count"]]
+            for ua, count in summary.http_user_agents.most_common(limit):
+                rows.append([ua, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_files:
+            rows = [["File", "Count"]]
+            for fname, count in summary.http_files.most_common(limit):
+                rows.append([fname, str(count)])
+            lines.append(_format_table(rows))
+
+    if summary.cert_count:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TLS Certificates"))
+        lines.append(_format_kv("Certificates", str(summary.cert_count)))
+        if summary.cert_subjects:
+            rows = [["Subject", "Count"]]
+            for subject, count in summary.cert_subjects.most_common(limit):
+                rows.append([subject, str(count)])
+            lines.append(_format_table(rows))
+        if summary.cert_issuers:
+            rows = [["Issuer", "Count"]]
+            for issuer, count in summary.cert_issuers.most_common(limit):
+                rows.append([issuer, str(count)])
+            lines.append(_format_table(rows))
+        if summary.weak_certs or summary.expired_certs or summary.self_signed_certs:
+            rows = [["Weak", "Expired", "Self-Signed"]]
+            rows.append([str(summary.weak_certs), str(summary.expired_certs), str(summary.self_signed_certs)])
+            lines.append(_format_table(rows))
+
+    if summary.detections:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Detections"))
+        for item in summary.detections:
+            severity = str(item.get("severity", "info")).lower()
+            summary_text = str(item.get("summary", ""))
+            details = str(item.get("details", ""))
+            if severity == "critical":
+                marker = danger("[CRIT]")
+            elif severity == "high":
+                marker = danger("[HIGH]")
+            elif severity == "warning":
+                marker = warn("[WARN]")
+            else:
+                marker = ok("[INFO]")
+            lines.append(f"{marker} {summary_text}")
+            if details:
+                lines.append(muted(f"  {details}"))
+            if summary_text == "TCP retransmission spikes" and summary.retrans_timeseries:
+                lines.append(muted(f"  Trend: {sparkline(summary.retrans_timeseries)}"))
+
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts"))
+        for item in summary.artifacts[:limit]:
+            lines.append(muted(f"- {item}"))
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
+def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = False) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"TCP ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("TCP Packets", str(summary.tcp_packets)))
+    lines.append(_format_kv("Unique Clients", str(len(summary.client_counts))))
+    lines.append(_format_kv("Unique Servers", str(len(summary.server_counts))))
+    lines.append(_format_kv("Conversations", str(len(summary.conversations))))
+    lines.append(_format_kv("Start", format_ts(summary.first_seen)))
+    lines.append(_format_kv("End", format_ts(summary.last_seen)))
+    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+
+    if summary.conversations:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TCP Conversations"))
+        rows = [["Src", "Dst", "Sport", "Dport", "Packets", "Bytes", "SYN", "SYN-ACK", "RST", "FIN"]]
+        for convo in summary.conversations[:limit]:
+            rows.append([
+                convo.src_ip,
+                convo.dst_ip,
+                str(convo.src_port),
+                str(convo.dst_port),
+                str(convo.packets),
+                format_bytes_as_mb(convo.bytes),
+                str(convo.syn),
+                str(convo.syn_ack),
+                str(convo.rst),
+                str(convo.fin),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.client_counts or summary.server_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top TCP Clients & Servers"))
+        rows = [["Clients", "Servers"]]
+        clients = [f"{ip}({count})" for ip, count in summary.client_counts.most_common(10)]
+        servers = [f"{ip}({count})" for ip, count in summary.server_counts.most_common(10)]
+        max_len = max(len(clients), len(servers), 1)
+        for idx in range(max_len):
+            rows.append([
+                clients[idx] if idx < len(clients) else "-",
+                servers[idx] if idx < len(servers) else "-",
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.port_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top TCP Destination Ports"))
+        rows = [["Port", "Count"]]
+        for port, count in summary.port_counts.most_common(limit):
+            rows.append([str(port), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.services:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TCP Services"))
+        rows = [["Service", "Port", "Proto", "Count"]]
+        for svc in summary.services[:limit]:
+            rows.append([
+                str(svc.get("service", "-")),
+                str(svc.get("port", "-")),
+                str(svc.get("proto", "-")),
+                str(svc.get("count", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.http_requests or summary.http_responses:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Observations (Plaintext)"))
+        lines.append(muted("Note: HTTPS payloads are encrypted; HTTP data shown here is plaintext traffic only."))
+        lines.append(_format_kv("HTTP Requests", str(summary.http_requests)))
+        lines.append(_format_kv("HTTP Responses", str(summary.http_responses)))
+
+        if summary.http_methods:
+            rows = [["Method", "Count"]]
+            for method, count in summary.http_methods.most_common(limit):
+                rows.append([method, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_statuses:
+            rows = [["Status", "Count"]]
+            for status, count in summary.http_statuses.most_common(limit):
+                rows.append([status, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_urls:
+            rows = [["URL", "Count"]]
+            for url, count in summary.http_urls.most_common(limit):
+                rows.append([url, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_user_agents:
+            rows = [["User-Agent", "Count"]]
+            for ua, count in summary.http_user_agents.most_common(limit):
+                rows.append([ua, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_files:
+            rows = [["File", "Count"]]
+            for fname, count in summary.http_files.most_common(limit):
+                rows.append([fname, str(count)])
+            lines.append(_format_table(rows))
+
+    if summary.file_artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Files Discovered (All Protocols)"))
+        rows = [["Filename", "Count"]]
+        for fname, count in summary.file_artifacts.most_common(limit):
+            rows.append([fname, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.detections:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Detections"))
+        for item in summary.detections:
+            severity = str(item.get("severity", "info")).lower()
+            summary_text = str(item.get("summary", ""))
+            details = str(item.get("details", ""))
+            if severity == "critical":
+                marker = danger("[CRIT]")
+            elif severity == "high":
+                marker = danger("[HIGH]")
+            elif severity == "warning":
+                marker = warn("[WARN]")
+            else:
+                marker = ok("[INFO]")
+            lines.append(f"{marker} {summary_text}")
+            if details:
+                lines.append(muted(f"  {details}"))
+
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts"))
+        for item in summary.artifacts[:limit]:
+            lines.append(muted(f"- {item}"))
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
+def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = False) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"UDP ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("UDP Packets", str(summary.udp_packets)))
+    lines.append(_format_kv("Unique Clients", str(len(summary.client_counts))))
+    lines.append(_format_kv("Unique Servers", str(len(summary.server_counts))))
+    lines.append(_format_kv("Conversations", str(len(summary.conversations))))
+    lines.append(_format_kv("Start", format_ts(summary.first_seen)))
+    lines.append(_format_kv("End", format_ts(summary.last_seen)))
+    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+
+    if summary.conversations:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("UDP Conversations"))
+        rows = [["Src", "Dst", "Sport", "Dport", "Packets", "Bytes"]]
+        for convo in summary.conversations[:limit]:
+            rows.append([
+                convo.src_ip,
+                convo.dst_ip,
+                str(convo.src_port),
+                str(convo.dst_port),
+                str(convo.packets),
+                format_bytes_as_mb(convo.bytes),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.client_counts or summary.server_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top UDP Clients & Servers"))
+        rows = [["Clients", "Servers"]]
+        client_text = ", ".join(f"{ip}({count})" for ip, count in summary.client_counts.most_common(10)) or "-"
+        server_text = ", ".join(f"{ip}({count})" for ip, count in summary.server_counts.most_common(10)) or "-"
+        rows.append([client_text, server_text])
+        lines.append(_format_table(rows))
+
+    if summary.port_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top UDP Destination Ports"))
+        rows = [["Port", "Count"]]
+        for port, count in summary.port_counts.most_common(limit):
+            rows.append([str(port), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.services:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("UDP Services"))
+        rows = [["Service", "Port", "Proto", "Count"]]
+        for svc in summary.services[:limit]:
+            rows.append([
+                str(svc.get("service", "-")),
+                str(svc.get("port", "-")),
+                str(svc.get("proto", "-")),
+                str(svc.get("count", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.http_requests or summary.http_responses:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Observations (Plaintext)"))
+        lines.append(muted("Note: HTTPS payloads are encrypted; HTTP data shown here is plaintext traffic only."))
+        lines.append(_format_kv("HTTP Requests", str(summary.http_requests)))
+        lines.append(_format_kv("HTTP Responses", str(summary.http_responses)))
+
+        if summary.http_methods:
+            rows = [["Method", "Count"]]
+            for method, count in summary.http_methods.most_common(limit):
+                rows.append([method, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_statuses:
+            rows = [["Status", "Count"]]
+            for status, count in summary.http_statuses.most_common(limit):
+                rows.append([status, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_urls:
+            rows = [["URL", "Count"]]
+            for url, count in summary.http_urls.most_common(limit):
+                rows.append([url, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_user_agents:
+            rows = [["User-Agent", "Count"]]
+            for ua, count in summary.http_user_agents.most_common(limit):
+                rows.append([ua, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.http_files:
+            rows = [["File", "Count"]]
+            for fname, count in summary.http_files.most_common(limit):
+                rows.append([fname, str(count)])
+            lines.append(_format_table(rows))
+
+    if summary.file_artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Files Discovered (All Protocols)"))
+        rows = [["Filename", "Count"]]
+        for fname, count in summary.file_artifacts.most_common(limit):
+            rows.append([fname, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.detections:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Detections"))
+        for item in summary.detections:
+            severity = str(item.get("severity", "info")).lower()
+            summary_text = str(item.get("summary", ""))
+            details = str(item.get("details", ""))
+            if severity == "critical":
+                marker = danger("[CRIT]")
+            elif severity == "high":
+                marker = danger("[HIGH]")
+            elif severity == "warning":
+                marker = warn("[WARN]")
+            else:
+                marker = ok("[INFO]")
+            lines.append(f"{marker} {summary_text}")
+            if details:
+                lines.append(muted(f"  {details}"))
+
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts"))
+        for item in summary.artifacts[:limit]:
+            lines.append(muted(f"- {item}"))
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
+def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool = False) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"EXFILTRATION ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
+    lines.append(_format_kv("Outbound Bytes", format_bytes_as_mb(summary.outbound_bytes)))
+    lines.append(_format_kv("Start", format_ts(summary.first_seen)))
+    lines.append(_format_kv("End", format_ts(summary.last_seen)))
+    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+
+    if summary.outbound_flows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Outbound Flows (Private -> Public)"))
+        rows = [["Src", "Dst", "Bytes"]]
+        for item in summary.outbound_flows[:limit]:
+            rows.append([
+                str(item.get("src", "-")),
+                str(item.get("dst", "-")),
+                format_bytes_as_mb(int(item.get("bytes", 0))),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.dns_tunnel_suspects:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("DNS Tunneling Heuristics"))
+        rows = [["Src", "Total", "Unique", "Long"]]
+        for item in summary.dns_tunnel_suspects[:limit]:
+            rows.append([
+                str(item.get("src", "-")),
+                str(item.get("total", "-")),
+                str(item.get("unique", "-")),
+                str(item.get("long", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.http_post_suspects:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Large HTTP POST Payloads"))
+        rows = [["Src", "Dst", "Host", "URI", "Bytes", "Content-Type"]]
+        for item in summary.http_post_suspects[:limit]:
+            rows.append([
+                str(item.get("src", "-")),
+                str(item.get("dst", "-")),
+                str(item.get("host", "-")),
+                str(item.get("uri", "-")),
+                str(item.get("bytes", "-")),
+                str(item.get("content_type", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.file_artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Files Discovered"))
+        rows = [["Filename", "Size", "Note"]]
+        for item in summary.file_artifacts[:limit]:
+            size_val = item.get("size")
+            rows.append([
+                str(item.get("filename", "-")),
+                format_bytes_as_mb(int(size_val)) if isinstance(size_val, int) else "-",
+                str(item.get("note", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.detections:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Detections"))
+        for item in summary.detections:
+            severity = str(item.get("severity", "info")).lower()
+            summary_text = str(item.get("summary", ""))
+            details = str(item.get("details", ""))
+            if severity == "critical":
+                marker = danger("[CRIT]")
+            elif severity == "high":
+                marker = danger("[HIGH]")
+            elif severity == "warning":
+                marker = warn("[WARN]")
+            else:
+                marker = ok("[INFO]")
+            lines.append(f"{marker} {summary_text}")
+            if details:
+                lines.append(muted(f"  {details}"))
+
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts"))
+        for item in summary.artifacts[:limit]:
+            lines.append(muted(f"- {item}"))
 
     lines.append(SECTION_BAR)
     return "\n".join(lines)

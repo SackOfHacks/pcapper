@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import OrderedDict
+import os
 import struct
 from pathlib import Path
 from typing import Iterable, Optional
@@ -11,7 +13,8 @@ from .progress import build_statusbar
 from .utils import detect_file_type
 
 
-_PACKET_CACHE: dict[Path, tuple[list[object], "PcapMeta"]] = {}
+_PACKET_CACHE: "OrderedDict[Path, tuple[list[object], 'PcapMeta']]" = OrderedDict()
+_CACHE_BYTES = 0
 
 
 @dataclass(frozen=True)
@@ -57,76 +60,102 @@ def _read_pcapng_interfaces(path: Path) -> list[dict[str, object]]:
     if_stats: dict[int, dict[str, object]] = {}
     try:
         with path.open("rb") as handle:
-            data = handle.read()
+            endian = "<"
+            while True:
+                header = handle.read(8)
+                if len(header) < 8:
+                    break
+                block_type = struct.unpack("<I", header[:4])[0]
+                if block_type == 0x0A0D0D0A:
+                    block_len = struct.unpack("<I", header[4:8])[0]
+                    if block_len < 12:
+                        block_len = struct.unpack(">I", header[4:8])[0]
+                else:
+                    block_len = struct.unpack(f"{endian}I", header[4:8])[0]
+
+                if block_len < 12 or block_len > 64 * 1024 * 1024:
+                    break
+
+                if block_type == 0x0A0D0D0A:
+                    body_len = block_len - 12
+                    bom_bytes = handle.read(4)
+                    if len(bom_bytes) < 4:
+                        break
+                    bom = struct.unpack("<I", bom_bytes)[0]
+                    if bom == 0x1A2B3C4D:
+                        endian = "<"
+                    elif bom == 0x4D3C2B1A:
+                        endian = ">"
+                    remaining = body_len - 4
+                    if remaining > 0:
+                        handle.seek(remaining, 1)
+                    handle.seek(4, 1)
+                    continue
+
+                if block_type == 0x00000001:
+                    body_len = block_len - 12
+                    body = handle.read(body_len)
+                    if len(body) < body_len:
+                        break
+                    if len(body) >= 8:
+                        linktype, _reserved, snaplen = struct.unpack(f"{endian}HHI", body[:8])
+                        iface: dict[str, object] = {
+                            "linktype": linktype,
+                            "snaplen": snaplen,
+                        }
+                        opt_offset = 8
+                        while opt_offset + 4 <= len(body):
+                            code, length = struct.unpack(f"{endian}HH", body[opt_offset:opt_offset + 4])
+                            opt_offset += 4
+                            if code == 0:
+                                break
+                            value = body[opt_offset:opt_offset + length]
+                            opt_offset += (length + 3) & ~3
+
+                            if code == 2:  # if_name
+                                iface["if_name"] = value.rstrip(b"\x00").decode(errors="ignore")
+                            elif code == 3:  # if_description
+                                iface["if_description"] = value.rstrip(b"\x00").decode(errors="ignore")
+                            elif code == 6:  # if_MACaddr
+                                iface["if_macaddr"] = ":".join(f"{b:02x}" for b in value[:6])
+                            elif code == 8 and len(value) >= 8:  # if_speed
+                                iface["if_speed"] = struct.unpack(f"{endian}Q", value[:8])[0]
+                            elif code == 11 and len(value) >= 1:  # if_filter
+                                filter_val = value[1:]
+                                iface["if_filter"] = filter_val.rstrip(b"\x00").decode(errors="ignore")
+                            elif code == 12:  # if_os
+                                iface["if_os"] = value.rstrip(b"\x00").decode(errors="ignore")
+
+                        iface["id"] = len(interfaces)
+                        interfaces.append(iface)
+
+                    handle.seek(4, 1)
+                    continue
+
+                if block_type == 0x00000005:
+                    body_len = block_len - 12
+                    body = handle.read(body_len)
+                    if len(body) < body_len:
+                        break
+                    if len(body) >= 12:
+                        iface_id = struct.unpack(f"{endian}I", body[:4])[0]
+                        opt_offset = 12
+                        stats = if_stats.setdefault(iface_id, {})
+                        while opt_offset + 4 <= len(body):
+                            code, length = struct.unpack(f"{endian}HH", body[opt_offset:opt_offset + 4])
+                            opt_offset += 4
+                            if code == 0:
+                                break
+                            value = body[opt_offset:opt_offset + length]
+                            opt_offset += (length + 3) & ~3
+                            if code == 5 and len(value) >= 8:  # isb_ifdrop
+                                stats["dropcount"] = struct.unpack(f"{endian}Q", value[:8])[0]
+                    handle.seek(4, 1)
+                    continue
+
+                handle.seek(block_len - 8, 1)
     except Exception:
         return interfaces
-
-    offset = 0
-    data_len = len(data)
-    endian = "<"
-    while offset + 12 <= data_len:
-        if data[offset:offset + 4] == b"\x0a\x0d\x0d\x0a":
-            if offset + 16 <= data_len:
-                bom = struct.unpack("<I", data[offset + 8:offset + 12])[0]
-                if bom == 0x1A2B3C4D:
-                    endian = "<"
-                elif bom == 0x4D3C2B1A:
-                    endian = ">"
-        try:
-            block_type, block_len = struct.unpack(f"{endian}II", data[offset:offset + 8])
-        except Exception:
-            break
-        if block_len < 12 or offset + block_len > data_len:
-            break
-        body = data[offset + 8:offset + block_len - 4]
-
-        if block_type == 0x00000001 and len(body) >= 8:
-            linktype, _reserved, snaplen = struct.unpack(f"{endian}HHI", body[:8])
-            iface: dict[str, object] = {
-                "linktype": linktype,
-                "snaplen": snaplen,
-            }
-            opt_offset = 8
-            while opt_offset + 4 <= len(body):
-                code, length = struct.unpack(f"{endian}HH", body[opt_offset:opt_offset + 4])
-                opt_offset += 4
-                if code == 0:
-                    break
-                value = body[opt_offset:opt_offset + length]
-                opt_offset += (length + 3) & ~3
-
-                if code == 2:  # if_name
-                    iface["if_name"] = value.rstrip(b"\x00").decode(errors="ignore")
-                elif code == 3:  # if_description
-                    iface["if_description"] = value.rstrip(b"\x00").decode(errors="ignore")
-                elif code == 6:  # if_MACaddr
-                    iface["if_macaddr"] = ":".join(f"{b:02x}" for b in value[:6])
-                elif code == 8 and len(value) >= 8:  # if_speed
-                    iface["if_speed"] = struct.unpack(f"{endian}Q", value[:8])[0]
-                elif code == 11 and len(value) >= 1:  # if_filter
-                    filter_val = value[1:]
-                    iface["if_filter"] = filter_val.rstrip(b"\x00").decode(errors="ignore")
-                elif code == 12:  # if_os
-                    iface["if_os"] = value.rstrip(b"\x00").decode(errors="ignore")
-
-            iface["id"] = len(interfaces)
-            interfaces.append(iface)
-
-        elif block_type == 0x00000005 and len(body) >= 12:
-            iface_id = struct.unpack(f"{endian}I", body[:4])[0]
-            opt_offset = 12
-            stats = if_stats.setdefault(iface_id, {})
-            while opt_offset + 4 <= len(body):
-                code, length = struct.unpack(f"{endian}HH", body[opt_offset:opt_offset + 4])
-                opt_offset += 4
-                if code == 0:
-                    break
-                value = body[opt_offset:opt_offset + length]
-                opt_offset += (length + 3) & ~3
-                if code == 5 and len(value) >= 8:  # isb_ifdrop
-                    stats["dropcount"] = struct.unpack(f"{endian}Q", value[:8])[0]
-
-        offset += block_len
 
     for iface_id, stats in if_stats.items():
         if 0 <= iface_id < len(interfaces):
@@ -164,6 +193,31 @@ class PacketListReader:
         return None
 
 
+def _reader_stream(reader: object) -> Optional[object]:
+    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
+        candidate = getattr(reader, attr, None)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _cache_config() -> tuple[bool, int, int]:
+    enabled = os.environ.get("PCAPPER_CACHE_ENABLED", "1") != "0"
+    try:
+        max_cache = int(os.environ.get("PCAPPER_CACHE_MAX_BYTES", str(256 * 1024 * 1024)))
+    except Exception:
+        max_cache = 256 * 1024 * 1024
+    try:
+        max_file = int(os.environ.get("PCAPPER_CACHE_FILE_MAX_BYTES", str(64 * 1024 * 1024)))
+    except Exception:
+        max_file = 64 * 1024 * 1024
+    if max_cache < 0:
+        max_cache = 0
+    if max_file < 0:
+        max_file = 0
+    return enabled, max_cache, max_file
+
+
 def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], PcapMeta]:
     file_type = detect_file_type(path)
     size_bytes = 0
@@ -174,12 +228,7 @@ def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], Pc
 
     reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
     status = build_statusbar(path, enabled=show_status)
-    stream = None
-    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-        candidate = getattr(reader, attr, None)
-        if candidate is not None:
-            stream = candidate
-            break
+    stream = _reader_stream(reader)
 
     packets: list[object] = []
     try:
@@ -242,11 +291,23 @@ def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], Pc
 
 
 def get_cached_packets(path: Path, show_status: bool = True) -> tuple[list[object], PcapMeta]:
+    global _CACHE_BYTES
     cached = _PACKET_CACHE.get(path)
     if cached:
+        _PACKET_CACHE.move_to_end(path)
         return cached
     packets, meta = load_packets(path, show_status=show_status)
+    size_bytes = max(0, int(getattr(meta, "size_bytes", 0) or 0))
+    enabled, max_cache, _max_file = _cache_config()
+    if not enabled or max_cache == 0:
+        return packets, meta
+    while _PACKET_CACHE and _CACHE_BYTES + size_bytes > max_cache:
+        _, evicted = _PACKET_CACHE.popitem(last=False)
+        evicted_meta = evicted[1]
+        evicted_size = max(0, int(getattr(evicted_meta, "size_bytes", 0) or 0))
+        _CACHE_BYTES = max(0, _CACHE_BYTES - evicted_size)
     _PACKET_CACHE[path] = (packets, meta)
+    _CACHE_BYTES += size_bytes
     return packets, meta
 
 
@@ -267,7 +328,21 @@ def get_reader(
         status = build_statusbar(path, enabled=show_status)
         return reader, status, None, size_bytes, (meta.file_type if meta else detect_file_type(path))
 
-    cached_packets, cached_meta = get_cached_packets(path, show_status=show_status)
-    reader = PacketListReader(cached_packets, cached_meta)
-    status = build_statusbar(path, enabled=False)
-    return reader, status, None, cached_meta.size_bytes, cached_meta.file_type
+    enabled, max_cache, max_file = _cache_config()
+    file_type = meta.file_type if meta else detect_file_type(path)
+    try:
+        size_bytes = meta.size_bytes if meta else path.stat().st_size
+    except Exception:
+        size_bytes = 0
+
+    cache_allowed = enabled and max_cache > 0 and max_file > 0 and (size_bytes == 0 or size_bytes <= max_file)
+    if cache_allowed:
+        cached_packets, cached_meta = get_cached_packets(path, show_status=show_status)
+        reader = PacketListReader(cached_packets, cached_meta)
+        status = build_statusbar(path, enabled=False)
+        return reader, status, None, cached_meta.size_bytes, cached_meta.file_type
+
+    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
+    status = build_statusbar(path, enabled=show_status)
+    stream = _reader_stream(reader)
+    return reader, status, stream, size_bytes, file_type

@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+import hashlib
 import re
 
 from .pcap_cache import PcapMeta, get_reader
@@ -109,6 +110,11 @@ def _extract_tokens(text: str) -> list[str]:
         for match in re.finditer(pattern, text):
             tokens.append(match.group(0))
     return tokens
+
+
+def _token_fingerprint(token: str) -> str:
+    digest = hashlib.sha256(token.encode("utf-8", errors="ignore")).hexdigest()
+    return f"sha256:{digest[:16]}"
 
 
 def analyze_http(
@@ -268,7 +274,7 @@ def analyze_http(
 
                     tokens = _extract_tokens(uri)
                     for token in tokens:
-                        session_tokens[token] += 1
+                        session_tokens[_token_fingerprint(token)] += 1
 
                     filename = _extract_filename(headers, uri)
                     if filename:
@@ -338,7 +344,7 @@ def analyze_http(
                     if set_cookie:
                         tokens = _extract_tokens(set_cookie)
                         for token in tokens:
-                            session_tokens[token] += 1
+                            session_tokens[_token_fingerprint(token)] += 1
 
                     conv = conversations[(dst_ip, src_ip)]
                     conv["responses"] = int(conv["responses"]) + 1

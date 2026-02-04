@@ -38,6 +38,11 @@ from .reporting import (
     render_timeline_summary,
     render_domain_summary,
     render_ldap_summary,
+    render_kerberos_summary,
+    render_tls_summary,
+    render_tcp_summary,
+    render_udp_summary,
+    render_exfil_summary,
     render_generic_rollup,
 )
 from .vlan import analyze_vlans
@@ -63,6 +68,11 @@ from .health import analyze_health
 from .timeline import analyze_timeline
 from .domain import analyze_domain
 from .ldap import analyze_ldap
+from .kerberos import analyze_kerberos
+from .tls import analyze_tls
+from .tcp import analyze_tcp
+from .udp import analyze_udp
+from .exfil import analyze_exfil
 
 
 def _ordered_steps(argv: list[str]) -> list[str]:
@@ -71,6 +81,10 @@ def _ordered_steps(argv: list[str]) -> list[str]:
         "--icmp": "icmp",
         "--dns": "dns",
         "--http": "http",
+        "--tls": "tls",
+        "--tcp": "tcp",
+        "--udp": "udp",
+        "--exfil": "exfil",
         "--sizes": "sizes",
         "--ips": "ips",
         "--beacon": "beacon",
@@ -85,6 +99,7 @@ def _ordered_steps(argv: list[str]) -> list[str]:
         "--timeline": "timeline",
         "--domain": "domain",
         "--ldap": "ldap",
+        "--kerberos": "kerberos",
         "--health": "health",
         "--ntlm": "ntlm",
         "--netbios": "netbios",
@@ -122,10 +137,15 @@ def _patch_readers(packets: list[object], meta) -> None:
     import pcapper.timeline as timeline
     import pcapper.domain as domain
     import pcapper.ldap as ldap
+    import pcapper.kerberos as kerberos
     import pcapper.ntlm as ntlm
     import pcapper.netbios as netbios
     import pcapper.modbus as modbus
     import pcapper.dnp3 as dnp3
+    import pcapper.tls as tls
+    import pcapper.tcp as tcp
+    import pcapper.udp as udp
+    import pcapper.exfil as exfil
 
     modules = [
         vlan,
@@ -147,10 +167,15 @@ def _patch_readers(packets: list[object], meta) -> None:
         timeline,
         domain,
         ldap,
+        kerberos,
         ntlm,
         netbios,
         modbus,
         dnp3,
+        tls,
+        tcp,
+        udp,
+        exfil,
     ]
 
     def _reader_factory(*_args, **_kwargs):
@@ -237,6 +262,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include HTTP analysis in the output.",
     )
     parser.add_argument(
+        "--tls",
+        action="store_true",
+        help="Include TLS/HTTPS analysis in the output.",
+    )
+    parser.add_argument(
+        "--tcp",
+        action="store_true",
+        help="Include TCP analysis in the output.",
+    )
+    parser.add_argument(
+        "--udp",
+        action="store_true",
+        help="Include UDP analysis in the output.",
+    )
+    parser.add_argument(
+        "--exfil",
+        action="store_true",
+        help="Include exfiltration heuristics and anomaly analysis.",
+    )
+    parser.add_argument(
         "--sizes",
         action="store_true",
         help="Include packet size distribution analysis.",
@@ -307,6 +352,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include LDAP analysis (queries, users, servers, anomalies, secrets).",
     )
     parser.add_argument(
+        "--kerberos",
+        action="store_true",
+        help="Include Kerberos analysis (requests, errors, principals, attacks).",
+    )
+    parser.add_argument(
         "-ip",
         dest="timeline_ip",
         help="Target IP for timeline analysis (use with --timeline).",
@@ -373,6 +423,10 @@ def _analyze_paths(
     show_icmp: bool,
     show_dns: bool,
     show_http: bool,
+    show_tls: bool,
+    show_tcp: bool,
+    show_udp: bool,
+    show_exfil: bool,
     show_sizes: bool,
     show_ips: bool,
     show_beacon: bool,
@@ -396,6 +450,7 @@ def _analyze_paths(
     view_name: str | None,
     show_domain: bool,
     show_ldap: bool,
+    show_kerberos: bool,
     ordered_steps: list[str],
     summarize: bool,
 ) -> int:
@@ -439,6 +494,30 @@ def _analyze_paths(
                     rollups.setdefault("http", []).append(http_summary)
                 else:
                     print(render_http_summary(http_summary, verbose=verbose))
+            elif step == "tls" and show_tls:
+                tls_summary = analyze_tls(path, show_status=False, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("tls", []).append(tls_summary)
+                else:
+                    print(render_tls_summary(tls_summary, verbose=verbose))
+            elif step == "tcp" and show_tcp:
+                tcp_summary = analyze_tcp(path, show_status=False, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("tcp", []).append(tcp_summary)
+                else:
+                    print(render_tcp_summary(tcp_summary, verbose=verbose))
+            elif step == "udp" and show_udp:
+                udp_summary = analyze_udp(path, show_status=False, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("udp", []).append(udp_summary)
+                else:
+                    print(render_udp_summary(udp_summary, verbose=verbose))
+            elif step == "exfil" and show_exfil:
+                exfil_summary = analyze_exfil(path, show_status=False, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("exfil", []).append(exfil_summary)
+                else:
+                    print(render_exfil_summary(exfil_summary, verbose=verbose))
             elif step == "sizes" and show_sizes:
                 size_summary = analyze_sizes(path, show_status=False)
                 if summarize_rollups:
@@ -535,6 +614,12 @@ def _analyze_paths(
                     rollups.setdefault("ldap", []).append(ldap_summary)
                 else:
                     print(render_ldap_summary(ldap_summary))
+            elif step == "kerberos" and show_kerberos:
+                kerberos_summary = analyze_kerberos(path, show_status=False, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("kerberos", []).append(kerberos_summary)
+                else:
+                    print(render_kerberos_summary(kerberos_summary))
             elif step == "ntlm" and show_ntlm:
                 ntlm_summary = analyze_ntlm(path, show_status=False)
                 if summarize_rollups:
@@ -568,6 +653,10 @@ def _analyze_paths(
             "icmp": "ICMP ANALYSIS",
             "dns": "DNS ANALYSIS",
             "http": "HTTP ANALYSIS",
+            "tls": "TLS/HTTPS ANALYSIS",
+            "tcp": "TCP ANALYSIS",
+            "udp": "UDP ANALYSIS",
+            "exfil": "EXFILTRATION ANALYSIS",
             "sizes": "PACKET SIZE ANALYSIS",
             "ips": "IP INTELLIGENCE ANALYSIS",
             "beacon": "BEACON ANALYSIS",
@@ -583,10 +672,12 @@ def _analyze_paths(
             "timeline": "TIMELINE ANALYSIS",
             "domain": "DOMAIN ANALYSIS",
             "ldap": "LDAP ANALYSIS",
+            "kerberos": "KERBEROS ANALYSIS",
             "ntlm": "NTLM ANALYSIS",
             "netbios": "NETBIOS ANALYSIS",
         }
-        for step in ordered_steps:
+        rollup_steps = [step for step in title_map.keys() if rollups.get(step)]
+        for step in rollup_steps:
             if step in ("modbus", "dnp3", "vlan"):
                 continue
             if rollups.get(step):
@@ -640,6 +731,10 @@ def main() -> int:
             show_icmp=args.icmp,
             show_dns=args.dns,
             show_http=args.http,
+            show_tls=args.tls,
+            show_tcp=args.tcp,
+            show_udp=args.udp,
+            show_exfil=args.exfil,
             show_sizes=args.sizes,
             show_ips=args.ips,
             show_beacon=args.beacon,
@@ -663,6 +758,7 @@ def main() -> int:
             view_name=args.view,
             show_domain=args.domain,
             show_ldap=args.ldap,
+            show_kerberos=args.kerberos,
             ordered_steps=ordered_steps,
             summarize=args.summarize,
         )
@@ -680,6 +776,10 @@ def main() -> int:
         show_icmp=args.icmp,
         show_dns=args.dns,
         show_http=args.http,
+        show_tls=args.tls,
+        show_tcp=args.tcp,
+        show_udp=args.udp,
+        show_exfil=args.exfil,
         show_sizes=args.sizes,
         show_ips=args.ips,
         show_beacon=args.beacon,
@@ -703,6 +803,7 @@ def main() -> int:
         view_name=args.view,
         show_domain=args.domain,
         show_ldap=args.ldap,
+        show_kerberos=args.kerberos,
         ordered_steps=ordered_steps,
         summarize=args.summarize,
     )
