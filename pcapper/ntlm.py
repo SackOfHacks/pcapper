@@ -291,7 +291,7 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
             path, show_status=show_status
         )
     except Exception as exc:
-        return NtlmAnalysis(path, 0.0, 0, 0, Counter(), Counter(), Counter(), Counter(), [], [], [f"Error: {e}"])
+        return NtlmAnalysis(path, 0.0, 0, 0, Counter(), Counter(), Counter(), Counter(), [], [], [f"Error: {exc}"])
 
     size_bytes = size_bytes
 
@@ -454,9 +454,9 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                             value=f"{src}->{dst}",
                             description="NTLM handshake completed (Type1/2/3)"
                         ))
-                    status = _parse_smb2_status(payload) or _parse_smb1_status(payload) or _parse_http_status(payload)
-                    if status:
-                        status_codes[status] += 1
+                    status_code = _parse_smb2_status(payload) or _parse_smb1_status(payload) or _parse_http_status(payload)
+                    if status_code:
+                        status_codes[status_code] += 1
                     
                 elif msg_type == MSG_TYPE_CHALLENGE:
                      # Message Type 2 (Server Challenge)
@@ -476,9 +476,9 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                              versions["NTLMv1"] += 1
                          if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
                              artifacts.append(NtlmArtifact(value="Extended Session Security", description="NTLM Challenge Flag"))
-                     status = _parse_smb2_status(payload) or _parse_smb1_status(payload) or _parse_http_status(payload)
-                     if status:
-                         status_codes[status] += 1
+                     status_code = _parse_smb2_status(payload) or _parse_smb1_status(payload) or _parse_http_status(payload)
+                     if status_code:
+                         status_codes[status_code] += 1
                      
                 elif msg_type == MSG_TYPE_NEGOTIATE:
                      # Message Type 1
