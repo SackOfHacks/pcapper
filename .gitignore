@@ -34,6 +34,9 @@ htmlcov/
 # Logs
 *.log
 
+# Local tests (not committed)
+.local_tests/
+
 # PCAP data and extracted artifacts
 *.pcap
 *.pcapng
