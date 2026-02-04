@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pcapper"
-version = "0.5.5"
+version = "0.5.6"
 description = "Modular PCAP analysis CLI"
 readme = "README.md"
 requires-python = ">=3.9"

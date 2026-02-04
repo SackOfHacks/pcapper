@@ -90,6 +90,20 @@ FILE_TRANSFER_PROTOCOLS = {
     "NFS",
 }
 
+FILE_TYPE_EXTENSIONS: dict[str, set[str]] = {
+    "EXE/DLL": {".exe", ".dll", ".sys", ".scr", ".cpl", ".ocx"},
+    "PDF": {".pdf"},
+    "ZIP/Office": {".zip", ".docx", ".xlsx", ".pptx", ".jar", ".apk", ".odt", ".ods", ".odp", ".docm", ".xlsm", ".pptm"},
+    "ELF": {".elf", ".so", ".bin", ".out"},
+    "PNG": {".png"},
+    "JPG": {".jpg", ".jpeg"},
+    "GIF": {".gif"},
+    "GZIP": {".gz", ".tgz", ".gzip"},
+    "HTML": {".html", ".htm", ".xhtml", ".shtml"},
+    "X509": {".cer", ".crt", ".pem", ".der", ".p7b", ".pfx", ".p12"},
+    "DICOM": {".dcm"},
+}
+
 def _flow_protocol(sport: Optional[int], dport: Optional[int]) -> str:
     ports = set(filter(None, [sport, dport]))
     if 80 in ports or 8080 in ports or 8000 in ports:
@@ -121,6 +135,20 @@ def _flow_protocol(sport: Optional[int], dport: Optional[int]) -> str:
     if 3306 in ports:
         return "MYSQL"
     return "UNKNOWN"
+
+
+def _extension_mismatch(filename: str, file_type: str) -> Optional[tuple[str, set[str]]]:
+    if not filename or not file_type:
+        return None
+    expected = FILE_TYPE_EXTENSIONS.get(file_type.upper())
+    if not expected:
+        return None
+    ext = Path(filename).suffix.lower()
+    if not ext:
+        return None
+    if ext in expected:
+        return None
+    return ext, expected
 
 def _normalize_filename(name: str) -> str:
     try:
@@ -1973,6 +2001,23 @@ def _export_with_dpkt(
             ))
 
     if artifacts:
+        mismatch_seen: set[tuple[str, str, str]] = set()
+        for art in artifacts:
+            mismatch = _extension_mismatch(art.filename, art.file_type)
+            if not mismatch:
+                continue
+            ext, expected = mismatch
+            key = (art.filename, art.file_type, ext)
+            if key in mismatch_seen:
+                continue
+            mismatch_seen.add(key)
+            detections.append({
+                "severity": "high",
+                "summary": f"File extension/type mismatch: {art.filename}",
+                "details": f"Extension {ext} does not match detected type {art.file_type}. Expected: {', '.join(sorted(expected))}.",
+                "source": "Files",
+            })
+
         if extract_name:
             out_root = output_dir or Path.cwd() / "files"
             out_root.mkdir(parents=True, exist_ok=True)
@@ -2042,6 +2087,31 @@ def _dedupe_artifacts(artifacts: List[FileArtifact]) -> List[FileArtifact]:
     return unique
 
 
+def _expected_extensions_for_type(file_type: str) -> Optional[set[str]]:
+    for key, value in FILE_TYPE_EXTENSIONS.items():
+        if key.lower() == file_type.lower():
+            return value
+    return None
+
+
+def _collect_extension_mismatches(artifacts: List[FileArtifact]) -> List[Tuple[str, str, str]]:
+    mismatches: List[Tuple[str, str, str]] = []
+    for art in artifacts:
+        filename = art.filename or ""
+        file_type = getattr(art, "file_type", "") or ""
+        if not filename or not file_type:
+            continue
+        expected = _expected_extensions_for_type(file_type)
+        if not expected:
+            continue
+        ext = Path(filename).suffix.lower()
+        if not ext:
+            continue
+        if ext not in expected:
+            mismatches.append((filename, file_type, ext))
+    return mismatches
+
+
 # --- Entry Point ---
 
 def analyze_files(
@@ -2067,27 +2137,54 @@ def analyze_files(
         return FileTransferSummary(path, 0, [], [], [], [], [], ["dpkt parsing failed"])
 
     if include_x509:
+        artifacts = _dedupe_artifacts(_dedupe_x509_artifacts(dpkt_summary.artifacts))
+        detections = list(dpkt_summary.detections)
+        mismatches = _collect_extension_mismatches(artifacts)
+        if mismatches:
+            examples = "; ".join(
+                f"{name} -> {ftype}" for name, ftype, _ in mismatches[:5]
+            )
+            detections.append({
+                "severity": "high",
+                "summary": "File extension/type mismatch detected",
+                "details": f"{len(mismatches)} file(s) where extension does not match detected type. Examples: {examples}",
+                "source": "Files",
+            })
         return FileTransferSummary(
             path=dpkt_summary.path,
             total_candidates=dpkt_summary.total_candidates,
             candidates=dpkt_summary.candidates,
-            artifacts=_dedupe_artifacts(_dedupe_x509_artifacts(dpkt_summary.artifacts)),
+            artifacts=artifacts,
             extracted=dpkt_summary.extracted,
             views=dpkt_summary.views,
-            detections=dpkt_summary.detections,
+            detections=detections,
             errors=dpkt_summary.errors,
         )
+
+    artifacts = [
+        a for a in _dedupe_artifacts(_dedupe_x509_artifacts(dpkt_summary.artifacts))
+        if a.protocol != "X509AF"
+    ]
+    detections = list(dpkt_summary.detections)
+    mismatches = _collect_extension_mismatches(artifacts)
+    if mismatches:
+        examples = "; ".join(
+            f"{name} -> {ftype}" for name, ftype, _ in mismatches[:5]
+        )
+        detections.append({
+            "severity": "high",
+            "summary": "File extension/type mismatch detected",
+            "details": f"{len(mismatches)} file(s) where extension does not match detected type. Examples: {examples}",
+            "source": "Files",
+        })
 
     return FileTransferSummary(
         path=dpkt_summary.path,
         total_candidates=dpkt_summary.total_candidates,
         candidates=dpkt_summary.candidates,
-        artifacts=[
-            a for a in _dedupe_artifacts(_dedupe_x509_artifacts(dpkt_summary.artifacts))
-            if a.protocol != "X509AF"
-        ],
+        artifacts=artifacts,
         extracted=dpkt_summary.extracted,
         views=dpkt_summary.views,
-        detections=dpkt_summary.detections,
+        detections=detections,
         errors=dpkt_summary.errors,
     )

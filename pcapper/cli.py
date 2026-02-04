@@ -492,7 +492,7 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("smb", []).append(smb_summary)
                 else:
-                    print(render_smb_summary(smb_summary))
+                    print(render_smb_summary(smb_summary, verbose=verbose))
             elif step == "nfs" and show_nfs:
                 nfs_summary = analyze_nfs(path, show_status=False)
                 if summarize_rollups:

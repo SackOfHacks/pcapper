@@ -581,13 +581,19 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Detections"))
         for item in summary.detections:
-            severity = item.get("severity", "info")
+            severity = str(item.get("severity", "info")).lower()
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
-            if severity == "warning":
+            summary_lower = summary_text.lower()
+            if "extension/type mismatch" in summary_lower:
+                marker = danger("[HIGH]")
+                summary_text = danger(summary_text)
+            elif severity == "warning":
                 marker = warn("[WARN]")
             elif severity == "critical":
                 marker = danger("[CRIT]")
+            elif severity == "high":
+                marker = danger("[HIGH]")
             else:
                 marker = ok("[INFO]")
             lines.append(f"{marker} {summary_text}")
@@ -771,13 +777,18 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Detections"))
         for item in summary.detections:
-            severity = item.get("severity", "info")
+            severity = str(item.get("severity", "info")).lower()
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
+            if "extension/type mismatch" in summary_text.lower():
+                severity = "high"
             if severity == "warning":
                 marker = warn("[WARN]")
             elif severity == "critical":
                 marker = danger("[CRIT]")
+            elif severity == "high":
+                marker = danger("[HIGH]")
+                summary_text = danger(summary_text)
             else:
                 marker = ok("[INFO]")
             lines.append(f"{marker} {summary_text}")
@@ -2323,7 +2334,7 @@ def render_services_summary(summary: ServiceSummary) -> str:
     return "\n".join(lines)
 
 
-def render_smb_summary(summary: SmbSummary) -> str:
+def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"SMB PROTOCOL ANALYSIS :: {summary.path.name}"))
@@ -2510,24 +2521,49 @@ def render_smb_summary(summary: SmbSummary) -> str:
                 rows.append([domain, str(count)])
             lines.append(_format_table(rows))
 
-    # 11. Anomalies
+    # 11. Anomalies & Risks (summary by default, detailed with verbose)
     lines.append(SUBSECTION_BAR)
     lines.append(header("SMB Anomalies & Risks"))
+
     if not summary.anomalies:
         lines.append(ok("No SMB-specific anomalies detected."))
     else:
-        for a in summary.anomalies:
-            sev_color = danger if a.severity in ("CRITICAL", "HIGH") else warn
-            lines.append(sev_color(f"[{a.severity}] {a.title}"))
-            lines.append(f"  {a.description}")
-            lines.append(muted(f"  Src: {a.src} -> Dst: {a.dst}"))
-            lines.append("")
+        severity_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+        severity_counts = Counter(a.severity for a in summary.anomalies)
+        rows = [["Severity", "Count", "Indicators"]]
+        for sev in severity_order:
+            if severity_counts.get(sev):
+                indicators = Counter(a.title for a in summary.anomalies if a.severity == sev)
+                indicator_text = ", ".join(
+                    f"{title} ({count})" for title, count in indicators.most_common(5)
+                )
+                sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
+                if sev == "LOW":
+                    sev_color = muted
+                rows.append([
+                    sev_color(sev),
+                    str(severity_counts[sev]),
+                    muted(indicator_text) if indicator_text else muted("-"),
+                ])
+        lines.append(_format_table(rows))
 
-    if summary.lateral_movement:
+        if verbose:
+            lines.append("")
+            for a in summary.anomalies:
+                sev_color = danger if a.severity in ("CRITICAL", "HIGH") else warn
+                lines.append(sev_color(f"[{a.severity}] {a.title}"))
+                lines.append(f"  {a.description}")
+                lines.append(muted(f"  Src: {a.src} -> Dst: {a.dst}"))
+                lines.append("")
+
+    if not summary.lateral_movement:
+        lines.append(ok("No SMB lateral movement indicators detected."))
+    else:
         lines.append(SUBSECTION_BAR)
         lines.append(header("SMB Lateral Movement Scoring"))
+        top_scores = sorted(summary.lateral_movement, key=lambda x: x.get("score", 0), reverse=True)[:5]
         rows = [["Client", "Servers", "Admin Shares", "Failures", "Score"]]
-        for item in summary.lateral_movement[:10]:
+        for item in top_scores:
             rows.append([
                 str(item.get("client", "-")),
                 str(item.get("servers", "-")),
@@ -2536,6 +2572,20 @@ def render_smb_summary(summary: SmbSummary) -> str:
                 str(item.get("score", "-")),
             ])
         lines.append(_format_table(rows))
+
+        if verbose:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("SMB Lateral Movement Scoring (Detailed)"))
+            rows = [["Client", "Servers", "Admin Shares", "Failures", "Score"]]
+            for item in summary.lateral_movement[:10]:
+                rows.append([
+                    str(item.get("client", "-")),
+                    str(item.get("servers", "-")),
+                    str(item.get("admin_shares", "-")),
+                    str(item.get("failures", "-")),
+                    str(item.get("score", "-")),
+                ])
+            lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return "\n".join(lines)

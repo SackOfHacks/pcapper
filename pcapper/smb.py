@@ -782,8 +782,8 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
         reader.close()
 
     lateral_movement: List[Dict[str, object]] = []
-    for client, servers in client_to_servers.items():
-        server_count = len(servers)
+    for client, server_set in client_to_servers.items():
+        server_count = len(server_set)
         admin_hits = client_admin_shares.get(client, 0)
         failures = client_failures.get(client, 0)
         score = (server_count / 3.0) + (admin_hits * 1.5) + (failures / 5.0)
@@ -796,6 +796,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
                 "score": round(score, 2),
             })
         
+    server_values = list(servers.values()) if isinstance(servers, dict) else list(servers)
     return SmbSummary(
         path=path,
         total_packets=total_packets,
@@ -807,7 +808,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
         error_codes=error_codes,
         sessions=list(sessions.values()),
         conversations=list(conversations.values()),
-        servers=list(servers.values()),
+        servers=server_values,
         clients=list(clients.values()),
         shares=list(shares.values()),
         files=files,
