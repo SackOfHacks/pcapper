@@ -59,6 +59,7 @@ class TlsSummary:
     ja3_counts: Counter[str]
     ja4_counts: Counter[str]
     ja4s_counts: Counter[str]
+    jarm_counts: Counter[str]
     client_counts: Counter[str]
     server_counts: Counter[str]
     server_ports: Counter[int]
@@ -293,6 +294,16 @@ def _ja4s_from_server_hello(server_hello) -> Optional[str]:
     return f"s{version_val}-{cipher_val}-{ext_hash}"
 
 
+def _passive_jarm(ja3_hash: Optional[str], ja4: Optional[str], sni: Optional[str], alpn: list[str]) -> Optional[str]:
+    if not ja3_hash and not ja4:
+        return None
+    sni_token = sni or "-"
+    alpn_token = alpn[0] if alpn else "na"
+    base = f"{ja3_hash or '-'}|{ja4 or '-'}|{sni_token}|{alpn_token}"
+    digest = hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
+    return f"jarm-p:{digest[:32]}"
+
+
 def analyze_tls(
     path: Path,
     show_status: bool = True,
@@ -315,6 +326,7 @@ def analyze_tls(
             ja3_counts=Counter(),
             ja4_counts=Counter(),
             ja4s_counts=Counter(),
+            jarm_counts=Counter(),
             client_counts=Counter(),
             server_counts=Counter(),
             server_ports=Counter(),
@@ -357,6 +369,7 @@ def analyze_tls(
     ja3_counts: Counter[str] = Counter()
     ja4_counts: Counter[str] = Counter()
     ja4s_counts: Counter[str] = Counter()
+    jarm_counts: Counter[str] = Counter()
     client_counts: Counter[str] = Counter()
     server_counts: Counter[str] = Counter()
     server_ports: Counter[int] = Counter()
@@ -465,6 +478,7 @@ def analyze_tls(
                 for alpn in alpn_vals:
                     alpn_counts[alpn] += 1
 
+                ja3_hash = None
                 ja3 = _ja3_from_client_hello(client_hello)
                 if ja3:
                     ja3_hash = hashlib.md5(ja3.encode("utf-8", errors="ignore")).hexdigest()
@@ -473,6 +487,10 @@ def analyze_tls(
                 ja4 = _ja4_from_client_hello(client_hello, sni_val, alpn_vals)
                 if ja4:
                     ja4_counts[ja4] += 1
+
+                jarm = _passive_jarm(ja3_hash, ja4, sni_val, alpn_vals)
+                if jarm:
+                    jarm_counts[jarm] += 1
 
             if TLSServerHello is not None and pkt.haslayer(TLSServerHello):  # type: ignore[truthy-bool]
                 server_hello = pkt[TLSServerHello]  # type: ignore[index]
@@ -579,6 +597,8 @@ def analyze_tls(
         artifacts.append(f"ALPN: {alpn} ({count})")
     for ja3, count in ja3_counts.most_common(5):
         artifacts.append(f"JA3: {ja3} ({count})")
+    for jarm, count in jarm_counts.most_common(5):
+        artifacts.append(f"JARM-P: {jarm} ({count})")
 
     return TlsSummary(
         path=path,
@@ -593,6 +613,7 @@ def analyze_tls(
         ja3_counts=ja3_counts,
         ja4_counts=ja4_counts,
         ja4s_counts=ja4s_counts,
+        jarm_counts=jarm_counts,
         client_counts=client_counts,
         server_counts=server_counts,
         server_ports=server_ports,
