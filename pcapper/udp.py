@@ -44,6 +44,9 @@ class UdpSummary:
     client_counts: Counter[str]
     server_counts: Counter[str]
     port_counts: Counter[int]
+    quic_packets: int
+    quic_sessions: int
+    quic_versions: Counter[str]
     http_requests: int
     http_responses: int
     http_methods: Counter[str]
@@ -89,6 +92,9 @@ def analyze_udp(
             client_counts=Counter(),
             server_counts=Counter(),
             port_counts=Counter(),
+            quic_packets=0,
+            quic_sessions=0,
+            quic_versions=Counter(),
             http_requests=0,
             http_responses=0,
             http_methods=Counter(),
@@ -122,6 +128,9 @@ def analyze_udp(
     client_counts: Counter[str] = Counter()
     server_counts: Counter[str] = Counter()
     port_counts: Counter[int] = Counter()
+    quic_packets = 0
+    quic_sessions: set[tuple[str, str, int, int]] = set()
+    quic_versions: Counter[str] = Counter()
     src_to_ports: dict[str, set[int]] = defaultdict(set)
     src_to_dsts: dict[str, set[str]] = defaultdict(set)
     amp_flows: dict[tuple[str, str, int], dict[str, int]] = defaultdict(lambda: {"client": 0, "server": 0})
@@ -195,6 +204,21 @@ def analyze_udp(
                 payload_len = len(bytes(udp_layer.payload))
             except Exception:
                 payload_len = 0
+
+            payload = b""
+            try:
+                payload = bytes(udp_layer.payload)
+            except Exception:
+                payload = b""
+
+            if payload and (sport in (443, 8443) or dport in (443, 8443)):
+                first_byte = payload[0]
+                if first_byte & 0x80 and len(payload) >= 5:
+                    version = int.from_bytes(payload[1:5], "big")
+                    if version != 0:
+                        quic_packets += 1
+                        quic_sessions.add((src_ip or "-", dst_ip or "-", sport, dport))
+                        quic_versions[f"0x{version:08x}"] += 1
 
             if dport in AMPLIFICATION_PORTS or sport in AMPLIFICATION_PORTS:
                 if dport in AMPLIFICATION_PORTS:
@@ -338,6 +362,9 @@ def analyze_udp(
         client_counts=client_counts,
         server_counts=server_counts,
         port_counts=port_counts,
+        quic_packets=quic_packets,
+        quic_sessions=len(quic_sessions),
+        quic_versions=quic_versions,
         http_requests=http_summary.total_requests,
         http_responses=http_summary.total_responses,
         http_methods=http_summary.method_counts,

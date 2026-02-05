@@ -72,6 +72,8 @@ class Dnp3Message:
     func_code: Optional[int]
     func_name: str
     is_master: bool # True if sending requests typically (heuristically)
+    app_control: Optional[int] = None
+    unsolicited: bool = False
 
 @dataclass
 class Dnp3Anomaly:
@@ -94,6 +96,11 @@ class Dnp3Analysis:
     src_addrs: Counter[int] = field(default_factory=Counter) # DNP3 Addresses
     dst_addrs: Counter[int] = field(default_factory=Counter)
     ip_endpoints: Counter[str] = field(default_factory=Counter) # IP addresses participating
+    write_ops: Counter[str] = field(default_factory=Counter)
+    file_ops: Counter[str] = field(default_factory=Counter)
+    auth_ops: Counter[str] = field(default_factory=Counter)
+    restart_ops: Counter[str] = field(default_factory=Counter)
+    unsolicited_responses: int = 0
     
     # Activity
     messages: List[Dnp3Message] = field(default_factory=list)
@@ -129,6 +136,11 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
     src_addrs = Counter()
     dst_addrs = Counter()
     ip_endpoints = Counter()
+    write_ops = Counter()
+    file_ops = Counter()
+    auth_ops = Counter()
+    restart_ops = Counter()
+    unsolicited_responses = 0
     
     messages: List[Dnp3Message] = []
     anomalies: List[Dnp3Anomaly] = []
@@ -266,6 +278,8 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                     
                     func_code = None
                     func_name = "Unknown/Fragment"
+                    app_control = None
+                    unsolicited = False
                     
                     if len(dnp3_data) > 11: # 10 Header + 1 Transport + at least 1 App
                         # Transport Byte at offset 10
@@ -275,6 +289,12 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                         # Just checking if it looks like an App header
                         # This is a bit heuristic without full reassembly
                         
+                        app_control = dnp3_data[11] if len(dnp3_data) > 11 else None
+                        if app_control is not None:
+                            unsolicited = (app_control & 0x10) != 0
+                            if unsolicited:
+                                unsolicited_responses += 1
+
                         app_fc = dnp3_data[12] if len(dnp3_data) > 12 else None
                         # Actually:
                         # Header (10)
@@ -290,12 +310,14 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                             
                             # Anomalies
                             if func_code in (13, 14): # Restarts
+                                restart_ops[func_name] += 1
                                 anomalies.append(Dnp3Anomaly(
                                     "HIGH", "DNP3 Restart", f"System restart command ({func_name}) detected",
                                     src_ip, dst_ip, ts
                                 ))
                             
                             if func_code == 2: # Write
+                                write_ops[func_name] += 1
                                 anomalies.append(Dnp3Anomaly(
                                     "MEDIUM", "DNP3 Write", f"Write command detected to {dst_ip} (Addr {dl_dst})",
                                     src_ip, dst_ip, ts
@@ -304,10 +326,18 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                             if func_code in (0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1F): # File operations (23-31 roughly)
                                 # 25=Open, 27=Delete etc.
                                 if 25 <= func_code <= 27:
+                                    file_ops[func_name] += 1
                                     anomalies.append(Dnp3Anomaly(
                                         "HIGH", "DNP3 File Op", f"File operation ({func_name}) detected",
                                         src_ip, dst_ip, ts
                                     ))
+
+                            if func_code in (32, 33):
+                                auth_ops[func_name] += 1
+                                anomalies.append(Dnp3Anomaly(
+                                    "MEDIUM", "DNP3 Auth", f"Secure auth function ({func_name}) observed",
+                                    src_ip, dst_ip, ts
+                                ))
                             
                             if func_code == 129: # Response
                                 # Check Internal Indications (IIN)
@@ -341,8 +371,9 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                         len=dl_len,
                         func_code=func_code,
                         func_name=func_name,
-                        is_master=(dl_src < 65500) # Simple guess, usually masters are low, outstations also low.. 
-                                                   # Actually directionality is better inferred from Master bit in DL Control, but let's leave simplistic
+                        is_master=(func_code is not None and func_code != 129),
+                        app_control=app_control,
+                        unsolicited=unsolicited,
                     ))
 
                 except struct.error:
@@ -368,6 +399,11 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
         src_addrs=src_addrs,
         dst_addrs=dst_addrs,
         ip_endpoints=ip_endpoints,
+        write_ops=write_ops,
+        file_ops=file_ops,
+        auth_ops=auth_ops,
+        restart_ops=restart_ops,
+        unsolicited_responses=unsolicited_responses,
         messages=messages,
         anomalies=anomalies,
         errors=errors

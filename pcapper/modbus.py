@@ -66,6 +66,12 @@ class ModbusMessage:
     unit_id: int
     func_code: int
     func_name: str
+    address: Optional[int] = None
+    quantity: Optional[int] = None
+    value: Optional[int] = None
+    byte_count: Optional[int] = None
+    mei_type: Optional[int] = None
+    device_id_code: Optional[int] = None
     is_exception: bool = False
     exception_code: Optional[int] = None
     exception_desc: Optional[str] = None
@@ -92,6 +98,10 @@ class ModbusAnalysis:
     unit_ids: Counter[int] = field(default_factory=Counter)
     src_ips: Counter[str] = field(default_factory=Counter) # Client IPs usually
     dst_ips: Counter[str] = field(default_factory=Counter) # Server/PLC IPs
+    read_ops: Counter[str] = field(default_factory=Counter)
+    write_ops: Counter[str] = field(default_factory=Counter)
+    file_ops: Counter[str] = field(default_factory=Counter)
+    device_id_requests: Counter[str] = field(default_factory=Counter)
     
     # Activity
     messages: List[ModbusMessage] = field(default_factory=list)
@@ -148,6 +158,9 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     write_events = Counter()
     exception_events = Counter()
     diagnostic_events = Counter()
+    file_events = Counter()
+    device_id_events = Counter()
+    broadcast_events = Counter()
 
     try:
         with status as pbar:
@@ -273,6 +286,33 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                     func_name = FUNC_NAMES.get(original_func, f"Unknown ({original_func})")
                     func_counts[func_name] += 1
                     unit_ids[unit_id] += 1
+
+                    address = None
+                    quantity = None
+                    value = None
+                    byte_count = None
+                    mei_type = None
+                    device_id_code = None
+
+                    if len(pdu) >= 5 and original_func in (1, 2, 3, 4):
+                        address = int.from_bytes(pdu[1:3], "big")
+                        quantity = int.from_bytes(pdu[3:5], "big")
+                        read_ops[f"{func_name} @ {address} x{quantity}"] += 1
+                    elif len(pdu) >= 5 and original_func in (5, 6):
+                        address = int.from_bytes(pdu[1:3], "big")
+                        value = int.from_bytes(pdu[3:5], "big")
+                        write_ops[f"{func_name} @ {address} = {value}"] += 1
+                    elif len(pdu) >= 6 and original_func in (15, 16):
+                        address = int.from_bytes(pdu[1:3], "big")
+                        quantity = int.from_bytes(pdu[3:5], "big")
+                        byte_count = pdu[5]
+                        write_ops[f"{func_name} @ {address} x{quantity}"] += 1
+                    elif original_func in (20, 21):
+                        file_ops[func_name] += 1
+                    elif original_func == 43 and len(pdu) >= 3:
+                        mei_type = pdu[1]
+                        device_id_code = pdu[2]
+                        device_id_requests[f"MEI {mei_type} / ID {device_id_code}"] += 1
                     
                     is_server_response = (sport == MODBUS_TCP_PORT)
 
@@ -289,10 +329,16 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                         # Check for Write Operations (Risk)
                         if original_func in (5, 6, 15, 16, 21, 22, 23):
                             write_events[(func_name, unit_id, src_ip, dst_ip)] += 1
+                            if unit_id == 0:
+                                broadcast_events[(func_name, src_ip, dst_ip)] += 1
 
                         # Diagnostic functions can be risky
                         if original_func in (8, 43):
                             diagnostic_events[(func_name, src_ip, dst_ip)] += 1
+                        if original_func in (20, 21):
+                            file_events[(func_name, src_ip, dst_ip)] += 1
+                        if original_func == 43:
+                            device_id_events[(func_name, src_ip, dst_ip)] += 1
 
                     else:
                         dst_ips[src_ip] += 1 # Server is source
@@ -311,6 +357,12 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                         unit_id=unit_id,
                         func_code=func_code,
                         func_name=func_name,
+                        address=address,
+                        quantity=quantity,
+                        value=value,
+                        byte_count=byte_count,
+                        mei_type=mei_type,
+                        device_id_code=device_id_code,
                         is_exception=is_exception,
                         exception_code=exception_code,
                         exception_desc=exception_desc,
@@ -353,6 +405,39 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
             ts=0.0,
         ))
 
+    for (func_name, src_ip, dst_ip), count in file_events.items():
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(ModbusAnomaly(
+            severity="HIGH",
+            title="Modbus File Record",
+            description=f"File record operation ({func_name}){suffix}",
+            src=src_ip,
+            dst=dst_ip,
+            ts=0.0,
+        ))
+
+    for (func_name, src_ip, dst_ip), count in device_id_events.items():
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(ModbusAnomaly(
+            severity="LOW",
+            title="Modbus Device ID Query",
+            description=f"Device identity request ({func_name}){suffix}",
+            src=src_ip,
+            dst=dst_ip,
+            ts=0.0,
+        ))
+
+    for (func_name, src_ip, dst_ip), count in broadcast_events.items():
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(ModbusAnomaly(
+            severity="HIGH",
+            title="Modbus Broadcast Write",
+            description=f"Broadcast write detected ({func_name}){suffix}",
+            src=src_ip,
+            dst=dst_ip,
+            ts=0.0,
+        ))
+
     for (exc_code, exc_desc, original_func, src_ip, dst_ip), count in exception_events.items():
         suffix = f" (x{count})" if count > 1 else ""
         desc_text = f"Exception {exc_code} ({exc_desc}) for Function {original_func}{suffix}"
@@ -374,6 +459,10 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
         unit_ids=unit_ids,
         src_ips=src_ips,
         dst_ips=dst_ips,
+        read_ops=read_ops,
+        write_ops=write_ops,
+        file_ops=file_ops,
+        device_id_requests=device_id_requests,
         messages=messages,
         anomalies=anomalies,
         errors=errors

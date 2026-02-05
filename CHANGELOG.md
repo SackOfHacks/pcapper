@@ -4,12 +4,27 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 1.0.0 — 2026-02-04
+### Added
+- IOC extraction and export, richer threat-hunting outputs, and email analysis.
+- Stream reassembly, TLS/QUIC enhancements, and expanded file triage.
+- Performance options (streaming, multiprocessing, index cache) and new CLI UX.
+
+### Changed
+- Reporting dashboards and help menu organization for faster review.
+
 ## 0.6.5 — 2026-02-04
 ### Changed
-- Version bump and release prep updates.
+- Added IOC export (JSON/CSV/STIX) and CLI options for output control.
+- Documented IOC enrichment configuration and cache/rate-limit controls.
+- Added TCP stream reassembly for HTTP parsing and HTTP/2 preface detection.
+- Added passive JARM fingerprints in TLS analysis and QUIC detection in UDP.
+- Added credential hunting module for HTTP auth, NTLM/Kerberos artifacts, and SMB sessions.
+- Added file triage with YARA scanning, MIME/PE/ELF metadata, hash clustering, and expanded carving.
+- Added timeline filters (IP/port/domain/user) and JSON export for SIEM ingestion.
 
 ### Fixed
-- Packaging metadata consistency checks.
+- Added caching/rate limiting for IP intel lookups.
 
 ## 0.6.0 — 2026-02-04
 ### Added

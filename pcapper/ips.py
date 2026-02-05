@@ -11,6 +11,7 @@ import urllib.request
 import urllib.error
 import hashlib
 import math
+import time
 
 from .pcap_cache import get_reader
 from .utils import safe_float, detect_file_type
@@ -540,10 +541,86 @@ def _fetch_json(url: str, headers: dict[str, str], timeout: float = 5.0) -> Opti
         return None
 
 
+_INTEL_CACHE: dict[str, dict[str, object]] | None = None
+_INTEL_LAST_REQUEST: dict[str, float] = {}
+
+
+def _intel_cache_path() -> Path:
+    override = os.environ.get("PCAPPER_INTEL_CACHE")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".pcapper" / "ip_intel_cache.json"
+
+
+def _load_intel_cache() -> dict[str, dict[str, object]]:
+    global _INTEL_CACHE
+    if _INTEL_CACHE is not None:
+        return _INTEL_CACHE
+    cache_path = _intel_cache_path()
+    try:
+        if cache_path.exists():
+            _INTEL_CACHE = json.loads(cache_path.read_text(encoding="utf-8"))
+        else:
+            _INTEL_CACHE = {}
+    except Exception:
+        _INTEL_CACHE = {}
+    return _INTEL_CACHE
+
+
+def _save_intel_cache() -> None:
+    cache_path = _intel_cache_path()
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache = _load_intel_cache()
+        cache_path.write_text(json.dumps(cache), encoding="utf-8")
+    except Exception:
+        return
+
+
+def _rate_limit(provider: str) -> None:
+    try:
+        limit = float(os.environ.get("PCAPPER_IP_INTEL_RATE_LIMIT", "1.0"))
+    except Exception:
+        limit = 1.0
+    if limit <= 0:
+        return
+    last = _INTEL_LAST_REQUEST.get(provider)
+    if last is None:
+        _INTEL_LAST_REQUEST[provider] = time.time()
+        return
+    elapsed = time.time() - last
+    if elapsed < limit:
+        time.sleep(limit - elapsed)
+    _INTEL_LAST_REQUEST[provider] = time.time()
+
+
+def _cached_lookup(provider: str, ip_text: str, fetcher) -> Optional[dict[str, object]]:
+    cache = _load_intel_cache()
+    cache_key = f"{provider}:{ip_text}"
+    try:
+        ttl = int(os.environ.get("PCAPPER_IP_INTEL_CACHE_TTL", "86400"))
+    except Exception:
+        ttl = 86400
+    entry = cache.get(cache_key)
+    now = time.time()
+    if isinstance(entry, dict):
+        ts = entry.get("ts")
+        if isinstance(ts, (int, float)) and (now - ts) <= ttl:
+            cached = entry.get("data")
+            if isinstance(cached, dict):
+                return cached
+    _rate_limit(provider)
+    data = fetcher()
+    if data:
+        cache[cache_key] = {"ts": now, "data": data}
+        _save_intel_cache()
+    return data
+
+
 def _abuseipdb_lookup(ip_text: str, api_key: str) -> Optional[dict[str, object]]:
     url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip_text}&maxAgeInDays=90&verbose=true"
     headers = {"Key": api_key, "Accept": "application/json"}
-    data = _fetch_json(url, headers)
+    data = _cached_lookup("abuseipdb", ip_text, lambda: _fetch_json(url, headers))
     if not data:
         return None
     payload = data.get("data")
@@ -562,7 +639,7 @@ def _abuseipdb_lookup(ip_text: str, api_key: str) -> Optional[dict[str, object]]
 def _otx_lookup(ip_text: str, api_key: str) -> Optional[dict[str, object]]:
     url = f"https://otx.alienvault.com/api/v1/indicators/IPv4/{ip_text}/general"
     headers = {"X-OTX-API-KEY": api_key, "Accept": "application/json"}
-    data = _fetch_json(url, headers)
+    data = _cached_lookup("otx", ip_text, lambda: _fetch_json(url, headers))
     if not data:
         return None
     pulse_info = data.get("pulse_info")
@@ -580,7 +657,7 @@ def _otx_lookup(ip_text: str, api_key: str) -> Optional[dict[str, object]]:
 def _virustotal_lookup(ip_text: str, api_key: str) -> Optional[dict[str, object]]:
     url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip_text}"
     headers = {"x-apikey": api_key, "Accept": "application/json"}
-    data = _fetch_json(url, headers)
+    data = _cached_lookup("virustotal", ip_text, lambda: _fetch_json(url, headers))
     if not data:
         return None
     data_obj = data.get("data")
