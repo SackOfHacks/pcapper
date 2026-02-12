@@ -70,6 +70,16 @@ class TlsSummary:
     http_urls: Counter[str]
     http_user_agents: Counter[str]
     http_files: Counter[str]
+    http_referrers: Counter[str]
+    http_referrer_hosts: Counter[str]
+    http_referrer_schemes: Counter[str]
+    http_referrer_paths: Counter[str]
+    http_referrer_tokens: Counter[str]
+    http_referrer_ip_hosts: Counter[str]
+    http_referrer_present: int
+    http_referrer_missing: int
+    http_referrer_cross_host: int
+    http_referrer_https_to_http: int
     http_clients: Counter[str]
     http_servers: Counter[str]
     cert_subjects: Counter[str]
@@ -84,6 +94,69 @@ class TlsSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": str(self.path),
+            "total_packets": self.total_packets,
+            "tls_packets": self.tls_packets,
+            "client_hellos": self.client_hellos,
+            "server_hellos": self.server_hellos,
+            "versions": dict(self.versions),
+            "cipher_suites": dict(self.cipher_suites),
+            "sni_counts": dict(self.sni_counts),
+            "alpn_counts": dict(self.alpn_counts),
+            "ja3_counts": dict(self.ja3_counts),
+            "ja4_counts": dict(self.ja4_counts),
+            "ja4s_counts": dict(self.ja4s_counts),
+            "client_counts": dict(self.client_counts),
+            "server_counts": dict(self.server_counts),
+            "server_ports": dict(self.server_ports),
+            "conversations": [
+                {
+                    "client_ip": conv.client_ip,
+                    "server_ip": conv.server_ip,
+                    "server_port": conv.server_port,
+                    "packets": conv.packets,
+                    "bytes": conv.bytes,
+                    "first_seen": conv.first_seen,
+                    "last_seen": conv.last_seen,
+                    "sni": conv.sni,
+                }
+                for conv in self.conversations
+            ],
+            "http_requests": self.http_requests,
+            "http_responses": self.http_responses,
+            "http_methods": dict(self.http_methods),
+            "http_statuses": dict(self.http_statuses),
+            "http_urls": dict(self.http_urls),
+            "http_user_agents": dict(self.http_user_agents),
+            "http_files": dict(self.http_files),
+            "http_referrers": dict(self.http_referrers),
+            "http_referrer_hosts": dict(self.http_referrer_hosts),
+            "http_referrer_schemes": dict(self.http_referrer_schemes),
+            "http_referrer_paths": dict(self.http_referrer_paths),
+            "http_referrer_tokens": dict(self.http_referrer_tokens),
+            "http_referrer_ip_hosts": dict(self.http_referrer_ip_hosts),
+            "http_referrer_present": self.http_referrer_present,
+            "http_referrer_missing": self.http_referrer_missing,
+            "http_referrer_cross_host": self.http_referrer_cross_host,
+            "http_referrer_https_to_http": self.http_referrer_https_to_http,
+            "http_clients": dict(self.http_clients),
+            "http_servers": dict(self.http_servers),
+            "cert_subjects": dict(self.cert_subjects),
+            "cert_issuers": dict(self.cert_issuers),
+            "cert_count": self.cert_count,
+            "weak_certs": self.weak_certs,
+            "expired_certs": self.expired_certs,
+            "self_signed_certs": self.self_signed_certs,
+            "detections": list(self.detections),
+            "artifacts": list(self.artifacts),
+            "errors": list(self.errors),
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "duration_seconds": self.duration_seconds,
+        }
 
 
 def _is_grease(value: int) -> bool:
@@ -326,6 +399,16 @@ def analyze_tls(
             http_urls=Counter(),
             http_user_agents=Counter(),
             http_files=Counter(),
+            http_referrers=Counter(),
+            http_referrer_hosts=Counter(),
+            http_referrer_schemes=Counter(),
+            http_referrer_paths=Counter(),
+            http_referrer_tokens=Counter(),
+            http_referrer_ip_hosts=Counter(),
+            http_referrer_present=0,
+            http_referrer_missing=0,
+            http_referrer_cross_host=0,
+            http_referrer_https_to_http=0,
             http_clients=Counter(),
             http_servers=Counter(),
             cert_subjects=Counter(),
@@ -604,6 +687,16 @@ def analyze_tls(
         http_urls=http_summary.url_counts,
         http_user_agents=http_summary.user_agents,
         http_files=http_summary.file_artifacts,
+        http_referrers=http_summary.referrer_counts,
+        http_referrer_hosts=http_summary.referrer_host_counts,
+        http_referrer_schemes=http_summary.referrer_scheme_counts,
+        http_referrer_paths=http_summary.referrer_path_counts,
+        http_referrer_tokens=http_summary.referrer_token_counts,
+        http_referrer_ip_hosts=http_summary.referrer_ip_hosts,
+        http_referrer_present=http_summary.referrer_present,
+        http_referrer_missing=http_summary.referrer_missing,
+        http_referrer_cross_host=http_summary.referrer_cross_host,
+        http_referrer_https_to_http=http_summary.referrer_https_to_http,
         http_clients=http_summary.client_counts,
         http_servers=http_summary.server_counts,
         cert_subjects=cert_summary.subjects,

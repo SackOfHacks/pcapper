@@ -11,6 +11,35 @@ from .icmp import analyze_icmp
 from .dns import analyze_dns
 from .beacon import analyze_beacons
 from .files import analyze_files
+from .modbus import analyze_modbus
+from .dnp3 import analyze_dnp3
+from .iec104 import analyze_iec104
+from .bacnet import analyze_bacnet
+from .enip import analyze_enip
+from .profinet import analyze_profinet
+from .s7 import analyze_s7
+from .opc import analyze_opc
+from .ethercat import analyze_ethercat
+from .fins import analyze_fins
+from .crimson import analyze_crimson
+from .pcworx import analyze_pcworx
+from .melsec import analyze_melsec
+from .cip import analyze_cip
+from .odesys import analyze_odesys
+from .niagara import analyze_niagara
+from .mms import analyze_mms
+from .srtp import analyze_srtp
+from .df1 import analyze_df1
+from .pccc import analyze_pccc
+from .csp import analyze_csp
+from .modicon import analyze_modicon
+from .yokogawa import analyze_yokogawa
+from .honeywell import analyze_honeywell
+from .mqtt import analyze_mqtt
+from .coap import analyze_coap
+from .hart import analyze_hart
+from .prconos import analyze_prconos
+from .iccp import analyze_iccp
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -29,6 +58,43 @@ class ThreatSummary:
     errors: list[str]
 
 
+def _normalize_severity(value: object) -> str:
+    text = str(value).upper()
+    if text == "CRITICAL":
+        return "critical"
+    if text == "HIGH":
+        return "high"
+    if text in {"MEDIUM", "WARN", "WARNING"}:
+        return "warning"
+    return "info"
+
+
+def _append_ot_anomalies(
+    detections: list[dict[str, object]],
+    source: str,
+    anomalies: list[object],
+) -> None:
+    for anomaly in anomalies:
+        title = str(getattr(anomaly, "title", "OT Anomaly"))
+        description = str(getattr(anomaly, "description", ""))
+        src = getattr(anomaly, "src", None)
+        dst = getattr(anomaly, "dst", None)
+        details = description
+        if src or dst:
+            details = f"{description} ({src or '?'} -> {dst or '?'})"
+        item: dict[str, object] = {
+            "source": source,
+            "severity": _normalize_severity(getattr(anomaly, "severity", "info")),
+            "summary": title,
+            "details": details,
+        }
+        if src:
+            item["top_sources"] = [(src, 1)]
+        if dst:
+            item["top_destinations"] = [(dst, 1)]
+        detections.append(item)
+
+
 def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     errors: list[str] = []
     detections: list[dict[str, object]] = []
@@ -38,6 +104,45 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     dns_summary = analyze_dns(path, show_status=show_status)
     beacon_summary = analyze_beacons(path, show_status=show_status)
     files_summary = analyze_files(path, show_status=show_status)
+
+    ot_summaries = {
+        "Modbus": analyze_modbus(path, show_status=show_status),
+        "DNP3": analyze_dnp3(path, show_status=show_status),
+        "IEC-104": analyze_iec104(path, show_status=show_status),
+        "BACnet": analyze_bacnet(path, show_status=show_status),
+        "EtherNet/IP": analyze_enip(path, show_status=show_status),
+        "Profinet": analyze_profinet(path, show_status=show_status),
+        "S7": analyze_s7(path, show_status=show_status),
+        "OPC UA": analyze_opc(path, show_status=show_status),
+        "EtherCAT": analyze_ethercat(path, show_status=show_status),
+        "FINS": analyze_fins(path, show_status=show_status),
+        "Crimson": analyze_crimson(path, show_status=show_status),
+        "PCWorx": analyze_pcworx(path, show_status=show_status),
+        "MELSEC": analyze_melsec(path, show_status=show_status),
+        "CIP": analyze_cip(path, show_status=show_status),
+        "ODESYS": analyze_odesys(path, show_status=show_status),
+        "Niagara": analyze_niagara(path, show_status=show_status),
+        "MMS": analyze_mms(path, show_status=show_status),
+        "SRTP": analyze_srtp(path, show_status=show_status),
+        "DF1": analyze_df1(path, show_status=show_status),
+        "PCCC": analyze_pccc(path, show_status=show_status),
+        "CSP": analyze_csp(path, show_status=show_status),
+        "Modicon": analyze_modicon(path, show_status=show_status),
+        "Yokogawa": analyze_yokogawa(path, show_status=show_status),
+        "Honeywell": analyze_honeywell(path, show_status=show_status),
+        "MQTT": analyze_mqtt(path, show_status=show_status),
+        "CoAP": analyze_coap(path, show_status=show_status),
+        "HART-IP": analyze_hart(path, show_status=show_status),
+        "ProConOS": analyze_prconos(path, show_status=show_status),
+        "ICCP": analyze_iccp(path, show_status=show_status),
+    }
+
+    for source, summary in ot_summaries.items():
+        anomalies = getattr(summary, "anomalies", None)
+        if isinstance(anomalies, list) and anomalies:
+            _append_ot_anomalies(detections, source, anomalies)
+        for err in getattr(summary, "errors", []) or []:
+            errors.append(f"{source}: {err}")
 
     for item in icmp_summary.detections:
         detections.append({

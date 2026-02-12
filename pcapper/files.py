@@ -24,6 +24,7 @@ except Exception:  # pragma: no cover
     dpkt = None
 
 from .utils import safe_float, detect_file_type_bytes
+from .cip import CIP_SERVICE_NAMES
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
@@ -85,6 +86,7 @@ FILE_TRANSFER_PROTOCOLS = {
     "POP3",
     "SMTP",
     "NFS",
+    "ENIP",
 }
 
 FILE_TYPE_EXTENSIONS: dict[str, set[str]] = {
@@ -99,6 +101,28 @@ FILE_TYPE_EXTENSIONS: dict[str, set[str]] = {
     "HTML": {".html", ".htm", ".xhtml", ".shtml"},
     "X509": {".cer", ".crt", ".pem", ".der", ".p7b", ".pfx", ".p12"},
     "DICOM": {".dcm"},
+}
+
+ENIP_TCP_PORT = 44818
+ENIP_UDP_PORT = 2222
+ENIP_HEADER_LEN = 24
+
+ENIP_COMMANDS = {
+    0x0001: "NOP",
+    0x0004: "ListServices",
+    0x0063: "ListIdentity",
+    0x0064: "ListInterfaces",
+    0x0065: "RegisterSession",
+    0x0066: "UnregisterSession",
+    0x0067: "SendRRData",
+    0x0068: "SendUnitData",
+    0x0069: "IndicateStatus",
+    0x006A: "Cancel",
+    0x006B: "FindNextObjectInstance",
+    0x006C: "ReadObjectInstanceAttributes",
+    0x006D: "WriteObjectInstanceAttributes",
+    0x006F: "SendRRData",
+    0x0070: "SendUnitData",
 }
 
 def _flow_protocol(sport: Optional[int], dport: Optional[int]) -> str:
@@ -131,6 +155,8 @@ def _flow_protocol(sport: Optional[int], dport: Optional[int]) -> str:
         return "RDP"
     if 3306 in ports:
         return "MYSQL"
+    if ENIP_TCP_PORT in ports or ENIP_UDP_PORT in ports:
+        return "ENIP"
     return "UNKNOWN"
 
 
@@ -356,6 +382,93 @@ def _is_tftp_payload(payload: bytes) -> bool:
         rest = payload[2:]
         return b"\x00" in rest[:256]
     return True
+
+
+def _parse_enip_frames(stream: bytes) -> list[tuple[int, bytes]]:
+    frames: list[tuple[int, bytes]] = []
+    offset = 0
+    while offset + ENIP_HEADER_LEN <= len(stream):
+        header = stream[offset:offset + ENIP_HEADER_LEN]
+        cmd = int.from_bytes(header[0:2], "little")
+        length = int.from_bytes(header[2:4], "little")
+        total_len = ENIP_HEADER_LEN + length
+        if cmd not in ENIP_COMMANDS:
+            break
+        if length < 0 or offset + total_len > len(stream):
+            break
+        data = stream[offset + ENIP_HEADER_LEN:offset + total_len]
+        frames.append((cmd, data))
+        offset += total_len
+    return frames
+
+
+def _scan_enip_frames(stream: bytes) -> list[tuple[int, bytes]]:
+    frames: list[tuple[int, bytes]] = []
+    offset = 0
+    max_len = len(stream)
+    while offset + ENIP_HEADER_LEN <= max_len:
+        cmd = int.from_bytes(stream[offset:offset + 2], "little")
+        if cmd not in ENIP_COMMANDS:
+            offset += 1
+            continue
+        length = int.from_bytes(stream[offset + 2:offset + 4], "little")
+        total_len = ENIP_HEADER_LEN + length
+        if length < 0 or total_len <= ENIP_HEADER_LEN:
+            offset += 1
+            continue
+        if offset + total_len > max_len:
+            offset += 1
+            continue
+        data = stream[offset + ENIP_HEADER_LEN:offset + total_len]
+        frames.append((cmd, data))
+        offset += total_len
+    return frames
+
+
+def _parse_enip_cpf(data: bytes) -> Optional[bytes]:
+    if len(data) < 6:
+        return None
+    ptr = 0
+    ptr += 4
+    ptr += 2
+    if ptr + 2 > len(data):
+        return None
+    item_count = int.from_bytes(data[ptr:ptr + 2], "little")
+    ptr += 2
+    cip_payload: Optional[bytes] = None
+    for _ in range(item_count):
+        if ptr + 4 > len(data):
+            break
+        item_type = int.from_bytes(data[ptr:ptr + 2], "little")
+        item_length = int.from_bytes(data[ptr + 2:ptr + 4], "little")
+        ptr += 4
+        item_data = data[ptr:ptr + item_length]
+        ptr += item_length
+        if item_type in {0x00B1, 0x00B2, 0x00B4}:
+            cip_payload = item_data
+    return cip_payload
+
+
+def _parse_cip_data(payload: bytes) -> tuple[Optional[int], bool, bytes]:
+    if not payload:
+        return None, True, b""
+    service = payload[0]
+    is_request = (service & 0x80) == 0
+    if is_request:
+        if len(payload) < 2:
+            return service, True, b""
+        path_size_words = payload[1]
+        path_len = path_size_words * 2
+        data_offset = 2 + path_len
+        if data_offset <= len(payload):
+            return service, True, payload[data_offset:]
+        return service, True, b""
+    if len(payload) >= 4:
+        additional_size = payload[3]
+        data_offset = 4 + (additional_size * 2)
+        if data_offset <= len(payload):
+            return service, False, payload[data_offset:]
+    return service, False, b""
 
 # --- Protocol Parsers ---
 
@@ -1579,6 +1692,13 @@ def _export_with_dpkt(
     need_payload = bool(extract_name or view_name)
     seen_x509: set[str] = set()
     seen_x509_meta: set[tuple[str, str, str, int]] = set()
+    enip_buffers: Dict[tuple[str, str, int, int, str, str], Dict[str, object]] = {}
+    enip_payload_hashes: set[str] = set()
+    enip_best: Dict[tuple[str, str, str, str], tuple[int, str]] = {}
+    enip_file_services = {0x73, 0x74, 0x75, 0x55, 0x4C, 0x4E, 0x4D, 0x4F}
+    max_enip_bytes = 50_000_000
+    min_enip_bytes = 1024
+    min_enip_named_bytes = 2048
 
     def _add_artifact(artifact: FileArtifact) -> None:
         artifacts.append(artifact)
@@ -1744,6 +1864,45 @@ def _export_with_dpkt(
             continue
 
         protocol = _detect_app_protocol_from_stream(stream, sport, dport)
+
+        # ENIP/CIP extraction (firmware or large object transfers)
+        is_enip = ENIP_TCP_PORT in (sport, dport) or stream[:2] in {b"\x04\x00", b"\x63\x00", b"\x6f\x00", b"\x70\x00"}
+        if is_enip:
+            enip_frames = _parse_enip_frames(stream)
+            if not enip_frames:
+                enip_frames = _scan_enip_frames(stream)
+            for cmd, data in enip_frames:
+                if cmd in {0x006F, 0x0070}:
+                    cip_payload = _parse_enip_cpf(data)
+                else:
+                    cip_payload = data
+                if not cip_payload:
+                    continue
+                service, is_request, cip_data = _parse_cip_data(cip_payload)
+                if service is None:
+                    continue
+                service_code = service & 0x7F
+                if service_code not in enip_file_services and len(cip_data) < 1024:
+                    continue
+                service_name = CIP_SERVICE_NAMES.get(service_code, f"service_0x{service_code:02x}")
+                direction = "request" if is_request else "response"
+                key = (src, dst, sport, dport, service_name, direction)
+                if key not in enip_buffers:
+                    enip_buffers[key] = {
+                        "data": bytearray(),
+                        "first_pkt": first_pkt,
+                        "service": service_name,
+                        "direction": direction,
+                        "src": src,
+                        "dst": dst,
+                        "sport": sport,
+                        "dport": dport,
+                    }
+                buf = enip_buffers[key]["data"]
+                if isinstance(buf, bytearray) and len(buf) < max_enip_bytes:
+                    remaining = max_enip_bytes - len(buf)
+                    buf.extend(cip_data[:remaining])
+            
 
         # HTTP
         if protocol == "HTTP":
@@ -2008,6 +2167,114 @@ def _export_with_dpkt(
                 file_type=detect_file_type_bytes(data),
                 payload=data if need_payload else None,
             ))
+
+    # ENIP/CIP extraction for UDP payloads
+    for src, dst, sport, dport, payload, pidx in udp_packets:
+        if ENIP_UDP_PORT not in (sport, dport):
+            continue
+        if len(payload) < ENIP_HEADER_LEN:
+            continue
+        enip_frames = _parse_enip_frames(payload)
+        if not enip_frames:
+            enip_frames = _scan_enip_frames(payload)
+        for cmd, data in enip_frames:
+            if cmd in {0x006F, 0x0070}:
+                cip_payload = _parse_enip_cpf(data)
+            else:
+                cip_payload = data
+            if not cip_payload:
+                continue
+            service, is_request, cip_data = _parse_cip_data(cip_payload)
+            if service is None:
+                continue
+            service_code = service & 0x7F
+            if service_code not in enip_file_services and len(cip_data) < 1024:
+                continue
+            service_name = CIP_SERVICE_NAMES.get(service_code, f"service_0x{service_code:02x}")
+            direction = "request" if is_request else "response"
+            key = (src, dst, sport, dport, service_name, direction)
+            if key not in enip_buffers:
+                enip_buffers[key] = {
+                    "data": bytearray(),
+                    "first_pkt": pidx,
+                    "service": service_name,
+                    "direction": direction,
+                    "src": src,
+                    "dst": dst,
+                    "sport": sport,
+                    "dport": dport,
+                }
+            buf = enip_buffers[key]["data"]
+            if isinstance(buf, bytearray) and len(buf) < max_enip_bytes:
+                remaining = max_enip_bytes - len(buf)
+                buf.extend(cip_data[:remaining])
+
+    # ENIP/CIP buffered artifacts
+    for key, meta in enip_buffers.items():
+        data = meta.get("data")
+        if not isinstance(data, bytearray):
+            continue
+        if len(data) < min_enip_bytes:
+            continue
+        service_name = str(meta.get("service", "cip_data"))
+        direction = str(meta.get("direction", "payload"))
+        first_pkt = int(meta.get("first_pkt", 0) or 0)
+        src = str(meta.get("src", ""))
+        dst = str(meta.get("dst", ""))
+        sport = int(meta.get("sport", 0) or 0)
+        dport = int(meta.get("dport", 0) or 0)
+        payload = bytes(data)
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest in enip_payload_hashes:
+            continue
+        enip_payload_hashes.add(digest)
+
+        candidate_names = _scan_filenames(payload)
+        candidate_name = next((n for n in candidate_names if _is_plausible_filename(n)), None)
+        if not candidate_name:
+            alt_names = re.findall(r"[A-Za-z0-9_\-]{3,}\.(?:l5x|l5k|acd|bin|hex|fw|zip)", payload.decode("latin-1", errors="ignore"), re.IGNORECASE)
+            candidate_name = next((n for n in alt_names if _is_plausible_filename(n)), None)
+        file_type = detect_file_type_bytes(payload)
+        if candidate_name:
+            fname = _normalize_filename(candidate_name)
+        else:
+            if file_type in ("UNKNOWN", "BINARY") and len(payload) < min_enip_named_bytes:
+                continue
+            short_hash = hashlib.sha256(payload).hexdigest()[:10]
+            if service_name in {"ProgramDownload", "ProgramUpload", "ProgramCommand"}:
+                fname = _normalize_filename(
+                    f"enip_{service_name}_{src}_to_{dst}_{direction}_{short_hash}.bin"
+                )
+            else:
+                fname = _normalize_filename(
+                    f"enip_{service_name}_{direction}_{short_hash}.bin"
+                )
+            if file_type not in ("UNKNOWN", "BINARY"):
+                expected = _expected_extensions_for_type(file_type)
+                if expected:
+                    ext = sorted(expected)[0]
+                    if not fname.lower().endswith(ext):
+                        fname = f"{Path(fname).stem}{ext}"
+
+        best_key = (service_name, direction, src, dst)
+        best = enip_best.get(best_key)
+        if best and len(payload) <= best[0]:
+            continue
+        enip_best[best_key] = (len(payload), fname)
+
+        _add_artifact(FileArtifact(
+            protocol="ENIP",
+            src_ip=src,
+            dst_ip=dst,
+            src_port=sport,
+            dst_port=dport,
+            filename=fname,
+            size_bytes=len(payload),
+            packet_index=first_pkt,
+            note=f"ENIP/CIP {service_name} payload ({direction})",
+            file_type=file_type,
+            payload=payload if need_payload else None,
+        ))
 
     if artifacts:
         mismatch_seen: set[tuple[str, str, str]] = set()

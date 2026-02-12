@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, Counter
 from dataclasses import dataclass, field
+import ipaddress
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import re
@@ -60,7 +61,15 @@ COMMON_PORTS = {
     445: "SMB", 514: "Syslog", 636: "LDAPS", 993: "IMAPS", 995: "POP3S",
     1433: "MSSQL", 1521: "Oracle", 3306: "MySQL", 3389: "RDP", 
     5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 8000: "HTTP-Alt", 
-    8080: "HTTP-Proxy", 8443: "HTTPS-Alt", 9200: "Elasticsearch", 27017: "MongoDB"
+    8080: "HTTP-Proxy", 8443: "HTTPS-Alt", 9200: "Elasticsearch", 27017: "MongoDB",
+    102: "S7/MMS/ICCP", 502: "Modbus/TCP", 9600: "FINS", 20000: "DNP3",
+    2404: "IEC-104", 47808: "BACnet/IP", 44818: "EtherNet/IP", 2222: "ENIP-IO",
+    34962: "PROFINET", 34963: "PROFINET", 34964: "PROFINET", 4840: "OPC UA",
+    1911: "Niagara Fox", 4911: "Niagara Fox", 5094: "HART-IP",
+    18245: "GE SRTP", 18246: "GE SRTP", 20547: "ProConOS", 1962: "PCWorx",
+    5006: "MELSEC", 5007: "MELSEC", 5683: "CoAP", 5684: "CoAP",
+    2455: "ODESYS", 1217: "ODESYS", 34378: "Yokogawa Vnet/IP",
+    34379: "Yokogawa Vnet/IP", 34380: "Yokogawa Vnet/IP"
 }
 
 # --- Logic ---
@@ -127,7 +136,7 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
             path, show_status=show_status
         )
     except Exception as exc:
-        return ServiceSummary(path, 0, [], [], {}, [f"Error: {e}"])
+        return ServiceSummary(path, 0, [], [], {}, [f"Error: {exc}"])
     size_bytes = size_bytes
 
     # Map: (IP, Port, Proto) -> ServiceAsset
@@ -192,13 +201,25 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
                     s.bytes += pkt_len
                     s.last_seen = ts
                     continue
+
+                # Provisional service: client traffic to a well-known port
+                if dport in COMMON_PORTS:
+                    k = (dst, dport, "TCP")
+                    if k not in services:
+                        s_name = COMMON_PORTS.get(dport, f"TCP/{dport}")
+                        services[k] = ServiceAsset(dst, dport, "TCP", s_name, first_seen=ts, last_seen=ts)
+                    s = services[k]
+                    s.clients.add(src)
+                    s.packets += 1
+                    s.bytes += pkt_len
+                    s.last_seen = ts
                 
                 # Check payloads for banners (from src)
                 if Raw in pkt:
                     payload = bytes(pkt[Raw])
                     if payload:
                         guessed_service, banner = _guess_service(payload, sport)
-                        is_known_port = sport in COMMON_PORTS and sport < 10000
+                        is_known_port = sport in COMMON_PORTS
                         if is_known_port or guessed_service:
                             s_name = COMMON_PORTS.get(sport, guessed_service or f"TCP/{sport}")
                             k = (src, sport, "TCP")
@@ -239,6 +260,17 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
                     if sport == 53 and DNS in pkt and pkt[DNS].qr == 1:
                         # It's a DNS Server
                         pass
+                elif dport in COMMON_PORTS:
+                    # Provisional UDP service (one-way client -> server)
+                    k = (dst, dport, "UDP")
+                    if k not in services:
+                        s_name = COMMON_PORTS.get(dport, f"UDP/{dport}")
+                        services[k] = ServiceAsset(dst, dport, "UDP", s_name, first_seen=ts, last_seen=ts)
+                    s = services[k]
+                    s.clients.add(src)
+                    s.packets += 1
+                    s.bytes += pkt_len
+                    s.last_seen = ts
 
     except Exception as e:
         errors.append(str(e))
@@ -247,11 +279,32 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
         reader.close()
 
     # Risk Assessment
+    def _is_public_ip(value: str) -> bool:
+        try:
+            ip_addr = ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        return ip_addr.is_global
+
+    risky_cleartext = {
+        "Telnet": "HIGH",
+        "FTP": "HIGH",
+        "TFTP": "HIGH",
+        "HTTP": "MEDIUM",
+        "POP3": "MEDIUM",
+        "IMAP": "MEDIUM",
+        "LDAP": "MEDIUM",
+        "SNMP": "MEDIUM",
+        "VNC": "MEDIUM",
+    }
+    admin_services = {"SSH", "RDP", "SMB", "VNC", "Telnet", "WinRM"}
+    udp_amplifiers = {"DNS", "NTP", "SNMP"}
     for k, asset in services.items():
         # Cleartext protocols
-        if asset.service_name in ("FTP", "Telnet", "HTTP"):
+        if asset.service_name in risky_cleartext:
             risks.append(ServiceRisk(
-                "HIGH", "Cleartext Service", 
+                risky_cleartext[asset.service_name],
+                "Cleartext Service",
                 f"Unencrypted {asset.service_name} service detected. Credentials/Data at risk.",
                 f"{asset.ip}:{asset.port}"
             ))
@@ -287,6 +340,22 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
                     f"{svc} detected on non-standard port {asset.port}.",
                     f"{asset.ip}:{asset.port}",
                 ))
+
+        if _is_public_ip(asset.ip) and any(svc in asset.service_name for svc in admin_services):
+            risks.append(ServiceRisk(
+                "HIGH",
+                "Public Admin Service",
+                f"Administrative service {asset.service_name} exposed on a public IP.",
+                f"{asset.ip}:{asset.port}",
+            ))
+
+        if asset.protocol == "UDP" and _is_public_ip(asset.ip) and asset.service_name in udp_amplifiers:
+            risks.append(ServiceRisk(
+                "MEDIUM",
+                "Potential UDP Amplification",
+                f"Public {asset.service_name} over UDP can be abused for amplification if open.",
+                f"{asset.ip}:{asset.port}",
+            ))
 
     # Hierarchy
     hier = Counter()

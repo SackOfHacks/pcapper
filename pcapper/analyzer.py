@@ -8,15 +8,27 @@ from typing import Iterable, Optional
 from .pcap_cache import PcapMeta, get_reader
 
 try:
-    from scapy.layers.l2 import Dot1Q  # type: ignore
+    from scapy.layers.l2 import Dot1Q, Ether  # type: ignore
+    from scapy.layers.inet import TCP, UDP  # type: ignore
 except Exception:  # pragma: no cover
     Dot1Q = None  # type: ignore
+    TCP = UDP = None  # type: ignore
+    Ether = None  # type: ignore
 
 from .models import InterfaceStat, PcapSummary
 from .utils import detect_file_type
+from .services import COMMON_PORTS
 
 
 IGNORE_LAYERS = {"Raw", "Padding", "NoPayload"}
+
+ETHERTYPE_PROTOCOLS = {
+    0x88A4: "EtherCAT",
+    0x8892: "PROFINET RT",
+    0x88B8: "IEC 61850 GOOSE",
+    0x88BA: "IEC 61850 SV",
+    0x88F7: "HSR/PRP",
+}
 
 
 def _layer_names(packet) -> Iterable[str]:
@@ -24,6 +36,46 @@ def _layer_names(packet) -> Iterable[str]:
         name = layer.__name__
         if name not in IGNORE_LAYERS:
             yield name
+
+
+def _port_protocol_name(pkt) -> str | None:
+    if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+        try:
+            sport = int(pkt[TCP].sport)
+            dport = int(pkt[TCP].dport)
+        except Exception:
+            return None
+        return COMMON_PORTS.get(sport) or COMMON_PORTS.get(dport)
+    if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+        try:
+            sport = int(pkt[UDP].sport)
+            dport = int(pkt[UDP].dport)
+        except Exception:
+            return None
+        return COMMON_PORTS.get(sport) or COMMON_PORTS.get(dport)
+    return None
+
+
+def _extract_ethertype(pkt) -> int | None:
+    if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+        try:
+            return int(pkt[Ether].type)
+        except Exception:
+            return None
+    try:
+        raw = bytes(pkt)
+        if len(raw) >= 14:
+            return int.from_bytes(raw[12:14], "big")
+    except Exception:
+        return None
+    return None
+
+
+def _ethertype_protocol_name(pkt) -> str | None:
+    ethertype = _extract_ethertype(pkt)
+    if ethertype is None:
+        return None
+    return ETHERTYPE_PROTOCOLS.get(ethertype)
 
 
 def _get_iface_name(pkt) -> Optional[str]:
@@ -136,8 +188,20 @@ def analyze_pcap(
                 except Exception:
                     pass
 
-            for name in set(_layer_names(pkt)):
+            port_proto = _port_protocol_name(pkt)
+            ethertype_proto = _ethertype_protocol_name(pkt)
+            layer_names = set(_layer_names(pkt))
+            if port_proto:
+                layer_names.discard("TCP")
+                layer_names.discard("UDP")
+
+            for name in layer_names:
                 protocol_counts[name] += 1
+
+            if port_proto:
+                protocol_counts[port_proto] += 1
+            if ethertype_proto:
+                protocol_counts[ethertype_proto] += 1
 
             if stream is not None and size_bytes:
                 try:

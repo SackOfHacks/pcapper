@@ -68,17 +68,64 @@ class ProtocolSummary:
     endpoints: List[Endpoint]
     anomalies: List[Anomaly]
     top_protocols: List[Tuple[str, int]]
+    port_protocols: List[Tuple[str, int]]
+    ethertype_protocols: List[Tuple[str, int]]
     errors: List[str]
 
 # --- Analysis ---
 
+INDUSTRIAL_PORTS = {
+    102: "S7/MMS/ICCP",
+    502: "Modbus/TCP",
+    9600: "FINS",
+    20000: "DNP3",
+    2404: "IEC-104",
+    47808: "BACnet/IP",
+    44818: "EtherNet/IP",
+    2222: "ENIP-IO",
+    34962: "PROFINET",
+    34963: "PROFINET",
+    34964: "PROFINET",
+    4840: "OPC UA",
+    1911: "Niagara Fox",
+    4911: "Niagara Fox",
+    5094: "HART-IP",
+    18245: "GE SRTP",
+    18246: "GE SRTP",
+    20547: "ProConOS",
+    1962: "PCWorx",
+    5006: "MELSEC",
+    5007: "MELSEC",
+    5683: "CoAP",
+    5684: "CoAP",
+    2455: "ODESYS",
+    1217: "ODESYS",
+    34378: "Yokogawa Vnet/IP",
+    34379: "Yokogawa Vnet/IP",
+    34380: "Yokogawa Vnet/IP",
+}
+
+ETHERTYPE_PROTOCOLS = {
+    0x88A4: "EtherCAT",
+    0x8892: "PROFINET RT",
+    0x88B8: "IEC 61850 GOOSE",
+    0x88BA: "IEC 61850 SV",
+    0x88F7: "HSR/PRP",
+}
+
 KNOWN_PORTS = {
     20: "FTP-Data", 21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP",
     53: "DNS", 67: "DHCP", 68: "DHCP", 69: "TFTP", 80: "HTTP",
-    110: "POP3", 123: "NTP", 137: "NetBIOS", 138: "NetBIOS", 139: "NetBIOS",
-    143: "IMAP", 161: "SNMP", 162: "SNMP", 389: "LDAP", 443: "HTTPS",
-    445: "SMB", 3306: "MySQL", 3389: "RDP", 5353: "mDNS", 8080: "HTTP-Alt"
+    88: "Kerberos", 110: "POP3", 123: "NTP", 135: "RPC",
+    137: "NetBIOS", 138: "NetBIOS", 139: "NetBIOS", 143: "IMAP",
+    161: "SNMP", 162: "SNMP", 389: "LDAP", 443: "HTTPS",
+    445: "SMB", 514: "Syslog", 636: "LDAPS", 993: "IMAPS", 995: "POP3S",
+    1433: "MSSQL", 1521: "Oracle", 3306: "MySQL", 3389: "RDP",
+    5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 8000: "HTTP-Alt",
+    8080: "HTTP-Proxy", 8443: "HTTPS-Alt", 9200: "Elasticsearch", 27017: "MongoDB",
+    5353: "mDNS",
 }
+KNOWN_PORTS.update(INDUSTRIAL_PORTS)
 
 def _get_proto_name(pkt: Packet) -> str:
     # Heuristic based on layers
@@ -112,14 +159,14 @@ def _get_proto_name(pkt: Packet) -> str:
 
 def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
     if IP is None:
-         return ProtocolSummary(path, 0, 0, ProtocolStat("Root"), [], [], [], [], ["Scapy not available"])
+         return ProtocolSummary(path, 0, 0, ProtocolStat("Root"), [], [], [], [], [], [], ["Scapy not available"])
 
     try:
         reader, status, stream, size_bytes, _file_type = get_reader(
             path, show_status=show_status
         )
     except Exception as e:
-        return ProtocolSummary(path, 0, 0, ProtocolStat("Root"), [], [], [], [], [f"Error opening pcap: {e}"])
+        return ProtocolSummary(path, 0, 0, ProtocolStat("Root"), [], [], [], [], [], [], [f"Error opening pcap: {e}"])
     size_bytes = size_bytes
 
     # Stats containers
@@ -130,10 +177,20 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
     broadcast_frames = 0
     arp_ip_macs: Dict[str, Set[str]] = defaultdict(set)
     gratuitous_arp = 0
+    tcp_syn_sources: Counter[str] = Counter()
+    tcp_syn_ports: Dict[str, Set[int]] = defaultdict(set)
+    tcp_rst_sources: Counter[str] = Counter()
+    tcp_null_scan: Counter[str] = Counter()
+    tcp_fin_scan: Counter[str] = Counter()
+    tcp_xmas_scan: Counter[str] = Counter()
+    ip_fragments = 0
+    icmp_large_payloads: List[Tuple[str, str, int]] = []
     
     start_ts = None
     end_ts = None
     pkt_idx = 0
+    port_protocol_counts: Counter[str] = Counter()
+    ethertype_protocol_counts: Counter[str] = Counter()
     
     errors = []
 
@@ -153,30 +210,49 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
             end_ts = ts
             
             pkt_len = len(pkt)
+            port_protocol_counts[_get_proto_name(pkt)] += 1
+            if Ether in pkt:
+                try:
+                    ethertype = int(pkt[Ether].type)
+                except Exception:
+                    ethertype = None
+                if ethertype is not None:
+                    label = ETHERTYPE_PROTOCOLS.get(ethertype)
+                    if label:
+                        ethertype_protocol_counts[label] += 1
             
             # 1. Hierarchy Update
-            # A simple way is to traverse layers
+            # Traverse layers while avoiding double-counting VLAN-tagged traffic.
             current_node = hierarchy
             current_node.packets += 1
             current_node.bytes += pkt_len
-            
-            layers = []
+
             layer = pkt
             while layer:
                 try:
                     lname = layer.name
-                    if not lname: # Fallback
+                    if not lname:  # Fallback
                         lname = layer.__class__.__name__
-                except:
+                except Exception:
                     lname = "Unknown"
-                    
+
                 if lname not in {"NoPayload", "Raw", "Padding"}:
-                    layers.append(lname)
-                    if lname not in current_node.sub_protocols:
-                        current_node.sub_protocols[lname] = ProtocolStat(lname)
-                    current_node = current_node.sub_protocols[lname]
-                    current_node.packets += 1
-                    current_node.bytes += pkt_len
+                    if lname in {"802.1Q", "Dot1Q"}:
+                        # Count VLAN tags, but do not make them the parent of L3/L4.
+                        vlan_parent = current_node
+                        if vlan_parent.name != "Ethernet":
+                            vlan_parent = hierarchy.sub_protocols.get("Ethernet", vlan_parent)
+                        if lname not in vlan_parent.sub_protocols:
+                            vlan_parent.sub_protocols[lname] = ProtocolStat(lname)
+                        vlan_node = vlan_parent.sub_protocols[lname]
+                        vlan_node.packets += 1
+                        vlan_node.bytes += pkt_len
+                    else:
+                        if lname not in current_node.sub_protocols:
+                            current_node.sub_protocols[lname] = ProtocolStat(lname)
+                        current_node = current_node.sub_protocols[lname]
+                        current_node.packets += 1
+                        current_node.bytes += pkt_len
                 layer = layer.payload
 
             # 2. Extract Endpoints & Conversations
@@ -190,11 +266,11 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                 dst = pkt[IP].dst
                 proto = "IP"
                 if TCP in pkt:
-                    proto = "TCP"
+                    proto = KNOWN_PORTS.get(pkt[TCP].sport) or KNOWN_PORTS.get(pkt[TCP].dport) or "TCP"
                     ports.add(pkt[TCP].sport)
                     ports.add(pkt[TCP].dport)
                 elif UDP in pkt:
-                    proto = "UDP"
+                    proto = KNOWN_PORTS.get(pkt[UDP].sport) or KNOWN_PORTS.get(pkt[UDP].dport) or "UDP"
                     ports.add(pkt[UDP].sport)
                     ports.add(pkt[UDP].dport)
                 elif ICMP in pkt:
@@ -258,6 +334,15 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                 c.ports.update(ports)
 
             # 3. Anomaly Detection (Basic)
+            if IP in pkt:
+                try:
+                    ip_layer = pkt[IP]
+                    if getattr(ip_layer, "frag", 0) or getattr(ip_layer, "flags", 0):
+                        if getattr(ip_layer, "frag", 0) > 0 or str(getattr(ip_layer, "flags", "")).lower().find("mf") >= 0:
+                            ip_fragments += 1
+                except Exception:
+                    pass
+
             # Cleartext Credentials
             if TCP in pkt and Raw in pkt:
                 payload = bytes(pkt[Raw])
@@ -296,6 +381,52 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                     # FTP explicit USER/PASS lines
                     if re.search(r"(?i)^USER\s+\S+", text) and re.search(r"(?i)^PASS\s+\S+", text):
                         anomalies.append(Anomaly("HIGH", "Cleartext Creds", "FTP USER/PASS observed", pkt_idx, src, dst))
+
+            if TCP in pkt:
+                try:
+                    flags = pkt[TCP].flags
+                except Exception:
+                    flags = None
+
+                syn = ack = fin = rst = psh = urg = False
+                if isinstance(flags, str):
+                    syn = "S" in flags
+                    ack = "A" in flags
+                    fin = "F" in flags
+                    rst = "R" in flags
+                    psh = "P" in flags
+                    urg = "U" in flags
+                elif isinstance(flags, int):
+                    syn = bool(flags & 0x02)
+                    ack = bool(flags & 0x10)
+                    fin = bool(flags & 0x01)
+                    rst = bool(flags & 0x04)
+                    psh = bool(flags & 0x08)
+                    urg = bool(flags & 0x20)
+
+                if syn and not ack and src:
+                    tcp_syn_sources[src] += 1
+                    try:
+                        tcp_syn_ports[src].add(int(pkt[TCP].dport))
+                    except Exception:
+                        pass
+
+                if rst and src:
+                    tcp_rst_sources[src] += 1
+
+                if flags == 0 and src:
+                    tcp_null_scan[src] += 1
+
+                if fin and not (syn or ack or rst) and src:
+                    tcp_fin_scan[src] += 1
+
+                if fin and psh and urg and src:
+                    tcp_xmas_scan[src] += 1
+
+            if ICMP in pkt and Raw in pkt:
+                payload = bytes(pkt[Raw])
+                if len(payload) >= 512:
+                    icmp_large_payloads.append((src or "-", dst or "-", len(payload)))
 
             # Non-Standard Ports for known protocols? 
             # (Hard without deep inspection, skipping for now to keep it safe)
@@ -338,15 +469,81 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
             0,
         ))
 
-    # SYN Scan heuristic
-    syn_counts = Counter()
-    for c in convs.values():
-         if c.protocol == "TCP" and c.packets < 3:
-             syn_counts[c.src] += 1
-    
-    for ip, count in syn_counts.items():
-        if count > 100:
-            anomalies.append(Anomaly("MEDIUM", "Port Scan", f"Potential SYN scan activity (>100 incomplete TCP flows) from {ip}", 0, ip, None))
+    # TCP scan heuristics
+    for ip, count in tcp_syn_sources.items():
+        unique_ports = len(tcp_syn_ports.get(ip, set()))
+        if count > 200 or unique_ports > 100:
+            anomalies.append(Anomaly(
+                "MEDIUM",
+                "Port Scan",
+                f"Potential SYN scan activity ({count} SYNs, {unique_ports} ports) from {ip}",
+                0,
+                ip,
+                None,
+            ))
+
+    for ip, count in tcp_null_scan.items():
+        if count >= 10:
+            anomalies.append(Anomaly(
+                "MEDIUM",
+                "TCP Null Scan",
+                f"Null scan pattern observed ({count} packets) from {ip}",
+                0,
+                ip,
+                None,
+            ))
+
+    for ip, count in tcp_fin_scan.items():
+        if count >= 10:
+            anomalies.append(Anomaly(
+                "MEDIUM",
+                "TCP FIN Scan",
+                f"FIN scan pattern observed ({count} packets) from {ip}",
+                0,
+                ip,
+                None,
+            ))
+
+    for ip, count in tcp_xmas_scan.items():
+        if count >= 10:
+            anomalies.append(Anomaly(
+                "MEDIUM",
+                "TCP Xmas Scan",
+                f"Xmas scan pattern observed ({count} packets) from {ip}",
+                0,
+                ip,
+                None,
+            ))
+
+    for ip, count in tcp_rst_sources.items():
+        if count > 500:
+            anomalies.append(Anomaly(
+                "LOW",
+                "TCP Reset Flood",
+                f"High TCP RST volume ({count} packets) from {ip}",
+                0,
+                ip,
+                None,
+            ))
+
+    if ip_fragments > 50:
+        anomalies.append(Anomaly(
+            "MEDIUM",
+            "IP Fragmentation",
+            f"Elevated IP fragmentation observed ({ip_fragments} fragments)",
+            0,
+        ))
+
+    if len(icmp_large_payloads) > 10:
+        src, dst, size = max(icmp_large_payloads, key=lambda item: item[2])
+        anomalies.append(Anomaly(
+            "MEDIUM",
+            "Large ICMP Payloads",
+            f"Large ICMP payloads observed ({len(icmp_large_payloads)} packets, max {size} bytes)",
+            0,
+            src,
+            dst,
+        ))
 
     # Calculate Top Protocols
     # Flatten hierarchy counts? Or just use root children?
@@ -369,5 +566,7 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
         endpoints=list(eps.values()),
         anomalies=anomalies,
         top_protocols=layer_counts.most_common(10),
+        port_protocols=port_protocol_counts.most_common(12),
+        ethertype_protocols=ethertype_protocol_counts.most_common(12),
         errors=errors
     )

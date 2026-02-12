@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 import ipaddress
 import re
+import textwrap
 from typing import Iterable
 
 from .models import PcapSummary
@@ -20,10 +21,14 @@ from .services import ServiceSummary, COMMON_PORTS
 from .smb import SmbSummary
 from .nfs import NfsSummary
 from .strings import StringsSummary
+from .creds import CredentialSummary
+from .search import SearchSummary
 from .certificates import CertificateSummary
 from .tls import TlsSummary
+from .ssh import SshSummary
+from .syslog import SyslogSummary
 from .tcp import TcpSummary
-from .udp import UdpSummary
+from .udp import UdpSummary, UdpConversation
 from .exfil import ExfilSummary
 from .http import HttpSummary
 from .sizes import SizeSummary, render_size_sparkline
@@ -94,6 +99,42 @@ def _format_table(rows: Iterable[list[str]]) -> str:
     return "\n".join(lines)
 
 
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_IPV6_RE = re.compile(r"\b[0-9A-Fa-f:]{2,}\b")
+
+
+def _is_public_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_global
+    except Exception:
+        return False
+
+
+def _highlight_public_ips(text: str) -> str:
+    def _replace_ipv4(match: re.Match[str]) -> str:
+        ip_value = match.group(0)
+        return danger(ip_value) if _is_public_ip(ip_value) else ip_value
+
+    def _replace_ipv6(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if ":" not in token:
+            return token
+        return danger(token) if _is_public_ip(token) else token
+
+    text = _IPV4_RE.sub(_replace_ipv4, text)
+    return _IPV6_RE.sub(_replace_ipv6, text)
+
+
+def _finalize_output(lines: list[str]) -> str:
+    return _highlight_public_ips("\n".join(lines))
+
+
+def _truncate_text(value: str, max_len: int = 80) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 1] + "…"
+
+
 def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
     summary_list = list(summaries)
     if not summary_list:
@@ -102,18 +143,27 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
     totals: dict[str, float] = {}
     counters: dict[str, Counter[str]] = {}
     unions: dict[str, set[object]] = {}
+    service_endpoints: dict[str, Counter[str]] = defaultdict(Counter)
+    packet_buckets: dict[str, dict[str, float]] = {}
+    payload_buckets: dict[str, dict[str, float]] = {}
+    artifact_counts: Counter[str] = Counter()
+    anomaly_counts: Counter[str] = Counter()
 
     preferred_numeric = {
         "total_packets": "Total Packets",
         "total_bytes": "Total Bytes",
         "packet_count": "Total Packets",
         "packets": "Total Packets",
+        "protocol_packets": "Protocol Packets",
+        "protocol_bytes": "Protocol Bytes",
         "duration_seconds": "Combined Duration",
         "duration": "Combined Duration",
         "modbus_packets": "Modbus Packets",
         "dnp3_packets": "DNP3 Packets",
         "total_requests": "Total Requests",
         "total_responses": "Total Responses",
+        "requests": "Total Requests",
+        "responses": "Total Responses",
         "total_tagged_packets": "Tagged Packets",
         "total_tagged_bytes": "Tagged Bytes",
     }
@@ -121,6 +171,8 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
     preferred_sets = {
         "src_ips": "Unique Source IPs",
         "dst_ips": "Unique Destination IPs",
+        "client_ips": "Unique Clients",
+        "server_ips": "Unique Servers",
         "clients": "Unique Clients",
         "servers": "Unique Servers",
     }
@@ -134,6 +186,53 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
             elif isinstance(value, (int, float)) and not isinstance(value, bool):
                 if name in preferred_numeric:
                     totals[name] = totals.get(name, 0.0) + float(value)
+
+        summary_service_endpoints = getattr(summary, "service_endpoints", None)
+        if isinstance(summary_service_endpoints, dict):
+            for service, endpoints in summary_service_endpoints.items():
+                if isinstance(endpoints, Counter):
+                    service_endpoints[str(service)].update(endpoints)
+
+        for bucket_name, bucket_store in (
+            ("packet_size_buckets", packet_buckets),
+            ("payload_size_buckets", payload_buckets),
+        ):
+            buckets = getattr(summary, bucket_name, None)
+            if not buckets:
+                continue
+            for bucket in buckets:
+                bucket_label = getattr(bucket, "label", None)
+                if bucket_label is None:
+                    continue
+                entry = bucket_store.setdefault(
+                    str(bucket_label),
+                    {"count": 0.0, "sum": 0.0, "min": 0.0, "max": 0.0},
+                )
+                count = float(getattr(bucket, "count", 0) or 0)
+                avg = float(getattr(bucket, "avg", 0.0) or 0.0)
+                min_val = float(getattr(bucket, "min", 0) or 0)
+                max_val = float(getattr(bucket, "max", 0) or 0)
+                if entry["count"] == 0:
+                    entry["min"] = min_val
+                    entry["max"] = max_val
+                else:
+                    entry["min"] = min(entry["min"], min_val)
+                    entry["max"] = max(entry["max"], max_val)
+                entry["count"] += count
+                entry["sum"] += avg * count
+
+        artifacts = getattr(summary, "artifacts", None)
+        if isinstance(artifacts, list):
+            for artifact in artifacts:
+                kind = str(getattr(artifact, "kind", "artifact"))
+                detail = str(getattr(artifact, "detail", ""))
+                artifact_counts[f"{kind}: {detail}"] += 1
+
+        anomalies = getattr(summary, "anomalies", None)
+        if isinstance(anomalies, list):
+            for anomaly in anomalies:
+                title = str(getattr(anomaly, "title", "Event"))
+                anomaly_counts[title] += 1
 
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -155,6 +254,28 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
         if key in unions:
             lines.append(_format_kv(label_text, str(len(unions[key]))))
 
+    client_counter = counters.get("client_ips") or counters.get("clients") or counters.get("src_ips")
+    server_counter = counters.get("server_ips") or counters.get("servers") or counters.get("dst_ips")
+    if client_counter or server_counter:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Endpoint Statistics"))
+        col_width = 45
+        lines.append(highlight(f"{'Clients':<{col_width}} | {'Servers'}"))
+        lines.append(muted("-" * 90))
+        clients = client_counter.most_common(10) if client_counter else []
+        servers = server_counter.most_common(10) if server_counter else []
+        max_rows = max(len(clients), len(servers))
+        for i in range(max_rows):
+            c_str = ""
+            s_str = ""
+            if i < len(clients):
+                ip, cnt = clients[i]
+                c_str = f"{ip} ({cnt})"
+            if i < len(servers):
+                ip, cnt = servers[i]
+                s_str = f"{ip} ({cnt})"
+            lines.append(f"{c_str:<{col_width}} | {s_str}")
+
     if counters:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Aggregated Counters"))
@@ -166,8 +287,64 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
                 rows.append([str(item), str(count)])
             lines.append(_format_table(rows))
 
+    if service_endpoints:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Service Endpoints"))
+        rows = [["Service", "Top Endpoints"]]
+        for service, counter in Counter({
+            svc: sum(cnt.values()) for svc, cnt in service_endpoints.items()
+        }).most_common(10):
+            endpoints = service_endpoints.get(service, Counter())
+            top_eps = ", ".join(f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(3))
+            rows.append([service, top_eps or "-"])
+        lines.append(_format_table(rows))
+
+    if packet_buckets or payload_buckets:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Packet/Payload Size Analysis"))
+
+        def _render_bucket_table(bucket_store: dict[str, dict[str, float]], label_text: str) -> None:
+            if not bucket_store:
+                return
+            total = sum(entry["count"] for entry in bucket_store.values())
+            if not total:
+                return
+            rows = [["Bucket", "Count", "Pct", "Min", "Avg", "Max"]]
+            for bucket_label, entry in bucket_store.items():
+                avg = (entry["sum"] / entry["count"]) if entry["count"] else 0.0
+                pct = (entry["count"] / total) * 100
+                rows.append([
+                    bucket_label,
+                    str(int(entry["count"])),
+                    f"{pct:.1f}%",
+                    str(int(entry["min"])) if entry["min"] else "0",
+                    f"{avg:.1f}",
+                    str(int(entry["max"])) if entry["max"] else "0",
+                ])
+            lines.append(label(label_text))
+            lines.append(_format_table(rows))
+
+        _render_bucket_table(packet_buckets, "Packet Buckets")
+        _render_bucket_table(payload_buckets, "Payload Buckets")
+
+    if artifact_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts & Observations"))
+        rows = [["Artifact", "Count"]]
+        for detail, count in artifact_counts.most_common(12):
+            rows.append([detail, str(count)])
+        lines.append(_format_table(rows))
+
+    if anomaly_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies & Threat Indicators"))
+        rows = [["Title", "Count"]]
+        for title, count in anomaly_counts.most_common(12):
+            rows.append([title, str(count)])
+        lines.append(_format_table(rows))
+
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def _protocol_rows(protocol_counts: Counter[str], packet_count: int, limit: int) -> list[list[str]]:
@@ -239,7 +416,7 @@ def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
         lines.append(muted("No VLAN-tagged traffic detected."))
     lines.append(SECTION_BAR)
 
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = False) -> str:
@@ -343,7 +520,7 @@ def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = F
                 lines.append(muted(f"  Destinations: {dst_text}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_vlan_rollup(summaries: Iterable[VlanSummary], limit: int = 20, verbose: bool = False) -> str:
@@ -605,7 +782,7 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25) -> str:
                 lines.append(muted(f"  {details}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25) -> str:
@@ -813,7 +990,7 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25) -> str:
                 lines.append(muted(f"  {details}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25) -> str:
@@ -968,7 +1145,7 @@ def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25) -> str
                 lines.append(muted(f"  {details}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -1245,7 +1422,7 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         lines.append(muted(", ".join(summary.files_discovered[:20])))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -1466,7 +1643,7 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
                 lines.append(muted(f"  Servers: {server_text}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -1756,7 +1933,7 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -1842,6 +2019,107 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
         for ua, count in summary.user_agents.most_common(limit):
             rows.append([ua, str(count)])
         lines.append(_format_table(rows))
+
+    if summary.referrer_counts or summary.referrer_present or summary.referrer_missing:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Referrer Analysis"))
+
+        def _normalize_referrer_items(items: list[tuple[str, int]], truncate: bool) -> list[tuple[str, int]]:
+            ordered = sorted(items, key=lambda item: (-item[1], item[0]))
+            if not truncate:
+                return ordered
+            if verbose:
+                return ordered
+            merged: dict[str, int] = {}
+            for value, count in ordered:
+                display = _truncate_text(value, max_len=96)
+                merged[display] = merged.get(display, 0) + count
+            return sorted(merged.items(), key=lambda item: (-item[1], item[0]))
+
+        def _append_referrer_table(title: str, header_text: str, items: list[tuple[str, int]], truncate: bool = False) -> None:
+            if not items:
+                return
+            normalized = _normalize_referrer_items(items, truncate)
+            if not normalized:
+                return
+            lines.append(label(title))
+            count_width = max(1, max(len(str(count)) for _, count in normalized))
+            rows = [[label(header_text), label("Count")]]
+            for value, count in normalized:
+                rows.append([value, str(count).rjust(count_width)])
+            lines.append(_format_table(rows))
+
+        lines.append(label("Summary"))
+        stats_rows = [
+            [label("Metric"), label("Value")],
+            ["Referrers Present", str(summary.referrer_present)],
+            ["Referrers Missing", str(summary.referrer_missing)],
+            ["Unique Referrers", str(len(summary.referrer_counts))],
+            ["Unique Referrer Hosts", str(len(summary.referrer_host_counts))],
+            ["Cross-Host Referrers", str(summary.referrer_cross_host)],
+            ["HTTPS→HTTP Referrers", str(summary.referrer_https_to_http)],
+            ["Referrers w/ Tokens", str(sum(summary.referrer_token_counts.values()))],
+            ["Referrers w/ IP Hosts", str(len(summary.referrer_ip_hosts))],
+        ]
+        lines.append(_format_table(stats_rows))
+
+        anomalies: list[str] = []
+        if summary.referrer_https_to_http:
+            anomalies.append(f"Mixed content/downgrade referrers: {summary.referrer_https_to_http}")
+        if summary.referrer_token_counts:
+            anomalies.append(f"Token-like strings in referrers: {sum(summary.referrer_token_counts.values())}")
+        if summary.referrer_ip_hosts:
+            anomalies.append(f"IP-literal referrer hosts: {len(summary.referrer_ip_hosts)}")
+        if summary.referrer_cross_host and summary.referrer_present:
+            ratio = summary.referrer_cross_host / max(1, summary.referrer_present)
+            if ratio > 0.7:
+                anomalies.append(f"High cross-site referrer rate: {summary.referrer_cross_host}/{summary.referrer_present}")
+        if anomalies:
+            lines.append(header("Referrer Anomalies/Threats"))
+            for item in anomalies:
+                lines.append(warn(f"- {item}"))
+
+        if summary.referrer_scheme_counts:
+            _append_referrer_table(
+                "Scheme Counts",
+                "Scheme",
+                summary.referrer_scheme_counts.most_common(limit),
+            )
+
+        if summary.referrer_host_counts:
+            _append_referrer_table(
+                "Referrer Hosts",
+                "Referrer Host",
+                summary.referrer_host_counts.most_common(limit),
+            )
+
+        show_paths = bool(summary.referrer_path_counts) and (
+            verbose
+            or not summary.referrer_counts
+            or len(summary.referrer_path_counts) != len(summary.referrer_counts)
+        )
+        if show_paths:
+            _append_referrer_table(
+                "Referrer Paths",
+                "Referrer Path",
+                summary.referrer_path_counts.most_common(limit),
+                truncate=True,
+            )
+
+        if summary.referrer_counts:
+            _append_referrer_table(
+                "Referrers",
+                "Referrer",
+                summary.referrer_counts.most_common(limit),
+                truncate=True,
+            )
+
+        if summary.referrer_token_counts:
+            _append_referrer_table(
+                "Token Fingerprints",
+                "Token Fingerprint",
+                summary.referrer_token_counts.most_common(limit),
+            )
 
     if summary.server_headers:
         lines.append(SUBSECTION_BAR)
@@ -1948,7 +2226,7 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
                 lines.append(muted(f"  {details}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -2063,42 +2341,57 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             rows.append([str(port), str(count)])
         lines.append(_format_table(rows))
 
-    if summary.http_requests or summary.http_responses:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("HTTP Observations (Plaintext)"))
-        lines.append(muted("Note: HTTPS payloads are encrypted; HTTP data shown here is plaintext traffic only."))
-        lines.append(_format_kv("HTTP Requests", str(summary.http_requests)))
-        lines.append(_format_kv("HTTP Responses", str(summary.http_responses)))
+        if summary.http_referrers or summary.http_referrer_present or summary.http_referrer_missing:
+            lines.append(header("HTTP Referrer Analysis (Plaintext)"))
+            stats_rows = [
+                ["Metric", "Value"],
+                ["Referrers Present", str(summary.http_referrer_present)],
+                ["Referrers Missing", str(summary.http_referrer_missing)],
+                ["Unique Referrers", str(len(summary.http_referrers))],
+                ["Unique Referrer Hosts", str(len(summary.http_referrer_hosts))],
+                ["Cross-Host Referrers", str(summary.http_referrer_cross_host)],
+                ["HTTPS→HTTP Referrers", str(summary.http_referrer_https_to_http)],
+                ["Referrers w/ Tokens", str(sum(summary.http_referrer_tokens.values()))],
+                ["Referrers w/ IP Hosts", str(len(summary.http_referrer_ip_hosts))],
+            ]
+            lines.append(_format_table(stats_rows))
 
-        if summary.http_methods:
-            rows = [["Method", "Count"]]
-            for method, count in summary.http_methods.most_common(limit):
-                rows.append([method, str(count)])
-            lines.append(_format_table(rows))
+            if summary.http_referrer_schemes:
+                rows = [["Scheme", "Count"]]
+                for scheme, count in summary.http_referrer_schemes.most_common(limit):
+                    rows.append([scheme, str(count)])
+                lines.append(_format_table(rows))
 
-        if summary.http_statuses:
-            rows = [["Status", "Count"]]
-            for status, count in summary.http_statuses.most_common(limit):
-                rows.append([status, str(count)])
-            lines.append(_format_table(rows))
+            if summary.http_referrer_hosts:
+                rows = [["Referrer Host", "Count"]]
+                for host, count in summary.http_referrer_hosts.most_common(limit):
+                    rows.append([host, str(count)])
+                lines.append(_format_table(rows))
 
-        if summary.http_urls:
-            rows = [["URL", "Count"]]
-            for url, count in summary.http_urls.most_common(limit):
-                rows.append([url, str(count)])
-            lines.append(_format_table(rows))
+            if summary.http_referrers:
+                rows = [["Referrer", "Count"]]
+                for ref, count in summary.http_referrers.most_common(limit):
+                    display = ref if verbose else _truncate_text(ref, max_len=96)
+                    rows.append([display, str(count)])
+                lines.append(_format_table(rows))
 
-        if summary.http_user_agents:
-            rows = [["User-Agent", "Count"]]
-            for ua, count in summary.http_user_agents.most_common(limit):
-                rows.append([ua, str(count)])
-            lines.append(_format_table(rows))
+            show_paths = bool(summary.http_referrer_paths) and (
+                verbose
+                or not summary.http_referrers
+                or len(summary.http_referrer_paths) != len(summary.http_referrers)
+            )
+            if show_paths:
+                rows = [["Referrer Path", "Count"]]
+                for path, count in summary.http_referrer_paths.most_common(limit):
+                    display = path if verbose else _truncate_text(path, max_len=96)
+                    rows.append([display, str(count)])
+                lines.append(_format_table(rows))
 
-        if summary.http_files:
-            rows = [["File", "Count"]]
-            for fname, count in summary.http_files.most_common(limit):
-                rows.append([fname, str(count)])
-            lines.append(_format_table(rows))
+            if summary.http_referrer_tokens:
+                rows = [["Token Fingerprint", "Count"]]
+                for token, count in summary.http_referrer_tokens.most_common(limit):
+                    rows.append([token, str(count)])
+                lines.append(_format_table(rows))
 
     if summary.cert_count:
         lines.append(SUBSECTION_BAR)
@@ -2147,7 +2440,351 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             lines.append(muted(f"- {item}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
+
+
+def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = False) -> str:
+    if not summary:
+        return ""
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"SSH ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
+    lines.append(_format_kv("SSH Packets", str(summary.ssh_packets)))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
+    if summary.duration_seconds is not None:
+        lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+    lines.append(_format_kv("Sessions", str(summary.total_sessions)))
+    lines.append(_format_kv("Unique Clients", str(summary.unique_clients)))
+    lines.append(_format_kv("Unique Servers", str(summary.unique_servers)))
+
+    if summary.server_ports:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Server Ports"))
+        rows = [["Port", "Count"]]
+        for port, count in summary.server_ports.most_common(limit):
+            rows.append([str(port), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.client_counts or summary.server_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top SSH Clients & Servers"))
+        rows = [["Clients", "Servers"]]
+        client_text = ", ".join(
+            f"{ip}({count})" for ip, count in summary.client_counts.most_common(8)
+        ) or "-"
+        server_text = ", ".join(
+            f"{ip}({count})" for ip, count in summary.server_counts.most_common(8)
+        ) or "-"
+        rows.append([client_text, server_text])
+        lines.append(_format_table(rows))
+
+    if summary.client_versions or summary.server_versions:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("SSH Versions"))
+        rows = [["Client Versions", "Server Versions"]]
+        client_text = ", ".join(
+            f"{_truncate_text(name, 40)}({count})" for name, count in summary.client_versions.most_common(6)
+        ) or "-"
+        server_text = ", ".join(
+            f"{_truncate_text(name, 40)}({count})" for name, count in summary.server_versions.most_common(6)
+        ) or "-"
+        rows.append([client_text, server_text])
+        lines.append(_format_table(rows))
+
+    if summary.client_software or summary.server_software:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("SSH Software"))
+        rows = [["Clients", "Servers"]]
+        client_text = ", ".join(
+            f"{_truncate_text(name, 40)}({count})" for name, count in summary.client_software.most_common(6)
+        ) or "-"
+        server_text = ", ".join(
+            f"{_truncate_text(name, 40)}({count})" for name, count in summary.server_software.most_common(6)
+        ) or "-"
+        rows.append([client_text, server_text])
+        lines.append(_format_table(rows))
+
+    if summary.kex_algorithms or summary.cipher_algorithms or summary.mac_algorithms or summary.host_key_algorithms:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Crypto Negotiation"))
+        rows = [["KEX", "Host Key", "Cipher", "MAC", "Compression"]]
+        rows.append([
+            ", ".join(f"{name}({count})" for name, count in summary.kex_algorithms.most_common(3)) or "-",
+            ", ".join(f"{name}({count})" for name, count in summary.host_key_algorithms.most_common(3)) or "-",
+            ", ".join(f"{name}({count})" for name, count in summary.cipher_algorithms.most_common(3)) or "-",
+            ", ".join(f"{name}({count})" for name, count in summary.mac_algorithms.most_common(3)) or "-",
+            ", ".join(f"{name}({count})" for name, count in summary.compression_algorithms.most_common(3)) or "-",
+        ])
+        lines.append(_format_table(rows))
+
+    if summary.auth_methods:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Auth Methods"))
+        rows = [["Method", "Count"]]
+        for name, count in summary.auth_methods.most_common(limit):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.request_counts or summary.response_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Requests & Responses"))
+        rows = [["Requests", "Responses"]]
+        req_text = ", ".join(
+            f"{name.replace('SSH_MSG_', '')}({count})"
+            for name, count in summary.request_counts.most_common(6)
+        ) or "-"
+        resp_text = ", ".join(
+            f"{name.replace('SSH_MSG_', '')}({count})"
+            for name, count in summary.response_counts.most_common(6)
+        ) or "-"
+        rows.append([req_text, resp_text])
+        lines.append(_format_table(rows))
+
+    if summary.disconnect_reasons:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Disconnect Reasons"))
+        rows = [["Reason", "Count"]]
+        for reason, count in summary.disconnect_reasons.most_common(limit):
+            rows.append([reason, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.plaintext_strings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Plaintext"))
+        rows = [["String", "Count"]]
+        for text, count in summary.plaintext_strings.most_common(limit):
+            rows.append([_truncate_text(text, 60), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.file_artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Files Discovered"))
+        rows = [["File", "Count"]]
+        for name, count in summary.file_artifacts.most_common(limit):
+            rows.append([_truncate_text(name, 60), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies"))
+        for item in summary.anomalies[:limit]:
+            title = str(item.get("title", "Event"))
+            details = str(item.get("details", ""))
+            if details:
+                lines.append(warn(f"- {title}: {details}"))
+            else:
+                lines.append(warn(f"- {title}"))
+
+    if summary.detections:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Detections"))
+        for item in summary.detections:
+            severity = str(item.get("severity", "info")).lower()
+            summary_text = str(item.get("summary", ""))
+            details = str(item.get("details", ""))
+            if severity in {"critical", "high"}:
+                marker = danger("[HIGH]")
+                summary_text = danger(summary_text)
+            elif severity == "warning":
+                marker = warn("[WARN]")
+            else:
+                marker = ok("[INFO]")
+            lines.append(f"{marker} {summary_text}")
+            if details:
+                lines.append(muted(f"  {details}"))
+
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts"))
+        for item in summary.artifacts[:limit]:
+            lines.append(f"- {_truncate_text(item, 80)}")
+
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines)
+
+
+def render_syslog_summary(summary: SyslogSummary, limit: int = 12, verbose: bool = False) -> str:
+    if not summary:
+        return ""
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"SYSLOG ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
+    lines.append(_format_kv("Syslog Packets", str(summary.syslog_packets)))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
+    if summary.duration_seconds is not None:
+        lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+    lines.append(_format_kv("Messages", str(summary.total_messages)))
+    lines.append(_format_kv("Unique Clients", str(summary.unique_clients)))
+    lines.append(_format_kv("Unique Servers", str(summary.unique_servers)))
+
+    if summary.server_ports:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Server Ports"))
+        rows = [["Port", "Count"]]
+        for port, count in summary.server_ports.most_common(limit):
+            rows.append([str(port), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.client_counts or summary.server_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Syslog Clients & Servers"))
+        rows = [["Clients", "Servers"]]
+        client_text = ", ".join(
+            f"{ip}({count})" for ip, count in summary.client_counts.most_common(8)
+        ) or "-"
+        server_text = ", ".join(
+            f"{ip}({count})" for ip, count in summary.server_counts.most_common(8)
+        ) or "-"
+        rows.append([client_text, server_text])
+        lines.append(_format_table(rows))
+
+    if summary.hostname_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Hostnames"))
+        rows = [["Hostname", "Count"]]
+        for name, count in summary.hostname_counts.most_common(limit):
+            rows.append([_truncate_text(name, 50), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.appname_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Applications"))
+        rows = [["App", "Count"]]
+        for name, count in summary.appname_counts.most_common(limit):
+            rows.append([_truncate_text(name, 50), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.version_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Syslog Versions"))
+        rows = [["Version", "Count"]]
+        for version, count in summary.version_counts.most_common(limit):
+            rows.append([str(version), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.facility_counts or summary.severity_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Facility & Severity"))
+        rows = [["Facilities", "Severities"]]
+        facility_text = ", ".join(
+            f"{name}({count})" for name, count in summary.facility_counts.most_common(6)
+        ) or "-"
+        severity_text = ", ".join(
+            f"{name}({count})" for name, count in summary.severity_counts.most_common(6)
+        ) or "-"
+        rows.append([facility_text, severity_text])
+        lines.append(_format_table(rows))
+
+    if summary.request_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Request Summary"))
+        rows = [["Request", "Count"]]
+        for name, count in summary.request_counts.most_common(limit):
+            rows.append([_truncate_text(name, 50), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.response_codes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Response Codes"))
+        rows = [["Code", "Count"]]
+        for name, count in summary.response_codes.most_common(limit):
+            rows.append([_truncate_text(name, 30), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.conversations:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Syslog Conversations"))
+        rows = [["Client", "Server", "Proto", "Port", "Packets", "Bytes"]]
+        for convo in summary.conversations[:limit]:
+            rows.append([
+                convo.client_ip,
+                convo.server_ip,
+                convo.protocol,
+                str(convo.server_port),
+                str(convo.packets),
+                format_bytes_as_mb(convo.bytes),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.plaintext_strings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Plaintext"))
+        rows = [["String", "Count"]]
+        for text, count in summary.plaintext_strings.most_common(limit):
+            rows.append([_truncate_text(text, 70), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.file_artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Files Discovered"))
+        rows = [["File", "Count"]]
+        for name, count in summary.file_artifacts.most_common(limit):
+            rows.append([_truncate_text(name, 60), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies"))
+        for item in summary.anomalies[:limit]:
+            title = item.title
+            details = item.details
+            sev = item.severity
+            sev_color = danger if sev in ("HIGH", "CRITICAL") else warn
+            lines.append(sev_color(f"[{sev}] {title}: {details}"))
+
+    if summary.detections:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Detections"))
+        for item in summary.detections:
+            severity = str(item.get("severity", "info")).lower()
+            summary_text = str(item.get("summary", ""))
+            details = str(item.get("details", ""))
+            if severity in {"critical", "high"}:
+                marker = danger("[HIGH]")
+                summary_text = danger(summary_text)
+            elif severity == "warning":
+                marker = warn("[WARN]")
+            else:
+                marker = ok("[INFO]")
+            lines.append(f"{marker} {summary_text}")
+            if details:
+                lines.append(muted(f"  {details}"))
+
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts"))
+        rows = [["Type", "Detail", "Src", "Dst"]]
+        for item in summary.artifacts[:limit]:
+            rows.append([
+                str(item.kind),
+                _truncate_text(str(item.detail), 60),
+                str(item.src),
+                str(item.dst),
+            ])
+        lines.append(_format_table(rows))
+
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines)
 
 
 def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -2162,13 +2799,53 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         for err in summary.errors:
             lines.append(danger(f"- {err}"))
 
-    lines.append(_format_kv("TCP Packets", str(summary.tcp_packets)))
+    tcp_packet_ratio = (summary.tcp_packets / summary.total_packets) if summary.total_packets else 0.0
+    tcp_byte_ratio = (summary.tcp_bytes / summary.total_bytes) if summary.total_bytes else 0.0
+    avg_tcp_pkt = (summary.tcp_bytes / summary.tcp_packets) if summary.tcp_packets else 0.0
+    avg_tcp_payload = (summary.tcp_payload_bytes / summary.tcp_packets) if summary.tcp_packets else 0.0
+    tcp_pps = (summary.tcp_packets / summary.duration_seconds) if summary.duration_seconds else 0.0
+    tcp_bps = (summary.tcp_bytes / summary.duration_seconds) if summary.duration_seconds else 0.0
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Protocol Statistics"))
+    lines.append(_format_kv("TCP Packets", f"{summary.tcp_packets} ({tcp_packet_ratio:.1%})"))
+    lines.append(_format_kv("TCP Bytes", f"{format_bytes_as_mb(summary.tcp_bytes)} ({tcp_byte_ratio:.1%})"))
     lines.append(_format_kv("Unique Clients", str(len(summary.client_counts))))
     lines.append(_format_kv("Unique Servers", str(len(summary.server_counts))))
+    lines.append(_format_kv("Unique Endpoints", str(len(getattr(summary, "endpoint_packets", {})))))
     lines.append(_format_kv("Conversations", str(len(summary.conversations))))
     lines.append(_format_kv("Start", format_ts(summary.first_seen)))
     lines.append(_format_kv("End", format_ts(summary.last_seen)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Overall Traffic Statistics"))
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
+    lines.append(_format_kv("TCP Payload Bytes", format_bytes_as_mb(summary.tcp_payload_bytes)))
+    lines.append(_format_kv("Avg TCP Packet Size", f"{avg_tcp_pkt:.1f} bytes"))
+    lines.append(_format_kv("Avg TCP Payload Size", f"{avg_tcp_payload:.1f} bytes"))
+    lines.append(_format_kv("TCP Packets/sec", f"{tcp_pps:.2f}"))
+    lines.append(_format_kv("TCP Bytes/sec", f"{tcp_bps:.2f}"))
+
+    if summary.packet_size_hist or summary.payload_size_hist:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Packet & Payload Size Distribution"))
+        bucket_labels = ["<=64", "65-128", "129-256", "257-512", "513-1024", "1025-1500", "1501-9000", ">9000"]
+        if summary.packet_size_hist:
+            packet_series = [summary.packet_size_hist.get(label, 0) for label in bucket_labels]
+            lines.append(_format_kv("Packet Size Buckets", ", ".join(bucket_labels)))
+            lines.append(_format_kv("Packet Size Spark", sparkline(packet_series)))
+            stats = summary.packet_size_stats
+            lines.append(_format_kv("Packet Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+        if summary.payload_size_hist:
+            payload_series = [summary.payload_size_hist.get(label, 0) for label in bucket_labels]
+            lines.append(_format_kv("Payload Size Buckets", ", ".join(bucket_labels)))
+            lines.append(_format_kv("Payload Size Spark", sparkline(payload_series)))
+            stats = summary.payload_size_stats
+            lines.append(_format_kv("Payload Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+        if summary.zero_payload_packets:
+            lines.append(_format_kv("Zero Payload Packets", str(summary.zero_payload_packets)))
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
@@ -2191,75 +2868,62 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
 
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Top TCP Clients & Servers"))
-        rows = [["Clients", "Servers"]]
-        clients = [f"{ip}({count})" for ip, count in summary.client_counts.most_common(10)]
-        servers = [f"{ip}({count})" for ip, count in summary.server_counts.most_common(10)]
-        max_len = max(len(clients), len(servers), 1)
-        for idx in range(max_len):
+        lines.append(header("TCP Client/Server Statistics"))
+        client_bytes = summary.client_bytes if isinstance(summary.client_bytes, Counter) else Counter()
+        server_bytes = summary.server_bytes if isinstance(summary.server_bytes, Counter) else Counter()
+        rows = [["Client", "Server"]]
+        client_list = [
+            f"{ip}({summary.client_counts[ip]}/{format_bytes_as_mb(client_bytes.get(ip, 0))})"
+            for ip, _count in summary.client_counts.most_common(10)
+        ]
+        server_list = [
+            f"{ip}({summary.server_counts[ip]}/{format_bytes_as_mb(server_bytes.get(ip, 0))})"
+            for ip, _count in summary.server_counts.most_common(10)
+        ]
+        max_rows = max(len(client_list), len(server_list), 1)
+        for idx in range(max_rows):
             rows.append([
-                clients[idx] if idx < len(clients) else "-",
-                servers[idx] if idx < len(servers) else "-",
+                client_list[idx] if idx < len(client_list) else "-",
+                server_list[idx] if idx < len(server_list) else "-",
             ])
+        lines.append(_format_table(rows))
+
+    if getattr(summary, "endpoint_packets", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TCP Endpoint Statistics"))
+        rows = [["Endpoint", "Packets", "Bytes"]]
+        endpoint_bytes = summary.endpoint_bytes if isinstance(summary.endpoint_bytes, Counter) else Counter()
+        for ip, count in summary.endpoint_packets.most_common(limit):
+            rows.append([ip, str(count), format_bytes_as_mb(endpoint_bytes.get(ip, 0))])
         lines.append(_format_table(rows))
 
     if summary.port_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top TCP Destination Ports"))
-        rows = [["Port", "Count"]]
+        rows = [["Port", "Count", "Destinations"]]
+        port_destinations = summary.port_destinations if isinstance(summary.port_destinations, dict) else {}
         for port, count in summary.port_counts.most_common(limit):
-            rows.append([str(port), str(count)])
+            dsts = port_destinations.get(port, Counter())
+            dst_text = ", ".join(f"{ip}({cnt})" for ip, cnt in dsts.most_common(3)) or "-"
+            rows.append([str(port), str(count), dst_text])
         lines.append(_format_table(rows))
 
     if summary.services:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("TCP Services"))
-        rows = [["Service", "Port", "Proto", "Count"]]
+        lines.append(header("TCP Services (Endpoints)"))
+        rows = [["Service", "Endpoint", "Port", "Clients", "Count"]]
         for svc in summary.services[:limit]:
+            client_note = str(svc.get("clients", "-"))
+            if svc.get("client_count"):
+                client_note = f"{svc.get('client_count')} :: {client_note}"
             rows.append([
                 str(svc.get("service", "-")),
+                str(svc.get("endpoint", "-")),
                 str(svc.get("port", "-")),
-                str(svc.get("proto", "-")),
+                client_note,
                 str(svc.get("count", "-")),
             ])
         lines.append(_format_table(rows))
-
-    if summary.http_requests or summary.http_responses:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("HTTP Observations (Plaintext)"))
-        lines.append(muted("Note: HTTPS payloads are encrypted; HTTP data shown here is plaintext traffic only."))
-        lines.append(_format_kv("HTTP Requests", str(summary.http_requests)))
-        lines.append(_format_kv("HTTP Responses", str(summary.http_responses)))
-
-        if summary.http_methods:
-            rows = [["Method", "Count"]]
-            for method, count in summary.http_methods.most_common(limit):
-                rows.append([method, str(count)])
-            lines.append(_format_table(rows))
-
-        if summary.http_statuses:
-            rows = [["Status", "Count"]]
-            for status, count in summary.http_statuses.most_common(limit):
-                rows.append([status, str(count)])
-            lines.append(_format_table(rows))
-
-        if summary.http_urls:
-            rows = [["URL", "Count"]]
-            for url, count in summary.http_urls.most_common(limit):
-                rows.append([url, str(count)])
-            lines.append(_format_table(rows))
-
-        if summary.http_user_agents:
-            rows = [["User-Agent", "Count"]]
-            for ua, count in summary.http_user_agents.most_common(limit):
-                rows.append([ua, str(count)])
-            lines.append(_format_table(rows))
-
-        if summary.http_files:
-            rows = [["File", "Count"]]
-            for fname, count in summary.http_files.most_common(limit):
-                rows.append([fname, str(count)])
-            lines.append(_format_table(rows))
 
     if summary.file_artifacts:
         lines.append(SUBSECTION_BAR)
@@ -2295,7 +2959,7 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
             lines.append(muted(f"- {item}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -2310,13 +2974,53 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         for err in summary.errors:
             lines.append(danger(f"- {err}"))
 
-    lines.append(_format_kv("UDP Packets", str(summary.udp_packets)))
+    udp_packet_ratio = (summary.udp_packets / summary.total_packets) if summary.total_packets else 0.0
+    udp_byte_ratio = (summary.udp_bytes / summary.total_bytes) if summary.total_bytes else 0.0
+    avg_udp_pkt = (summary.udp_bytes / summary.udp_packets) if summary.udp_packets else 0.0
+    avg_udp_payload = (summary.udp_payload_bytes / summary.udp_packets) if summary.udp_packets else 0.0
+    udp_pps = (summary.udp_packets / summary.duration_seconds) if summary.duration_seconds else 0.0
+    udp_bps = (summary.udp_bytes / summary.duration_seconds) if summary.duration_seconds else 0.0
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Protocol Statistics"))
+    lines.append(_format_kv("UDP Packets", f"{summary.udp_packets} ({udp_packet_ratio:.1%})"))
+    lines.append(_format_kv("UDP Bytes", f"{format_bytes_as_mb(summary.udp_bytes)} ({udp_byte_ratio:.1%})"))
     lines.append(_format_kv("Unique Clients", str(len(summary.client_counts))))
     lines.append(_format_kv("Unique Servers", str(len(summary.server_counts))))
+    lines.append(_format_kv("Unique Endpoints", str(len(summary.endpoint_packets))))
     lines.append(_format_kv("Conversations", str(len(summary.conversations))))
     lines.append(_format_kv("Start", format_ts(summary.first_seen)))
     lines.append(_format_kv("End", format_ts(summary.last_seen)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Overall Traffic Statistics"))
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
+    lines.append(_format_kv("UDP Payload Bytes", format_bytes_as_mb(summary.udp_payload_bytes)))
+    lines.append(_format_kv("Avg UDP Packet Size", f"{avg_udp_pkt:.1f} bytes"))
+    lines.append(_format_kv("Avg UDP Payload Size", f"{avg_udp_payload:.1f} bytes"))
+    lines.append(_format_kv("UDP Packets/sec", f"{udp_pps:.2f}"))
+    lines.append(_format_kv("UDP Bytes/sec", f"{udp_bps:.2f}"))
+
+    if summary.packet_size_hist or summary.payload_size_hist:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Packet & Payload Size Distribution"))
+        bucket_labels = ["<=64", "65-128", "129-256", "257-512", "513-1024", "1025-1500", "1501-9000", ">9000"]
+        if summary.packet_size_hist:
+            packet_series = [summary.packet_size_hist.get(label, 0) for label in bucket_labels]
+            lines.append(_format_kv("Packet Size Buckets", ", ".join(bucket_labels)))
+            lines.append(_format_kv("Packet Size Spark", sparkline(packet_series)))
+            stats = summary.packet_size_stats
+            lines.append(_format_kv("Packet Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+        if summary.payload_size_hist:
+            payload_series = [summary.payload_size_hist.get(label, 0) for label in bucket_labels]
+            lines.append(_format_kv("Payload Size Buckets", ", ".join(bucket_labels)))
+            lines.append(_format_kv("Payload Size Spark", sparkline(payload_series)))
+            stats = summary.payload_size_stats
+            lines.append(_format_kv("Payload Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+        if summary.zero_payload_packets:
+            lines.append(_format_kv("Zero Payload Packets", str(summary.zero_payload_packets)))
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
@@ -2335,70 +3039,62 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
 
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Top UDP Clients & Servers"))
-        rows = [["Clients", "Servers"]]
-        client_text = ", ".join(f"{ip}({count})" for ip, count in summary.client_counts.most_common(10)) or "-"
-        server_text = ", ".join(f"{ip}({count})" for ip, count in summary.server_counts.most_common(10)) or "-"
-        rows.append([client_text, server_text])
+        lines.append(header("UDP Client/Server Statistics"))
+        client_bytes = summary.client_bytes if isinstance(summary.client_bytes, Counter) else Counter()
+        server_bytes = summary.server_bytes if isinstance(summary.server_bytes, Counter) else Counter()
+        rows = [["Client", "Server"]]
+        client_list = [
+            f"{ip}({summary.client_counts[ip]}/{format_bytes_as_mb(client_bytes.get(ip, 0))})"
+            for ip, _count in summary.client_counts.most_common(10)
+        ]
+        server_list = [
+            f"{ip}({summary.server_counts[ip]}/{format_bytes_as_mb(server_bytes.get(ip, 0))})"
+            for ip, _count in summary.server_counts.most_common(10)
+        ]
+        max_rows = max(len(client_list), len(server_list))
+        for idx in range(max_rows):
+            rows.append([
+                client_list[idx] if idx < len(client_list) else "-",
+                server_list[idx] if idx < len(server_list) else "-",
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.endpoint_packets:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("UDP Endpoint Statistics"))
+        rows = [["Endpoint", "Packets", "Bytes"]]
+        endpoint_bytes = summary.endpoint_bytes if isinstance(summary.endpoint_bytes, Counter) else Counter()
+        for ip, count in summary.endpoint_packets.most_common(limit):
+            rows.append([ip, str(count), format_bytes_as_mb(endpoint_bytes.get(ip, 0))])
         lines.append(_format_table(rows))
 
     if summary.port_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top UDP Destination Ports"))
-        rows = [["Port", "Count"]]
+        rows = [["Port", "Count", "Destinations"]]
+        port_destinations = summary.port_destinations if isinstance(summary.port_destinations, dict) else {}
         for port, count in summary.port_counts.most_common(limit):
-            rows.append([str(port), str(count)])
+            dsts = port_destinations.get(port, Counter())
+            dst_text = ", ".join(f"{ip}({cnt})" for ip, cnt in dsts.most_common(3)) or "-"
+            rows.append([str(port), str(count), dst_text])
         lines.append(_format_table(rows))
 
     if summary.services:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("UDP Services"))
-        rows = [["Service", "Port", "Proto", "Count"]]
+        lines.append(header("UDP Services (Endpoints)"))
+        rows = [["Service", "Endpoint", "Port", "Clients", "Count"]]
         for svc in summary.services[:limit]:
+            client_note = str(svc.get("clients", "-"))
+            if svc.get("client_count"):
+                client_note = f"{svc.get('client_count')} :: {client_note}"
             rows.append([
                 str(svc.get("service", "-")),
+                str(svc.get("endpoint", "-")),
                 str(svc.get("port", "-")),
-                str(svc.get("proto", "-")),
+                client_note,
                 str(svc.get("count", "-")),
             ])
         lines.append(_format_table(rows))
-
-    if summary.http_requests or summary.http_responses:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("HTTP Observations (Plaintext)"))
-        lines.append(muted("Note: HTTPS payloads are encrypted; HTTP data shown here is plaintext traffic only."))
-        lines.append(_format_kv("HTTP Requests", str(summary.http_requests)))
-        lines.append(_format_kv("HTTP Responses", str(summary.http_responses)))
-
-        if summary.http_methods:
-            rows = [["Method", "Count"]]
-            for method, count in summary.http_methods.most_common(limit):
-                rows.append([method, str(count)])
-            lines.append(_format_table(rows))
-
-        if summary.http_statuses:
-            rows = [["Status", "Count"]]
-            for status, count in summary.http_statuses.most_common(limit):
-                rows.append([status, str(count)])
-            lines.append(_format_table(rows))
-
-        if summary.http_urls:
-            rows = [["URL", "Count"]]
-            for url, count in summary.http_urls.most_common(limit):
-                rows.append([url, str(count)])
-            lines.append(_format_table(rows))
-
-        if summary.http_user_agents:
-            rows = [["User-Agent", "Count"]]
-            for ua, count in summary.http_user_agents.most_common(limit):
-                rows.append([ua, str(count)])
-            lines.append(_format_table(rows))
-
-        if summary.http_files:
-            rows = [["File", "Count"]]
-            for fname, count in summary.http_files.most_common(limit):
-                rows.append([fname, str(count)])
-            lines.append(_format_table(rows))
 
     if summary.file_artifacts:
         lines.append(SUBSECTION_BAR)
@@ -2434,7 +3130,260 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
             lines.append(muted(f"- {item}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
+
+
+def _udp_bucket_ranges() -> list[tuple[str, int, int]]:
+    return [
+        ("<=64", 0, 64),
+        ("65-128", 65, 128),
+        ("129-256", 129, 256),
+        ("257-512", 257, 512),
+        ("513-1024", 513, 1024),
+        ("1025-1500", 1025, 1500),
+        ("1501-9000", 1501, 9000),
+        (">9000", 9001, 9001),
+    ]
+
+
+def _approx_hist_stats(hist: Counter[str]) -> dict[str, float]:
+    if not hist:
+        return {"min": 0.0, "max": 0.0, "avg": 0.0, "p50": 0.0, "p95": 0.0}
+
+    ranges = _udp_bucket_ranges()
+    total = sum(hist.values())
+    if total <= 0:
+        return {"min": 0.0, "max": 0.0, "avg": 0.0, "p50": 0.0, "p95": 0.0}
+
+    min_val = 0.0
+    max_val = 0.0
+    for label, low, high in ranges:
+        if hist.get(label, 0) > 0:
+            min_val = float(low)
+            break
+    for label, low, high in reversed(ranges):
+        if hist.get(label, 0) > 0:
+            max_val = float(high)
+            break
+
+    def _quantile(target_pct: float) -> float:
+        target = total * (target_pct / 100.0)
+        running = 0
+        for label, low, high in ranges:
+            running += hist.get(label, 0)
+            if running >= target:
+                if label == ">9000":
+                    return float(low)
+                return float((low + high) / 2)
+        return max_val
+
+    weighted_sum = 0.0
+    for label, low, high in ranges:
+        mid = float(low) if label == ">9000" else float((low + high) / 2)
+        weighted_sum += mid * hist.get(label, 0)
+
+    return {
+        "min": min_val,
+        "max": max_val,
+        "avg": weighted_sum / total,
+        "p50": _quantile(50.0),
+        "p95": _quantile(95.0),
+    }
+
+
+def render_udp_rollup(summaries: Iterable[UdpSummary], limit: int = 12, verbose: bool = False) -> str:
+    summary_list = list(summaries)
+    if not summary_list:
+        return ""
+
+    total_packets = sum(item.total_packets for item in summary_list)
+    total_bytes = sum(item.total_bytes for item in summary_list)
+    udp_packets = sum(item.udp_packets for item in summary_list)
+    udp_bytes = sum(item.udp_bytes for item in summary_list)
+    udp_payload_bytes = sum(item.udp_payload_bytes for item in summary_list)
+    zero_payload_packets = sum(item.zero_payload_packets for item in summary_list)
+
+    client_counts: Counter[str] = Counter()
+    client_bytes: Counter[str] = Counter()
+    server_counts: Counter[str] = Counter()
+    server_bytes: Counter[str] = Counter()
+    port_counts: Counter[int] = Counter()
+    port_destinations: dict[int, Counter[str]] = defaultdict(Counter)
+    endpoint_packets: Counter[str] = Counter()
+    endpoint_bytes: Counter[str] = Counter()
+    packet_size_hist: Counter[str] = Counter()
+    payload_size_hist: Counter[str] = Counter()
+    http_methods: Counter[str] = Counter()
+    http_statuses: Counter[str] = Counter()
+    http_urls: Counter[str] = Counter()
+    http_user_agents: Counter[str] = Counter()
+    http_files: Counter[str] = Counter()
+    file_artifacts: Counter[str] = Counter()
+    errors: list[str] = []
+
+    first_seen = None
+    last_seen = None
+
+    conversations: dict[tuple[str, str, int, int], dict[str, object]] = defaultdict(lambda: {
+        "packets": 0,
+        "bytes": 0,
+        "first_seen": None,
+        "last_seen": None,
+    })
+
+    detections: dict[tuple[str, str], dict[str, object]] = {}
+    artifact_counts: Counter[str] = Counter()
+
+    services_agg: dict[tuple[str, str, int, str], dict[str, object]] = {}
+
+    for item in summary_list:
+        client_counts.update(item.client_counts if isinstance(item.client_counts, Counter) else Counter())
+        client_bytes.update(item.client_bytes if isinstance(item.client_bytes, Counter) else Counter())
+        server_counts.update(item.server_counts if isinstance(item.server_counts, Counter) else Counter())
+        server_bytes.update(item.server_bytes if isinstance(item.server_bytes, Counter) else Counter())
+        port_counts.update(item.port_counts if isinstance(item.port_counts, Counter) else Counter())
+        endpoint_packets.update(item.endpoint_packets if isinstance(item.endpoint_packets, Counter) else Counter())
+        endpoint_bytes.update(item.endpoint_bytes if isinstance(item.endpoint_bytes, Counter) else Counter())
+        packet_size_hist.update(item.packet_size_hist if isinstance(item.packet_size_hist, Counter) else Counter())
+        payload_size_hist.update(item.payload_size_hist if isinstance(item.payload_size_hist, Counter) else Counter())
+        http_methods.update(item.http_methods if isinstance(item.http_methods, Counter) else Counter())
+        http_statuses.update(item.http_statuses if isinstance(item.http_statuses, Counter) else Counter())
+        http_urls.update(item.http_urls if isinstance(item.http_urls, Counter) else Counter())
+        http_user_agents.update(item.http_user_agents if isinstance(item.http_user_agents, Counter) else Counter())
+        http_files.update(item.http_files if isinstance(item.http_files, Counter) else Counter())
+        file_artifacts.update(item.file_artifacts if isinstance(item.file_artifacts, Counter) else Counter())
+        errors.extend(item.errors if isinstance(item.errors, list) else [])
+
+        port_map = item.port_destinations if isinstance(item.port_destinations, dict) else {}
+        for port, counter in port_map.items():
+            if isinstance(counter, Counter):
+                port_destinations[port].update(counter)
+
+        for convo in item.conversations:
+            key = (convo.src_ip, convo.dst_ip, convo.src_port, convo.dst_port)
+            info = conversations[key]
+            info["packets"] = int(info["packets"]) + convo.packets
+            info["bytes"] = int(info["bytes"]) + convo.bytes
+            if convo.first_seen is not None:
+                if info["first_seen"] is None or convo.first_seen < info["first_seen"]:
+                    info["first_seen"] = convo.first_seen
+            if convo.last_seen is not None:
+                if info["last_seen"] is None or convo.last_seen > info["last_seen"]:
+                    info["last_seen"] = convo.last_seen
+
+        for det in item.detections:
+            summary_text = str(det.get("summary", ""))
+            details = str(det.get("details", ""))
+            if not summary_text:
+                continue
+            detections.setdefault((summary_text, details), det)
+
+        for artifact in item.artifacts:
+            artifact_counts[artifact] += 1
+
+        for svc in item.services:
+            service = str(svc.get("service", "-"))
+            endpoint = str(svc.get("endpoint", "-"))
+            port = int(svc.get("port", 0)) if str(svc.get("port", "")).isdigit() else 0
+            proto = str(svc.get("proto", "UDP"))
+            key = (service, endpoint, port, proto)
+            entry = services_agg.setdefault(key, {
+                "service": service,
+                "endpoint": endpoint,
+                "port": port,
+                "proto": proto,
+                "count": 0,
+                "client_count": 0,
+                "clients": set(),
+            })
+            entry["count"] = int(entry["count"]) + int(svc.get("count", 0) or 0)
+            entry["client_count"] = int(entry["client_count"]) + int(svc.get("client_count", 0) or 0)
+            clients_text = str(svc.get("clients", "-"))
+            if clients_text and clients_text != "-":
+                for part in clients_text.split(","):
+                    value = part.strip()
+                    if value:
+                        entry["clients"].add(value)
+
+        if item.first_seen is not None:
+            if first_seen is None or item.first_seen < first_seen:
+                first_seen = item.first_seen
+        if item.last_seen is not None:
+            if last_seen is None or item.last_seen > last_seen:
+                last_seen = item.last_seen
+
+    duration_seconds = None
+    if first_seen is not None and last_seen is not None:
+        duration_seconds = max(0.0, last_seen - first_seen)
+
+    conversation_rows: list[UdpConversation] = []
+    for (src_ip, dst_ip, sport, dport), info in conversations.items():
+        conversation_rows.append(UdpConversation(
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            src_port=sport,
+            dst_port=dport,
+            packets=int(info["packets"]),
+            bytes=int(info["bytes"]),
+            first_seen=info["first_seen"],
+            last_seen=info["last_seen"],
+        ))
+
+    services: list[dict[str, object]] = []
+    for entry in services_agg.values():
+        clients_list = sorted(entry["clients"])[:5]
+        services.append({
+            "service": entry["service"],
+            "endpoint": entry["endpoint"],
+            "port": entry["port"],
+            "proto": entry["proto"],
+            "count": entry["count"],
+            "client_count": entry["client_count"],
+            "clients": ", ".join(clients_list) if clients_list else "-",
+        })
+
+    services.sort(key=lambda value: int(value.get("count", 0)), reverse=True)
+    errors = sorted({err for err in errors if err})
+
+    rollup = UdpSummary(
+        path=Path("ALL_PCAPS"),
+        total_packets=total_packets,
+        total_bytes=total_bytes,
+        udp_packets=udp_packets,
+        udp_bytes=udp_bytes,
+        udp_payload_bytes=udp_payload_bytes,
+        conversations=sorted(conversation_rows, key=lambda item: item.packets, reverse=True),
+        client_counts=client_counts,
+        client_bytes=client_bytes,
+        server_counts=server_counts,
+        server_bytes=server_bytes,
+        port_counts=port_counts,
+        port_destinations=port_destinations,
+        endpoint_packets=endpoint_packets,
+        endpoint_bytes=endpoint_bytes,
+        packet_size_hist=packet_size_hist,
+        payload_size_hist=payload_size_hist,
+        packet_size_stats=_approx_hist_stats(packet_size_hist),
+        payload_size_stats=_approx_hist_stats(payload_size_hist),
+        zero_payload_packets=zero_payload_packets,
+        http_requests=sum(item.http_requests for item in summary_list),
+        http_responses=sum(item.http_responses for item in summary_list),
+        http_methods=http_methods,
+        http_statuses=http_statuses,
+        http_urls=http_urls,
+        http_user_agents=http_user_agents,
+        http_files=http_files,
+        file_artifacts=file_artifacts,
+        services=services,
+        detections=list(detections.values()),
+        artifacts=[f"{name} ({count})" for name, count in artifact_counts.most_common(20)],
+        errors=errors,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        duration_seconds=duration_seconds,
+    )
+
+    return render_udp_summary(rollup, limit=limit, verbose=verbose)
 
 
 def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -2535,7 +3484,7 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
             lines.append(muted(f"- {item}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_sizes_summary(summary: SizeSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -2594,7 +3543,7 @@ def render_sizes_summary(summary: SizeSummary, limit: int = 12, verbose: bool = 
                 lines.append(muted(f"  {details}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -2710,7 +3659,7 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
                 lines.append(muted(f"  {details}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_threats_summary(summary: ThreatSummary) -> str:
@@ -2802,7 +3751,7 @@ def render_threats_summary(summary: ThreatSummary) -> str:
         lines.append(muted("No notable threats detected."))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_files_summary(summary: FileTransferSummary, limit: int | None = None) -> str:
@@ -2897,7 +3846,7 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None)
                 lines.append(muted(f"  {details}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) -> str:
@@ -2923,6 +3872,24 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         pct = (count / summary.total_packets * 100) if summary.total_packets else 0
         rows.append([name, str(count), f"{pct:.1f}%"])
     lines.append(_format_table(rows))
+
+    if summary.port_protocols:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Port-Based Protocols (Service Heuristics)"))
+        rows = [["Protocol", "Packets", "% traffic"]]
+        for name, count in summary.port_protocols:
+            pct = (count / summary.total_packets * 100) if summary.total_packets else 0
+            rows.append([name, str(count), f"{pct:.1f}%"])
+        lines.append(_format_table(rows))
+
+    if summary.ethertype_protocols:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Ethertype Protocols (L2)"))
+        rows = [["Protocol", "Packets", "% traffic"]]
+        for name, count in summary.ethertype_protocols:
+            pct = (count / summary.total_packets * 100) if summary.total_packets else 0
+            rows.append([name, str(count), f"{pct:.1f}%"])
+        lines.append(_format_table(rows))
 
     # 2. Hierarchy
     lines.append(SUBSECTION_BAR)
@@ -3034,7 +4001,7 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_services_summary(summary: ServiceSummary) -> str:
@@ -3072,6 +4039,28 @@ def render_services_summary(summary: ServiceSummary) -> str:
             ])
         lines.append(_format_table(rows))
 
+    if summary.hierarchy:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Service Prevalence"))
+        rows = [["Service", "Count"]]
+        for name, count in sorted(summary.hierarchy.items(), key=lambda item: item[1], reverse=True):
+            rows.append([name, str(count)])
+        lines.append(_format_table(rows))
+
+    banners = [asset for asset in summary.assets if asset.software]
+    if banners:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Service Banners"))
+        rows = [["Address", "Port", "Service", "Banner"]]
+        for asset in banners:
+            rows.append([
+                asset.ip,
+                str(asset.port),
+                asset.service_name,
+                asset.software or "-",
+            ])
+        lines.append(_format_table(rows))
+
     # 2. Risks / Threats
     lines.append(SUBSECTION_BAR)
     lines.append(header("Cybersecurity Risks"))
@@ -3090,7 +4079,7 @@ def render_services_summary(summary: ServiceSummary) -> str:
             lines.append("")
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
@@ -3347,7 +4336,7 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
             lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_nfs_summary(summary: NfsSummary) -> str:
@@ -3491,7 +4480,7 @@ def render_nfs_summary(summary: NfsSummary) -> str:
             lines.append("")
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_strings_summary(summary: StringsSummary) -> str:
@@ -3592,7 +4581,105 @@ def render_strings_summary(summary: StringsSummary) -> str:
             lines.append(warn(f"[WARN] {item}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
+
+
+def render_search_summary(summary: SearchSummary) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"SEARCH RESULTS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Query", summary.query))
+    lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
+    lines.append(_format_kv("Matches", str(summary.matches)))
+    if summary.truncated:
+        lines.append(warn(f"[WARN] Showing first {len(summary.hits)} matches."))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Match Details"))
+    if not summary.hits:
+        lines.append(muted("No matches found."))
+    else:
+        rows = [["Pkt", "Time", "Src", "Dst", "Proto", "Sport", "Dport", "Len", "Context"]]
+        for hit in summary.hits:
+            rows.append([
+                str(hit.packet_number),
+                format_ts(hit.ts),
+                hit.src_ip,
+                hit.dst_ip,
+                hit.protocol,
+                str(hit.src_port) if hit.src_port is not None else "-",
+                str(hit.dst_port) if hit.dst_port is not None else "-",
+                str(hit.payload_len),
+                _truncate_text(hit.context, 80),
+            ])
+        lines.append(_format_table(rows))
+
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines)
+
+
+def render_creds_summary(summary: CredentialSummary) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"CREDENTIAL EXPOSURE :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
+    lines.append(_format_kv("Matches", str(summary.matches)))
+
+    if summary.kind_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Match Types"))
+        rows = [["Type", "Count"]]
+        for kind, count in summary.kind_counts.most_common(15):
+            rows.append([kind, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.user_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Users"))
+        rows = [["User", "Count"]]
+        for user, count in summary.user_counts.most_common(15):
+            rows.append([user, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.truncated:
+        lines.append(warn(f"[WARN] Showing first {len(summary.hits)} matches."))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Credential Hits"))
+    if not summary.hits:
+        lines.append(muted("No credential material detected."))
+    else:
+        for hit in summary.hits:
+            header_line = (
+                f"Pkt {hit.packet_number}  {format_ts(hit.ts)}  "
+                f"{hit.src_ip} -> {hit.dst_ip}  {hit.protocol}"
+            )
+            lines.append(header_line)
+            lines.append(
+                f"  Kind: {hit.kind} | User: {hit.username or '-'} | Secret: {hit.secret or '-'}"
+            )
+            if hit.evidence:
+                lines.append(f"  Evidence: {hit.evidence}")
+            lines.append("")
+
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines)
 
 
 def render_certificates_summary(summary: CertificateSummary) -> str:
@@ -3689,7 +4776,7 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_health_summary(summary: HealthSummary) -> str:
@@ -3702,6 +4789,18 @@ def render_health_summary(summary: HealthSummary) -> str:
     lines.append(_format_kv("TCP Packets", str(summary.tcp_packets)))
     lines.append(_format_kv("UDP Packets", str(summary.udp_packets)))
 
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Throughput"))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
+    lines.append(_format_kv("Start", format_ts(summary.first_seen)))
+    lines.append(_format_kv("End", format_ts(summary.last_seen)))
+    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+    if summary.duration_seconds:
+        pps = summary.total_packets / summary.duration_seconds
+        bps = (summary.total_bytes / summary.duration_seconds) * 8
+        lines.append(_format_kv("Packets/sec", f"{pps:.2f}"))
+        lines.append(_format_kv("Bits/sec", format_speed_bps(int(bps))))
+
     if summary.errors:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Errors"))
@@ -3713,10 +4812,57 @@ def render_health_summary(summary: HealthSummary) -> str:
     lines.append(_format_kv("TCP Retransmissions", str(summary.retransmissions)))
     lines.append(_format_kv("Retransmission Rate", f"{summary.retransmission_rate:.2%}"))
 
+    if summary.endpoint_bytes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Talkers"))
+        rows = [["Endpoint", "Packets", "Bytes"]]
+        endpoint_packets = summary.endpoint_packets if isinstance(summary.endpoint_packets, Counter) else Counter()
+        endpoint_bytes = summary.endpoint_bytes if isinstance(summary.endpoint_bytes, Counter) else Counter()
+        for ip, byte_count in endpoint_bytes.most_common(10):
+            rows.append([
+                ip,
+                str(endpoint_packets.get(ip, 0)),
+                format_bytes_as_mb(byte_count),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.flow_duration_buckets:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Flow Duration Distribution"))
+        bucket_order = ["<=1s", "1-10s", "10-60s", "1-5m", "5-30m", ">30m"]
+        for key, label_text in (("all", "All"), ("tcp", "TCP"), ("udp", "UDP")):
+            buckets = summary.flow_duration_buckets.get(key, Counter())
+            if not buckets:
+                continue
+            counts = [int(buckets.get(bucket, 0)) for bucket in bucket_order]
+            lines.append(_format_kv(f"{label_text} Buckets", ", ".join(bucket_order)))
+            lines.append(_format_kv(f"{label_text} Counts", ", ".join(str(val) for val in counts)))
+
     lines.append(SUBSECTION_BAR)
     lines.append(header("TTL / Hop Limit"))
     lines.append(_format_kv("Expired TTL/Hop Limit", str(summary.ttl_expired)))
     lines.append(_format_kv("Low TTL/Hop Limit (<=5)", str(summary.ttl_low)))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("TCP/UDP Health Indicators"))
+    syn_only = summary.tcp_syn - summary.tcp_syn_ack
+    rst_ratio = (summary.tcp_rst / summary.tcp_syn) if summary.tcp_syn else 0.0
+    lines.append(_format_kv("TCP SYN", str(summary.tcp_syn)))
+    lines.append(_format_kv("TCP SYN-ACK", str(summary.tcp_syn_ack)))
+    lines.append(_format_kv("TCP RST", str(summary.tcp_rst)))
+    lines.append(_format_kv("SYN without SYN-ACK", str(max(0, syn_only))))
+    lines.append(_format_kv("RST/SYN Ratio", f"{rst_ratio:.2%}"))
+    lines.append(_format_kv("Zero-Window", str(summary.tcp_zero_window)))
+    lines.append(_format_kv("Small-Window", str(summary.tcp_small_window)))
+    if summary.tcp_zero_window_sources:
+        top_zero = ", ".join(f"{ip}({count})" for ip, count in summary.tcp_zero_window_sources.most_common(5))
+        lines.append(_format_kv("Zero-Window Sources", top_zero))
+    if summary.tcp_rst_sources:
+        top_rst = ", ".join(f"{ip}({count})" for ip, count in summary.tcp_rst_sources.most_common(5))
+        lines.append(_format_kv("RST Sources", top_rst))
+    if summary.udp_amp_candidates:
+        lines.append(_format_kv("UDP Amplification", str(len(summary.udp_amp_candidates))))
+        lines.append(_format_kv("Top Candidates", ", ".join(summary.udp_amp_candidates[:5])))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Quality of Service (DSCP/ECN)"))
@@ -3738,6 +4884,31 @@ def render_health_summary(summary: HealthSummary) -> str:
     lines.append(_format_kv("Expired/Invalid", str(summary.expired_certs)))
     lines.append(_format_kv("Self-Signed", str(summary.self_signed_certs)))
 
+    if summary.ot_timing:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OT Cycle/Jitter"))
+        for key, label_text in (
+            ("profinet_rt", "Profinet RT"),
+            ("enip_io", "ENIP IO"),
+            ("s7_rosctr", "S7 COTP/ROSCTR"),
+        ):
+            entries = summary.ot_timing.get(key, [])
+            if not entries:
+                continue
+            lines.append(muted(label_text))
+            rows = [["Session", "Avg(s)", "Std(s)", "CV", "Min", "Max", "Samples"]]
+            for item in entries:
+                rows.append([
+                    str(item.get("session", "-")),
+                    f"{float(item.get('avg', 0.0)):.3f}",
+                    f"{float(item.get('std', 0.0)):.3f}",
+                    f"{float(item.get('cv', 0.0)):.2f}",
+                    f"{float(item.get('min', 0.0)):.3f}",
+                    f"{float(item.get('max', 0.0)):.3f}",
+                    str(item.get("count", 0)),
+                ])
+            lines.append(_format_table(rows))
+
     if summary.findings:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Findings"))
@@ -3756,7 +4927,7 @@ def render_health_summary(summary: HealthSummary) -> str:
                 lines.append(muted(f"  {details}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_timeline_summary(summary: TimelineSummary, limit: int = 200) -> str:
@@ -3829,7 +5000,7 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200) -> str:
         lines.append(f"{format_ts(event.ts)} | {event.category} | {summary_text} | {details_text}")
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 def render_ntlm_summary(summary: "NtlmAnalysis") -> str:
     """
@@ -3980,7 +5151,7 @@ def render_ntlm_summary(summary: "NtlmAnalysis") -> str:
                 lines.append(line_str)
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
@@ -4212,7 +5383,7 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
             lines.append(muted(f"  Src: {a.src_ip} -> Dst: {a.dst_ip}"))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> str:
     """
@@ -4236,24 +5407,55 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
             lines.append(danger(f"- {err}"))
 
     # 1. Overview
+    total_packets = summary.total_packets
+    total_bytes = summary.total_bytes
+    modbus_packets = summary.modbus_packets
+    modbus_bytes = summary.modbus_bytes
+    modbus_payload_bytes = summary.modbus_payload_bytes
+    modbus_packet_ratio = (modbus_packets / total_packets) if total_packets else 0.0
+    modbus_byte_ratio = (modbus_bytes / total_bytes) if total_bytes else 0.0
+    avg_modbus_pkt = (modbus_bytes / modbus_packets) if modbus_packets else 0.0
+    avg_modbus_payload = (modbus_payload_bytes / modbus_packets) if modbus_packets else 0.0
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Overall Traffic Statistics"))
     lines.append(_format_kv("Scan Duration", f"{summary.duration:.2f}s"))
-    lines.append(_format_kv("Modbus Packets", str(summary.modbus_packets)))
+    lines.append(_format_kv("Total Packets", str(total_packets)))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(total_bytes)))
+    if summary.duration:
+        pps = total_packets / summary.duration
+        bps = (total_bytes / summary.duration) * 8
+        lines.append(_format_kv("Packets/sec", f"{pps:.2f}"))
+        lines.append(_format_kv("Bits/sec", format_speed_bps(int(bps))))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Modbus Protocol Statistics"))
+    lines.append(_format_kv("Modbus Packets", f"{modbus_packets} ({modbus_packet_ratio:.1%})"))
+    lines.append(_format_kv("Modbus Bytes", f"{format_bytes_as_mb(modbus_bytes)} ({modbus_byte_ratio:.1%})"))
+    lines.append(_format_kv("Modbus Payload Bytes", format_bytes_as_mb(modbus_payload_bytes)))
+    lines.append(_format_kv("Avg Modbus Packet Size", f"{avg_modbus_pkt:.1f} bytes"))
+    lines.append(_format_kv("Avg Modbus Payload Size", f"{avg_modbus_payload:.1f} bytes"))
     lines.append(_format_kv("Unique Clients", str(summary.unique_clients)))
     lines.append(_format_kv("Unique Servers", str(summary.unique_servers)))
     lines.append(_format_kv("Error Rate", f"{summary.error_rate:.2f}%"))
     
     # 2. Function Codes
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Function Code Usage"))
+    lines.append(header("Observed Commands"))
     if not summary.func_counts:
         lines.append(muted("No Modbus functions detected."))
     else:
         for func, count in summary.func_counts.most_common():
-            # Highlight potentially dangerous functions
-            is_write = "Write" in func
-            c = danger if is_write else lambda x: x
-            
-            lines.append(c(f"{func:<40} : {count}"))
+            lowered = func.lower()
+            is_write = "write" in lowered
+            is_diag = any(token in lowered for token in ("diagnostic", "encapsulated", "report server", "file"))
+            if is_write:
+                color = danger
+            elif is_diag:
+                color = warn
+            else:
+                color = lambda x: x
+            lines.append(color(f"{func:<40} : {count}"))
             
     # 3. Unit IDs
     lines.append(SUBSECTION_BAR)
@@ -4270,31 +5472,115 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
 
     # 4. Endpoints
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Modbus Endpoints"))
-    
+    lines.append(header("Endpoint Statistics"))
+    if summary.endpoint_packets:
+        rows = [["Endpoint", "Packets", "Bytes"]]
+        for ip, count in summary.endpoint_packets.most_common(10):
+            rows.append([
+                ip,
+                str(count),
+                format_bytes_as_mb(summary.endpoint_bytes.get(ip, 0)),
+            ])
+        lines.append(_format_table(rows))
+    else:
+        lines.append(muted("No Modbus endpoints detected."))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Client/Server Statistics"))
     col_width = 45
-    
     lines.append(highlight(f"{'Clients (Controllers)':<{col_width}} | {'Servers (PLCs/Sensors)'}"))
     lines.append(muted("-" * 90))
-    
     clients = summary.src_ips.most_common(10)
     servers = summary.dst_ips.most_common(10)
-    
     max_rows = max(len(clients), len(servers))
-    
     for i in range(max_rows):
         c_str = ""
         s_str = ""
-        
         if i < len(clients):
             ip, cnt = clients[i]
-            c_str = f"{ip} ({cnt})"
-        
+            c_bytes = format_bytes_as_mb(summary.client_bytes.get(ip, 0))
+            c_str = f"{ip} ({cnt}/{c_bytes})"
         if i < len(servers):
             ip, cnt = servers[i]
-            s_str = f"{ip} ({cnt})"
-            
+            s_bytes = format_bytes_as_mb(summary.server_bytes.get(ip, 0))
+            s_str = f"{ip} ({cnt}/{s_bytes})"
         lines.append(f"{c_str:<{col_width}} | {s_str}")
+
+    if summary.service_endpoints:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Modbus Services (Endpoints)"))
+        rows = [["Service", "Top Endpoints"]]
+        for func_name, counter in Counter({
+            name: sum(cnt.values()) for name, cnt in summary.service_endpoints.items()
+        }).most_common(10):
+            endpoints = summary.service_endpoints.get(func_name, Counter())
+            top_eps = ", ".join(f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(3))
+            rows.append([func_name, top_eps or "-"])
+        lines.append(_format_table(rows))
+
+    if summary.artifacts:
+        equipment_hits = [
+            artifact for artifact in summary.artifacts
+            if str(getattr(artifact, "kind", "")) == "equipment"
+        ]
+        if equipment_hits:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Equipment Inventory"))
+            counts = Counter(str(getattr(artifact, "detail", "")) for artifact in equipment_hits)
+            endpoints: dict[str, Counter[str]] = defaultdict(Counter)
+            for artifact in equipment_hits:
+                detail = str(getattr(artifact, "detail", ""))
+                src = str(getattr(artifact, "src", "?"))
+                dst = str(getattr(artifact, "dst", "?"))
+                endpoints[detail][f"{src} -> {dst}"] += 1
+            rows = [["Equipment", "Count", "Top Endpoints"]]
+            for detail, count in counts.most_common(12):
+                top_eps = ", ".join(
+                    f"{ep} ({cnt})" for ep, cnt in endpoints[detail].most_common(3)
+                )
+                rows.append([detail, str(count), top_eps or "-"])
+            lines.append(_format_table(rows))
+
+    if summary.packet_size_hist or summary.payload_size_hist:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Packet & Payload Size Distribution"))
+        bucket_labels = ["<=64", "65-128", "129-256", "257-512", "513-1024", "1025-1500", "1501-9000", ">9000"]
+        if summary.packet_size_hist:
+            packet_series = [summary.packet_size_hist.get(label, 0) for label in bucket_labels]
+            lines.append(_format_kv("Packet Size Buckets", ", ".join(bucket_labels)))
+            lines.append(_format_kv("Packet Size Spark", sparkline(packet_series)))
+            stats = summary.packet_size_stats
+            lines.append(_format_kv("Packet Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+        if summary.payload_size_hist:
+            payload_series = [summary.payload_size_hist.get(label, 0) for label in bucket_labels]
+            lines.append(_format_kv("Payload Size Buckets", ", ".join(bucket_labels)))
+            lines.append(_format_kv("Payload Size Spark", sparkline(payload_series)))
+            stats = summary.payload_size_stats
+            lines.append(_format_kv("Payload Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+
+    if summary.flow_duration_buckets:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Flow Duration Distribution"))
+        bucket_order = ["<=1s", "1-10s", "10-60s", "1-5m", "5-30m", ">30m"]
+        for key, label_text in (("all", "All"), ("requests", "Requests"), ("responses", "Responses")):
+            buckets = summary.flow_duration_buckets.get(key, Counter())
+            if not buckets:
+                continue
+            counts = [int(buckets.get(bucket, 0)) for bucket in bucket_order]
+            lines.append(_format_kv(f"{label_text} Buckets", ", ".join(bucket_order)))
+            lines.append(_format_kv(f"{label_text} Counts", ", ".join(str(val) for val in counts)))
+
+    if summary.messages:
+        exception_counts = Counter(
+            f"{msg.exception_desc or 'Exception'}" for msg in summary.messages if msg.is_exception
+        )
+        if exception_counts:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Exception Responses"))
+            rows = [["Exception", "Count"]]
+            for exc, count in exception_counts.most_common(10):
+                rows.append([exc, str(count)])
+            lines.append(_format_table(rows))
 
     # 5. Anomalies
     if summary.anomalies:
@@ -4334,7 +5620,7 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
                 lines.append("")
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
@@ -4350,22 +5636,62 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
     total_pcaps = len(summary_list)
     total_duration = 0.0
     total_modbus_packets = 0
+    total_packets = 0
+    total_bytes = 0
+    total_modbus_bytes = 0
+    total_modbus_payload_bytes = 0
     total_messages = 0
     total_exceptions = 0
     func_counts = Counter()
     unit_ids = Counter()
     src_ips = Counter()
     dst_ips = Counter()
+    client_bytes = Counter()
+    server_bytes = Counter()
+    endpoint_packets = Counter()
+    endpoint_bytes = Counter()
+    service_endpoints: dict[str, Counter[str]] = defaultdict(Counter)
+    packet_size_hist = Counter()
+    payload_size_hist = Counter()
+    flow_duration_buckets: dict[str, Counter[str]] = {
+        "all": Counter(),
+        "requests": Counter(),
+        "responses": Counter(),
+    }
+    equipment_counts: Counter[str] = Counter()
+    equipment_endpoints: dict[str, Counter[str]] = defaultdict(Counter)
     all_anomalies = []
     errors = Counter()
 
     for summary in summary_list:
         total_duration += summary.duration
+        total_packets += summary.total_packets
+        total_bytes += summary.total_bytes
         total_modbus_packets += summary.modbus_packets
+        total_modbus_bytes += summary.modbus_bytes
+        total_modbus_payload_bytes += summary.modbus_payload_bytes
         func_counts.update(summary.func_counts)
         unit_ids.update(summary.unit_ids)
         src_ips.update(summary.src_ips)
         dst_ips.update(summary.dst_ips)
+        client_bytes.update(summary.client_bytes)
+        server_bytes.update(summary.server_bytes)
+        endpoint_packets.update(summary.endpoint_packets)
+        endpoint_bytes.update(summary.endpoint_bytes)
+        packet_size_hist.update(summary.packet_size_hist)
+        payload_size_hist.update(summary.payload_size_hist)
+        for name, counter in summary.service_endpoints.items():
+            service_endpoints[name].update(counter)
+        for artifact in summary.artifacts:
+            if str(getattr(artifact, "kind", "")) != "equipment":
+                continue
+            detail = str(getattr(artifact, "detail", ""))
+            equipment_counts[detail] += 1
+            src = str(getattr(artifact, "src", "?"))
+            dst = str(getattr(artifact, "dst", "?"))
+            equipment_endpoints[detail][f"{src} -> {dst}"] += 1
+        for key in ("all", "requests", "responses"):
+            flow_duration_buckets[key].update(summary.flow_duration_buckets.get(key, Counter()))
         total_messages += len(summary.messages)
         total_exceptions += sum(1 for msg in summary.messages if msg.is_exception)
         all_anomalies.extend(summary.anomalies)
@@ -4388,7 +5714,11 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
 
     lines.append(_format_kv("PCAPs Analyzed", str(total_pcaps)))
     lines.append(_format_kv("Combined Duration", f"{total_duration:.2f}s"))
+    lines.append(_format_kv("Total Packets", str(total_packets)))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(total_bytes)))
     lines.append(_format_kv("Modbus Packets", str(total_modbus_packets)))
+    lines.append(_format_kv("Modbus Bytes", format_bytes_as_mb(total_modbus_bytes)))
+    lines.append(_format_kv("Modbus Payload Bytes", format_bytes_as_mb(total_modbus_payload_bytes)))
     lines.append(_format_kv("Total Messages", str(total_messages)))
     lines.append(_format_kv("Unique Clients", str(len(src_ips))))
     lines.append(_format_kv("Unique Servers", str(len(dst_ips))))
@@ -4428,11 +5758,71 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
         s_str = ""
         if i < len(clients):
             ip, cnt = clients[i]
-            c_str = f"{ip} ({cnt})"
+            c_str = f"{ip} ({cnt}/{format_bytes_as_mb(client_bytes.get(ip, 0))})"
         if i < len(servers):
             ip, cnt = servers[i]
-            s_str = f"{ip} ({cnt})"
+            s_str = f"{ip} ({cnt}/{format_bytes_as_mb(server_bytes.get(ip, 0))})"
         lines.append(f"{c_str:<{col_width}} | {s_str}")
+
+    if endpoint_packets:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Endpoints"))
+        rows = [["Endpoint", "Packets", "Bytes"]]
+        for ip, count in endpoint_packets.most_common(10):
+            rows.append([
+                ip,
+                str(count),
+                format_bytes_as_mb(endpoint_bytes.get(ip, 0)),
+            ])
+        lines.append(_format_table(rows))
+
+    if service_endpoints:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Modbus Services (Endpoints)"))
+        rows = [["Service", "Top Endpoints"]]
+        for func_name, counter in Counter({
+            name: sum(cnt.values()) for name, cnt in service_endpoints.items()
+        }).most_common(10):
+            endpoints = service_endpoints.get(func_name, Counter())
+            top_eps = ", ".join(f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(3))
+            rows.append([func_name, top_eps or "-"])
+        lines.append(_format_table(rows))
+
+    if equipment_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Equipment Inventory"))
+        rows = [["Equipment", "Count", "Top Endpoints"]]
+        for detail, count in equipment_counts.most_common(12):
+            top_eps = ", ".join(
+                f"{ep} ({cnt})" for ep, cnt in equipment_endpoints[detail].most_common(3)
+            )
+            rows.append([detail, str(count), top_eps or "-"])
+        lines.append(_format_table(rows))
+
+    if packet_size_hist or payload_size_hist:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Packet & Payload Size Distribution"))
+        bucket_labels = ["<=64", "65-128", "129-256", "257-512", "513-1024", "1025-1500", "1501-9000", ">9000"]
+        if packet_size_hist:
+            packet_series = [packet_size_hist.get(label, 0) for label in bucket_labels]
+            lines.append(_format_kv("Packet Size Buckets", ", ".join(bucket_labels)))
+            lines.append(_format_kv("Packet Size Spark", sparkline(packet_series)))
+        if payload_size_hist:
+            payload_series = [payload_size_hist.get(label, 0) for label in bucket_labels]
+            lines.append(_format_kv("Payload Size Buckets", ", ".join(bucket_labels)))
+            lines.append(_format_kv("Payload Size Spark", sparkline(payload_series)))
+
+    if flow_duration_buckets:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Flow Duration Distribution"))
+        bucket_order = ["<=1s", "1-10s", "10-60s", "1-5m", "5-30m", ">30m"]
+        for key, label_text in (("all", "All"), ("requests", "Requests"), ("responses", "Responses")):
+            buckets = flow_duration_buckets.get(key, Counter())
+            if not buckets:
+                continue
+            counts = [int(buckets.get(bucket, 0)) for bucket in bucket_order]
+            lines.append(_format_kv(f"{label_text} Buckets", ", ".join(bucket_order)))
+            lines.append(_format_kv(f"{label_text} Counts", ", ".join(str(val) for val in counts)))
 
     if all_anomalies:
         lines.append(SUBSECTION_BAR)
@@ -4455,7 +5845,7 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
             lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
     """
@@ -4521,7 +5911,7 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
             lines.append("")
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
 
 
 def render_dnp3_rollup(summaries: Iterable["Dnp3Analysis"]) -> str:
@@ -4615,4 +6005,929 @@ def render_dnp3_rollup(summaries: Iterable["Dnp3Analysis"]) -> str:
             lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
-    return "\n".join(lines)
+    return _finalize_output(lines)
+
+
+def _render_industrial_summary(title: str, summary: object, packet_label: str = "Protocol Packets") -> str:
+    if not summary:
+        return ""
+
+    total_packets = getattr(summary, "total_packets", 0)
+    protocol_packets = getattr(summary, "protocol_packets", 0)
+    duration = getattr(summary, "duration", 0.0)
+    src_ips = getattr(summary, "src_ips", Counter())
+    dst_ips = getattr(summary, "dst_ips", Counter())
+    sessions = getattr(summary, "sessions", Counter())
+    commands = getattr(summary, "commands", Counter())
+    artifacts = getattr(summary, "artifacts", [])
+    anomalies = getattr(summary, "anomalies", [])
+    errors = getattr(summary, "errors", [])
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"{title.upper()} ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Scan Duration", f"{duration:.2f}s"))
+    lines.append(_format_kv("Total Packets", str(total_packets)))
+    lines.append(_format_kv(packet_label, str(protocol_packets)))
+    lines.append(_format_kv("Unique Clients", str(len(src_ips))))
+    lines.append(_format_kv("Unique Servers", str(len(dst_ips))))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Top Endpoints"))
+    if not src_ips and not dst_ips:
+        lines.append(muted("No endpoints detected."))
+    else:
+        col_width = 45
+        lines.append(highlight(f"{'Clients':<{col_width}} | {'Servers'}"))
+        lines.append(muted("-" * 90))
+        clients = src_ips.most_common(10)
+        servers = dst_ips.most_common(10)
+        max_rows = max(len(clients), len(servers))
+        for i in range(max_rows):
+            c_str = ""
+            s_str = ""
+            if i < len(clients):
+                ip, cnt = clients[i]
+                c_str = f"{ip} ({cnt})"
+            if i < len(servers):
+                ip, cnt = servers[i]
+                s_str = f"{ip} ({cnt})"
+            lines.append(f"{c_str:<{col_width}} | {s_str}")
+
+    if commands:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Commands/Operations"))
+        rows = [["Command", "Count"]]
+        for cmd, count in commands.most_common(12):
+            rows.append([str(cmd), str(count)])
+        lines.append(_format_table(rows))
+
+    if sessions:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Sessions"))
+        rows = [["Session", "Packets"]]
+        for sess, count in sessions.most_common(10):
+            rows.append([str(sess), str(count)])
+        lines.append(_format_table(rows))
+
+    if artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts & Observations"))
+        rows = [["Type", "Detail", "Src", "Dst"]]
+        for artifact in artifacts[:12]:
+            rows.append([
+                str(getattr(artifact, "kind", "artifact")),
+                str(getattr(artifact, "detail", ""))[:80],
+                str(getattr(artifact, "src", "?")),
+                str(getattr(artifact, "dst", "?")),
+            ])
+        lines.append(_format_table(rows))
+
+    if anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies & Events"))
+        for anomaly in anomalies[:12]:
+            sev = getattr(anomaly, "severity", "INFO")
+            sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
+            lines.append(sev_color(f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"))
+            lines.append(muted(f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"))
+
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines)
+
+
+def render_iec104_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("IEC-104", summary, packet_label="IEC-104 Packets")
+
+
+def render_bacnet_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("BACnet", summary, packet_label="BACnet Packets")
+
+
+def render_enip_summary(summary: "ENIPAnalysis") -> str:
+    if not summary:
+        return ""
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"ETHERNET/IP ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    duration = summary.duration
+    rate = (summary.enip_bytes / duration) if duration and duration > 0 else 0
+
+    lines.append(_format_kv("Scan Duration", f"{duration:.2f}s"))
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
+    lines.append(_format_kv("ENIP Packets", str(summary.enip_packets)))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
+    lines.append(_format_kv("ENIP Bytes", format_bytes_as_mb(summary.enip_bytes)))
+    lines.append(_format_kv("ENIP Throughput", format_speed_bps(int(rate * 8))))
+    lines.append(_format_kv("Requests", str(summary.requests)))
+    lines.append(_format_kv("Responses", str(summary.responses)))
+    lines.append(_format_kv("Connected/Unconnected", f"{summary.connected_packets}/{summary.unconnected_packets}"))
+    lines.append(_format_kv("I/O Packets (UDP/2222)", str(summary.io_packets)))
+    lines.append(_format_kv("Unique Clients", str(len(summary.client_ips))))
+    lines.append(_format_kv("Unique Servers", str(len(summary.server_ips))))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Endpoint Statistics"))
+    if not summary.client_ips and not summary.server_ips:
+        lines.append(muted("No ENIP endpoints detected."))
+    else:
+        col_width = 45
+        lines.append(highlight(f"{'Clients':<{col_width}} | {'Servers'}"))
+        lines.append(muted("-" * 90))
+        clients = summary.client_ips.most_common(10)
+        servers = summary.server_ips.most_common(10)
+        max_rows = max(len(clients), len(servers))
+        for i in range(max_rows):
+            c_str = ""
+            s_str = ""
+            if i < len(clients):
+                ip, cnt = clients[i]
+                c_str = f"{ip} ({cnt})"
+            if i < len(servers):
+                ip, cnt = servers[i]
+                s_str = f"{ip} ({cnt})"
+            lines.append(f"{c_str:<{col_width}} | {s_str}")
+
+    if summary.sessions:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Sessions"))
+        rows = [["Session", "Packets"]]
+        for sess, count in summary.sessions.most_common(12):
+            rows.append([str(sess), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.enip_commands:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("ENIP Encapsulation Commands"))
+        rows = [["Command", "Count", "Risk"]]
+        suspicious = {
+            "ListServices",
+            "ListIdentity",
+            "ListInterfaces",
+            "RegisterSession",
+            "WriteObjectInstanceAttributes",
+        }
+        for cmd, count in summary.enip_commands.most_common(12):
+            risk = "Normal"
+            display = cmd
+            if cmd in suspicious:
+                risk = "Suspicious"
+                display = warn(cmd)
+            rows.append([display, str(count), risk])
+        lines.append(_format_table(rows))
+
+    if summary.cip_services:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Encapsulated CIP Services"))
+        rows = [["Service", "Count", "Risk"]]
+        dangerous = {
+            "Reset",
+            "Start",
+            "Stop",
+            "ProgramDownload",
+            "ProgramCommand",
+            "WriteTag",
+            "WriteTagFragmented",
+            "ReadModifyWriteTag",
+            "WriteData",
+        }
+        suspicious = {
+            "Set_Attribute_List",
+            "Set_Attribute_Single",
+            "Set_Attributes_All",
+            "Forward_Open",
+            "Forward_Close",
+            "Create",
+            "Delete",
+            "ProgramUpload",
+        }
+        for service, count in summary.cip_services.most_common(16):
+            risk = "Normal"
+            display = service
+            if service in dangerous:
+                risk = "Dangerous"
+                display = danger(service)
+            elif service in suspicious:
+                risk = "Suspicious"
+                display = warn(service)
+            rows.append([display, str(count), risk])
+        lines.append(_format_table(rows))
+
+    if summary.service_endpoints:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Service Endpoints"))
+        rows = [["Service", "Top Endpoints"]]
+        for service, count in summary.cip_services.most_common(8):
+            endpoints = summary.service_endpoints.get(service, Counter())
+            top_eps = ", ".join(
+                f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(3)
+            )
+            rows.append([service, top_eps or "-"])
+        lines.append(_format_table(rows))
+
+    if summary.status_codes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("ENIP/CIP Status Codes"))
+        rows = [["Status", "Count"]]
+        for status, count in summary.status_codes.most_common(12):
+            rows.append([str(status), str(count)])
+        lines.append(_format_table(rows))
+
+    if getattr(summary, "identities", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Device Inventory (ListIdentity)"))
+        rows = [[
+            "IP",
+            "Vendor ID",
+            "Device Type",
+            "Product Code",
+            "Revision",
+            "Serial",
+            "Product Name",
+        ]]
+        def _format_identity_label(name: object | None, code: object | None, label: str) -> str:
+            if name:
+                return f"{name} ({code})"
+            if code is None or code == "-":
+                return "-"
+            try:
+                code_val = int(code)
+            except Exception:
+                return str(code)
+            if code_val == 0:
+                return f"Unknown {label} (0)"
+            return f"{label} {code_val}"
+
+        for ident in summary.identities[:20]:
+            vendor_id = getattr(ident, "vendor_id", "-")
+            vendor_name = getattr(ident, "vendor_name", None)
+            vendor_display = _format_identity_label(vendor_name, vendor_id, "Vendor")
+
+            device_type = getattr(ident, "device_type", "-")
+            device_type_name = getattr(ident, "device_type_name", None)
+            device_display = _format_identity_label(device_type_name, device_type, "DeviceType")
+
+            product_code = getattr(ident, "product_code", "-")
+            product_name = getattr(ident, "product_code_name", None)
+            product_display = _format_identity_label(product_name, product_code, "Product")
+
+            rows.append([
+                str(getattr(ident, "src_ip", "?")),
+                vendor_display,
+                device_display,
+                product_display,
+                str(getattr(ident, "revision", "-")),
+                str(getattr(ident, "serial_number", "-")),
+                _truncate_text(str(getattr(ident, "product_name", "-")), 32),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.packet_size_buckets or summary.payload_size_buckets:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Packet/Payload Size Analysis"))
+
+        def _summarize_buckets(buckets: list[SizeBucket]) -> tuple[int, float, int, int]:
+            total = sum(bucket.count for bucket in buckets)
+            if not total:
+                return 0, 0.0, 0, 0
+            avg = sum(bucket.avg * bucket.count for bucket in buckets) / total
+            min_val = min(bucket.min for bucket in buckets if bucket.count)
+            max_val = max(bucket.max for bucket in buckets if bucket.count)
+            return total, avg, min_val, max_val
+
+        if summary.packet_size_buckets:
+            total, avg, min_val, max_val = _summarize_buckets(summary.packet_size_buckets)
+            counts = [bucket.count for bucket in summary.packet_size_buckets]
+            lines.append(label("Packet Sizes"))
+            lines.append(_format_kv("Count", str(total)))
+            lines.append(_format_kv("Min/Avg/Max", f"{min_val}/{avg:.1f}/{max_val}"))
+            lines.append(_format_kv("Distribution", sparkline(counts)))
+
+        if summary.payload_size_buckets:
+            total, avg, min_val, max_val = _summarize_buckets(summary.payload_size_buckets)
+            counts = [bucket.count for bucket in summary.payload_size_buckets]
+            lines.append(label("Payload Sizes"))
+            lines.append(_format_kv("Count", str(total)))
+            lines.append(_format_kv("Min/Avg/Max", f"{min_val}/{avg:.1f}/{max_val}"))
+            lines.append(_format_kv("Distribution", sparkline(counts)))
+
+        rows = [["Bucket", "Packets", "Pct", "Min", "Avg", "Max"]]
+        for bucket in summary.packet_size_buckets[:10]:
+            rows.append([
+                bucket.label,
+                str(bucket.count),
+                f"{bucket.pct:.1f}%",
+                str(bucket.min),
+                f"{bucket.avg:.1f}",
+                str(bucket.max),
+            ])
+        if len(rows) > 1:
+            lines.append(label("Packet Buckets"))
+            lines.append(_format_table(rows))
+
+        rows = [["Bucket", "Payloads", "Pct", "Min", "Avg", "Max"]]
+        for bucket in summary.payload_size_buckets[:10]:
+            rows.append([
+                bucket.label,
+                str(bucket.count),
+                f"{bucket.pct:.1f}%",
+                str(bucket.min),
+                f"{bucket.avg:.1f}",
+                str(bucket.max),
+            ])
+        if len(rows) > 1:
+            lines.append(label("Payload Buckets"))
+            lines.append(_format_table(rows))
+
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts & Observations"))
+        rows = [[label("Type"), label("Detail"), label("Src"), label("Dst")]]
+        for artifact in summary.artifacts[:12]:
+            kind = str(getattr(artifact, "kind", "artifact"))
+            detail = str(getattr(artifact, "detail", ""))
+            detail = " ".join(detail.split())
+            if kind == "tag":
+                tokens = re.findall(r"[A-Za-z0-9_]{3,}", detail)
+                if tokens:
+                    unique = []
+                    seen = set()
+                    for tok in tokens:
+                        if tok in seen:
+                            continue
+                        unique.append(tok)
+                        seen.add(tok)
+                    preview = ", ".join(unique[:4])
+                    extra = len(unique) - 4
+                    if extra > 0:
+                        preview = f"{preview} (+{extra})"
+                    detail = preview
+                else:
+                    detail = _truncate_text(detail, 32)
+            detail_lines = [detail]
+            if kind == "tag":
+                kind_display = highlight(kind)
+            elif kind == "identity":
+                kind_display = warn(kind)
+            else:
+                kind_display = label(kind)
+            src = str(getattr(artifact, "src", "?"))
+            dst = str(getattr(artifact, "dst", "?"))
+            rows.append([kind_display, detail_lines[0], src, dst])
+            for extra in detail_lines[1:]:
+                rows.append([muted("·"), muted(extra), "", ""])
+        lines.append(_format_table(rows))
+
+    if summary.anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies & Threats"))
+        sev_map = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        sorted_anoms = sorted(summary.anomalies, key=lambda x: sev_map.get(x.severity, 99))
+        for anomaly in sorted_anoms[:20]:
+            sev = getattr(anomaly, "severity", "INFO")
+            sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
+            if sev == "LOW":
+                sev_color = muted
+            lines.append(sev_color(f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"))
+            lines.append(muted(f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"))
+
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines)
+
+
+def _render_ot_protocol_summary(
+    title: str,
+    summary: object,
+    packet_label: str,
+    dangerous_tokens: set[str] | None = None,
+    suspicious_tokens: set[str] | None = None,
+) -> str:
+    if not summary:
+        return ""
+
+    total_packets = getattr(summary, "total_packets", 0)
+    protocol_packets = getattr(summary, "protocol_packets", 0)
+    total_bytes = getattr(summary, "total_bytes", 0)
+    protocol_bytes = getattr(summary, "protocol_bytes", 0)
+    duration = getattr(summary, "duration", 0.0)
+    src_ips = getattr(summary, "src_ips", Counter())
+    dst_ips = getattr(summary, "dst_ips", Counter())
+    client_ips = getattr(summary, "client_ips", Counter())
+    server_ips = getattr(summary, "server_ips", Counter())
+    sessions = getattr(summary, "sessions", Counter())
+    commands = getattr(summary, "commands", Counter())
+    service_endpoints = getattr(summary, "service_endpoints", {})
+    packet_buckets = getattr(summary, "packet_size_buckets", [])
+    payload_buckets = getattr(summary, "payload_size_buckets", [])
+    artifacts = getattr(summary, "artifacts", [])
+    anomalies = getattr(summary, "anomalies", [])
+    errors = getattr(summary, "errors", [])
+
+    def _summarize_buckets(buckets: list[SizeBucket]) -> tuple[int, float, int, int]:
+        total = sum(bucket.count for bucket in buckets)
+        if not total:
+            return 0, 0.0, 0, 0
+        avg = sum(bucket.avg * bucket.count for bucket in buckets) / total
+        min_val = min(bucket.min for bucket in buckets if bucket.count)
+        max_val = max(bucket.max for bucket in buckets if bucket.count)
+        return total, avg, min_val, max_val
+
+    dangerous_tokens = dangerous_tokens or set()
+    suspicious_tokens = suspicious_tokens or set()
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"{title.upper()} ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Scan Duration", f"{duration:.2f}s"))
+    lines.append(_format_kv("Total Packets", str(total_packets)))
+    lines.append(_format_kv(packet_label, str(protocol_packets)))
+    lines.append(_format_kv("Total Bytes", str(total_bytes)))
+    lines.append(_format_kv(f"{title} Bytes", str(protocol_bytes)))
+    if protocol_packets:
+        lines.append(_format_kv("Avg Packet Size", f"{protocol_bytes / protocol_packets:.1f}"))
+
+    if packet_buckets or payload_buckets:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Packet/Payload Size Analysis"))
+        if packet_buckets:
+            total, avg, min_val, max_val = _summarize_buckets(packet_buckets)
+            counts = [bucket.count for bucket in packet_buckets]
+            lines.append(label("Packet Sizes"))
+            lines.append(_format_kv("Count", str(total)))
+            lines.append(_format_kv("Min/Avg/Max", f"{min_val}/{avg:.1f}/{max_val}"))
+            lines.append(_format_kv("Distribution", sparkline(counts)))
+        if payload_buckets:
+            total, avg, min_val, max_val = _summarize_buckets(payload_buckets)
+            counts = [bucket.count for bucket in payload_buckets]
+            lines.append(label("Payload Sizes"))
+            lines.append(_format_kv("Count", str(total)))
+            lines.append(_format_kv("Min/Avg/Max", f"{min_val}/{avg:.1f}/{max_val}"))
+            lines.append(_format_kv("Distribution", sparkline(counts)))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Endpoint Statistics"))
+    lines.append(_format_kv("Unique Clients", str(len(client_ips) or len(src_ips))))
+    lines.append(_format_kv("Unique Servers", str(len(server_ips) or len(dst_ips))))
+    col_width = 45
+    lines.append(highlight(f"{'Clients':<{col_width}} | {'Servers'}"))
+    lines.append(muted("-" * 90))
+    clients = (client_ips or src_ips).most_common(10)
+    servers = (server_ips or dst_ips).most_common(10)
+    max_rows = max(len(clients), len(servers))
+    for i in range(max_rows):
+        c_str = ""
+        s_str = ""
+        if i < len(clients):
+            ip, cnt = clients[i]
+            c_str = f"{ip} ({cnt})"
+        if i < len(servers):
+            ip, cnt = servers[i]
+            s_str = f"{ip} ({cnt})"
+        lines.append(f"{c_str:<{col_width}} | {s_str}")
+
+    if sessions:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Sessions"))
+        rows = [["Session", "Packets"]]
+        for sess, count in sessions.most_common(10):
+            rows.append([str(sess), str(count)])
+        lines.append(_format_table(rows))
+
+    if commands:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Commands/Operations"))
+        rows = [["Command", "Count", "Risk"]]
+        for cmd, count in commands.most_common(16):
+            cmd_text = str(cmd)
+            lowered = cmd_text.lower()
+            risk = "Normal"
+            display = cmd_text
+            if any(token in lowered for token in dangerous_tokens):
+                risk = "Dangerous"
+                display = danger(cmd_text)
+            elif any(token in lowered for token in suspicious_tokens):
+                risk = "Suspicious"
+                display = warn(cmd_text)
+            rows.append([display, str(count), risk])
+        lines.append(_format_table(rows))
+
+    if service_endpoints:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Service Endpoints"))
+        rows = [["Service", "Top Endpoints"]]
+        for service, _count in commands.most_common(10):
+            endpoints = service_endpoints.get(str(service), Counter())
+            top_eps = ", ".join(f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(3))
+            rows.append([str(service), top_eps or "-"])
+        lines.append(_format_table(rows))
+
+    if artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts & Observations"))
+        rows = [["Type", "Detail", "Src", "Dst"]]
+        for artifact in artifacts[:16]:
+            rows.append([
+                str(getattr(artifact, "kind", "artifact")),
+                str(getattr(artifact, "detail", ""))[:80],
+                str(getattr(artifact, "src", "?")),
+                str(getattr(artifact, "dst", "?")),
+            ])
+        lines.append(_format_table(rows))
+
+        equipment_hits = [
+            artifact for artifact in artifacts
+            if str(getattr(artifact, "kind", "")) == "equipment"
+        ]
+        if equipment_hits:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Equipment Inventory"))
+            counts = Counter(str(getattr(artifact, "detail", "")) for artifact in equipment_hits)
+            endpoints: dict[str, Counter[str]] = defaultdict(Counter)
+            for artifact in equipment_hits:
+                detail = str(getattr(artifact, "detail", ""))
+                src = str(getattr(artifact, "src", "?"))
+                dst = str(getattr(artifact, "dst", "?"))
+                endpoints[detail][f"{src} -> {dst}"] += 1
+            rows = [["Equipment", "Count", "Top Endpoints"]]
+            for detail, count in counts.most_common(12):
+                top_eps = ", ".join(
+                    f"{ep} ({cnt})" for ep, cnt in endpoints[detail].most_common(3)
+                )
+                rows.append([detail, str(count), top_eps or "-"])
+            lines.append(_format_table(rows))
+
+    if anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies & Threat Indicators"))
+        for anomaly in anomalies[:16]:
+            sev = getattr(anomaly, "severity", "INFO")
+            sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
+            lines.append(sev_color(f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"))
+            lines.append(muted(f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"))
+
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines)
+
+
+def render_profinet_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_ot_protocol_summary(
+        "Profinet",
+        summary,
+        packet_label="Profinet Packets",
+        dangerous_tokens={"set", "write", "alarm", "download", "upload"},
+        suspicious_tokens={"identify", "query", "scan"},
+    )
+
+
+def render_s7_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_ot_protocol_summary(
+        "S7",
+        summary,
+        packet_label="S7 Packets",
+        dangerous_tokens={"write", "stop", "download", "upload", "start", "plc"},
+        suspicious_tokens={"read", "setup", "userdata", "block", "diag"},
+    )
+
+
+def render_opc_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("OPC UA", summary, packet_label="OPC UA Packets")
+
+
+def render_ethercat_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("EtherCAT", summary, packet_label="EtherCAT Packets")
+
+
+def render_fins_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("FINS", summary, packet_label="FINS Packets")
+
+
+def render_crimson_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("Crimson V3", summary, packet_label="Crimson Packets")
+
+
+def render_pcworx_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("PCWorx", summary, packet_label="PCWorx Packets")
+
+
+def render_melsec_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("MELSEC-Q", summary, packet_label="MELSEC Packets")
+
+
+def render_cip_summary(summary: "CIPAnalysis") -> str:
+    if not summary:
+        return ""
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"CIP ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    duration = summary.duration
+    rate = (summary.cip_bytes / duration) if duration and duration > 0 else 0
+
+    lines.append(_format_kv("Scan Duration", f"{duration:.2f}s"))
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
+    lines.append(_format_kv("CIP Packets", str(summary.cip_packets)))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
+    lines.append(_format_kv("CIP Bytes", format_bytes_as_mb(summary.cip_bytes)))
+    lines.append(_format_kv("CIP Throughput", format_speed_bps(int(rate * 8))))
+    lines.append(_format_kv("Requests", str(summary.requests)))
+    lines.append(_format_kv("Responses", str(summary.responses)))
+    lines.append(_format_kv("Connected/Unconnected", f"{summary.connected_packets}/{summary.unconnected_packets}"))
+    lines.append(_format_kv("I/O Packets (UDP/2222)", str(summary.io_packets)))
+    lines.append(_format_kv("Unique Clients", str(len(summary.client_ips))))
+    lines.append(_format_kv("Unique Servers", str(len(summary.server_ips))))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Endpoint Statistics"))
+    if not summary.client_ips and not summary.server_ips:
+        lines.append(muted("No CIP endpoints detected."))
+    else:
+        col_width = 45
+        lines.append(highlight(f"{'Clients':<{col_width}} | {'Servers'}"))
+        lines.append(muted("-" * 90))
+        clients = summary.client_ips.most_common(10)
+        servers = summary.server_ips.most_common(10)
+        max_rows = max(len(clients), len(servers))
+        for i in range(max_rows):
+            c_str = ""
+            s_str = ""
+            if i < len(clients):
+                ip, cnt = clients[i]
+                c_str = f"{ip} ({cnt})"
+            if i < len(servers):
+                ip, cnt = servers[i]
+                s_str = f"{ip} ({cnt})"
+            lines.append(f"{c_str:<{col_width}} | {s_str}")
+
+    if summary.sessions:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Sessions"))
+        rows = [["Session", "Packets"]]
+        for sess, count in summary.sessions.most_common(12):
+            rows.append([str(sess), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.enip_commands:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("ENIP Encapsulation Commands"))
+        rows = [["Command", "Count"]]
+        for cmd, count in summary.enip_commands.most_common(12):
+            rows.append([str(cmd), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.cip_services:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("CIP Service Usage"))
+        rows = [["Service", "Count", "Risk"]]
+        dangerous = {
+            "Reset",
+            "Start",
+            "Stop",
+            "ProgramDownload",
+            "ProgramCommand",
+            "WriteTag",
+            "WriteTagFragmented",
+            "ReadModifyWriteTag",
+            "WriteData",
+        }
+        suspicious = {
+            "Set_Attribute_List",
+            "Set_Attribute_Single",
+            "Set_Attributes_All",
+            "Forward_Open",
+            "Forward_Close",
+            "Create",
+            "Delete",
+            "ProgramUpload",
+        }
+        for service, count in summary.cip_services.most_common(16):
+            risk = "Normal"
+            display = service
+            if service in dangerous:
+                risk = "Dangerous"
+                display = danger(service)
+            elif service in suspicious:
+                risk = "Suspicious"
+                display = warn(service)
+            rows.append([display, str(count), risk])
+        lines.append(_format_table(rows))
+
+    if summary.service_endpoints:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Service Endpoints"))
+        rows = [["Service", "Top Endpoints"]]
+        for service, count in summary.cip_services.most_common(8):
+            endpoints = summary.service_endpoints.get(service, Counter())
+            top_eps = ", ".join(
+                f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(3)
+            )
+            rows.append([service, top_eps or "-"])
+        lines.append(_format_table(rows))
+
+    if summary.class_ids or summary.instance_ids or summary.attribute_ids:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("CIP Object Path Statistics"))
+        if summary.class_ids:
+            rows = [["Class ID", "Count"]]
+            for class_id, count in summary.class_ids.most_common(10):
+                rows.append([str(class_id), str(count)])
+            lines.append(label("Top Class IDs"))
+            lines.append(_format_table(rows))
+        if summary.instance_ids:
+            rows = [["Instance ID", "Count"]]
+            for inst_id, count in summary.instance_ids.most_common(10):
+                rows.append([str(inst_id), str(count)])
+            lines.append(label("Top Instance IDs"))
+            lines.append(_format_table(rows))
+        if summary.attribute_ids:
+            rows = [["Attribute ID", "Count"]]
+            for attr_id, count in summary.attribute_ids.most_common(10):
+                rows.append([str(attr_id), str(count)])
+            lines.append(label("Top Attribute IDs"))
+            lines.append(_format_table(rows))
+
+    if summary.status_codes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("CIP Status Codes"))
+        rows = [["Status", "Count"]]
+        for status, count in summary.status_codes.most_common(12):
+            rows.append([str(status), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.packet_size_buckets or summary.payload_size_buckets:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Packet/Payload Size Analysis"))
+
+        def _summarize_buckets(buckets: list[SizeBucket]) -> tuple[int, float, int, int]:
+            total = sum(bucket.count for bucket in buckets)
+            if not total:
+                return 0, 0.0, 0, 0
+            avg = sum(bucket.avg * bucket.count for bucket in buckets) / total
+            min_val = min(bucket.min for bucket in buckets if bucket.count)
+            max_val = max(bucket.max for bucket in buckets if bucket.count)
+            return total, avg, min_val, max_val
+
+        if summary.packet_size_buckets:
+            total, avg, min_val, max_val = _summarize_buckets(summary.packet_size_buckets)
+            counts = [bucket.count for bucket in summary.packet_size_buckets]
+            lines.append(label("Packet Sizes"))
+            lines.append(_format_kv("Count", str(total)))
+            lines.append(_format_kv("Min/Avg/Max", f"{min_val}/{avg:.1f}/{max_val}"))
+            lines.append(_format_kv("Distribution", sparkline(counts)))
+
+        if summary.payload_size_buckets:
+            total, avg, min_val, max_val = _summarize_buckets(summary.payload_size_buckets)
+            counts = [bucket.count for bucket in summary.payload_size_buckets]
+            lines.append(label("Payload Sizes"))
+            lines.append(_format_kv("Count", str(total)))
+            lines.append(_format_kv("Min/Avg/Max", f"{min_val}/{avg:.1f}/{max_val}"))
+            lines.append(_format_kv("Distribution", sparkline(counts)))
+
+        rows = [["Bucket", "Packets", "Pct", "Min", "Avg", "Max"]]
+        for bucket in summary.packet_size_buckets[:10]:
+            rows.append([
+                bucket.label,
+                str(bucket.count),
+                f"{bucket.pct:.1f}%",
+                str(bucket.min),
+                f"{bucket.avg:.1f}",
+                str(bucket.max),
+            ])
+        if len(rows) > 1:
+            lines.append(label("Packet Buckets"))
+            lines.append(_format_table(rows))
+
+        rows = [["Bucket", "Payloads", "Pct", "Min", "Avg", "Max"]]
+        for bucket in summary.payload_size_buckets[:10]:
+            rows.append([
+                bucket.label,
+                str(bucket.count),
+                f"{bucket.pct:.1f}%",
+                str(bucket.min),
+                f"{bucket.avg:.1f}",
+                str(bucket.max),
+            ])
+        if len(rows) > 1:
+            lines.append(label("Payload Buckets"))
+            lines.append(_format_table(rows))
+
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts & Observations"))
+        rows = [["Type", "Detail", "Src", "Dst"]]
+        for artifact in summary.artifacts[:12]:
+            rows.append([
+                str(getattr(artifact, "kind", "artifact")),
+                _truncate_text(str(getattr(artifact, "detail", "")), 80),
+                str(getattr(artifact, "src", "?")),
+                str(getattr(artifact, "dst", "?")),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Anomalies & Threats"))
+        sev_map = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        sorted_anoms = sorted(summary.anomalies, key=lambda x: sev_map.get(x.severity, 99))
+        for anomaly in sorted_anoms[:20]:
+            sev = getattr(anomaly, "severity", "INFO")
+            sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
+            if sev == "LOW":
+                sev_color = muted
+            lines.append(sev_color(f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"))
+            lines.append(muted(f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"))
+
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines)
+
+
+def render_odesys_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("ODESYS", summary, packet_label="ODESYS Packets")
+
+
+def render_niagara_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("Niagara Fox", summary, packet_label="Niagara Packets")
+
+
+def render_mms_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("IEC 61850 MMS", summary, packet_label="MMS Packets")
+
+
+def render_srtp_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("GE SRTP", summary, packet_label="SRTP Packets")
+
+
+def render_df1_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("DF1", summary, packet_label="DF1 Packets")
+
+
+def render_pccc_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("PCCC", summary, packet_label="PCCC Packets")
+
+
+def render_csp_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("CSP", summary, packet_label="CSP Packets")
+
+
+def render_modicon_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("Modicon", summary, packet_label="Modicon Packets")
+
+
+def render_yokogawa_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("Yokogawa Vnet/IP", summary, packet_label="Yokogawa Packets")
+
+
+def render_honeywell_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("Honeywell CDA", summary, packet_label="Honeywell Packets")
+
+
+def render_mqtt_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("MQTT", summary, packet_label="MQTT Packets")
+
+
+def render_coap_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("CoAP", summary, packet_label="CoAP Packets")
+
+
+def render_hart_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("HART-IP", summary, packet_label="HART Packets")
+
+
+def render_prconos_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("ProConOS", summary, packet_label="ProConOS Packets")
+
+
+def render_iccp_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("ICCP/TASE.2", summary, packet_label="ICCP Packets")
