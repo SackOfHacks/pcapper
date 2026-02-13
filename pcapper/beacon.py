@@ -376,9 +376,23 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
 
     detections: list[dict[str, object]] = []
     if candidates:
+        severity_rank = {"info": 0, "warning": 1, "high": 2, "critical": 3}
+
+        def _candidate_severity(item: BeaconCandidate) -> str:
+            is_external = _is_private(item.src_ip) and _is_public(item.dst_ip)
+            if item.score >= 0.88 and item.count >= 30 and item.duration_seconds >= 3600 and is_external:
+                return "critical"
+            if item.score >= 0.78 and item.count >= 20 and is_external:
+                return "high"
+            if item.score >= 0.70 and item.count >= 15:
+                return "warning"
+            return "info"
+
         src_counts: Counter[str] = Counter()
         dst_counts: Counter[str] = Counter()
         flow_details: list[str] = []
+        flow_evidence: list[str] = []
+        peak_severity = "info"
         for item in candidates[:3]:
             duration = 0.0
             if item.first_seen is not None and item.last_seen is not None:
@@ -394,29 +408,108 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                 f"median {item.median_interval:.2f}s, MAD {item.mad_interval:.2f}s, duration {_format_duration(duration)}, "
                 f"avg bytes {item.avg_bytes:.0f}, size MAD {item.mad_bytes:.0f}, score {item.score:.2f}"
             )
+            flow_evidence.append(
+                f"{item.src_ip}->{item.dst_ip} {proto_label} count={item.count} top_interval={item.top_interval}s top_size={item.top_size}"
+            )
             src_counts[item.src_ip] += item.count
             dst_counts[item.dst_ip] += item.count
+            candidate_severity = _candidate_severity(item)
+            if severity_rank[candidate_severity] > severity_rank[peak_severity]:
+                peak_severity = candidate_severity
         detections.append({
             "type": "beaconing",
-            "severity": "warning",
+            "severity": peak_severity,
             "summary": f"{len(candidates)} beacon-like flows detected",
             "details": "Periodic communication patterns may indicate C2 or scheduled tasks. "
                        f"Top flows: {'; '.join(flow_details)}",
             "top_sources": src_counts.most_common(5),
             "top_destinations": dst_counts.most_common(5),
+            "evidence": flow_evidence,
         })
+
+        src_to_dsts: dict[str, set[str]] = defaultdict(set)
+        src_to_events: Counter[str] = Counter()
+        for item in candidates:
+            if item.score < 0.70:
+                continue
+            src_to_dsts[item.src_ip].add(item.dst_ip)
+            src_to_events[item.src_ip] += item.count
+        fanout_rows = [
+            (src, len(dsts), src_to_events[src])
+            for src, dsts in src_to_dsts.items()
+            if len(dsts) >= 3 and src_to_events[src] >= 15
+        ]
+        if fanout_rows:
+            fanout_rows.sort(key=lambda row: (row[1], row[2]), reverse=True)
+            detections.append({
+                "type": "beacon_fanout",
+                "severity": "high",
+                "summary": "Source beaconing to multiple destinations",
+                "details": ", ".join(
+                    f"{src} -> {dst_count} destinations ({events} events)"
+                    for src, dst_count, events in fanout_rows[:5]
+                ),
+                "top_sources": [(src, events) for src, _dst_count, events in fanout_rows[:5]],
+            })
+
+        low_and_slow = [
+            item
+            for item in candidates
+            if item.mean_interval >= 300
+            and item.periodicity_score >= 0.80
+            and item.duration_seconds >= 3600
+            and item.count >= 10
+        ]
+        if low_and_slow:
+            detections.append({
+                "type": "beacon_low_slow",
+                "severity": "high",
+                "summary": "Low-and-slow periodic beaconing pattern",
+                "details": "; ".join(
+                    f"{item.src_ip}->{item.dst_ip} interval≈{item.mean_interval:.0f}s duration={_format_duration(item.duration_seconds)}"
+                    for item in low_and_slow[:5]
+                ),
+                "top_sources": Counter(item.src_ip for item in low_and_slow).most_common(5),
+                "top_destinations": Counter(item.dst_ip for item in low_and_slow).most_common(5),
+            })
+
+        high_frequency = [
+            item
+            for item in candidates
+            if item.mean_interval <= 30
+            and item.periodicity_score >= 0.75
+            and item.count >= 30
+            and item.duration_seconds >= 600
+        ]
+        if high_frequency:
+            detections.append({
+                "type": "beacon_high_frequency",
+                "severity": "warning",
+                "summary": "High-frequency periodic check-in pattern",
+                "details": "; ".join(
+                    f"{item.src_ip}->{item.dst_ip} interval≈{item.mean_interval:.1f}s count={item.count}"
+                    for item in high_frequency[:5]
+                ),
+                "top_sources": Counter(item.src_ip for item in high_frequency).most_common(5),
+                "top_destinations": Counter(item.dst_ip for item in high_frequency).most_common(5),
+            })
+
         for item in candidates[:3]:
             duration = 0.0
             if item.first_seen is not None and item.last_seen is not None:
                 duration = max(0.0, item.last_seen - item.first_seen)
             detections.append({
                 "type": "beacon_candidate",
-                "severity": "info",
+                "severity": _candidate_severity(item),
                 "summary": f"Beacon candidate {item.src_ip} -> {item.dst_ip}",
                 "details": f"{item.count} events, mean {item.mean_interval:.2f}s, median {item.median_interval:.2f}s, "
                            f"MAD {item.mad_interval:.2f}s, duration {_format_duration(duration)}, avg bytes {item.avg_bytes:.0f}, "
                            f"size MAD {item.mad_bytes:.0f}, periodicity {item.periodicity_score:.2f}, size {item.size_score:.2f}, "
                            f"duration {item.duration_score:.2f}, count {item.count_score:.2f}, score {item.score:.2f}",
+                "evidence": [
+                    f"timeline={','.join(str(value) for value in item.timeline[:16])}",
+                    f"top_interval={item.top_interval}s top_size={item.top_size} bytes",
+                ],
             })
     else:
         detections.append({

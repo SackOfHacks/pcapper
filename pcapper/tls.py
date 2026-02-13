@@ -71,6 +71,7 @@ class TlsSummary:
     http_user_agents: Counter[str]
     http_files: Counter[str]
     http_referrers: Counter[str]
+    http_referrer_request_hosts: dict[str, Counter[str]]
     http_referrer_hosts: Counter[str]
     http_referrer_schemes: Counter[str]
     http_referrer_paths: Counter[str]
@@ -133,6 +134,9 @@ class TlsSummary:
             "http_user_agents": dict(self.http_user_agents),
             "http_files": dict(self.http_files),
             "http_referrers": dict(self.http_referrers),
+            "http_referrer_request_hosts": {
+                ref: dict(hosts) for ref, hosts in self.http_referrer_request_hosts.items()
+            },
             "http_referrer_hosts": dict(self.http_referrer_hosts),
             "http_referrer_schemes": dict(self.http_referrer_schemes),
             "http_referrer_paths": dict(self.http_referrer_paths),
@@ -688,6 +692,7 @@ def analyze_tls(
         http_user_agents=http_summary.user_agents,
         http_files=http_summary.file_artifacts,
         http_referrers=http_summary.referrer_counts,
+        http_referrer_request_hosts=http_summary.referrer_request_host_counts,
         http_referrer_hosts=http_summary.referrer_host_counts,
         http_referrer_schemes=http_summary.referrer_scheme_counts,
         http_referrer_paths=http_summary.referrer_path_counts,

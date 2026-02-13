@@ -139,9 +139,12 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
     
     try:
         with status as pbar:
-            total_count = len(reader)
+            try:
+                total_count = len(reader)
+            except Exception:
+                total_count = None
             for i, pkt in enumerate(reader):
-                if i % 10 == 0:
+                if total_count and i % 10 == 0:
                     try:
                         pbar.update(int((i / max(1, total_count)) * 100))
                     except Exception:
@@ -351,9 +354,12 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                     pass
 
     except Exception as e:
-        errors.append(str(e))
-    # finally:
-    #    reader.close()
+        errors.append(f"{type(e).__name__}: {e}")
+    finally:
+        try:
+            reader.close()
+        except Exception:
+            pass
     
     duration = 0.0
     if start_time and last_time:

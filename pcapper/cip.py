@@ -107,6 +107,27 @@ SUSPICIOUS_SERVICE_CODES = {
     0x75,
 }
 
+HIGH_RISK_SERVICE_CODES = {
+    0x05,
+    0x06,
+    0x07,
+    0x4C,
+    0x4E,
+    0x4F,
+    0x55,
+    0x74,
+    0x75,
+}
+
+ENUMERATION_SERVICE_CODES = {
+    0x01,
+    0x03,
+    0x0E,
+    0x4B,
+    0x4D,
+    0x50,
+}
+
 SIZE_BUCKETS = [
     (0, 19, "0-19"),
     (20, 39, "20-39"),
@@ -151,6 +172,12 @@ class CIPAnalysis:
     sessions: Counter[str] = field(default_factory=Counter)
     enip_commands: Counter[str] = field(default_factory=Counter)
     cip_services: Counter[str] = field(default_factory=Counter)
+    high_risk_services: Counter[str] = field(default_factory=Counter)
+    suspicious_services: Counter[str] = field(default_factory=Counter)
+    source_risky_commands: Counter[str] = field(default_factory=Counter)
+    source_enum_commands: Counter[str] = field(default_factory=Counter)
+    server_error_responses: Counter[str] = field(default_factory=Counter)
+    service_error_counts: Counter[str] = field(default_factory=Counter)
     service_endpoints: dict[str, Counter[str]] = field(default_factory=dict)
     class_ids: Counter[int] = field(default_factory=Counter)
     instance_ids: Counter[int] = field(default_factory=Counter)
@@ -161,6 +188,58 @@ class CIPAnalysis:
     artifacts: list[IndustrialArtifact] = field(default_factory=list)
     anomalies: list[IndustrialAnomaly] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+
+def merge_cip_summaries(summaries: list[CIPAnalysis]) -> CIPAnalysis:
+    if not summaries:
+        return CIPAnalysis(path=Path("ALL_PCAPS_0"))
+
+    merged = CIPAnalysis(path=Path(f"ALL_PCAPS_{len(summaries)}"))
+    error_seen: set[str] = set()
+
+    for summary in summaries:
+        merged.duration += summary.duration
+        merged.total_packets += summary.total_packets
+        merged.cip_packets += summary.cip_packets
+        merged.total_bytes += summary.total_bytes
+        merged.cip_bytes += summary.cip_bytes
+        merged.requests += summary.requests
+        merged.responses += summary.responses
+        merged.connected_packets += summary.connected_packets
+        merged.unconnected_packets += summary.unconnected_packets
+        merged.io_packets += summary.io_packets
+
+        merged.src_ips.update(summary.src_ips)
+        merged.dst_ips.update(summary.dst_ips)
+        merged.client_ips.update(summary.client_ips)
+        merged.server_ips.update(summary.server_ips)
+        merged.sessions.update(summary.sessions)
+        merged.enip_commands.update(summary.enip_commands)
+        merged.cip_services.update(summary.cip_services)
+        merged.high_risk_services.update(summary.high_risk_services)
+        merged.suspicious_services.update(summary.suspicious_services)
+        merged.source_risky_commands.update(summary.source_risky_commands)
+        merged.source_enum_commands.update(summary.source_enum_commands)
+        merged.server_error_responses.update(summary.server_error_responses)
+        merged.service_error_counts.update(summary.service_error_counts)
+        merged.class_ids.update(summary.class_ids)
+        merged.instance_ids.update(summary.instance_ids)
+        merged.attribute_ids.update(summary.attribute_ids)
+        merged.status_codes.update(summary.status_codes)
+
+        for service, counter in summary.service_endpoints.items():
+            merged.service_endpoints.setdefault(service, Counter()).update(counter)
+
+        merged.artifacts.extend(summary.artifacts)
+        merged.anomalies.extend(summary.anomalies)
+
+        for err in summary.errors:
+            if err in error_seen:
+                continue
+            error_seen.add(err)
+            merged.errors.append(err)
+
+    return merged
 
 
 def _extract_transport(pkt) -> tuple[bool, str, str, int, int, bytes]:
@@ -459,12 +538,16 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
     src_requests: Counter[str] = Counter()
     src_responses: Counter[str] = Counter()
     src_commands: dict[str, Counter[str]] = defaultdict(Counter)
+    failed_pairs: Counter[str] = Counter()
 
     try:
         with status as pbar:
-            total_count = len(reader)
+            try:
+                total_count = len(reader)
+            except Exception:
+                total_count = None
             for idx, pkt in enumerate(reader):
-                if idx % 10 == 0:
+                if total_count and idx % 10 == 0:
                     try:
                         pbar.update(int((idx / max(1, total_count)) * 100))
                     except Exception:
@@ -557,9 +640,19 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
 
                 if service_name:
                     analysis.cip_services[service_name] += 1
-                    src_commands[src_ip][service_name] += 1
+                    actor_ip = src_ip if is_request else dst_ip
+                    src_commands[actor_ip][service_name] += 1
                     endpoints = analysis.service_endpoints.setdefault(service_name, Counter())
                     endpoints[f"{src_ip} -> {dst_ip}"] += 1
+
+                    service_code = (service & 0x7F) if service is not None else None
+                    if is_request and service_code is not None:
+                        if service_code in HIGH_RISK_SERVICE_CODES:
+                            analysis.high_risk_services[service_name] += 1
+                            analysis.source_risky_commands[src_ip] += 1
+                        elif service_code in ENUMERATION_SERVICE_CODES:
+                            analysis.suspicious_services[service_name] += 1
+                            analysis.source_enum_commands[src_ip] += 1
 
                 if class_id is not None:
                     analysis.class_ids[class_id] += 1
@@ -571,6 +664,13 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                 if general_status is not None:
                     status_text = general_status_text or f"0x{general_status:02x}"
                     analysis.status_codes[status_text] += 1
+
+                    if general_status != 0x00:
+                        if service_name:
+                            analysis.service_error_counts[service_name] += 1
+                        if not is_request:
+                            analysis.server_error_responses[src_ip] += 1
+                            failed_pairs[f"{dst_ip} -> {src_ip}"] += 1
 
                 if path_str and "Symbol:" in path_str:
                     for segment in path_str.split("/"):
@@ -651,7 +751,12 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         )
 
     except Exception as exc:
-        analysis.errors.append(str(exc))
+        analysis.errors.append(f"{type(exc).__name__}: {exc}")
+    finally:
+        try:
+            reader.close()
+        except Exception:
+            pass
 
     if start_time is not None and last_time is not None:
         analysis.duration = last_time - start_time
@@ -685,6 +790,68 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         description=f"High volume of session/identity requests ({req_count}) from source.",
                         src=src,
                         dst="*",
+                        ts=0.0,
+                    )
+                )
+
+    for src, risky_count in analysis.source_risky_commands.items():
+        req_count = src_requests.get(src, 0)
+        risky_ratio = (risky_count / req_count) if req_count else 0.0
+        if risky_count >= 20 and risky_ratio >= 0.25:
+            if len(analysis.anomalies) < max_anomalies:
+                analysis.anomalies.append(
+                    IndustrialAnomaly(
+                        severity="HIGH",
+                        title="CIP Control Command Burst",
+                        description=f"{risky_count} high-risk write/control commands from source ({risky_ratio:.0%} of requests).",
+                        src=src,
+                        dst="*",
+                        ts=0.0,
+                    )
+                )
+
+    for src, enum_count in analysis.source_enum_commands.items():
+        unique_dsts = len(src_dst_counts.get(src, {}))
+        if enum_count >= 30 and unique_dsts >= 8:
+            if len(analysis.anomalies) < max_anomalies:
+                analysis.anomalies.append(
+                    IndustrialAnomaly(
+                        severity="MEDIUM",
+                        title="CIP Reconnaissance Campaign",
+                        description=f"Enumeration-heavy behavior observed across {unique_dsts} endpoints ({enum_count} requests).",
+                        src=src,
+                        dst="*",
+                        ts=0.0,
+                    )
+                )
+
+    for server, error_count in analysis.server_error_responses.items():
+        resp_count = src_responses.get(server, 0)
+        error_ratio = (error_count / resp_count) if resp_count else 0.0
+        if error_count >= 20 and error_ratio >= 0.4:
+            if len(analysis.anomalies) < max_anomalies:
+                analysis.anomalies.append(
+                    IndustrialAnomaly(
+                        severity="MEDIUM",
+                        title="CIP Server Error Flood",
+                        description=f"Server produced {error_count} failed responses ({error_ratio:.0%} failure rate).",
+                        src=server,
+                        dst="*",
+                        ts=0.0,
+                    )
+                )
+
+    for pair, error_count in failed_pairs.items():
+        if error_count >= 10:
+            client, server = pair.split(" -> ", 1)
+            if len(analysis.anomalies) < max_anomalies:
+                analysis.anomalies.append(
+                    IndustrialAnomaly(
+                        severity="HIGH",
+                        title="Repeated Failed CIP Operations",
+                        description=f"{error_count} failed responses for client/server pair (possible brute-force or unsupported command abuse).",
+                        src=client,
+                        dst=server,
                         ts=0.0,
                     )
                 )
@@ -726,5 +893,28 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         ts=0.0,
                     )
                 )
+
+    for service_name, endpoints in analysis.service_endpoints.items():
+        if service_name not in analysis.high_risk_services:
+            continue
+        for endpoint, count in endpoints.items():
+            if count < 10:
+                continue
+            try:
+                _src, dst = endpoint.split(" -> ", 1)
+            except ValueError:
+                continue
+            if _is_public_ip(dst):
+                if len(analysis.anomalies) < max_anomalies:
+                    analysis.anomalies.append(
+                        IndustrialAnomaly(
+                            severity="HIGH",
+                            title="High-Risk CIP Command to Public Endpoint",
+                            description=f"{service_name} invoked {count} times toward public destination.",
+                            src="*",
+                            dst=dst,
+                            ts=0.0,
+                        )
+                    )
 
     return analysis

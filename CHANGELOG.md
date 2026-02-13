@@ -4,6 +4,38 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+### Added
+- Wildcard target resolution support for quoted glob patterns and mixed target inputs.
+- Multiple positional target support (e.g., shell-expanded wildcards like `Un*` resolving to many files).
+- Merged summarize rendering for timeline analysis (`--summarize --timeline -ip ...`).
+- Parser regression tests for grouped-help completeness, alphabetical IT/ICS flag ordering, and multi-target parsing.
+- New `--dhcp` analyzer with DHCP conversations/sessions, lease/option intelligence, client/server endpoint detail, artifacts, and attack/threat-hunting detections (starvation, rogue DHCP, NAK floods, probing, beaconing, exfil-style option abuse).
+- Beaconing enhancements: severity tiers, fan-out detection, low-and-slow cadence detection, high-frequency check-in detection, and candidate evidence payloads.
+- Exfiltration enhancements: per-source DNS tunneling heuristics (entropy + max label), uncommon high-volume outbound channel detection, aggregated HTTP POST channel detection, and richer exfil evidence.
+- New smoke coverage for beacon fan-out and exfil per-source DNS/uncommon-port detections.
+
+### Changed
+- CLI help menu organization now enforces complete alphabetical ordering inside IT and OT/ICS groups.
+- README refreshed to reflect current CLI behavior, wildcard/multi-target usage, summarize semantics, and full grouped flag inventory.
+- IT grouped help inventory now includes `--dhcp`, with ordering/completeness checks aligned to the live parser definitions.
+- Dependency ordering normalized in `requirements.txt` and `pyproject.toml`.
+- Threat, beacon, and exfil reporting now render richer evidence lines directly under detections for faster triage.
+- README now includes a direct `--help` verification command and explicit IT/ICS function counts.
+- `requirements.txt` now explicitly marks runtime dependencies as alphabetically ordered.
+
+### Fixed
+- `argparse` failure when shell-expanded wildcard input produced multiple targets (`unrecognized arguments ...`).
+- Timeline summarize output path now renders full merged timeline report instead of generic rollup-only output.
+- OT false positives in `--threats` were reduced by strict protocol signature gating (CIP/EtherNet-IP/DNP3), confidence checks, and anomaly deduping.
+
+## 1.2.0 — 2026-02-13
+### Changed
+- Version bump and release metadata alignment.
+
+### Fixed
+- Reader handling and progress robustness improvements for large streamed captures.
+
 ## 0.6.5 — 2026-02-04
 ### Changed
 - Version bump and release prep updates.

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from numbers import Real
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 from .pcap_cache import PcapMeta, get_reader
 
@@ -318,4 +318,115 @@ def analyze_pcap(
         duration_seconds=duration_seconds,
         interface_stats=interface_stats,
         protocol_counts=protocol_counts,
+    )
+
+
+def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
+    if not summaries:
+        return PcapSummary(
+            path=Path("ALL_PCAPS_0"),
+            file_type="pcap",
+            size_bytes=0,
+            packet_count=0,
+            start_ts=None,
+            end_ts=None,
+            duration_seconds=0.0,
+            interface_stats=[],
+            protocol_counts=Counter(),
+        )
+
+    file_types = {summary.file_type for summary in summaries if summary.file_type}
+    merged_file_type = file_types.pop() if len(file_types) == 1 else "mixed"
+    merged_size = sum(summary.size_bytes for summary in summaries)
+    merged_packets = sum(summary.packet_count for summary in summaries)
+
+    start_values = [summary.start_ts for summary in summaries if summary.start_ts is not None]
+    end_values = [summary.end_ts for summary in summaries if summary.end_ts is not None]
+    merged_start = min(start_values) if start_values else None
+    merged_end = max(end_values) if end_values else None
+    merged_duration = sum((summary.duration_seconds or 0.0) for summary in summaries)
+
+    merged_protocols: Counter[str] = Counter()
+    for summary in summaries:
+        merged_protocols.update(summary.protocol_counts)
+
+    iface_data: dict[str, dict[str, object]] = {}
+    for summary in summaries:
+        for iface in summary.interface_stats:
+            data = iface_data.setdefault(
+                iface.name,
+                {
+                    "linktypes": set(),
+                    "snaplens": set(),
+                    "packet_count": 0,
+                    "dropped_packets": 0,
+                    "has_dropped": False,
+                    "capture_filters": set(),
+                    "descriptions": set(),
+                    "speeds": set(),
+                    "macs": set(),
+                    "oses": set(),
+                    "vlan_ids": set(),
+                },
+            )
+
+            if iface.linktype:
+                data["linktypes"].add(iface.linktype)
+            if iface.snaplen is not None:
+                data["snaplens"].add(iface.snaplen)
+            if iface.packet_count is not None:
+                data["packet_count"] = int(data["packet_count"]) + iface.packet_count
+            if iface.dropped_packets is not None:
+                data["has_dropped"] = True
+                data["dropped_packets"] = int(data["dropped_packets"]) + iface.dropped_packets
+            if iface.capture_filter:
+                data["capture_filters"].add(iface.capture_filter)
+            if iface.description:
+                data["descriptions"].add(iface.description)
+            if iface.speed_bps is not None:
+                data["speeds"].add(iface.speed_bps)
+            if iface.mac:
+                data["macs"].add(iface.mac)
+            if iface.os:
+                data["oses"].add(iface.os)
+            data["vlan_ids"].update(iface.vlan_ids)
+
+    merged_interfaces: list[InterfaceStat] = []
+    for name in sorted(iface_data.keys()):
+        data = iface_data[name]
+        linktypes = sorted(data["linktypes"])
+        snaplens = sorted(data["snaplens"])
+        capture_filters = sorted(data["capture_filters"])
+        descriptions = sorted(data["descriptions"])
+        speeds = sorted(data["speeds"])
+        macs = sorted(data["macs"])
+        oses = sorted(data["oses"])
+        vlan_ids = sorted(data["vlan_ids"])
+
+        merged_interfaces.append(
+            InterfaceStat(
+                name=name,
+                linktype=linktypes[0] if len(linktypes) == 1 else ("mixed" if linktypes else None),
+                snaplen=snaplens[0] if len(snaplens) == 1 else (max(snaplens) if snaplens else None),
+                packet_count=int(data["packet_count"]) if int(data["packet_count"]) > 0 else None,
+                dropped_packets=int(data["dropped_packets"]) if bool(data["has_dropped"]) else None,
+                capture_filter=(capture_filters[0] if len(capture_filters) == 1 else ("multiple" if capture_filters else None)),
+                description=(descriptions[0] if len(descriptions) == 1 else ("multiple" if descriptions else None)),
+                speed_bps=speeds[0] if len(speeds) == 1 else None,
+                mac=macs[0] if len(macs) == 1 else None,
+                os=oses[0] if len(oses) == 1 else None,
+                vlan_ids=vlan_ids,
+            )
+        )
+
+    return PcapSummary(
+        path=Path(f"ALL_PCAPS_{len(summaries)}"),
+        file_type=merged_file_type,
+        size_bytes=merged_size,
+        packet_count=merged_packets,
+        start_ts=merged_start,
+        end_ts=merged_end,
+        duration_seconds=merged_duration,
+        interface_stats=merged_interfaces,
+        protocol_counts=merged_protocols,
     )

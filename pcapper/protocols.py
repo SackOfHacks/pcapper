@@ -127,6 +127,8 @@ KNOWN_PORTS = {
 }
 KNOWN_PORTS.update(INDUSTRIAL_PORTS)
 
+OSCILLATION_REPEAT_CAP = 3
+
 def _get_proto_name(pkt: Packet) -> str:
     # Heuristic based on layers
     if IP in pkt:
@@ -228,7 +230,19 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
             current_node.bytes += pkt_len
 
             layer = pkt
+            prev_effective_layer: str | None = None
+            effective_path_layers: List[str] = []
+            oscillation_repeats = 0
+            visited_layer_ids: Set[int] = set()
+            depth = 0
             while layer:
+                depth += 1
+                if depth > 256:
+                    break
+                layer_id = id(layer)
+                if layer_id in visited_layer_ids:
+                    break
+                visited_layer_ids.add(layer_id)
                 try:
                     lname = layer.name
                     if not lname:  # Fallback
@@ -248,11 +262,27 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                         vlan_node.packets += 1
                         vlan_node.bytes += pkt_len
                     else:
+                        if lname == prev_effective_layer:
+                            layer = layer.payload
+                            continue
+                        if (
+                            len(effective_path_layers) >= 3
+                            and effective_path_layers[-3] == effective_path_layers[-1]
+                            and effective_path_layers[-2] == lname
+                            and effective_path_layers[-3] != effective_path_layers[-2]
+                        ):
+                            oscillation_repeats += 1
+                            if oscillation_repeats >= OSCILLATION_REPEAT_CAP:
+                                break
+                        else:
+                            oscillation_repeats = 0
                         if lname not in current_node.sub_protocols:
                             current_node.sub_protocols[lname] = ProtocolStat(lname)
                         current_node = current_node.sub_protocols[lname]
                         current_node.packets += 1
                         current_node.bytes += pkt_len
+                        prev_effective_layer = lname
+                        effective_path_layers.append(lname)
                 layer = layer.payload
 
             # 2. Extract Endpoints & Conversations

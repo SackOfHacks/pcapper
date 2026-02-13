@@ -296,9 +296,12 @@ def analyze_port_protocol(
 
     try:
         with status as pbar:
-            total_count = len(reader)
+            try:
+                total_count = len(reader)
+            except Exception:
+                total_count = None
             for idx, pkt in enumerate(reader):
-                if idx % 10 == 0:
+                if total_count and idx % 10 == 0:
                     try:
                         pbar.update(int((idx / max(1, total_count)) * 100))
                     except Exception:
@@ -391,7 +394,12 @@ def analyze_port_protocol(
                         analysis.anomalies.append(anomaly)
 
     except Exception as exc:
-        analysis.errors.append(str(exc))
+        analysis.errors.append(f"{type(exc).__name__}: {exc}")
+    finally:
+        try:
+            reader.close()
+        except Exception:
+            pass
 
     if start_time is not None and last_time is not None:
         analysis.duration = last_time - start_time
@@ -493,9 +501,12 @@ def analyze_ethertype_protocol(
 
     try:
         with status as pbar:
-            total_count = len(reader)
+            try:
+                total_count = len(reader)
+            except Exception:
+                total_count = None
             for idx, pkt in enumerate(reader):
-                if idx % 10 == 0:
+                if total_count and idx % 10 == 0:
                     try:
                         pbar.update(int((idx / max(1, total_count)) * 100))
                     except Exception:
@@ -574,7 +585,12 @@ def analyze_ethertype_protocol(
                         analysis.anomalies.append(anomaly)
 
     except Exception as exc:
-        analysis.errors.append(str(exc))
+        analysis.errors.append(f"{type(exc).__name__}: {exc}")
+    finally:
+        try:
+            reader.close()
+        except Exception:
+            pass
 
     if start_time is not None and last_time is not None:
         analysis.duration = last_time - start_time

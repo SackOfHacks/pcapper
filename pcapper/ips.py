@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 import ipaddress
 import json
 import os
@@ -134,6 +134,288 @@ class IpSummary:
     intel_findings: list[dict[str, object]]
     detections: list[dict[str, object]]
     errors: list[str]
+
+
+def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
+    summary_list = list(summaries)
+    if not summary_list:
+        return IpSummary(
+            path=Path("ALL_PCAPS_0"),
+            total_packets=0,
+            total_bytes=0,
+            unique_ips=0,
+            unique_sources=0,
+            unique_destinations=0,
+            ipv4_count=0,
+            ipv6_count=0,
+            protocol_counts=Counter(),
+            src_counts=Counter(),
+            dst_counts=Counter(),
+            ip_category_counts=Counter(),
+            endpoints=[],
+            conversations=[],
+            first_seen=None,
+            last_seen=None,
+            duration_seconds=0.0,
+            tls_client_hellos=0,
+            ja3_counts=Counter(),
+            ja4_counts=Counter(),
+            ja4s_counts=Counter(),
+            sni_counts=Counter(),
+            sni_entropy={},
+            ja_reputation_hits=[],
+            tls_cert_risks=[],
+            suspicious_port_profiles=[],
+            lateral_movement_scores=[],
+            intel_findings=[],
+            detections=[],
+            errors=[],
+        )
+
+    total_packets = 0
+    total_bytes = 0
+    tls_client_hellos = 0
+    duration_seconds = 0.0
+    first_seen: Optional[float] = None
+    last_seen: Optional[float] = None
+
+    protocol_counts: Counter[str] = Counter()
+    src_counts: Counter[str] = Counter()
+    dst_counts: Counter[str] = Counter()
+    ip_category_counts: Counter[str] = Counter()
+    ja3_counts: Counter[str] = Counter()
+    ja4_counts: Counter[str] = Counter()
+    ja4s_counts: Counter[str] = Counter()
+    sni_counts: Counter[str] = Counter()
+    sni_entropy: dict[str, float] = {}
+
+    endpoint_map: dict[str, dict[str, object]] = {}
+    conversation_map: dict[tuple[str, str, str], dict[str, object]] = {}
+    all_ips: set[str] = set()
+
+    tls_cert_risks: list[dict[str, object]] = []
+    suspicious_port_profiles: list[dict[str, object]] = []
+    lateral_movement_scores: list[dict[str, object]] = []
+    intel_findings: list[dict[str, object]] = []
+
+    detection_seen: set[tuple[str, str, str]] = set()
+    detections: list[dict[str, object]] = []
+
+    error_seen: set[str] = set()
+    errors: list[str] = []
+
+    rep_hits: dict[tuple[str, str, str], int] = defaultdict(int)
+
+    for summary in summary_list:
+        total_packets += summary.total_packets
+        total_bytes += summary.total_bytes
+        tls_client_hellos += summary.tls_client_hellos
+        if summary.duration_seconds is not None:
+            duration_seconds += summary.duration_seconds
+
+        if summary.first_seen is not None:
+            if first_seen is None or summary.first_seen < first_seen:
+                first_seen = summary.first_seen
+        if summary.last_seen is not None:
+            if last_seen is None or summary.last_seen > last_seen:
+                last_seen = summary.last_seen
+
+        protocol_counts.update(summary.protocol_counts)
+        src_counts.update(summary.src_counts)
+        dst_counts.update(summary.dst_counts)
+        ip_category_counts.update(summary.ip_category_counts)
+        ja3_counts.update(summary.ja3_counts)
+        ja4_counts.update(summary.ja4_counts)
+        ja4s_counts.update(summary.ja4s_counts)
+        sni_counts.update(summary.sni_counts)
+
+        all_ips.update(summary.src_counts.keys())
+        all_ips.update(summary.dst_counts.keys())
+
+        for sni, entropy in summary.sni_entropy.items():
+            existing = sni_entropy.get(sni)
+            if existing is None or entropy > existing:
+                sni_entropy[sni] = entropy
+
+        for item in summary.ja_reputation_hits:
+            rep_type = str(item.get("type", "-"))
+            fp = str(item.get("fingerprint", "-"))
+            label = str(item.get("label", "-"))
+            count = int(item.get("count", 0) or 0)
+            rep_hits[(rep_type, fp, label)] += count
+
+        tls_cert_risks.extend(summary.tls_cert_risks)
+        suspicious_port_profiles.extend(summary.suspicious_port_profiles)
+        lateral_movement_scores.extend(summary.lateral_movement_scores)
+        intel_findings.extend(summary.intel_findings)
+
+        for detection in summary.detections:
+            key = (
+                str(detection.get("severity", "info")),
+                str(detection.get("summary", "")),
+                str(detection.get("details", "")),
+            )
+            if key in detection_seen:
+                continue
+            detection_seen.add(key)
+            detections.append(detection)
+
+        for err in summary.errors:
+            if err in error_seen:
+                continue
+            error_seen.add(err)
+            errors.append(err)
+
+        for endpoint in summary.endpoints:
+            entry = endpoint_map.setdefault(
+                endpoint.ip,
+                {
+                    "packets_sent": 0,
+                    "packets_recv": 0,
+                    "bytes_sent": 0,
+                    "bytes_recv": 0,
+                    "protocols": set(),
+                    "peers": set(),
+                    "ports": set(),
+                    "first_seen": None,
+                    "last_seen": None,
+                    "geo": None,
+                    "asn": None,
+                },
+            )
+            entry["packets_sent"] = int(entry["packets_sent"]) + endpoint.packets_sent
+            entry["packets_recv"] = int(entry["packets_recv"]) + endpoint.packets_recv
+            entry["bytes_sent"] = int(entry["bytes_sent"]) + endpoint.bytes_sent
+            entry["bytes_recv"] = int(entry["bytes_recv"]) + endpoint.bytes_recv
+            entry["protocols"].update(endpoint.protocols)
+            entry["peers"].update(endpoint.peers)
+            entry["ports"].update(endpoint.ports)
+
+            ep_first = endpoint.first_seen
+            ep_last = endpoint.last_seen
+            cur_first = entry["first_seen"]
+            cur_last = entry["last_seen"]
+            if ep_first is not None and (cur_first is None or ep_first < cur_first):
+                entry["first_seen"] = ep_first
+            if ep_last is not None and (cur_last is None or ep_last > cur_last):
+                entry["last_seen"] = ep_last
+
+            if entry["geo"] is None and endpoint.geo:
+                entry["geo"] = endpoint.geo
+            if entry["asn"] is None and endpoint.asn:
+                entry["asn"] = endpoint.asn
+
+        for conv in summary.conversations:
+            key = (conv.src, conv.dst, conv.protocol)
+            entry = conversation_map.setdefault(
+                key,
+                {
+                    "packets": 0,
+                    "bytes": 0,
+                    "first_seen": None,
+                    "last_seen": None,
+                    "ports": set(),
+                },
+            )
+            entry["packets"] = int(entry["packets"]) + conv.packets
+            entry["bytes"] = int(entry["bytes"]) + conv.bytes
+            entry["ports"].update(conv.ports)
+
+            cur_first = entry["first_seen"]
+            cur_last = entry["last_seen"]
+            if conv.first_seen is not None and (cur_first is None or conv.first_seen < cur_first):
+                entry["first_seen"] = conv.first_seen
+            if conv.last_seen is not None and (cur_last is None or conv.last_seen > cur_last):
+                entry["last_seen"] = conv.last_seen
+
+    endpoint_rows: list[IpEndpoint] = []
+    for ip_text, data in endpoint_map.items():
+        endpoint_rows.append(
+            IpEndpoint(
+                ip=ip_text,
+                packets_sent=int(data["packets_sent"]),
+                packets_recv=int(data["packets_recv"]),
+                bytes_sent=int(data["bytes_sent"]),
+                bytes_recv=int(data["bytes_recv"]),
+                protocols=sorted(list(data["protocols"])),
+                peers=sorted(list(data["peers"])),
+                ports=sorted(list(data["ports"])),
+                first_seen=data["first_seen"],
+                last_seen=data["last_seen"],
+                geo=data["geo"],
+                asn=data["asn"],
+            )
+        )
+
+    conversation_rows: list[IpConversation] = []
+    for (src, dst, proto), data in conversation_map.items():
+        conversation_rows.append(
+            IpConversation(
+                src=src,
+                dst=dst,
+                protocol=proto,
+                packets=int(data["packets"]),
+                bytes=int(data["bytes"]),
+                first_seen=data["first_seen"],
+                last_seen=data["last_seen"],
+                ports=sorted(list(data["ports"])),
+            )
+        )
+
+    ipv4_count = 0
+    ipv6_count = 0
+    for ip_text in all_ips:
+        try:
+            addr = ipaddress.ip_address(ip_text)
+            if addr.version == 4:
+                ipv4_count += 1
+            elif addr.version == 6:
+                ipv6_count += 1
+        except Exception:
+            continue
+
+    ja_reputation_hits = [
+        {
+            "type": rep_type,
+            "fingerprint": fingerprint,
+            "label": label,
+            "count": count,
+        }
+        for (rep_type, fingerprint, label), count in rep_hits.items()
+    ]
+
+    return IpSummary(
+        path=Path(f"ALL_PCAPS_{len(summary_list)}"),
+        total_packets=total_packets,
+        total_bytes=total_bytes,
+        unique_ips=len(all_ips),
+        unique_sources=len(src_counts),
+        unique_destinations=len(dst_counts),
+        ipv4_count=ipv4_count,
+        ipv6_count=ipv6_count,
+        protocol_counts=protocol_counts,
+        src_counts=src_counts,
+        dst_counts=dst_counts,
+        ip_category_counts=ip_category_counts,
+        endpoints=endpoint_rows,
+        conversations=conversation_rows,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        duration_seconds=duration_seconds,
+        tls_client_hellos=tls_client_hellos,
+        ja3_counts=ja3_counts,
+        ja4_counts=ja4_counts,
+        ja4s_counts=ja4s_counts,
+        sni_counts=sni_counts,
+        sni_entropy=sni_entropy,
+        ja_reputation_hits=ja_reputation_hits,
+        tls_cert_risks=tls_cert_risks,
+        suspicious_port_profiles=suspicious_port_profiles,
+        lateral_movement_scores=lateral_movement_scores,
+        intel_findings=intel_findings,
+        detections=detections,
+        errors=errors,
+    )
 
 
 def _classify_ip(ip_text: str) -> list[str]:

@@ -115,6 +115,115 @@ class ENIPAnalysis:
     identities: list[IdentityInfo] = field(default_factory=list)
 
 
+def merge_enip_summaries(summaries: list[ENIPAnalysis]) -> ENIPAnalysis:
+    if not summaries:
+        return ENIPAnalysis(path=Path("ALL_PCAPS_0"))
+
+    merged = ENIPAnalysis(path=Path(f"ALL_PCAPS_{len(summaries)}"))
+
+    def _merge_buckets(all_buckets: list[list[SizeBucket]]) -> list[SizeBucket]:
+        by_label: dict[str, dict[str, float]] = {}
+        for bucket_list in all_buckets:
+            for bucket in bucket_list:
+                entry = by_label.setdefault(
+                    bucket.label,
+                    {"count": 0.0, "sum": 0.0, "min": 0.0, "max": 0.0},
+                )
+                count = float(bucket.count)
+                if count <= 0:
+                    continue
+                if entry["count"] == 0:
+                    entry["min"] = float(bucket.min)
+                    entry["max"] = float(bucket.max)
+                else:
+                    entry["min"] = min(entry["min"], float(bucket.min))
+                    entry["max"] = max(entry["max"], float(bucket.max))
+                entry["count"] += count
+                entry["sum"] += float(bucket.avg) * count
+
+        total_count = sum(entry["count"] for entry in by_label.values())
+        merged_buckets: list[SizeBucket] = []
+        for low, high, label in SIZE_BUCKETS:
+            _ = low, high
+            entry = by_label.get(label)
+            if not entry or entry["count"] <= 0:
+                merged_buckets.append(SizeBucket(label=label, count=0, avg=0.0, min=0, max=0, pct=0.0))
+                continue
+            count = int(entry["count"])
+            avg = entry["sum"] / entry["count"] if entry["count"] else 0.0
+            pct = (entry["count"] / total_count) * 100 if total_count else 0.0
+            merged_buckets.append(
+                SizeBucket(
+                    label=label,
+                    count=count,
+                    avg=avg,
+                    min=int(entry["min"]),
+                    max=int(entry["max"]),
+                    pct=pct,
+                )
+            )
+        return merged_buckets
+
+    error_seen: set[str] = set()
+    identity_seen: set[tuple[object, object, object, object, object]] = set()
+
+    packet_bucket_lists: list[list[SizeBucket]] = []
+    payload_bucket_lists: list[list[SizeBucket]] = []
+
+    for summary in summaries:
+        merged.duration += summary.duration
+        merged.total_packets += summary.total_packets
+        merged.enip_packets += summary.enip_packets
+        merged.total_bytes += summary.total_bytes
+        merged.enip_bytes += summary.enip_bytes
+        merged.requests += summary.requests
+        merged.responses += summary.responses
+        merged.connected_packets += summary.connected_packets
+        merged.unconnected_packets += summary.unconnected_packets
+        merged.io_packets += summary.io_packets
+
+        merged.src_ips.update(summary.src_ips)
+        merged.dst_ips.update(summary.dst_ips)
+        merged.client_ips.update(summary.client_ips)
+        merged.server_ips.update(summary.server_ips)
+        merged.sessions.update(summary.sessions)
+        merged.enip_commands.update(summary.enip_commands)
+        merged.cip_services.update(summary.cip_services)
+        merged.status_codes.update(summary.status_codes)
+
+        for service, counter in summary.service_endpoints.items():
+            merged.service_endpoints.setdefault(service, Counter()).update(counter)
+
+        packet_bucket_lists.append(summary.packet_size_buckets)
+        payload_bucket_lists.append(summary.payload_size_buckets)
+
+        merged.artifacts.extend(summary.artifacts)
+        merged.anomalies.extend(summary.anomalies)
+
+        for err in summary.errors:
+            if err in error_seen:
+                continue
+            error_seen.add(err)
+            merged.errors.append(err)
+
+        for ident in summary.identities:
+            key = (
+                ident.src_ip,
+                ident.vendor_id,
+                ident.device_type,
+                ident.product_code,
+                ident.serial_number,
+            )
+            if key in identity_seen:
+                continue
+            identity_seen.add(key)
+            merged.identities.append(ident)
+
+    merged.packet_size_buckets = _merge_buckets(packet_bucket_lists)
+    merged.payload_size_buckets = _merge_buckets(payload_bucket_lists)
+    return merged
+
+
 def _extract_transport(pkt) -> tuple[bool, str, str, int, int, bytes]:
     src_ip = "?"
     dst_ip = "?"
@@ -418,9 +527,12 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
 
     try:
         with status as pbar:
-            total_count = len(reader)
+            try:
+                total_count = len(reader)
+            except Exception:
+                total_count = None
             for idx, pkt in enumerate(reader):
-                if idx % 10 == 0:
+                if total_count and idx % 10 == 0:
                     try:
                         pbar.update(int((idx / max(1, total_count)) * 100))
                     except Exception:
@@ -592,7 +704,12 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         )
 
     except Exception as exc:
-        analysis.errors.append(str(exc))
+        analysis.errors.append(f"{type(exc).__name__}: {exc}")
+    finally:
+        try:
+            reader.close()
+        except Exception:
+            pass
 
     if start_time is not None and last_time is not None:
         analysis.duration = last_time - start_time

@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
+import re
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -39,6 +40,112 @@ class TimelineSummary:
     errors: list[str]
 
 
+def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSummary:
+    summary_list = list(summaries)
+    if not summary_list:
+        return TimelineSummary(
+            path=Path("ALL_PCAPS_0"),
+            target_ip="-",
+            total_packets=0,
+            events=[],
+            errors=[],
+        )
+
+    target_ip = summary_list[0].target_ip
+    total_packets = sum(item.total_packets for item in summary_list)
+    merged_events: list[TimelineEvent] = []
+    for item in summary_list:
+        merged_events.extend(item.events)
+    merged_events.sort(key=lambda event: (event.ts is None, event.ts))
+
+    seen_errors: set[str] = set()
+    errors: list[str] = []
+    for item in summary_list:
+        for err in item.errors:
+            if err in seen_errors:
+                continue
+            seen_errors.add(err)
+            errors.append(err)
+
+    return TimelineSummary(
+        path=Path(f"ALL_PCAPS_{len(summary_list)}"),
+        target_ip=target_ip,
+        total_packets=total_packets,
+        events=merged_events,
+        errors=errors,
+    )
+
+
+EMAIL_PORT_SERVICES: dict[int, str] = {
+    25: "SMTP",
+    465: "SMTPS",
+    587: "SMTP Submission",
+    2525: "SMTP Alternate",
+    110: "POP3",
+    995: "POP3S",
+    143: "IMAP",
+    993: "IMAPS",
+}
+
+
+def _decode_payload_line(payload: bytes | None) -> str:
+    if not payload:
+        return ""
+    try:
+        text = payload.decode("latin-1", errors="ignore")
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    first = text.split("\r\n", 1)[0].split("\n", 1)[0].strip()
+    return first[:200]
+
+
+def _extract_email_action(service: str, first_line: str) -> str | None:
+    if not first_line:
+        return None
+    upper = first_line.upper()
+
+    if service.startswith("SMTP"):
+        smtp_cmds = (
+            "EHLO", "HELO", "MAIL FROM", "RCPT TO", "DATA", "STARTTLS", "AUTH", "QUIT", "NOOP", "RSET", "VRFY", "EXPN"
+        )
+        for cmd in smtp_cmds:
+            if upper.startswith(cmd):
+                return cmd
+        if re.match(r"^\d{3}\b", upper):
+            return f"SMTP reply {upper[:3]}"
+
+    if service.startswith("IMAP"):
+        imap_cmds = (
+            "LOGIN", "AUTHENTICATE", "SELECT", "EXAMINE", "FETCH", "UID", "SEARCH", "STORE", "COPY", "APPEND", "IDLE", "LOGOUT", "STARTTLS", "CAPABILITY"
+        )
+        parts = upper.split()
+        if parts:
+            if parts[0] in {"*", "+"} and len(parts) >= 2:
+                token = parts[1]
+                if token in {"OK", "NO", "BAD", "BYE", "PREAUTH"}:
+                    return f"IMAP reply {token}"
+            if len(parts) >= 2:
+                token = parts[1]
+                if token in imap_cmds:
+                    return token
+
+    if service.startswith("POP3"):
+        pop3_cmds = (
+            "USER", "PASS", "APOP", "AUTH", "STAT", "LIST", "RETR", "DELE", "TOP", "UIDL", "CAPA", "STLS", "QUIT"
+        )
+        for cmd in pop3_cmds:
+            if upper.startswith(cmd):
+                return cmd
+        if upper.startswith("+OK"):
+            return "POP3 reply +OK"
+        if upper.startswith("-ERR"):
+            return "POP3 reply -ERR"
+
+    return None
+
+
 def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> TimelineSummary:
     errors: list[str] = []
     events: list[TimelineEvent] = []
@@ -60,6 +167,8 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
     seen_udp_flows: set[tuple[str, int]] = set()
     seen_domain_flows: set[tuple[str, int, str, str]] = set()
     seen_ldap_flows: set[tuple[str, int, str, str]] = set()
+    seen_email_flows: set[tuple[str, int, str, str, str]] = set()
+    seen_email_actions: set[tuple[str, int, str, str, str, str]] = set()
     scan_ports: dict[str, set[int]] = defaultdict(set)
     scan_first: dict[str, float] = {}
     scan_last: dict[str, float] = {}
@@ -159,6 +268,29 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                 summary="HTTP POST",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
                             ))
+                    if dport in EMAIL_PORT_SERVICES:
+                        service = EMAIL_PORT_SERVICES[dport]
+                        flow_key = (dst_ip, dport, "TCP", "outbound", service)
+                        if flow_key not in seen_email_flows:
+                            seen_email_flows.add(flow_key)
+                            events.append(TimelineEvent(
+                                ts=ts,
+                                category="Email",
+                                summary=f"{service} connection",
+                                details=f"{target_ip} -> {dst_ip}:{dport}",
+                            ))
+                        first_line = _decode_payload_line(payload)
+                        action = _extract_email_action(service, first_line)
+                        if action:
+                            action_key = (dst_ip, dport, "TCP", "outbound", service, action)
+                            if action_key not in seen_email_actions:
+                                seen_email_actions.add(action_key)
+                                events.append(TimelineEvent(
+                                    ts=ts,
+                                    category="Email",
+                                    summary=f"{service} action",
+                                    details=f"{target_ip} -> {dst_ip}:{dport} {action}",
+                                ))
                     if dport in ldap_ports:
                         key = (dst_ip, dport, "TCP", "outbound")
                         if key not in seen_ldap_flows:
@@ -192,6 +324,34 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                             scan_last[dst_ip] = ts
                 elif dst_ip == target_ip:
                     sport = int(getattr(tcp_layer, "sport", 0) or 0)
+                    payload = None
+                    try:
+                        payload = bytes(tcp_layer.payload)
+                    except Exception:
+                        payload = None
+                    if sport in EMAIL_PORT_SERVICES:
+                        service = EMAIL_PORT_SERVICES[sport]
+                        flow_key = (src_ip, sport, "TCP", "inbound", service)
+                        if flow_key not in seen_email_flows:
+                            seen_email_flows.add(flow_key)
+                            events.append(TimelineEvent(
+                                ts=ts,
+                                category="Email",
+                                summary=f"{service} connection",
+                                details=f"{src_ip} -> {target_ip}:{sport}",
+                            ))
+                        first_line = _decode_payload_line(payload)
+                        action = _extract_email_action(service, first_line)
+                        if action:
+                            action_key = (src_ip, sport, "TCP", "inbound", service, action)
+                            if action_key not in seen_email_actions:
+                                seen_email_actions.add(action_key)
+                                events.append(TimelineEvent(
+                                    ts=ts,
+                                    category="Email",
+                                    summary=f"{service} action",
+                                    details=f"{src_ip} -> {target_ip}:{sport} {action}",
+                                ))
                     if sport in ldap_ports:
                         key = (src_ip, sport, "TCP", "inbound")
                         if key not in seen_ldap_flows:

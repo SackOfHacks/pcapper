@@ -199,7 +199,7 @@ def analyze_search(
                 )
             )
     except Exception as exc:
-        errors.append(str(exc))
+        errors.append(f"{type(exc).__name__}: {exc}")
     finally:
         status.finish()
         try:

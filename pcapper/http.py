@@ -55,6 +55,7 @@ class HttpSummary:
     host_counts: Counter[str]
     url_counts: Counter[str]
     referrer_counts: Counter[str]
+    referrer_request_host_counts: dict[str, Counter[str]]
     referrer_host_counts: Counter[str]
     referrer_scheme_counts: Counter[str]
     referrer_path_counts: Counter[str]
@@ -95,6 +96,9 @@ class HttpSummary:
             "host_counts": dict(self.host_counts),
             "url_counts": dict(self.url_counts),
             "referrer_counts": dict(self.referrer_counts),
+            "referrer_request_host_counts": {
+                ref: dict(hosts) for ref, hosts in self.referrer_request_host_counts.items()
+            },
             "referrer_host_counts": dict(self.referrer_host_counts),
             "referrer_scheme_counts": dict(self.referrer_scheme_counts),
             "referrer_path_counts": dict(self.referrer_path_counts),
@@ -221,6 +225,7 @@ def analyze_http(
             host_counts=Counter(),
             url_counts=Counter(),
             referrer_counts=Counter(),
+            referrer_request_host_counts={},
             referrer_host_counts=Counter(),
             referrer_scheme_counts=Counter(),
             referrer_path_counts=Counter(),
@@ -261,6 +266,7 @@ def analyze_http(
     host_counts: Counter[str] = Counter()
     url_counts: Counter[str] = Counter()
     referrer_counts: Counter[str] = Counter()
+    referrer_request_host_counts: dict[str, Counter[str]] = defaultdict(Counter)
     referrer_host_counts: Counter[str] = Counter()
     referrer_scheme_counts: Counter[str] = Counter()
     referrer_path_counts: Counter[str] = Counter()
@@ -369,6 +375,8 @@ def analyze_http(
                     if referrer:
                         referrer_present += 1
                         referrer_counts[referrer] += 1
+                        if host_norm:
+                            referrer_request_host_counts[referrer][host_norm] += 1
                         scheme, ref_host, ref_path = _parse_referrer(referrer)
                         if scheme:
                             referrer_scheme_counts[scheme] += 1
@@ -663,6 +671,7 @@ def analyze_http(
         host_counts=host_counts,
         url_counts=url_counts,
         referrer_counts=referrer_counts,
+        referrer_request_host_counts=dict(referrer_request_host_counts),
         referrer_host_counts=referrer_host_counts,
         referrer_scheme_counts=referrer_scheme_counts,
         referrer_path_counts=referrer_path_counts,
