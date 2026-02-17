@@ -8,9 +8,10 @@ import gzip
 import zlib
 import email
 import socket
+import os
 from email import policy
 from collections import defaultdict, Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any, Set
 from urllib.parse import unquote, urlsplit
@@ -25,6 +26,26 @@ except Exception:  # pragma: no cover
 
 from .utils import safe_float, detect_file_type_bytes
 from .cip import CIP_SERVICE_NAMES
+
+try:
+    import magic  # type: ignore
+except Exception:  # pragma: no cover
+    magic = None  # type: ignore
+
+try:
+    import yara  # type: ignore
+except Exception:  # pragma: no cover
+    yara = None  # type: ignore
+
+try:
+    import pefile  # type: ignore
+except Exception:  # pragma: no cover
+    pefile = None  # type: ignore
+
+try:
+    from elftools.elf.elffile import ELFFile  # type: ignore
+except Exception:  # pragma: no cover
+    ELFFile = None  # type: ignore
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
@@ -78,6 +99,8 @@ class FileTransferSummary:
     views: List[Any]
     detections: List[Dict[str, str]]
     errors: List[str]
+    hash_clusters: List[Dict[str, Any]] = field(default_factory=list)
+    yara_hits: List[Dict[str, Any]] = field(default_factory=list)
 
 # --- Helper Functions ---
 
@@ -1745,6 +1768,111 @@ def _normalize_x509_payload(payload: bytes) -> bytes:
     return payload
 
 
+_YARA_RULES = None
+
+
+def _load_yara_rules():
+    global _YARA_RULES
+    if _YARA_RULES is not None:
+        return _YARA_RULES
+    if yara is None:
+        _YARA_RULES = None
+        return None
+    rules_path = os.environ.get("PCAPPER_YARA_RULES")
+    if not rules_path:
+        _YARA_RULES = None
+        return None
+    path = Path(rules_path).expanduser()
+    if path.is_file():
+        try:
+            _YARA_RULES = yara.compile(filepath=str(path))
+            return _YARA_RULES
+        except Exception:
+            _YARA_RULES = None
+            return None
+    if path.is_dir():
+        rule_files = list(path.glob("*.yar")) + list(path.glob("*.yara"))
+        if not rule_files:
+            _YARA_RULES = None
+            return None
+        try:
+            file_map = {str(rf): str(rf) for rf in rule_files}
+            _YARA_RULES = yara.compile(filepaths=file_map)
+            return _YARA_RULES
+        except Exception:
+            _YARA_RULES = None
+            return None
+    _YARA_RULES = None
+    return None
+
+
+def _scan_yara(payload: bytes) -> list[str]:
+    rules = _load_yara_rules()
+    if rules is None:
+        return []
+    try:
+        matches = rules.match(data=payload)
+        return [m.rule for m in matches]
+    except Exception:
+        return []
+
+
+def _compute_hashes(payload: bytes) -> tuple[str, str]:
+    sha256 = hashlib.sha256(payload).hexdigest()
+    md5 = hashlib.md5(payload).hexdigest()
+    return sha256, md5
+
+
+def _detect_mime(payload: bytes) -> Optional[str]:
+    if not payload or magic is None:
+        return None
+    try:
+        return magic.from_buffer(payload, mime=True)
+    except Exception:
+        return None
+
+
+def _parse_pe_metadata(payload: bytes) -> Optional[Dict[str, Any]]:
+    if not payload or pefile is None:
+        return None
+    if not payload.startswith(b"MZ"):
+        return None
+    try:
+        pe = pefile.PE(data=payload, fast_load=True)
+        pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+        info = {
+            "machine": hex(pe.FILE_HEADER.Machine),
+            "timestamp": int(pe.FILE_HEADER.TimeDateStamp),
+            "subsystem": int(pe.OPTIONAL_HEADER.Subsystem),
+            "entrypoint": hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint),
+            "sections": len(getattr(pe, "sections", []) or []),
+            "imports": len(getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) or []),
+        }
+        return info
+    except Exception:
+        return None
+
+
+def _parse_elf_metadata(payload: bytes) -> Optional[Dict[str, Any]]:
+    if not payload or ELFFile is None:
+        return None
+    if not payload.startswith(b"\x7fELF"):
+        return None
+    try:
+        from io import BytesIO
+        elf = ELFFile(BytesIO(payload))
+        header = elf.header
+        info = {
+            "class": header.get("e_ident", {}).get("EI_CLASS"),
+            "machine": header.get("e_machine"),
+            "entrypoint": hex(header.get("e_entry", 0)),
+            "sections": elf.num_sections(),
+        }
+        return info
+    except Exception:
+        return None
+
+
 def _export_with_dpkt(
     path: Path,
     extract_name: Optional[str],
@@ -1758,7 +1886,8 @@ def _export_with_dpkt(
     views: List[Any] = []
     detections: List[Dict[str, str]] = []
     errors: List[str] = []
-    need_payload = bool(extract_name or view_name)
+    triage_enabled = os.environ.get("PCAPPER_FILE_TRIAGE", "1").strip().lower() in {"1", "true", "yes", "y"}
+    need_payload = bool(extract_name or view_name or triage_enabled or os.environ.get("PCAPPER_YARA_RULES"))
     seen_x509: set[str] = set()
     seen_x509_meta: set[tuple[str, str, str, int]] = set()
     enip_buffers: Dict[tuple[str, str, int, int, str, str], Dict[str, object]] = {}
@@ -2476,6 +2605,44 @@ def _collect_extension_mismatches(artifacts: List[FileArtifact]) -> List[Tuple[s
     return mismatches
 
 
+def _apply_file_triage(artifacts: List[FileArtifact]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    hash_map: Dict[str, List[FileArtifact]] = defaultdict(list)
+    yara_hits: List[Dict[str, Any]] = []
+    for art in artifacts:
+        payload = getattr(art, "payload", None)
+        if not isinstance(payload, (bytes, bytearray)):
+            continue
+        data = bytes(payload)
+        sha256, md5 = _compute_hashes(data)
+        art.sha256 = sha256
+        art.md5 = md5
+        art.mime_type = _detect_mime(data)
+        art.pe_info = _parse_pe_metadata(data)
+        art.elf_info = _parse_elf_metadata(data)
+        matches = _scan_yara(data)
+        if matches:
+            art.yara_matches = matches
+            yara_hits.append({
+                "filename": art.filename,
+                "protocol": art.protocol,
+                "matches": matches,
+                "sha256": sha256,
+            })
+        hash_map[sha256].append(art)
+
+    clusters: List[Dict[str, Any]] = []
+    for digest, items in hash_map.items():
+        if len(items) <= 1:
+            continue
+        clusters.append({
+            "sha256": digest,
+            "count": len(items),
+            "files": [item.filename for item in items],
+            "protocols": sorted({item.protocol for item in items}),
+        })
+    return clusters, yara_hits
+
+
 # --- Entry Point ---
 
 def analyze_files(
@@ -2514,6 +2681,21 @@ def analyze_files(
                 "details": f"{len(mismatches)} file(s) where extension does not match detected type. Examples: {examples}",
                 "source": "Files",
             })
+        hash_clusters, yara_hits = _apply_file_triage(artifacts)
+        if hash_clusters:
+            detections.append({
+                "severity": "info",
+                "summary": "Identical file hashes observed",
+                "details": f"{len(hash_clusters)} hash cluster(s) with duplicates.",
+                "source": "Files",
+            })
+        if yara_hits:
+            detections.append({
+                "severity": "warning",
+                "summary": "YARA matches detected",
+                "details": f"{len(yara_hits)} file(s) matched rules.",
+                "source": "Files",
+            })
         return FileTransferSummary(
             path=dpkt_summary.path,
             total_candidates=dpkt_summary.total_candidates,
@@ -2523,6 +2705,8 @@ def analyze_files(
             views=dpkt_summary.views,
             detections=detections,
             errors=dpkt_summary.errors,
+            hash_clusters=hash_clusters,
+            yara_hits=yara_hits,
         )
 
     artifacts = [
@@ -2542,6 +2726,22 @@ def analyze_files(
             "source": "Files",
         })
 
+    hash_clusters, yara_hits = _apply_file_triage(artifacts)
+    if hash_clusters:
+        detections.append({
+            "severity": "info",
+            "summary": "Identical file hashes observed",
+            "details": f"{len(hash_clusters)} hash cluster(s) with duplicates.",
+            "source": "Files",
+        })
+    if yara_hits:
+        detections.append({
+            "severity": "warning",
+            "summary": "YARA matches detected",
+            "details": f"{len(yara_hits)} file(s) matched rules.",
+            "source": "Files",
+        })
+
     return FileTransferSummary(
         path=dpkt_summary.path,
         total_candidates=dpkt_summary.total_candidates,
@@ -2551,4 +2751,6 @@ def analyze_files(
         views=dpkt_summary.views,
         detections=detections,
         errors=dpkt_summary.errors,
+        hash_clusters=hash_clusters,
+        yara_hits=yara_hits,
     )

@@ -12,6 +12,7 @@ from .coloring import set_color_override
 from .discovery import find_pcaps, is_supported_pcap
 from .reporting import (
     render_summary,
+    render_dashboard,
     render_vlan_summary,
     render_vlan_rollup,
     render_icmp_summary,
@@ -87,6 +88,10 @@ from .reporting import (
     render_udp_rollup,
     render_exfil_summary,
     render_generic_rollup,
+    render_creds_summary,
+    render_creds_rollup,
+    render_iocs_summary,
+    render_email_summary,
 )
 from .vlan import analyze_vlans
 from .icmp import analyze_icmp
@@ -157,6 +162,8 @@ from .syslog import analyze_syslog
 from .tcp import analyze_tcp
 from .udp import analyze_udp
 from .exfil import analyze_exfil
+from .creds import analyze_creds
+from .email import analyze_email
 
 
 def _ordered_steps(argv: list[str]) -> list[str]:
@@ -473,9 +480,11 @@ def _analyze_paths(
     show_tcp: bool,
     show_udp: bool,
     show_exfil: bool,
+    show_email: bool,
     show_sizes: bool,
     show_ips: bool,
     show_beacon: bool,
+    show_ioc: bool,
     show_threats: bool,
     show_files: bool,
     show_protocols: bool,
@@ -490,6 +499,12 @@ def _analyze_paths(
     show_hostdetails: bool,
     show_timeline: bool,
     timeline_ip: str | None,
+    timeline_filter_ip: str | None,
+    timeline_filter_port: int | None,
+    timeline_filter_domain: str | None,
+    timeline_filter_user: str | None,
+    timeline_json: bool,
+    timeline_out: str | None,
     show_ntlm: bool,
     show_netbios: bool,
     show_arp: bool,
@@ -541,6 +556,29 @@ def _analyze_paths(
     modbus_rollups = []
     dnp3_rollups = []
     rollups: dict[str, list[object]] = {}
+    json_reports: list[dict[str, object]] = []
+
+    def _emit(section: str, *, buffer: list[str]) -> None:
+        if output_format == "json":
+            return
+        if output_format == "md":
+            buffer.append("```text")
+            buffer.append(_strip_ansi(section))
+            buffer.append("```")
+        else:
+            buffer.append(section)
+
+    def _ioc_output_path(base: str, fmt: str, pcap_path: Path) -> str:
+        base_path = Path(base).expanduser()
+        if base_path.exists() and base_path.is_dir():
+            return str(base_path / f"{pcap_path.stem}.iocs.{fmt}")
+        if base.endswith(('/', '\\')):
+            return str(Path(base) / f"{pcap_path.stem}.iocs.{fmt}")
+        if len(paths) == 1:
+            return str(base_path)
+        suffix = base_path.suffix or f".{fmt}"
+        stem = base_path.name[: -len(suffix)] if suffix and base_path.name.endswith(suffix) else base_path.name
+        return str(base_path.with_name(f"{stem}-{pcap_path.stem}{suffix}"))
 
     for idx, path in enumerate(paths, start=1):
         packets = None
@@ -572,19 +610,19 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("vlan", []).append(vlan_summary)
                 else:
-                    print(render_vlan_summary(vlan_summary, verbose=verbose))
+                    _emit(render_vlan_summary(vlan_summary, verbose=verbose), buffer=output_sections)
             elif step == "icmp" and show_icmp:
                 icmp_summary = analyze_icmp(path, show_status=show_status)
                 if summarize_rollups:
                     rollups.setdefault("icmp", []).append(icmp_summary)
                 else:
-                    print(render_icmp_summary(icmp_summary, verbose=verbose))
+                    _emit(render_icmp_summary(icmp_summary, verbose=verbose), buffer=output_sections)
             elif step == "dns" and show_dns:
                 dns_summary = analyze_dns(path, show_status=show_status, packets=packets, meta=meta)
                 if summarize_rollups:
                     rollups.setdefault("dns", []).append(dns_summary)
                 else:
-                    print(render_dns_summary(dns_summary, verbose=verbose))
+                    _emit(render_dns_summary(dns_summary, verbose=verbose), buffer=output_sections)
             elif step == "http" and show_http:
                 http_summary = analyze_http(path, show_status=show_status, packets=packets, meta=meta)
                 if summarize_rollups:
@@ -650,37 +688,45 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("tcp", []).append(tcp_summary)
                 else:
-                    print(render_tcp_summary(tcp_summary, verbose=verbose))
+                    _emit(render_tcp_summary(tcp_summary, verbose=verbose), buffer=output_sections)
             elif step == "udp" and show_udp:
                 udp_summary = analyze_udp(path, show_status=show_status, packets=packets, meta=meta)
                 if summarize_rollups:
                     rollups.setdefault("udp", []).append(udp_summary)
                 else:
-                    print(render_udp_summary(udp_summary, verbose=verbose))
+                    _emit(render_udp_summary(udp_summary, verbose=verbose), buffer=output_sections)
             elif step == "exfil" and show_exfil:
                 exfil_summary = analyze_exfil(path, show_status=show_status, packets=packets, meta=meta)
                 if summarize_rollups:
                     rollups.setdefault("exfil", []).append(exfil_summary)
                 else:
-                    print(render_exfil_summary(exfil_summary, verbose=verbose))
+                    _emit(render_exfil_summary(exfil_summary, verbose=verbose), buffer=output_sections)
             elif step == "sizes" and show_sizes:
                 size_summary = analyze_sizes(path, show_status=show_status)
                 if summarize_rollups:
                     rollups.setdefault("sizes", []).append(size_summary)
                 else:
-                    print(render_sizes_summary(size_summary, verbose=verbose))
+                    _emit(render_sizes_summary(size_summary, verbose=verbose), buffer=output_sections)
+            elif step == "email" and show_email:
+                email_summary = module_results.get("email") if mp_modules else analyze_email(path, show_status=False)
+                if email_summary is None:
+                    continue
+                if summarize_rollups:
+                    rollups.setdefault("email", []).append(email_summary)
+                else:
+                    _emit(render_email_summary(email_summary, verbose=verbose), buffer=output_sections)
             elif step == "ips" and show_ips:
                 ips_summary = analyze_ips(path, show_status=show_status)
                 if summarize_rollups:
                     rollups.setdefault("ips", []).append(ips_summary)
                 else:
-                    print(render_ips_summary(ips_summary, verbose=verbose))
+                    _emit(render_ips_summary(ips_summary, verbose=verbose), buffer=output_sections)
             elif step == "beacon" and show_beacon:
                 beacon_summary = analyze_beacons(path, show_status=show_status)
                 if summarize_rollups:
                     rollups.setdefault("beacon", []).append(beacon_summary)
                 else:
-                    print(render_beacon_summary(beacon_summary, verbose=verbose))
+                    _emit(render_beacon_summary(beacon_summary, verbose=verbose), buffer=output_sections)
             elif step == "threats" and show_threats:
                 threat_summary = analyze_threats(path, show_status=show_status)
                 if summarize_rollups:
@@ -688,41 +734,43 @@ def _analyze_paths(
                 else:
                     print(render_threats_summary(threat_summary, verbose=verbose))
             elif step == "files" and show_files:
-                files_summary = analyze_files(
+                files_summary = module_results.get("files") if mp_modules else analyze_files(
                     path,
                     extract_name=extract_name,
                     view_name=view_name,
                     show_status=show_status,
                     include_x509=verbose,
                 )
+                if files_summary is None:
+                    continue
                 if summarize_rollups:
                     rollups.setdefault("files", []).append(files_summary)
                 else:
-                    print(render_files_summary(files_summary))
+                    _emit(render_files_summary(files_summary), buffer=output_sections)
             elif step == "protocols" and show_protocols:
                 proto_summary = analyze_protocols(path, show_status=show_status)
                 if summarize_rollups:
                     rollups.setdefault("protocols", []).append(proto_summary)
                 else:
-                    print(render_protocols_summary(proto_summary, verbose=verbose))
+                    _emit(render_protocols_summary(proto_summary, verbose=verbose), buffer=output_sections)
             elif step == "services" and show_services:
                 svc_summary = analyze_services(path, show_status=show_status)
                 if summarize_rollups:
                     rollups.setdefault("services", []).append(svc_summary)
                 else:
-                    print(render_services_summary(svc_summary))
+                    _emit(render_services_summary(svc_summary), buffer=output_sections)
             elif step == "smb" and show_smb:
                 smb_summary = analyze_smb(path, show_status=show_status)
                 if summarize_rollups:
                     rollups.setdefault("smb", []).append(smb_summary)
                 else:
-                    print(render_smb_summary(smb_summary, verbose=verbose))
+                    _emit(render_smb_summary(smb_summary, verbose=verbose), buffer=output_sections)
             elif step == "nfs" and show_nfs:
                 nfs_summary = analyze_nfs(path, show_status=show_status)
                 if summarize_rollups:
                     rollups.setdefault("nfs", []).append(nfs_summary)
                 else:
-                    print(render_nfs_summary(nfs_summary))
+                    _emit(render_nfs_summary(nfs_summary), buffer=output_sections)
             elif step == "strings" and show_strings:
                 strings_summary = analyze_strings(path, show_status=show_status)
                 if summarize_rollups:
@@ -740,7 +788,7 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("certificates", []).append(cert_summary)
                 else:
-                    print(render_certificates_summary(cert_summary))
+                    _emit(render_certificates_summary(cert_summary), buffer=output_sections)
             elif step == "health" and show_health:
                 health_summary = analyze_health(path, show_status=show_status)
                 if summarize_rollups:
@@ -764,31 +812,35 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("timeline", []).append(timeline_summary)
                 else:
-                    print(render_timeline_summary(timeline_summary))
+                    if timeline_json:
+                        output = export_timeline_json(timeline_summary)
+                        write_timeline_json(output, timeline_out)
+                    else:
+                        _emit(render_timeline_summary(timeline_summary), buffer=output_sections)
             elif step == "domain" and show_domain:
                 domain_summary = analyze_domain(path, show_status=show_status, packets=packets, meta=meta)
                 if summarize_rollups:
                     rollups.setdefault("domain", []).append(domain_summary)
                 else:
-                    print(render_domain_summary(domain_summary))
+                    _emit(render_domain_summary(domain_summary), buffer=output_sections)
             elif step == "ldap" and show_ldap:
                 ldap_summary = analyze_ldap(path, show_status=show_status, packets=packets, meta=meta)
                 if summarize_rollups:
                     rollups.setdefault("ldap", []).append(ldap_summary)
                 else:
-                    print(render_ldap_summary(ldap_summary))
+                    _emit(render_ldap_summary(ldap_summary), buffer=output_sections)
             elif step == "kerberos" and show_kerberos:
                 kerberos_summary = analyze_kerberos(path, show_status=show_status, packets=packets, meta=meta)
                 if summarize_rollups:
                     rollups.setdefault("kerberos", []).append(kerberos_summary)
                 else:
-                    print(render_kerberos_summary(kerberos_summary))
+                    _emit(render_kerberos_summary(kerberos_summary), buffer=output_sections)
             elif step == "ntlm" and show_ntlm:
                 ntlm_summary = analyze_ntlm(path, show_status=show_status)
                 if summarize_rollups:
                     rollups.setdefault("ntlm", []).append(ntlm_summary)
                 else:
-                    print(render_ntlm_summary(ntlm_summary))
+                    _emit(render_ntlm_summary(ntlm_summary), buffer=output_sections)
             elif step == "netbios" and show_netbios:
                 nb_summary = analyze_netbios(path, show_status=show_status)
                 if summarize_rollups:
@@ -812,7 +864,7 @@ def _analyze_paths(
                 if summarize_rollups:
                     modbus_rollups.append(modbus_summary)
                 else:
-                    print(render_modbus_summary(modbus_summary, verbose=verbose))
+                    _emit(render_modbus_summary(modbus_summary, verbose=verbose), buffer=output_sections)
             elif step == "dnp3" and show_dnp3:
                 dnp3_summary = analyze_dnp3(path, show_status=show_status)
                 if summarize_rollups:
@@ -995,6 +1047,7 @@ def _analyze_paths(
             "vlan": "VLAN ANALYSIS",
             "icmp": "ICMP ANALYSIS",
             "dns": "DNS ANALYSIS",
+            "email": "EMAIL ANALYSIS",
             "http": "HTTP ANALYSIS",
             "ftp": "FTP ANALYSIS",
             "tls": "TLS/HTTPS ANALYSIS",
@@ -1123,14 +1176,21 @@ def _analyze_paths(
                     print(render_generic_rollup(title_map.get(step, step.upper()), rollups[step]))
                 print()
         if rollups.get("vlan"):
-            print(render_vlan_rollup(rollups["vlan"], verbose=verbose))
-            print()
+            _emit(render_vlan_rollup(rollups["vlan"], verbose=verbose), buffer=rollup_sections)
+            _emit("", buffer=rollup_sections)
         if show_modbus and modbus_rollups:
-            print(render_modbus_rollup(modbus_rollups))
+            _emit(render_modbus_rollup(modbus_rollups), buffer=rollup_sections)
             if show_dnp3 and dnp3_rollups:
-                print()
+                _emit("", buffer=rollup_sections)
         if show_dnp3 and dnp3_rollups:
-            print(render_dnp3_rollup(dnp3_rollups))
+            _emit(render_dnp3_rollup(dnp3_rollups), buffer=rollup_sections)
+        if rollups.get("creds"):
+            _emit(render_creds_rollup(rollups["creds"]), buffer=rollup_sections)
+            _emit("", buffer=rollup_sections)
+        if rollup_sections:
+            print("\n".join(rollup_sections))
+    if output_format == "json":
+        print(json.dumps({"reports": json_reports}, indent=2))
     return 0
 
 
@@ -1221,9 +1281,11 @@ def main() -> int:
         show_tcp=args.tcp,
         show_udp=args.udp,
         show_exfil=args.exfil,
+        show_email=args.email,
         show_sizes=args.sizes,
         show_ips=args.ips,
         show_beacon=args.beacon,
+        show_ioc=args.ioc,
         show_threats=args.threats,
         show_files=args.files,
         show_protocols=args.protocols,
@@ -1238,6 +1300,12 @@ def main() -> int:
         show_hostdetails=args.hostdetails,
         show_timeline=args.timeline,
         timeline_ip=args.timeline_ip,
+        timeline_filter_ip=args.timeline_filter_ip,
+        timeline_filter_port=args.timeline_filter_port,
+        timeline_filter_domain=args.timeline_filter_domain,
+        timeline_filter_user=args.timeline_filter_user,
+        timeline_json=args.timeline_json,
+        timeline_out=args.timeline_out,
         show_ntlm=args.ntlm,
         show_netbios=args.netbios,
         show_arp=args.arp,
@@ -1279,4 +1347,15 @@ def main() -> int:
         show_kerberos=args.kerberos,
         ordered_steps=ordered_steps,
         summarize=args.summarize,
+        ioc_export=args.ioc_export,
+        ioc_out=args.ioc_out,
+        output_format=args.output,
+        profile_path=args.profile,
+        baseline_path=args.baseline,
+        compare_path=args.compare,
+        streaming=args.stream or args.mp,
+        mp_modules=args.mp,
+        mp_workers=args.mp_workers,
+        index_cache=args.index_cache,
+        index_refresh=args.index_refresh,
     )

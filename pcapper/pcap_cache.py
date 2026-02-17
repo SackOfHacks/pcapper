@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import OrderedDict
+import hashlib
+import json
 import os
 import struct
 from pathlib import Path
 from typing import Iterable, Optional
 
 from scapy.utils import PcapReader, PcapNgReader
+
+try:
+    from scapy.utils import RawPcapReader, RawPcapNgReader  # type: ignore
+except Exception:  # pragma: no cover
+    RawPcapReader = None  # type: ignore
+    RawPcapNgReader = None  # type: ignore
 
 from .progress import build_statusbar
 from .utils import detect_file_type
@@ -25,6 +33,19 @@ class PcapMeta:
     linktype: object | None
     snaplen: object | None
     interfaces: object | None
+
+
+@dataclass(frozen=True)
+class PcapIndex:
+    path: Path
+    file_type: str
+    size_bytes: int
+    mtime: int
+    packet_count: int
+    first_ts: float | None
+    last_ts: float | None
+    stride: int
+    offsets: list[int] | None
 
 
 PCAP_MAGIC = {
@@ -218,6 +239,243 @@ def _cache_config() -> tuple[bool, int, int]:
     return enabled, max_cache, max_file
 
 
+def _index_cache_config() -> tuple[bool, Path, int]:
+    enabled = os.environ.get("PCAPPER_INDEX_CACHE_ENABLED", "0") != "0"
+    cache_root = os.environ.get("PCAPPER_INDEX_CACHE_DIR")
+    if cache_root:
+        cache_dir = Path(cache_root).expanduser()
+    else:
+        cache_dir = Path.home() / ".cache" / "pcapper" / "index"
+    try:
+        stride = int(os.environ.get("PCAPPER_INDEX_STRIDE", "50000"))
+    except Exception:
+        stride = 50000
+    if stride < 0:
+        stride = 0
+    return enabled, cache_dir, stride
+
+
+def _index_cache_path(path: Path, cache_dir: Path) -> Path:
+    digest = hashlib.sha256(str(path.resolve()).encode("utf-8", errors="ignore")).hexdigest()[:16]
+    name = f"{path.stem}.{digest}.pcapidx.json"
+    return cache_dir / name
+
+
+def _load_index_from_disk(path: Path) -> PcapIndex | None:
+    enabled, cache_dir, stride = _index_cache_config()
+    if not enabled:
+        return None
+    idx_path = _index_cache_path(path, cache_dir)
+    if not idx_path.exists():
+        return None
+    try:
+        data = json.loads(idx_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    try:
+        stat = path.stat()
+    except Exception:
+        return None
+
+    if int(data.get("size_bytes", -1)) != int(stat.st_size):
+        return None
+    if int(data.get("mtime", -1)) != int(stat.st_mtime):
+        return None
+
+    offsets = data.get("offsets")
+    return PcapIndex(
+        path=path,
+        file_type=str(data.get("file_type") or detect_file_type(path)),
+        size_bytes=int(data.get("size_bytes") or 0),
+        mtime=int(data.get("mtime") or 0),
+        packet_count=int(data.get("packet_count") or 0),
+        first_ts=float(data.get("first_ts")) if data.get("first_ts") is not None else None,
+        last_ts=float(data.get("last_ts")) if data.get("last_ts") is not None else None,
+        stride=int(data.get("stride") or stride),
+        offsets=[int(v) for v in offsets] if isinstance(offsets, list) else None,
+    )
+
+
+def _save_index_to_disk(index: PcapIndex) -> None:
+    enabled, cache_dir, _stride = _index_cache_config()
+    if not enabled:
+        return
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        idx_path = _index_cache_path(index.path, cache_dir)
+        payload = {
+            "path": str(index.path),
+            "file_type": index.file_type,
+            "size_bytes": index.size_bytes,
+            "mtime": index.mtime,
+            "packet_count": index.packet_count,
+            "first_ts": index.first_ts,
+            "last_ts": index.last_ts,
+            "stride": index.stride,
+            "offsets": index.offsets,
+        }
+        idx_path.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception:
+        return
+
+
+def build_pcap_index(path: Path, show_status: bool = False) -> PcapIndex | None:
+    enabled, _cache_dir, stride = _index_cache_config()
+    if not enabled:
+        return None
+
+    try:
+        stat = path.stat()
+        size_bytes = int(stat.st_size)
+        mtime = int(stat.st_mtime)
+    except Exception:
+        size_bytes = 0
+        mtime = 0
+
+    file_type = detect_file_type(path)
+    packet_count = 0
+    first_ts: float | None = None
+    last_ts: float | None = None
+    offsets: list[int] | None = [] if stride > 0 and file_type == "pcap" else None
+
+    status = build_statusbar(path, enabled=show_status, desc="Indexing")
+    if file_type == "pcap" and RawPcapReader is not None:
+        reader = RawPcapReader(str(path))
+        stream = _reader_stream(reader)
+        try:
+            while True:
+                try:
+                    offset = int(stream.tell()) if stream is not None else None
+                    pkt_data, pkt_meta = reader.read_packet()
+                except EOFError:
+                    break
+
+                packet_count += 1
+                sec = getattr(pkt_meta, "sec", None) or getattr(pkt_meta, "ts_sec", None)
+                usec = getattr(pkt_meta, "usec", None) or getattr(pkt_meta, "ts_usec", None)
+                if sec is not None and usec is not None:
+                    ts = float(sec) + (float(usec) / 1_000_000.0)
+                    if first_ts is None or ts < first_ts:
+                        first_ts = ts
+                    if last_ts is None or ts > last_ts:
+                        last_ts = ts
+                if offsets is not None and offset is not None and stride > 0 and (packet_count % stride == 0):
+                    offsets.append(offset)
+                if stream is not None and size_bytes:
+                    try:
+                        pos = stream.tell()
+                        percent = int(min(100, (pos / size_bytes) * 100))
+                        status.update(percent)
+                    except Exception:
+                        pass
+        finally:
+            status.finish()
+            reader.close()
+    elif file_type == "pcapng" and RawPcapNgReader is not None:
+        reader = RawPcapNgReader(str(path))
+        stream = _reader_stream(reader)
+        try:
+            for _pkt_data, pkt_meta in reader:
+                packet_count += 1
+                sec = getattr(pkt_meta, "sec", None) or getattr(pkt_meta, "ts_sec", None)
+                usec = getattr(pkt_meta, "usec", None) or getattr(pkt_meta, "ts_usec", None)
+                ts_val = getattr(pkt_meta, "time", None)
+                if sec is not None and usec is not None:
+                    ts = float(sec) + (float(usec) / 1_000_000.0)
+                elif ts_val is not None:
+                    try:
+                        ts = float(ts_val)
+                    except Exception:
+                        ts = None
+                else:
+                    ts = None
+
+                if ts is not None:
+                    if first_ts is None or ts < first_ts:
+                        first_ts = ts
+                    if last_ts is None or ts > last_ts:
+                        last_ts = ts
+
+                if stream is not None and size_bytes:
+                    try:
+                        pos = stream.tell()
+                        percent = int(min(100, (pos / size_bytes) * 100))
+                        status.update(percent)
+                    except Exception:
+                        pass
+        finally:
+            status.finish()
+            reader.close()
+    else:
+        status.finish()
+        return None
+
+    index = PcapIndex(
+        path=path,
+        file_type=file_type,
+        size_bytes=size_bytes,
+        mtime=mtime,
+        packet_count=packet_count,
+        first_ts=first_ts,
+        last_ts=last_ts,
+        stride=stride,
+        offsets=offsets,
+    )
+    _save_index_to_disk(index)
+    return index
+
+
+def build_pcap_index_from_packets(path: Path, packets: list[object], meta: PcapMeta) -> PcapIndex | None:
+    enabled, _cache_dir, stride = _index_cache_config()
+    if not enabled:
+        return None
+    try:
+        stat = path.stat()
+        size_bytes = int(stat.st_size)
+        mtime = int(stat.st_mtime)
+    except Exception:
+        size_bytes = int(getattr(meta, "size_bytes", 0) or 0)
+        mtime = 0
+
+    first_ts: float | None = None
+    last_ts: float | None = None
+    for pkt in packets:
+        ts = getattr(pkt, "time", None)
+        try:
+            ts_val = float(ts)
+        except Exception:
+            ts_val = None
+        if ts_val is None:
+            continue
+        if first_ts is None or ts_val < first_ts:
+            first_ts = ts_val
+        if last_ts is None or ts_val > last_ts:
+            last_ts = ts_val
+
+    index = PcapIndex(
+        path=path,
+        file_type=meta.file_type,
+        size_bytes=size_bytes,
+        mtime=mtime,
+        packet_count=len(packets),
+        first_ts=first_ts,
+        last_ts=last_ts,
+        stride=stride,
+        offsets=None,
+    )
+    _save_index_to_disk(index)
+    return index
+
+
+def get_pcap_index(path: Path, refresh: bool = False, show_status: bool = False) -> PcapIndex | None:
+    if not refresh:
+        cached = _load_index_from_disk(path)
+        if cached is not None:
+            return cached
+    return build_pcap_index(path, show_status=show_status)
+
+
 def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], PcapMeta]:
     file_type = detect_file_type(path)
     size_bytes = 0
@@ -287,6 +545,10 @@ def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], Pc
         snaplen=snaplen,
         interfaces=interfaces,
     )
+    try:
+        build_pcap_index_from_packets(path, packets, meta)
+    except Exception:
+        pass
     return packets, meta
 
 

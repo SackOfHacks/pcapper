@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 import re
@@ -9,6 +11,7 @@ import re
 from .pcap_cache import get_reader
 from .utils import safe_float
 from .files import analyze_files
+from .creds import analyze_creds
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -29,6 +32,11 @@ class TimelineEvent:
     category: str
     summary: str
     details: str
+    src_ip: Optional[str] = None
+    dst_ip: Optional[str] = None
+    port: Optional[int] = None
+    domain: Optional[str] = None
+    user: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +228,10 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                             category="DNS",
                             summary="DNS query",
                             details=f"{target_ip} queried {name} (type {qtype})",
+                            src_ip=target_ip,
+                            dst_ip=None,
+                            port=None,
+                            domain=name,
                         ))
                         qname_lower = name.lower()
                         if any(token in qname_lower for token in ("_ldap._tcp", "_kerberos._tcp", "_gc._tcp", "_msdcs")):
@@ -228,6 +240,10 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                 category="MS Domain",
                                 summary="Domain service discovery",
                                 details=f"{target_ip} queried {name}",
+                                src_ip=target_ip,
+                                dst_ip=None,
+                                port=None,
+                                domain=name,
                             ))
                     except Exception:
                         pass
@@ -260,6 +276,10 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                 category="HTTP",
                                 summary="HTTP POST",
                                 details=f"{target_ip} -> {dst_ip}:{dport} {line} Host: {host}",
+                                src_ip=target_ip,
+                                dst_ip=dst_ip,
+                                port=dport,
+                                domain=host,
                             ))
                         except Exception:
                             events.append(TimelineEvent(
@@ -267,6 +287,9 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                 category="HTTP",
                                 summary="HTTP POST",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
+                                src_ip=target_ip,
+                                dst_ip=dst_ip,
+                                port=dport,
                             ))
                     if dport in EMAIL_PORT_SERVICES:
                         service = EMAIL_PORT_SERVICES[dport]
@@ -300,6 +323,9 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                 category="LDAP",
                                 summary="LDAP connection",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
+                                src_ip=target_ip,
+                                dst_ip=dst_ip,
+                                port=dport,
                             ))
                     if dport in domain_ports:
                         key = (dst_ip, dport, "TCP", "outbound")
@@ -310,6 +336,9 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                 category="MS Domain",
                                 summary="Domain service access",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
+                                src_ip=target_ip,
+                                dst_ip=dst_ip,
+                                port=dport,
                             ))
                     if is_syn and dport:
                         events.append(TimelineEvent(
@@ -317,6 +346,9 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                             category="Connection",
                             summary="TCP connect attempt",
                             details=f"{target_ip} -> {dst_ip}:{dport} (SYN)",
+                            src_ip=target_ip,
+                            dst_ip=dst_ip,
+                            port=dport,
                         ))
                         scan_ports[dst_ip].add(dport)
                         if ts is not None:
@@ -361,6 +393,9 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                 category="LDAP",
                                 summary="LDAP connection",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
+                                src_ip=src_ip,
+                                dst_ip=target_ip,
+                                port=sport,
                             ))
                     if sport in domain_ports:
                         key = (src_ip, sport, "TCP", "inbound")
@@ -371,6 +406,9 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                 category="MS Domain",
                                 summary="Domain service access",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
+                                src_ip=src_ip,
+                                dst_ip=target_ip,
+                                port=sport,
                             ))
 
             if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
@@ -386,6 +424,9 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                 category="Connection",
                                 summary="UDP flow",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
+                                src_ip=target_ip,
+                                dst_ip=dst_ip,
+                                port=dport,
                             ))
                         if dport in ldap_ports:
                             key = (dst_ip, dport, "UDP", "outbound")
@@ -396,6 +437,9 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                     category="LDAP",
                                     summary="LDAP activity",
                                     details=f"{target_ip} -> {dst_ip}:{dport}",
+                                    src_ip=target_ip,
+                                    dst_ip=dst_ip,
+                                    port=dport,
                                 ))
                         if dport in domain_ports:
                             key = (dst_ip, dport, "UDP", "outbound")
@@ -406,6 +450,9 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                     category="MS Domain",
                                     summary="Domain service activity",
                                     details=f"{target_ip} -> {dst_ip}:{dport}",
+                                    src_ip=target_ip,
+                                    dst_ip=dst_ip,
+                                    port=dport,
                                 ))
                 elif dst_ip == target_ip:
                     sport = int(getattr(udp_layer, "sport", 0) or 0)
@@ -418,6 +465,9 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                 category="LDAP",
                                 summary="LDAP activity",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
+                                src_ip=src_ip,
+                                dst_ip=target_ip,
+                                port=sport,
                             ))
                     if sport in domain_ports:
                         key = (src_ip, sport, "UDP", "inbound")
@@ -428,6 +478,9 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                 category="MS Domain",
                                 summary="Domain service activity",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
+                                src_ip=src_ip,
+                                dst_ip=target_ip,
+                                port=sport,
                             ))
     finally:
         status.finish()
@@ -444,6 +497,8 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
             category=category,
             summary="File artifact",
             details=details,
+            src_ip=art.src_ip,
+            dst_ip=art.dst_ip,
         ))
 
     for dst_ip, ports in scan_ports.items():
@@ -458,7 +513,62 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                 category="Recon",
                 summary="Potential port scan",
                 details=f"{target_ip} -> {dst_ip} touched {len(ports)} ports over {duration}",
+                src_ip=target_ip,
+                dst_ip=dst_ip,
             ))
+
+    creds_summary = analyze_creds(path, show_status=False)
+    for item in creds_summary.http_basic:
+        events.append(TimelineEvent(
+            ts=creds_summary.first_seen,
+            category="Credentials",
+            summary="HTTP Basic credential",
+            details=f"{item.source} user={item.username}",
+            user=item.username,
+        ))
+    for item in creds_summary.http_digest:
+        events.append(TimelineEvent(
+            ts=creds_summary.first_seen,
+            category="Credentials",
+            summary="HTTP Digest credential",
+            details=f"{item.source} user={item.username}",
+            user=item.username,
+        ))
+    for user in creds_summary.ntlm_users:
+        events.append(TimelineEvent(
+            ts=creds_summary.first_seen,
+            category="Credentials",
+            summary="NTLM user",
+            details=f"NTLM user {user}",
+            user=user,
+        ))
+    for principal in creds_summary.kerberos_principals:
+        events.append(TimelineEvent(
+            ts=creds_summary.first_seen,
+            category="Credentials",
+            summary="Kerberos principal",
+            details=f"Kerberos principal {principal}",
+            user=principal,
+        ))
+
+    def _event_matches(item: TimelineEvent) -> bool:
+        if filter_ip:
+            if filter_ip != item.src_ip and filter_ip != item.dst_ip:
+                if filter_ip not in item.details:
+                    return False
+        if filter_port is not None:
+            if item.port != filter_port and f":{filter_port}" not in item.details:
+                return False
+        if filter_domain:
+            if item.domain != filter_domain and filter_domain not in item.details:
+                return False
+        if filter_user:
+            if item.user != filter_user and filter_user not in item.details:
+                return False
+        return True
+
+    if filter_ip or filter_port or filter_domain or filter_user:
+        events = [event for event in events if _event_matches(event)]
 
     events.sort(key=lambda item: (item.ts is None, item.ts))
 

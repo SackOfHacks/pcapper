@@ -89,6 +89,12 @@ class ModbusMessage:
     unit_id: int
     func_code: int
     func_name: str
+    address: Optional[int] = None
+    quantity: Optional[int] = None
+    value: Optional[int] = None
+    byte_count: Optional[int] = None
+    mei_type: Optional[int] = None
+    device_id_code: Optional[int] = None
     is_exception: bool = False
     exception_code: Optional[int] = None
     exception_desc: Optional[str] = None
@@ -596,6 +602,39 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
             severity="LOW",
             title="Modbus Diagnostic/Info",
             description=f"Diagnostic or Identity request ({func_name}){suffix}",
+            src=src_ip,
+            dst=dst_ip,
+            ts=0.0,
+        ))
+
+    for (func_name, src_ip, dst_ip), count in file_events.items():
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(ModbusAnomaly(
+            severity="HIGH",
+            title="Modbus File Record",
+            description=f"File record operation ({func_name}){suffix}",
+            src=src_ip,
+            dst=dst_ip,
+            ts=0.0,
+        ))
+
+    for (func_name, src_ip, dst_ip), count in device_id_events.items():
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(ModbusAnomaly(
+            severity="LOW",
+            title="Modbus Device ID Query",
+            description=f"Device identity request ({func_name}){suffix}",
+            src=src_ip,
+            dst=dst_ip,
+            ts=0.0,
+        ))
+
+    for (func_name, src_ip, dst_ip), count in broadcast_events.items():
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(ModbusAnomaly(
+            severity="HIGH",
+            title="Modbus Broadcast Write",
+            description=f"Broadcast write detected ({func_name}){suffix}",
             src=src_ip,
             dst=dst_ip,
             ts=0.0,

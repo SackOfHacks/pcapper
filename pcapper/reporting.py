@@ -1982,6 +1982,12 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
             rows.append([version, str(count)])
         lines.append(_format_table(rows))
 
+    if summary.http2_sessions:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP/2 Observations"))
+        lines.append(_format_kv("HTTP/2 Prefaces", str(summary.http2_prefaces)))
+        lines.append(_format_kv("HTTP/2 Sessions", str(summary.http2_sessions)))
+
     if summary.status_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Response Codes"))
@@ -2412,6 +2418,257 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
     return _finalize_output(lines)
 
 
+def render_creds_summary(summary: CredsSummary, limit: int = 12, verbose: bool = False) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"CREDENTIAL HUNTING :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("Start", format_ts(summary.first_seen)))
+    lines.append(_format_kv("End", format_ts(summary.last_seen)))
+    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+
+    if summary.http_auth_schemes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Auth Schemes"))
+        rows = [["Scheme", "Count"]]
+        for scheme, count in summary.http_auth_schemes.most_common(limit):
+            rows.append([scheme, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.http_basic:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Basic Credentials"))
+        rows = [["Source", "Username", "Password"]]
+        for item in summary.http_basic[:limit]:
+            rows.append([
+                item.source,
+                item.username or "-",
+                item.secret or "-",
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.http_digest:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Digest Credentials"))
+        rows = [["Source", "Username", "Realm", "URI", "Nonce", "Response"]]
+        for item in summary.http_digest[:limit]:
+            details = item.details or {}
+            rows.append([
+                item.source,
+                item.username or "-",
+                str(details.get("realm", "-")),
+                str(details.get("uri", "-")),
+                str(details.get("nonce", "-")),
+                str(details.get("response", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.http_other:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Auth Tokens (Other)"))
+        rows = [["Source", "Scheme", "Sample"]]
+        for item in summary.http_other[:limit]:
+            rows.append([
+                item.source,
+                item.auth_type,
+                str((item.details or {}).get("value", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.ntlm_users:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("NTLM Users"))
+        rows = [["User", "Count"]]
+        for user, count in summary.ntlm_users.most_common(limit):
+            rows.append([user, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.kerberos_principals:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Kerberos Principals"))
+        rows = [["Principal", "Count"]]
+        for principal, count in summary.kerberos_principals.most_common(limit):
+            rows.append([principal, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.kerberos_spns:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Kerberos SPNs"))
+        rows = [["SPN", "Count"]]
+        for spn, count in summary.kerberos_spns.most_common(limit):
+            rows.append([spn, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.smb_sessions:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("SMB Sessions"))
+        rows = [["Client", "Server", "User", "Domain", "Workstation", "Auth", "Guest", "SMB", "Signing"]]
+        for sess in summary.smb_sessions[:limit]:
+            rows.append([
+                str(sess.get("client", "-")),
+                str(sess.get("server", "-")),
+                str(sess.get("username", "-")),
+                str(sess.get("domain", "-")),
+                str(sess.get("workstation", "-")),
+                str(sess.get("auth", "-")),
+                str(sess.get("guest", "-")),
+                str(sess.get("smb_version", "-")),
+                str(sess.get("signing_required", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.detections:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Detections"))
+        for item in summary.detections:
+            severity = item.get("severity", "info")
+            summary_text = str(item.get("summary", ""))
+            details = str(item.get("details", ""))
+            if severity == "warning":
+                marker = warn("[WARN]")
+            elif severity == "critical":
+                marker = danger("[CRIT]")
+            else:
+                marker = ok("[INFO]")
+            lines.append(f"{marker} {summary_text}")
+            if details:
+                lines.append(muted(f"  {details}"))
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
+def render_creds_rollup(summaries: list[CredsSummary], limit: int = 12) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header("CREDENTIAL HUNTING ROLLUP"))
+    lines.append(SECTION_BAR)
+
+    total_packets = sum(s.total_packets for s in summaries)
+    http_auth = Counter()
+    ntlm_users = Counter()
+    kerberos_principals = Counter()
+    kerberos_spns = Counter()
+    http_basic = []
+    http_digest = []
+    http_other = []
+    smb_sessions = []
+
+    for summary in summaries:
+        http_auth.update(summary.http_auth_schemes)
+        ntlm_users.update(summary.ntlm_users)
+        kerberos_principals.update(summary.kerberos_principals)
+        kerberos_spns.update(summary.kerberos_spns)
+        http_basic.extend(summary.http_basic)
+        http_digest.extend(summary.http_digest)
+        http_other.extend(summary.http_other)
+        smb_sessions.extend(summary.smb_sessions)
+
+    lines.append(_format_kv("Captures", str(len(summaries))))
+    lines.append(_format_kv("Packets", str(total_packets)))
+
+    if http_auth:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Auth Schemes"))
+        rows = [["Scheme", "Count"]]
+        for scheme, count in http_auth.most_common(limit):
+            rows.append([scheme, str(count)])
+        lines.append(_format_table(rows))
+
+    if http_basic:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Basic Credentials"))
+        rows = [["Source", "Username", "Password"]]
+        for item in http_basic[:limit]:
+            rows.append([
+                item.source,
+                item.username or "-",
+                item.secret or "-",
+            ])
+        lines.append(_format_table(rows))
+
+    if http_digest:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Digest Credentials"))
+        rows = [["Source", "Username", "Realm", "URI", "Nonce", "Response"]]
+        for item in http_digest[:limit]:
+            details = item.details or {}
+            rows.append([
+                item.source,
+                item.username or "-",
+                str(details.get("realm", "-")),
+                str(details.get("uri", "-")),
+                str(details.get("nonce", "-")),
+                str(details.get("response", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if http_other:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP Auth Tokens (Other)"))
+        rows = [["Source", "Scheme", "Sample"]]
+        for item in http_other[:limit]:
+            rows.append([
+                item.source,
+                item.auth_type,
+                str((item.details or {}).get("value", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if ntlm_users:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("NTLM Users"))
+        rows = [["User", "Count"]]
+        for user, count in ntlm_users.most_common(limit):
+            rows.append([user, str(count)])
+        lines.append(_format_table(rows))
+
+    if kerberos_principals:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Kerberos Principals"))
+        rows = [["Principal", "Count"]]
+        for principal, count in kerberos_principals.most_common(limit):
+            rows.append([principal, str(count)])
+        lines.append(_format_table(rows))
+
+    if kerberos_spns:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Kerberos SPNs"))
+        rows = [["SPN", "Count"]]
+        for spn, count in kerberos_spns.most_common(limit):
+            rows.append([spn, str(count)])
+        lines.append(_format_table(rows))
+
+    if smb_sessions:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("SMB Sessions"))
+        rows = [["Client", "Server", "User", "Domain", "Workstation", "Auth", "Guest", "SMB", "Signing"]]
+        for sess in smb_sessions[:limit]:
+            rows.append([
+                str(sess.get("client", "-")),
+                str(sess.get("server", "-")),
+                str(sess.get("username", "-")),
+                str(sess.get("domain", "-")),
+                str(sess.get("workstation", "-")),
+                str(sess.get("auth", "-")),
+                str(sess.get("guest", "-")),
+                str(sess.get("smb_version", "-")),
+                str(sess.get("signing_required", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    lines.append(SECTION_BAR)
+    return "\n".join(lines)
+
+
 def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = False) -> str:
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -2488,6 +2745,22 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
         rows = [["JA4S", "Count"]]
         for ja4s, count in summary.ja4s_counts.most_common(limit):
             rows.append([ja4s, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.jarm_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("JARM (Passive)"))
+        rows = [["JARM", "Count"]]
+        for jarm, count in summary.jarm_counts.most_common(limit):
+            rows.append([jarm, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.jarm_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("JARM (Passive) Fingerprints"))
+        rows = [["JARM-P", "Count"]]
+        for jarm, count in summary.jarm_counts.most_common(limit):
+            rows.append([jarm, str(count)])
         lines.append(_format_table(rows))
 
     if summary.conversations:
@@ -4954,6 +5227,63 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None)
                 hostname,
                 getattr(item, "content_type", "-"),
                 item.note or "-",
+            ])
+        lines.append(_format_table(rows))
+
+        if any(getattr(item, "pe_info", None) or getattr(item, "elf_info", None) for item in summary.artifacts):
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("PE/ELF Metadata"))
+            rows = [["Filename", "Kind", "Entry", "Machine", "Sections", "Imports"]]
+            for item in summary.artifacts[:effective_limit]:
+                pe_info = getattr(item, "pe_info", None)
+                elf_info = getattr(item, "elf_info", None)
+                if pe_info:
+                    rows.append([
+                        item.filename,
+                        "PE",
+                        str(pe_info.get("entrypoint", "-")),
+                        str(pe_info.get("machine", "-")),
+                        str(pe_info.get("sections", "-")),
+                        str(pe_info.get("imports", "-")),
+                    ])
+                elif elf_info:
+                    rows.append([
+                        item.filename,
+                        "ELF",
+                        str(elf_info.get("entrypoint", "-")),
+                        str(elf_info.get("machine", "-")),
+                        str(elf_info.get("sections", "-")),
+                        "-",
+                    ])
+            lines.append(_format_table(rows))
+
+    if summary.yara_hits:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("YARA Matches"))
+        rows = [["Filename", "Rules", "SHA256"]]
+        for hit in summary.yara_hits[:effective_limit]:
+            rules = ", ".join(hit.get("matches", []))
+            sha = hit.get("sha256", "-")
+            sha_short = f"{sha[:12]}" if isinstance(sha, str) else "-"
+            rows.append([
+                str(hit.get("filename", "-")),
+                rules or "-",
+                sha_short,
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.hash_clusters:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Hash Clusters"))
+        rows = [["SHA256", "Count", "Files", "Protocols"]]
+        for cluster in summary.hash_clusters[:effective_limit]:
+            sha = cluster.get("sha256", "-")
+            sha_short = f"{sha[:12]}" if isinstance(sha, str) else "-"
+            rows.append([
+                sha_short,
+                str(cluster.get("count", "-")),
+                ", ".join(cluster.get("files", [])[:5]),
+                ", ".join(cluster.get("protocols", [])[:5]),
             ])
         lines.append(_format_table(rows))
 

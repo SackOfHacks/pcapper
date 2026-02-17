@@ -13,6 +13,7 @@ from .utils import safe_float
 from .icmp import analyze_icmp
 from .dns import analyze_dns
 from .beacon import analyze_beacons
+from .ips import analyze_ips
 from .files import analyze_files
 from .modbus import analyze_modbus
 from .dnp3 import analyze_dnp3
@@ -480,6 +481,7 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     icmp_summary = analyze_icmp(path, show_status=show_status)
     dns_summary = analyze_dns(path, show_status=show_status)
     beacon_summary = analyze_beacons(path, show_status=show_status)
+    ip_summary = analyze_ips(path, show_status=show_status)
     files_summary = analyze_files(path, show_status=show_status)
     http_summary = analyze_http(path, show_status=show_status)
     creds_summary = analyze_creds(path, show_status=show_status)
@@ -629,6 +631,24 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
                 "top_destinations": [(candidate.dst_ip, candidate.count)],
             })
 
+        c2_candidates = [c for c in beacon_summary.candidates if c.score >= 0.7]
+        if c2_candidates:
+            top_c2 = c2_candidates[:5]
+            details = "; ".join(
+                f"{c.src_ip}->{c.dst_ip} {c.proto}:{c.dst_port or '-'} score {c.score:.2f} "
+                f"periodicity {c.periodicity_score:.2f} duration {c.duration_score:.2f}"
+                for c in top_c2
+            )
+            high_risk = [c for c in c2_candidates if c.score >= 0.85 and c.periodicity_score >= 0.8]
+            detections.append({
+                "source": "Beacon",
+                "severity": "critical" if high_risk else "warning",
+                "summary": "C2 beacon scoring anomalies",
+                "details": f"{len(c2_candidates)} high-scoring beacon flow(s). Top: {details}",
+                "top_sources": Counter(c.src_ip for c in c2_candidates).most_common(5),
+                "top_destinations": Counter(c.dst_ip for c in c2_candidates).most_common(5),
+            })
+
     # Suspicious file download detection
     suspicious_exts = {
         ".exe", ".dll", ".ps1", ".bat", ".vbs", ".js", ".scr",
@@ -707,6 +727,74 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
                 "details": f"{item['protocol']} {item['filename']} ({item['file_type']}) {item['src']} -> {item['dst']}",
             })
 
+    # DGA-style heuristics (high-entropy/long DNS labels)
+    if dns_summary.qname_counts:
+        suspicious_qnames: list[tuple[str, int, float]] = []
+        for qname, count in dns_summary.qname_counts.items():
+            name = str(qname).strip(".")
+            if not name or "." not in name:
+                continue
+            labels = [part for part in name.split(".") if part]
+            if not labels:
+                continue
+            longest = max(labels, key=len)
+            entropy = _shannon_entropy(longest)
+            if len(longest) >= 12 and entropy >= 4.0:
+                suspicious_qnames.append((name, int(count), entropy))
+
+        if suspicious_qnames:
+            ratio = len(suspicious_qnames) / max(1, len(dns_summary.qname_counts))
+            if len(suspicious_qnames) >= 20 or (ratio >= 0.2 and len(suspicious_qnames) >= 5):
+                top_q = sorted(suspicious_qnames, key=lambda x: (x[1], x[2]), reverse=True)[:5]
+                details = ", ".join(f"{name}({count},H={entropy:.2f})" for name, count, entropy in top_q)
+                detections.append({
+                    "source": "DNS",
+                    "severity": "warning",
+                    "summary": "Potential DGA-style DNS activity",
+                    "details": f"{len(suspicious_qnames)} high-entropy query names observed. Top: {details}",
+                    "top_sources": dns_summary.client_counts.most_common(3),
+                    "top_destinations": dns_summary.server_counts.most_common(3),
+                })
+
+    # Rare ASN / country alerts (requires GeoIP enrichment)
+    if ip_summary.endpoints:
+        asn_counts: Counter[str] = Counter()
+        asn_bytes: Counter[str] = Counter()
+        country_counts: Counter[str] = Counter()
+        country_bytes: Counter[str] = Counter()
+
+        for endpoint in ip_summary.endpoints:
+            total_bytes = int(getattr(endpoint, "bytes_sent", 0) + getattr(endpoint, "bytes_recv", 0))
+            if endpoint.asn:
+                asn_counts[endpoint.asn] += 1
+                asn_bytes[endpoint.asn] += total_bytes
+            country = _country_from_geo(endpoint.geo)
+            if country:
+                country_counts[country] += 1
+                country_bytes[country] += total_bytes
+
+        if len(asn_counts) >= 5:
+            rare_asn = [asn for asn, count in asn_counts.items() if count == 1 and asn_bytes[asn] >= 50000]
+            if rare_asn:
+                details = ", ".join(f"{asn}({asn_bytes[asn]} bytes)" for asn in rare_asn[:5])
+                detections.append({
+                    "source": "IP",
+                    "severity": "warning",
+                    "summary": "Rare ASN destinations observed",
+                    "details": f"{len(rare_asn)} ASN(s) seen only once with notable traffic. Top: {details}",
+                })
+
+        if len(country_counts) >= 5:
+            rare_countries = [c for c, count in country_counts.items() if count == 1 and country_bytes[c] >= 50000]
+            if rare_countries:
+                details = ", ".join(f"{c}({country_bytes[c]} bytes)" for c in rare_countries[:5])
+                detections.append({
+                    "source": "IP",
+                    "severity": "warning",
+                    "summary": "Rare country destinations observed",
+                    "details": f"{len(rare_countries)} country/countries seen only once with notable traffic. Top: {details}",
+                })
+
     if smb1_detected:
         detections.append({
             "source": "Files",
@@ -741,6 +829,7 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     strict_ot_pairs: dict[str, set[tuple[str, str]]] = defaultdict(set)
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+    bucket_seconds = 60.0
 
     try:
         for pkt in reader:
@@ -1049,6 +1138,60 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             "details": "Payload markers matched common offensive tooling/command execution strings.",
             "top_sources": suspicious_payload_sources.most_common(10),
             "evidence": _dedupe_evidence([f"{src} marker_hits={count}" for src, count in suspicious_payload_sources.most_common(10)], limit=10),
+        })
+
+    # Burst analysis with baseline (per-minute buckets)
+    burst_findings: list[dict[str, object]] = []
+    for ip_key, bucket_counts in src_buckets.items():
+        counts = list(bucket_counts.values())
+        if len(counts) < 5:
+            continue
+        median = _median([float(v) for v in counts])
+        mad = _mad([float(v) for v in counts], median)
+        max_count = max(counts) if counts else 0
+        threshold = max(50.0, median + (6.0 * mad))
+        if max_count >= threshold and max_count >= (median * 5 if median > 0 else 50):
+            peak_bucket = max(bucket_counts, key=bucket_counts.get)
+            burst_findings.append({
+                "role": "source",
+                "ip": ip_key,
+                "peak": int(max_count),
+                "baseline": round(median, 2),
+                "mad": round(mad, 2),
+                "bucket": int(peak_bucket),
+            })
+
+    for ip_key, bucket_counts in dst_buckets.items():
+        counts = list(bucket_counts.values())
+        if len(counts) < 5:
+            continue
+        median = _median([float(v) for v in counts])
+        mad = _mad([float(v) for v in counts], median)
+        max_count = max(counts) if counts else 0
+        threshold = max(50.0, median + (6.0 * mad))
+        if max_count >= threshold and max_count >= (median * 5 if median > 0 else 50):
+            peak_bucket = max(bucket_counts, key=bucket_counts.get)
+            burst_findings.append({
+                "role": "destination",
+                "ip": ip_key,
+                "peak": int(max_count),
+                "baseline": round(median, 2),
+                "mad": round(mad, 2),
+                "bucket": int(peak_bucket),
+            })
+
+    if burst_findings:
+        burst_findings.sort(key=lambda item: int(item.get("peak", 0)), reverse=True)
+        top_bursts = burst_findings[:5]
+        details = "; ".join(
+            f"{item['role']} {item['ip']} peak {item['peak']} (baseline {item['baseline']}, MAD {item['mad']})"
+            for item in top_bursts
+        )
+        detections.append({
+            "source": "Traffic",
+            "severity": "warning",
+            "summary": "Burst traffic anomalies detected",
+            "details": f"Baselined per-minute bursts identified. Top: {details}",
         })
 
     return ThreatSummary(path=path, detections=detections, errors=errors)

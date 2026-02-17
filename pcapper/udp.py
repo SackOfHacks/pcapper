@@ -346,6 +346,21 @@ def analyze_udp(
             if len(payloads) < 25:
                 payloads.append(payload_len)
 
+            payload = b""
+            try:
+                payload = bytes(udp_layer.payload)
+            except Exception:
+                payload = b""
+
+            if payload and (sport in (443, 8443) or dport in (443, 8443)):
+                first_byte = payload[0]
+                if first_byte & 0x80 and len(payload) >= 5:
+                    version = int.from_bytes(payload[1:5], "big")
+                    if version != 0:
+                        quic_packets += 1
+                        quic_sessions.add((src_ip or "-", dst_ip or "-", sport, dport))
+                        quic_versions[f"0x{version:08x}"] += 1
+
             if dport in AMPLIFICATION_PORTS or sport in AMPLIFICATION_PORTS:
                 if dport in AMPLIFICATION_PORTS:
                     client = src_ip or "-"

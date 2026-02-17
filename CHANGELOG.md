@@ -41,10 +41,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## 0.6.5 — 2026-02-04
 ### Changed
-- Version bump and release prep updates.
+- Added IOC export (JSON/CSV/STIX) and CLI options for output control.
+- Documented IOC enrichment configuration and cache/rate-limit controls.
+- Added TCP stream reassembly for HTTP parsing and HTTP/2 preface detection.
+- Added passive JARM fingerprints in TLS analysis and QUIC detection in UDP.
+- Added credential hunting module for HTTP auth, NTLM/Kerberos artifacts, and SMB sessions.
+- Added file triage with YARA scanning, MIME/PE/ELF metadata, hash clustering, and expanded carving.
+- Added timeline filters (IP/port/domain/user) and JSON export for SIEM ingestion.
 
 ### Fixed
-- Packaging metadata consistency checks.
+- Added caching/rate limiting for IP intel lookups.
 
 ## 0.6.0 — 2026-02-04
 ### Added
