@@ -14,6 +14,8 @@ This project follows [Semantic Versioning](https://semver.org/).
 - Beaconing enhancements: severity tiers, fan-out detection, low-and-slow cadence detection, high-frequency check-in detection, and candidate evidence payloads.
 - Exfiltration enhancements: per-source DNS tunneling heuristics (entropy + max label), uncommon high-volume outbound channel detection, aggregated HTTP POST channel detection, and richer exfil evidence.
 - New smoke coverage for beacon fan-out and exfil per-source DNS/uncommon-port detections.
+- New remote-access analyzers for `--rdp`, `--telnet`, `--vnc`, `--teamviewer`, and `--winrm` with host details, artifacts, and threat-hunting heuristics.
+- Expanded `--ssh` analysis with MAC visibility, auth outcomes, beaconing, and exfil heuristics.
 
 ### Changed
 - CLI help menu organization now enforces complete alphabetical ordering inside IT and OT/ICS groups.
@@ -23,6 +25,7 @@ This project follows [Semantic Versioning](https://semver.org/).
 - Threat, beacon, and exfil reporting now render richer evidence lines directly under detections for faster triage.
 - README now includes a direct `--help` verification command and explicit IT/ICS function counts.
 - `requirements.txt` now explicitly marks runtime dependencies as alphabetically ordered.
+- Summarize mode now renders full module sections for `--health`, `--rdp`, `--telnet`, `--vnc`, `--teamviewer`, and `--winrm`.
 
 ### Fixed
 - `argparse` failure when shell-expanded wildcard input produced multiple targets (`unrecognized arguments ...`).

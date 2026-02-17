@@ -47,6 +47,11 @@ class FileArtifact:
     note: Optional[str]
     file_type: str = "UNKNOWN"
     payload: Optional[bytes] = None
+    hostname: Optional[str] = None
+    content_type: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.filename = _normalize_filename(self.filename)
 
 
 @dataclass
@@ -102,6 +107,33 @@ FILE_TYPE_EXTENSIONS: dict[str, set[str]] = {
     "X509": {".cer", ".crt", ".pem", ".der", ".p7b", ".pfx", ".p12"},
     "DICOM": {".dcm"},
 }
+
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+}
+
+MAX_FILENAME_LENGTH = 200
 
 ENIP_TCP_PORT = 44818
 ENIP_UDP_PORT = 2222
@@ -177,11 +209,37 @@ def _normalize_filename(name: str) -> str:
     try:
         # Strip path traversal
         clean = Path(name).name
-        # Remove nulls and suspicious chars
-        clean = re.sub(r'[^\w\-.()\[\] ]', '_', clean)
-        return clean if clean else "unknown_file"
+        # Remove nulls and suspicious chars, keep ASCII for portability
+        clean = re.sub(r"[^A-Za-z0-9_.()\\[\\] -]", "_", clean)
+        clean = clean.strip(" .")
+        if not clean:
+            return "unknown_file"
+        # Avoid Windows reserved device names
+        stem = Path(clean).stem
+        if stem.upper() in WINDOWS_RESERVED_NAMES:
+            clean = f"{stem}_"
+            if Path(name).suffix:
+                clean = f"{clean}{Path(name).suffix}"
+        # Enforce a reasonable length cap for cross-platform compatibility
+        if len(clean) > MAX_FILENAME_LENGTH:
+            suffix = Path(clean).suffix
+            base = Path(clean).stem
+            max_stem = max(1, MAX_FILENAME_LENGTH - len(suffix))
+            clean = f"{base[:max_stem]}{suffix}"
+        return clean
     except Exception:
         return "unknown_file"
+
+
+def _safe_output_path(base_dir: Path, filename: str) -> Optional[Path]:
+    candidate = _unique_output_path(base_dir, filename)
+    try:
+        base_resolved = base_dir.resolve()
+        candidate_resolved = candidate.resolve()
+        candidate_resolved.relative_to(base_resolved)
+    except Exception:
+        return None
+    return candidate
 
 
 def _unique_output_path(base_dir: Path, filename: str) -> Path:
@@ -1020,7 +1078,7 @@ class FileExtractor:
     def finalize(self):
         # We need a two-pass approach for HTTP to correlate Requests with Responses
         # Pass 1: Scan for HTTP Requests and build pending_requests map
-        pending_requests: Dict[Tuple[str, str, int, int], List[str]] = defaultdict(list)
+        pending_requests: Dict[Tuple[str, str, int, int], List[Dict[str, Any]]] = defaultdict(list)
         
         # Pre-assemble all streams once to avoid double work?
         # No, memory is tight, we iterate self.tcp_streams.
@@ -1047,6 +1105,8 @@ class FileExtractor:
             for m in msgs:
                 if m["is_request"]:
                     fn = _extract_request_filename(m["start_line"])
+                    host_header = m["headers"].get("host", "")
+                    hostname = host_header.split(":")[0].strip() if host_header else None
                     if fn:
                         # Store for the REVERSE direction
                         # Key: (Dst(Server), DstPort, Src(Client), SrcPort)
@@ -1056,7 +1116,7 @@ class FileExtractor:
                         # Response Key will be (dst, src, dport, sport)
                         # Wait, tcp_streams key is (src, dst, sport, dport)
                         # So I should store it under (dst, src, dport, sport)
-                        pending_requests[(dst, src, dport, sport)].append(fn)
+                        pending_requests[(dst, src, dport, sport)].append({"filename": fn, "hostname": hostname})
 
         # Pass 1b: FTP control parsing (supports non-standard ports)
         ftp_transfers: List[Dict[str, Any]] = []
@@ -1149,11 +1209,11 @@ class FileExtractor:
             
             # Protocol Handlers
             if protocol == "HTTP":
-                # Check if we have pending filenames for this stream (Client <- Server)
+                # Check if we have pending requests for this stream (Client <- Server)
                 # Key matching current stream: (src, dst, sport, dport)
                 # Because we stored it using that key.
-                names = pending_requests.get((src, dst, sport, dport), [])
-                self._extract_http(stream, src, dst, sport, dport, first_pkt, names)
+                requests = pending_requests.get((src, dst, sport, dport), [])
+                self._extract_http(stream, src, dst, sport, dport, first_pkt, requests)
             elif protocol == "SMB":
                 self._extract_smb(stream, src, dst, sport, dport, first_pkt, flow_bytes)
             elif protocol in ("SMTP", "POP3", "IMAP"):
@@ -1335,18 +1395,24 @@ class FileExtractor:
             })
 
 
-    def _extract_http(self, stream: bytes, src: str, dst: str, sport: int, dport: int, idx: int, known_filenames: List[str] = None):
+    def _extract_http(self, stream: bytes, src: str, dst: str, sport: int, dport: int, idx: int, known_requests: List[Dict[str, Any]] = None):
         msgs = _parse_http_stream(stream)
-        pending_names = list(known_filenames) if known_filenames else []
+        pending_requests = list(known_requests) if known_requests else []
+        current_hostname = None
         
         for m in msgs:
             if m["is_request"]:
                 fn = _extract_request_filename(m["start_line"])
-                if fn: pending_names.append(fn)
+                if fn: pending_requests.append({"filename": fn, "hostname": None})  # For requests in the same stream
                 auth_header = m["headers"].get("authorization", "")
                 if "ntlm" in auth_header.lower():
                     self.http_ntlm_sources[src] += 1
                     self.http_ntlm_destinations[dst] += 1
+                # Extract hostname from Host header
+                host_header = m["headers"].get("host", "")
+                if host_header:
+                    # Remove port if present
+                    current_hostname = host_header.split(":")[0].strip()
             else:
                 # Response
                 body = m.get("body", b"")
@@ -1381,10 +1447,13 @@ class FileExtractor:
                         fname = content_location
                         explicit_name = True
                 
-                # Check pending names (Sync logic: Consume regardless of body size/existence to keep order)
-                if fname == "http_response.bin" and pending_names:
-                    fname = pending_names.pop(0)
+                # Check pending requests (Sync logic: Consume regardless of body size/existence to keep order)
+                if fname == "http_response.bin" and pending_requests:
+                    req_info = pending_requests.pop(0)
+                    fname = req_info["filename"]
                     explicit_name = True
+                    if req_info["hostname"]:
+                        current_hostname = req_info["hostname"]
 
                 if not body:
                     continue
@@ -1434,7 +1503,7 @@ class FileExtractor:
                     continue
 
                 if body.startswith(b"MZ") and not explicit_name:
-                    exe_name = next((n for n in pending_names if n.lower().endswith(".exe")), None)
+                    exe_name = next((req["filename"] for req in pending_requests if req["filename"].lower().endswith(".exe")), None)
                     if exe_name:
                         fname = exe_name
                         explicit_name = True
@@ -1454,7 +1523,7 @@ class FileExtractor:
                 self.artifacts.append(FileArtifact(
                     protocol="HTTP", src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
                     filename=_normalize_filename(fname), size_bytes=len(body), packet_index=idx,
-                    note="HTTP Response Body", file_type=ft, payload=body
+                    note="HTTP Response Body", file_type=ft, payload=body, hostname=current_hostname, content_type=content_type
                 ))
                 
                 # Double check for PEs inside HTTP bodies that might be wrapped or just to be sure
@@ -1480,7 +1549,7 @@ class FileExtractor:
                     self.artifacts.append(FileArtifact(
                         protocol="SMB2", src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
                         filename=_normalize_filename(filename), size_bytes=None, packet_index=idx,
-                        note="SMB2 Create", file_type="UNKNOWN", payload=None
+                        note="SMB2 Create", file_type="UNKNOWN", payload=None, hostname=None, content_type=None
                     ))
                 user, domain, _ = _parse_ntlm_type3(record)
                 if user:
@@ -1504,7 +1573,7 @@ class FileExtractor:
                     self.artifacts.append(FileArtifact(
                         protocol="SMB1", src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
                         filename=_normalize_filename(filename), size_bytes=None, packet_index=idx,
-                        note="SMB1 Create/Open", file_type="UNKNOWN", payload=None
+                        note="SMB1 Create/Open", file_type="UNKNOWN", payload=None, hostname=None, content_type=None
                     ))
                 user, domain, _ = _parse_ntlm_type3(record)
                 if user:
@@ -1842,7 +1911,7 @@ def _export_with_dpkt(
                 session["last_filename"] = None
 
     # HTTP request correlation
-    pending_requests: Dict[Tuple[str, str, int, int], List[str]] = defaultdict(list)
+    pending_requests: Dict[Tuple[str, str, int, int], List[Dict[str, Any]]] = defaultdict(list)
     for (src, dst, sport, dport), chunks in tcp_streams.items():
         stream, first_pkt = _assemble_stream(chunks)
         if not stream:
@@ -1853,9 +1922,10 @@ def _export_with_dpkt(
         for m in msgs:
             if m["is_request"]:
                 host = m["headers"].get("host")
+                hostname = host.split(":")[0].strip() if host else None
                 fn = _extract_request_filename(m["start_line"], host)
                 if fn:
-                    pending_requests[(dst, src, dport, sport)].append(fn)
+                    pending_requests[(dst, src, dport, sport)].append({"filename": fn, "hostname": hostname})
 
     # HTTP/IMF/SMB/DICOM/X509/FTP data extraction
     for (src, dst, sport, dport), chunks in tcp_streams.items():
@@ -1906,7 +1976,7 @@ def _export_with_dpkt(
 
         # HTTP
         if protocol == "HTTP":
-            names = pending_requests.get((src, dst, sport, dport), [])
+            requests = pending_requests.get((src, dst, sport, dport), [])
             msgs = _parse_http_stream(stream)
             for m in msgs:
                 if m["is_request"]:
@@ -1914,6 +1984,7 @@ def _export_with_dpkt(
                 body = m.get("body", b"")
                 fname = "http_response.bin"
                 explicit_name = False
+                hostname = None
                 disp = m["headers"].get("content-disposition", "")
                 if disp:
                     if "filename=" in disp.lower() or "attachment" in disp.lower():
@@ -1930,8 +2001,10 @@ def _export_with_dpkt(
                     if content_location:
                         fname = content_location
                         explicit_name = True
-                if fname == "http_response.bin" and names:
-                    fname = names.pop(0)
+                if fname == "http_response.bin" and requests:
+                    req_info = requests.pop(0)
+                    fname = req_info["filename"]
+                    hostname = req_info["hostname"]
                     explicit_name = True
                 if fname == "http_response.bin":
                     content_type = m["headers"].get("content-type", "")
@@ -1963,7 +2036,7 @@ def _export_with_dpkt(
                     continue
 
                 if body.startswith(b"MZ") and not explicit_name:
-                    exe_name = next((n for n in names if n.lower().endswith(".exe")), None)
+                    exe_name = next((req["filename"] for req in requests if req["filename"].lower().endswith(".exe")), None)
                     if exe_name:
                         fname = exe_name
                         explicit_name = True
@@ -1979,6 +2052,8 @@ def _export_with_dpkt(
                     note="HTTP Response Body",
                     file_type=ftype,
                     payload=body if need_payload else None,
+                    hostname=hostname,
+                    content_type=content_type,
                 ))
 
         # IMF (email attachments)
@@ -2015,6 +2090,7 @@ def _export_with_dpkt(
                         note="SMB2 Create",
                         file_type="UNKNOWN",
                         payload=None,
+                        hostname=None,
                     ))
                 # Skip heuristic SMB filename scans (too noisy)
 
@@ -2043,6 +2119,8 @@ def _export_with_dpkt(
                 note="DICOM payload",
                 file_type="DICOM",
                 payload=blob if need_payload else None,
+                hostname=None,
+                content_type=None,
             ))
 
         # X509AF
@@ -2065,6 +2143,8 @@ def _export_with_dpkt(
                 note="X509 PEM",
                 file_type="X509",
                 payload=pem if need_payload else None,
+                hostname=None,
+                content_type=None,
             ))
         for der in _extract_der_blobs(stream):
             digest = hashlib.sha256(_normalize_x509_payload(der)).hexdigest()
@@ -2085,6 +2165,8 @@ def _export_with_dpkt(
                 note="X509 DER",
                 file_type="X509",
                 payload=der if need_payload else None,
+                hostname=None,
+                content_type=None,
             ))
 
         # FTP data flows
@@ -2109,6 +2191,8 @@ def _export_with_dpkt(
                     note=f"FTP {transfer['direction']} data",
                     file_type=detect_file_type_bytes(stream),
                     payload=stream if need_payload else None,
+                    hostname=None,
+                    content_type=None,
                 ))
                 matched_ftp = True
 
@@ -2274,6 +2358,8 @@ def _export_with_dpkt(
             note=f"ENIP/CIP {service_name} payload ({direction})",
             file_type=file_type,
             payload=payload if need_payload else None,
+            hostname=None,
+            content_type=None,
         ))
 
     if artifacts:
@@ -2300,12 +2386,14 @@ def _export_with_dpkt(
             search = extract_name.lower()
             for art in artifacts:
                 if art.payload and search in art.filename.lower():
-                    out_p = _unique_output_path(out_root, art.filename)
+                    out_p = _safe_output_path(out_root, art.filename)
+                    if out_p is None:
+                        continue
                     try:
                         out_p.write_bytes(art.payload)
+                        extracted_paths.append(out_p)
                     except Exception:
-                        pass
-                    extracted_paths.append(out_p)
+                        continue
 
         if view_name:
             search = view_name.lower()

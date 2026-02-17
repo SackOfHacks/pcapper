@@ -60,6 +60,7 @@ from .reporting import (
     render_ips_summary,
     render_http_summary,
     render_sizes_summary,
+    render_ftp_summary,
     render_nfs_summary,
     render_strings_summary,
     render_search_summary,
@@ -68,12 +69,18 @@ from .reporting import (
     render_certificates_summary,
     render_health_summary,
     render_hostname_summary,
+    render_hostdetails_summary,
     render_timeline_summary,
     render_domain_summary,
     render_ldap_summary,
     render_kerberos_summary,
     render_tls_summary,
     render_ssh_summary,
+    render_rdp_summary,
+    render_telnet_summary,
+    render_vnc_summary,
+    render_teamviewer_summary,
+    render_winrm_summary,
     render_syslog_summary,
     render_tcp_summary,
     render_udp_summary,
@@ -87,8 +94,8 @@ from .dns import analyze_dns
 from .beacon import analyze_beacons
 from .threats import analyze_threats, merge_threats_summaries
 from .files import analyze_files
-from .protocols import analyze_protocols
-from .services import analyze_services
+from .protocols import analyze_protocols, merge_protocols_summaries
+from .services import analyze_services, merge_services_summaries
 from .smb import analyze_smb
 from .ntlm import analyze_ntlm
 from .netbios import analyze_netbios
@@ -126,19 +133,26 @@ from .iccp import analyze_iccp
 from .ips import analyze_ips, merge_ips_summaries
 from .http import analyze_http
 from .sizes import analyze_sizes
+from .ftp import analyze_ftp, merge_ftp_summaries
 from .nfs import analyze_nfs
 from .strings import analyze_strings
 from .search import analyze_search
 from .creds import analyze_creds
 from .certificates import analyze_certificates
-from .health import analyze_health
+from .health import analyze_health, merge_health_summaries
 from .hostname import analyze_hostname, merge_hostname_summaries
+from .hostdetails import analyze_hostdetails, merge_hostdetails_summaries
 from .timeline import analyze_timeline, merge_timeline_summaries
 from .domain import analyze_domain
 from .ldap import analyze_ldap
 from .kerberos import analyze_kerberos
 from .tls import analyze_tls
-from .ssh import analyze_ssh
+from .ssh import analyze_ssh, merge_ssh_summaries
+from .rdp import analyze_rdp, merge_rdp_summaries
+from .telnet import analyze_telnet, merge_telnet_summaries
+from .vnc import analyze_vnc, merge_vnc_summaries
+from .teamviewer import analyze_teamviewer, merge_teamviewer_summaries
+from .winrm import analyze_winrm, merge_winrm_summaries
 from .syslog import analyze_syslog
 from .tcp import analyze_tcp
 from .udp import analyze_udp
@@ -153,8 +167,14 @@ def _ordered_steps(argv: list[str]) -> list[str]:
         "--icmp": "icmp",
         "--dns": "dns",
         "--http": "http",
+        "--ftp": "ftp",
         "--tls": "tls",
         "--ssh": "ssh",
+        "--rdp": "rdp",
+        "--telnet": "telnet",
+        "--vnc": "vnc",
+        "--teamviewer": "teamviewer",
+        "--winrm": "winrm",
         "--syslog": "syslog",
         "--tcp": "tcp",
         "--udp": "udp",
@@ -176,6 +196,7 @@ def _ordered_steps(argv: list[str]) -> list[str]:
         "--kerberos": "kerberos",
         "--health": "health",
         "--hostname": "hostname",
+        "--hostdetails": "hostdetails",
         "--ntlm": "ntlm",
         "--netbios": "netbios",
         "--arp": "arp",
@@ -290,7 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
     general.add_argument(
         "-ip",
         dest="timeline_ip",
-        help="Target IP for timeline/hostname analysis (use with --timeline or --hostname).",
+        help="Target IP for host-centric analysis (use with --timeline or --hostdetails; optional for --hostname).",
     )
     general.add_argument(
         "-l",
@@ -355,7 +376,12 @@ def build_parser() -> argparse.ArgumentParser:
         ("--domain", "Include MS AD and domain analysis (services, users, DCs, artifacts)."),
         ("--exfil", "Include exfiltration heuristics and anomaly analysis."),
         ("--files", "Include file transfer discovery in the output."),
+        ("--ftp", "Include FTP analysis (credentials, transfers, threats, anomalies)."),
         ("--health", "Include overall traffic health assessment (retransmissions, TTL, QoS, SNMP, certs)."),
+        (
+            "--hostdetails",
+            "Deep host-centric threat hunting/forensics for a target IP (services, peers, attacks, beaconing, exfil, artifacts; use with -ip).",
+        ),
         ("--hostname", "Find hostnames for a target IP across DNS/HTTP/TLS/SMB/NetBIOS (use with -ip)."),
         ("--http", "Include HTTP analysis in the output."),
         ("--icmp", "Include ICMP analysis in the output."),
@@ -366,6 +392,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("--nfs", "Include NFS protocol analysis (RPC, Clients, Servers, Files, Anomalies)."),
         ("--ntlm", "Include NTLM authentication analysis (Users, Domains, Versions)."),
         ("--protocols", "Include detailed protocol hierarchy and anomaly analysis."),
+        ("--rdp", "Include RDP analysis (sessions, hostnames, anomalies, threats)."),
         ("--services", "Include service discovery and cybersecurity risk analysis."),
         ("--sizes", "Include packet size distribution analysis."),
         ("--smb", "Include SMB protocol analysis (Versioning, Shares, Anomalies)."),
@@ -373,11 +400,15 @@ def build_parser() -> argparse.ArgumentParser:
         ("--strings", "Include cleartext strings extraction and anomaly analysis."),
         ("--syslog", "Include syslog analysis (messages, clients, severity, anomalies)."),
         ("--tcp", "Include TCP analysis in the output."),
+        ("--teamviewer", "Include TeamViewer analysis (sessions, hints, anomalies, threats)."),
+        ("--telnet", "Include Telnet analysis (sessions, credentials, anomalies, threats)."),
         ("--threats", "Include consolidated threat detections in the output."),
         ("--timeline", "Include a threat-hunting timeline for a specific IP (use with -ip)."),
         ("--tls", "Include TLS/HTTPS analysis in the output."),
         ("--udp", "Include UDP analysis in the output."),
         ("--vlan", "Include VLAN analysis in the output."),
+        ("--vnc", "Include VNC analysis (sessions, banners, anomalies, threats)."),
+        ("--winrm", "Include WinRM analysis (HTTP/HTTPS, anomalies, threats)."),
     ]
     for flag, help_text in it_flags:
         it_group.add_argument(flag, action="store_true", help=help_text)
@@ -430,8 +461,14 @@ def _analyze_paths(
     show_icmp: bool,
     show_dns: bool,
     show_http: bool,
+    show_ftp: bool,
     show_tls: bool,
     show_ssh: bool,
+    show_rdp: bool,
+    show_telnet: bool,
+    show_vnc: bool,
+    show_teamviewer: bool,
+    show_winrm: bool,
     show_syslog: bool,
     show_tcp: bool,
     show_udp: bool,
@@ -450,6 +487,7 @@ def _analyze_paths(
     show_certificates: bool,
     show_health: bool,
     show_hostname: bool,
+    show_hostdetails: bool,
     show_timeline: bool,
     timeline_ip: str | None,
     show_ntlm: bool,
@@ -553,6 +591,12 @@ def _analyze_paths(
                     rollups.setdefault("http", []).append(http_summary)
                 else:
                     print(render_http_summary(http_summary, verbose=verbose))
+            elif step == "ftp" and show_ftp:
+                ftp_summary = analyze_ftp(path, show_status=show_status, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("ftp", []).append(ftp_summary)
+                else:
+                    print(render_ftp_summary(ftp_summary, verbose=verbose))
             elif step == "tls" and show_tls:
                 tls_summary = analyze_tls(path, show_status=show_status, packets=packets, meta=meta)
                 if summarize_rollups:
@@ -565,6 +609,36 @@ def _analyze_paths(
                     rollups.setdefault("ssh", []).append(ssh_summary)
                 else:
                     print(render_ssh_summary(ssh_summary, verbose=verbose))
+            elif step == "rdp" and show_rdp:
+                rdp_summary = analyze_rdp(path, show_status=show_status, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("rdp", []).append(rdp_summary)
+                else:
+                    print(render_rdp_summary(rdp_summary, verbose=verbose))
+            elif step == "telnet" and show_telnet:
+                telnet_summary = analyze_telnet(path, show_status=show_status, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("telnet", []).append(telnet_summary)
+                else:
+                    print(render_telnet_summary(telnet_summary, verbose=verbose))
+            elif step == "vnc" and show_vnc:
+                vnc_summary = analyze_vnc(path, show_status=show_status, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("vnc", []).append(vnc_summary)
+                else:
+                    print(render_vnc_summary(vnc_summary, verbose=verbose))
+            elif step == "teamviewer" and show_teamviewer:
+                tv_summary = analyze_teamviewer(path, show_status=show_status, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("teamviewer", []).append(tv_summary)
+                else:
+                    print(render_teamviewer_summary(tv_summary, verbose=verbose))
+            elif step == "winrm" and show_winrm:
+                winrm_summary = analyze_winrm(path, show_status=show_status, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("winrm", []).append(winrm_summary)
+                else:
+                    print(render_winrm_summary(winrm_summary, verbose=verbose))
             elif step == "syslog" and show_syslog:
                 syslog_summary = analyze_syslog(path, show_status=show_status, packets=packets, meta=meta)
                 if summarize_rollups:
@@ -679,6 +753,12 @@ def _analyze_paths(
                     rollups.setdefault("hostname", []).append(hostname_summary)
                 else:
                     print(render_hostname_summary(hostname_summary, verbose=verbose))
+            elif step == "hostdetails" and show_hostdetails and timeline_ip:
+                hostdetails_summary = analyze_hostdetails(path, timeline_ip, show_status=show_status)
+                if summarize_rollups:
+                    rollups.setdefault("hostdetails", []).append(hostdetails_summary)
+                else:
+                    print(render_hostdetails_summary(hostdetails_summary, verbose=verbose))
             elif step == "timeline" and show_timeline and timeline_ip:
                 timeline_summary = analyze_timeline(path, timeline_ip, show_status=show_status)
                 if summarize_rollups:
@@ -916,8 +996,14 @@ def _analyze_paths(
             "icmp": "ICMP ANALYSIS",
             "dns": "DNS ANALYSIS",
             "http": "HTTP ANALYSIS",
+            "ftp": "FTP ANALYSIS",
             "tls": "TLS/HTTPS ANALYSIS",
             "ssh": "SSH ANALYSIS",
+            "rdp": "RDP ANALYSIS",
+            "telnet": "TELNET ANALYSIS",
+            "vnc": "VNC ANALYSIS",
+            "teamviewer": "TEAMVIEWER ANALYSIS",
+            "winrm": "WINRM ANALYSIS",
             "syslog": "SYSLOG ANALYSIS",
             "tcp": "TCP ANALYSIS",
             "udp": "UDP ANALYSIS",
@@ -936,6 +1022,7 @@ def _analyze_paths(
             "certificates": "CERTIFICATE ANALYSIS",
             "health": "TRAFFIC HEALTH ANALYSIS",
             "hostname": "HOSTNAME DISCOVERY",
+            "hostdetails": "HOST DETAILS",
             "timeline": "TIMELINE ANALYSIS",
             "domain": "DOMAIN ANALYSIS",
             "ldap": "LDAP ANALYSIS",
@@ -988,6 +1075,39 @@ def _analyze_paths(
                 elif step == "hostname":
                     merged_hostname = merge_hostname_summaries(rollups[step])
                     print(render_hostname_summary(merged_hostname, verbose=verbose))
+                elif step == "hostdetails":
+                    merged_hostdetails = merge_hostdetails_summaries(rollups[step])
+                    print(render_hostdetails_summary(merged_hostdetails, verbose=verbose))
+                elif step == "ftp":
+                    merged_ftp = merge_ftp_summaries(rollups[step])
+                    print(render_ftp_summary(merged_ftp, verbose=verbose))
+                elif step == "ssh":
+                    merged_ssh = merge_ssh_summaries(rollups[step])
+                    print(render_ssh_summary(merged_ssh, verbose=verbose))
+                elif step == "protocols":
+                    merged_protocols = merge_protocols_summaries(rollups[step])
+                    print(render_protocols_summary(merged_protocols, verbose=verbose))
+                elif step == "services":
+                    merged_services = merge_services_summaries(rollups[step])
+                    print(render_services_summary(merged_services))
+                elif step == "health":
+                    merged_health = merge_health_summaries(rollups[step])
+                    print(render_health_summary(merged_health))
+                elif step == "rdp":
+                    merged_rdp = merge_rdp_summaries(rollups[step])
+                    print(render_rdp_summary(merged_rdp, verbose=verbose))
+                elif step == "telnet":
+                    merged_telnet = merge_telnet_summaries(rollups[step])
+                    print(render_telnet_summary(merged_telnet, verbose=verbose))
+                elif step == "vnc":
+                    merged_vnc = merge_vnc_summaries(rollups[step])
+                    print(render_vnc_summary(merged_vnc, verbose=verbose))
+                elif step == "teamviewer":
+                    merged_tv = merge_teamviewer_summaries(rollups[step])
+                    print(render_teamviewer_summary(merged_tv, verbose=verbose))
+                elif step == "winrm":
+                    merged_winrm = merge_winrm_summaries(rollups[step])
+                    print(render_winrm_summary(merged_winrm, verbose=verbose))
                 elif step == "threats":
                     merged_threats = merge_threats_summaries(rollups[step])
                     print(render_threats_summary(merged_threats, verbose=verbose))
@@ -1031,6 +1151,9 @@ def main() -> int:
 
     if args.timeline and not args.timeline_ip:
         print("Timeline analysis requires a target IP. Use -ip <address> with --timeline.")
+        return 2
+    if args.hostdetails and not args.timeline_ip:
+        print("Host details analysis requires a target IP. Use -ip <address> with --hostdetails.")
         return 2
 
     raw_targets = args.target if isinstance(args.target, list) else [args.target]
@@ -1086,8 +1209,14 @@ def main() -> int:
         show_icmp=args.icmp,
         show_dns=args.dns,
         show_http=args.http,
+        show_ftp=args.ftp,
         show_tls=args.tls,
         show_ssh=args.ssh,
+        show_rdp=args.rdp,
+        show_telnet=args.telnet,
+        show_vnc=args.vnc,
+        show_teamviewer=args.teamviewer,
+        show_winrm=args.winrm,
         show_syslog=args.syslog,
         show_tcp=args.tcp,
         show_udp=args.udp,
@@ -1106,6 +1235,7 @@ def main() -> int:
         show_certificates=args.certificates,
         show_health=args.health,
         show_hostname=args.hostname,
+        show_hostdetails=args.hostdetails,
         show_timeline=args.timeline,
         timeline_ip=args.timeline_ip,
         show_ntlm=args.ntlm,

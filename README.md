@@ -2,6 +2,15 @@
 
 Modular PCAP/PCAPNG analysis CLI for fast triage and deep-dive protocol investigations across enterprise IT and ICS/OT traffic.
 
+## ICS/OT Focus
+
+Industrial networks are first-class here: deep protocol coverage, safety-conscious detections, and context that reads like an OT incident timeline instead of a raw packet dump.
+
+What you get:
+- Dedicated OT protocol analyzers (IEC-104, DNP3, S7, Profinet, EtherNet/IP, MMS, and more).
+- OT-aware timing/jitter insights for control traffic.
+- Analyst-friendly outputs tuned for plant floors, substations, and mixed IT/OT environments.
+
 ## Install
 
 ```bash
@@ -43,6 +52,7 @@ Use `--summarize` to aggregate selected analyses across all resolved target pcap
 
 - `--ips` summarize renders a merged IPS report.
 - `--timeline` summarize renders a merged timeline report.
+- `--health`, `--rdp`, `--telnet`, `--vnc`, `--teamviewer`, and `--winrm` summarize render full module sections.
 - Other modules summarize via module rollups.
 - Recursive directory traversal is enabled only with `-r/--recursive`.
 
@@ -88,6 +98,7 @@ python -m pcapper --help
 - `--exfil`
 - `--files`
 - `--health`
+- `--hostdetails`
 - `--hostname`
 - `--http`
 - `--icmp`
@@ -98,6 +109,7 @@ python -m pcapper --help
 - `--nfs`
 - `--ntlm`
 - `--protocols`
+- `--rdp`
 - `--services`
 - `--sizes`
 - `--smb`
@@ -105,13 +117,17 @@ python -m pcapper --help
 - `--strings`
 - `--syslog`
 - `--tcp`
+- `--teamviewer`
+- `--telnet`
 - `--threats`
 - `--timeline`
 - `--tls`
 - `--udp`
 - `--vlan`
+- `--vnc`
+- `--winrm`
 
-Count: 32 flags
+Count: 39 flags
 
 ### OT/ICS/Industrial functions (alphabetical)
 

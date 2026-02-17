@@ -234,7 +234,7 @@ def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], Pc
     try:
         for pkt in reader:
             packets.append(pkt)
-            if stream is not None and size_bytes:
+            if status.enabled and stream is not None and size_bytes:
                 try:
                     pos = stream.tell()
                     percent = int(min(100, (pos / size_bytes) * 100))

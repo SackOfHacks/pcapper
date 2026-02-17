@@ -62,6 +62,247 @@ class HealthSummary:
     errors: list[str]
 
 
+def merge_health_summaries(summaries: list[HealthSummary] | tuple[HealthSummary, ...] | set[HealthSummary]) -> HealthSummary:
+    summary_list = list(summaries)
+    if not summary_list:
+        return HealthSummary(
+            path=Path("ALL_PCAPS_0"),
+            total_packets=0,
+            total_bytes=0,
+            tcp_packets=0,
+            udp_packets=0,
+            retransmissions=0,
+            retransmission_rate=0.0,
+            first_seen=None,
+            last_seen=None,
+            duration_seconds=None,
+            endpoint_packets=Counter(),
+            endpoint_bytes=Counter(),
+            flow_duration_buckets={"all": Counter(), "tcp": Counter(), "udp": Counter()},
+            tcp_syn=0,
+            tcp_syn_ack=0,
+            tcp_rst=0,
+            tcp_zero_window=0,
+            tcp_small_window=0,
+            tcp_syn_sources=Counter(),
+            tcp_rst_sources=Counter(),
+            tcp_zero_window_sources=Counter(),
+            udp_amp_candidates=[],
+            ot_timing={"profinet_rt": [], "enip_io": [], "s7_rosctr": []},
+            ttl_expired=0,
+            ttl_low=0,
+            dscp_counts=Counter(),
+            ecn_counts=Counter(),
+            snmp_packets=0,
+            snmp_versions=Counter(),
+            snmp_communities=Counter(),
+            expired_certs=0,
+            self_signed_certs=0,
+            findings=[],
+            errors=[],
+        )
+
+    total_packets = 0
+    total_bytes = 0
+    tcp_packets = 0
+    udp_packets = 0
+    retransmissions = 0
+    tcp_syn = 0
+    tcp_syn_ack = 0
+    tcp_rst = 0
+    tcp_zero_window = 0
+    tcp_small_window = 0
+    ttl_expired = 0
+    ttl_low = 0
+    snmp_packets = 0
+    expired_certs = 0
+    self_signed_certs = 0
+
+    first_seen: Optional[float] = None
+    last_seen: Optional[float] = None
+
+    endpoint_packets: Counter[str] = Counter()
+    endpoint_bytes: Counter[str] = Counter()
+    flow_duration_buckets: dict[str, Counter[str]] = {
+        "all": Counter(),
+        "tcp": Counter(),
+        "udp": Counter(),
+    }
+    tcp_syn_sources: Counter[str] = Counter()
+    tcp_rst_sources: Counter[str] = Counter()
+    tcp_zero_window_sources: Counter[str] = Counter()
+    dscp_counts: Counter[int] = Counter()
+    ecn_counts: Counter[int] = Counter()
+    snmp_versions: Counter[str] = Counter()
+    snmp_communities: Counter[str] = Counter()
+
+    udp_amp_candidates: list[str] = []
+    ot_timing: dict[str, list[dict[str, object]]] = {
+        "profinet_rt": [],
+        "enip_io": [],
+        "s7_rosctr": [],
+    }
+    errors: list[str] = []
+
+    for summary in summary_list:
+        total_packets += summary.total_packets
+        total_bytes += summary.total_bytes
+        tcp_packets += summary.tcp_packets
+        udp_packets += summary.udp_packets
+        retransmissions += summary.retransmissions
+        tcp_syn += summary.tcp_syn
+        tcp_syn_ack += summary.tcp_syn_ack
+        tcp_rst += summary.tcp_rst
+        tcp_zero_window += summary.tcp_zero_window
+        tcp_small_window += summary.tcp_small_window
+        ttl_expired += summary.ttl_expired
+        ttl_low += summary.ttl_low
+        snmp_packets += summary.snmp_packets
+        expired_certs += summary.expired_certs
+        self_signed_certs += summary.self_signed_certs
+
+        if summary.first_seen is not None:
+            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+        if summary.last_seen is not None:
+            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+
+        endpoint_packets.update(summary.endpoint_packets)
+        endpoint_bytes.update(summary.endpoint_bytes)
+
+        for key in ("all", "tcp", "udp"):
+            flow_duration_buckets.setdefault(key, Counter()).update(summary.flow_duration_buckets.get(key, Counter()))
+
+        tcp_syn_sources.update(summary.tcp_syn_sources)
+        tcp_rst_sources.update(summary.tcp_rst_sources)
+        tcp_zero_window_sources.update(summary.tcp_zero_window_sources)
+        dscp_counts.update(summary.dscp_counts)
+        ecn_counts.update(summary.ecn_counts)
+        snmp_versions.update(summary.snmp_versions)
+        snmp_communities.update(summary.snmp_communities)
+
+        udp_amp_candidates.extend(summary.udp_amp_candidates)
+        for key in ("profinet_rt", "enip_io", "s7_rosctr"):
+            ot_timing[key].extend(summary.ot_timing.get(key, []))
+        errors.extend(summary.errors)
+
+    if udp_amp_candidates:
+        seen_amp: set[str] = set()
+        unique_amp: list[str] = []
+        for item in udp_amp_candidates:
+            if item in seen_amp:
+                continue
+            seen_amp.add(item)
+            unique_amp.append(item)
+        udp_amp_candidates = unique_amp
+
+    retransmission_rate = (retransmissions / tcp_packets) if tcp_packets else 0.0
+    duration_seconds = None
+    if first_seen is not None and last_seen is not None:
+        duration_seconds = max(0.0, last_seen - first_seen)
+
+    findings: list[dict[str, object]] = []
+    if retransmissions > 50 and retransmission_rate > 0.01:
+        findings.append({
+            "severity": "warning",
+            "summary": "Elevated TCP retransmissions",
+            "details": f"{retransmissions} retransmissions ({retransmission_rate:.2%} of TCP packets).",
+        })
+    if tcp_syn:
+        syn_only = tcp_syn - tcp_syn_ack
+        if syn_only > 50:
+            findings.append({
+                "severity": "warning",
+                "summary": "High SYN without SYN-ACK",
+                "details": f"SYN-only count: {syn_only}.",
+            })
+        rst_ratio = tcp_rst / max(tcp_syn, 1)
+        if tcp_rst > 50 and rst_ratio >= 0.2:
+            findings.append({
+                "severity": "warning",
+                "summary": "High TCP RST/SYN ratio",
+                "details": f"RST {tcp_rst} vs SYN {tcp_syn} ({rst_ratio:.2%}).",
+            })
+    if tcp_zero_window > 20:
+        findings.append({
+            "severity": "warning",
+            "summary": "TCP zero-window events",
+            "details": f"{tcp_zero_window} packets with zero window observed.",
+        })
+    if udp_amp_candidates:
+        findings.append({
+            "severity": "warning",
+            "summary": "Potential UDP amplification patterns",
+            "details": ", ".join(udp_amp_candidates[:3]),
+        })
+    if ttl_expired:
+        findings.append({
+            "severity": "warning",
+            "summary": "Expired TTL/Hop Limit observed",
+            "details": f"{ttl_expired} packets with TTL/Hop Limit <= 1.",
+        })
+    if ttl_low and ttl_low > ttl_expired:
+        findings.append({
+            "severity": "info",
+            "summary": "Low TTL/Hop Limit values",
+            "details": f"{ttl_low} packets with TTL/Hop Limit <= 5.",
+        })
+    if expired_certs:
+        findings.append({
+            "severity": "warning",
+            "summary": "Expired certificates detected",
+            "details": f"{expired_certs} expired or invalid certificate(s).",
+        })
+    if snmp_packets:
+        findings.append({
+            "severity": "warning",
+            "summary": "SNMP traffic observed",
+            "details": f"{snmp_packets} SNMP packets detected; review community strings and access controls.",
+        })
+        if any(comm.lower() in {"public", "private"} for comm in snmp_communities):
+            findings.append({
+                "severity": "critical",
+                "summary": "Default SNMP community strings detected",
+                "details": "SNMP community strings include 'public' or 'private'.",
+            })
+
+    return HealthSummary(
+        path=Path("ALL_PCAPS"),
+        total_packets=total_packets,
+        total_bytes=total_bytes,
+        tcp_packets=tcp_packets,
+        udp_packets=udp_packets,
+        retransmissions=retransmissions,
+        retransmission_rate=retransmission_rate,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        duration_seconds=duration_seconds,
+        endpoint_packets=endpoint_packets,
+        endpoint_bytes=endpoint_bytes,
+        flow_duration_buckets=flow_duration_buckets,
+        tcp_syn=tcp_syn,
+        tcp_syn_ack=tcp_syn_ack,
+        tcp_rst=tcp_rst,
+        tcp_zero_window=tcp_zero_window,
+        tcp_small_window=tcp_small_window,
+        tcp_syn_sources=tcp_syn_sources,
+        tcp_rst_sources=tcp_rst_sources,
+        tcp_zero_window_sources=tcp_zero_window_sources,
+        udp_amp_candidates=udp_amp_candidates,
+        ot_timing=ot_timing,
+        ttl_expired=ttl_expired,
+        ttl_low=ttl_low,
+        dscp_counts=dscp_counts,
+        ecn_counts=ecn_counts,
+        snmp_packets=snmp_packets,
+        snmp_versions=snmp_versions,
+        snmp_communities=snmp_communities,
+        expired_certs=expired_certs,
+        self_signed_certs=self_signed_certs,
+        findings=findings,
+        errors=errors,
+    )
+
+
 AMPLIFICATION_PORTS = {19, 53, 123, 161, 389, 1900, 5353, 11211}
 FLOW_BUCKETS = [
     (0.0, 1.0, "<=1s"),

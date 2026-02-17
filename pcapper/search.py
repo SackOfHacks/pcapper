@@ -161,7 +161,7 @@ def analyze_search(
         for pkt in reader:
             total_packets += 1
 
-            if stream is not None and size_bytes:
+            if status.enabled and stream is not None and size_bytes:
                 try:
                     pos = stream.tell()
                     percent = int(min(100, (pos / size_bytes) * 100))

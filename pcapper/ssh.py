@@ -12,11 +12,13 @@ from .utils import safe_float
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
+    from scapy.layers.l2 import Ether  # type: ignore
     from scapy.packet import Raw  # type: ignore
 except Exception:  # pragma: no cover
     IP = None  # type: ignore
     TCP = None  # type: ignore
     IPv6 = None  # type: ignore
+    Ether = None  # type: ignore
     Raw = None  # type: ignore
 
 
@@ -192,12 +194,20 @@ class SshConversation:
     server_ip: str
     server_port: int
     client_port: int
+    client_mac: Optional[str]
+    server_mac: Optional[str]
     packets: int
     bytes: int
+    client_packets: int
+    server_packets: int
+    client_bytes: int
+    server_bytes: int
     first_seen: Optional[float]
     last_seen: Optional[float]
     client_version: Optional[str]
     server_version: Optional[str]
+    auth_failures: int
+    auth_successes: int
 
 
 @dataclass(frozen=True)
@@ -206,11 +216,18 @@ class SshSummary:
     total_packets: int
     ssh_packets: int
     total_bytes: int
+    client_packets: int
+    server_packets: int
+    client_bytes: int
+    server_bytes: int
     total_sessions: int
     unique_clients: int
     unique_servers: int
     client_counts: Counter[str]
     server_counts: Counter[str]
+    client_macs: Counter[str]
+    server_macs: Counter[str]
+    ip_to_macs: dict[str, list[str]]
     server_ports: Counter[int]
     client_versions: Counter[str]
     server_versions: Counter[str]
@@ -232,6 +249,9 @@ class SshSummary:
     suspicious_plaintext: Counter[str]
     file_artifacts: Counter[str]
     conversations: list[SshConversation]
+    auth_attempts_by_client: Counter[str]
+    auth_failures_by_client: Counter[str]
+    auth_successes_by_client: Counter[str]
     detections: list[dict[str, object]]
     anomalies: list[dict[str, object]]
     artifacts: list[str]
@@ -246,11 +266,18 @@ class SshSummary:
             "total_packets": self.total_packets,
             "ssh_packets": self.ssh_packets,
             "total_bytes": self.total_bytes,
+            "client_packets": self.client_packets,
+            "server_packets": self.server_packets,
+            "client_bytes": self.client_bytes,
+            "server_bytes": self.server_bytes,
             "total_sessions": self.total_sessions,
             "unique_clients": self.unique_clients,
             "unique_servers": self.unique_servers,
             "client_counts": dict(self.client_counts),
             "server_counts": dict(self.server_counts),
+            "client_macs": dict(self.client_macs),
+            "server_macs": dict(self.server_macs),
+            "ip_to_macs": {key: list(value) for key, value in self.ip_to_macs.items()},
             "server_ports": dict(self.server_ports),
             "client_versions": dict(self.client_versions),
             "server_versions": dict(self.server_versions),
@@ -277,15 +304,26 @@ class SshSummary:
                     "server_ip": conv.server_ip,
                     "server_port": conv.server_port,
                     "client_port": conv.client_port,
+                    "client_mac": conv.client_mac,
+                    "server_mac": conv.server_mac,
                     "packets": conv.packets,
                     "bytes": conv.bytes,
+                    "client_packets": conv.client_packets,
+                    "server_packets": conv.server_packets,
+                    "client_bytes": conv.client_bytes,
+                    "server_bytes": conv.server_bytes,
                     "first_seen": conv.first_seen,
                     "last_seen": conv.last_seen,
                     "client_version": conv.client_version,
                     "server_version": conv.server_version,
+                    "auth_failures": conv.auth_failures,
+                    "auth_successes": conv.auth_successes,
                 }
                 for conv in self.conversations
             ],
+            "auth_attempts_by_client": dict(self.auth_attempts_by_client),
+            "auth_failures_by_client": dict(self.auth_failures_by_client),
+            "auth_successes_by_client": dict(self.auth_successes_by_client),
             "detections": list(self.detections),
             "anomalies": list(self.anomalies),
             "artifacts": list(self.artifacts),
@@ -296,18 +334,252 @@ class SshSummary:
         }
 
 
+def merge_ssh_summaries(
+    summaries: list[SshSummary] | tuple[SshSummary, ...] | set[SshSummary],
+) -> SshSummary:
+    summary_list = list(summaries)
+    if not summary_list:
+        return SshSummary(
+            path=Path("ALL_PCAPS_0"),
+            total_packets=0,
+            ssh_packets=0,
+            total_bytes=0,
+            client_packets=0,
+            server_packets=0,
+            client_bytes=0,
+            server_bytes=0,
+            total_sessions=0,
+            unique_clients=0,
+            unique_servers=0,
+            client_counts=Counter(),
+            server_counts=Counter(),
+            client_macs=Counter(),
+            server_macs=Counter(),
+            ip_to_macs={},
+            server_ports=Counter(),
+            client_versions=Counter(),
+            server_versions=Counter(),
+            client_software=Counter(),
+            server_software=Counter(),
+            auth_methods=Counter(),
+            kex_algorithms=Counter(),
+            host_key_algorithms=Counter(),
+            cipher_algorithms=Counter(),
+            mac_algorithms=Counter(),
+            compression_algorithms=Counter(),
+            message_types=Counter(),
+            client_message_types=Counter(),
+            server_message_types=Counter(),
+            request_counts=Counter(),
+            response_counts=Counter(),
+            disconnect_reasons=Counter(),
+            plaintext_strings=Counter(),
+            suspicious_plaintext=Counter(),
+            file_artifacts=Counter(),
+            conversations=[],
+            auth_attempts_by_client=Counter(),
+            auth_failures_by_client=Counter(),
+            auth_successes_by_client=Counter(),
+            detections=[],
+            anomalies=[],
+            artifacts=[],
+            errors=[],
+            first_seen=None,
+            last_seen=None,
+            duration_seconds=None,
+        )
+
+    total_packets = 0
+    ssh_packets = 0
+    total_bytes = 0
+    client_packets = 0
+    server_packets = 0
+    client_bytes = 0
+    server_bytes = 0
+    total_sessions = 0
+
+    first_seen: Optional[float] = None
+    last_seen: Optional[float] = None
+
+    client_counts: Counter[str] = Counter()
+    server_counts: Counter[str] = Counter()
+    client_macs: Counter[str] = Counter()
+    server_macs: Counter[str] = Counter()
+    ip_to_macs: dict[str, set[str]] = defaultdict(set)
+    server_ports: Counter[int] = Counter()
+    client_versions: Counter[str] = Counter()
+    server_versions: Counter[str] = Counter()
+    client_software: Counter[str] = Counter()
+    server_software: Counter[str] = Counter()
+    auth_methods: Counter[str] = Counter()
+    kex_algorithms: Counter[str] = Counter()
+    host_key_algorithms: Counter[str] = Counter()
+    cipher_algorithms: Counter[str] = Counter()
+    mac_algorithms: Counter[str] = Counter()
+    compression_algorithms: Counter[str] = Counter()
+    message_types: Counter[str] = Counter()
+    client_message_types: Counter[str] = Counter()
+    server_message_types: Counter[str] = Counter()
+    request_counts: Counter[str] = Counter()
+    response_counts: Counter[str] = Counter()
+    disconnect_reasons: Counter[str] = Counter()
+    plaintext_strings: Counter[str] = Counter()
+    suspicious_plaintext: Counter[str] = Counter()
+    file_artifacts: Counter[str] = Counter()
+    auth_attempts_by_client: Counter[str] = Counter()
+    auth_failures_by_client: Counter[str] = Counter()
+    auth_successes_by_client: Counter[str] = Counter()
+
+    conversations: list[SshConversation] = []
+    detections: list[dict[str, object]] = []
+    anomalies: list[dict[str, object]] = []
+    artifacts: list[str] = []
+    errors: list[str] = []
+
+    for summary in summary_list:
+        total_packets += summary.total_packets
+        ssh_packets += summary.ssh_packets
+        total_bytes += summary.total_bytes
+        client_packets += summary.client_packets
+        server_packets += summary.server_packets
+        client_bytes += summary.client_bytes
+        server_bytes += summary.server_bytes
+        total_sessions += summary.total_sessions
+
+        if summary.first_seen is not None:
+            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+        if summary.last_seen is not None:
+            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+
+        client_counts.update(summary.client_counts)
+        server_counts.update(summary.server_counts)
+        client_macs.update(summary.client_macs)
+        server_macs.update(summary.server_macs)
+        for ip_value, macs in summary.ip_to_macs.items():
+            ip_to_macs[ip_value].update(macs)
+        server_ports.update(summary.server_ports)
+        client_versions.update(summary.client_versions)
+        server_versions.update(summary.server_versions)
+        client_software.update(summary.client_software)
+        server_software.update(summary.server_software)
+        auth_methods.update(summary.auth_methods)
+        kex_algorithms.update(summary.kex_algorithms)
+        host_key_algorithms.update(summary.host_key_algorithms)
+        cipher_algorithms.update(summary.cipher_algorithms)
+        mac_algorithms.update(summary.mac_algorithms)
+        compression_algorithms.update(summary.compression_algorithms)
+        message_types.update(summary.message_types)
+        client_message_types.update(summary.client_message_types)
+        server_message_types.update(summary.server_message_types)
+        request_counts.update(summary.request_counts)
+        response_counts.update(summary.response_counts)
+        disconnect_reasons.update(summary.disconnect_reasons)
+        plaintext_strings.update(summary.plaintext_strings)
+        suspicious_plaintext.update(summary.suspicious_plaintext)
+        file_artifacts.update(summary.file_artifacts)
+        auth_attempts_by_client.update(summary.auth_attempts_by_client)
+        auth_failures_by_client.update(summary.auth_failures_by_client)
+        auth_successes_by_client.update(summary.auth_successes_by_client)
+
+        conversations.extend(summary.conversations)
+        detections.extend(summary.detections)
+        anomalies.extend(summary.anomalies)
+        artifacts.extend(summary.artifacts)
+        errors.extend(summary.errors)
+
+    duration_seconds = None
+    if first_seen is not None and last_seen is not None:
+        duration_seconds = max(0.0, last_seen - first_seen)
+
+    return SshSummary(
+        path=Path("ALL_PCAPS"),
+        total_packets=total_packets,
+        ssh_packets=ssh_packets,
+        total_bytes=total_bytes,
+        client_packets=client_packets,
+        server_packets=server_packets,
+        client_bytes=client_bytes,
+        server_bytes=server_bytes,
+        total_sessions=total_sessions,
+        unique_clients=len(client_counts),
+        unique_servers=len(server_counts),
+        client_counts=client_counts,
+        server_counts=server_counts,
+        client_macs=client_macs,
+        server_macs=server_macs,
+        ip_to_macs={key: sorted(value) for key, value in ip_to_macs.items()},
+        server_ports=server_ports,
+        client_versions=client_versions,
+        server_versions=server_versions,
+        client_software=client_software,
+        server_software=server_software,
+        auth_methods=auth_methods,
+        kex_algorithms=kex_algorithms,
+        host_key_algorithms=host_key_algorithms,
+        cipher_algorithms=cipher_algorithms,
+        mac_algorithms=mac_algorithms,
+        compression_algorithms=compression_algorithms,
+        message_types=message_types,
+        client_message_types=client_message_types,
+        server_message_types=server_message_types,
+        request_counts=request_counts,
+        response_counts=response_counts,
+        disconnect_reasons=disconnect_reasons,
+        plaintext_strings=plaintext_strings,
+        suspicious_plaintext=suspicious_plaintext,
+        file_artifacts=file_artifacts,
+        conversations=conversations,
+        auth_attempts_by_client=auth_attempts_by_client,
+        auth_failures_by_client=auth_failures_by_client,
+        auth_successes_by_client=auth_successes_by_client,
+        detections=detections,
+        anomalies=anomalies,
+        artifacts=artifacts,
+        errors=errors,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        duration_seconds=duration_seconds,
+    )
+
 @dataclass
 class _SessionState:
     client_ip: str
     server_ip: str
     client_port: int
     server_port: int
+    client_mac: Optional[str] = None
+    server_mac: Optional[str] = None
     packets: int = 0
     bytes: int = 0
+    client_packets: int = 0
+    server_packets: int = 0
+    client_bytes: int = 0
+    server_bytes: int = 0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
     client_version: Optional[str] = None
     server_version: Optional[str] = None
+    auth_failures: int = 0
+    auth_successes: int = 0
+
+
+def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
+    if len(times) < 5:
+        return None
+    times_sorted = sorted(times)
+    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
+    if len(deltas) < 4:
+        return None
+    avg = sum(deltas) / len(deltas)
+    if avg <= 0:
+        return None
+    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
+    stddev = variance ** 0.5
+    if avg < 5 or avg > 86400:
+        return None
+    if stddev > max(5.0, avg * 0.25):
+        return None
+    return {"avg": avg, "stddev": stddev}
 
 
 def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
@@ -441,11 +713,18 @@ def analyze_ssh(
             total_packets=0,
             ssh_packets=0,
             total_bytes=0,
+            client_packets=0,
+            server_packets=0,
+            client_bytes=0,
+            server_bytes=0,
             total_sessions=0,
             unique_clients=0,
             unique_servers=0,
             client_counts=Counter(),
             server_counts=Counter(),
+            client_macs=Counter(),
+            server_macs=Counter(),
+            ip_to_macs={},
             server_ports=Counter(),
             client_versions=Counter(),
             server_versions=Counter(),
@@ -467,6 +746,9 @@ def analyze_ssh(
             suspicious_plaintext=Counter(),
             file_artifacts=Counter(),
             conversations=[],
+            auth_attempts_by_client=Counter(),
+            auth_failures_by_client=Counter(),
+            auth_successes_by_client=Counter(),
             detections=[],
             anomalies=[],
             artifacts=[],
@@ -483,12 +765,19 @@ def analyze_ssh(
     total_packets = 0
     ssh_packets = 0
     total_bytes = 0
+    client_packets = 0
+    server_packets = 0
+    client_bytes = 0
+    server_bytes = 0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
     sessions: dict[tuple[str, int, str, int], _SessionState] = {}
     client_counts: Counter[str] = Counter()
     server_counts: Counter[str] = Counter()
+    client_macs: Counter[str] = Counter()
+    server_macs: Counter[str] = Counter()
+    ip_to_macs: dict[str, set[str]] = defaultdict(set)
     server_ports: Counter[int] = Counter()
 
     client_versions: Counter[str] = Counter()
@@ -518,6 +807,12 @@ def analyze_ssh(
     }
 
     short_session_counts: Counter[tuple[str, str]] = Counter()
+    short_session_by_client: Counter[str] = Counter()
+    short_session_targets: dict[str, set[str]] = defaultdict(set)
+    pair_first_seen: dict[tuple[str, str], list[float]] = defaultdict(list)
+    auth_attempts_by_client: Counter[str] = Counter()
+    auth_failures_by_client: Counter[str] = Counter()
+    auth_successes_by_client: Counter[str] = Counter()
 
     try:
         for pkt in reader:
@@ -553,6 +848,17 @@ def analyze_ssh(
             sport = int(getattr(tcp, "sport", 0) or 0)
             dport = int(getattr(tcp, "dport", 0) or 0)
 
+            eth_src = None
+            eth_dst = None
+            if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+                try:
+                    eth_layer = pkt[Ether]  # type: ignore[index]
+                    eth_src = str(getattr(eth_layer, "src", "")) or None
+                    eth_dst = str(getattr(eth_layer, "dst", "")) or None
+                except Exception:
+                    eth_src = None
+                    eth_dst = None
+
             payload = b""
             if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
                 try:
@@ -584,6 +890,14 @@ def analyze_ssh(
             server_ports[server_port] += 1
             client_counts[client_ip] += 1
             server_counts[server_ip] += 1
+            if eth_src and src_ip:
+                ip_to_macs[src_ip].add(eth_src.lower())
+            if eth_dst and dst_ip:
+                ip_to_macs[dst_ip].add(eth_dst.lower())
+            if eth_src and src_ip == client_ip:
+                client_macs[eth_src.lower()] += 1
+            if eth_dst and dst_ip == server_ip:
+                server_macs[eth_dst.lower()] += 1
 
             session_key = (client_ip, client_port, server_ip, server_port)
             session = sessions.get(session_key)
@@ -599,8 +913,22 @@ def analyze_ssh(
                     last_seen=ts,
                 )
                 sessions[session_key] = session
+            if session.client_mac is None and eth_src and src_ip == client_ip:
+                session.client_mac = eth_src.lower()
+            if session.server_mac is None and eth_dst and dst_ip == server_ip:
+                session.server_mac = eth_dst.lower()
             session.packets += 1
             session.bytes += pkt_len
+            if src_ip == client_ip:
+                session.client_packets += 1
+                session.client_bytes += pkt_len
+                client_packets += 1
+                client_bytes += pkt_len
+            else:
+                session.server_packets += 1
+                session.server_bytes += pkt_len
+                server_packets += 1
+                server_bytes += pkt_len
             if ts is not None:
                 if session.first_seen is None or ts < session.first_seen:
                     session.first_seen = ts
@@ -645,6 +973,14 @@ def analyze_ssh(
                     server_message_types[name] += 1
                     if name in RESPONSE_TYPES:
                         response_counts[name] += 1
+                    if msg_type == 51:
+                        session.auth_failures += 1
+                        auth_failures_by_client[client_ip] += 1
+                    if msg_type == 52:
+                        session.auth_successes += 1
+                        auth_successes_by_client[client_ip] += 1
+                if msg_type == 50 and src_ip == client_ip:
+                    auth_attempts_by_client[client_ip] += 1
                 if msg_type == 1 and reason is not None:
                     disconnect_reasons[SSH_DISCONNECT_REASONS.get(reason, f"Reason {reason}")] += 1
 
@@ -666,16 +1002,28 @@ def analyze_ssh(
                 server_ip=session.server_ip,
                 server_port=session.server_port,
                 client_port=session.client_port,
+                client_mac=session.client_mac,
+                server_mac=session.server_mac,
                 packets=session.packets,
                 bytes=session.bytes,
+                client_packets=session.client_packets,
+                server_packets=session.server_packets,
+                client_bytes=session.client_bytes,
+                server_bytes=session.server_bytes,
                 first_seen=session.first_seen,
                 last_seen=session.last_seen,
                 client_version=session.client_version,
                 server_version=session.server_version,
+                auth_failures=session.auth_failures,
+                auth_successes=session.auth_successes,
             )
         )
         if session.packets <= 6 and session.bytes < 2000:
             short_session_counts[(session.client_ip, session.server_ip)] += 1
+            short_session_by_client[session.client_ip] += 1
+            short_session_targets[session.client_ip].add(session.server_ip)
+        if session.first_seen is not None:
+            pair_first_seen[(session.client_ip, session.server_ip)].append(session.first_seen)
 
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
@@ -724,11 +1072,61 @@ def analyze_ssh(
                 "details": f"{client_ip} -> {server_ip} short sessions: {count}",
             })
 
+    for client_ip, count in short_session_by_client.items():
+        targets = short_session_targets.get(client_ip, set())
+        if count >= 30 and len(targets) >= 10:
+            anomalies.append({
+                "title": "Potential SSH scanning",
+                "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
+            })
+
+    for client_ip, failures in auth_failures_by_client.items():
+        successes = auth_successes_by_client.get(client_ip, 0)
+        if failures >= 25 and successes == 0:
+            detections.append({
+                "severity": "warning",
+                "summary": "Possible SSH brute force",
+                "details": f"{client_ip} auth failures: {failures}",
+            })
+        elif failures >= 50 and successes > 0:
+            detections.append({
+                "severity": "warning",
+                "summary": "Possible password spraying",
+                "details": f"{client_ip} auth failures: {failures}, successes: {successes}",
+            })
+
     if disconnect_reasons:
         anomalies.append({
             "title": "SSH disconnects observed",
             "details": ", ".join(f"{reason}({count})" for reason, count in disconnect_reasons.most_common(5)),
         })
+
+    for (client_ip, server_ip), times in pair_first_seen.items():
+        score = _beaconing_score(times)
+        if score:
+            detections.append({
+                "severity": "info",
+                "summary": "Potential SSH beaconing",
+                "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
+            })
+
+    for session in sessions.values():
+        if session.client_bytes >= 50 * 1024 * 1024 and session.client_bytes > session.server_bytes * 3:
+            detections.append({
+                "severity": "warning",
+                "summary": "Potential SSH data exfiltration",
+                "details": (
+                    f"{session.client_ip} -> {session.server_ip} "
+                    f"outbound {session.client_bytes / (1024 * 1024):.1f} MB"
+                ),
+            })
+        if session.last_seen is not None and session.first_seen is not None:
+            duration = session.last_seen - session.first_seen
+            if duration >= 4 * 3600:
+                anomalies.append({
+                    "title": "Long-lived SSH session",
+                    "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
+                })
 
     total_sessions = len(conversations)
 
@@ -737,11 +1135,18 @@ def analyze_ssh(
         total_packets=total_packets,
         ssh_packets=ssh_packets,
         total_bytes=total_bytes,
+        client_packets=client_packets,
+        server_packets=server_packets,
+        client_bytes=client_bytes,
+        server_bytes=server_bytes,
         total_sessions=total_sessions,
         unique_clients=len(client_counts),
         unique_servers=len(server_counts),
         client_counts=client_counts,
         server_counts=server_counts,
+        client_macs=client_macs,
+        server_macs=server_macs,
+        ip_to_macs={key: sorted(value) for key, value in ip_to_macs.items()},
         server_ports=server_ports,
         client_versions=client_versions,
         server_versions=server_versions,
@@ -763,6 +1168,9 @@ def analyze_ssh(
         suspicious_plaintext=suspicious_plaintext,
         file_artifacts=file_artifacts,
         conversations=conversations,
+        auth_attempts_by_client=auth_attempts_by_client,
+        auth_failures_by_client=auth_failures_by_client,
+        auth_successes_by_client=auth_successes_by_client,
         detections=detections,
         anomalies=anomalies,
         artifacts=artifacts,

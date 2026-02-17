@@ -51,6 +51,71 @@ class ServiceSummary:
     hierarchy: Dict[str, int] # Service Name -> Count
     errors: List[str]
 
+
+def merge_services_summaries(
+    summaries: List[ServiceSummary] | Tuple[ServiceSummary, ...] | Set[ServiceSummary],
+) -> ServiceSummary:
+    summary_list = list(summaries)
+    if not summary_list:
+        return ServiceSummary(
+            path=Path("ALL_PCAPS_0"),
+            total_services=0,
+            assets=[],
+            risks=[],
+            hierarchy={},
+            errors=[],
+        )
+
+    assets_map: Dict[Tuple[str, int, str], ServiceAsset] = {}
+    risks: List[ServiceRisk] = []
+    cleartext_hits: Dict[Tuple[str, str], Set[int]] = defaultdict(set)
+    nonstandard_hits: Dict[Tuple[str, str], Set[int]] = defaultdict(set)
+    hierarchy: Counter[str] = Counter()
+    errors: List[str] = []
+
+    for summary in summary_list:
+        risks.extend(summary.risks)
+        hierarchy.update(summary.hierarchy)
+        errors.extend(summary.errors)
+        for asset in summary.assets:
+            key = (asset.ip, asset.port, asset.protocol)
+            existing = assets_map.get(key)
+            if existing is None:
+                assets_map[key] = ServiceAsset(
+                    ip=asset.ip,
+                    port=asset.port,
+                    protocol=asset.protocol,
+                    service_name=asset.service_name,
+                    software=asset.software,
+                    packets=asset.packets,
+                    bytes=asset.bytes,
+                    clients=set(asset.clients),
+                    first_seen=asset.first_seen,
+                    last_seen=asset.last_seen,
+                )
+            else:
+                existing.packets += asset.packets
+                existing.bytes += asset.bytes
+                existing.clients.update(asset.clients)
+                existing.first_seen = min(existing.first_seen, asset.first_seen)
+                existing.last_seen = max(existing.last_seen, asset.last_seen)
+                if not existing.software and asset.software:
+                    existing.software = asset.software
+
+    assets = sorted(
+        assets_map.values(),
+        key=lambda item: (item.ip, item.port, item.protocol),
+    )
+
+    return ServiceSummary(
+        path=Path("ALL_PCAPS"),
+        total_services=len(assets),
+        assets=assets,
+        risks=risks,
+        hierarchy=dict(hierarchy),
+        errors=errors,
+    )
+
 # --- Constants ---
 
 COMMON_PORTS = {
@@ -143,6 +208,8 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
     services: Dict[Tuple[str, int, str], ServiceAsset] = {}
     risks: List[ServiceRisk] = []
     errors: List[str] = []
+    cleartext_hits: Dict[Tuple[str, str], Set[int]] = defaultdict(set)
+    nonstandard_hits: Dict[Tuple[str, str], Set[int]] = defaultdict(set)
     
     # To identify servers in TCP, we look for SYN-ACK (Flags=0x12) from them
     # OR we look for well-known ports responding
@@ -219,23 +286,32 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
                     payload = bytes(pkt[Raw])
                     if payload:
                         guessed_service, banner = _guess_service(payload, sport)
-                        is_known_port = sport in COMMON_PORTS
-                        if is_known_port or guessed_service:
+                        if not guessed_service:
+                            continue
+                        if sport in COMMON_PORTS or sport <= 1024:
                             s_name = COMMON_PORTS.get(sport, guessed_service or f"TCP/{sport}")
                             k = (src, sport, "TCP")
-                            if k not in services:
-                                services[k] = ServiceAsset(src, sport, "TCP", s_name, first_seen=ts, last_seen=ts)
+                        elif dport in COMMON_PORTS:
+                            s_name = COMMON_PORTS.get(dport, guessed_service or f"TCP/{dport}")
+                            k = (dst, dport, "TCP")
+                        else:
+                            continue
 
-                            s = services[k]
-                            if guessed_service and s.service_name.startswith("TCP/"):
-                                s.service_name = guessed_service
-                            s.packets += 1
-                            s.bytes += pkt_len
-                            s.last_seen = ts
+                        if k not in services:
+                            services[k] = ServiceAsset(k[0], k[1], "TCP", s_name, first_seen=ts, last_seen=ts)
+                        s = services[k]
+                        if guessed_service and s.service_name.startswith("TCP/"):
+                            s.service_name = guessed_service
+                        s.packets += 1
+                        s.bytes += pkt_len
+                        s.last_seen = ts
+                        if k[0] == src:
                             s.clients.add(dst)
+                        else:
+                            s.clients.add(src)
 
-                            if banner and not s.software:
-                                s.software = banner
+                        if banner and not s.software:
+                            s.software = banner
             
             # UDP
             elif UDP in pkt:
@@ -302,12 +378,7 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
     for k, asset in services.items():
         # Cleartext protocols
         if asset.service_name in risky_cleartext:
-            risks.append(ServiceRisk(
-                risky_cleartext[asset.service_name],
-                "Cleartext Service",
-                f"Unencrypted {asset.service_name} service detected. Credentials/Data at risk.",
-                f"{asset.ip}:{asset.port}"
-            ))
+            cleartext_hits[(asset.ip, asset.service_name)].add(asset.port)
         
         # Old versions (Simple check)
         if asset.software:
@@ -319,10 +390,6 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
                     f"{asset.ip}:{asset.port}"
                 ))
                 
-        # Non-standard ports
-        if asset.port == 2222 and "SSH" in asset.service_name:
-             risks.append(ServiceRisk("LOW", "Non-Standard SSH", "SSH on port 2222", f"{asset.ip}:{asset.port}"))
-
         nonstandard_ports = {
             "HTTP": {80, 8080, 8000, 8443},
             "HTTPS": {443, 8443},
@@ -334,12 +401,7 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
         }
         for svc, ports in nonstandard_ports.items():
             if svc in asset.service_name and asset.port not in ports:
-                risks.append(ServiceRisk(
-                    "LOW",
-                    "Non-Standard Port",
-                    f"{svc} detected on non-standard port {asset.port}.",
-                    f"{asset.ip}:{asset.port}",
-                ))
+                nonstandard_hits[(asset.ip, svc)].add(asset.port)
 
         if _is_public_ip(asset.ip) and any(svc in asset.service_name for svc in admin_services):
             risks.append(ServiceRisk(
@@ -356,6 +418,28 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
                 f"Public {asset.service_name} over UDP can be abused for amplification if open.",
                 f"{asset.ip}:{asset.port}",
             ))
+
+    for (ip_value, svc), ports in cleartext_hits.items():
+        port_list = ", ".join(str(port) for port in sorted(ports))
+        details = f"Unencrypted {svc} service detected. Credentials/Data at risk."
+        if port_list:
+            details = f"{details} Ports: {port_list}."
+        risks.append(ServiceRisk(
+            risky_cleartext.get(svc, "MEDIUM"),
+            "Cleartext Service",
+            details,
+            f"{ip_value}:{sorted(ports)[0]}",
+        ))
+
+    for (ip_value, svc), ports in nonstandard_hits.items():
+        port_list = ", ".join(str(port) for port in sorted(ports))
+        details = f"{svc} detected on non-standard ports: {port_list}."
+        risks.append(ServiceRisk(
+            "LOW",
+            "Non-Standard Port",
+            details,
+            f"{ip_value}:{sorted(ports)[0]}",
+        ))
 
     # Hierarchy
     hier = Counter()

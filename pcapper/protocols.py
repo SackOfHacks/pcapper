@@ -72,6 +72,96 @@ class ProtocolSummary:
     ethertype_protocols: List[Tuple[str, int]]
     errors: List[str]
 
+
+def merge_protocols_summaries(
+    summaries: List[ProtocolSummary] | Tuple[ProtocolSummary, ...] | Set[ProtocolSummary]
+) -> ProtocolSummary:
+    summary_list = list(summaries)
+    if not summary_list:
+        return ProtocolSummary(
+            path=Path("ALL_PCAPS_0"),
+            total_packets=0,
+            duration=0.0,
+            hierarchy=ProtocolStat("Root"),
+            conversations=[],
+            endpoints=[],
+            anomalies=[],
+            top_protocols=[],
+            port_protocols=[],
+            ethertype_protocols=[],
+            errors=[],
+        )
+
+    def _merge_node(target: ProtocolStat, source: ProtocolStat) -> None:
+        target.packets += source.packets
+        target.bytes += source.bytes
+        for name, child in source.sub_protocols.items():
+            if name not in target.sub_protocols:
+                target.sub_protocols[name] = ProtocolStat(name)
+            _merge_node(target.sub_protocols[name], child)
+
+    total_packets = 0
+    duration = 0.0
+    hierarchy = ProtocolStat("Root")
+    conversations: List[Conversation] = []
+    endpoints_map: Dict[str, Endpoint] = {}
+    anomalies: List[Anomaly] = []
+    top_counter: Counter[str] = Counter()
+    port_counter: Counter[str] = Counter()
+    eth_counter: Counter[str] = Counter()
+    errors: List[str] = []
+
+    for summary in summary_list:
+        total_packets += summary.total_packets
+        duration += float(summary.duration or 0.0)
+        _merge_node(hierarchy, summary.hierarchy)
+        conversations.extend(summary.conversations)
+        anomalies.extend(summary.anomalies)
+        errors.extend(summary.errors)
+
+        for name, count in summary.top_protocols:
+            top_counter[name] += int(count)
+        for name, count in summary.port_protocols:
+            port_counter[name] += int(count)
+        for name, count in summary.ethertype_protocols:
+            eth_counter[name] += int(count)
+
+        for endpoint in summary.endpoints:
+            existing = endpoints_map.get(endpoint.address)
+            if existing is None:
+                endpoints_map[endpoint.address] = Endpoint(
+                    address=endpoint.address,
+                    packets_sent=endpoint.packets_sent,
+                    packets_recv=endpoint.packets_recv,
+                    bytes_sent=endpoint.bytes_sent,
+                    bytes_recv=endpoint.bytes_recv,
+                    protocols=set(endpoint.protocols),
+                )
+            else:
+                existing.packets_sent += endpoint.packets_sent
+                existing.packets_recv += endpoint.packets_recv
+                existing.bytes_sent += endpoint.bytes_sent
+                existing.bytes_recv += endpoint.bytes_recv
+                existing.protocols.update(endpoint.protocols)
+
+    top_protocols = top_counter.most_common(10)
+    port_protocols = port_counter.most_common(10)
+    ethertype_protocols = eth_counter.most_common(10)
+
+    return ProtocolSummary(
+        path=Path("ALL_PCAPS"),
+        total_packets=total_packets,
+        duration=duration,
+        hierarchy=hierarchy,
+        conversations=conversations,
+        endpoints=list(endpoints_map.values()),
+        anomalies=anomalies,
+        top_protocols=top_protocols,
+        port_protocols=port_protocols,
+        ethertype_protocols=ethertype_protocols,
+        errors=errors,
+    )
+
 # --- Analysis ---
 
 INDUSTRIAL_PORTS = {

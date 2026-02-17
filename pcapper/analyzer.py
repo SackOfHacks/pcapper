@@ -203,7 +203,7 @@ def analyze_pcap(
             if ethertype_proto:
                 protocol_counts[ethertype_proto] += 1
 
-            if stream is not None and size_bytes:
+            if status.enabled and stream is not None and size_bytes:
                 try:
                     pos = stream.tell()
                     percent = int(min(100, (pos / size_bytes) * 100))
