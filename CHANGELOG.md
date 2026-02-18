@@ -4,15 +4,22 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 1.2.6 — 2026-02-18
 ### Added
-- _Nothing yet._
+- New analyzers: QUIC (`--quic`), HTTP/2 (`--http2`), encrypted DNS (`--encrypted-dns`), NTP (`--ntp`), VPN/tunnel detection (`--vpn`), OPC Classic (`--opc-classic`), IEC 61850 GOOSE/SV (`--goose`, `--sv`), LLDP/Profinet DCP (`--lldp`), PTP (`--ptp`), IEC 101/103 heuristic (`--iec101-103`), OT command normalization (`--ot-commands`), IOC matching (`--ioc`), CTF flag finder (`--ctf`), pcap metadata (`--pcapmeta`), and TCP stream analysis (`--streams`).
+- Stream tooling: `--follow`, `--follow-id`, `--lookup-stream-id`, and `--streams-full`.
+- Export options: `--json`, `--csv`, and `--sqlite` outputs, plus case packaging via `--case-dir`/`--case-name`.
+- Packet slicing controls: `--bpf`, `--time-start`, and `--time-end`.
 
 ### Changed
-- _Nothing yet._
+- Summarize mode now renders merged summaries per module (no per‑pcap sections).
+- Help menu ordering is now enforced alphabetically in IT and OT/ICS groups.
+- Section headers now use reversed color styling for main headers.
+- Public IP highlighting now applies across all reporting sections.
 
 ### Fixed
-- _Nothing yet._
+- Disabled argparse abbreviations so unknown flags error clearly, with “Did you mean …” hints.
+- Stream reassembly now uses TCP sequence ordering with gap tracking.
 
 ## 1.2.2 — 2026-02-18
 ### Added

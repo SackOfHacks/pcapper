@@ -14,6 +14,10 @@ ANSI_BLUE = "\x1b[34m"
 ANSI_MAGENTA = "\x1b[35m"
 ANSI_CYAN = "\x1b[36m"
 ANSI_WHITE = "\x1b[37m"
+ANSI_BLACK = "\x1b[30m"
+ANSI_BLUE_BG = "\x1b[104m"
+ANSI_RED_BG = "\x1b[41m"
+ANSI_RED_BG = "\x1b[41m"
 
 _COLOR_OVERRIDE: bool | None = None
 
@@ -51,6 +55,8 @@ def set_color_override(enabled: bool | None) -> None:
 
 
 def header(text: str, enabled: bool | None = None) -> str:
+    if "::" in text:
+        return reverse_header(text, enabled)
     return colorize(text, ANSI_CYAN, enabled, bold=True)
 
 
@@ -81,5 +87,20 @@ def muted(text: str, enabled: bool | None = None) -> str:
 def highlight(text: str, enabled: bool | None = None) -> str:
     return colorize(text, ANSI_WHITE, enabled, bold=True)
 
-def highlight(text: str, enabled: bool | None = None) -> str:
-    return colorize(text, ANSI_WHITE, enabled, bold=True)
+
+def reverse_header(text: str, enabled: bool | None = None) -> str:
+    if not use_color(enabled):
+        return text
+    return f"{ANSI_BLUE_BG}{ANSI_WHITE}{ANSI_BOLD}{text}{ANSI_RESET}"
+
+
+def danger_bg(text: str, enabled: bool | None = None) -> str:
+    if not use_color(enabled):
+        return text
+    return f"{ANSI_RED_BG}{ANSI_WHITE}{ANSI_BOLD}{text}{ANSI_RESET}"
+
+
+def danger_bg(text: str, enabled: bool | None = None) -> str:
+    if not use_color(enabled):
+        return text
+    return f"{ANSI_RED_BG}{ANSI_WHITE}{ANSI_BOLD}{text}{ANSI_RESET}"

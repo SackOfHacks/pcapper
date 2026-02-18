@@ -639,6 +639,18 @@ def analyze_tls(
             "summary": "No ALPN advertised",
             "details": "TLS handshakes missing ALPN hints (could indicate legacy clients).",
         })
+    if any(alpn.startswith("h2") for alpn in alpn_counts):
+        detections.append({
+            "severity": "info",
+            "summary": "HTTP/2 ALPN observed",
+            "details": "TLS ALPN indicates HTTP/2 usage (h2).",
+        })
+    if any(alpn.startswith("h3") for alpn in alpn_counts):
+        detections.append({
+            "severity": "info",
+            "summary": "HTTP/3 ALPN observed",
+            "details": "TLS ALPN indicates HTTP/3/QUIC usage (h3).",
+        })
 
     if cert_summary.self_signed:
         detections.append({

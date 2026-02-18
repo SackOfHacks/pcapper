@@ -52,14 +52,13 @@ python -m pcapper "~/Downloads/pcaps/Un*" --summarize --ips
 python -m pcapper one.pcap two.pcapng ~/Downloads/pcaps/ --summarize --timeline -ip 10.182.207.28
 ```
 
+Secrets/credentials are redacted by default in reports. Use `--show-secrets` to display them.
+
 ## Summarize behavior
 
 Use `--summarize` to aggregate selected analyses across all resolved target pcaps.
 
-- `--ips` summarize renders a merged IPS report.
-- `--timeline` summarize renders a merged timeline report.
-- `--health`, `--rdp`, `--telnet`, `--vnc`, `--teamviewer`, and `--winrm` summarize render full module sections.
-- Other modules summarize via module rollups.
+- Summarize renders merged rollup output only (no per‑pcap sections).
 - Recursive directory traversal is enabled only with `-r/--recursive`.
 
 ## CLI Flag Groups
@@ -79,16 +78,30 @@ python -m pcapper --help
 
 ### General flags
 
+- `--bpf EXPR`
 - `--base`
+- `--case-dir DIR`
+- `--case-name NAME`
+- `-case`
+- `--csv PATH`
 - `--extract FILENAME`
+- `--follow FLOW`
+- `--follow-id STREAM_ID`
 - `-ip TIMELINE_IP`
+- `--ioc-file PATH`
+- `--json PATH`
 - `-l, --limit-protocols`
+- `--lookup-stream-id STREAM_ID`
 - `--no-color`
 - `--no-status`
-- `--search STRING`
-- `-case`
 - `-r, --recursive`
+- `--sqlite PATH`
+- `--search STRING`
+- `--show-secrets`
+- `--streams-full`
 - `-summarize, --summarize`
+- `--time-end TIME`
+- `--time-start TIME`
 - `-v, --verbose`
 - `--view FILENAME`
 
@@ -98,9 +111,11 @@ python -m pcapper --help
 - `--beacon`
 - `--certificates`
 - `--creds`
+- `--ctf`
 - `--dhcp`
 - `--dns`
 - `--domain`
+- `--encrypted-dns`
 - `--exfil`
 - `--files`
 - `--ftp`
@@ -108,19 +123,30 @@ python -m pcapper --help
 - `--hostdetails`
 - `--hostname`
 - `--http`
+- `--http2`
 - `--icmp`
+- `--ioc`
 - `--ips`
 - `--kerberos`
 - `--ldap`
 - `--netbios`
 - `--nfs`
 - `--ntlm`
+- `--ntp`
+- `--opc-classic`
+- `--pcapmeta`
+- `--powershell`
 - `--protocols`
+- `--quic`
 - `--rdp`
+- `--rpc`
 - `--services`
 - `--sizes`
 - `--smb`
+- `--smtp`
+- `--snmp`
 - `--ssh`
+- `--streams`
 - `--strings`
 - `--syslog`
 - `--tcp`
@@ -132,9 +158,11 @@ python -m pcapper --help
 - `--udp`
 - `--vlan`
 - `--vnc`
+- `--vpn`
 - `--winrm`
+- `--wmic`
 
-Count: 40 flags
+Count: 54 flags
 
 ### OT/ICS/Industrial functions (alphabetical)
 
@@ -148,10 +176,13 @@ Count: 40 flags
 - `--enip`
 - `--ethercat`
 - `--fins`
+- `--goose`
 - `--hart`
 - `--honeywell`
 - `--iccp`
+- `--iec101-103`
 - `--iec104`
+- `--lldp`
 - `--melsec`
 - `--mms`
 - `--modbus`
@@ -160,15 +191,18 @@ Count: 40 flags
 - `--niagara`
 - `--odesys`
 - `--opc`
+- `--ot-commands`
 - `--pccc`
 - `--pcworx`
 - `--prconos`
 - `--profinet`
+- `--ptp`
 - `--s7`
 - `--srtp`
+- `--sv`
 - `--yokogawa`
 
-Count: 30 flags
+Count: 35 flags
 
 ## Notes
 
