@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 import re
+import ipaddress
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -13,6 +14,18 @@ from .powershell import PS_COMMAND_RE
 from .wmic import WMIC_COMMAND_RE
 from .winrm import WINRM_PORTS, WSMAN_RE
 from .telnet import TELNET_PORTS
+from .modbus import FUNC_NAMES as MODBUS_FUNC_NAMES, EXCEPTION_CODES as MODBUS_EXC_CODES
+from .cip import ENIP_COMMANDS
+from .opc import OPC_TYPES, OPC_UA_PORT
+from .modbus import MODBUS_TCP_PORT
+from .dnp3 import DNP3_PORT
+from .iec104 import IEC104_PORT
+from .s7 import S7_PORT
+from .bacnet import BACNET_PORT
+from .profinet import PROFINET_PORTS
+from .dnp3 import analyze_dnp3
+from .iec104 import analyze_iec104
+from .s7 import analyze_s7
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -56,6 +69,18 @@ class TimelineSummary:
     total_packets: int
     events: list[TimelineEvent]
     errors: list[str]
+    first_seen: Optional[float] = None
+    last_seen: Optional[float] = None
+    duration: Optional[float] = None
+    category_counts: dict[str, int] = field(default_factory=dict)
+    peer_counts: dict[str, int] = field(default_factory=dict)
+    port_counts: dict[int, int] = field(default_factory=dict)
+    ot_protocol_counts: dict[str, int] = field(default_factory=dict)
+    ot_activity_bins: dict[str, list[int]] = field(default_factory=dict)
+    ot_activity_bin_count: int = 0
+    ot_risk_score: int = 0
+    ot_risk_findings: list[str] = field(default_factory=list)
+    ot_storyline: list[str] = field(default_factory=list)
 
 
 def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSummary:
@@ -67,6 +92,18 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
             total_packets=0,
             events=[],
             errors=[],
+            first_seen=None,
+            last_seen=None,
+            duration=None,
+            category_counts={},
+            peer_counts={},
+            port_counts={},
+            ot_protocol_counts={},
+            ot_activity_bins={},
+            ot_activity_bin_count=0,
+            ot_risk_score=0,
+            ot_risk_findings=[],
+            ot_storyline=[],
         )
 
     target_ip = summary_list[0].target_ip
@@ -85,13 +122,75 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
             seen_errors.add(err)
             errors.append(err)
 
-    return TimelineSummary(
+    first_seen = None
+    last_seen = None
+    category_counts: Counter[str] = Counter()
+    peer_counts: Counter[str] = Counter()
+    port_counts: Counter[int] = Counter()
+    ot_protocol_counts: Counter[str] = Counter()
+    ot_activity_bins: dict[str, list[int]] = {}
+    ot_bin_count = 0
+
+    for item in summary_list:
+        if item.first_seen is not None:
+            first_seen = item.first_seen if first_seen is None else min(first_seen, item.first_seen)
+        if item.last_seen is not None:
+            last_seen = item.last_seen if last_seen is None else max(last_seen, item.last_seen)
+        category_counts.update(item.category_counts or {})
+        peer_counts.update(item.peer_counts or {})
+        port_counts.update(item.port_counts or {})
+        ot_protocol_counts.update(item.ot_protocol_counts or {})
+        if item.ot_activity_bins:
+            ot_bin_count = max(ot_bin_count, item.ot_activity_bin_count)
+            for proto, bins in item.ot_activity_bins.items():
+                merged = ot_activity_bins.setdefault(proto, [0] * len(bins))
+                if len(merged) < len(bins):
+                    merged.extend([0] * (len(bins) - len(merged)))
+                for idx, val in enumerate(bins):
+                    merged[idx] += val
+
+    duration = None
+    if first_seen is not None and last_seen is not None:
+        duration = max(0.0, last_seen - first_seen)
+
+    merged = TimelineSummary(
         path=Path(f"ALL_PCAPS_{len(summary_list)}"),
         target_ip=target_ip,
         total_packets=total_packets,
         events=merged_events,
         errors=errors,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        duration=duration,
+        category_counts=dict(category_counts),
+        peer_counts=dict(peer_counts),
+        port_counts=dict(port_counts),
+        ot_protocol_counts=dict(ot_protocol_counts),
+        ot_activity_bins=ot_activity_bins,
+        ot_activity_bin_count=ot_bin_count,
     )
+    risk_score, risk_findings = _compute_ot_risk_posture(merged.events, target_ip)
+    storyline = _compute_ot_storyline(merged.events, target_ip, merged.ot_protocol_counts, risk_score, risk_findings)
+    merged = TimelineSummary(
+        path=merged.path,
+        target_ip=merged.target_ip,
+        total_packets=merged.total_packets,
+        events=merged.events,
+        errors=merged.errors,
+        first_seen=merged.first_seen,
+        last_seen=merged.last_seen,
+        duration=merged.duration,
+        category_counts=merged.category_counts,
+        peer_counts=merged.peer_counts,
+        port_counts=merged.port_counts,
+        ot_protocol_counts=merged.ot_protocol_counts,
+        ot_activity_bins=merged.ot_activity_bins,
+        ot_activity_bin_count=merged.ot_activity_bin_count,
+        ot_risk_score=risk_score,
+        ot_risk_findings=risk_findings,
+        ot_storyline=storyline,
+    )
+    return merged
 
 
 EMAIL_PORT_SERVICES: dict[int, str] = {
@@ -103,6 +202,55 @@ EMAIL_PORT_SERVICES: dict[int, str] = {
     995: "POP3S",
     143: "IMAP",
     993: "IMAPS",
+}
+
+OT_PORT_PROTOCOLS: dict[int, str] = {
+    MODBUS_TCP_PORT: "Modbus",
+    DNP3_PORT: "DNP3",
+    IEC104_PORT: "IEC-104",
+    S7_PORT: "S7",
+    44818: "ENIP",
+    2222: "CIP",
+    BACNET_PORT: "BACnet",
+    OPC_UA_PORT: "OPC UA",
+    1911: "Niagara Fox",
+    4911: "Niagara Fox",
+    9600: "FINS",
+    5094: "HART-IP",
+    18245: "SRTP",
+    18246: "SRTP",
+    1962: "PCWorx",
+    5006: "MELSEC",
+    5007: "MELSEC",
+    20547: "ProConOS",
+    2455: "CODESYS",
+    1217: "CODESYS",
+    5683: "CoAP",
+    5684: "CoAP",
+}
+
+for _port in PROFINET_PORTS:
+    OT_PORT_PROTOCOLS[_port] = "PROFINET"
+
+OT_CATEGORIES = {
+    "Modbus",
+    "DNP3",
+    "IEC-104",
+    "S7",
+    "ENIP",
+    "CIP",
+    "BACnet",
+    "OPC UA",
+    "PROFINET",
+    "Niagara Fox",
+    "FINS",
+    "HART-IP",
+    "SRTP",
+    "PCWorx",
+    "MELSEC",
+    "ProConOS",
+    "CODESYS",
+    "CoAP",
 }
 
 
@@ -313,6 +461,184 @@ def _snmp_pdu_type(payload: bytes | None) -> str | None:
     }.get(pdu)
 
 
+def _parse_modbus_command(payload: bytes | None) -> tuple[int, str, bool, int | None, str | None] | None:
+    if not payload or len(payload) < 8:
+        return None
+    try:
+        unit_id = payload[6]
+        func_code = payload[7]
+    except Exception:
+        return None
+    is_exception = func_code >= 0x80
+    base_code = func_code & 0x7F
+    name = MODBUS_FUNC_NAMES.get(base_code, f"Function {base_code}")
+    exc_code = None
+    exc_desc = None
+    if is_exception and len(payload) >= 9:
+        exc_code = payload[8]
+        exc_desc = MODBUS_EXC_CODES.get(exc_code)
+    return func_code, name, is_exception, unit_id, exc_desc
+
+
+def _parse_enip_command(payload: bytes | None) -> tuple[int, str | None] | None:
+    if not payload or len(payload) < 2:
+        return None
+    cmd = int.from_bytes(payload[:2], "little", signed=False)
+    return cmd, ENIP_COMMANDS.get(cmd)
+
+
+def _parse_opcua_message(payload: bytes | None) -> str | None:
+    if not payload or len(payload) < 3:
+        return None
+    return OPC_TYPES.get(payload[:3])
+
+
+def _iec104_frame_type(payload: bytes | None) -> str | None:
+    if not payload or len(payload) < 6:
+        return None
+    if payload[0] != 0x68:
+        return None
+    ctrl = payload[2:6]
+    if (ctrl[0] & 0x01) == 0:
+        return "I-frame"
+    if (ctrl[0] & 0x03) == 1:
+        return "S-frame"
+    if (ctrl[0] & 0x03) == 3:
+        return "U-frame"
+    return None
+
+
+def _dnp3_frame_seen(payload: bytes | None) -> bool:
+    if not payload:
+        return False
+    return payload.find(b"\x05\x64") != -1
+
+
+def _s7comm_seen(payload: bytes | None) -> bool:
+    if not payload:
+        return False
+    if len(payload) >= 4 and payload[:2] == b"\x03\x00":
+        return b"\x32" in payload
+    return False
+
+
+def _extract_ip_candidates(text: str) -> set[str]:
+    candidates: set[str] = set()
+    for token in re.findall(r"(?:\\d{1,3}\\.){3}\\d{1,3}", text):
+        candidates.add(token)
+    return candidates
+
+
+def _compute_ot_activity_bins(
+    events: list[TimelineEvent],
+    first_seen: Optional[float],
+    last_seen: Optional[float],
+    bins: int = 24,
+) -> tuple[dict[str, list[int]], int]:
+    if not events or first_seen is None or last_seen is None or last_seen <= first_seen:
+        return {}, 0
+    duration = max(1.0, last_seen - first_seen)
+    bin_size = duration / bins
+    protocol_bins: dict[str, list[int]] = {}
+    for event in events:
+        if event.ts is None:
+            continue
+        if event.category not in OT_CATEGORIES:
+            continue
+        idx = int((event.ts - first_seen) / bin_size)
+        if idx >= bins:
+            idx = bins - 1
+        if idx < 0:
+            idx = 0
+        bucket = protocol_bins.setdefault(event.category, [0] * bins)
+        bucket[idx] += 1
+    return protocol_bins, bins
+
+
+def _compute_ot_risk_posture(events: list[TimelineEvent], target_ip: str) -> tuple[int, list[str]]:
+    if not events:
+        return 0, []
+    score = 0
+    findings: list[str] = []
+    public_peers: set[str] = set()
+    control_hits = 0
+    transfer_hits = 0
+    anomaly_hits = 0
+
+    control_tokens = (
+        "write", "control", "setpoint", "start", "stop", "program", "download", "upload", "firmware",
+        "plcstop", "plchotstart", "plccoldstart", "writevar",
+    )
+    for event in events:
+        if event.category not in OT_CATEGORIES:
+            continue
+        detail = f"{event.summary} {event.details}".lower()
+        if any(token in detail for token in control_tokens):
+            control_hits += 1
+        if any(token in detail for token in ("download", "upload", "file operation", "program transfer")):
+            transfer_hits += 1
+        if "anomaly" in detail or "restart" in detail or "command" in detail:
+            if "error" not in detail:
+                anomaly_hits += 1
+        for ip_text in _extract_ip_candidates(event.details):
+            if ip_text == target_ip:
+                continue
+            try:
+                if ipaddress.ip_address(ip_text).is_global:
+                    public_peers.add(ip_text)
+            except Exception:
+                continue
+
+    if public_peers:
+        score += 30
+        findings.append(f"OT protocol traffic to public IPs ({len(public_peers)}).")
+    if control_hits:
+        score += 25
+        findings.append(f"OT control/write activity indicators ({control_hits}).")
+    if transfer_hits:
+        score += 25
+        findings.append(f"OT program/file transfer indicators ({transfer_hits}).")
+    if anomaly_hits:
+        score += min(20, anomaly_hits * 5)
+        findings.append(f"OT protocol anomalies or control events ({anomaly_hits}).")
+
+    score = min(100, score)
+    return score, findings
+
+
+def _compute_ot_storyline(
+    events: list[TimelineEvent],
+    target_ip: str,
+    ot_protocol_counts: dict[str, int],
+    risk_score: int,
+    risk_findings: list[str],
+) -> list[str]:
+    if not ot_protocol_counts:
+        return [f"No OT/ICS protocols observed for {target_ip}."]
+    top_protocols = sorted(ot_protocol_counts.items(), key=lambda item: (-item[1], item[0]))
+    proto_text = ", ".join(f"{name} ({count})" for name, count in top_protocols[:4])
+    storyline = [f"OT protocols observed: {proto_text}."]
+    if risk_score:
+        storyline.append(f"OT risk posture scored {risk_score}/100.")
+    if risk_findings:
+        storyline.append("Key signals: " + "; ".join(risk_findings[:3]))
+    control_hits = 0
+    for event in events:
+        if event.category not in OT_CATEGORIES:
+            continue
+        detail = f"{event.summary} {event.details}".lower()
+        if any(token in detail for token in ("write", "control", "setpoint", "start", "stop", "program", "download", "upload", "firmware")):
+            control_hits += 1
+    if control_hits:
+        storyline.append(f"Control or program-change indications seen ({control_hits}).")
+    return storyline
+
+
+def _first_ts_for_category(events: list[TimelineEvent], category: str) -> Optional[float]:
+    timestamps = [event.ts for event in events if event.category == category and event.ts is not None]
+    return min(timestamps) if timestamps else None
+
+
 def _read_ber_length(payload: bytes, offset: int) -> tuple[Optional[int], int]:
     if offset >= len(payload):
         return None, offset
@@ -383,7 +709,7 @@ def _netbios_session_hint(payload: bytes | None) -> str | None:
     return None
 
 
-def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> TimelineSummary:
+def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timeline_bins: int = 24) -> TimelineSummary:
     errors: list[str] = []
     events: list[TimelineEvent] = []
 
@@ -401,6 +727,13 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
     total_packets = 0
     idx = 0
     index_ts: dict[int, float] = {}
+    first_seen: Optional[float] = None
+    last_seen: Optional[float] = None
+    peer_counts: Counter[str] = Counter()
+    port_counts: Counter[int] = Counter()
+    ot_protocol_counts: Counter[str] = Counter()
+    seen_ot_flows: set[tuple[str, str, str, int]] = set()
+    seen_ot_commands: set[tuple[str, str, str, int, str]] = set()
     seen_udp_flows: set[tuple[str, int]] = set()
     seen_domain_flows: set[tuple[str, int, str, str]] = set()
     seen_ldap_flows: set[tuple[str, int, str, str]] = set()
@@ -452,6 +785,16 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
 
             if not src_ip or not dst_ip:
                 continue
+
+            if (src_ip == target_ip or dst_ip == target_ip):
+                if ts is not None:
+                    if first_seen is None or ts < first_seen:
+                        first_seen = ts
+                    if last_seen is None or ts > last_seen:
+                        last_seen = ts
+                peer_ip = dst_ip if src_ip == target_ip else src_ip
+                if peer_ip:
+                    peer_counts[peer_ip] += 1
 
             if (src_ip == target_ip or dst_ip == target_ip):
                 label = _icmp_label(pkt)
@@ -519,13 +862,125 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                     is_syn = "S" in flags and "A" not in flags
                 elif isinstance(flags, int):
                     is_syn = (flags & 0x02) != 0 and (flags & 0x10) == 0
-                if src_ip == target_ip:
-                    dport = int(getattr(tcp_layer, "dport", 0) or 0)
+                sport = int(getattr(tcp_layer, "sport", 0) or 0)
+                dport = int(getattr(tcp_layer, "dport", 0) or 0)
+                payload = None
+                try:
+                    payload = bytes(tcp_layer.payload)
+                except Exception:
                     payload = None
-                    try:
-                        payload = bytes(tcp_layer.payload)
-                    except Exception:
-                        payload = None
+                if src_ip == target_ip or dst_ip == target_ip:
+                    port_key = dport if src_ip == target_ip else sport
+                    if port_key:
+                        port_counts[port_key] += 1
+                        proto = OT_PORT_PROTOCOLS.get(port_key)
+                        if proto:
+                            ot_protocol_counts[proto] += 1
+                            direction = "outbound" if src_ip == target_ip else "inbound"
+                            peer_ip = dst_ip if src_ip == target_ip else src_ip
+                            if peer_ip:
+                                cmd_event_added = False
+                                if proto == "Modbus" and port_key == MODBUS_TCP_PORT:
+                                    parsed = _parse_modbus_command(payload)
+                                    if parsed:
+                                        func_code, func_name, is_exc, unit_id, exc_desc = parsed
+                                        label = f"Modbus {func_name}"
+                                        if is_exc:
+                                            label = f"Modbus exception {func_name}"
+                                        key = (proto, direction, peer_ip, port_key, label)
+                                        if key not in seen_ot_commands:
+                                            seen_ot_commands.add(key)
+                                            detail = f"{target_ip} -> {peer_ip}:{port_key} unit {unit_id} {func_name}"
+                                            if is_exc and exc_desc:
+                                                detail += f" (Exception: {exc_desc})"
+                                            events.append(TimelineEvent(
+                                                ts=ts,
+                                                category="Modbus",
+                                                summary=label,
+                                                details=detail,
+                                            ))
+                                            cmd_event_added = True
+                                elif proto in {"ENIP", "CIP"} and port_key in {44818, 2222}:
+                                    enip = _parse_enip_command(payload)
+                                    if enip:
+                                        cmd, name = enip
+                                        label = name or f"ENIP cmd 0x{cmd:04x}"
+                                        key = (proto, direction, peer_ip, port_key, label)
+                                        if key not in seen_ot_commands:
+                                            seen_ot_commands.add(key)
+                                            events.append(TimelineEvent(
+                                                ts=ts,
+                                                category=proto,
+                                                summary=f"{proto} {label}",
+                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                            ))
+                                            cmd_event_added = True
+                                elif proto == "OPC UA" and port_key == OPC_UA_PORT:
+                                    msg = _parse_opcua_message(payload)
+                                    if msg:
+                                        label = f"OPC UA {msg}"
+                                        key = (proto, direction, peer_ip, port_key, label)
+                                        if key not in seen_ot_commands:
+                                            seen_ot_commands.add(key)
+                                            events.append(TimelineEvent(
+                                                ts=ts,
+                                                category="OPC UA",
+                                                summary=label,
+                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                            ))
+                                            cmd_event_added = True
+                                elif proto == "IEC-104" and port_key == IEC104_PORT:
+                                    frame = _iec104_frame_type(payload)
+                                    if frame:
+                                        label = f"IEC-104 {frame}"
+                                        key = (proto, direction, peer_ip, port_key, label)
+                                        if key not in seen_ot_commands:
+                                            seen_ot_commands.add(key)
+                                            events.append(TimelineEvent(
+                                                ts=ts,
+                                                category="IEC-104",
+                                                summary=label,
+                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                            ))
+                                            cmd_event_added = True
+                                elif proto == "DNP3" and port_key == DNP3_PORT:
+                                    if _dnp3_frame_seen(payload):
+                                        label = "DNP3 frame"
+                                        key = (proto, direction, peer_ip, port_key, label)
+                                        if key not in seen_ot_commands:
+                                            seen_ot_commands.add(key)
+                                            events.append(TimelineEvent(
+                                                ts=ts,
+                                                category="DNP3",
+                                                summary=label,
+                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                            ))
+                                            cmd_event_added = True
+                                elif proto == "S7" and port_key == S7_PORT:
+                                    if _s7comm_seen(payload):
+                                        label = "S7comm packet"
+                                        key = (proto, direction, peer_ip, port_key, label)
+                                        if key not in seen_ot_commands:
+                                            seen_ot_commands.add(key)
+                                            events.append(TimelineEvent(
+                                                ts=ts,
+                                                category="S7",
+                                                summary=label,
+                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                            ))
+                                            cmd_event_added = True
+
+                                if not cmd_event_added:
+                                    flow_key = (proto, direction, peer_ip, port_key)
+                                    if flow_key not in seen_ot_flows:
+                                        seen_ot_flows.add(flow_key)
+                                        events.append(TimelineEvent(
+                                            ts=ts,
+                                            category=proto,
+                                            summary=f"{proto} flow",
+                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                        ))
+                if src_ip == target_ip:
                     if dport in {139, 445}:
                         hint = _netbios_session_hint(payload)
                         if hint:
@@ -671,12 +1126,6 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                             scan_first.setdefault(dst_ip, ts)
                             scan_last[dst_ip] = ts
                 elif dst_ip == target_ip:
-                    sport = int(getattr(tcp_layer, "sport", 0) or 0)
-                    payload = None
-                    try:
-                        payload = bytes(tcp_layer.payload)
-                    except Exception:
-                        payload = None
                     if sport in {139, 445}:
                         hint = _netbios_session_hint(payload)
                         if hint:
@@ -792,13 +1241,48 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
 
             if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                 udp_layer = pkt[UDP]  # type: ignore[index]
-                if src_ip == target_ip:
-                    dport = int(getattr(udp_layer, "dport", 0) or 0)
+                sport = int(getattr(udp_layer, "sport", 0) or 0)
+                dport = int(getattr(udp_layer, "dport", 0) or 0)
+                payload = None
+                try:
+                    payload = bytes(udp_layer.payload)
+                except Exception:
                     payload = None
-                    try:
-                        payload = bytes(udp_layer.payload)
-                    except Exception:
-                        payload = None
+                if src_ip == target_ip or dst_ip == target_ip:
+                    port_key = dport if src_ip == target_ip else sport
+                    if port_key:
+                        port_counts[port_key] += 1
+                        proto = OT_PORT_PROTOCOLS.get(port_key)
+                        if proto:
+                            ot_protocol_counts[proto] += 1
+                            direction = "outbound" if src_ip == target_ip else "inbound"
+                            peer_ip = dst_ip if src_ip == target_ip else src_ip
+                            if peer_ip:
+                                cmd_event_added = False
+                                if proto == "DNP3" and port_key == DNP3_PORT:
+                                    if _dnp3_frame_seen(payload):
+                                        label = "DNP3 frame"
+                                        key = (proto, direction, peer_ip, port_key, label)
+                                        if key not in seen_ot_commands:
+                                            seen_ot_commands.add(key)
+                                            events.append(TimelineEvent(
+                                                ts=ts,
+                                                category="DNP3",
+                                                summary=label,
+                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                            ))
+                                            cmd_event_added = True
+                                if not cmd_event_added:
+                                    flow_key = (proto, direction, peer_ip, port_key)
+                                    if flow_key not in seen_ot_flows:
+                                        seen_ot_flows.add(flow_key)
+                                        events.append(TimelineEvent(
+                                            ts=ts,
+                                            category=proto,
+                                            summary=f"{proto} flow",
+                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                        ))
+                if src_ip == target_ip:
                     if dport:
                         key = (dst_ip, dport)
                         if key not in seen_udp_flows:
@@ -864,12 +1348,6 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                                     details=f"{target_ip} -> {dst_ip}:{dport}",
                                 ))
                 elif dst_ip == target_ip:
-                    sport = int(getattr(udp_layer, "sport", 0) or 0)
-                    payload = None
-                    try:
-                        payload = bytes(udp_layer.payload)
-                    except Exception:
-                        payload = None
                     rpc_type = _rpc_packet_type(payload)
                     if rpc_type and sport in {135, 445, 593}:
                         key = (src_ip, dst_ip, sport, rpc_type)
@@ -955,7 +1433,117 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
                 details=f"{target_ip} -> {dst_ip} touched {len(ports)} ports over {duration}",
             ))
 
+    if "DNP3" in ot_protocol_counts:
+        dnp3_summary = analyze_dnp3(path, show_status=False)
+        errors.extend(dnp3_summary.errors)
+        seen_msgs: set[tuple[str, str, str, int, int]] = set()
+        for msg in dnp3_summary.messages:
+            if msg.src_ip != target_ip and msg.dst_ip != target_ip:
+                continue
+            key = (msg.src_ip, msg.dst_ip, msg.func_name, msg.src_addr, msg.dst_addr)
+            if key in seen_msgs:
+                continue
+            seen_msgs.add(key)
+            events.append(TimelineEvent(
+                ts=msg.ts,
+                category="DNP3",
+                summary=f"DNP3 {msg.func_name}",
+                details=f"{msg.src_ip} -> {msg.dst_ip} addr {msg.src_addr}->{msg.dst_addr}",
+            ))
+            if len(seen_msgs) >= 200:
+                break
+        for anomaly in dnp3_summary.anomalies:
+            if anomaly.src != target_ip and anomaly.dst != target_ip:
+                continue
+            events.append(TimelineEvent(
+                ts=anomaly.ts,
+                category="DNP3",
+                summary=anomaly.title,
+                details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
+            ))
+
+    if "IEC-104" in ot_protocol_counts:
+        iec_summary = analyze_iec104(path, show_status=False)
+        errors.extend(iec_summary.errors)
+        for anomaly in iec_summary.anomalies:
+            if anomaly.src != target_ip and anomaly.dst != target_ip:
+                continue
+            events.append(TimelineEvent(
+                ts=anomaly.ts,
+                category="IEC-104",
+                summary=anomaly.title,
+                details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
+            ))
+        for artifact in iec_summary.artifacts:
+            if artifact.src != target_ip and artifact.dst != target_ip:
+                continue
+            events.append(TimelineEvent(
+                ts=artifact.ts,
+                category="IEC-104",
+                summary=f"IEC-104 artifact ({artifact.kind})",
+                details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
+            ))
+        if iec_summary.command_events:
+            seen_cmds: set[tuple[str, str, str, float]] = set()
+            for cmd_event in iec_summary.command_events:
+                if cmd_event.src != target_ip and cmd_event.dst != target_ip:
+                    continue
+                key = (cmd_event.src, cmd_event.dst, cmd_event.command, cmd_event.ts)
+                if key in seen_cmds:
+                    continue
+                seen_cmds.add(key)
+                events.append(TimelineEvent(
+                    ts=cmd_event.ts,
+                    category="IEC-104",
+                    summary=f"IEC-104 {cmd_event.command}",
+                    details=f"{cmd_event.src} -> {cmd_event.dst}",
+                ))
+
+    if "S7" in ot_protocol_counts:
+        s7_summary = analyze_s7(path, show_status=False)
+        errors.extend(s7_summary.errors)
+        for anomaly in s7_summary.anomalies:
+            if anomaly.src != target_ip and anomaly.dst != target_ip:
+                continue
+            events.append(TimelineEvent(
+                ts=anomaly.ts,
+                category="S7",
+                summary=anomaly.title,
+                details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
+            ))
+        for artifact in s7_summary.artifacts:
+            if artifact.src != target_ip and artifact.dst != target_ip:
+                continue
+            events.append(TimelineEvent(
+                ts=artifact.ts,
+                category="S7",
+                summary=f"S7 artifact ({artifact.kind})",
+                details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
+            ))
+        if s7_summary.command_events:
+            seen_cmds: set[tuple[str, str, str, float]] = set()
+            for cmd_event in s7_summary.command_events:
+                if cmd_event.src != target_ip and cmd_event.dst != target_ip:
+                    continue
+                key = (cmd_event.src, cmd_event.dst, cmd_event.command, cmd_event.ts)
+                if key in seen_cmds:
+                    continue
+                seen_cmds.add(key)
+                events.append(TimelineEvent(
+                    ts=cmd_event.ts,
+                    category="S7",
+                    summary=f"S7 {cmd_event.command}",
+                    details=f"{cmd_event.src} -> {cmd_event.dst}",
+                ))
+
     events.sort(key=lambda item: (item.ts is None, item.ts))
+    category_counts = Counter(event.category for event in events)
+    duration = None
+    if first_seen is not None and last_seen is not None:
+        duration = max(0.0, last_seen - first_seen)
+    ot_activity_bins, ot_bin_count = _compute_ot_activity_bins(events, first_seen, last_seen, bins=max(4, timeline_bins))
+    ot_risk_score, ot_risk_findings = _compute_ot_risk_posture(events, target_ip)
+    ot_storyline = _compute_ot_storyline(events, target_ip, dict(ot_protocol_counts), ot_risk_score, ot_risk_findings)
 
     return TimelineSummary(
         path=path,
@@ -963,4 +1551,16 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True) -> Ti
         total_packets=total_packets,
         events=events,
         errors=errors + file_summary.errors,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        duration=duration,
+        category_counts=dict(category_counts),
+        peer_counts=dict(peer_counts),
+        port_counts=dict(port_counts),
+        ot_protocol_counts=dict(ot_protocol_counts),
+        ot_activity_bins=ot_activity_bins,
+        ot_activity_bin_count=ot_bin_count,
+        ot_risk_score=ot_risk_score,
+        ot_risk_findings=ot_risk_findings,
+        ot_storyline=ot_storyline,
     )
