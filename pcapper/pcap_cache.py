@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from scapy.utils import PcapReader, PcapNgReader
+try:
+    from scapy.all import sniff  # type: ignore
+except Exception:  # pragma: no cover
+    sniff = None  # type: ignore
 
 from .progress import build_statusbar
 from .utils import detect_file_type
@@ -309,6 +313,52 @@ def get_cached_packets(path: Path, show_status: bool = True) -> tuple[list[objec
     _PACKET_CACHE[path] = (packets, meta)
     _CACHE_BYTES += size_bytes
     return packets, meta
+
+
+def load_packets_if_allowed(path: Path, show_status: bool = True) -> tuple[list[object], PcapMeta] | tuple[None, None]:
+    enabled, max_cache, max_file = _cache_config()
+    if not enabled or max_cache <= 0 or max_file <= 0:
+        return None, None
+    try:
+        size_bytes = path.stat().st_size
+    except Exception:
+        size_bytes = 0
+    if size_bytes and size_bytes > max_file:
+        return None, None
+    return get_cached_packets(path, show_status=show_status)
+
+
+def load_filtered_packets(
+    path: Path,
+    *,
+    show_status: bool = True,
+    bpf: str | None = None,
+    time_start: float | None = None,
+    time_end: float | None = None,
+) -> tuple[list[object], PcapMeta]:
+    if bpf and sniff is not None:
+        try:
+            packets = sniff(offline=str(path), filter=bpf)
+            meta_packets, meta = load_packets(path, show_status=show_status)
+            return list(packets), meta
+        except Exception:
+            pass
+
+    packets, meta = load_packets(path, show_status=show_status)
+    if time_start is None and time_end is None:
+        return packets, meta
+
+    filtered: list[object] = []
+    for pkt in packets:
+        ts = getattr(pkt, "time", None)
+        if ts is None:
+            continue
+        if time_start is not None and ts < time_start:
+            continue
+        if time_end is not None and ts > time_end:
+            continue
+        filtered.append(pkt)
+    return filtered, meta
 
 
 def has_cached_packets(path: Path) -> bool:

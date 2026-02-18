@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from __future__ import annotations
+
+from dataclasses import is_dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
+import base64
 
 
 PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
@@ -108,3 +112,55 @@ def hexdump(data: bytes, width: int = 16) -> str:
         ascii_part = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
         lines.append(f"{offset:08x}  {hex_part:<{width * 3}}  {ascii_part}")
     return "\n".join(lines)
+
+
+def to_serializable(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return {"_bytes_b64": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, dict):
+        return {str(k): to_serializable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [to_serializable(item) for item in value]
+    if hasattr(value, "to_dict") and callable(getattr(value, "to_dict")):
+        try:
+            return to_serializable(value.to_dict())
+        except Exception:
+            pass
+    if is_dataclass(value):
+        try:
+            return to_serializable(asdict(value))
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        try:
+            return to_serializable(vars(value))
+        except Exception:
+            pass
+    return str(value)
+
+
+def parse_time_arg(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except Exception:
+        pass
+    try:
+        if text.endswith("Z"):
+            text = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None

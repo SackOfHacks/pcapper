@@ -127,6 +127,8 @@ COMMON_PORTS = {
     1433: "MSSQL", 1521: "Oracle", 3306: "MySQL", 3389: "RDP", 
     5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 8000: "HTTP-Alt", 
     8080: "HTTP-Proxy", 8443: "HTTPS-Alt", 9200: "Elasticsearch", 27017: "MongoDB",
+    500: "IKE", 4500: "IPsec NAT-T", 1194: "OpenVPN", 51820: "WireGuard",
+    1701: "L2TP", 1723: "PPTP", 853: "DoT", 784: "QUIC", 4433: "QUIC",
     102: "S7/MMS/ICCP", 502: "Modbus/TCP", 9600: "FINS", 20000: "DNP3",
     2404: "IEC-104", 47808: "BACnet/IP", 44818: "EtherNet/IP", 2222: "ENIP-IO",
     34962: "PROFINET", 34963: "PROFINET", 34964: "PROFINET", 4840: "OPC UA",

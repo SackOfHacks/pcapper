@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import re
+import os
 import base64
 import hashlib
 import struct
-import gzip
 import zlib
 import email
 import socket
@@ -49,9 +49,18 @@ class FileArtifact:
     payload: Optional[bytes] = None
     hostname: Optional[str] = None
     content_type: Optional[str] = None
+    sha256: Optional[str] = None
+    md5: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.filename = _normalize_filename(self.filename)
+        if self.payload and (self.sha256 is None or self.md5 is None):
+            try:
+                self.sha256 = hashlib.sha256(self.payload).hexdigest()
+                self.md5 = hashlib.md5(self.payload).hexdigest()
+            except Exception:
+                self.sha256 = self.sha256 or None
+                self.md5 = self.md5 or None
 
 
 @dataclass
@@ -78,6 +87,31 @@ class FileTransferSummary:
     views: List[Any]
     detections: List[Dict[str, str]]
     errors: List[str]
+
+
+def merge_files_summaries(summaries: List[FileTransferSummary]) -> FileTransferSummary:
+    if not summaries:
+        return FileTransferSummary(Path("ALL_PCAPS"), 0, [], [], [], [], [], [])
+    total_candidates = sum(item.total_candidates for item in summaries)
+    candidates: List[FileTransfer] = []
+    artifacts: List[FileArtifact] = []
+    detections: List[Dict[str, str]] = []
+    errors: List[str] = []
+    for summary in summaries:
+        candidates.extend(summary.candidates)
+        artifacts.extend(summary.artifacts)
+        detections.extend(summary.detections)
+        errors.extend(summary.errors)
+    return FileTransferSummary(
+        path=Path("ALL_PCAPS"),
+        total_candidates=total_candidates,
+        candidates=candidates,
+        artifacts=artifacts,
+        extracted=[],
+        views=[],
+        detections=detections,
+        errors=sorted(set(errors)),
+    )
 
 # --- Helper Functions ---
 
@@ -134,6 +168,12 @@ WINDOWS_RESERVED_NAMES = {
 }
 
 MAX_FILENAME_LENGTH = 200
+try:
+    MAX_DECOMPRESSED_BYTES = int(os.environ.get("PCAPPER_MAX_DECOMPRESSED_BYTES", str(10 * 1024 * 1024)))
+except Exception:
+    MAX_DECOMPRESSED_BYTES = 10 * 1024 * 1024
+if MAX_DECOMPRESSED_BYTES < 0:
+    MAX_DECOMPRESSED_BYTES = 0
 
 ENIP_TCP_PORT = 44818
 ENIP_UDP_PORT = 2222
@@ -253,6 +293,27 @@ def _unique_output_path(base_dir: Path, filename: str) -> Path:
         if not alt.exists():
             return alt
     return base_dir / f"{stem}_{hashlib.sha256(filename.encode('utf-8', errors='ignore')).hexdigest()[:8]}{suffix}"
+
+
+def _safe_decompress(data: bytes, encoding: str, max_output: int = MAX_DECOMPRESSED_BYTES) -> bytes:
+    if not data:
+        return data
+    if max_output <= 0:
+        return b""
+    try:
+        if encoding == "gzip":
+            decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        elif encoding == "deflate":
+            decompressor = zlib.decompressobj()
+        else:
+            return data
+        out = decompressor.decompress(data, max_output + 1)
+        out += decompressor.flush()
+        if len(out) > max_output:
+            return out[:max_output]
+        return out
+    except Exception:
+        return data
 
 def _extract_tftp(payload: bytes) -> Optional[str]:
     if len(payload) < 4:
@@ -629,13 +690,9 @@ def _parse_http_stream(stream: bytes) -> List[Dict[str, Any]]:
 
         # Handle compression
         if headers.get("content-encoding") == "gzip":
-            try:
-                body = gzip.decompress(body)
-            except: pass
+            body = _safe_decompress(body, "gzip")
         elif headers.get("content-encoding") == "deflate":
-            try:
-                body = zlib.decompress(body)
-            except: pass
+            body = _safe_decompress(body, "deflate")
 
         messages.append({
             "is_request": is_request,
