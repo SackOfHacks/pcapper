@@ -60,6 +60,14 @@ class IndustrialAnomaly:
 
 
 @dataclass
+class IndustrialCommandEvent:
+    ts: float
+    src: str
+    dst: str
+    command: str
+
+
+@dataclass
 class IndustrialAnalysis:
     path: Path
     duration: float = 0.0
@@ -79,6 +87,7 @@ class IndustrialAnalysis:
     service_endpoints: dict[str, Counter[str]] = field(default_factory=dict)
     packet_size_buckets: list["SizeBucket"] = field(default_factory=list)
     payload_size_buckets: list["SizeBucket"] = field(default_factory=list)
+    command_events: list[IndustrialCommandEvent] = field(default_factory=list)
     artifacts: list[IndustrialArtifact] = field(default_factory=list)
     anomalies: list[IndustrialAnomaly] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -367,6 +376,16 @@ def analyze_port_protocol(
                         for cmd in commands:
                             endpoints = analysis.service_endpoints.setdefault(str(cmd), Counter())
                             endpoints[f"{src_ip} -> {dst_ip}"] += 1
+                    if ts is not None and len(analysis.command_events) < 5000:
+                        for cmd in commands:
+                            analysis.command_events.append(
+                                IndustrialCommandEvent(
+                                    ts=ts,
+                                    src=src_ip,
+                                    dst=dst_ip,
+                                    command=str(cmd),
+                                )
+                            )
 
                 if artifact_parser is None:
                     artifacts = _default_artifacts(payload)

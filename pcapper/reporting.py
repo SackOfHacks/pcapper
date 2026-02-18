@@ -7389,7 +7389,7 @@ def render_hostdetails_summary(summary: HostDetailsSummary, limit: int = 20, ver
     return _finalize_output(lines)
 
 
-def render_timeline_summary(summary: TimelineSummary, limit: int = 200) -> str:
+def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose: bool = False) -> str:
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"TIMELINE :: {summary.target_ip} :: {summary.path.name}"))
@@ -7397,6 +7397,32 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200) -> str:
 
     lines.append(_format_kv("Packets", str(summary.total_packets)))
     lines.append(_format_kv("Events", str(len(summary.events))))
+    if summary.first_seen is not None or summary.last_seen is not None:
+        lines.append(_format_kv("First Seen", format_ts(summary.first_seen)))
+        lines.append(_format_kv("Last Seen", format_ts(summary.last_seen)))
+    if summary.duration is not None:
+        lines.append(_format_kv("Duration", f"{summary.duration:.1f}s"))
+    if summary.peer_counts:
+        lines.append(_format_kv("Unique Peers", str(len(summary.peer_counts))))
+    if summary.port_counts:
+        lines.append(_format_kv("Unique Ports", str(len(summary.port_counts))))
+    if summary.ot_risk_score:
+        risk_level = "LOW"
+        if summary.ot_risk_score >= 60:
+            risk_level = "HIGH"
+        elif summary.ot_risk_score >= 25:
+            risk_level = "MEDIUM"
+        score_text = f"{summary.ot_risk_score}/100 ({risk_level})"
+        lines.append(_format_kv("OT Risk Posture", score_text))
+        if summary.ot_risk_findings:
+            lines.append(muted("Findings:"))
+            for finding in summary.ot_risk_findings:
+                lines.append(muted(f"- {finding}"))
+    if summary.ot_storyline:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OT Attack Storyline"))
+        for line in summary.ot_storyline:
+            lines.append(muted(f"- {line}"))
 
     if summary.errors:
         lines.append(SUBSECTION_BAR)
@@ -7420,6 +7446,9 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200) -> str:
             for port in (445, 3389, 22, 23, 135, 139, 5985, 5986):
                 if f":{port}" in text:
                     return "suspicious"
+        if any(token in text for token in ("write", "control", "start", "stop", "setpoint", "program", "firmware")):
+            if item.category in {"Modbus", "DNP3", "IEC-104", "S7", "CIP", "ENIP", "BACnet", "OPC UA", "PROFINET"}:
+                return "suspicious"
         return "info"
 
     def _highlight_ips(text: str, target_ip: str) -> str:
@@ -7445,10 +7474,11 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200) -> str:
                 tokens[idx] = token.replace(stripped, ok(stripped))
         return " ".join(tokens)
 
+    event_limit = len(summary.events) if verbose else limit
     lines.append(SUBSECTION_BAR)
     lines.append(header("Activity Timeline"))
     lines.append(muted("Time | Category | Summary | Details"))
-    for event in summary.events[:limit]:
+    for event in summary.events[:event_limit]:
         severity = _severity_for_event(event)
         summary_text = event.summary
         if severity == "malicious":
@@ -7457,6 +7487,51 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200) -> str:
             summary_text = warn(event.summary)
         details_text = _highlight_ips(_redact_in_text(event.details), summary.target_ip)
         lines.append(f"{format_ts(event.ts)} | {event.category} | {summary_text} | {details_text}")
+
+    if not verbose and len(summary.events) > limit:
+        lines.append(muted(f"... {len(summary.events) - limit} additional events not shown"))
+
+    if summary.category_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Category Overview"))
+        categories = sorted(summary.category_counts.items(), key=lambda item: (-item[1], item[0]))
+        if not verbose:
+            categories = categories[:12]
+        for name, count in categories:
+            lines.append(muted(f"- {name}: {count}"))
+
+    if summary.ot_protocol_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OT Protocols Seen"))
+        for name, count in sorted(summary.ot_protocol_counts.items(), key=lambda item: (-item[1], item[0])):
+            lines.append(muted(f"- {name}: {count}"))
+
+    if summary.ot_activity_bins:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OT Activity Sparklines"))
+        for name, bins in sorted(summary.ot_activity_bins.items(), key=lambda item: (-sum(item[1]), item[0])):
+            graph = sparkline(bins)
+            lines.append(muted(f"- {name}: {graph} ({sum(bins)})"))
+
+    if summary.peer_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Peers"))
+        peer_items = Counter(summary.peer_counts).most_common()
+        if not verbose:
+            peer_items = peer_items[:10]
+        for peer, count in peer_items:
+            peer_text = _highlight_ips(peer, summary.target_ip)
+            lines.append(muted(f"- {peer_text}: {count}"))
+
+    if summary.port_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Ports"))
+        port_items = Counter(summary.port_counts).most_common()
+        if not verbose:
+            port_items = port_items[:10]
+        for port, count in port_items:
+            svc = COMMON_PORTS.get(port, "-")
+            lines.append(muted(f"- {port} ({svc}): {count}"))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)

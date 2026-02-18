@@ -459,6 +459,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Apply a BPF filter (requires libpcap support via scapy).",
     )
     general.add_argument(
+        "--timeline-bins",
+        type=int,
+        default=24,
+        help="Number of time buckets to use for timeline OT activity sparklines.",
+    )
+    general.add_argument(
         "--time-start",
         metavar="TIME",
         help="Only include packets at/after this time (epoch or ISO 8601).",
@@ -670,6 +676,7 @@ def _analyze_paths(
     show_hostdetails: bool,
     show_timeline: bool,
     timeline_ip: str | None,
+    timeline_bins: int,
     show_ntlm: bool,
     show_netbios: bool,
     show_arp: bool,
@@ -1150,11 +1157,16 @@ def _analyze_paths(
                     print(render_hostdetails_summary(hostdetails_summary, verbose=verbose))
                 export_summaries["hostdetails"] = hostdetails_summary
             elif step == "timeline" and show_timeline and timeline_ip:
-                timeline_summary = analyze_timeline(path, timeline_ip, show_status=step_status)
+                timeline_summary = analyze_timeline(
+                    path,
+                    timeline_ip,
+                    show_status=step_status,
+                    timeline_bins=timeline_bins,
+                )
                 if summarize_rollups:
                     rollups.setdefault("timeline", []).append(timeline_summary)
                 else:
-                    print(render_timeline_summary(timeline_summary))
+                    print(render_timeline_summary(timeline_summary, verbose=verbose))
                 export_summaries["timeline"] = timeline_summary
             elif step == "domain" and show_domain:
                 domain_summary = analyze_domain(path, show_status=step_status, packets=packets, meta=meta)
@@ -1470,7 +1482,7 @@ def _analyze_paths(
                 print()
         merge_handlers: dict[str, tuple[callable, callable]] = {
             "ips": (merge_ips_summaries, lambda s: render_ips_summary(s, verbose=verbose)),
-            "timeline": (merge_timeline_summaries, render_timeline_summary),
+            "timeline": (merge_timeline_summaries, lambda s: render_timeline_summary(s, verbose=verbose)),
             "hostname": (merge_hostname_summaries, lambda s: render_hostname_summary(s, verbose=verbose)),
             "hostdetails": (merge_hostdetails_summaries, lambda s: render_hostdetails_summary(s, verbose=verbose)),
             "ftp": (merge_ftp_summaries, lambda s: render_ftp_summary(s, verbose=verbose)),
@@ -1761,6 +1773,7 @@ def main() -> int:
         show_hostdetails=args.hostdetails,
         show_timeline=args.timeline,
         timeline_ip=args.timeline_ip,
+        timeline_bins=args.timeline_bins,
         show_ntlm=args.ntlm,
         show_netbios=args.netbios,
         show_arp=args.arp,
