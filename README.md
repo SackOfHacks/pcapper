@@ -2,14 +2,20 @@
 
 Modular PCAP/PCAPNG analysis CLI for fast triage and deep-dive protocol investigations across enterprise IT and ICS/OT traffic.
 
-## ICS/OT Focus
+**OT/ICS READY** — plant-floor triage in minutes, not hours.
+
+## OT/ICS Command Center
 
 Industrial networks are first-class here: deep protocol coverage, safety-conscious detections, and context that reads like an OT incident timeline instead of a raw packet dump.
+
+Signal > noise for substations, plants, and mixed IT/OT environments.
 
 What you get:
 - Dedicated OT protocol analyzers (IEC-104, DNP3, S7, Profinet, EtherNet/IP, MMS, and more).
 - OT-aware timing/jitter insights for control traffic.
 - Analyst-friendly outputs tuned for plant floors, substations, and mixed IT/OT environments.
+- Control-command visibility for safety/availability impacts (writes, downloads, starts/stops).
+- OT/ICS-centric threat and anomaly rollups with evidence lines for fast triage.
 
 ## Install
 
@@ -97,6 +103,7 @@ python -m pcapper --help
 - `--domain`
 - `--exfil`
 - `--files`
+- `--ftp`
 - `--health`
 - `--hostdetails`
 - `--hostname`
@@ -127,7 +134,7 @@ python -m pcapper --help
 - `--vnc`
 - `--winrm`
 
-Count: 39 flags
+Count: 40 flags
 
 ### OT/ICS/Industrial functions (alphabetical)
 

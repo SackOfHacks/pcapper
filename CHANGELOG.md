@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 ### Added
+- _Nothing yet._
+
+### Changed
+- _Nothing yet._
+
+### Fixed
+- _Nothing yet._
+
+## 1.2.2 — 2026-02-18
+### Added
 - Wildcard target resolution support for quoted glob patterns and mixed target inputs.
 - Multiple positional target support (e.g., shell-expanded wildcards like `Un*` resolving to many files).
 - Merged summarize rendering for timeline analysis (`--summarize --timeline -ip ...`).
@@ -26,6 +36,9 @@ This project follows [Semantic Versioning](https://semver.org/).
 - README now includes a direct `--help` verification command and explicit IT/ICS function counts.
 - `requirements.txt` now explicitly marks runtime dependencies as alphabetically ordered.
 - Summarize mode now renders full module sections for `--health`, `--rdp`, `--telnet`, `--vnc`, `--teamviewer`, and `--winrm`.
+- CLI help description refreshed for IT + OT/ICS framing.
+- README now highlights OT/ICS command-center positioning and includes `--ftp` in the IT flag inventory.
+- `requirements.txt` now notes synchronization with `pyproject.toml`.
 
 ### Fixed
 - `argparse` failure when shell-expanded wildcard input produced multiple targets (`unrecognized arguments ...`).

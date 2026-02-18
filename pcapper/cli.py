@@ -250,7 +250,7 @@ def _build_banner() -> str:
         "   ██████╔╝██║      ███████║██████╔╝██████╔╝█████╗  ██████╔╝    ",
         "   ██╔═══╝ ██║      ██╔══██║██╔═══╝ ██╔═══╝ ██╔══╝  ██╔══██╗    ",
         "   ██║     ╚██████╗ ██║  ██║██║     ██║     ███████╗██║  ██║    ",
-        "   ╚═╝      ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝     ╚══════╝╚═╝  ╚═╝ ICS",
+        "   ╚═╝      ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝     ╚══════╝╚═╝  ╚═╝ ICS/OT",
         "======================================================================",
         f"  PCAPPER v{__version__}  ::  Compile Date {compile_date}",
         "======================================================================",
@@ -288,7 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
     banner = _build_banner()
     parser = argparse.ArgumentParser(
         prog="pcapper",
-        description=f"{banner}\n\nModular PCAP analyzer for fast triage and reporting.",
+        description=f"{banner}\n\nModular PCAP analyzer for fast triage and reporting across IT + OT/ICS traffic.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
