@@ -4,6 +4,13 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 1.3.1 — 2026-02-19
+### Added
+- RDP session tables with endpoints, timing, duration, packet counts, and size; client/server lists now render as vertical columns for readability.
+
+### Fixed
+- SSH analysis now initializes device fingerprint aggregation to prevent runtime errors.
+
 ## 1.3.0 — 2026-02-19
 ### Added
 - Device fingerprinting across IT/OT/IoT traffic (vendor/model/OS/firmware/software) with rollups integrated into host, service, and OT reporting.

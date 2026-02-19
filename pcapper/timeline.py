@@ -801,6 +801,25 @@ def analyze_timeline(
     seen_nbns_events: set[tuple[str, str, str]] = set()
     seen_snmp_events: set[tuple[str, str, int, str]] = set()
     seen_netbios_sessions: set[tuple[str, str, int]] = set()
+    tcp_handshakes: dict[tuple[str, str, int, int], list[dict[str, Optional[float]]]] = defaultdict(list)
+
+    def _new_handshake(syn_ts: Optional[float] = None, synack_ts: Optional[float] = None) -> dict[str, Optional[float]]:
+        return {"syn": syn_ts, "synack": synack_ts, "ack": None}
+
+    def _find_handshake_for_synack(items: list[dict[str, Optional[float]]]) -> dict[str, Optional[float]] | None:
+        for handshake in reversed(items):
+            if handshake["syn"] is not None and handshake["synack"] is None:
+                return handshake
+        for handshake in reversed(items):
+            if handshake["synack"] is None:
+                return handshake
+        return None
+
+    def _find_handshake_for_ack(items: list[dict[str, Optional[float]]]) -> dict[str, Optional[float]] | None:
+        for handshake in reversed(items):
+            if handshake["synack"] is not None and handshake["ack"] is None:
+                return handshake
+        return None
 
     domain_ports = {88, 464, 445, 139, 135, 593, 3268, 3269}
     ldap_ports = {389, 636, 3268, 3269}
@@ -908,13 +927,35 @@ def analyze_timeline(
                 tcp_layer = pkt[TCP]  # type: ignore[index]
                 flags = getattr(tcp_layer, "flags", None)
                 is_syn = False
-                is_synack = False
+                is_ack = False
+                is_rst = False
+                is_fin = False
                 if isinstance(flags, str):
-                    is_syn = "S" in flags and "A" not in flags
-                    is_synack = "S" in flags and "A" in flags
-                elif isinstance(flags, int):
-                    is_syn = (flags & 0x02) != 0 and (flags & 0x10) == 0
-                    is_synack = (flags & 0x12) == 0x12
+                    flag_text = flags
+                else:
+                    flag_text = None
+                flag_bits: Optional[int] = None
+                if flag_text is None and flags is not None:
+                    try:
+                        flag_bits = int(flags)
+                    except Exception:
+                        try:
+                            flag_text = str(flags)
+                        except Exception:
+                            flag_text = None
+                if flag_text is not None:
+                    is_syn = "S" in flag_text
+                    is_ack = "A" in flag_text
+                    is_rst = "R" in flag_text
+                    is_fin = "F" in flag_text
+                elif flag_bits is not None:
+                    is_syn = (flag_bits & 0x02) != 0
+                    is_ack = (flag_bits & 0x10) != 0
+                    is_rst = (flag_bits & 0x04) != 0
+                    is_fin = (flag_bits & 0x01) != 0
+                is_synack = is_syn and is_ack
+                is_syn_only = is_syn and not is_ack
+                is_final_ack = is_ack and not is_syn and not is_rst and not is_fin
                 sport = int(getattr(tcp_layer, "sport", 0) or 0)
                 dport = int(getattr(tcp_layer, "dport", 0) or 0)
                 payload = None
@@ -922,6 +963,25 @@ def analyze_timeline(
                     payload = bytes(tcp_layer.payload)
                 except Exception:
                     payload = None
+                if (src_ip == target_ip or dst_ip == target_ip) and sport and dport:
+                    if is_syn_only:
+                        key = (src_ip, dst_ip, sport, dport)
+                        tcp_handshakes[key].append(_new_handshake(syn_ts=ts))
+                    elif is_synack:
+                        key = (dst_ip, src_ip, dport, sport)
+                        bucket = tcp_handshakes[key]
+                        handshake = _find_handshake_for_synack(bucket)
+                        if handshake is None:
+                            handshake = _new_handshake()
+                            bucket.append(handshake)
+                        handshake["synack"] = ts
+                    elif is_final_ack:
+                        key = (src_ip, dst_ip, sport, dport)
+                        bucket = tcp_handshakes.get(key)
+                        if bucket:
+                            handshake = _find_handshake_for_ack(bucket)
+                            if handshake is not None:
+                                handshake["ack"] = ts
                 if src_ip == target_ip or dst_ip == target_ip:
                     port_key = dport if src_ip == target_ip else sport
                     if port_key:
@@ -1168,7 +1228,7 @@ def analyze_timeline(
                                 summary="Domain service access",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
                             ))
-                    if is_syn and dport:
+                    if is_syn_only and dport:
                         events.append(TimelineEvent(
                             ts=ts,
                             category="Connection",
@@ -1187,7 +1247,7 @@ def analyze_timeline(
                             details=f"{target_ip} -> {dst_ip}:{sport} (SYN-ACK)",
                         ))
                 elif dst_ip == target_ip:
-                    if is_syn and dport:
+                    if is_syn_only and dport:
                         events.append(TimelineEvent(
                             ts=ts,
                             category="Connection",
@@ -1507,6 +1567,23 @@ def analyze_timeline(
                 category="Recon",
                 summary="Potential port scan",
                 details=f"{target_ip} -> {dst_ip} touched {len(ports)} ports over {duration}",
+            ))
+
+    for (client_ip, server_ip, client_port, server_port), handshakes in tcp_handshakes.items():
+        for handshake in handshakes:
+            if handshake["syn"] is None or handshake["synack"] is None:
+                continue
+            if handshake["ack"] is not None:
+                continue
+            detail = (
+                f"{client_ip}:{client_port} -> {server_ip}:{server_port} "
+                "(SYN/SYN-ACK seen, final ACK missing)"
+            )
+            events.append(TimelineEvent(
+                ts=handshake["synack"],
+                category="Connection",
+                summary="TCP handshake incomplete",
+                details=detail,
             ))
 
     if "DNP3" in ot_protocol_counts:

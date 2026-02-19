@@ -3603,13 +3603,49 @@ def render_rdp_summary(summary: RdpSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top RDP Clients & Servers"))
         rows = [["Clients", "Servers"]]
-        client_text = ", ".join(
+        client_items = [
             f"{ip}({count})" for ip, count in summary.client_counts.most_common(_limit_value(8))
-        ) or "-"
-        server_text = ", ".join(
+        ]
+        server_items = [
             f"{ip}({count})" for ip, count in summary.server_counts.most_common(_limit_value(8))
-        ) or "-"
-        rows.append([client_text, server_text])
+        ]
+        max_len = max(len(client_items), len(server_items))
+        if max_len == 0:
+            rows.append(["-", "-"])
+        else:
+            for idx in range(max_len):
+                rows.append([
+                    client_items[idx] if idx < len(client_items) else "-",
+                    server_items[idx] if idx < len(server_items) else "-",
+                ])
+        lines.append(_format_table(rows))
+
+    if summary.conversations:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("RDP Sessions"))
+        rows = [["Client", "Server", "Start", "End", "Duration", "Packets", "Size"]]
+        if verbose:
+            rows[0].extend(["UDP", "TLS"])
+        top_sessions = sorted(summary.conversations, key=lambda conv: conv.bytes, reverse=True)[:limit]
+        for conv in top_sessions:
+            duration = None
+            if conv.first_seen is not None and conv.last_seen is not None:
+                duration = max(0.0, conv.last_seen - conv.first_seen)
+            row = [
+                f"{conv.client_ip}:{conv.client_port}",
+                f"{conv.server_ip}:{conv.server_port}",
+                format_ts(conv.first_seen),
+                format_ts(conv.last_seen),
+                format_duration(duration),
+                str(conv.packets),
+                format_bytes_as_mb(conv.bytes),
+            ]
+            if verbose:
+                row.extend([
+                    "yes" if conv.udp_detected else "no",
+                    "yes" if conv.tls_detected else "no",
+                ])
+            rows.append(row)
         lines.append(_format_table(rows))
 
     if summary.ip_to_macs:
@@ -3689,23 +3725,6 @@ def render_rdp_summary(summary: RdpSummary, limit: int = 12, verbose: bool = Fal
         lines.append(header("Artifacts"))
         for item in summary.artifacts[:limit]:
             lines.append(f"- {_truncate_text(item, 80)}")
-
-    if summary.conversations and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Sessions"))
-        rows = [["Client", "Server", "C->S MB", "S->C MB", "Packets", "UDP", "TLS"]]
-        top_sessions = sorted(summary.conversations, key=lambda conv: conv.bytes, reverse=True)[:limit]
-        for conv in top_sessions:
-            rows.append([
-                f"{conv.client_ip}:{conv.client_port}",
-                f"{conv.server_ip}:{conv.server_port}",
-                f"{conv.client_bytes / (1024 * 1024):.1f}",
-                f"{conv.server_bytes / (1024 * 1024):.1f}",
-                str(conv.packets),
-                "yes" if conv.udp_detected else "no",
-                "yes" if conv.tls_detected else "no",
-            ])
-        lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
@@ -8328,6 +8347,8 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
 
     def _severity_for_event(item: TimelineEvent) -> str:
         text = f"{item.summary} {item.details}".lower()
+        if "handshake incomplete" in text or "final ack missing" in text:
+            return "suspicious"
         if "potential port scan" in text:
             return "suspicious"
         if "http post" in text:
