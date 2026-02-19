@@ -4,12 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from collections import Counter, defaultdict
+from functools import lru_cache
 import ipaddress
 import math
 import re
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, counter_inc, setdict_add
 from .icmp import analyze_icmp
 from .dns import analyze_dns
 from .beacon import analyze_beacons
@@ -45,8 +46,36 @@ from .prconos import analyze_prconos
 from .iccp import analyze_iccp
 from .creds import analyze_creds
 from .http import analyze_http
+from .tls import analyze_tls
+from .ldap import analyze_ldap
+from .kerberos import analyze_kerberos
+from .ntlm import analyze_ntlm
+from .syslog import analyze_syslog
+from .arp import analyze_arp
+from .dhcp import analyze_dhcp
+from .exfil import analyze_exfil
+from .quic import analyze_quic
+from .encrypted_dns import analyze_encrypted_dns
+from .vpn import analyze_vpn
+from .smb import analyze_smb
+from .rdp import analyze_rdp
+from .winrm import analyze_winrm
+from .wmic import analyze_wmic
+from .powershell import analyze_powershell
+from .ssh import analyze_ssh
+from .smtp import analyze_smtp
+from .rpc import analyze_rpc
+from .snmp import analyze_snmp
+from .tcp import analyze_tcp
+from .udp import analyze_udp
+from .goose import analyze_goose
+from .sv import analyze_sv
+from .ptp import analyze_ptp
+from .lldp_dcp import analyze_lldp_dcp
+from .opc_classic import analyze_opc_classic
+from .ot_risk import compute_ot_risk_posture, dedupe_findings
 
-ENIP_PORTS = {44818, 2222}
+ENIP_PORTS = {44818, 2222, 2221}
 DNP3_PORT = 20000
 ENIP_COMMAND_SET = {
     0x0001, 0x0004, 0x0063, 0x0064, 0x0065, 0x0066,
@@ -58,6 +87,43 @@ CIP_SERVICE_CODE_SET = {
     0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x4B, 0x4C, 0x4D, 0x4E,
     0x4F, 0x50, 0x51, 0x52, 0x54, 0x55, 0x5C, 0x73, 0x74, 0x75,
     0x91,
+}
+
+OT_PORTS: dict[int, str] = {
+    319: "PTP",
+    320: "PTP",
+    502: "Modbus",
+    20000: "DNP3",
+    2404: "IEC-104",
+    102: "S7/MMS/ICCP",
+    44818: "EtherNet/IP",
+    2222: "CIP/ENIP-IO",
+    2221: "CIP Security",
+    47808: "BACnet",
+    34962: "Profinet",
+    34963: "Profinet",
+    34964: "Profinet",
+    4840: "OPC UA",
+    789: "Crimson",
+    1911: "Niagara Fox",
+    4911: "Niagara Fox",
+    9600: "FINS",
+    5094: "HART-IP",
+    18245: "SRTP",
+    18246: "SRTP",
+    1962: "PCWorx",
+    5006: "MELSEC",
+    5007: "MELSEC",
+    20547: "ProConOS",
+    2455: "CODESYS",
+    1217: "CODESYS",
+    5683: "CoAP",
+    5684: "CoAP",
+    1883: "MQTT",
+    8883: "MQTT-TLS",
+    34378: "Yokogawa Vnet/IP",
+    34379: "Yokogawa Vnet/IP",
+    34380: "Yokogawa Vnet/IP",
 }
 
 try:
@@ -80,20 +146,92 @@ class ThreatSummary:
     path: Path
     detections: list[dict[str, object]]
     errors: list[str]
+    total_packets: int = 0
+    first_seen: Optional[float] = None
+    last_seen: Optional[float] = None
+    duration: Optional[float] = None
+    ot_protocol_counts: dict[str, int] = None  # type: ignore[assignment]
+    public_ot_pairs: list[tuple[str, str, str]] = None  # type: ignore[assignment]
+    ot_peer_internal: list[tuple[str, int]] = None  # type: ignore[assignment]
+    ot_peer_external: list[tuple[str, int]] = None  # type: ignore[assignment]
+    ot_risk_score: int = 0
+    ot_risk_findings: list[str] = None  # type: ignore[assignment]
+    storyline: list[str] = None  # type: ignore[assignment]
 
 
 def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
     if not summaries:
-        return ThreatSummary(path=Path("ALL_PCAPS"), detections=[], errors=[])
+        return ThreatSummary(
+            path=Path("ALL_PCAPS"),
+            detections=[],
+            errors=[],
+            total_packets=0,
+            first_seen=None,
+            last_seen=None,
+            duration=None,
+            ot_protocol_counts={},
+            public_ot_pairs=[],
+            ot_peer_internal=[],
+            ot_peer_external=[],
+            ot_risk_score=0,
+            ot_risk_findings=[],
+            storyline=[],
+        )
 
     merged_detections: list[dict[str, object]] = []
     merged_errors: list[str] = []
+    total_packets = 0
+    first_seen: Optional[float] = None
+    last_seen: Optional[float] = None
+    ot_protocol_counts: Counter[str] = Counter()
+    public_ot_pairs: list[tuple[str, str, str]] = []
+    ot_peer_internal: Counter[str] = Counter()
+    ot_peer_external: Counter[str] = Counter()
+    risk_scores: list[int] = []
+    risk_findings: list[str] = []
+    storyline: list[str] = []
     for summary in summaries:
         merged_detections.extend(summary.detections)
         merged_errors.extend(summary.errors)
+        total_packets += summary.total_packets
+        if summary.first_seen is not None:
+            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+        if summary.last_seen is not None:
+            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+        ot_protocol_counts.update(summary.ot_protocol_counts or {})
+        if summary.public_ot_pairs:
+            public_ot_pairs.extend(summary.public_ot_pairs)
+        if summary.ot_peer_internal:
+            ot_peer_internal.update(dict(summary.ot_peer_internal))
+        if summary.ot_peer_external:
+            ot_peer_external.update(dict(summary.ot_peer_external))
+        if summary.ot_risk_score:
+            risk_scores.append(summary.ot_risk_score)
+        if summary.ot_risk_findings:
+            risk_findings.extend(summary.ot_risk_findings)
+        if summary.storyline:
+            storyline.extend(summary.storyline)
 
     deduped_errors = sorted(set(merged_errors))
-    return ThreatSummary(path=Path("ALL_PCAPS"), detections=merged_detections, errors=deduped_errors)
+    duration = None
+    if first_seen is not None and last_seen is not None:
+        duration = max(0.0, last_seen - first_seen)
+    return ThreatSummary(
+        path=Path("ALL_PCAPS"),
+        detections=merged_detections,
+        errors=deduped_errors,
+        total_packets=total_packets,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        duration=duration,
+        ot_protocol_counts=dict(ot_protocol_counts),
+        public_ot_pairs=public_ot_pairs,
+        ot_peer_internal=ot_peer_internal.most_common(10),
+        ot_peer_external=ot_peer_external.most_common(10),
+        ot_risk_score=max(risk_scores) if risk_scores else 0,
+        ot_risk_findings=_dedupe_evidence(risk_findings, limit=6),
+        storyline=_dedupe_evidence(storyline, limit=6),
+    )
 
 
 def _normalize_severity(value: object) -> str:
@@ -136,6 +274,127 @@ def _append_ot_anomalies(
         if dst:
             item["top_destinations"] = [(dst, 1)]
         detections.append(item)
+
+
+def _append_detection_items(
+    detections: list[dict[str, object]],
+    source: str,
+    items: list[dict[str, object]] | None,
+) -> None:
+    if not items:
+        return
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        detections.append({
+            "source": source,
+            **item,
+        })
+
+
+def _append_anomaly_items(
+    detections: list[dict[str, object]],
+    source: str,
+    anomalies: list[object] | None,
+) -> None:
+    if not anomalies:
+        return
+    for anomaly in anomalies:
+        if isinstance(anomaly, dict):
+            severity = _normalize_severity(anomaly.get("severity", "info"))
+            summary = str(anomaly.get("title") or anomaly.get("summary") or "Anomaly")
+            details = str(anomaly.get("details") or anomaly.get("description") or "")
+            item: dict[str, object] = {
+                "source": source,
+                "severity": severity,
+                "summary": summary,
+                "details": details,
+            }
+            src = anomaly.get("src") or anomaly.get("source_ip")
+            dst = anomaly.get("dst") or anomaly.get("dest_ip")
+            if src:
+                item["top_sources"] = [(str(src), 1)]
+            if dst:
+                item["top_destinations"] = [(str(dst), 1)]
+            detections.append(item)
+            continue
+
+        title = str(getattr(anomaly, "title", "") or getattr(anomaly, "summary", "") or "Anomaly")
+        details = str(getattr(anomaly, "details", "") or getattr(anomaly, "description", "") or "")
+        severity = _normalize_severity(getattr(anomaly, "severity", "info"))
+        item = {
+            "source": source,
+            "severity": severity,
+            "summary": title,
+            "details": details,
+        }
+        src = getattr(anomaly, "src", None)
+        dst = getattr(anomaly, "dst", None)
+        if src:
+            item["top_sources"] = [(str(src), 1)]
+        if dst:
+            item["top_destinations"] = [(str(dst), 1)]
+        detections.append(item)
+
+
+_ARP_THREAT_SEVERITY = {
+    "ARP Spoofing": "high",
+    "Poisoning Indicators": "high",
+    "Address Impersonation": "high",
+    "Failover/Poisoning Signal": "high",
+    "ARP Sweep": "warning",
+    "Layer2 Flooding": "warning",
+}
+
+
+_DHCP_THREAT_SEVERITY = {
+    "Rogue DHCP Server": "high",
+    "DHCP Starvation": "high",
+    "DHCP NAK Flooding": "warning",
+    "Lease Brute Force/Enumeration": "warning",
+    "DHCP Probing/Scanning": "warning",
+    "DHCP Beaconing": "info",
+    "DHCP Option Exfiltration": "warning",
+    "Public DHCP Infrastructure Exposure": "high",
+}
+
+
+_OT_COMMAND_KEYWORDS: dict[str, str] = {
+    "plcstop": "critical",
+    "plccoldstart": "high",
+    "plchotstart": "high",
+    "stopdt": "high",
+    "startdt": "warning",
+    "stop": "high",
+    "start": "warning",
+    "restart": "high",
+    "reset": "high",
+    "download": "high",
+    "upload": "warning",
+    "program": "high",
+    "firmware": "critical",
+    "write": "warning",
+    "setpoint": "high",
+    "override": "high",
+    "control": "warning",
+    "delete": "high",
+    "erase": "critical",
+}
+
+
+def _collect_ot_command_hits(commands: Counter[str]) -> tuple[Counter[str], str]:
+    hits: Counter[str] = Counter()
+    severity_rank = {"critical": 0, "high": 1, "warning": 2, "info": 3}
+    max_sev = "info"
+    for cmd, count in commands.items():
+        cmd_lower = str(cmd).lower()
+        for token, sev in _OT_COMMAND_KEYWORDS.items():
+            if token in cmd_lower:
+                hits[cmd] += int(count)
+                if severity_rank.get(sev, 99) < severity_rank.get(max_sev, 99):
+                    max_sev = sev
+                break
+    return hits, max_sev
 
 
 def _counter_total(value: object) -> int:
@@ -336,7 +595,11 @@ SUSPICIOUS_PAYLOAD_MARKERS = [
     "nc ",
 ]
 
+FAILED_AUTH_PATTERNS_BYTES = [pattern.encode("utf-8", errors="ignore") for pattern in FAILED_AUTH_PATTERNS]
+SUSPICIOUS_PAYLOAD_MARKERS_BYTES = [pattern.encode("utf-8", errors="ignore") for pattern in SUSPICIOUS_PAYLOAD_MARKERS]
 
+
+@lru_cache(maxsize=100000)
 def _is_private_ip(value: str) -> bool:
     try:
         return ipaddress.ip_address(value).is_private
@@ -344,6 +607,7 @@ def _is_private_ip(value: str) -> bool:
         return False
 
 
+@lru_cache(maxsize=100000)
 def _is_public_ip(value: str) -> bool:
     try:
         return ipaddress.ip_address(value).is_global
@@ -351,30 +615,71 @@ def _is_public_ip(value: str) -> bool:
         return False
 
 
+def _ot_risk_posture_from_detections(
+    detections: list[dict[str, object]],
+    public_ot_flows: int,
+    control_hits: int,
+) -> tuple[int, list[str]]:
+    high_sev_ot = 0
+    high_sev_general = 0
+    for item in detections:
+        source = str(item.get("source", "")).lower()
+        severity = str(item.get("severity", "info")).lower()
+        summary = str(item.get("summary", "")).lower()
+        if severity not in {"high", "critical"}:
+            continue
+        is_ot = "ot/ics" in source or any(token in summary for token in ("modbus", "dnp3", "iec-104", "s7", "enip", "cip", "opc", "bacnet"))
+        if is_ot:
+            high_sev_ot += 1
+        else:
+            high_sev_general += 1
+
+    score, findings = compute_ot_risk_posture(
+        public_ot_flows=public_ot_flows,
+        control_hits=control_hits,
+        anomaly_hits=high_sev_ot,
+        high_sev_ot=high_sev_ot,
+        high_sev_general=high_sev_general,
+    )
+    return score, dedupe_findings(findings, limit=6)
+
+
+def _threats_storyline(
+    detections: list[dict[str, object]],
+    ot_protocol_counts: dict[str, int],
+    risk_score: int,
+    risk_findings: list[str],
+) -> list[str]:
+    if not detections:
+        return ["No notable threat detections observed."]
+    top_protocols = sorted(ot_protocol_counts.items(), key=lambda item: (-item[1], item[0]))[:4]
+    storyline: list[str] = []
+    if top_protocols:
+        proto_text = ", ".join(f"{name} ({count})" for name, count in top_protocols)
+        storyline.append(f"OT protocols present: {proto_text}.")
+    if risk_score:
+        storyline.append(f"OT risk posture scored {risk_score}/100.")
+    if risk_findings:
+        storyline.append("Key signals: " + "; ".join(risk_findings[:3]))
+
+    severity_order = {"critical": 0, "high": 1, "warning": 2, "info": 3}
+    sorted_dets = sorted(
+        detections,
+        key=lambda item: (severity_order.get(str(item.get("severity", "info")).lower(), 99)),
+    )
+    top = sorted_dets[:3]
+    if top:
+        examples = "; ".join(str(item.get("summary", "")) for item in top if item.get("summary"))
+        if examples:
+            storyline.append(f"Top detections: {examples}.")
+    return storyline
+
+
 def _tcp_is_syn(flags: object) -> bool:
     if isinstance(flags, int):
         return (flags & 0x02) != 0 and (flags & 0x10) == 0
     text = str(flags)
     return "S" in text and "A" not in text
-
-
-def _payload_text(pkt) -> str:
-    if Raw is not None and pkt.haslayer(Raw):
-        try:
-            return bytes(pkt[Raw].load).decode("latin-1", errors="ignore")
-        except Exception:
-            return ""
-    if TCP is not None and pkt.haslayer(TCP):
-        try:
-            return bytes(pkt[TCP].payload).decode("latin-1", errors="ignore")
-        except Exception:
-            return ""
-    if UDP is not None and pkt.haslayer(UDP):
-        try:
-            return bytes(pkt[UDP].payload).decode("latin-1", errors="ignore")
-        except Exception:
-            return ""
-    return ""
 
 
 def _entropy(value: str) -> float:
@@ -475,6 +780,9 @@ def _file_detection_evidence(item: dict[str, object], artifacts_by_name: dict[st
 def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     errors: list[str] = []
     detections: list[dict[str, object]] = []
+    public_ot_pairs: set[tuple[str, str, str]] = set()
+    ot_peer_internal: Counter[str] = Counter()
+    ot_peer_external: Counter[str] = Counter()
 
     # Aggregate detections from specialized modules
     icmp_summary = analyze_icmp(path, show_status=show_status)
@@ -483,6 +791,33 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     files_summary = analyze_files(path, show_status=show_status)
     http_summary = analyze_http(path, show_status=show_status)
     creds_summary = analyze_creds(path, show_status=show_status)
+    tls_summary = analyze_tls(path, show_status=show_status)
+    ldap_summary = analyze_ldap(path, show_status=show_status)
+    kerberos_summary = analyze_kerberos(path, show_status=show_status)
+    ntlm_summary = analyze_ntlm(path, show_status=show_status)
+    syslog_summary = analyze_syslog(path, show_status=show_status)
+    arp_summary = analyze_arp(path, show_status=show_status)
+    dhcp_summary = analyze_dhcp(path, show_status=show_status)
+    exfil_summary = analyze_exfil(path, show_status=show_status)
+    quic_summary = analyze_quic(path, show_status=show_status)
+    edns_summary = analyze_encrypted_dns(path, show_status=show_status)
+    vpn_summary = analyze_vpn(path, show_status=show_status)
+    smb_summary = analyze_smb(path, show_status=show_status)
+    rdp_summary = analyze_rdp(path, show_status=show_status)
+    winrm_summary = analyze_winrm(path, show_status=show_status)
+    wmic_summary = analyze_wmic(path, show_status=show_status)
+    powershell_summary = analyze_powershell(path, show_status=show_status)
+    ssh_summary = analyze_ssh(path, show_status=show_status)
+    smtp_summary = analyze_smtp(path, show_status=show_status)
+    rpc_summary = analyze_rpc(path, show_status=show_status)
+    snmp_summary = analyze_snmp(path, show_status=show_status)
+    tcp_summary = analyze_tcp(path, show_status=show_status)
+    udp_summary = analyze_udp(path, show_status=show_status)
+    goose_summary = analyze_goose(path, show_status=show_status)
+    sv_summary = analyze_sv(path, show_status=show_status)
+    ptp_summary = analyze_ptp(path, show_status=show_status)
+    lldp_summary = analyze_lldp_dcp(path, show_status=show_status)
+    opc_classic_summary = analyze_opc_classic(path, show_status=show_status)
 
     artifacts_by_name: dict[str, list[object]] = defaultdict(list)
     for artifact in files_summary.artifacts:
@@ -521,6 +856,7 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
         "ProConOS": analyze_prconos(path, show_status=show_status),
         "ICCP": analyze_iccp(path, show_status=show_status),
     }
+    ot_protocol_counts: Counter[str] = Counter()
 
     ot_candidates: dict[str, list[object]] = {}
     for source, summary in ot_summaries.items():
@@ -555,6 +891,81 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             enriched["evidence"] = http_evidence
         detections.append(enriched)
 
+    _append_detection_items(detections, "TLS", tls_summary.detections)
+    _append_detection_items(detections, "LDAP", ldap_summary.detections)
+    _append_detection_items(detections, "Kerberos", kerberos_summary.detections)
+    _append_detection_items(detections, "Syslog", syslog_summary.detections)
+    _append_detection_items(detections, "Exfil", exfil_summary.detections)
+    _append_detection_items(detections, "QUIC", quic_summary.detections)
+    _append_detection_items(detections, "Encrypted DNS", edns_summary.detections)
+    _append_detection_items(detections, "VPN", vpn_summary.detections)
+    _append_detection_items(detections, "RDP", rdp_summary.detections)
+    _append_detection_items(detections, "WinRM", winrm_summary.detections)
+    _append_detection_items(detections, "WMIC", wmic_summary.detections)
+    _append_detection_items(detections, "PowerShell", powershell_summary.detections)
+    _append_detection_items(detections, "SSH", ssh_summary.detections)
+    _append_detection_items(detections, "SMTP", smtp_summary.detections)
+    _append_detection_items(detections, "RPC", rpc_summary.detections)
+    _append_detection_items(detections, "SNMP", snmp_summary.detections)
+    _append_detection_items(detections, "TCP", tcp_summary.detections)
+    _append_detection_items(detections, "UDP", udp_summary.detections)
+    _append_detection_items(detections, "GOOSE", goose_summary.detections)
+    _append_detection_items(detections, "SV", sv_summary.detections)
+    _append_detection_items(detections, "PTP", ptp_summary.detections)
+    _append_detection_items(detections, "LLDP/DCP", lldp_summary.detections)
+    _append_detection_items(detections, "OPC Classic", opc_classic_summary.detections)
+
+    _append_anomaly_items(detections, "NTLM", ntlm_summary.anomalies)
+    _append_anomaly_items(detections, "Syslog", syslog_summary.anomalies)
+    _append_anomaly_items(detections, "SMB", smb_summary.anomalies)
+    _append_anomaly_items(detections, "RDP", rdp_summary.anomalies)
+    _append_anomaly_items(detections, "WinRM", winrm_summary.anomalies)
+    _append_anomaly_items(detections, "WMIC", wmic_summary.anomalies)
+    _append_anomaly_items(detections, "PowerShell", powershell_summary.anomalies)
+    _append_anomaly_items(detections, "SSH", ssh_summary.anomalies)
+    _append_anomaly_items(detections, "SMTP", smtp_summary.anomalies)
+    _append_anomaly_items(detections, "RPC", rpc_summary.anomalies)
+    _append_anomaly_items(detections, "SNMP", snmp_summary.anomalies)
+
+    if smb_summary.lateral_movement:
+        detections.append({
+            "source": "SMB",
+            "severity": "warning",
+            "summary": "SMB lateral movement indicators",
+            "details": f"{len(smb_summary.lateral_movement)} lateral movement signals.",
+            "evidence": _dedupe_evidence(
+                [str(item) for item in smb_summary.lateral_movement[:8]],
+                limit=8,
+            ),
+        })
+    if smb_summary.versions and smb_summary.versions.get("SMB1"):
+        detections.append({
+            "source": "SMB",
+            "severity": "critical",
+            "summary": "Legacy SMBv1 usage observed",
+            "details": f"{smb_summary.versions.get('SMB1')} SMBv1 packet(s) detected.",
+        })
+
+    if arp_summary.threats:
+        for threat, count in arp_summary.threats.items():
+            detections.append({
+                "source": "ARP",
+                "severity": _ARP_THREAT_SEVERITY.get(threat, "warning"),
+                "summary": threat,
+                "details": f"{count} event(s) flagged.",
+            })
+    _append_anomaly_items(detections, "ARP", arp_summary.anomalies)
+
+    if dhcp_summary.threat_summary:
+        for threat, count in dhcp_summary.threat_summary.items():
+            detections.append({
+                "source": "DHCP",
+                "severity": _DHCP_THREAT_SEVERITY.get(threat, "warning"),
+                "summary": threat,
+                "details": f"{count} event(s) flagged.",
+            })
+    _append_anomaly_items(detections, "DHCP", dhcp_summary.anomalies)
+
     if creds_summary.matches:
         hits_by_src: Counter[str] = Counter(hit.src_ip for hit in creds_summary.hits)
         hits_by_dst: Counter[str] = Counter(hit.dst_ip for hit in creds_summary.hits)
@@ -579,6 +990,33 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
 
     errors.extend(http_summary.errors)
     errors.extend(creds_summary.errors)
+    errors.extend(tls_summary.errors)
+    errors.extend(ldap_summary.errors)
+    errors.extend(kerberos_summary.errors)
+    errors.extend(ntlm_summary.errors)
+    errors.extend(syslog_summary.errors)
+    errors.extend(arp_summary.errors)
+    errors.extend(dhcp_summary.errors)
+    errors.extend(exfil_summary.errors)
+    errors.extend(quic_summary.errors)
+    errors.extend(edns_summary.errors)
+    errors.extend(vpn_summary.errors)
+    errors.extend(smb_summary.errors)
+    errors.extend(rdp_summary.errors)
+    errors.extend(winrm_summary.errors)
+    errors.extend(wmic_summary.errors)
+    errors.extend(powershell_summary.errors)
+    errors.extend(ssh_summary.errors)
+    errors.extend(smtp_summary.errors)
+    errors.extend(rpc_summary.errors)
+    errors.extend(snmp_summary.errors)
+    errors.extend(tcp_summary.errors)
+    errors.extend(udp_summary.errors)
+    errors.extend(goose_summary.errors)
+    errors.extend(sv_summary.errors)
+    errors.extend(ptp_summary.errors)
+    errors.extend(lldp_summary.errors)
+    errors.extend(opc_classic_summary.errors)
 
     smb1_sources: Counter[str] = Counter()
     smb1_destinations: Counter[str] = Counter()
@@ -741,9 +1179,12 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     strict_ot_pairs: dict[str, set[tuple[str, str]]] = defaultdict(set)
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+    total_packets = 0
+    control_command_total = 0
 
     try:
         for pkt in reader:
+            total_packets += 1
             if stream is not None and size_bytes:
                 try:
                     pos = stream.tell()
@@ -773,19 +1214,19 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             if not src_ip or not dst_ip:
                 continue
 
-            src_counts[src_ip] += 1
-            dst_counts[dst_ip] += 1
-            src_targets[src_ip].add(dst_ip)
+            counter_inc(src_counts, src_ip)
+            counter_inc(dst_counts, dst_ip)
+            setdict_add(src_targets, src_ip, dst_ip)
 
             pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
             if _is_private_ip(src_ip) and _is_public_ip(dst_ip):
                 outbound_bytes_public[(src_ip, dst_ip)] += pkt_len
-                outbound_public_dests_by_src[src_ip].add(dst_ip)
+                setdict_add(outbound_public_dests_by_src, src_ip, dst_ip)
 
             payload_data = _payload_bytes(pkt)
-            payload_text = payload_data.decode("latin-1", errors="ignore").lower() if payload_data else ""
-            if payload_text and any(marker in payload_text for marker in SUSPICIOUS_PAYLOAD_MARKERS):
-                suspicious_payload_sources[src_ip] += 1
+            payload_lower = payload_data.lower() if payload_data else b""
+            if payload_lower and any(marker in payload_lower for marker in SUSPICIOUS_PAYLOAD_MARKERS_BYTES):
+                counter_inc(suspicious_payload_sources, src_ip)
 
             if DNS is not None and DNSQR is not None and pkt.haslayer(DNS):
                 dns_layer = pkt[DNS]
@@ -799,48 +1240,62 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
                         labels = [label for label in qname.split(".") if label]
                         longest_label = max((len(label) for label in labels), default=0)
                         if len(qname) >= 60 or longest_label >= 32 or _entropy(qname) >= 3.8:
-                            dns_tunnel_sources[src_ip] += 1
+                            counter_inc(dns_tunnel_sources, src_ip)
                         if qtype == 16:
-                            dns_txt_query_sources[src_ip] += 1
+                            counter_inc(dns_txt_query_sources, src_ip)
 
             if TCP is not None and pkt.haslayer(TCP):
                 tcp_layer = pkt[TCP]
                 dport = int(getattr(tcp_layer, "dport", 0) or 0)
                 sport = int(getattr(tcp_layer, "sport", 0) or 0)
 
+                if (dport in OT_PORTS or sport in OT_PORTS):
+                    proto = OT_PORTS.get(dport) or OT_PORTS.get(sport) or "OT"
+                    if _is_public_ip(src_ip) or _is_public_ip(dst_ip):
+                        public_ot_pairs.add((proto, src_ip, dst_ip))
+                        if _is_public_ip(src_ip):
+                            counter_inc(ot_peer_external, src_ip)
+                        if _is_public_ip(dst_ip):
+                            counter_inc(ot_peer_external, dst_ip)
+                    if _is_private_ip(src_ip):
+                        counter_inc(ot_peer_internal, src_ip)
+                    if _is_private_ip(dst_ip):
+                        counter_inc(ot_peer_internal, dst_ip)
+                    counter_inc(ot_protocol_counts, proto)
+
                 if sport in ENIP_PORTS or dport in ENIP_PORTS:
                     enip_ok, cip_ok = _strict_enip_cip_marker(payload_data)
                     if enip_ok:
                         strict_ot_counts["EtherNet/IP"] += 1
-                        strict_ot_pairs["EtherNet/IP"].add((src_ip, dst_ip))
+                        setdict_add(strict_ot_pairs, "EtherNet/IP", (src_ip, dst_ip))
                     if cip_ok:
                         strict_ot_counts["CIP"] += 1
-                        strict_ot_pairs["CIP"].add((src_ip, dst_ip))
+                        setdict_add(strict_ot_pairs, "CIP", (src_ip, dst_ip))
 
                 if sport == DNP3_PORT or dport == DNP3_PORT:
                     if _strict_dnp3_marker(payload_data):
                         strict_ot_counts["DNP3"] += 1
-                        strict_ot_pairs["DNP3"].add((src_ip, dst_ip))
+                        setdict_add(strict_ot_pairs, "DNP3", (src_ip, dst_ip))
 
                 if dport:
-                    pair_ports[(src_ip, dst_ip)].add(dport)
-                    src_ports[src_ip].add(dport)
+                    setdict_add(pair_ports, (src_ip, dst_ip), dport)
+                    setdict_add(src_ports, src_ip, dport)
 
                 flags = getattr(tcp_layer, "flags", None)
                 if flags is not None and _tcp_is_syn(flags):
-                    syn_counts[src_ip] += 1
+                    counter_inc(syn_counts, src_ip)
                     if dport in AUTH_PORTS:
-                        auth_attempts[(src_ip, dst_ip, AUTH_PORTS[dport])] += 1
+                        counter_inc(auth_attempts, (src_ip, dst_ip, AUTH_PORTS[dport]))
 
                 service = AUTH_PORTS.get(dport) or AUTH_PORTS.get(sport)
-                if service and payload_text and any(pattern in payload_text for pattern in FAILED_AUTH_PATTERNS):
-                    auth_failures[(src_ip, dst_ip, service)] += 1
+                if service and payload_lower and any(pattern in payload_lower for pattern in FAILED_AUTH_PATTERNS_BYTES):
+                    counter_inc(auth_failures, (src_ip, dst_ip, service))
 
                 lateral_service = LATERAL_PORTS.get(dport)
                 if lateral_service and _is_private_ip(src_ip) and _is_private_ip(dst_ip):
-                    lateral_targets[src_ip].add(dst_ip)
+                    setdict_add(lateral_targets, src_ip, dst_ip)
 
-                if dport in WEB_PORTS and payload_text.startswith(("post ", "put ")):
+                if dport in WEB_PORTS and payload_lower.startswith((b"post ", b"put ")):
                     if _is_private_ip(src_ip) and _is_public_ip(dst_ip):
                         outbound_bytes_public[(src_ip, dst_ip)] += pkt_len
 
@@ -849,29 +1304,57 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
                 dport = int(getattr(udp_layer, "dport", 0) or 0)
                 sport = int(getattr(udp_layer, "sport", 0) or 0)
 
+                if (dport in OT_PORTS or sport in OT_PORTS):
+                    proto = OT_PORTS.get(dport) or OT_PORTS.get(sport) or "OT"
+                    if _is_public_ip(src_ip) or _is_public_ip(dst_ip):
+                        public_ot_pairs.add((proto, src_ip, dst_ip))
+                        if _is_public_ip(src_ip):
+                            counter_inc(ot_peer_external, src_ip)
+                        if _is_public_ip(dst_ip):
+                            counter_inc(ot_peer_external, dst_ip)
+                    if _is_private_ip(src_ip):
+                        counter_inc(ot_peer_internal, src_ip)
+                    if _is_private_ip(dst_ip):
+                        counter_inc(ot_peer_internal, dst_ip)
+                    counter_inc(ot_protocol_counts, proto)
+
                 if sport in ENIP_PORTS or dport in ENIP_PORTS:
                     enip_ok, cip_ok = _strict_enip_cip_marker(payload_data)
                     if enip_ok:
                         strict_ot_counts["EtherNet/IP"] += 1
-                        strict_ot_pairs["EtherNet/IP"].add((src_ip, dst_ip))
+                        setdict_add(strict_ot_pairs, "EtherNet/IP", (src_ip, dst_ip))
                     if cip_ok:
                         strict_ot_counts["CIP"] += 1
-                        strict_ot_pairs["CIP"].add((src_ip, dst_ip))
+                        setdict_add(strict_ot_pairs, "CIP", (src_ip, dst_ip))
 
                 if sport == DNP3_PORT or dport == DNP3_PORT:
                     if _strict_dnp3_marker(payload_data):
                         strict_ot_counts["DNP3"] += 1
-                        strict_ot_pairs["DNP3"].add((src_ip, dst_ip))
+                        setdict_add(strict_ot_pairs, "DNP3", (src_ip, dst_ip))
 
                 if dport:
-                    udp_target_counts[dst_ip] += 1
-                    src_ports[src_ip].add(dport)
+                    counter_inc(udp_target_counts, dst_ip)
+                    setdict_add(src_ports, src_ip, dport)
 
     finally:
         status.finish()
         reader.close()
 
     duration_seconds = max(0.0, (last_seen or 0.0) - (first_seen or 0.0)) if first_seen is not None and last_seen is not None else None
+
+    # Add layer-2 OT/ICS protocol presence not captured by port heuristics
+    if goose_summary.goose_packets:
+        ot_protocol_counts["GOOSE"] += goose_summary.goose_packets
+    if sv_summary.sv_packets:
+        ot_protocol_counts["SV"] += sv_summary.sv_packets
+    if ptp_summary.ptp_packets:
+        ot_protocol_counts["PTP"] += ptp_summary.ptp_packets
+    if lldp_summary.lldp_packets:
+        ot_protocol_counts["LLDP"] += lldp_summary.lldp_packets
+    if lldp_summary.dcp_packets:
+        ot_protocol_counts["DCP"] += lldp_summary.dcp_packets
+    if opc_classic_summary.opc_packets:
+        ot_protocol_counts["OPC Classic"] += opc_classic_summary.opc_packets
 
     for source, anomalies in ot_candidates.items():
         summary_obj = ot_summaries.get(source)
@@ -888,8 +1371,145 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             if strict_count < 2:
                 continue
 
+        high_anoms = [
+            anomaly for anomaly in anomalies
+            if _normalize_severity(getattr(anomaly, "severity", "info")) in {"high", "critical"}
+        ]
+
+        if high_anoms:
+            _append_ot_anomalies(detections, source, high_anoms)
         if _ot_presence_confident(source, summary_obj, anomalies):
             _append_ot_anomalies(detections, source, anomalies)
+
+    # OT command/control activity across protocols
+    for source, summary_obj in ot_summaries.items():
+        commands = getattr(summary_obj, "commands", None)
+        if isinstance(commands, Counter) and commands:
+            hits, severity = _collect_ot_command_hits(commands)
+            if hits:
+                evidence = [f"{cmd}({count})" for cmd, count in hits.most_common(10)]
+                detections.append({
+                    "source": source,
+                    "severity": severity,
+                    "summary": "OT control/engineering command activity",
+                    "details": f"{sum(hits.values())} control-like command(s) observed in {source}.",
+                    "evidence": _dedupe_evidence(evidence, limit=10),
+                })
+
+        func_counts = getattr(summary_obj, "func_counts", None)
+        if isinstance(func_counts, Counter):
+            func_hits, func_sev = _collect_ot_command_hits(func_counts)
+            if func_hits:
+                detections.append({
+                    "source": source,
+                    "severity": func_sev,
+                    "summary": "OT protocol function operations observed",
+                    "details": f"{sum(func_hits.values())} control-like function call(s) detected.",
+                    "evidence": _dedupe_evidence(
+                        [f"{name}({count})" for name, count in func_hits.most_common(10)],
+                        limit=8,
+                    ),
+                })
+            diag_total = sum(count for name, count in func_counts.items() if "diagnostic" in name.lower())
+            if diag_total:
+                detections.append({
+                    "source": source,
+                    "severity": "warning",
+                    "summary": "OT diagnostic/maintenance operations observed",
+                    "details": f"{diag_total} diagnostic function call(s) detected.",
+                    "evidence": _dedupe_evidence(
+                        [f"{name}({count})" for name, count in func_counts.items() if "diagnostic" in name.lower()],
+                        limit=6,
+                    ),
+                })
+
+        if hasattr(summary_obj, "source_risky_commands"):
+            risky = getattr(summary_obj, "source_risky_commands", Counter())
+            if isinstance(risky, Counter) and risky:
+                detections.append({
+                    "source": source,
+                    "severity": "high",
+                    "summary": "High-risk OT commands observed",
+                    "details": f"{sum(risky.values())} risky command(s) issued.",
+                    "top_sources": risky.most_common(8),
+                })
+        if hasattr(summary_obj, "source_enum_commands"):
+            enum_cmds = getattr(summary_obj, "source_enum_commands", Counter())
+            if isinstance(enum_cmds, Counter) and enum_cmds:
+                detections.append({
+                    "source": source,
+                    "severity": "warning",
+                    "summary": "OT enumeration activity observed",
+                    "details": f"{sum(enum_cmds.values())} enumeration command(s) issued.",
+                    "top_sources": enum_cmds.most_common(8),
+                })
+        if hasattr(summary_obj, "high_risk_services"):
+            high_risk_services = getattr(summary_obj, "high_risk_services", Counter())
+            if isinstance(high_risk_services, Counter) and high_risk_services:
+                detections.append({
+                    "source": source,
+                    "severity": "high",
+                    "summary": "High-risk OT services observed",
+                    "details": f"{sum(high_risk_services.values())} high-risk service invocation(s).",
+                    "evidence": _dedupe_evidence(
+                        [f"{name}({count})" for name, count in high_risk_services.most_common(8)],
+                        limit=8,
+                    ),
+                })
+        if hasattr(summary_obj, "suspicious_services"):
+            suspicious_services = getattr(summary_obj, "suspicious_services", Counter())
+            if isinstance(suspicious_services, Counter) and suspicious_services:
+                detections.append({
+                    "source": source,
+                    "severity": "warning",
+                    "summary": "Suspicious OT service usage",
+                    "details": f"{sum(suspicious_services.values())} suspicious service invocation(s).",
+                    "evidence": _dedupe_evidence(
+                        [f"{name}({count})" for name, count in suspicious_services.most_common(8)],
+                        limit=8,
+                    ),
+                })
+
+    if ot_protocol_counts:
+        proto_text = ", ".join(f"{name} ({count})" for name, count in ot_protocol_counts.most_common(8))
+        detections.append({
+            "source": "OT/ICS",
+            "severity": "info",
+            "summary": "OT protocol activity observed",
+            "details": proto_text or "-",
+        })
+
+    if public_ot_pairs:
+        top_pairs = sorted(public_ot_pairs)[:10]
+        evidence = [f"{proto} {src}->{dst}" for proto, src, dst in top_pairs]
+        detections.append({
+            "source": "OT/ICS",
+            "severity": "high",
+            "summary": "OT protocol traffic involving public IPs",
+            "details": f"{len(public_ot_pairs)} OT flow(s) included public addressing.",
+            "evidence": _dedupe_evidence(evidence, limit=10),
+        })
+
+    control_tokens = ("write", "control", "setpoint", "start", "stop", "download", "upload", "program", "firmware")
+    control_commands: Counter[str] = Counter()
+    for source, summary_obj in ot_summaries.items():
+        commands = getattr(summary_obj, "commands", None)
+        if not isinstance(commands, Counter):
+            continue
+        for cmd, count in commands.items():
+            cmd_text = str(cmd).lower()
+            if any(token in cmd_text for token in control_tokens):
+                control_commands[f"{source}:{cmd}"] += int(count)
+                control_command_total += int(count)
+    if control_commands:
+        top_cmds = [f"{cmd} ({count})" for cmd, count in control_commands.most_common(10)]
+        detections.append({
+            "source": "OT/ICS",
+            "severity": "high" if sum(control_commands.values()) >= 5 else "warning",
+            "summary": "OT control/program operations observed",
+            "details": f"{sum(control_commands.values())} control-like command(s) detected.",
+            "evidence": _dedupe_evidence(top_cmds, limit=10),
+        })
 
     vertical_scan_hits: list[tuple[str, str, int]] = []
     for (src_ip, dst_ip), ports in pair_ports.items():
@@ -1051,4 +1671,26 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             "evidence": _dedupe_evidence([f"{src} marker_hits={count}" for src, count in suspicious_payload_sources.most_common(10)], limit=10),
         })
 
-    return ThreatSummary(path=path, detections=detections, errors=errors)
+    risk_score, risk_findings = _ot_risk_posture_from_detections(
+        detections,
+        public_ot_flows=len(public_ot_pairs),
+        control_hits=control_command_total,
+    )
+    storyline = _threats_storyline(detections, dict(ot_protocol_counts), risk_score, risk_findings)
+
+    return ThreatSummary(
+        path=path,
+        detections=detections,
+        errors=errors,
+        total_packets=total_packets,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        duration=duration_seconds,
+        ot_protocol_counts=dict(ot_protocol_counts),
+        public_ot_pairs=sorted(public_ot_pairs),
+        ot_peer_internal=ot_peer_internal.most_common(10),
+        ot_peer_external=ot_peer_external.most_common(10),
+        ot_risk_score=risk_score,
+        ot_risk_findings=risk_findings,
+        storyline=storyline,
+    )

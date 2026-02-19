@@ -7,7 +7,7 @@ from collections import Counter
 import re
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, safe_read_text
 from .files import analyze_files
 
 try:
@@ -36,23 +36,23 @@ class IocSummary:
     duration_seconds: Optional[float]
 
 
-def _load_iocs(path: Path) -> tuple[set[str], set[str], set[str]]:
+def _load_iocs(path: Path, errors: list[str] | None = None) -> tuple[set[str], set[str], set[str]]:
     ips: set[str] = set()
     domains: set[str] = set()
     hashes: set[str] = set()
-    try:
-        for line in path.read_text().splitlines():
-            token = line.strip()
-            if not token or token.startswith("#"):
-                continue
-            if re.fullmatch(r"[0-9a-fA-F]{32,64}", token):
-                hashes.add(token.lower())
-            elif re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", token):
-                ips.add(token)
-            else:
-                domains.add(token.lower())
-    except Exception:
-        pass
+    raw = safe_read_text(path, error_list=errors, context="IOC file read")
+    if not raw:
+        return ips, domains, hashes
+    for line in raw.splitlines():
+        token = line.strip()
+        if not token or token.startswith("#"):
+            continue
+        if re.fullmatch(r"[0-9a-fA-F]{32,64}", token):
+            hashes.add(token.lower())
+        elif re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", token):
+            ips.add(token)
+        else:
+            domains.add(token.lower())
     return ips, domains, hashes
 
 
@@ -76,12 +76,12 @@ def _extract_payload(pkt) -> bytes:
 
 
 def analyze_iocs(path: Path, ioc_path: Path, show_status: bool = True) -> IocSummary:
-    ips, domains, hashes = _load_iocs(ioc_path)
+    errors: list[str] = []
+    ips, domains, hashes = _load_iocs(ioc_path, errors=errors)
     ip_hits: Counter[str] = Counter()
     domain_hits: Counter[str] = Counter()
     hash_hits: Counter[str] = Counter()
     detections: list[dict[str, object]] = []
-    errors: list[str] = []
 
     files_summary = analyze_files(path, show_status=show_status)
     for artifact in files_summary.artifacts:

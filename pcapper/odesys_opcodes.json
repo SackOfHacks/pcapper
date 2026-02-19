@@ -1,0 +1,10 @@
+{
+  "protocol": "ODESYS",
+  "magic_ascii": ["CODESYS", "CoDeSys", "3S"],
+  "magic_hex": [],
+  "opcode_offsets": [0, 4, 8],
+  "opcode_size": 2,
+  "opcode_endian": "little",
+  "max_scan": 256,
+  "opcodes": {}
+}

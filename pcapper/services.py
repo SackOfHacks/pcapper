@@ -129,13 +129,14 @@ COMMON_PORTS = {
     8080: "HTTP-Proxy", 8443: "HTTPS-Alt", 9200: "Elasticsearch", 27017: "MongoDB",
     500: "IKE", 4500: "IPsec NAT-T", 1194: "OpenVPN", 51820: "WireGuard",
     1701: "L2TP", 1723: "PPTP", 853: "DoT", 784: "QUIC", 4433: "QUIC",
-    102: "S7/MMS/ICCP", 502: "Modbus/TCP", 9600: "FINS", 20000: "DNP3",
-    2404: "IEC-104", 47808: "BACnet/IP", 44818: "EtherNet/IP", 2222: "ENIP-IO",
+    102: "S7/MMS/ICCP", 319: "PTP Event", 320: "PTP General", 502: "Modbus/TCP", 9600: "FINS", 20000: "DNP3",
+    2404: "IEC-104", 47808: "BACnet/IP", 44818: "EtherNet/IP", 2222: "ENIP-IO", 2221: "CIP Security",
     34962: "PROFINET", 34963: "PROFINET", 34964: "PROFINET", 4840: "OPC UA",
-    1911: "Niagara Fox", 4911: "Niagara Fox", 5094: "HART-IP",
+    789: "Crimson", 1911: "Niagara Fox", 4911: "Niagara Fox", 5094: "HART-IP",
     18245: "GE SRTP", 18246: "GE SRTP", 20547: "ProConOS", 1962: "PCWorx",
     5006: "MELSEC", 5007: "MELSEC", 5683: "CoAP", 5684: "CoAP",
-    2455: "ODESYS", 1217: "ODESYS", 34378: "Yokogawa Vnet/IP",
+    2455: "ODESYS", 1217: "ODESYS", 1883: "MQTT", 8883: "MQTT-TLS",
+    34378: "Yokogawa Vnet/IP",
     34379: "Yokogawa Vnet/IP", 34380: "Yokogawa Vnet/IP"
 }
 
@@ -194,7 +195,7 @@ def _guess_service(payload: bytes, port: int) -> tuple[Optional[str], Optional[s
 
     return None, None
 
-def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
+def analyze_services(path: Path, show_status: bool = True, filter_ip: Optional[str] = None) -> ServiceSummary:
     if IP is None:
          return ServiceSummary(path, 0, [], [], {}, ["Scapy unavailable"])
 
@@ -261,6 +262,8 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
                 if is_syn_ack:
                     # src is the Server
                     k = (src, sport, "TCP")
+                    if filter_ip and src != filter_ip:
+                        continue
                     if k not in services:
                         s_name = COMMON_PORTS.get(sport, f"TCP/{sport}")
                         services[k] = ServiceAsset(src, sport, "TCP", s_name, first_seen=ts, last_seen=ts)
@@ -274,6 +277,8 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
                 # Provisional service: client traffic to a well-known port
                 if dport in COMMON_PORTS:
                     k = (dst, dport, "TCP")
+                    if filter_ip and dst != filter_ip:
+                        continue
                     if k not in services:
                         s_name = COMMON_PORTS.get(dport, f"TCP/{dport}")
                         services[k] = ServiceAsset(dst, dport, "TCP", s_name, first_seen=ts, last_seen=ts)
@@ -299,6 +304,8 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
                         else:
                             continue
 
+                        if filter_ip and k[0] != filter_ip:
+                            continue
                         if k not in services:
                             services[k] = ServiceAsset(k[0], k[1], "TCP", s_name, first_seen=ts, last_seen=ts)
                         s = services[k]
@@ -324,6 +331,8 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
                 # UDP is stateless. Logic: Traffic FROM a well known port (DNS, NTP) is a service
                 if sport in COMMON_PORTS:
                     k = (src, sport, "UDP")
+                    if filter_ip and src != filter_ip:
+                        continue
                     if k not in services:
                         s_name = COMMON_PORTS.get(sport, f"UDP/{sport}")
                         services[k] = ServiceAsset(src, sport, "UDP", s_name, first_seen=ts, last_seen=ts)
@@ -341,6 +350,8 @@ def analyze_services(path: Path, show_status: bool = True) -> ServiceSummary:
                 elif dport in COMMON_PORTS:
                     # Provisional UDP service (one-way client -> server)
                     k = (dst, dport, "UDP")
+                    if filter_ip and dst != filter_ip:
+                        continue
                     if k not in services:
                         s_name = COMMON_PORTS.get(dport, f"UDP/{dport}")
                         services[k] = ServiceAsset(dst, dport, "UDP", s_name, first_seen=ts, last_seen=ts)

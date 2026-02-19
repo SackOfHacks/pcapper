@@ -10,6 +10,7 @@ from typing import Optional
 
 from .pcap_cache import get_reader
 from .utils import safe_float
+from .device_detection import device_fingerprints_from_text
 
 try:
     from scapy.layers.inet import IP, UDP  # type: ignore
@@ -275,6 +276,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
     exfil_signals: Counter[str] = Counter()
     strings_counter: Counter[str] = Counter()
     files: set[str] = set()
+    seen_device_artifacts: set[str] = set()
     max_anomalies = 250
 
     def _append_anomaly(severity: str, title: str, description: str, src: str, dst: str, ts: float) -> None:
@@ -375,6 +377,28 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 summary.vendor_classes[vendor_class] += 1
             if client_id:
                 summary.client_ids[client_id] += 1
+
+            for value, source_label in (
+                (vendor_class, "DHCP vendor class"),
+                (hostname, "DHCP hostname"),
+                (client_id, "DHCP client-id"),
+            ):
+                if not value:
+                    continue
+                for detail in device_fingerprints_from_text(str(value), source=source_label):
+                    key = f"device:{detail}"
+                    if key in seen_device_artifacts:
+                        continue
+                    seen_device_artifacts.add(key)
+                    summary.artifacts.append(
+                        DhcpArtifact(
+                            kind="device",
+                            detail=detail,
+                            src=src_ip,
+                            dst=dst_ip,
+                            ts=ts,
+                        )
+                    )
 
             if msg_type in _CLIENT_MSG_TYPES:
                 summary.client_details[chaddr] += 1

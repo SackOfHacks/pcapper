@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float
+from .utils import detect_file_type, safe_float, decode_payload, counter_inc, set_add_cap
 
 
 RPC_CALL = 0
@@ -201,10 +201,10 @@ def _extract_strings(data: bytes, min_len: int = 4) -> Set[str]:
             current.append(b)
         else:
             if len(current) >= min_len:
-                results.add(current.decode("latin-1", errors="ignore"))
+                results.add(decode_payload(current, encoding="latin-1"))
             current = bytearray()
     if len(current) >= min_len:
-        results.add(current.decode("latin-1", errors="ignore"))
+        results.add(decode_payload(current, encoding="latin-1"))
     return results
 
 
@@ -232,7 +232,7 @@ def _parse_auth_unix(blob: bytes) -> Tuple[Optional[str], Optional[int], Optiona
         offset = 8
         name = None
         if name_len > 0 and offset + name_len <= len(blob):
-            name = blob[offset:offset + name_len].decode("latin-1", errors="ignore")
+            name = decode_payload(blob[offset:offset + name_len], encoding="latin-1")
         offset = _rpc_align(offset + name_len)
         if offset + 8 <= len(blob):
             uid = struct.unpack(">I", blob[offset:offset + 4])[0]
@@ -374,8 +374,8 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
                 server = dst if is_request else src
                 length = len(payload)
 
-                top_clients[client] += 1
-                top_servers[server] += 1
+                counter_inc(top_clients, client)
+                counter_inc(top_servers, server)
 
                 cli = _get_client(client)
                 srv = _get_server(server)
@@ -409,24 +409,24 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
 
                     if vers == 3:
                         proc_name = NFS_V3_PROC.get(proc, f"PROC_{proc}")
-                        versions["NFSv3"] += 1
-                        cli.versions.add("NFSv3")
-                        srv.versions.add("NFSv3")
+                        counter_inc(versions, "NFSv3")
+                        set_add_cap(cli.versions, "NFSv3")
+                        set_add_cap(srv.versions, "NFSv3")
                     elif vers == 4:
                         proc_name = NFS_V4_PROC.get(proc, f"PROC_{proc}")
-                        versions["NFSv4"] += 1
-                        cli.versions.add("NFSv4")
-                        srv.versions.add("NFSv4")
+                        counter_inc(versions, "NFSv4")
+                        set_add_cap(cli.versions, "NFSv4")
+                        set_add_cap(srv.versions, "NFSv4")
                     else:
                         proc_name = f"PROC_{proc}"
-                        versions[f"NFSv{vers}"] += 1
-                        cli.versions.add(f"NFSv{vers}")
-                        srv.versions.add(f"NFSv{vers}")
+                        counter_inc(versions, f"NFSv{vers}")
+                        set_add_cap(cli.versions, f"NFSv{vers}")
+                        set_add_cap(srv.versions, f"NFSv{vers}")
 
-                    procedures[proc_name] += 1
-                    requests[proc_name] += 1
+                    counter_inc(procedures, proc_name)
+                    counter_inc(requests, proc_name)
                     convo.requests += 1
-                    convo.procedures[proc_name] += 1
+                    counter_inc(convo.procedures, proc_name)
 
                     cred_flavor = struct.unpack(">I", rpc_payload[24:28])[0]
                     cred_len = struct.unpack(">I", rpc_payload[28:32])[0]
@@ -435,14 +435,14 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
                     if cred_flavor == AUTH_UNIX:
                         name, uid, gid = _parse_auth_unix(cred_blob)
                         if name:
-                            cli.usernames.add(name)
-                            observed_users[name] += 1
+                            set_add_cap(cli.usernames, name)
+                            counter_inc(observed_users, name)
                         if uid is not None:
-                            cli.uids.add(uid)
+                            set_add_cap(cli.uids, uid)
                             if uid == 0:
                                 anomalies.append(NfsAnomaly("HIGH", "NFS Root UID", f"Root UID used by {client}", total_packets, client, server))
                         if gid is not None:
-                            cli.gids.add(gid)
+                            set_add_cap(cli.gids, gid)
                     elif cred_flavor == AUTH_NULL:
                         anomalies.append(NfsAnomaly("MEDIUM", "NFS NULL Auth", f"Null authentication from {client}", total_packets, client, server))
 
@@ -452,7 +452,7 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
                     strings = _extract_strings(rpc_payload[32 + _rpc_align(cred_len):])
                     for text in strings:
                         if "/" in text or "." in text:
-                            artifacts.add(text)
+                            set_add_cap(artifacts, text)
                             if proc_name in {"LOOKUP", "CREATE", "REMOVE", "MKDIR", "RMDIR", "RENAME", "READ", "WRITE"}:
                                 files.append(NfsFileOp(action=proc_name, name=text, client_ip=client, server_ip=server, ts=ts))
 
@@ -465,10 +465,10 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
                         if offset + 4 <= len(rpc_payload):
                             accept_stat = struct.unpack(">I", rpc_payload[offset:offset + 4])[0]
                             status_text = NFS_STATUS.get(accept_stat, f"{accept_stat}")
-                            status_codes[status_text] += 1
-                            responses["REPLY"] += 1
+                            counter_inc(status_codes, status_text)
+                            counter_inc(responses, "REPLY")
                             convo.responses += 1
-                            convo.statuses[status_text] += 1
+                            counter_inc(convo.statuses, status_text)
 
                             sess = sessions.get(xid)
                             if sess:

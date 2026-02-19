@@ -8,7 +8,7 @@ import re
 import ipaddress
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, counter_inc, decode_payload
 from .files import analyze_files
 from .powershell import PS_COMMAND_RE
 from .wmic import WMIC_COMMAND_RE
@@ -26,6 +26,7 @@ from .profinet import PROFINET_PORTS
 from .dnp3 import analyze_dnp3
 from .iec104 import analyze_iec104
 from .s7 import analyze_s7
+from .ot_risk import compute_ot_risk_posture, dedupe_findings
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -78,6 +79,8 @@ class TimelineSummary:
     ot_protocol_counts: dict[str, int] = field(default_factory=dict)
     ot_activity_bins: dict[str, list[int]] = field(default_factory=dict)
     ot_activity_bin_count: int = 0
+    non_ot_activity_bins: list[int] = field(default_factory=list)
+    non_ot_activity_bin_count: int = 0
     ot_risk_score: int = 0
     ot_risk_findings: list[str] = field(default_factory=list)
     ot_storyline: list[str] = field(default_factory=list)
@@ -101,6 +104,8 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
             ot_protocol_counts={},
             ot_activity_bins={},
             ot_activity_bin_count=0,
+            non_ot_activity_bins=[],
+            non_ot_activity_bin_count=0,
             ot_risk_score=0,
             ot_risk_findings=[],
             ot_storyline=[],
@@ -130,6 +135,8 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
     ot_protocol_counts: Counter[str] = Counter()
     ot_activity_bins: dict[str, list[int]] = {}
     ot_bin_count = 0
+    non_ot_bins: list[int] = []
+    non_ot_bin_count = 0
 
     for item in summary_list:
         if item.first_seen is not None:
@@ -148,6 +155,14 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
                     merged.extend([0] * (len(bins) - len(merged)))
                 for idx, val in enumerate(bins):
                     merged[idx] += val
+        if item.non_ot_activity_bins:
+            non_ot_bin_count = max(non_ot_bin_count, item.non_ot_activity_bin_count)
+            if not non_ot_bins:
+                non_ot_bins = [0] * len(item.non_ot_activity_bins)
+            if len(non_ot_bins) < len(item.non_ot_activity_bins):
+                non_ot_bins.extend([0] * (len(item.non_ot_activity_bins) - len(non_ot_bins)))
+            for idx, val in enumerate(item.non_ot_activity_bins):
+                non_ot_bins[idx] += val
 
     duration = None
     if first_seen is not None and last_seen is not None:
@@ -168,6 +183,8 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
         ot_protocol_counts=dict(ot_protocol_counts),
         ot_activity_bins=ot_activity_bins,
         ot_activity_bin_count=ot_bin_count,
+        non_ot_activity_bins=non_ot_bins,
+        non_ot_activity_bin_count=non_ot_bin_count,
     )
     risk_score, risk_findings = _compute_ot_risk_posture(merged.events, target_ip)
     storyline = _compute_ot_storyline(merged.events, target_ip, merged.ot_protocol_counts, risk_score, risk_findings)
@@ -186,6 +203,8 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
         ot_protocol_counts=merged.ot_protocol_counts,
         ot_activity_bins=merged.ot_activity_bins,
         ot_activity_bin_count=merged.ot_activity_bin_count,
+        non_ot_activity_bins=merged.non_ot_activity_bins,
+        non_ot_activity_bin_count=merged.non_ot_activity_bin_count,
         ot_risk_score=risk_score,
         ot_risk_findings=risk_findings,
         ot_storyline=storyline,
@@ -253,14 +272,34 @@ OT_CATEGORIES = {
     "CoAP",
 }
 
+NON_OT_CATEGORIES = {
+    "Connection",
+    "DNS",
+    "Email",
+    "File Transfer",
+    "HTTP",
+    "ICMP",
+    "LDAP",
+    "MS Domain",
+    "NetBIOS",
+    "PowerShell",
+    "RPC",
+    "Recon",
+    "SMB",
+    "SNMP",
+    "Telnet",
+    "WMIC",
+    "WinRM",
+    "mDNS",
+}
+
+TIMELINE_CATEGORIES = tuple(sorted(OT_CATEGORIES | NON_OT_CATEGORIES, key=str.casefold))
+
 
 def _decode_payload_line(payload: bytes | None) -> str:
     if not payload:
         return ""
-    try:
-        text = payload.decode("latin-1", errors="ignore")
-    except Exception:
-        return ""
+    text = decode_payload(payload, encoding="latin-1")
     if not text:
         return ""
     first = text.split("\r\n", 1)[0].split("\n", 1)[0].strip()
@@ -335,10 +374,7 @@ def _extract_email_command(service: str, first_line: str) -> str | None:
 def _extract_powershell_command(payload: bytes | None) -> str | None:
     if not payload:
         return None
-    try:
-        text = payload.decode("latin-1", errors="ignore")
-    except Exception:
-        return None
+    text = decode_payload(payload, encoding="latin-1")
     if not text:
         return None
     match = PS_COMMAND_RE.search(text[:2000])
@@ -350,10 +386,7 @@ def _extract_powershell_command(payload: bytes | None) -> str | None:
 def _extract_wmic_command(payload: bytes | None) -> str | None:
     if not payload:
         return None
-    try:
-        text = payload.decode("latin-1", errors="ignore")
-    except Exception:
-        return None
+    text = decode_payload(payload, encoding="latin-1")
     if not text:
         return None
     match = WMIC_COMMAND_RE.search(text[:2000])
@@ -371,10 +404,7 @@ WINRM_COMMAND_RE = re.compile(
 def _extract_winrm_command(payload: bytes | None) -> str | None:
     if not payload:
         return None
-    try:
-        text = payload.decode("latin-1", errors="ignore")
-    except Exception:
-        return None
+    text = decode_payload(payload, encoding="latin-1")
     if not text:
         return None
     match = WINRM_COMMAND_RE.search(text[:4000])
@@ -393,10 +423,7 @@ TELNET_COMMAND_RE = re.compile(r"^[#>$]\s*([A-Za-z0-9._:/\\-]+(?:\s+[^\r\n]{0,16
 def _extract_telnet_command(payload: bytes | None) -> str | None:
     if not payload:
         return None
-    try:
-        text = payload.decode("latin-1", errors="ignore")
-    except Exception:
-        return None
+    text = decode_payload(payload, encoding="latin-1")
     if not text:
         return None
     match = TELNET_COMMAND_RE.search(text[:2000])
@@ -555,11 +582,34 @@ def _compute_ot_activity_bins(
     return protocol_bins, bins
 
 
+def _compute_non_ot_activity_bins(
+    events: list[TimelineEvent],
+    first_seen: Optional[float],
+    last_seen: Optional[float],
+    bins: int = 24,
+) -> tuple[list[int], int]:
+    if not events or first_seen is None or last_seen is None or last_seen <= first_seen:
+        return [], 0
+    duration = max(1.0, last_seen - first_seen)
+    bin_size = duration / bins
+    bucket = [0] * bins
+    for event in events:
+        if event.ts is None:
+            continue
+        if event.category in OT_CATEGORIES:
+            continue
+        idx = int((event.ts - first_seen) / bin_size)
+        if idx >= bins:
+            idx = bins - 1
+        if idx < 0:
+            idx = 0
+        bucket[idx] += 1
+    return bucket, bins
+
+
 def _compute_ot_risk_posture(events: list[TimelineEvent], target_ip: str) -> tuple[int, list[str]]:
     if not events:
         return 0, []
-    score = 0
-    findings: list[str] = []
     public_peers: set[str] = set()
     control_hits = 0
     transfer_hits = 0
@@ -589,21 +639,14 @@ def _compute_ot_risk_posture(events: list[TimelineEvent], target_ip: str) -> tup
             except Exception:
                 continue
 
-    if public_peers:
-        score += 30
-        findings.append(f"OT protocol traffic to public IPs ({len(public_peers)}).")
-    if control_hits:
-        score += 25
-        findings.append(f"OT control/write activity indicators ({control_hits}).")
+    score, findings = compute_ot_risk_posture(
+        public_ot_flows=len(public_peers),
+        control_hits=control_hits,
+        anomaly_hits=anomaly_hits,
+    )
     if transfer_hits:
-        score += 25
         findings.append(f"OT program/file transfer indicators ({transfer_hits}).")
-    if anomaly_hits:
-        score += min(20, anomaly_hits * 5)
-        findings.append(f"OT protocol anomalies or control events ({anomaly_hits}).")
-
-    score = min(100, score)
-    return score, findings
+    return score, dedupe_findings(findings, limit=6)
 
 
 def _compute_ot_storyline(
@@ -709,7 +752,14 @@ def _netbios_session_hint(payload: bytes | None) -> str | None:
     return None
 
 
-def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timeline_bins: int = 24) -> TimelineSummary:
+def analyze_timeline(
+    path: Path,
+    target_ip: str,
+    show_status: bool = True,
+    timeline_bins: int = 24,
+    timeline_storyline_off: bool = False,
+    categories: set[str] | None = None,
+) -> TimelineSummary:
     errors: list[str] = []
     events: list[TimelineEvent] = []
 
@@ -794,7 +844,7 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timel
                         last_seen = ts
                 peer_ip = dst_ip if src_ip == target_ip else src_ip
                 if peer_ip:
-                    peer_counts[peer_ip] += 1
+                    counter_inc(peer_counts, peer_ip)
 
             if (src_ip == target_ip or dst_ip == target_ip):
                 label = _icmp_label(pkt)
@@ -858,10 +908,13 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timel
                 tcp_layer = pkt[TCP]  # type: ignore[index]
                 flags = getattr(tcp_layer, "flags", None)
                 is_syn = False
+                is_synack = False
                 if isinstance(flags, str):
                     is_syn = "S" in flags and "A" not in flags
+                    is_synack = "S" in flags and "A" in flags
                 elif isinstance(flags, int):
                     is_syn = (flags & 0x02) != 0 and (flags & 0x10) == 0
+                    is_synack = (flags & 0x12) == 0x12
                 sport = int(getattr(tcp_layer, "sport", 0) or 0)
                 dport = int(getattr(tcp_layer, "dport", 0) or 0)
                 payload = None
@@ -872,7 +925,7 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timel
                 if src_ip == target_ip or dst_ip == target_ip:
                     port_key = dport if src_ip == target_ip else sport
                     if port_key:
-                        port_counts[port_key] += 1
+                        counter_inc(port_counts, port_key)
                         proto = OT_PORT_PROTOCOLS.get(port_key)
                         if proto:
                             ot_protocol_counts[proto] += 1
@@ -1026,7 +1079,8 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timel
                                 summary="WMIC command",
                                 details=f"{target_ip} -> {dst_ip}:{dport} {wmic_cmd}",
                             ))
-                    if payload and (dport in WINRM_PORTS or WSMAN_RE.search(payload.decode("latin-1", errors="ignore"))):
+                    payload_text = decode_payload(payload, encoding="latin-1") if payload else ""
+                    if payload and (dport in WINRM_PORTS or (payload_text and WSMAN_RE.search(payload_text))):
                         winrm_cmd = _extract_winrm_command(payload)
                         if winrm_cmd:
                             key = (src_ip, dst_ip, dport, winrm_cmd)
@@ -1125,7 +1179,28 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timel
                         if ts is not None:
                             scan_first.setdefault(dst_ip, ts)
                             scan_last[dst_ip] = ts
+                    if is_synack and sport:
+                        events.append(TimelineEvent(
+                            ts=ts,
+                            category="Connection",
+                            summary="TCP SYN-ACK",
+                            details=f"{target_ip} -> {dst_ip}:{sport} (SYN-ACK)",
+                        ))
                 elif dst_ip == target_ip:
+                    if is_syn and dport:
+                        events.append(TimelineEvent(
+                            ts=ts,
+                            category="Connection",
+                            summary="TCP connect attempt",
+                            details=f"{src_ip} -> {target_ip}:{dport} (SYN)",
+                        ))
+                    if is_synack and sport:
+                        events.append(TimelineEvent(
+                            ts=ts,
+                            category="Connection",
+                            summary="TCP SYN-ACK",
+                            details=f"{src_ip} -> {target_ip}:{sport} (SYN-ACK)",
+                        ))
                     if sport in {139, 445}:
                         hint = _netbios_session_hint(payload)
                         if hint:
@@ -1171,7 +1246,8 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timel
                                 summary="WMIC command",
                                 details=f"{src_ip} -> {target_ip}:{sport} {wmic_cmd}",
                             ))
-                    if payload and (sport in WINRM_PORTS or WSMAN_RE.search(payload.decode("latin-1", errors="ignore"))):
+                    payload_text = decode_payload(payload, encoding="latin-1") if payload else ""
+                    if payload and (sport in WINRM_PORTS or (payload_text and WSMAN_RE.search(payload_text))):
                         winrm_cmd = _extract_winrm_command(payload)
                         if winrm_cmd:
                             key = (src_ip, dst_ip, sport, winrm_cmd)
@@ -1251,7 +1327,7 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timel
                 if src_ip == target_ip or dst_ip == target_ip:
                     port_key = dport if src_ip == target_ip else sport
                     if port_key:
-                        port_counts[port_key] += 1
+                        counter_inc(port_counts, port_key)
                         proto = OT_PORT_PROTOCOLS.get(port_key)
                         if proto:
                             ot_protocol_counts[proto] += 1
@@ -1484,11 +1560,11 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timel
                 details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
             ))
         if iec_summary.command_events:
-            seen_cmds: set[tuple[str, str, str, float]] = set()
+            seen_cmds: set[tuple[str, str, str, int]] = set()
             for cmd_event in iec_summary.command_events:
                 if cmd_event.src != target_ip and cmd_event.dst != target_ip:
                     continue
-                key = (cmd_event.src, cmd_event.dst, cmd_event.command, cmd_event.ts)
+                key = (cmd_event.src, cmd_event.dst, cmd_event.command, int(cmd_event.ts or 0))
                 if key in seen_cmds:
                     continue
                 seen_cmds.add(key)
@@ -1521,11 +1597,11 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timel
                 details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
             ))
         if s7_summary.command_events:
-            seen_cmds: set[tuple[str, str, str, float]] = set()
+            seen_cmds: set[tuple[str, str, str, int]] = set()
             for cmd_event in s7_summary.command_events:
                 if cmd_event.src != target_ip and cmd_event.dst != target_ip:
                     continue
-                key = (cmd_event.src, cmd_event.dst, cmd_event.command, cmd_event.ts)
+                key = (cmd_event.src, cmd_event.dst, cmd_event.command, int(cmd_event.ts or 0))
                 if key in seen_cmds:
                     continue
                 seen_cmds.add(key)
@@ -1536,14 +1612,29 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timel
                     details=f"{cmd_event.src} -> {cmd_event.dst}",
                 ))
 
+    if categories is not None:
+        events = [event for event in events if event.category in categories]
+        if ot_protocol_counts:
+            ot_protocol_counts = Counter({
+                name: count for name, count in ot_protocol_counts.items()
+                if name in categories
+            })
+
     events.sort(key=lambda item: (item.ts is None, item.ts))
     category_counts = Counter(event.category for event in events)
     duration = None
     if first_seen is not None and last_seen is not None:
         duration = max(0.0, last_seen - first_seen)
     ot_activity_bins, ot_bin_count = _compute_ot_activity_bins(events, first_seen, last_seen, bins=max(4, timeline_bins))
+    non_ot_bins, non_ot_bin_count = _compute_non_ot_activity_bins(events, first_seen, last_seen, bins=max(4, timeline_bins))
     ot_risk_score, ot_risk_findings = _compute_ot_risk_posture(events, target_ip)
-    ot_storyline = _compute_ot_storyline(events, target_ip, dict(ot_protocol_counts), ot_risk_score, ot_risk_findings)
+    ot_storyline = [] if timeline_storyline_off else _compute_ot_storyline(
+        events,
+        target_ip,
+        dict(ot_protocol_counts),
+        ot_risk_score,
+        ot_risk_findings,
+    )
 
     return TimelineSummary(
         path=path,
@@ -1560,6 +1651,8 @@ def analyze_timeline(path: Path, target_ip: str, show_status: bool = True, timel
         ot_protocol_counts=dict(ot_protocol_counts),
         ot_activity_bins=ot_activity_bins,
         ot_activity_bin_count=ot_bin_count,
+        non_ot_activity_bins=non_ot_bins,
+        non_ot_activity_bin_count=non_ot_bin_count,
         ot_risk_score=ot_risk_score,
         ot_risk_findings=ot_risk_findings,
         ot_storyline=ot_storyline,

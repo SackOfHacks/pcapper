@@ -16,6 +16,9 @@ What you get:
 - Analyst-friendly outputs tuned for plant floors, substations, and mixed IT/OT environments.
 - Control-command visibility for safety/availability impacts (writes, downloads, starts/stops).
 - OT/ICS-centric threat and anomaly rollups with evidence lines for fast triage.
+- Device fingerprinting across IT/OT/IoT traffic (vendor/model/OS/firmware/software) for asset-aware triage.
+- Deeper OT protocol decoding for DNP3, IEC 61850 GOOSE/SV, Modbus, BACnet, OPC UA, CoAP, MQTT, and CIP/ENIP.
+- Routing protocol forensics (OSPF/BGP/IS-IS/PIM) with route-change, auth, and control-plane health visibility.
 
 ## Install
 
@@ -140,6 +143,7 @@ python -m pcapper --help
 - `--quic`
 - `--rdp`
 - `--rpc`
+- `--routing`
 - `--services`
 - `--sizes`
 - `--smb`
@@ -162,7 +166,7 @@ python -m pcapper --help
 - `--winrm`
 - `--wmic`
 
-Count: 54 flags
+Count: 55 flags
 
 ### OT/ICS/Industrial functions (alphabetical)
 
@@ -207,6 +211,8 @@ Count: 35 flags
 ## Notes
 
 - For timeline mode, supply `-ip` with `--timeline`.
+- Use `-categories` with `--timeline` to filter event categories (comma-separated). Use `-categories false` to print the supported list.
+- Timeline output always shows all events (independent of `-v`) and includes TCP SYN/SYN-ACK connection events with port visibility.
 - If your shell expands wildcards (for example `Un*`), pcapper now accepts the resulting multiple target arguments directly.
 - Use `--no-status` for cleaner output in logs/pipelines.
 

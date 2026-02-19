@@ -25,9 +25,10 @@ IGNORE_LAYERS = {"Raw", "Padding", "NoPayload"}
 ETHERTYPE_PROTOCOLS = {
     0x88A4: "EtherCAT",
     0x8892: "PROFINET RT",
+    0x88CC: "LLDP",
     0x88B8: "IEC 61850 GOOSE",
     0x88BA: "IEC 61850 SV",
-    0x88F7: "HSR/PRP",
+    0x88F7: "PTP",
 }
 
 

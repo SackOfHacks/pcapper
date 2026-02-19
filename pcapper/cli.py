@@ -67,6 +67,7 @@ from .reporting import (
     render_search_summary,
     render_search_rollup,
     render_creds_summary,
+    render_secrets_summary,
     render_certificates_summary,
     render_health_summary,
     render_hostname_summary,
@@ -94,12 +95,14 @@ from .reporting import (
     render_exfil_summary,
     render_generic_rollup,
     set_redact_secrets,
+    set_verbose_output,
     render_pcapmeta_summary,
     render_quic_summary,
     render_http2_summary,
     render_encrypted_dns_summary,
     render_ntp_summary,
     render_vpn_summary,
+    render_routing_summary,
     render_goose_summary,
     render_sv_summary,
     render_lldp_dcp_summary,
@@ -111,7 +114,7 @@ from .reporting import (
     render_ot_commands_summary,
     render_iec101_103_summary,
 )
-from .pcap_cache import load_packets_if_allowed, load_filtered_packets
+from .pcap_cache import load_packets_if_allowed, load_filtered_packets, get_reader
 from .exporting import ExportBundle, export_json, export_csv, export_sqlite
 from .vlan import analyze_vlans
 from .icmp import analyze_icmp
@@ -163,11 +166,12 @@ from .nfs import analyze_nfs
 from .strings import analyze_strings
 from .search import analyze_search
 from .creds import analyze_creds
+from .secrets import analyze_secrets
 from .certificates import analyze_certificates
 from .health import analyze_health, merge_health_summaries
 from .hostname import analyze_hostname, merge_hostname_summaries
 from .hostdetails import analyze_hostdetails, merge_hostdetails_summaries
-from .timeline import analyze_timeline, merge_timeline_summaries
+from .timeline import analyze_timeline, merge_timeline_summaries, OT_CATEGORIES, NON_OT_CATEGORIES, TIMELINE_CATEGORIES
 from .domain import analyze_domain
 from .ldap import analyze_ldap
 from .kerberos import analyze_kerberos
@@ -193,6 +197,7 @@ from .http2 import analyze_http2
 from .encrypted_dns import analyze_encrypted_dns
 from .ntp import analyze_ntp
 from .vpn import analyze_vpn
+from .routing import analyze_routing, merge_routing_summaries
 from .goose import analyze_goose
 from .sv import analyze_sv
 from .lldp_dcp import analyze_lldp_dcp
@@ -203,13 +208,15 @@ from .ctf import analyze_ctf
 from .ioc import analyze_iocs
 from .ot_commands import analyze_ot_commands
 from .iec101_103 import analyze_iec101_103
-from .utils import parse_time_arg
+from .utils import parse_time_arg, hexdump
 
 
 def _ordered_steps(argv: list[str]) -> list[str]:
     flag_map = {
         "--search": "search",
+        "--packet": "packet",
         "--creds": "creds",
+        "--secrets": "secrets",
         "--vlan": "vlan",
         "--icmp": "icmp",
         "--dns": "dns",
@@ -246,6 +253,7 @@ def _ordered_steps(argv: list[str]) -> list[str]:
         "--ioc": "ioc",
         "--files": "files",
         "--protocols": "protocols",
+        "--routing": "routing",
         "--services": "services",
         "--smb": "smb",
         "--nfs": "nfs",
@@ -352,6 +360,54 @@ def _expand_target_wildcard(pattern: Path, recursive: bool) -> list[Path]:
     return paths
 
 
+def _normalize_timeline_category(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def _print_timeline_categories() -> None:
+    print("Supported timeline categories:")
+    print("Non-OT:")
+    for name in sorted(NON_OT_CATEGORIES, key=str.casefold):
+        print(f"  - {name}")
+    print("OT/ICS:")
+    for name in sorted(OT_CATEGORIES, key=str.casefold):
+        print(f"  - {name}")
+
+
+def _parse_timeline_categories(raw: str | None) -> tuple[set[str] | None, bool, list[str]]:
+    if raw is None:
+        return None, False, []
+
+    tokens = [token.strip() for token in raw.split(",")]
+    if not tokens:
+        return None, True, []
+
+    for token in tokens:
+        normalized = _normalize_timeline_category(token)
+        if not normalized or normalized in {"false", "no", "none", "0"}:
+            return None, True, []
+
+    supported = {
+        _normalize_timeline_category(name): name for name in TIMELINE_CATEGORIES
+    }
+    categories: set[str] = set()
+    invalid: list[str] = []
+    for token in tokens:
+        normalized = _normalize_timeline_category(token)
+        if not normalized:
+            continue
+        match = supported.get(normalized)
+        if match:
+            categories.add(match)
+        else:
+            invalid.append(token)
+
+    if not categories:
+        return None, True, []
+
+    return categories, False, invalid
+
+
 class PcapperArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # type: ignore[override]
         if "unrecognized arguments:" in message:
@@ -395,7 +451,7 @@ def build_parser() -> argparse.ArgumentParser:
     general.add_argument(
         "-ip",
         dest="timeline_ip",
-        help="Target IP for host-centric analysis (use with --timeline or --hostdetails; optional for --hostname).",
+        help="Target IP for host-centric analysis (use with --timeline, --hostdetails, or --services; optional for --hostname).",
     )
     general.add_argument(
         "-l",
@@ -415,6 +471,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the processing status bar.",
     )
     general.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable cProfile and print a performance summary to stderr.",
+    )
+    general.add_argument(
+        "--profile-out",
+        metavar="PATH",
+        help="Write cProfile stats to PATH (use with --profile).",
+    )
+    general.add_argument(
         "--show-secrets",
         action="store_true",
         help="Display secrets/credentials in output (default is redacted).",
@@ -423,6 +489,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--search",
         metavar="STRING",
         help="Search packet payloads for a string (case-insensitive) and list matches.",
+    )
+    general.add_argument(
+        "--packet",
+        metavar="N",
+        type=int,
+        help="Show packet N in ASCII/HEX format (1-based index).",
     )
     general.add_argument(
         "-case",
@@ -449,9 +521,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show verbose details in analysis output.",
     )
     general.add_argument(
+        "-vt",
+        "--vt",
+        dest="vt",
+        action="store_true",
+        help="Enable VirusTotal lookups for DNS queries/domains and HTTP URLs/domains (requires VT_API_KEY).",
+    )
+    general.add_argument(
         "--view",
         metavar="FILENAME",
         help="View extracted file content in ASCII/HEX (use with --files).",
+    )
+    general.add_argument(
+        "-raw",
+        dest="view_raw",
+        action="store_true",
+        help="Show --view output as raw text (no ASCII/HEX).",
     )
     general.add_argument(
         "--bpf",
@@ -463,6 +548,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=24,
         help="Number of time buckets to use for timeline OT activity sparklines.",
+    )
+    general.add_argument(
+        "--timeline-storyline-off",
+        action="store_true",
+        help="Disable the OT attack storyline block in timeline output.",
+    )
+    general.add_argument(
+        "-categories",
+        "--timeline-categories",
+        dest="timeline_categories",
+        metavar="LIST",
+        help="Comma-separated timeline event categories to include (use -categories false or empty to list supported categories).",
     )
     general.add_argument(
         "--time-start",
@@ -531,6 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("--beacon", "Include beaconing analysis in the output."),
         ("--certificates", "Include TLS certificate extraction and analysis."),
         ("--creds", "Scan for credential exposure (HTTP, FTP, SMTP, DNS, etc.)."),
+        ("--secrets", "Discover reversible encoded/obfuscated secrets (base64, hex, url-encoded, JWT)."),
         ("--dhcp", "Include DHCP analysis (leases, options, clients/servers, attacks, anomalies)."),
         ("--dns", "Include DNS analysis in the output."),
         ("--domain", "Include MS AD and domain analysis (services, users, DCs, artifacts)."),
@@ -552,6 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("--nfs", "Include NFS protocol analysis (RPC, Clients, Servers, Files, Anomalies)."),
         ("--ntlm", "Include NTLM authentication analysis (Users, Domains, Versions)."),
         ("--protocols", "Include detailed protocol hierarchy and anomaly analysis."),
+        ("--routing", "Include routing protocol analysis (OSPF, IS-IS, BGP, RIP, EIGRP, VRRP, HSRP)."),
         ("--rdp", "Include RDP analysis (sessions, hostnames, anomalies, threats)."),
         ("--services", "Include service discovery and cybersecurity risk analysis."),
         ("--sizes", "Include packet size distribution analysis."),
@@ -641,6 +740,7 @@ def _analyze_paths(
     show_vlan: bool,
     show_icmp: bool,
     show_dns: bool,
+    dns_vt: bool,
     show_http: bool,
     show_ftp: bool,
     show_tls: bool,
@@ -665,11 +765,14 @@ def _analyze_paths(
     show_threats: bool,
     show_files: bool,
     show_protocols: bool,
+    show_routing: bool,
     show_services: bool,
     show_smb: bool,
     show_nfs: bool,
     show_strings: bool,
     show_creds: bool,
+    show_secrets_scan: bool,
+    show_secrets: bool,
     show_certificates: bool,
     show_health: bool,
     show_hostname: bool,
@@ -677,6 +780,8 @@ def _analyze_paths(
     show_timeline: bool,
     timeline_ip: str | None,
     timeline_bins: int,
+    timeline_storyline_off: bool,
+    timeline_categories: set[str] | None,
     show_ntlm: bool,
     show_netbios: bool,
     show_arp: bool,
@@ -712,6 +817,8 @@ def _analyze_paths(
     verbose: bool,
     extract_name: str | None,
     view_name: str | None,
+    view_raw: bool,
+    packet_index: int | None,
     show_domain: bool,
     show_ldap: bool,
     show_kerberos: bool,
@@ -761,6 +868,63 @@ def _analyze_paths(
 
     if case_dir:
         case_dir.mkdir(parents=True, exist_ok=True)
+
+    def _render_packet(path: Path, index: int, packets: list[object] | None) -> None:
+        if index <= 0:
+            print("--packet must be a positive integer.")
+            return
+
+        pkt = None
+        if packets is not None:
+            if index - 1 < len(packets):
+                pkt = packets[index - 1]
+            else:
+                print(f"Packet {index} not found in loaded packet list.")
+                return
+        else:
+            reader, status, _stream, _size_bytes, _file_type = get_reader(
+                path,
+                packets=None,
+                meta=None,
+                show_status=step_status,
+            )
+            try:
+                for i, item in enumerate(reader, start=1):
+                    if i == index:
+                        pkt = item
+                        break
+            finally:
+                status.finish()
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+            if pkt is None:
+                print(f"Packet {index} not found in capture.")
+                return
+
+        raw = None
+        try:
+            raw = bytes(pkt)
+        except Exception:
+            original = getattr(pkt, "original", None)
+            if isinstance(original, (bytes, bytearray)):
+                raw = bytes(original)
+
+        print("=" * 72)
+        print(f"PACKET VIEW :: {path.name} :: #{index}")
+        print("=" * 72)
+        try:
+            summary = pkt.summary()  # type: ignore[attr-defined]
+        except Exception:
+            summary = None
+        if summary:
+            print(summary)
+        if raw:
+            print(hexdump(raw))
+        else:
+            print("<packet bytes unavailable>")
+        print("=" * 72)
 
     def _resolve_export_path(base: Path, pcap_path: Path, suffix: str) -> Path:
         if case_dir and not base.is_absolute():
@@ -818,6 +982,8 @@ def _analyze_paths(
                 else:
                     print(render_search_summary(search_summary))
                 export_summaries["search"] = search_summary
+            elif step == "packet" and packet_index is not None:
+                _render_packet(path, packet_index, packets)
             elif step == "vlan" and show_vlan:
                 vlan_summary = analyze_vlans(path, show_status=step_status)
                 if summarize_rollups:
@@ -833,14 +999,26 @@ def _analyze_paths(
                     print(render_icmp_summary(icmp_summary, verbose=verbose))
                 export_summaries["icmp"] = icmp_summary
             elif step == "dns" and show_dns:
-                dns_summary = analyze_dns(path, show_status=step_status, packets=packets, meta=meta)
+                dns_summary = analyze_dns(
+                    path,
+                    show_status=step_status,
+                    packets=packets,
+                    meta=meta,
+                    vt_lookup=dns_vt,
+                )
                 if summarize_rollups:
                     rollups.setdefault("dns", []).append(dns_summary)
                 else:
                     print(render_dns_summary(dns_summary, verbose=verbose))
                 export_summaries["dns"] = dns_summary
             elif step == "http" and show_http:
-                http_summary = analyze_http(path, show_status=step_status, packets=packets, meta=meta)
+                http_summary = analyze_http(
+                    path,
+                    show_status=step_status,
+                    packets=packets,
+                    meta=meta,
+                    vt_lookup=dns_vt,
+                )
                 if summarize_rollups:
                     rollups.setdefault("http", []).append(http_summary)
                 else:
@@ -1034,6 +1212,7 @@ def _analyze_paths(
                     extract_name=extract_name,
                     output_dir=(case_dir / "files") if case_dir else None,
                     view_name=view_name,
+                    view_raw=view_raw,
                     show_status=step_status,
                     include_x509=verbose,
                 )
@@ -1049,8 +1228,15 @@ def _analyze_paths(
                 else:
                     print(render_protocols_summary(proto_summary, verbose=verbose))
                 export_summaries["protocols"] = proto_summary
+            elif step == "routing" and show_routing:
+                routing_summary = analyze_routing(path, show_status=step_status)
+                if summarize_rollups:
+                    rollups.setdefault("routing", []).append(routing_summary)
+                else:
+                    print(render_routing_summary(routing_summary, verbose=verbose))
+                export_summaries["routing"] = routing_summary
             elif step == "services" and show_services:
-                svc_summary = analyze_services(path, show_status=step_status)
+                svc_summary = analyze_services(path, show_status=step_status, filter_ip=timeline_ip)
                 if summarize_rollups:
                     rollups.setdefault("services", []).append(svc_summary)
                 else:
@@ -1082,8 +1268,15 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("creds", []).append(creds_summary)
                 else:
-                    print(render_creds_summary(creds_summary))
+                    print(render_creds_summary(creds_summary, show_secrets=show_secrets))
                 export_summaries["creds"] = creds_summary
+            elif step == "secrets" and show_secrets_scan:
+                secrets_summary = analyze_secrets(path, show_status=step_status, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("secrets", []).append(secrets_summary)
+                else:
+                    print(render_secrets_summary(secrets_summary, show_secrets=show_secrets))
+                export_summaries["secrets"] = secrets_summary
             elif step == "certificates" and show_certificates:
                 cert_summary = analyze_certificates(path, show_status=step_status)
                 if summarize_rollups:
@@ -1162,6 +1355,8 @@ def _analyze_paths(
                     timeline_ip,
                     show_status=step_status,
                     timeline_bins=timeline_bins,
+                    timeline_storyline_off=timeline_storyline_off,
+                    categories=timeline_categories,
                 )
                 if summarize_rollups:
                     rollups.setdefault("timeline", []).append(timeline_summary)
@@ -1488,6 +1683,7 @@ def _analyze_paths(
             "ftp": (merge_ftp_summaries, lambda s: render_ftp_summary(s, verbose=verbose)),
             "ssh": (merge_ssh_summaries, lambda s: render_ssh_summary(s, verbose=verbose)),
             "protocols": (merge_protocols_summaries, lambda s: render_protocols_summary(s, verbose=verbose)),
+            "routing": (merge_routing_summaries, lambda s: render_routing_summary(s, verbose=verbose)),
             "services": (merge_services_summaries, render_services_summary),
             "health": (merge_health_summaries, render_health_summary),
             "rdp": (merge_rdp_summaries, lambda s: render_rdp_summary(s, verbose=verbose)),
@@ -1539,11 +1735,13 @@ def _analyze_paths(
             "vpn": "VPN/TUNNEL ANALYSIS",
             "files": "FILE TRANSFER ANALYSIS",
             "protocols": "PROTOCOL ANALYSIS",
+            "routing": "ROUTING ANALYSIS",
             "services": "SERVICE ANALYSIS",
             "smb": "SMB ANALYSIS",
             "nfs": "NFS ANALYSIS",
             "strings": "STRINGS ANALYSIS",
             "creds": "CREDENTIAL EXPOSURE",
+            "secrets": "SECRET DISCOVERY",
             "certificates": "CERTIFICATE ANALYSIS",
             "health": "TRAFFIC HEALTH ANALYSIS",
             "hostname": "HOSTNAME DISCOVERY",
@@ -1648,9 +1846,40 @@ def main() -> int:
 
     ordered_steps = _ordered_steps(sys.argv)
 
+    timeline_categories, show_category_list, invalid_categories = _parse_timeline_categories(
+        getattr(args, "timeline_categories", None)
+    )
+    if show_category_list:
+        _print_timeline_categories()
+        return 0
+    if invalid_categories:
+        invalid_text = ", ".join(item.strip() for item in invalid_categories if item.strip())
+        if invalid_text:
+            print(f"Unknown timeline categories: {invalid_text}")
+        _print_timeline_categories()
+        return 2
+
     if args.no_color:
         set_color_override(False)
     set_redact_secrets(not args.show_secrets)
+    set_verbose_output(args.verbose)
+    if getattr(args, "vt", False) and not args.dns:
+        args.dns = True
+    if getattr(args, "vt", False) and "dns" not in ordered_steps:
+        ordered_steps.append("dns")
+
+    if args.limit_protocols <= 0:
+        print("--limit-protocols must be a positive integer.")
+        return 2
+    if getattr(args, "packet", None) is not None and args.packet <= 0:
+        print("--packet must be a positive integer.")
+        return 2
+    if args.timeline_bins <= 0:
+        print("--timeline-bins must be a positive integer.")
+        return 2
+    if args.profile_out and not args.profile:
+        print("--profile-out requires --profile.")
+        return 2
 
     if args.timeline and not args.timeline_ip:
         print("Timeline analysis requires a target IP. Use -ip <address> with --timeline.")
@@ -1728,119 +1957,151 @@ def main() -> int:
     if case_dir and not (export_json_path or export_csv_path or export_sqlite_path):
         export_json_path = case_dir / "pcapper.json"
 
-    return _analyze_paths(
-        paths,
-        args.limit_protocols,
-        show_base=args.base,
-        show_status=not args.no_status,
-        search_query=args.search,
-        search_case=args.search_case,
-        show_vlan=args.vlan,
-        show_icmp=args.icmp,
-        show_dns=args.dns,
-        show_http=args.http,
-        show_ftp=args.ftp,
-        show_tls=args.tls,
-        show_ssh=args.ssh,
-        show_rdp=args.rdp,
-        show_telnet=args.telnet,
-        show_vnc=args.vnc,
-        show_teamviewer=args.teamviewer,
-        show_winrm=args.winrm,
-        show_wmic=args.wmic,
-        show_powershell=args.powershell,
-        show_syslog=args.syslog,
-        show_snmp=args.snmp,
-        show_smtp=args.smtp,
-        show_rpc=args.rpc,
-        show_tcp=args.tcp,
-        show_udp=args.udp,
-        show_exfil=args.exfil,
-        show_sizes=args.sizes,
-        show_ips=args.ips,
-        show_beacon=args.beacon,
-        show_threats=args.threats,
-        show_files=args.files,
-        show_protocols=args.protocols,
-        show_services=args.services,
-        show_smb=args.smb,
-        show_nfs=args.nfs,
-        show_strings=args.strings,
-        show_creds=args.creds,
-        show_certificates=args.certificates,
-        show_health=args.health,
-        show_hostname=args.hostname,
-        show_hostdetails=args.hostdetails,
-        show_timeline=args.timeline,
-        timeline_ip=args.timeline_ip,
-        timeline_bins=args.timeline_bins,
-        show_ntlm=args.ntlm,
-        show_netbios=args.netbios,
-        show_arp=args.arp,
-        show_dhcp=getattr(args, "dhcp", False),
-        show_modbus=args.modbus,
-        show_dnp3=args.dnp3,
-        show_iec104=args.iec104,
-        show_bacnet=args.bacnet,
-        show_enip=args.enip,
-        show_profinet=args.profinet,
-        show_s7=args.s7,
-        show_opc=args.opc,
-        show_ethercat=args.ethercat,
-        show_fins=args.fins,
-        show_crimson=args.crimson,
-        show_pcworx=args.pcworx,
-        show_melsec=args.melsec,
-        show_cip=args.cip,
-        show_odesys=args.odesys,
-        show_niagara=args.niagara,
-        show_mms=args.mms,
-        show_srtp=args.srtp,
-        show_df1=args.df1,
-        show_pccc=args.pccc,
-        show_csp=args.csp,
-        show_modicon=args.modicon,
-        show_yokogawa=args.yokogawa,
-        show_honeywell=args.honeywell,
-        show_mqtt=args.mqtt,
-        show_coap=args.coap,
-        show_hart=args.hart,
-        show_prconos=args.prconos,
-        show_iccp=args.iccp,
-        verbose=args.verbose,
-        extract_name=args.extract,
-        view_name=args.view,
-        show_domain=args.domain,
-        show_ldap=args.ldap,
-        show_kerberos=args.kerberos,
-        ordered_steps=ordered_steps,
-        summarize=args.summarize,
-        show_quic=getattr(args, "quic", False),
-        show_http2=getattr(args, "http2", False),
-        show_encrypted_dns=getattr(args, "encrypted_dns", False),
-        show_ntp=getattr(args, "ntp", False),
-        show_vpn=getattr(args, "vpn", False),
-        show_goose=getattr(args, "goose", False),
-        show_sv=getattr(args, "sv", False),
-        show_lldp=getattr(args, "lldp", False),
-        show_ptp=getattr(args, "ptp", False),
-        show_opc_classic=getattr(args, "opc_classic", False),
-        show_streams=getattr(args, "streams", False),
-        follow_stream=getattr(args, "follow", None),
-        follow_stream_id=getattr(args, "follow_id", None),
-        lookup_stream_id=getattr(args, "lookup_stream_id", None),
-        streams_full=getattr(args, "streams_full", False),
-        show_ctf=getattr(args, "ctf", False),
-        show_ioc=getattr(args, "ioc", False),
-        ioc_file=getattr(args, "ioc_file", None),
-        show_pcapmeta=getattr(args, "pcapmeta", False),
-        show_ot_commands=getattr(args, "ot_commands", False),
-        show_iec101_103=getattr(args, "iec101_103", False),
-        bpf=getattr(args, "bpf", None),
-        time_start=time_start,
-        time_end=time_end,
-        export_json_path=export_json_path,
-        export_csv_path=export_csv_path,
-        export_sqlite_path=export_sqlite_path,
-        case_dir=case_dir,
-    )
+    def _run_analysis() -> int:
+        return _analyze_paths(
+            paths,
+            args.limit_protocols,
+            show_base=args.base,
+            show_status=not args.no_status,
+            search_query=args.search,
+            search_case=args.search_case,
+            show_vlan=args.vlan,
+            show_icmp=args.icmp,
+            show_dns=args.dns,
+            dns_vt=args.vt,
+            show_http=args.http,
+            show_ftp=args.ftp,
+            show_tls=args.tls,
+            show_ssh=args.ssh,
+            show_rdp=args.rdp,
+            show_telnet=args.telnet,
+            show_vnc=args.vnc,
+            show_teamviewer=args.teamviewer,
+            show_winrm=args.winrm,
+            show_wmic=args.wmic,
+            show_powershell=args.powershell,
+            show_syslog=args.syslog,
+            show_snmp=args.snmp,
+            show_smtp=args.smtp,
+            show_rpc=args.rpc,
+            show_tcp=args.tcp,
+            show_udp=args.udp,
+            show_exfil=args.exfil,
+            show_sizes=args.sizes,
+            show_ips=args.ips,
+            show_beacon=args.beacon,
+            show_threats=args.threats,
+            show_files=args.files,
+            show_protocols=args.protocols,
+            show_routing=args.routing,
+            show_services=args.services,
+            show_smb=args.smb,
+            show_nfs=args.nfs,
+            show_strings=args.strings,
+            show_creds=args.creds,
+            show_secrets_scan=getattr(args, "secrets", False),
+            show_secrets=args.show_secrets,
+            show_certificates=args.certificates,
+            show_health=args.health,
+            show_hostname=args.hostname,
+            show_hostdetails=args.hostdetails,
+            show_timeline=args.timeline,
+            timeline_ip=args.timeline_ip,
+            timeline_bins=args.timeline_bins,
+            timeline_storyline_off=args.timeline_storyline_off,
+            timeline_categories=timeline_categories,
+            show_ntlm=args.ntlm,
+            show_netbios=args.netbios,
+            show_arp=args.arp,
+            show_dhcp=getattr(args, "dhcp", False),
+            show_modbus=args.modbus,
+            show_dnp3=args.dnp3,
+            show_iec104=args.iec104,
+            show_bacnet=args.bacnet,
+            show_enip=args.enip,
+            show_profinet=args.profinet,
+            show_s7=args.s7,
+            show_opc=args.opc,
+            show_ethercat=args.ethercat,
+            show_fins=args.fins,
+            show_crimson=args.crimson,
+            show_pcworx=args.pcworx,
+            show_melsec=args.melsec,
+            show_cip=args.cip,
+            show_odesys=args.odesys,
+            show_niagara=args.niagara,
+            show_mms=args.mms,
+            show_srtp=args.srtp,
+            show_df1=args.df1,
+            show_pccc=args.pccc,
+            show_csp=args.csp,
+            show_modicon=args.modicon,
+            show_yokogawa=args.yokogawa,
+            show_honeywell=args.honeywell,
+            show_mqtt=args.mqtt,
+            show_coap=args.coap,
+            show_hart=args.hart,
+            show_prconos=args.prconos,
+            show_iccp=args.iccp,
+            verbose=args.verbose,
+            extract_name=args.extract,
+            view_name=args.view,
+            view_raw=args.view_raw,
+            packet_index=args.packet,
+            show_domain=args.domain,
+            show_ldap=args.ldap,
+            show_kerberos=args.kerberos,
+            ordered_steps=ordered_steps,
+            summarize=args.summarize,
+            show_quic=getattr(args, "quic", False),
+            show_http2=getattr(args, "http2", False),
+            show_encrypted_dns=getattr(args, "encrypted_dns", False),
+            show_ntp=getattr(args, "ntp", False),
+            show_vpn=getattr(args, "vpn", False),
+            show_goose=getattr(args, "goose", False),
+            show_sv=getattr(args, "sv", False),
+            show_lldp=getattr(args, "lldp", False),
+            show_ptp=getattr(args, "ptp", False),
+            show_opc_classic=getattr(args, "opc_classic", False),
+            show_streams=getattr(args, "streams", False),
+            follow_stream=getattr(args, "follow", None),
+            follow_stream_id=getattr(args, "follow_id", None),
+            lookup_stream_id=getattr(args, "lookup_stream_id", None),
+            streams_full=getattr(args, "streams_full", False),
+            show_ctf=getattr(args, "ctf", False),
+            show_ioc=getattr(args, "ioc", False),
+            ioc_file=getattr(args, "ioc_file", None),
+            show_pcapmeta=getattr(args, "pcapmeta", False),
+            show_ot_commands=getattr(args, "ot_commands", False),
+            show_iec101_103=getattr(args, "iec101_103", False),
+            bpf=getattr(args, "bpf", None),
+            time_start=time_start,
+            time_end=time_end,
+            export_json_path=export_json_path,
+            export_csv_path=export_csv_path,
+            export_sqlite_path=export_sqlite_path,
+            case_dir=case_dir,
+        )
+
+    if not args.profile:
+        return _run_analysis()
+
+    import cProfile
+    import io
+    import pstats
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+    try:
+        result = _run_analysis()
+    finally:
+        profiler.disable()
+        stream = io.StringIO()
+        stats = pstats.Stats(profiler, stream=stream).sort_stats("cumtime")
+        stats.print_stats(40)
+        print(stream.getvalue(), file=sys.stderr)
+        if args.profile_out:
+            out_path = Path(args.profile_out).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            profiler.dump_stats(str(out_path))
+    return result

@@ -8,6 +8,7 @@ import re
 
 from .pcap_cache import get_reader
 from .utils import safe_float
+from .device_detection import device_fingerprints_from_text
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -87,6 +88,7 @@ class TelnetSummary:
     plaintext_strings: Counter[str]
     suspicious_plaintext: Counter[str]
     file_artifacts: Counter[str]
+    device_fingerprints: Counter[str]
     conversations: list[TelnetConversation]
     detections: list[dict[str, object]]
     anomalies: list[dict[str, object]]
@@ -121,6 +123,7 @@ class TelnetSummary:
             "plaintext_strings": dict(self.plaintext_strings),
             "suspicious_plaintext": dict(self.suspicious_plaintext),
             "file_artifacts": dict(self.file_artifacts),
+            "device_fingerprints": dict(self.device_fingerprints),
             "conversations": [
                 {
                     "client_ip": conv.client_ip,
@@ -316,6 +319,7 @@ def analyze_telnet(
             plaintext_strings=Counter(),
             suspicious_plaintext=Counter(),
             file_artifacts=Counter(),
+            device_fingerprints=Counter(),
             conversations=[],
             detections=[],
             anomalies=[],
@@ -354,6 +358,7 @@ def analyze_telnet(
     plaintext_strings: Counter[str] = Counter()
     suspicious_plaintext: Counter[str] = Counter()
     file_artifacts: Counter[str] = Counter()
+    device_fingerprints: Counter[str] = Counter()
     artifacts: list[str] = []
 
     short_session_counts: Counter[tuple[str, str]] = Counter()
@@ -521,6 +526,10 @@ def analyze_telnet(
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
 
+    for text, count in plaintext_strings.most_common(50):
+        for detail in device_fingerprints_from_text(text, source="Telnet plaintext"):
+            device_fingerprints[detail] += count
+
     conversations: list[TelnetConversation] = []
     for session in sessions.values():
         conversations.append(
@@ -643,6 +652,7 @@ def analyze_telnet(
         plaintext_strings=plaintext_strings,
         suspicious_plaintext=suspicious_plaintext,
         file_artifacts=file_artifacts,
+        device_fingerprints=device_fingerprints,
         conversations=conversations,
         detections=detections,
         anomalies=anomalies,
@@ -683,6 +693,7 @@ def merge_telnet_summaries(
             plaintext_strings=Counter(),
             suspicious_plaintext=Counter(),
             file_artifacts=Counter(),
+            device_fingerprints=Counter(),
             conversations=[],
             detections=[],
             anomalies=[],
@@ -717,6 +728,7 @@ def merge_telnet_summaries(
     plaintext_strings: Counter[str] = Counter()
     suspicious_plaintext: Counter[str] = Counter()
     file_artifacts: Counter[str] = Counter()
+    device_fingerprints: Counter[str] = Counter()
     conversations: list[TelnetConversation] = []
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
@@ -751,6 +763,7 @@ def merge_telnet_summaries(
         plaintext_strings.update(summary.plaintext_strings)
         suspicious_plaintext.update(summary.suspicious_plaintext)
         file_artifacts.update(summary.file_artifacts)
+        device_fingerprints.update(summary.device_fingerprints)
         conversations.extend(summary.conversations)
         detections.extend(summary.detections)
         anomalies.extend(summary.anomalies)
@@ -785,6 +798,7 @@ def merge_telnet_summaries(
         plaintext_strings=plaintext_strings,
         suspicious_plaintext=suspicious_plaintext,
         file_artifacts=file_artifacts,
+        device_fingerprints=device_fingerprints,
         conversations=conversations,
         detections=detections,
         anomalies=anomalies,

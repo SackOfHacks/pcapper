@@ -1807,6 +1807,7 @@ def _export_with_dpkt(
     extract_name: Optional[str],
     output_dir: Optional[Path],
     view_name: Optional[str],
+    view_raw: bool,
     show_status: bool,
     packets: Optional[List[Packet]] = None,
 ) -> Optional[FileTransferSummary]:
@@ -2456,7 +2457,12 @@ def _export_with_dpkt(
             search = view_name.lower()
             for art in artifacts:
                 if art.payload and search in art.filename.lower():
-                    views.append({"filename": art.filename, "payload": art.payload, "size": len(art.payload)})
+                    views.append({
+                        "filename": art.filename,
+                        "payload": art.payload,
+                        "size": len(art.payload),
+                        "raw": view_raw,
+                    })
 
         detections.append({
             "severity": "info",
@@ -2540,6 +2546,7 @@ def analyze_files(
     extract_name: Optional[str] = None,
     output_dir: Optional[Path] = None,
     view_name: Optional[str] = None,
+    view_raw: bool = False,
     show_status: bool = True,
     include_x509: bool = False,
 ) -> FileTransferSummary:
@@ -2551,6 +2558,7 @@ def analyze_files(
         extract_name=extract_name,
         output_dir=output_dir,
         view_name=view_name,
+        view_raw=view_raw,
         show_status=show_status,
         packets=None,
     )

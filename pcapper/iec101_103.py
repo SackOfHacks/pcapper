@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+import ipaddress
 from typing import Optional
 
 from .pcap_cache import get_reader
@@ -25,11 +26,54 @@ class Iec101103Summary:
     candidate_packets: int
     client_counts: Counter[str]
     server_counts: Counter[str]
+    type_counts: Counter[str]
+    cause_counts: Counter[str]
     detections: list[dict[str, object]]
     errors: list[str]
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+
+
+CAUSES = {
+    1: "Periodic",
+    2: "Background",
+    3: "Spontaneous",
+    4: "Initialized",
+    5: "Request",
+    6: "Activation",
+    7: "Activation Confirmation",
+    8: "Deactivation",
+    9: "Deactivation Confirmation",
+    10: "Activation Termination",
+}
+
+
+def _parse_asdu(payload: bytes) -> tuple[Optional[str], Optional[str]]:
+    if len(payload) < 9:
+        return None, None
+    if payload[0] != 0x68:
+        return None, None
+    if len(payload) >= 6 and payload[3] == 0x68:
+        idx = 4
+        if idx + 1 >= len(payload):
+            return None, None
+        idx += 1
+        if idx + 1 >= len(payload):
+            return None, None
+        idx += 1
+    else:
+        idx = 6
+    if idx + 6 > len(payload):
+        return None, None
+    type_id = payload[idx]
+    vsq = payload[idx + 1]
+    _ = vsq
+    cot_raw = int.from_bytes(payload[idx + 2:idx + 4], "little")
+    cot = cot_raw & 0x3F
+    cause_name = CAUSES.get(cot, f"COT {cot}")
+    type_name = f"ASDU {type_id}"
+    return type_name, cause_name
 
 
 def _iec_apdu_candidate(payload: bytes) -> bool:
@@ -47,6 +91,8 @@ def analyze_iec101_103(path: Path, show_status: bool = True) -> Iec101103Summary
     candidate_packets = 0
     client_counts: Counter[str] = Counter()
     server_counts: Counter[str] = Counter()
+    type_counts: Counter[str] = Counter()
+    cause_counts: Counter[str] = Counter()
     detections: list[dict[str, object]] = []
     errors: list[str] = []
     first_seen: Optional[float] = None
@@ -92,6 +138,12 @@ def analyze_iec101_103(path: Path, show_status: bool = True) -> Iec101103Summary
             client_counts[src_ip] += 1
             server_counts[dst_ip] += 1
 
+            type_name, cause_name = _parse_asdu(payload)
+            if type_name:
+                type_counts[type_name] += 1
+            if cause_name:
+                cause_counts[cause_name] += 1
+
     finally:
         status.finish()
         reader.close()
@@ -102,6 +154,27 @@ def analyze_iec101_103(path: Path, show_status: bool = True) -> Iec101103Summary
             "summary": "IEC 60870-5-101/103 candidate traffic observed",
             "details": f"{candidate_packets} packets matched IEC 101/103 APDU framing heuristics.",
         })
+    unique_clients = len(client_counts)
+    unique_servers = len(server_counts)
+    if unique_servers >= 20 and candidate_packets >= 50:
+        detections.append({
+            "severity": "warning",
+            "summary": "IEC 101/103 Broad Polling Pattern",
+            "details": f"{unique_clients} clients contacted {unique_servers} servers (possible scanning or wide polling).",
+        })
+    public_endpoints = []
+    for ip_value in set(client_counts) | set(server_counts):
+        try:
+            if ipaddress.ip_address(ip_value).is_global:
+                public_endpoints.append(ip_value)
+        except Exception:
+            continue
+    if public_endpoints:
+        detections.append({
+            "severity": "high",
+            "summary": "IEC 101/103 Exposure to Public IP",
+            "details": f"IEC 101/103 candidate traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
+        })
 
     duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
     return Iec101103Summary(
@@ -110,6 +183,8 @@ def analyze_iec101_103(path: Path, show_status: bool = True) -> Iec101103Summary
         candidate_packets=candidate_packets,
         client_counts=client_counts,
         server_counts=server_counts,
+        type_counts=type_counts,
+        cause_counts=cause_counts,
         detections=detections,
         errors=errors,
         first_seen=first_seen,

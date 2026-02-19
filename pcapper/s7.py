@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import ipaddress
 
 from .equipment import equipment_artifacts
 from .industrial_helpers import (
@@ -160,6 +161,17 @@ def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, comma
                 ts=ts,
             )
         )
+    if any(cmd in {"ReadVar", "BlockList", "GetBlockInfo", "GetDiagData"} for cmd in commands):
+        anomalies.append(
+            IndustrialAnomaly(
+                severity="LOW",
+                title="S7 Enumeration/Diagnostics",
+                description="PLC enumeration or diagnostic query observed.",
+                src=src_ip,
+                dst=dst_ip,
+                ts=ts,
+            )
+        )
     return anomalies
 
 
@@ -170,7 +182,7 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
 
 
 def analyze_s7(path: Path, show_status: bool = True) -> IndustrialAnalysis:
-    return analyze_port_protocol(
+    analysis = analyze_port_protocol(
         path=path,
         protocol_name="S7",
         tcp_ports={S7_PORT},
@@ -180,3 +192,22 @@ def analyze_s7(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         enable_enrichment=True,
         show_status=show_status,
     )
+    public_endpoints = []
+    for ip_value in set(analysis.src_ips) | set(analysis.dst_ips):
+        try:
+            if ipaddress.ip_address(ip_value).is_global:
+                public_endpoints.append(ip_value)
+        except Exception:
+            continue
+    if public_endpoints and len(analysis.anomalies) < 200:
+        analysis.anomalies.append(
+            IndustrialAnomaly(
+                severity="HIGH",
+                title="S7 Exposure to Public IP",
+                description=f"S7 traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
+                src="*",
+                dst="*",
+                ts=0.0,
+            )
+        )
+    return analysis

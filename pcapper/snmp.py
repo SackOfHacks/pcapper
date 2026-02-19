@@ -9,6 +9,7 @@ import re
 
 from .pcap_cache import get_reader
 from .utils import safe_float
+from .device_detection import device_fingerprints_from_text
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -374,6 +375,7 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
     artifacts: list[SnmpArtifact] = []
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
+    seen_device_artifacts: set[str] = set()
 
     community_by_flow: dict[tuple[str, str], set[str]] = defaultdict(set)
     dst_by_src: dict[str, set[str]] = defaultdict(set)
@@ -516,6 +518,12 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
                                 "details": f"{src_ip}->{dst_ip} {value[:80]}",
                                 "source": "SNMP",
                             })
+                        for detail in device_fingerprints_from_text(value, source="SNMP sysDescr"):
+                            key = f"device:{detail}"
+                            if key in seen_device_artifacts:
+                                continue
+                            seen_device_artifacts.add(key)
+                            artifacts.append(SnmpArtifact(kind="device", detail=detail, src=src_ip, dst=dst_ip))
                     if label == "ipAdEntAddr" and value:
                         ip_addresses[value] += 1
                     if label == "ifPhysAddress":
@@ -524,6 +532,12 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
                             mac_addresses[mac] += 1
                     if label in {"hrSWRunName", "hrSWInstalledName", "hrDeviceDescr"} and value:
                         services[_truncate(value, 80)] += 1
+                        for detail in device_fingerprints_from_text(value, source=f"SNMP {label}"):
+                            key = f"device:{detail}"
+                            if key in seen_device_artifacts:
+                                continue
+                            seen_device_artifacts.add(key)
+                            artifacts.append(SnmpArtifact(kind="device", detail=detail, src=src_ip, dst=dst_ip))
                     if value:
                         for pattern, reason in SUSPICIOUS_PATTERNS:
                             if pattern.search(value):
