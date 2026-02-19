@@ -1,15 +1,129 @@
 from __future__ import annotations
 
-from __future__ import annotations
-
 from dataclasses import is_dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Any
 import base64
+from collections import OrderedDict
+import os
 
 
 PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
+
+_DECODE_CACHE: "OrderedDict[tuple[bytes, str, bool], str]" = OrderedDict()
+_DECODE_CACHE_MAX_ITEMS = 2048
+_DECODE_CACHE_MAX_BYTES = 4096
+_MAX_COUNTER_KEYS = int(os.getenv("PCAPPER_MAX_COUNTER_KEYS", "50000"))
+_MAX_SET_ITEMS = int(os.getenv("PCAPPER_MAX_SET_ITEMS", "50000"))
+_MAX_SET_VALUES = int(os.getenv("PCAPPER_MAX_SET_VALUES", "2000"))
+
+
+def decode_payload(
+    payload: bytes | None,
+    *,
+    encoding: str = "latin-1",
+    lower: bool = False,
+    limit: int | None = None,
+    cache: bool = True,
+) -> str:
+    if not payload:
+        return ""
+    view = payload[:limit] if limit else payload
+    use_cache = cache and len(view) <= _DECODE_CACHE_MAX_BYTES
+    key = (view, encoding, lower)
+    if use_cache:
+        cached = _DECODE_CACHE.get(key)
+        if cached is not None:
+            _DECODE_CACHE.move_to_end(key)
+            return cached
+    try:
+        text = view.decode(encoding, errors="ignore")
+    except Exception:
+        text = ""
+    if lower:
+        text = text.lower()
+    if use_cache:
+        _DECODE_CACHE[key] = text
+        if len(_DECODE_CACHE) > _DECODE_CACHE_MAX_ITEMS:
+            _DECODE_CACHE.popitem(last=False)
+    return text
+
+
+def decode_payload_lower(payload: bytes | None, *, encoding: str = "latin-1", limit: int | None = None) -> str:
+    return decode_payload(payload, encoding=encoding, lower=True, limit=limit)
+
+
+def record_error(errors: list[str] | None, context: str, exc: Exception) -> None:
+    if errors is None:
+        return
+    errors.append(f"{context}: {type(exc).__name__}: {exc}")
+
+
+def safe_read_text(
+    path: Path,
+    *,
+    encoding: str = "utf-8",
+    errors: str = "ignore",
+    error_list: list[str] | None = None,
+    context: str = "read_text",
+) -> str:
+    try:
+        return path.read_text(encoding=encoding, errors=errors)
+    except Exception as exc:
+        record_error(error_list, context, exc)
+        return ""
+
+
+def safe_write_text(
+    path: Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    errors_list: list[str] | None = None,
+    context: str = "write_text",
+) -> None:
+    try:
+        path.write_text(text, encoding=encoding)
+    except Exception as exc:
+        record_error(errors_list, context, exc)
+        if errors_list is None:
+            raise IOError(f"{context}: {type(exc).__name__}: {exc}") from exc
+
+
+def counter_inc(counter: dict[object, int], key: object, inc: int = 1, max_keys: int | None = None) -> None:
+    limit = _MAX_COUNTER_KEYS if max_keys is None else max_keys
+    if key in counter or len(counter) < limit:
+        counter[key] = int(counter.get(key, 0)) + inc
+    else:
+        counter["__other__"] = int(counter.get("__other__", 0)) + inc
+
+
+def setdict_add(
+    store: dict[object, set[object]],
+    key: object,
+    value: object,
+    *,
+    max_keys: int | None = None,
+    max_values: int | None = None,
+) -> None:
+    limit = _MAX_COUNTER_KEYS if max_keys is None else max_keys
+    value_limit = _MAX_SET_VALUES if max_values is None else max_values
+    if key not in store:
+        if len(store) >= limit:
+            return
+        store[key] = set()
+    bucket = store[key]
+    if len(bucket) >= value_limit:
+        return
+    bucket.add(value)
+
+
+def set_add_cap(target: set[object], value: object, *, max_size: int | None = None) -> None:
+    limit = _MAX_SET_ITEMS if max_size is None else max_size
+    if len(target) >= limit:
+        return
+    target.add(value)
 
 
 def detect_file_type(path: Path) -> str:

@@ -8,6 +8,7 @@ import re
 
 from .pcap_cache import get_reader
 from .utils import safe_float
+from .device_detection import device_fingerprints_from_text
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -248,6 +249,7 @@ class SshSummary:
     plaintext_strings: Counter[str]
     suspicious_plaintext: Counter[str]
     file_artifacts: Counter[str]
+    device_fingerprints: Counter[str]
     conversations: list[SshConversation]
     auth_attempts_by_client: Counter[str]
     auth_failures_by_client: Counter[str]
@@ -298,6 +300,7 @@ class SshSummary:
             "plaintext_strings": dict(self.plaintext_strings),
             "suspicious_plaintext": dict(self.suspicious_plaintext),
             "file_artifacts": dict(self.file_artifacts),
+            "device_fingerprints": dict(self.device_fingerprints),
             "conversations": [
                 {
                     "client_ip": conv.client_ip,
@@ -376,6 +379,7 @@ def merge_ssh_summaries(
             plaintext_strings=Counter(),
             suspicious_plaintext=Counter(),
             file_artifacts=Counter(),
+            device_fingerprints=Counter(),
             conversations=[],
             auth_attempts_by_client=Counter(),
             auth_failures_by_client=Counter(),
@@ -426,6 +430,7 @@ def merge_ssh_summaries(
     plaintext_strings: Counter[str] = Counter()
     suspicious_plaintext: Counter[str] = Counter()
     file_artifacts: Counter[str] = Counter()
+    device_fingerprints: Counter[str] = Counter()
     auth_attempts_by_client: Counter[str] = Counter()
     auth_failures_by_client: Counter[str] = Counter()
     auth_successes_by_client: Counter[str] = Counter()
@@ -477,6 +482,7 @@ def merge_ssh_summaries(
         plaintext_strings.update(summary.plaintext_strings)
         suspicious_plaintext.update(summary.suspicious_plaintext)
         file_artifacts.update(summary.file_artifacts)
+        device_fingerprints.update(summary.device_fingerprints)
         auth_attempts_by_client.update(summary.auth_attempts_by_client)
         auth_failures_by_client.update(summary.auth_failures_by_client)
         auth_successes_by_client.update(summary.auth_successes_by_client)
@@ -528,6 +534,7 @@ def merge_ssh_summaries(
         plaintext_strings=plaintext_strings,
         suspicious_plaintext=suspicious_plaintext,
         file_artifacts=file_artifacts,
+        device_fingerprints=device_fingerprints,
         conversations=conversations,
         auth_attempts_by_client=auth_attempts_by_client,
         auth_failures_by_client=auth_failures_by_client,
@@ -994,6 +1001,19 @@ def analyze_ssh(
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
 
+    for version, count in client_versions.items():
+        for detail in device_fingerprints_from_text(version, source="SSH client banner"):
+            device_fingerprints[detail] += count
+    for version, count in server_versions.items():
+        for detail in device_fingerprints_from_text(version, source="SSH server banner"):
+            device_fingerprints[detail] += count
+    for software, count in client_software.items():
+        for detail in device_fingerprints_from_text(software, source="SSH client software"):
+            device_fingerprints[detail] += count
+    for software, count in server_software.items():
+        for detail in device_fingerprints_from_text(software, source="SSH server software"):
+            device_fingerprints[detail] += count
+
     conversations: list[SshConversation] = []
     for session in sessions.values():
         conversations.append(
@@ -1167,6 +1187,7 @@ def analyze_ssh(
         plaintext_strings=plaintext_strings,
         suspicious_plaintext=suspicious_plaintext,
         file_artifacts=file_artifacts,
+        device_fingerprints=device_fingerprints,
         conversations=conversations,
         auth_attempts_by_client=auth_attempts_by_client,
         auth_failures_by_client=auth_failures_by_client,

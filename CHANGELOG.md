@@ -4,7 +4,22 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-## 1.2.6 — 2026-02-18
+## 1.3.0 — 2026-02-19
+### Added
+- Device fingerprinting across IT/OT/IoT traffic (vendor/model/OS/firmware/software) with rollups integrated into host, service, and OT reporting.
+- Deeper OT protocol decoding including DNP3 object/variation parsing with expanded size tables and transport reassembly, IEC 61850 GOOSE/SV dataset value decoding with sequence-state tracking, OPC UA ResponseHeader plus common service request/response decoding, BACnet APDU services, CoAP option/URI parsing with Observe tracking, MQTT topic parsing, CIP/ENIP class/attribute/service decoding, and LLDP/PROFINET DCP block parsing.
+- OT risk posture scoring and attack-storyline summaries in timeline output.
+- New routing protocol analysis (`--routing`) for OSPF/BGP/RIP/EIGRP/VRRP/HSRP with sessions, auth exposure, and routing-health detections.
+- OSPF LSA parsing (types, IDs, advertising routers, MaxAge/sequence alerts) for deeper routing forensics.
+- BGP UPDATE parsing with NLRI/withdraw decoding, next-hop/origin/AS-path artifacts, and prefix-level rollups.
+- IS-IS TLV/LSP parsing with system IDs, areas, hostnames, reachability, and authentication insights.
+- PIM parsing (Hello + Join/Prune) with group/source tracking and DR/holdtime insights.
+
+### Changed
+- Timeline output now shows all events by default (independent of `-v`), includes TCP SYN/SYN-ACK connection events, and supports category filtering with an on-demand category list.
+- Reporting summaries expanded with richer OT command visibility, protocol artifacts, and device fingerprint context.
+
+## 1.2.8 — 2026-02-18
 ### Added
 - New analyzers: QUIC (`--quic`), HTTP/2 (`--http2`), encrypted DNS (`--encrypted-dns`), NTP (`--ntp`), VPN/tunnel detection (`--vpn`), OPC Classic (`--opc-classic`), IEC 61850 GOOSE/SV (`--goose`, `--sv`), LLDP/Profinet DCP (`--lldp`), PTP (`--ptp`), IEC 101/103 heuristic (`--iec101-103`), OT command normalization (`--ot-commands`), IOC matching (`--ioc`), CTF flag finder (`--ctf`), pcap metadata (`--pcapmeta`), and TCP stream analysis (`--streams`).
 - Stream tooling: `--follow`, `--follow-id`, `--lookup-stream-id`, and `--streams-full`.

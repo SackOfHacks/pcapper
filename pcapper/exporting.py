@@ -7,7 +7,7 @@ import json
 import csv
 import sqlite3
 
-from .utils import to_serializable
+from .utils import to_serializable, safe_write_text
 
 
 @dataclass
@@ -26,7 +26,7 @@ def export_json(bundle: ExportBundle, output_path: Path) -> None:
         "path": str(bundle.path),
         "summaries": {name: to_serializable(summary) for name, summary in bundle.summaries.items()},
     }
-    output_path.write_text(json.dumps(payload, indent=2))
+    safe_write_text(output_path, json.dumps(payload, indent=2), encoding="utf-8", context="export_json")
 
 
 def _iter_detections(summary: Any) -> Iterable[dict[str, Any]]:
@@ -71,11 +71,11 @@ def export_csv(bundle: ExportBundle, output_path: Path) -> None:
             rows.append(row)
 
     if not rows:
-        output_path.write_text("")
+        safe_write_text(output_path, "", encoding="utf-8", context="export_csv")
         return
 
     fieldnames = sorted({key for row in rows for key in row.keys()})
-    with output_path.open("w", newline="") as handle:
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
@@ -85,6 +85,8 @@ def export_csv(bundle: ExportBundle, output_path: Path) -> None:
 def export_sqlite(bundle: ExportBundle, output_path: Path) -> None:
     _ensure_parent(output_path)
     if output_path.exists():
+        if output_path.is_dir():
+            raise ValueError(f"SQLite export path is a directory: {output_path}")
         output_path.unlink()
     conn = sqlite3.connect(str(output_path))
     cur = conn.cursor()

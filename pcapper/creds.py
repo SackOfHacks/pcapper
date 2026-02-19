@@ -9,7 +9,7 @@ from typing import Optional
 
 from .pcap_cache import PcapMeta, get_reader
 from .services import COMMON_PORTS
-from .utils import safe_float
+from .utils import safe_float, decode_payload
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -126,7 +126,7 @@ def _extract_payload(pkt: Packet) -> bytes:
 
 
 def _safe_decode(value: bytes) -> str:
-    return value.decode("latin-1", errors="ignore")
+    return decode_payload(value, encoding="latin-1")
 
 
 def _build_context(text: str, needle: str, max_len: int = 80) -> str:

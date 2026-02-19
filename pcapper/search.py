@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, get_reader
-from .utils import safe_float
+from .utils import safe_float, decode_payload
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -98,7 +98,7 @@ def _build_context(text: str, index: int, query_len: int, max_len: int = 80) -> 
 def _find_match(payload: bytes, query: str, *, case_sensitive: bool) -> Optional[str]:
     if not query:
         return None
-    text = payload.decode("latin-1", errors="ignore")
+    text = decode_payload(payload, encoding="latin-1")
     if case_sensitive:
         idx = text.find(query)
         if idx >= 0:
@@ -115,7 +115,7 @@ def _find_match(payload: bytes, query: str, *, case_sensitive: bool) -> Optional
     except Exception:
         query_utf16 = b""
     if query_utf16 and query_utf16 in payload:
-        text16 = payload.decode("utf-16le", errors="ignore")
+        text16 = decode_payload(payload, encoding="utf-16le")
         if case_sensitive:
             idx = text16.find(query)
             if idx >= 0:

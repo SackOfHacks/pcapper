@@ -8,7 +8,7 @@ import math
 import ipaddress
 
 from .pcap_cache import get_reader
-from .utils import safe_float, format_bytes_as_mb
+from .utils import safe_float, format_bytes_as_mb, format_duration
 from .http import analyze_http
 from .dns import analyze_dns
 from .files import analyze_files
@@ -32,10 +32,13 @@ class ExfilSummary:
     total_bytes: int
     outbound_bytes: int
     outbound_flows: list[dict[str, object]]
+    internal_flows: list[dict[str, object]]
+    ot_flows: list[dict[str, object]]
     top_external_dsts: Counter[str]
     dns_tunnel_suspects: list[dict[str, object]]
     http_post_suspects: list[dict[str, object]]
     file_artifacts: list[dict[str, object]]
+    file_exfil_suspects: list[dict[str, object]]
     detections: list[dict[str, object]]
     artifacts: list[str]
     errors: list[str]
@@ -68,6 +71,28 @@ def _shannon_entropy(value: str) -> float:
     return -sum((count / total) * math.log2(count / total) for count in freq.values())
 
 
+OT_PORTS = {
+    102, 502, 9600, 20000, 2404, 47808, 44818, 2222, 34962, 34963, 34964,
+    4840, 1911, 4911, 5094, 18245, 18246, 20547, 1962, 5006, 5007, 5683,
+    5684, 2455, 1217, 34378, 34379, 34380,
+}
+
+FILE_TRANSFER_PORTS = {
+    20, 21, 22, 69, 80, 443, 445, 139, 2049, 111, 2121, 990, 989,
+}
+
+EMAIL_PORTS = {25, 465, 587, 110, 143, 993, 995}
+
+REMOTE_MGMT_PORTS = {22, 23, 135, 139, 445, 3389, 5900, 5938, 5985, 5986}
+
+SUSPICIOUS_EXFIL_EXTS = {
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".xz",
+    ".csv", ".sql", ".bak", ".db", ".sqlite", ".dump",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".pcap", ".pcapng", ".log", ".cfg", ".conf", ".ini",
+}
+
+
 def analyze_exfil(
     path: Path,
     show_status: bool = True,
@@ -83,10 +108,13 @@ def analyze_exfil(
             total_bytes=0,
             outbound_bytes=0,
             outbound_flows=[],
+            internal_flows=[],
+            ot_flows=[],
             top_external_dsts=Counter(),
             dns_tunnel_suspects=[],
             http_post_suspects=[],
             file_artifacts=[],
+            file_exfil_suspects=[],
             detections=[],
             artifacts=[],
             errors=errors,
@@ -108,6 +136,15 @@ def analyze_exfil(
     outbound_flow_last: dict[tuple[str, str, str, Optional[int]], float] = {}
     outbound_port_bytes: Counter[tuple[str, int]] = Counter()
     external_dsts: Counter[str] = Counter()
+    internal_flow_bytes: Counter[tuple[str, str, str, Optional[int]]] = Counter()
+    internal_flow_packets: Counter[tuple[str, str, str, Optional[int]]] = Counter()
+    internal_flow_first: dict[tuple[str, str, str, Optional[int]], float] = {}
+    internal_flow_last: dict[tuple[str, str, str, Optional[int]], float] = {}
+    ot_flow_bytes: Counter[tuple[str, str, str, Optional[int]]] = Counter()
+    ot_flow_packets: Counter[tuple[str, str, str, Optional[int]]] = Counter()
+    ot_flow_first: dict[tuple[str, str, str, Optional[int]], float] = {}
+    ot_flow_last: dict[tuple[str, str, str, Optional[int]], float] = {}
+    remote_mgmt_bytes: Counter[tuple[str, str, str, Optional[int]]] = Counter()
 
     dns_query_counts: Counter[str] = Counter()
     dns_unique_queries: dict[str, set[str]] = defaultdict(set)
@@ -137,6 +174,7 @@ def analyze_exfil(
             src_ip = None
             dst_ip = None
             proto = "IP"
+            src_port: Optional[int] = None
             dst_port: Optional[int] = None
             if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
                 ip_layer = pkt[IP]  # type: ignore[index]
@@ -149,9 +187,11 @@ def analyze_exfil(
 
             if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 proto = "TCP"
+                src_port = int(getattr(pkt[TCP], "sport", 0) or 0)  # type: ignore[index]
                 dst_port = int(getattr(pkt[TCP], "dport", 0) or 0)  # type: ignore[index]
             elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                 proto = "UDP"
+                src_port = int(getattr(pkt[UDP], "sport", 0) or 0)  # type: ignore[index]
                 dst_port = int(getattr(pkt[UDP], "dport", 0) or 0)  # type: ignore[index]
 
             if src_ip and dst_ip and ts is not None:
@@ -175,6 +215,33 @@ def analyze_exfil(
                 external_dsts[dst_ip] += pkt_len
                 if dst_port is not None and dst_port > 0:
                     outbound_port_bytes[(proto, dst_port)] += pkt_len
+
+            if _is_private_ip(src_ip) and _is_private_ip(dst_ip):
+                flow_key = (src_ip, dst_ip, proto, dst_port)
+                internal_flow_bytes[flow_key] += pkt_len
+                internal_flow_packets[flow_key] += 1
+                if ts is not None:
+                    if flow_key not in internal_flow_first:
+                        internal_flow_first[flow_key] = ts
+                    internal_flow_last[flow_key] = ts
+
+            ot_port = None
+            if src_port in OT_PORTS:
+                ot_port = src_port
+            elif dst_port in OT_PORTS:
+                ot_port = dst_port
+            if ot_port:
+                flow_key = (src_ip, dst_ip, proto, ot_port)
+                ot_flow_bytes[flow_key] += pkt_len
+                ot_flow_packets[flow_key] += 1
+                if ts is not None:
+                    if flow_key not in ot_flow_first:
+                        ot_flow_first[flow_key] = ts
+                    ot_flow_last[flow_key] = ts
+
+            if dst_port in REMOTE_MGMT_PORTS or src_port in REMOTE_MGMT_PORTS:
+                flow_key = (src_ip, dst_ip, proto, dst_port or src_port)
+                remote_mgmt_bytes[flow_key] += pkt_len
 
             if DNS is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
                 dns_layer = pkt[DNS]  # type: ignore[index]
@@ -207,29 +274,62 @@ def analyze_exfil(
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
 
-    outbound_flows = [
-        {
-            "src": src,
-            "dst": dst,
-            "proto": proto,
-            "dst_port": dst_port,
-            "bytes": bytes_sent,
-            "packets": outbound_flow_packets.get((src, dst, proto, dst_port), 0),
-            "duration_seconds": max(
-                0.0,
-                outbound_flow_last.get((src, dst, proto, dst_port), 0.0)
-                - outbound_flow_first.get((src, dst, proto, dst_port), 0.0),
-            ) if (src, dst, proto, dst_port) in outbound_flow_last else 0.0,
-        }
-        for (src, dst, proto, dst_port), bytes_sent in outbound_flow_bytes.most_common(15)
-    ]
+    def _build_flow_list(
+        counter_bytes: Counter[tuple[str, str, str, Optional[int]]],
+        counter_packets: Counter[tuple[str, str, str, Optional[int]]],
+        first_map: dict[tuple[str, str, str, Optional[int]], float],
+        last_map: dict[tuple[str, str, str, Optional[int]], float],
+        limit: int = 15,
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for (src, dst, proto, dst_port), bytes_sent in counter_bytes.most_common(limit):
+            duration = 0.0
+            if (src, dst, proto, dst_port) in last_map:
+                duration = max(
+                    0.0,
+                    last_map.get((src, dst, proto, dst_port), 0.0)
+                    - first_map.get((src, dst, proto, dst_port), 0.0),
+                )
+            rows.append({
+                "src": src,
+                "dst": dst,
+                "proto": proto,
+                "dst_port": dst_port,
+                "bytes": bytes_sent,
+                "packets": counter_packets.get((src, dst, proto, dst_port), 0),
+                "duration_seconds": duration,
+            })
+        return rows
 
-    for item in outbound_flows:
-        packets_count = int(item.get("packets", 0) or 0)
-        bytes_sent = int(item.get("bytes", 0) or 0)
-        duration = float(item.get("duration_seconds", 0.0) or 0.0)
-        item["avg_packet_bytes"] = (bytes_sent / packets_count) if packets_count > 0 else 0.0
-        item["bytes_per_second"] = (bytes_sent / duration) if duration > 0 else 0.0
+    outbound_flows = _build_flow_list(
+        outbound_flow_bytes,
+        outbound_flow_packets,
+        outbound_flow_first,
+        outbound_flow_last,
+        limit=15,
+    )
+    internal_flows = _build_flow_list(
+        internal_flow_bytes,
+        internal_flow_packets,
+        internal_flow_first,
+        internal_flow_last,
+        limit=15,
+    )
+    ot_flows = _build_flow_list(
+        ot_flow_bytes,
+        ot_flow_packets,
+        ot_flow_first,
+        ot_flow_last,
+        limit=15,
+    )
+
+    for bucket in (outbound_flows, internal_flows, ot_flows):
+        for item in bucket:
+            packets_count = int(item.get("packets", 0) or 0)
+            bytes_sent = int(item.get("bytes", 0) or 0)
+            duration = float(item.get("duration_seconds", 0.0) or 0.0)
+            item["avg_packet_bytes"] = (bytes_sent / packets_count) if packets_count > 0 else 0.0
+            item["bytes_per_second"] = (bytes_sent / duration) if duration > 0 else 0.0
 
     http_summary = analyze_http(path, show_status=False, packets=packets, meta=meta)
     dns_summary = analyze_dns(path, show_status=False, packets=packets, meta=meta)
@@ -308,6 +408,7 @@ def analyze_exfil(
             })
 
     file_artifacts: list[dict[str, object]] = []
+    file_exfil_suspects: list[dict[str, object]] = []
     for art in getattr(file_summary, "artifacts", []) or []:
         name = getattr(art, "filename", None)
         size = getattr(art, "size_bytes", None)
@@ -317,6 +418,31 @@ def analyze_exfil(
                 "size": int(size) if isinstance(size, int) else None,
                 "note": getattr(art, "note", None),
             })
+        src_ip = getattr(art, "src_ip", None)
+        dst_ip = getattr(art, "dst_ip", None)
+        proto = str(getattr(art, "protocol", "") or "-")
+        packet_index = getattr(art, "packet_index", None)
+        size_val = int(size) if isinstance(size, int) else 0
+        ext = ""
+        if name and "." in str(name):
+            ext = "." + str(name).lower().rsplit(".", 1)[-1]
+        if src_ip and dst_ip:
+            src_private = _is_private_ip(str(src_ip))
+            dst_public = _is_public_ip(str(dst_ip))
+            is_ot_proto = proto.upper() in {"ENIP", "S7", "MODBUS", "DNP3", "IEC104", "OPC", "OPC UA", "BACNET"}
+            is_file_proto = proto.upper() in {"HTTP", "HTTPS/SSL", "FTP", "TFTP", "SMB", "NFS", "SMTP", "IMAP", "POP3", "ENIP"}
+            if src_private and size_val >= 500_000 and (dst_public or is_ot_proto or is_file_proto):
+                file_exfil_suspects.append({
+                    "src": str(src_ip),
+                    "dst": str(dst_ip),
+                    "protocol": proto,
+                    "filename": str(name) if name else "-",
+                    "size": size_val,
+                    "packet": packet_index,
+                    "note": getattr(art, "note", None),
+                    "file_type": getattr(art, "file_type", None),
+                    "flagged_ext": ext if ext in SUSPICIOUS_EXFIL_EXTS else None,
+                })
 
     detections: list[dict[str, object]] = []
     if outbound_flows:
@@ -355,6 +481,75 @@ def analyze_exfil(
                 "details": f"{top_dst} received {dst_share * 100:.1f}% of outbound bytes ({format_bytes_as_mb(top_dst_bytes)}).",
             })
 
+    internal_candidates = []
+    for flow in internal_flows:
+        bytes_val = int(flow.get("bytes", 0) or 0)
+        port_val = flow.get("dst_port")
+        if bytes_val >= 10_000_000:
+            internal_candidates.append(flow)
+            continue
+        if bytes_val >= 1_000_000 and (
+            port_val in OT_PORTS
+            or port_val in FILE_TRANSFER_PORTS
+            or port_val in REMOTE_MGMT_PORTS
+        ):
+            internal_candidates.append(flow)
+    if internal_candidates:
+        detections.append({
+            "severity": "warning",
+            "summary": "Large internal data transfers",
+            "details": "; ".join(
+                f"{flow.get('src')}->{flow.get('dst')} {flow.get('proto')}/{flow.get('dst_port') or '-'} "
+                f"{format_bytes_as_mb(int(flow.get('bytes', 0) or 0))}"
+                for flow in internal_candidates[:6]
+            ),
+            "evidence": [
+                f"{flow.get('src')}->{flow.get('dst')} bytes={format_bytes_as_mb(int(flow.get('bytes', 0) or 0))} "
+                f"dur={format_duration(float(flow.get('duration_seconds', 0.0) or 0.0))}"
+                for flow in internal_candidates[:8]
+            ],
+        })
+
+    ot_candidates = [
+        flow for flow in ot_flows
+        if int(flow.get("bytes", 0) or 0) >= 1_000_000
+    ]
+    if ot_candidates:
+        external_ot = [
+            flow for flow in ot_candidates
+            if _is_public_ip(str(flow.get("src", ""))) or _is_public_ip(str(flow.get("dst", "")))
+        ]
+        severity = "critical" if external_ot else "warning"
+        detections.append({
+            "severity": severity,
+            "summary": "OT/ICS data movement on control ports",
+            "details": "; ".join(
+                f"{flow.get('src')}->{flow.get('dst')} {flow.get('proto')}/{flow.get('dst_port') or '-'} "
+                f"{format_bytes_as_mb(int(flow.get('bytes', 0) or 0))}"
+                for flow in ot_candidates[:6]
+            ),
+            "evidence": [
+                f"{flow.get('src')}->{flow.get('dst')} bytes={format_bytes_as_mb(int(flow.get('bytes', 0) or 0))} "
+                f"dur={format_duration(float(flow.get('duration_seconds', 0.0) or 0.0))}"
+                for flow in ot_candidates[:8]
+            ],
+        })
+
+    mgmt_suspects = [
+        (src, dst, proto, port, bytes_sent)
+        for (src, dst, proto, port), bytes_sent in remote_mgmt_bytes.most_common(8)
+        if bytes_sent >= 1_000_000
+    ]
+    if mgmt_suspects:
+        detections.append({
+            "severity": "warning",
+            "summary": "High-volume transfers over management ports",
+            "details": "; ".join(
+                f"{src}->{dst} {proto}/{port or '-'} {format_bytes_as_mb(bytes_sent)}"
+                for src, dst, proto, port, bytes_sent in mgmt_suspects[:6]
+            ),
+        })
+
     if dns_tunnel_suspects:
         detections.append({
             "severity": "high",
@@ -381,6 +576,23 @@ def analyze_exfil(
             ],
         })
 
+    if file_exfil_suspects:
+        detections.append({
+            "severity": "warning",
+            "summary": "Suspicious file transfer volume",
+            "details": "; ".join(
+                f"{item.get('src')}->{item.get('dst')} {item.get('protocol')} {item.get('filename')} "
+                f"{format_bytes_as_mb(int(item.get('size', 0) or 0))}"
+                for item in file_exfil_suspects[:6]
+            ),
+            "evidence": [
+                f"pkt={item.get('packet', '-')}, {item.get('src')}->{item.get('dst')} "
+                f"{item.get('protocol')} size={format_bytes_as_mb(int(item.get('size', 0) or 0))} "
+                f"type={item.get('file_type') or '-'}"
+                for item in file_exfil_suspects[:8]
+            ],
+        })
+
     common_outbound_ports = {
         20, 21, 22, 25, 53, 80, 110, 123, 143, 443, 465, 587, 993, 995,
         3306, 3389, 5060, 8080, 8443,
@@ -399,6 +611,26 @@ def analyze_exfil(
                 f"{proto}/{port}={format_bytes_as_mb(bytes_sent)}"
                 for proto, port, bytes_sent in uncommon_channels[:6]
             ),
+        })
+
+    txt_queries = int(dns_summary.type_counts.get("TXT", 0))
+    if dns_summary.query_packets and txt_queries:
+        txt_ratio = txt_queries / max(dns_summary.query_packets, 1)
+        if txt_ratio >= 0.2 and txt_queries >= 20:
+            detections.append({
+                "severity": "warning",
+                "summary": "High DNS TXT query volume",
+                "details": f"TXT queries are {txt_ratio * 100:.1f}% of DNS requests ({txt_queries}/{dns_summary.query_packets}).",
+            })
+
+    email_bytes = sum(
+        bytes_sent for (_proto, port), bytes_sent in outbound_port_bytes.items() if port in EMAIL_PORTS
+    )
+    if email_bytes >= 2_000_000:
+        detections.append({
+            "severity": "warning",
+            "summary": "High-volume outbound email traffic",
+            "details": f"Outbound email ports carried {format_bytes_as_mb(email_bytes)}.",
         })
 
     if dns_summary.qname_counts:
@@ -420,6 +652,14 @@ def analyze_exfil(
         artifacts.append(
             f"DNS suspect: {item['src']} unique={item['unique']}/{item['total']} entropy={item['avg_entropy']}"
         )
+    for flow in ot_flows[:3]:
+        artifacts.append(
+            f"OT flow: {flow.get('src')}->{flow.get('dst')} {flow.get('proto')}/{flow.get('dst_port') or '-'} ({format_bytes_as_mb(int(flow.get('bytes', 0) or 0))})"
+        )
+    for item in file_exfil_suspects[:3]:
+        artifacts.append(
+            f"File transfer: {item.get('src')}->{item.get('dst')} {item.get('protocol')} {item.get('filename')} ({format_bytes_as_mb(int(item.get('size', 0) or 0))})"
+        )
 
     return ExfilSummary(
         path=path,
@@ -427,10 +667,13 @@ def analyze_exfil(
         total_bytes=total_bytes,
         outbound_bytes=outbound_bytes,
         outbound_flows=outbound_flows,
+        internal_flows=internal_flows,
+        ot_flows=ot_flows,
         top_external_dsts=external_dsts,
         dns_tunnel_suspects=dns_tunnel_suspects,
         http_post_suspects=http_post_suspects,
         file_artifacts=file_artifacts,
+        file_exfil_suspects=file_exfil_suspects,
         detections=detections,
         artifacts=artifacts,
         errors=errors + http_summary.errors + dns_summary.errors + file_summary.errors,

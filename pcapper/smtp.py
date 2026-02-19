@@ -9,6 +9,7 @@ import re
 
 from .pcap_cache import get_reader
 from .utils import safe_float
+from .device_detection import device_fingerprints_from_text
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -239,6 +240,7 @@ def analyze_smtp(path: Path, show_status: bool = True, packets: list[object] | N
     artifacts: list[SmtpArtifact] = []
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
+    seen_device_artifacts: set[str] = set()
 
     dst_by_src: dict[str, set[str]] = defaultdict(set)
     auth_fail_by_src: Counter[str] = Counter()
@@ -263,6 +265,15 @@ def analyze_smtp(path: Path, show_status: bool = True, packets: list[object] | N
             if not line:
                 continue
             total_messages += 1
+            if line.startswith("220"):
+                banner = line[3:].lstrip("- ").strip()
+                if banner:
+                    for detail in device_fingerprints_from_text(banner, source="SMTP banner"):
+                        key = f"device:{detail}"
+                        if key in seen_device_artifacts:
+                            continue
+                        seen_device_artifacts.add(key)
+                        artifacts.append(SmtpArtifact(kind="device", detail=detail, src=src, dst=dst))
             upper = line.upper()
             if in_data:
                 if line == ".":

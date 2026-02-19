@@ -7,16 +7,33 @@ from typing import Optional
 import ipaddress
 
 from .pcap_cache import get_reader
-from .utils import safe_float, detect_file_type
+from .utils import safe_float
+from .services import COMMON_PORTS
 
 try:
-    from scapy.layers.inet import IP, TCP, UDP  # type: ignore
+    from scapy.layers.inet import IP, TCP, UDP, ICMP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
 except Exception:  # pragma: no cover
     IP = None  # type: ignore
     TCP = None  # type: ignore
     UDP = None  # type: ignore
     IPv6 = None  # type: ignore
+    ICMP = None  # type: ignore
+
+
+OT_PORTS = {
+    102, 502, 9600, 20000, 2404, 47808, 44818, 2222, 34962, 34963, 34964,
+    4840, 1911, 4911, 5094, 18245, 18246, 20547, 1962, 5006, 5007, 5683,
+    5684, 2455, 1217, 34378, 34379, 34380,
+}
+
+MGMT_PORTS = {
+    22, 23, 135, 139, 445, 3389, 5900, 5938, 5985, 5986,
+}
+
+TUNNEL_PORTS = {53, 123, 443, 784, 853, 1194, 1701, 1723, 4500, 500, 51820}
+
+MAX_BEACON_PACKET_SAMPLES = 10
 
 
 @dataclass(frozen=True)
@@ -48,6 +65,7 @@ class BeaconCandidate:
     first_seen: Optional[float]
     last_seen: Optional[float]
     timeline: list[int]
+    packet_samples: list[int]
 
 
 @dataclass(frozen=True)
@@ -170,15 +188,22 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
 
     session_conn_times: dict[tuple[str, str, str, Optional[int]], list[float]] = defaultdict(list)
     session_conn_sizes: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)
+    session_conn_packets: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)
     udp_session_times: dict[tuple[str, str, str, Optional[int]], list[float]] = defaultdict(list)
     udp_session_sizes: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)
+    udp_session_packets: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)
+    icmp_session_times: dict[tuple[str, str, str, Optional[int]], list[float]] = defaultdict(list)
+    icmp_session_sizes: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)
+    icmp_session_packets: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)
     conn_first_ts: dict[tuple[str, str, str, Optional[int], Optional[int]], float] = {}
     conn_syn_ts: dict[tuple[str, str, str, Optional[int], Optional[int]], float] = {}
+    conn_first_idx: dict[tuple[str, str, str, Optional[int], Optional[int]], int] = {}
+    conn_syn_idx: dict[tuple[str, str, str, Optional[int], Optional[int]], int] = {}
     conn_bytes: dict[tuple[str, str, str, Optional[int], Optional[int]], int] = defaultdict(int)
     total_packets = 0
 
     try:
-        for pkt in reader:
+        for pkt_index, pkt in enumerate(reader, start=1):
             if stream is not None and size_bytes:
                 try:
                     pos = stream.tell()
@@ -216,9 +241,11 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
 
                 if conn_key not in conn_first_ts:
                     conn_first_ts[conn_key] = ts
+                    conn_first_idx[conn_key] = pkt_index
                 conn_bytes[conn_key] += pkt_len
                 if is_syn:
                     conn_syn_ts[conn_key] = ts
+                    conn_syn_idx[conn_key] = pkt_index
             elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                 key = _flow_key(pkt)
                 if not key:
@@ -232,6 +259,19 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                 session_key = (client_ip, server_ip, proto, server_port)
                 udp_session_times[session_key].append(ts)
                 udp_session_sizes[session_key].append(pkt_len)
+                if len(udp_session_packets[session_key]) < MAX_BEACON_PACKET_SAMPLES:
+                    udp_session_packets[session_key].append(pkt_index)
+            elif ICMP is not None and pkt.haslayer(ICMP):  # type: ignore[truthy-bool]
+                key = _flow_key(pkt)
+                if not key:
+                    continue
+                src_ip, dst_ip, _proto, _sport, _dport = key
+                client_ip, server_ip = _normalize_pair(src_ip, dst_ip)
+                session_key = (client_ip, server_ip, "ICMP", None)
+                icmp_session_times[session_key].append(ts)
+                icmp_session_sizes[session_key].append(pkt_len)
+                if len(icmp_session_packets[session_key]) < MAX_BEACON_PACKET_SAMPLES:
+                    icmp_session_packets[session_key].append(pkt_index)
             else:
                 continue
     finally:
@@ -246,14 +286,23 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
         ts = conn_syn_ts.get(conn_key, first_ts)
         session_conn_times[session_key].append(ts)
         session_conn_sizes[session_key].append(conn_bytes.get(conn_key, 0))
+        pkt_idx = conn_syn_idx.get(conn_key, conn_first_idx.get(conn_key))
+        if pkt_idx is not None and len(session_conn_packets[session_key]) < MAX_BEACON_PACKET_SAMPLES:
+            session_conn_packets[session_key].append(pkt_idx)
 
-    combined_flows: list[tuple[tuple[str, str, str, Optional[int], Optional[int]], list[float], list[int]]] = []
+    combined_flows: list[tuple[tuple[str, str, str, Optional[int], Optional[int]], list[float], list[int], list[int]]] = []
     for (client, server, proto, server_port), times in session_conn_times.items():
         sizes = session_conn_sizes.get((client, server, proto, server_port), [])
-        combined_flows.append(((client, server, proto, server_port, None), times, sizes))
+        packets = session_conn_packets.get((client, server, proto, server_port), [])
+        combined_flows.append(((client, server, proto, server_port, None), times, sizes, packets))
     for (client, server, proto, server_port), times in udp_session_times.items():
         sizes = udp_session_sizes.get((client, server, proto, server_port), [])
-        combined_flows.append(((client, server, proto, server_port, None), times, sizes))
+        packets = udp_session_packets.get((client, server, proto, server_port), [])
+        combined_flows.append(((client, server, proto, server_port, None), times, sizes, packets))
+    for (client, server, proto, server_port), times in icmp_session_times.items():
+        sizes = icmp_session_sizes.get((client, server, proto, server_port), [])
+        packets = icmp_session_packets.get((client, server, proto, server_port), [])
+        combined_flows.append(((client, server, proto, server_port, None), times, sizes, packets))
     seen_keys: set[tuple[str, str, str, Optional[int], Optional[int]]] = set()
 
     benign_service_ports = {
@@ -272,15 +321,11 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
         except Exception:
             return False
 
-    for (src_ip, dst_ip, proto, sport, dport), times, sizes in combined_flows:
+    for (src_ip, dst_ip, proto, sport, dport), times, sizes, packets in combined_flows:
         key_id = (src_ip, dst_ip, proto, sport, dport)
         if key_id in seen_keys:
             continue
         seen_keys.add(key_id)
-
-        has_public = _is_public(src_ip) or _is_public(dst_ip)
-        if not has_public:
-            continue
         times_sorted = sorted(times)
         long_duration = (times_sorted[-1] - times_sorted[0]) if len(times_sorted) >= 2 else 0.0
         if len(times_sorted) < min_events and long_duration < 1800:
@@ -321,15 +366,35 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
             + (0.1 * count_score)
         )
 
+        port_value = sport or dport
+        has_public = _is_public(src_ip) or _is_public(dst_ip)
+        is_internal = _is_private(src_ip) and _is_private(dst_ip)
+        is_ot_port = port_value in OT_PORTS
+        is_mgmt_port = port_value in MGMT_PORTS
+
         if mean < 1.0 or mean > 86400.0:
             continue
         if score < 0.35 and len(times_sorted) < (min_events * 2):
             continue
         if proto == "UDP" and (len(times_sorted) < max(min_events, 15) or periodicity_score < 0.6):
             continue
-        if sport in benign_service_ports or dport in benign_service_ports:
-            if score < 0.8 and periodicity_score < 0.8:
+        if port_value in benign_service_ports:
+            if has_public:
+                if score < 0.8 and periodicity_score < 0.8:
+                    continue
+            else:
+                if score < 0.9 and periodicity_score < 0.85:
+                    continue
+        if not has_public:
+            if not is_internal:
                 continue
+            if not (is_ot_port or is_mgmt_port or score >= 0.85 or periodicity_score >= 0.9):
+                continue
+
+        packet_samples: list[int] = []
+        if packets:
+            paired = sorted(zip(times, packets), key=lambda item: item[0])
+            packet_samples = [pkt_id for _ts, pkt_id in paired[:MAX_BEACON_PACKET_SAMPLES]]
 
         candidates.append(
             BeaconCandidate(
@@ -360,6 +425,7 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                 first_seen=times_sorted[0],
                 last_seen=times_sorted[-1],
                 timeline=_timeline(times_sorted),
+                packet_samples=packet_samples,
             )
         )
 
@@ -378,15 +444,41 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
     if candidates:
         severity_rank = {"info": 0, "warning": 1, "high": 2, "critical": 3}
 
+        def _port_label(port_value: Optional[int]) -> str:
+            if not port_value:
+                return "-"
+            svc = COMMON_PORTS.get(port_value)
+            if svc:
+                return f"{port_value}({svc})"
+            return str(port_value)
+
+        def _proto_label(item: BeaconCandidate) -> str:
+            port_value = item.src_port or item.dst_port
+            port_text = _port_label(port_value)
+            if port_text != "-":
+                return f"{item.proto}:{port_text}"
+            return item.proto
+
         def _candidate_severity(item: BeaconCandidate) -> str:
-            is_external = _is_private(item.src_ip) and _is_public(item.dst_ip)
+            port_value = item.src_port or item.dst_port
+            is_external = _is_public(item.src_ip) or _is_public(item.dst_ip)
+            is_ot = port_value in OT_PORTS
+            if is_external and is_ot and item.score >= 0.75 and item.count >= 15:
+                return "critical"
             if item.score >= 0.88 and item.count >= 30 and item.duration_seconds >= 3600 and is_external:
                 return "critical"
-            if item.score >= 0.78 and item.count >= 20 and is_external:
+            if item.score >= 0.80 and item.count >= 20 and is_external:
                 return "high"
-            if item.score >= 0.70 and item.count >= 15:
+            if item.score >= 0.72 and item.count >= 15:
                 return "warning"
             return "info"
+
+        def _candidate_evidence(item: BeaconCandidate) -> str:
+            pkt_text = ",".join(str(pkt) for pkt in item.packet_samples[:5]) if item.packet_samples else "-"
+            return (
+                f"{item.src_ip}->{item.dst_ip} {_proto_label(item)} count={item.count} "
+                f"interval={item.top_interval}s size={item.top_size} pkt={pkt_text}"
+            )
 
         src_counts: Counter[str] = Counter()
         dst_counts: Counter[str] = Counter()
@@ -397,20 +489,13 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
             duration = 0.0
             if item.first_seen is not None and item.last_seen is not None:
                 duration = max(0.0, item.last_seen - item.first_seen)
-            if item.src_port and item.dst_port:
-                proto_label = f"{item.proto}:{item.src_port}->{item.dst_port}"
-            elif item.dst_port:
-                proto_label = f"{item.proto}:{item.dst_port}"
-            else:
-                proto_label = item.proto
+            proto_label = _proto_label(item)
             flow_details.append(
                 f"{item.src_ip}->{item.dst_ip} {proto_label}, {item.count} beacons, mean {item.mean_interval:.2f}s, "
                 f"median {item.median_interval:.2f}s, MAD {item.mad_interval:.2f}s, duration {_format_duration(duration)}, "
                 f"avg bytes {item.avg_bytes:.0f}, size MAD {item.mad_bytes:.0f}, score {item.score:.2f}"
             )
-            flow_evidence.append(
-                f"{item.src_ip}->{item.dst_ip} {proto_label} count={item.count} top_interval={item.top_interval}s top_size={item.top_size}"
-            )
+            flow_evidence.append(_candidate_evidence(item))
             src_counts[item.src_ip] += item.count
             dst_counts[item.dst_ip] += item.count
             candidate_severity = _candidate_severity(item)
@@ -473,6 +558,105 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                 "top_destinations": Counter(item.dst_ip for item in low_and_slow).most_common(5),
             })
 
+        external_candidates = [item for item in candidates if _is_public(item.src_ip) or _is_public(item.dst_ip)]
+        internal_candidates = [item for item in candidates if _is_private(item.src_ip) and _is_private(item.dst_ip)]
+        ot_external = [item for item in external_candidates if (item.src_port or item.dst_port) in OT_PORTS]
+        ot_internal = [item for item in internal_candidates if (item.src_port or item.dst_port) in OT_PORTS]
+        mgmt_internal = [item for item in internal_candidates if (item.src_port or item.dst_port) in MGMT_PORTS]
+        tunnel_external = [
+            item for item in external_candidates
+            if (item.src_port or item.dst_port) in TUNNEL_PORTS and item.avg_bytes <= 400
+        ]
+        icmp_candidates = [item for item in candidates if item.proto == "ICMP"]
+        uncommon_external = [
+            item for item in external_candidates
+            if (item.src_port or item.dst_port) not in COMMON_PORTS and (item.src_port or item.dst_port) is not None
+        ]
+
+        if ot_external:
+            detections.append({
+                "type": "beacon_ot_external",
+                "severity": "critical",
+                "summary": "OT/ICS beaconing to public IPs",
+                "details": "; ".join(
+                    f"{item.src_ip}->{item.dst_ip} {_proto_label(item)} interval≈{item.mean_interval:.1f}s score={item.score:.2f}"
+                    for item in ot_external[:5]
+                ),
+                "top_sources": Counter(item.src_ip for item in ot_external).most_common(5),
+                "top_destinations": Counter(item.dst_ip for item in ot_external).most_common(5),
+                "evidence": [_candidate_evidence(item) for item in ot_external[:8]],
+            })
+
+        if ot_internal:
+            detections.append({
+                "type": "beacon_ot_internal",
+                "severity": "warning",
+                "summary": "OT/ICS periodic control-channel patterns",
+                "details": "; ".join(
+                    f"{item.src_ip}->{item.dst_ip} {_proto_label(item)} interval≈{item.mean_interval:.1f}s score={item.score:.2f}"
+                    for item in ot_internal[:5]
+                ),
+                "top_sources": Counter(item.src_ip for item in ot_internal).most_common(5),
+                "top_destinations": Counter(item.dst_ip for item in ot_internal).most_common(5),
+                "evidence": [_candidate_evidence(item) for item in ot_internal[:8]],
+            })
+
+        if mgmt_internal:
+            detections.append({
+                "type": "beacon_internal_mgmt",
+                "severity": "warning",
+                "summary": "Internal periodic beacons on management ports",
+                "details": "; ".join(
+                    f"{item.src_ip}->{item.dst_ip} {_proto_label(item)} interval≈{item.mean_interval:.1f}s count={item.count}"
+                    for item in mgmt_internal[:5]
+                ),
+                "top_sources": Counter(item.src_ip for item in mgmt_internal).most_common(5),
+                "top_destinations": Counter(item.dst_ip for item in mgmt_internal).most_common(5),
+                "evidence": [_candidate_evidence(item) for item in mgmt_internal[:8]],
+            })
+
+        if tunnel_external:
+            detections.append({
+                "type": "beacon_tunnel_ports",
+                "severity": "warning",
+                "summary": "Periodic beacons over tunnel-friendly ports",
+                "details": "; ".join(
+                    f"{item.src_ip}->{item.dst_ip} {_proto_label(item)} interval≈{item.mean_interval:.1f}s avg_bytes≈{item.avg_bytes:.0f}"
+                    for item in tunnel_external[:5]
+                ),
+                "top_sources": Counter(item.src_ip for item in tunnel_external).most_common(5),
+                "top_destinations": Counter(item.dst_ip for item in tunnel_external).most_common(5),
+                "evidence": [_candidate_evidence(item) for item in tunnel_external[:8]],
+            })
+
+        if icmp_candidates:
+            detections.append({
+                "type": "beacon_icmp",
+                "severity": "warning",
+                "summary": "ICMP beacon-like activity",
+                "details": "; ".join(
+                    f"{item.src_ip}->{item.dst_ip} interval≈{item.mean_interval:.1f}s count={item.count}"
+                    for item in icmp_candidates[:5]
+                ),
+                "top_sources": Counter(item.src_ip for item in icmp_candidates).most_common(5),
+                "top_destinations": Counter(item.dst_ip for item in icmp_candidates).most_common(5),
+                "evidence": [_candidate_evidence(item) for item in icmp_candidates[:8]],
+            })
+
+        if uncommon_external:
+            detections.append({
+                "type": "beacon_uncommon_port",
+                "severity": "warning",
+                "summary": "Beaconing to public IPs on uncommon ports",
+                "details": "; ".join(
+                    f"{item.src_ip}->{item.dst_ip} {_proto_label(item)} interval≈{item.mean_interval:.1f}s"
+                    for item in uncommon_external[:5]
+                ),
+                "top_sources": Counter(item.src_ip for item in uncommon_external).most_common(5),
+                "top_destinations": Counter(item.dst_ip for item in uncommon_external).most_common(5),
+                "evidence": [_candidate_evidence(item) for item in uncommon_external[:8]],
+            })
+
         high_frequency = [
             item
             for item in candidates
@@ -509,6 +693,7 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                 "evidence": [
                     f"timeline={','.join(str(value) for value in item.timeline[:16])}",
                     f"top_interval={item.top_interval}s top_size={item.top_size} bytes",
+                    _candidate_evidence(item),
                 ],
             })
     else:

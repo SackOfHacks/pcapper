@@ -16,6 +16,7 @@ except ImportError:
 
 from .pcap_cache import get_reader
 from .equipment import equipment_artifacts
+from .device_detection import device_fingerprint_from_fields
 from .utils import detect_file_type, safe_float
 
 # --- Constants ---
@@ -44,6 +45,12 @@ FUNC_NAMES = {
     24: "Read FIFO Queue",
     43: "Encapsulated Interface Transport (Read Device ID)"
 }
+
+WRITE_FUNCTIONS = {5, 6, 15, 16, 21, 22, 23}
+DIAGNOSTIC_FUNCTIONS = {8, 43}
+ENUMERATION_FUNCTIONS = {17, 43}
+
+WRITE_BASELINE_MIN = 10
 
 EXCEPTION_CODES = {
     1: "Illegal Function",
@@ -93,6 +100,8 @@ class ModbusMessage:
     exception_code: Optional[int] = None
     exception_desc: Optional[str] = None
     payload_len: int = 0
+    detail: Optional[str] = None
+    direction: Optional[str] = None
 
 @dataclass
 class ModbusAnomaly:
@@ -214,6 +223,165 @@ def _is_public_ip(value: str) -> bool:
     except Exception:
         return False
 
+
+def _modbus_reg_type(func_code: int) -> Optional[str]:
+    if func_code in {1, 5, 15}:
+        return "coil"
+    if func_code == 2:
+        return "discrete_input"
+    if func_code in {3, 6, 16, 22, 23}:
+        return "holding_register"
+    if func_code == 4:
+        return "input_register"
+    return None
+
+
+def _format_register_range(reg_type: Optional[str], addr: Optional[int], qty: Optional[int]) -> str:
+    if addr is None:
+        return ""
+    if qty is None or qty <= 1:
+        return f"{reg_type or 'register'}[{addr}]"
+    return f"{reg_type or 'register'}[{addr}-{addr + max(qty - 1, 0)}]"
+
+
+def _parse_modbus_request_info(func_code: int, pdu: bytes) -> tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
+    if not pdu:
+        return None, None, None, None
+    try:
+        reg_type = _modbus_reg_type(func_code)
+        if func_code in {1, 2, 3, 4} and len(pdu) >= 5:
+            addr = int.from_bytes(pdu[1:3], "big")
+            qty = int.from_bytes(pdu[3:5], "big")
+            detail = f"{_format_register_range(reg_type, addr, qty)} qty={qty}"
+            return detail, reg_type, addr, qty
+        if func_code in {5, 6} and len(pdu) >= 5:
+            addr = int.from_bytes(pdu[1:3], "big")
+            value = int.from_bytes(pdu[3:5], "big")
+            detail = f"{_format_register_range(reg_type, addr, 1)} value=0x{value:04x}"
+            return detail, reg_type, addr, 1
+        if func_code in {15, 16} and len(pdu) >= 6:
+            addr = int.from_bytes(pdu[1:3], "big")
+            qty = int.from_bytes(pdu[3:5], "big")
+            byte_count = pdu[5]
+            detail = f"{_format_register_range(reg_type, addr, qty)} qty={qty} bytes={byte_count}"
+            return detail, reg_type, addr, qty
+        if func_code == 22 and len(pdu) >= 7:
+            addr = int.from_bytes(pdu[1:3], "big")
+            and_mask = int.from_bytes(pdu[3:5], "big")
+            or_mask = int.from_bytes(pdu[5:7], "big")
+            detail = f"{_format_register_range(reg_type, addr, 1)} and=0x{and_mask:04x} or=0x{or_mask:04x}"
+            return detail, reg_type, addr, 1
+        if func_code == 23 and len(pdu) >= 10:
+            read_addr = int.from_bytes(pdu[1:3], "big")
+            read_qty = int.from_bytes(pdu[3:5], "big")
+            write_addr = int.from_bytes(pdu[5:7], "big")
+            write_qty = int.from_bytes(pdu[7:9], "big")
+            byte_count = pdu[9]
+            detail = (
+                f"read={_format_register_range('holding_register', read_addr, read_qty)} "
+                f"write={_format_register_range('holding_register', write_addr, write_qty)} bytes={byte_count}"
+            )
+            return detail, "holding_register", write_addr, write_qty
+        if func_code == 8 and len(pdu) >= 5:
+            subfunc = int.from_bytes(pdu[1:3], "big")
+            data = int.from_bytes(pdu[3:5], "big")
+            detail = f"diag subfunc=0x{subfunc:04x} data=0x{data:04x}"
+            return detail, None, None, None
+        if func_code == 17:
+            return "report_server_id", None, None, None
+        if func_code == 43 and len(pdu) >= 3:
+            mei_type = pdu[1]
+            detail = f"mei=0x{mei_type:02x}"
+            return detail, None, None, None
+    except Exception:
+        return None, None, None, None
+    return None, None, None, None
+
+
+def _parse_modbus_response_detail(func_code: int, pdu: bytes) -> Optional[str]:
+    if not pdu or len(pdu) < 2:
+        return None
+    try:
+        reg_type = _modbus_reg_type(func_code)
+        if func_code in {1, 2} and len(pdu) >= 2:
+            byte_count = pdu[1]
+            data = pdu[2:2 + byte_count]
+            set_bits = sum(bin(b).count("1") for b in data)
+            total_bits = byte_count * 8
+            return f"{reg_type or 'bits'} bytes={byte_count} set={set_bits}/{total_bits}"
+        if func_code in {3, 4} and len(pdu) >= 2:
+            byte_count = pdu[1]
+            data = pdu[2:2 + byte_count]
+            regs = []
+            for idx in range(0, min(len(data), 16), 2):
+                if idx + 2 <= len(data):
+                    regs.append(int.from_bytes(data[idx:idx + 2], "big"))
+            preview = ", ".join(str(r) for r in regs[:6])
+            return f"{reg_type or 'registers'} count={byte_count // 2} values=[{preview}]"
+        if func_code in {5, 6} and len(pdu) >= 5:
+            addr = int.from_bytes(pdu[1:3], "big")
+            value = int.from_bytes(pdu[3:5], "big")
+            return f"write_ack {reg_type or 'register'}[{addr}] value=0x{value:04x}"
+        if func_code in {15, 16} and len(pdu) >= 5:
+            addr = int.from_bytes(pdu[1:3], "big")
+            qty = int.from_bytes(pdu[3:5], "big")
+            return f"write_ack {_format_register_range(reg_type, addr, qty)} qty={qty}"
+        if func_code == 22 and len(pdu) >= 7:
+            addr = int.from_bytes(pdu[1:3], "big")
+            and_mask = int.from_bytes(pdu[3:5], "big")
+            or_mask = int.from_bytes(pdu[5:7], "big")
+            return f"mask_write_ack {_format_register_range(reg_type, addr, 1)} and=0x{and_mask:04x} or=0x{or_mask:04x}"
+        if func_code == 23 and len(pdu) >= 2:
+            byte_count = pdu[1]
+            return f"readwrite_response bytes={byte_count}"
+        if func_code == 17 and len(pdu) >= 2:
+            byte_count = pdu[1]
+            text = pdu[2:2 + byte_count].decode("ascii", errors="ignore").strip()
+            return f"server_id={text}" if text else "server_id"
+        if func_code == 43 and len(pdu) >= 3:
+            mei_type = pdu[1]
+            return f"device_id_response mei=0x{mei_type:02x}"
+    except Exception:
+        return None
+    return None
+
+
+def _parse_device_id_response(pdu: bytes) -> dict[str, str]:
+    if len(pdu) < 7:
+        return {}
+    if pdu[1] != 0x0E:
+        return {}
+    idx = 7
+    fields: dict[str, str] = {}
+    object_map = {
+        0x00: "vendor",
+        0x01: "product_code",
+        0x02: "revision",
+        0x03: "vendor_url",
+        0x04: "product",
+        0x05: "model",
+        0x06: "user_app",
+    }
+    while idx + 2 <= len(pdu):
+        obj_id = pdu[idx]
+        length = pdu[idx + 1]
+        idx += 2
+        if idx + length > len(pdu):
+            break
+        raw = pdu[idx:idx + length]
+        idx += length
+        value = raw.decode("latin-1", errors="ignore").strip()
+        if not value:
+            continue
+        key = object_map.get(obj_id)
+        if key and key not in fields:
+            fields[key] = value
+    return fields
+
+def _parse_modbus_request_detail(func_code: int, pdu: bytes) -> str | None:
+    detail, _, _, _ = _parse_modbus_request_info(func_code, pdu)
+    return detail
+
 def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     if TCP is None:
         return ModbusAnalysis(
@@ -281,7 +449,16 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     write_events = Counter()
     exception_events = Counter()
     diagnostic_events = Counter()
+    enumeration_events = Counter()
+    reserved_events = Counter()
+    write_details: Dict[Tuple[str, int, str, str], str] = {}
+    src_write_requests: Counter[str] = Counter()
+    nonstandard_port_counts: Counter[str] = Counter()
     seen_artifacts: Set[str] = set()
+    max_anomalies = 200
+    asset_write_targets: Dict[Tuple[str, int], Set[str]] = defaultdict(set)
+    asset_write_counts: Counter[Tuple[str, int]] = Counter()
+    write_target_anoms_seen: Set[str] = set()
 
     try:
         with status as pbar:
@@ -355,7 +532,7 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                 # 1. Port-based check
                 if sport == MODBUS_TCP_PORT or dport == MODBUS_TCP_PORT:
                      is_modbus = True
-                
+
                 # 2. Heuristic check (if not standard port)
                 if not is_modbus and payload and len(payload) >= 8:
                     try:
@@ -372,6 +549,8 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                 
                 if not is_modbus:
                     continue
+                if (sport != MODBUS_TCP_PORT and dport != MODBUS_TCP_PORT) and payload:
+                    nonstandard_port_counts[f"{sport}->{dport}"] += 1
 
                 modbus_packets += 1
                 modbus_bytes += pkt_len
@@ -439,6 +618,7 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                             src_ip = pkt[0].src if hasattr(pkt[0], 'src') else "0.0.0.0"
                             dst_ip = pkt[0].dst if hasattr(pkt[0], 'dst') else "0.0.0.0"
 
+                        request_detail = None
                         if not is_server_response:
                             src_ips[src_ip] += 1
                             client_bytes[src_ip] += pkt_len
@@ -450,13 +630,46 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                             if pdu:
                                 src_dst_payload_bytes[src_ip][dst_ip] += len(pdu)
 
+                            request_detail, reg_type, addr, qty = _parse_modbus_request_info(original_func, pdu)
+
                             # Check for Write Operations (Risk)
-                            if original_func in (5, 6, 15, 16, 21, 22, 23):
+                            if original_func in WRITE_FUNCTIONS:
                                 write_events[(func_name, unit_id, src_ip, dst_ip)] += 1
+                                src_write_requests[src_ip] += 1
+                                if request_detail:
+                                    write_details[(func_name, unit_id, src_ip, dst_ip)] = request_detail
+                                asset_key = (dst_ip, unit_id)
+                                asset_write_counts[asset_key] += 1
+                                target = _format_register_range(reg_type, addr, qty)
+                                if target:
+                                    if target not in asset_write_targets[asset_key]:
+                                        asset_write_targets[asset_key].add(target)
+                                        if asset_write_counts[asset_key] >= WRITE_BASELINE_MIN:
+                                            anomaly_key = f"{asset_key}:{target}"
+                                            if anomaly_key not in write_target_anoms_seen and len(anomalies) < max_anomalies:
+                                                write_target_anoms_seen.add(anomaly_key)
+                                                anomalies.append(
+                                                    ModbusAnomaly(
+                                                        severity="MEDIUM",
+                                                        title="Modbus Unexpected Write Target",
+                                                        description=f"New write target for asset {dst_ip} Unit {unit_id}: {target}",
+                                                        src=src_ip,
+                                                        dst=dst_ip,
+                                                        ts=ts or 0.0,
+                                                    )
+                                                )
 
                             # Diagnostic functions can be risky
-                            if original_func in (8, 43):
+                            if original_func in DIAGNOSTIC_FUNCTIONS:
                                 diagnostic_events[(func_name, src_ip, dst_ip)] += 1
+
+                            if original_func == 43 and request_detail and request_detail.startswith("mei=0x0e"):
+                                enumeration_events[(func_name, src_ip, dst_ip)] += 1
+                            elif original_func in ENUMERATION_FUNCTIONS:
+                                enumeration_events[(func_name, src_ip, dst_ip)] += 1
+
+                            if func_name.startswith("Reserved/Proprietary"):
+                                reserved_events[(original_func, src_ip, dst_ip)] += 1
 
                         else:
                             dst_ips[src_ip] += 1 # Server is source
@@ -493,6 +706,31 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                     ts=ts or 0.0,
                                 ))
 
+                        if is_server_response and original_func == 43 and pdu:
+                            device_fields = _parse_device_id_response(pdu)
+                            if device_fields:
+                                detail = device_fingerprint_from_fields(
+                                    {
+                                        "vendor": device_fields.get("vendor"),
+                                        "model": device_fields.get("model"),
+                                        "product": device_fields.get("product") or device_fields.get("product_code"),
+                                        "firmware": device_fields.get("revision"),
+                                        "software": device_fields.get("user_app"),
+                                    },
+                                    source="Modbus Read Device ID",
+                                )
+                                if detail:
+                                    key = f"device:{detail}"
+                                    if key not in seen_artifacts and len(artifacts) < 200:
+                                        seen_artifacts.add(key)
+                                        artifacts.append(ModbusArtifact(
+                                            kind="device",
+                                            detail=detail,
+                                            src=src_ip,
+                                            dst=dst_ip,
+                                            ts=ts or 0.0,
+                                        ))
+
                         flow_key = (src_ip, dst_ip, sport, dport)
                         flow = flow_map[flow_key]
                         if ts is not None:
@@ -513,6 +751,10 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                             exception_events[(exception_code, exception_desc, original_func, src_ip, dst_ip)] += 1
 
                         # Store message (limit to reasonable number if memory constraint, but user wants details)
+                        response_detail = None
+                        if is_server_response and not is_exception:
+                            response_detail = _parse_modbus_response_detail(original_func, pdu)
+
                         messages.append(ModbusMessage(
                             ts=ts,
                             src_ip=src_ip,
@@ -526,7 +768,9 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                             is_exception=is_exception,
                             exception_code=exception_code,
                             exception_desc=exception_desc,
-                            payload_len=len(pdu)
+                            payload_len=len(pdu),
+                            detail=request_detail if not is_server_response else response_detail,
+                            direction="response" if is_server_response else "request",
                         ))
 
                     if not parsed_any and sport != MODBUS_TCP_PORT and dport != MODBUS_TCP_PORT:
@@ -571,37 +815,71 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
             flow_duration_buckets["responses"][bucket] += 1
 
     for (func_name, unit_id, src_ip, dst_ip), count in write_events.items():
+        if len(anomalies) >= max_anomalies:
+            break
         suffix = f" (x{count})" if count > 1 else ""
+        detail = write_details.get((func_name, unit_id, src_ip, dst_ip))
+        detail_text = f" [{detail}]" if detail else ""
         anomalies.append(ModbusAnomaly(
             severity="HIGH",
             title="Modbus Write Operation",
-            description=f"Write command ({func_name}) sent to Unit ID {unit_id}{suffix}",
+            description=f"Write command ({func_name}) sent to Unit ID {unit_id}{suffix}{detail_text}",
             src=src_ip,
             dst=dst_ip,
             ts=0.0,
         ))
         if unit_id == 0:
+            if len(anomalies) < max_anomalies:
+                anomalies.append(ModbusAnomaly(
+                    severity="CRITICAL",
+                    title="Modbus Broadcast Write",
+                    description=f"Broadcast write using {func_name} to Unit ID 0{suffix}{detail_text}",
+                    src=src_ip,
+                    dst=dst_ip,
+                    ts=0.0,
+                ))
+
+    for (func_name, src_ip, dst_ip), count in diagnostic_events.items():
+        suffix = f" (x{count})" if count > 1 else ""
+        if len(anomalies) < max_anomalies:
             anomalies.append(ModbusAnomaly(
-                severity="CRITICAL",
-                title="Modbus Broadcast Write",
-                description=f"Broadcast write using {func_name} to Unit ID 0{suffix}",
+                severity="LOW",
+                title="Modbus Diagnostic/Info",
+                description=f"Diagnostic or identity request ({func_name}){suffix}",
                 src=src_ip,
                 dst=dst_ip,
                 ts=0.0,
             ))
 
-    for (func_name, src_ip, dst_ip), count in diagnostic_events.items():
+    for (func_name, src_ip, dst_ip), count in enumeration_events.items():
+        if len(anomalies) >= max_anomalies:
+            break
         suffix = f" (x{count})" if count > 1 else ""
         anomalies.append(ModbusAnomaly(
             severity="LOW",
-            title="Modbus Diagnostic/Info",
-            description=f"Diagnostic or Identity request ({func_name}){suffix}",
+            title="Modbus Enumeration",
+            description=f"Device identity discovery ({func_name}){suffix}",
+            src=src_ip,
+            dst=dst_ip,
+            ts=0.0,
+        ))
+
+    for (func_code, src_ip, dst_ip), count in reserved_events.items():
+        if len(anomalies) >= max_anomalies:
+            break
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(ModbusAnomaly(
+            severity="LOW",
+            title="Modbus Proprietary Function",
+            description=f"Reserved/proprietary function {func_code}{suffix}",
             src=src_ip,
             dst=dst_ip,
             ts=0.0,
         ))
 
     for (exc_code, exc_desc, original_func, src_ip, dst_ip), count in exception_events.items():
+        if len(anomalies) >= max_anomalies:
+            break
         suffix = f" (x{count})" if count > 1 else ""
         desc_text = f"Exception {exc_code} ({exc_desc}) for Function {original_func}{suffix}"
         severity = "MEDIUM"
@@ -621,37 +899,40 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
         req_count = src_requests.get(src_ip, 0)
         resp_count = src_responses.get(src_ip, 0)
         if unique_dsts >= 20 and req_count > resp_count * 2:
-            anomalies.append(ModbusAnomaly(
-                severity="MEDIUM",
-                title="Modbus Scanning/Probing",
-                description=f"Source contacted {unique_dsts} endpoints with low response rate.",
-                src=src_ip,
-                dst="*",
-                ts=0.0,
-            ))
+            if len(anomalies) < max_anomalies:
+                anomalies.append(ModbusAnomaly(
+                    severity="MEDIUM",
+                    title="Modbus Scanning/Probing",
+                    description=f"Source contacted {unique_dsts} endpoints with low response rate.",
+                    src=src_ip,
+                    dst="*",
+                    ts=0.0,
+                ))
 
         unit_count = len(src_unit_ids.get(src_ip, set()))
         if unit_count >= 20:
-            anomalies.append(ModbusAnomaly(
-                severity="MEDIUM",
-                title="Modbus Unit ID Scan",
-                description=f"Source probed {unit_count} Unit IDs.",
-                src=src_ip,
-                dst="*",
-                ts=0.0,
-            ))
+            if len(anomalies) < max_anomalies:
+                anomalies.append(ModbusAnomaly(
+                    severity="MEDIUM",
+                    title="Modbus Unit ID Scan",
+                    description=f"Source probed {unit_count} Unit IDs.",
+                    src=src_ip,
+                    dst="*",
+                    ts=0.0,
+                ))
 
     for src_ip, dsts in src_dst_payload_bytes.items():
         for dst_ip, byte_count in dsts.items():
             if byte_count >= 1_000_000 and _is_public_ip(dst_ip) and _is_private_ip(src_ip):
-                anomalies.append(ModbusAnomaly(
-                    severity="HIGH",
-                    title="Possible Modbus Data Exfiltration",
-                    description=f"{byte_count} bytes sent to public IP.",
-                    src=src_ip,
-                    dst=dst_ip,
-                    ts=0.0,
-                ))
+                if len(anomalies) < max_anomalies:
+                    anomalies.append(ModbusAnomaly(
+                        severity="HIGH",
+                        title="Possible Modbus Data Exfiltration",
+                        description=f"{byte_count} bytes sent to public IP.",
+                        src=src_ip,
+                        dst=dst_ip,
+                        ts=0.0,
+                    ))
 
     for session_key, intervals in session_intervals.items():
         if len(intervals) < 6:
@@ -665,14 +946,52 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
             src_part, dst_part = session_key.split(" -> ", 1)
             src_ip = src_part.split(":", 1)[0]
             dst_ip = dst_part.split(":", 1)[0]
+            if len(anomalies) < max_anomalies:
+                anomalies.append(ModbusAnomaly(
+                    severity="LOW",
+                    title="Possible Modbus Beaconing",
+                    description=f"Regular interval traffic (~{avg:.2f}s) observed.",
+                    src=src_ip,
+                    dst=dst_ip,
+                    ts=0.0,
+                ))
+
+    for src_ip, count in src_write_requests.items():
+        req_count = src_requests.get(src_ip, 0)
+        ratio = (count / req_count) if req_count else 0.0
+        if count >= 20 and ratio >= 0.3 and len(anomalies) < max_anomalies:
             anomalies.append(ModbusAnomaly(
-                severity="LOW",
-                title="Possible Modbus Beaconing",
-                description=f"Regular interval traffic (~{avg:.2f}s) observed.",
+                severity="HIGH",
+                title="Modbus Write Burst",
+                description=f"{count} write requests ({ratio:.0%} of client traffic).",
                 src=src_ip,
-                dst=dst_ip,
+                dst="*",
                 ts=0.0,
             ))
+
+    if nonstandard_port_counts:
+        for session, count in nonstandard_port_counts.most_common(6):
+            if len(anomalies) >= max_anomalies:
+                break
+            anomalies.append(ModbusAnomaly(
+                severity="MEDIUM",
+                title="Modbus on Non-Standard Port",
+                description=f"Modbus signature observed on {session} ({count} packets).",
+                src="*",
+                dst="*",
+                ts=0.0,
+            ))
+
+    public_endpoints = [ip for ip in set(src_ips) | set(dst_ips) if _is_public_ip(ip)]
+    if public_endpoints and len(anomalies) < max_anomalies:
+        anomalies.append(ModbusAnomaly(
+            severity="HIGH",
+            title="Modbus Exposure to Public IP",
+            description=f"Modbus traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
+            src="*",
+            dst="*",
+            ts=0.0,
+        ))
 
     return ModbusAnalysis(
         path=path,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -13,7 +14,12 @@ import hashlib
 import math
 
 from .pcap_cache import get_reader
-from .utils import safe_float, detect_file_type
+from .utils import safe_float, detect_file_type, safe_read_text, counter_inc, setdict_add, set_add_cap
+
+MAX_ENDPOINTS = int(os.getenv("PCAPPER_MAX_ENDPOINTS", "20000"))
+MAX_CONVERSATIONS = int(os.getenv("PCAPPER_MAX_CONVERSATIONS", "50000"))
+MAX_UNIQUE_IPS = int(os.getenv("PCAPPER_MAX_UNIQUE_IPS", "200000"))
+MAX_SET_VALUES = int(os.getenv("PCAPPER_MAX_SET_VALUES", "2000"))
 
 try:
     from scapy.layers.inet import IP  # type: ignore
@@ -34,6 +40,11 @@ try:
     from scapy.layers.inet import ICMP  # type: ignore
 except Exception:  # pragma: no cover
     ICMP = None  # type: ignore
+
+try:
+    from scapy.layers.l2 import Ether  # type: ignore
+except Exception:  # pragma: no cover
+    Ether = None  # type: ignore
 
 try:
     from scapy.layers.inet6 import IPv6  # type: ignore
@@ -116,6 +127,7 @@ class IpSummary:
     src_counts: Counter[str]
     dst_counts: Counter[str]
     ip_category_counts: Counter[str]
+    ip_mac_counts: dict[str, Counter[str]]
     endpoints: list[IpEndpoint]
     conversations: list[IpConversation]
     first_seen: Optional[float]
@@ -152,6 +164,7 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
             src_counts=Counter(),
             dst_counts=Counter(),
             ip_category_counts=Counter(),
+            ip_mac_counts={},
             endpoints=[],
             conversations=[],
             first_seen=None,
@@ -178,11 +191,14 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     duration_seconds = 0.0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+    skipped_endpoints = 0
+    skipped_conversations = 0
 
     protocol_counts: Counter[str] = Counter()
     src_counts: Counter[str] = Counter()
     dst_counts: Counter[str] = Counter()
     ip_category_counts: Counter[str] = Counter()
+    ip_mac_counts: dict[str, Counter[str]] = {}
     ja3_counts: Counter[str] = Counter()
     ja4_counts: Counter[str] = Counter()
     ja4s_counts: Counter[str] = Counter()
@@ -224,6 +240,9 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
         src_counts.update(summary.src_counts)
         dst_counts.update(summary.dst_counts)
         ip_category_counts.update(summary.ip_category_counts)
+        for ip_value, counter in summary.ip_mac_counts.items():
+            existing = ip_mac_counts.setdefault(ip_value, Counter())
+            existing.update(counter)
         ja3_counts.update(summary.ja3_counts)
         ja4_counts.update(summary.ja4_counts)
         ja4s_counts.update(summary.ja4s_counts)
@@ -397,6 +416,7 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
         src_counts=src_counts,
         dst_counts=dst_counts,
         ip_category_counts=ip_category_counts,
+        ip_mac_counts=ip_mac_counts,
         endpoints=endpoint_rows,
         conversations=conversation_rows,
         first_seen=first_seen,
@@ -418,6 +438,7 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     )
 
 
+@lru_cache(maxsize=100000)
 def _classify_ip(ip_text: str) -> list[str]:
     categories: list[str] = []
     try:
@@ -646,11 +667,9 @@ def _load_reputation_list(path_value: Optional[str]) -> dict[str, str]:
     if not path.exists():
         return {}
 
-    try:
-        raw = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+    raw = safe_read_text(path, encoding="utf-8", errors="ignore")
+    if not raw:
         return {}
-
     raw = raw.strip()
     if not raw:
         return {}
@@ -914,6 +933,7 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
             src_counts=Counter(),
             dst_counts=Counter(),
             ip_category_counts=Counter(),
+            ip_mac_counts={},
             endpoints=[],
             conversations=[],
             first_seen=None,
@@ -944,6 +964,7 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
     src_counts: Counter[str] = Counter()
     dst_counts: Counter[str] = Counter()
     ip_category_counts: Counter[str] = Counter()
+    ip_mac_counts: dict[str, Counter[str]] = defaultdict(Counter)
 
     endpoints: dict[str, dict[str, object]] = defaultdict(lambda: {
         "packets_sent": 0,
@@ -988,6 +1009,18 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+    skipped_endpoints = 0
+    skipped_conversations = 0
+
+    def _record_mac(ip_text: str, mac: str) -> None:
+        if not ip_text or not mac:
+            return
+        mac_value = mac.lower()
+        if mac_value == "00:00:00:00:00:00":
+            return
+        counter = ip_mac_counts[ip_text]
+        if mac_value in counter or len(counter) < MAX_SET_VALUES:
+            counter[mac_value] += 1
 
     try:
         for pkt in reader:
@@ -1006,41 +1039,47 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 src_ip = str(getattr(ip_layer, "src", ""))
                 dst_ip = str(getattr(ip_layer, "dst", ""))
                 if src_ip:
-                    ipv4_set.add(src_ip)
+                    set_add_cap(ipv4_set, src_ip, max_size=MAX_UNIQUE_IPS)
                 if dst_ip:
-                    ipv4_set.add(dst_ip)
+                    set_add_cap(ipv4_set, dst_ip, max_size=MAX_UNIQUE_IPS)
             elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
                 ip_layer = pkt[IPv6]  # type: ignore[index]
                 src_ip = str(getattr(ip_layer, "src", ""))
                 dst_ip = str(getattr(ip_layer, "dst", ""))
                 if src_ip:
-                    ipv6_set.add(src_ip)
+                    set_add_cap(ipv6_set, src_ip, max_size=MAX_UNIQUE_IPS)
                 if dst_ip:
-                    ipv6_set.add(dst_ip)
+                    set_add_cap(ipv6_set, dst_ip, max_size=MAX_UNIQUE_IPS)
             else:
                 continue
 
             if not src_ip or not dst_ip:
                 continue
 
+            if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+                eth_layer = pkt[Ether]  # type: ignore[index]
+                _record_mac(src_ip, str(getattr(eth_layer, "src", "")))
+                _record_mac(dst_ip, str(getattr(eth_layer, "dst", "")))
+
             total_packets += 1
             pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
             total_bytes += pkt_len
 
             protocol = _infer_protocol(pkt)
-            protocol_counts[protocol] += 1
+            counter_inc(protocol_counts, protocol)
 
-            unique_ips.update([src_ip, dst_ip])
-            src_ips.add(src_ip)
-            dst_ips.add(dst_ip)
+            set_add_cap(unique_ips, src_ip, max_size=MAX_UNIQUE_IPS)
+            set_add_cap(unique_ips, dst_ip, max_size=MAX_UNIQUE_IPS)
+            set_add_cap(src_ips, src_ip, max_size=MAX_UNIQUE_IPS)
+            set_add_cap(dst_ips, dst_ip, max_size=MAX_UNIQUE_IPS)
 
-            src_counts[src_ip] += 1
-            dst_counts[dst_ip] += 1
+            counter_inc(src_counts, src_ip)
+            counter_inc(dst_counts, dst_ip)
 
             for category in _classify_ip(src_ip):
-                ip_category_counts[category] += 1
+                counter_inc(ip_category_counts, category)
             for category in _classify_ip(dst_ip):
-                ip_category_counts[category] += 1
+                counter_inc(ip_category_counts, category)
 
             ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:
@@ -1050,11 +1089,16 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                     last_seen = ts
 
             conv_key = (src_ip, dst_ip, protocol)
-            conv = conversations[conv_key]
-            conv["packets"] = int(conv["packets"]) + 1
-            conv["bytes"] = int(conv["bytes"]) + pkt_len
+            conv = None
+            if conv_key not in conversations and len(conversations) >= MAX_CONVERSATIONS:
+                skipped_conversations += 1
+                conv = None
+            else:
+                conv = conversations[conv_key]
+                conv["packets"] = int(conv["packets"]) + 1
+                conv["bytes"] = int(conv["bytes"]) + pkt_len
 
-            if ts is not None:
+            if conv is not None and ts is not None:
                 if conv["first_seen"] is None or ts < conv["first_seen"]:  # type: ignore[operator]
                     conv["first_seen"] = ts
                 if conv["last_seen"] is None or ts > conv["last_seen"]:  # type: ignore[operator]
@@ -1064,30 +1108,33 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 tcp_layer = pkt[TCP]  # type: ignore[index]
                 sport = getattr(tcp_layer, "sport", None)
                 dport = getattr(tcp_layer, "dport", None)
-                if sport is not None:
-                    conv["ports"].add(int(sport))
-                if dport is not None:
-                    conv["ports"].add(int(dport))
+                if conv is not None and sport is not None:
+                    set_add_cap(conv["ports"], int(sport), max_size=MAX_SET_VALUES)
+                if conv is not None and dport is not None:
+                    set_add_cap(conv["ports"], int(dport), max_size=MAX_SET_VALUES)
                 if sport is not None and dport is not None:
-                    src_to_ports[src_ip].add(int(dport))
-                    src_to_dsts[src_ip].add(dst_ip)
-                    dst_to_ports[dst_ip].add(int(dport))
-                    dst_to_srcs[dst_ip].add(src_ip)
+                    setdict_add(src_to_ports, src_ip, int(dport), max_values=MAX_SET_VALUES)
+                    setdict_add(src_to_dsts, src_ip, dst_ip, max_values=MAX_SET_VALUES)
+                    setdict_add(dst_to_ports, dst_ip, int(dport), max_values=MAX_SET_VALUES)
+                    setdict_add(dst_to_srcs, dst_ip, src_ip, max_values=MAX_SET_VALUES)
             elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                 udp_layer = pkt[UDP]  # type: ignore[index]
                 sport = getattr(udp_layer, "sport", None)
                 dport = getattr(udp_layer, "dport", None)
-                if sport is not None:
-                    conv["ports"].add(int(sport))
-                if dport is not None:
-                    conv["ports"].add(int(dport))
+                if conv is not None and sport is not None:
+                    set_add_cap(conv["ports"], int(sport), max_size=MAX_SET_VALUES)
+                if conv is not None and dport is not None:
+                    set_add_cap(conv["ports"], int(dport), max_size=MAX_SET_VALUES)
                 if sport is not None and dport is not None:
-                    src_to_ports[src_ip].add(int(dport))
-                    src_to_dsts[src_ip].add(dst_ip)
-                    dst_to_ports[dst_ip].add(int(dport))
-                    dst_to_srcs[dst_ip].add(src_ip)
+                    setdict_add(src_to_ports, src_ip, int(dport), max_values=MAX_SET_VALUES)
+                    setdict_add(src_to_dsts, src_ip, dst_ip, max_values=MAX_SET_VALUES)
+                    setdict_add(dst_to_ports, dst_ip, int(dport), max_values=MAX_SET_VALUES)
+                    setdict_add(dst_to_srcs, dst_ip, src_ip, max_values=MAX_SET_VALUES)
 
             for ip_text, direction in ((src_ip, "sent"), (dst_ip, "recv")):
+                if ip_text not in endpoints and len(endpoints) >= MAX_ENDPOINTS:
+                    skipped_endpoints += 1
+                    continue
                 entry = endpoints[ip_text]
                 if direction == "sent":
                     entry["packets_sent"] = int(entry["packets_sent"]) + 1
@@ -1096,20 +1143,20 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                     entry["packets_recv"] = int(entry["packets_recv"]) + 1
                     entry["bytes_recv"] = int(entry["bytes_recv"]) + pkt_len
 
-                entry["protocols"].add(protocol)
+                set_add_cap(entry["protocols"], protocol, max_size=MAX_SET_VALUES)
                 peer = dst_ip if ip_text == src_ip else src_ip
-                entry["peers"].add(peer)
+                set_add_cap(entry["peers"], peer, max_size=MAX_SET_VALUES)
 
                 if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                     tcp_layer = pkt[TCP]  # type: ignore[index]
                     port = getattr(tcp_layer, "sport" if ip_text == src_ip else "dport", None)
                     if port is not None:
-                        entry["ports"].add(int(port))
+                        set_add_cap(entry["ports"], int(port), max_size=MAX_SET_VALUES)
                 elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                     udp_layer = pkt[UDP]  # type: ignore[index]
                     port = getattr(udp_layer, "sport" if ip_text == src_ip else "dport", None)
                     if port is not None:
-                        entry["ports"].add(int(port))
+                        set_add_cap(entry["ports"], int(port), max_size=MAX_SET_VALUES)
 
                 if ts is not None:
                     if entry["first_seen"] is None or ts < entry["first_seen"]:  # type: ignore[operator]
@@ -1166,6 +1213,12 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
+    if skipped_endpoints:
+        errors.append(f"Endpoint cap reached; {skipped_endpoints} endpoint updates skipped.")
+    if skipped_conversations:
+        errors.append(f"Conversation cap reached; {skipped_conversations} conversation updates skipped.")
+    if len(unique_ips) >= MAX_UNIQUE_IPS:
+        errors.append("Unique IP cap reached; additional IPs not counted.")
 
     endpoint_rows: list[IpEndpoint] = []
     for ip_text, data in endpoints.items():
@@ -1483,6 +1536,7 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
         src_counts=src_counts,
         dst_counts=dst_counts,
         ip_category_counts=ip_category_counts,
+        ip_mac_counts=ip_mac_counts,
         endpoints=endpoint_rows,
         conversations=conversation_rows,
         first_seen=first_seen,

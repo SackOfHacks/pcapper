@@ -4,14 +4,20 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
+from .utils import safe_read_text, decode_payload
+from .device_detection import device_fingerprints_from_text
 
+@lru_cache(maxsize=4)
 def _load_json(path: Path) -> dict[str, object]:
     if not path.exists():
         return {}
     try:
         import json
 
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw_text = safe_read_text(path, encoding="utf-8", errors="ignore")
+        if not raw_text:
+            return {}
+        raw = json.loads(raw_text)
         return raw if isinstance(raw, dict) else {}
     except Exception:
         return {}
@@ -79,7 +85,7 @@ def _equipment_index() -> dict[str, tuple[str, str]]:
 def equipment_artifacts(payload: bytes, limit: int = 512) -> list[tuple[str, str]]:
     if not payload:
         return []
-    text = payload[:limit].decode("utf-8", errors="ignore")
+    text = decode_payload(payload, encoding="utf-8", limit=limit)
     if not text:
         return []
     lowered = text.lower()
@@ -95,5 +101,11 @@ def equipment_artifacts(payload: bytes, limit: int = 512) -> list[tuple[str, str
                 continue
             seen.add(detail)
             matches.append(("equipment", detail))
+
+    for detail in device_fingerprints_from_text(text, source="payload"):
+        if detail in seen:
+            continue
+        seen.add(detail)
+        matches.append(("device", detail))
 
     return matches

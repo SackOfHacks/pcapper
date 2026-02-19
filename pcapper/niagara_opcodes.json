@@ -1,0 +1,10 @@
+{
+  "protocol": "Niagara Fox",
+  "magic_ascii": ["FOX", "fox"],
+  "magic_hex": [],
+  "opcode_offsets": [0, 4, 8],
+  "opcode_size": 2,
+  "opcode_endian": "big",
+  "max_scan": 256,
+  "opcodes": {}
+}

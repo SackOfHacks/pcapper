@@ -166,17 +166,21 @@ def merge_protocols_summaries(
 
 INDUSTRIAL_PORTS = {
     102: "S7/MMS/ICCP",
+    319: "PTP Event",
+    320: "PTP General",
     502: "Modbus/TCP",
     9600: "FINS",
     20000: "DNP3",
     2404: "IEC-104",
     47808: "BACnet/IP",
     44818: "EtherNet/IP",
-    2222: "ENIP-IO",
+    2222: "CIP/ENIP-IO",
+    2221: "CIP Security",
     34962: "PROFINET",
     34963: "PROFINET",
     34964: "PROFINET",
     4840: "OPC UA",
+    789: "Crimson",
     1911: "Niagara Fox",
     4911: "Niagara Fox",
     5094: "HART-IP",
@@ -190,6 +194,8 @@ INDUSTRIAL_PORTS = {
     5684: "CoAP",
     2455: "ODESYS",
     1217: "ODESYS",
+    1883: "MQTT",
+    8883: "MQTT-TLS",
     34378: "Yokogawa Vnet/IP",
     34379: "Yokogawa Vnet/IP",
     34380: "Yokogawa Vnet/IP",
@@ -198,9 +204,10 @@ INDUSTRIAL_PORTS = {
 ETHERTYPE_PROTOCOLS = {
     0x88A4: "EtherCAT",
     0x8892: "PROFINET RT",
+    0x88CC: "LLDP",
     0x88B8: "IEC 61850 GOOSE",
     0x88BA: "IEC 61850 SV",
-    0x88F7: "HSR/PRP",
+    0x88F7: "PTP",
 }
 
 KNOWN_PORTS = {
@@ -325,6 +332,7 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
             oscillation_repeats = 0
             visited_layer_ids: Set[int] = set()
             depth = 0
+            l4_node: ProtocolStat | None = None
             while layer:
                 depth += 1
                 if depth > 256:
@@ -371,9 +379,31 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                         current_node = current_node.sub_protocols[lname]
                         current_node.packets += 1
                         current_node.bytes += pkt_len
+                        if lname in {"TCP", "UDP"}:
+                            l4_node = current_node
                         prev_effective_layer = lname
                         effective_path_layers.append(lname)
                 layer = layer.payload
+
+            # 1b. Inject port-based industrial protocol labels under L4 when no dissector exists.
+            port_label = None
+            if TCP in pkt:
+                try:
+                    port_label = KNOWN_PORTS.get(int(pkt[TCP].sport)) or KNOWN_PORTS.get(int(pkt[TCP].dport))
+                except Exception:
+                    port_label = None
+            elif UDP in pkt:
+                try:
+                    port_label = KNOWN_PORTS.get(int(pkt[UDP].sport)) or KNOWN_PORTS.get(int(pkt[UDP].dport))
+                except Exception:
+                    port_label = None
+            if l4_node is not None and port_label and port_label not in effective_path_layers:
+                child = l4_node.sub_protocols.get(port_label)
+                if child is None:
+                    child = ProtocolStat(port_label)
+                    l4_node.sub_protocols[port_label] = child
+                child.packets += 1
+                child.bytes += pkt_len
 
             # 2. Extract Endpoints & Conversations
             src = None
