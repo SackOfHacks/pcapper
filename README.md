@@ -1,8 +1,39 @@
 # Pcapper
 
-Modular PCAP/PCAPNG analysis CLI for fast triage and deep-dive protocol investigations across enterprise IT and ICS/OT traffic.
+![Python](https://img.shields.io/badge/python-3.9%2B-0B7285)
+![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
+![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
+![License](https://img.shields.io/badge/license-MIT-6C757D)
+
+```text
+  ____                                                    
+ |  _ \  ___ __ _ _ __  _ __   ___ _ __                  
+ | |_) |/ __/ _` | '_ \| '_ \ / _ \ '__|                 
+ |  __/| (_| (_| | |_) | |_) |  __/ |                    
+ |_|    \___\__,_| .__/| .__/ \___|_|                    
+                 |_|   |_|                              
+  PCAP triage for IT + OT/ICS, fast enough for the plant floor
+```
+
+**Pcapper** is a modular PCAP/PCAPNG analysis CLI for fast triage and deep-dive protocol investigations across enterprise IT and ICS/OT traffic.
 
 **OT/ICS READY** — plant-floor triage in minutes, not hours.
+
+| Focus | What You Get |
+| --- | --- |
+| Speed | First-pass answers in minutes, not hours |
+| Depth | Protocol-aware summaries, artifacts, and anomalies |
+| OT/ICS | Control-plane context and safety-aware detections |
+
+```
+Capture -> Decoders -> Sessions -> Detections -> Reports
+   .pcap     300+       RDP/SSH      Beaconing   CLI/JSON/SQLite
+```
+
+Promotional highlights:
+- Remote-access session visibility (RDP/SSH/WinRM/VNC/TeamViewer/Telnet) with endpoints, timing, and data volume.
+- OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
+- Evidence-first reporting that surfaces context, not just counts.
 
 ## OT/ICS Command Center
 
@@ -17,6 +48,7 @@ What you get:
 - Control-command visibility for safety/availability impacts (writes, downloads, starts/stops).
 - OT/ICS-centric threat and anomaly rollups with evidence lines for fast triage.
 - Device fingerprinting across IT/OT/IoT traffic (vendor/model/OS/firmware/software) for asset-aware triage.
+- Remote-access session visibility (RDP/SSH/WinRM/VNC/TeamViewer/Telnet) with endpoints, timing, and data volume.
 - Deeper OT protocol decoding for DNP3, IEC 61850 GOOSE/SV, Modbus, BACnet, OPC UA, CoAP, MQTT, and CIP/ENIP.
 - Routing protocol forensics (OSPF/BGP/IS-IS/PIM) with route-change, auth, and control-plane health visibility.
 
@@ -53,6 +85,37 @@ python -m pcapper ~/Downloads/pcaps/ --dhcp --no-status
 python -m pcapper ~/Downloads/pcaps/Un* --arp
 python -m pcapper "~/Downloads/pcaps/Un*" --summarize --ips
 python -m pcapper one.pcap two.pcapng ~/Downloads/pcaps/ --summarize --timeline -ip 10.182.207.28
+```
+
+## Quick Demo
+
+```text
+========================================================================
+RDP ANALYSIS :: sample.pcap
+========================================================================
+Total Packets            : 214,993
+RDP Packets              : 18,876
+Total Bytes              : 133.42 MB
+Client -> Server         : 21.07 MB
+Server -> Client         : 112.35 MB
+Duration                 : 2h 13m 14.2s
+Sessions                 : 14
+TCP Sessions             : 9
+UDP Sessions             : 5
+Unique Clients           : 3
+Unique Servers           : 3
+------------------------------------------------------------------------
+Top RDP Clients & Servers
+Clients                  Servers
+10.51.142.55(17481)       10.180.81.111(17481)
+10.51.137.116(1560)       10.180.81.123(1560)
+10.182.106.47(8)          10.180.81.139(8)
+------------------------------------------------------------------------
+RDP Sessions
+Client                   Server                   Start                     End                       Duration    Packets  Size
+10.51.142.55:51332        10.180.81.111:3389       2026-02-19T09:12:42Z      2026-02-19T11:25:54Z      2h 13m 12s  17481    104.2 MB
+10.51.137.116:55190       10.180.81.123:3389       2026-02-19T12:01:04Z      2026-02-19T12:27:33Z      26m 29s    1560     12.7 MB
+========================================================================
 ```
 
 Secrets/credentials are redacted by default in reports. Use `--show-secrets` to display them.

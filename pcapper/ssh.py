@@ -752,6 +752,7 @@ def analyze_ssh(
             plaintext_strings=Counter(),
             suspicious_plaintext=Counter(),
             file_artifacts=Counter(),
+            device_fingerprints=Counter(),
             conversations=[],
             auth_attempts_by_client=Counter(),
             auth_failures_by_client=Counter(),
@@ -802,6 +803,7 @@ def analyze_ssh(
     plaintext_strings: Counter[str] = Counter()
     suspicious_plaintext: Counter[str] = Counter()
     file_artifacts: Counter[str] = Counter()
+    device_fingerprints: Counter[str] = Counter()
     artifacts: list[str] = []
 
     algo_counters: dict[str, Counter[str]] = {
