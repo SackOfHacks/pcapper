@@ -4,6 +4,27 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 1.4.2 — 2026-02-25
+### Fixed
+- `--files` table rendering now tolerates missing values (no NoneType crashes).
+- Deterministic ordering improves float handling and avoids full sorts for small `n`.
+
+## 1.4.1 — 2026-02-25
+### Added
+- Configurable defaults via `pcapper.toml` (or `--config`/`PCAPPER_CONFIG`).
+- Structured logging hooks (`--log-file`, `--log-json`) and `--self-check`.
+- Plugin registry with entry-point discovery (`pcapper.plugins`).
+- CI workflow and focused QA tests (exports/redaction, deterministic counters).
+
+### Changed
+- Banner now shows a deterministic OT/ICS quote of the day (override with `PCAPPER_QUOTE` or `PCAPPER_QUOTE_SEED`).
+- Output ordering is deterministic by default (`PCAPPER_DETERMINISTIC=0` to restore Python's default Counter tie ordering).
+
+### Fixed
+- Packaged builds now include OT/ICS opcode/mapping JSON files.
+- Plugin discovery now works on Python 3.9.
+- Deterministic ordering preserves float counts and avoids full sorts when `n` is small.
+
 ## 1.4.0 — 2026-02-25
 ### Added
 - RDP session tables with endpoints, timing, duration, packet counts, and size; client/server lists now render as vertical columns for readability.

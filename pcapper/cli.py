@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import difflib
 import glob
+import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 from .analyzer import analyze_pcap, merge_pcap_summaries
 from .coloring import set_color_override
 from .discovery import find_pcaps, is_supported_pcap
+from .config import find_config, load_config
+from .plugins import load_plugins, plugin_map, PluginSpec
 from .reporting import (
     render_summary,
     render_vlan_summary,
@@ -215,9 +221,21 @@ from .ot_commands import analyze_ot_commands, load_ot_control_config, OtControlC
 from .iec101_103 import analyze_iec101_103
 from .utils import parse_time_arg, hexdump
 
+_PLUGIN_SPECS: list[PluginSpec] | None = None
+_PLUGIN_ERRORS: list[str] = []
 
-def _ordered_steps(argv: list[str]) -> list[str]:
-    flag_map = {
+
+def _load_plugins_once() -> tuple[list[PluginSpec], list[str]]:
+    global _PLUGIN_SPECS, _PLUGIN_ERRORS
+    if _PLUGIN_SPECS is None:
+        result = load_plugins()
+        _PLUGIN_SPECS = result.plugins
+        _PLUGIN_ERRORS = result.errors
+    return list(_PLUGIN_SPECS), list(_PLUGIN_ERRORS)
+
+
+def _builtin_flag_map() -> dict[str, str]:
+    return {
         "--search": "search",
         "--packet": "packet",
         "--creds": "creds",
@@ -315,6 +333,32 @@ def _ordered_steps(argv: list[str]) -> list[str]:
         "--ot-commands-fast": "ot_commands",
         "--iec101-103": "iec101_103",
     }
+
+
+def _filtered_plugins(flag_map: dict[str, str]) -> tuple[list[PluginSpec], list[str]]:
+    plugins, errors = _load_plugins_once()
+    seen_flags = set(flag_map.keys())
+    seen_steps = set(flag_map.values())
+    filtered: list[PluginSpec] = []
+    for spec in plugins:
+        if spec.flag in seen_flags:
+            errors.append(f"plugin flag collision: {spec.flag}")
+            continue
+        if spec.name in seen_steps:
+            errors.append(f"plugin name collision: {spec.name}")
+            continue
+        filtered.append(spec)
+        seen_flags.add(spec.flag)
+        seen_steps.add(spec.name)
+    return filtered, errors
+
+
+def _ordered_steps(argv: list[str], plugins: list[PluginSpec] | None = None) -> list[str]:
+    flag_map = _builtin_flag_map()
+    if plugins is None:
+        plugins, _errors = _filtered_plugins(flag_map)
+    for spec in plugins:
+        flag_map[spec.flag] = spec.name
     ordered: list[str] = []
     seen: set[str] = set()
     for arg in argv:
@@ -326,20 +370,227 @@ def _ordered_steps(argv: list[str]) -> list[str]:
 
 
 def _build_banner() -> str:
-    compile_date = datetime.now(timezone.utc).date().isoformat()
+    ot_ics_quotes = [
+        "Safety before speed. Reliability before novelty.",
+        "In OT, availability is the first control.",
+        "A quiet control network is a healthy one.",
+        "Know the process, not just the packets.",
+        "What changes state can change safety.",
+        "Latency is a signal. Jitter is a story.",
+        "Every write is a decision; log it.",
+        "Trust the physics, verify the traffic.",
+        "Asset context turns alerts into action.",
+        "A stable process leaves a stable trail.",
+    ]
+    override = os.environ.get("PCAPPER_QUOTE", "").strip()
+    if override:
+        quote = override
+    else:
+        seed_raw = os.environ.get("PCAPPER_QUOTE_SEED", "").strip()
+        if seed_raw:
+            try:
+                seed_value = int(seed_raw)
+            except ValueError:
+                seed_value = sum(ord(ch) for ch in seed_raw)
+        elif os.environ.get("PYTEST_CURRENT_TEST"):
+            seed_value = 0
+        else:
+            seed_value = datetime.now(timezone.utc).date().toordinal()
+        quote = ot_ics_quotes[seed_value % len(ot_ics_quotes)]
     banner = [
-        "======================================================================",
+        "=====================================================================================",
         "   ██████╗  ██████╗  █████╗ ██████╗ ██████╗ ███████╗██████╗     ",
         "   ██╔══██╗██╔════╝ ██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔══██╗    ",
         "   ██████╔╝██║      ███████║██████╔╝██████╔╝█████╗  ██████╔╝    ",
         "   ██╔═══╝ ██║      ██╔══██║██╔═══╝ ██╔═══╝ ██╔══╝  ██╔══██╗    ",
         "   ██║     ╚██████╗ ██║  ██║██║     ██║     ███████╗██║  ██║    ",
         "   ╚═╝      ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝     ╚══════╝╚═╝  ╚═╝ ICS/OT",
-        "======================================================================",
-        f"  PCAPPER v{__version__}  ::  Compile Date {compile_date}",
-        "======================================================================",
+        "=====================================================================================",
+        f"  PCAPPER v{__version__}  ::  Quote of the Day: \"{quote}\"",
+        "=====================================================================================",
     ]
     return "\n".join(banner)
+
+
+@dataclass(frozen=True)
+class LogConfig:
+    path: Path | None
+    json: bool
+    stream: Any | None = None
+
+
+def _collect_argv_options(argv: list[str]) -> set[str]:
+    options: set[str] = set()
+    for token in argv:
+        if token.startswith("-"):
+            options.add(token.split("=", 1)[0])
+    return options
+
+
+def _coerce_config_value(action: argparse.Action, value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(action, argparse._StoreTrueAction):
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+    if isinstance(action, argparse._StoreFalseAction):
+        if isinstance(value, str):
+            return not (value.strip().lower() in {"1", "true", "yes", "on"})
+        return not bool(value)
+    if action.dest == "timeline_categories" and isinstance(value, list):
+        return ",".join(str(item) for item in value)
+    if action.type:
+        try:
+            return action.type(value)
+        except Exception:
+            return value
+    return value
+
+
+def _extract_config_defaults(config: dict[str, Any]) -> dict[str, Any]:
+    defaults: dict[str, Any] = {}
+    if isinstance(config.get("defaults"), dict):
+        defaults.update(config["defaults"])  # type: ignore[arg-type]
+    for key in ("log_file", "log_json", "config"):
+        if key in config:
+            defaults[key] = config[key]
+    logging_block = config.get("logging")
+    if isinstance(logging_block, dict):
+        for key in ("log_file", "log_json"):
+            if key in logging_block:
+                defaults[key] = logging_block[key]
+    return defaults
+
+
+def _apply_config_defaults(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    argv: list[str],
+) -> None:
+    defaults = _extract_config_defaults(config)
+    if not defaults:
+        return
+    provided = _collect_argv_options(argv)
+    for action in parser._actions:
+        if not action.option_strings:
+            continue
+        dest = action.dest
+        if dest not in defaults:
+            continue
+        if any(opt in provided for opt in action.option_strings):
+            continue
+        value = _coerce_config_value(action, defaults[dest])
+        setattr(args, dest, value)
+
+
+def _log_event(log_config: LogConfig | None, event: str, **fields: Any) -> None:
+    if not log_config:
+        return
+    payload = {"ts": datetime.now(timezone.utc).isoformat(), "event": event}
+    payload.update(fields)
+    line = json.dumps(payload, separators=(",", ":")) if log_config.json else " ".join(
+        [payload["ts"], event] + [f"{key}={value}" for key, value in fields.items()]
+    )
+    try:
+        if log_config.path:
+            log_config.path.parent.mkdir(parents=True, exist_ok=True)
+            with log_config.path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{line}\n")
+        elif log_config.stream:
+            log_config.stream.write(f"{line}\n")
+            log_config.stream.flush()
+    except Exception:
+        return
+
+
+def _run_self_check(
+    plugins: list[PluginSpec],
+    plugin_errors: list[str],
+    config_path: Path | None,
+) -> int:
+    print("PCAPPER SELF-CHECK")
+    print("==================")
+    if config_path:
+        print(f"Config: {config_path}")
+    else:
+        print("Config: (none)")
+
+    checks: list[tuple[str, str, str]] = []
+
+    def _check_import(name: str, required: bool = True) -> None:
+        try:
+            __import__(name)
+            checks.append((name, "OK", "imported"))
+        except Exception as exc:
+            status = "FAIL" if required else "WARN"
+            checks.append((name, status, f"{type(exc).__name__}: {exc}"))
+
+    _check_import("dpkt", required=True)
+    _check_import("scapy", required=True)
+    _check_import("geoip2", required=False)
+    _check_import("cryptography", required=False)
+    _check_import("pydicom", required=False)
+
+    try:
+        from importlib import resources as importlib_resources
+
+        required_files = [
+            "enip_mappings.json",
+            "siemens_mappings.json",
+            "niagara_opcodes.json",
+            "odesys_opcodes.json",
+        ]
+        for filename in required_files:
+            exists = (importlib_resources.files("pcapper") / filename).is_file()
+            checks.append((filename, "OK" if exists else "WARN", "package data"))
+    except Exception as exc:
+        checks.append(("package-data", "WARN", f"{type(exc).__name__}: {exc}"))
+
+    try:
+        from scapy.all import conf  # type: ignore
+
+        use_pcap = bool(getattr(conf, "use_pcap", False))
+        checks.append(("libpcap", "OK" if use_pcap else "WARN", "scapy.conf.use_pcap"))
+    except Exception as exc:
+        checks.append(("libpcap", "WARN", f"{type(exc).__name__}: {exc}"))
+
+    if plugin_errors:
+        for err in plugin_errors:
+            checks.append(("plugins", "WARN", err))
+    elif plugins:
+        checks.append(("plugins", "OK", f"{len(plugins)} loaded"))
+    else:
+        checks.append(("plugins", "OK", "none"))
+
+    max_label = max(len(item[0]) for item in checks) if checks else 0
+    failures = 0
+    for name, status, detail in checks:
+        if status == "FAIL":
+            failures += 1
+        print(f"{name:<{max_label}}  [{status}]  {detail}")
+
+    return 1 if failures else 0
+
+
+def _build_log_config(args: argparse.Namespace) -> LogConfig | None:
+    path = Path(args.log_file).expanduser() if getattr(args, "log_file", None) else None
+    log_json = bool(getattr(args, "log_json", False))
+    if path is None and not log_json:
+        return None
+    stream = None if path else sys.stderr
+    return LogConfig(path=path, json=log_json, stream=stream)
+
+
+def _render_plugin_summary(spec: PluginSpec, summary: object, verbose: bool = False) -> str:
+    if spec.render:
+        try:
+            return spec.render(summary, verbose=verbose)  # type: ignore[arg-type]
+        except TypeError:
+            return spec.render(summary)
+    title = spec.title or spec.name.upper()
+    return render_generic_rollup(title, [summary])
 
 
 def _has_glob_wildcards(value: str) -> bool:
@@ -460,7 +711,7 @@ class PcapperArgumentParser(argparse.ArgumentParser):
         super().error(message)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentParser:
     banner = _build_banner()
     parser = PcapperArgumentParser(
         prog="pcapper",
@@ -475,6 +726,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path(s) to pcap/pcapng file(s), wildcard pattern(s), or director(ies) of captures.",
     )
     general = parser.add_argument_group("GENERAL FLAGS")
+    general.add_argument(
+        "--config",
+        metavar="PATH",
+        help="Path to pcapper TOML config file (defaults: ./pcapper.toml, ~/.pcapper.toml, ~/.config/pcapper/config.toml).",
+    )
+    general.add_argument(
+        "--self-check",
+        action="store_true",
+        help="Run dependency and environment self-checks and exit.",
+    )
+    general.add_argument(
+        "--list-plugins",
+        action="store_true",
+        help="List discovered plugins and exit.",
+    )
+    general.add_argument(
+        "--log-file",
+        metavar="PATH",
+        help="Write structured log events to PATH.",
+    )
+    general.add_argument(
+        "--log-json",
+        action="store_true",
+        help="Emit logs as JSON lines (default is key=value).",
+    )
     general.add_argument(
         "--base",
         action="store_true",
@@ -788,6 +1064,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=10,
         help="Limit rows in OT command sessions table (default: 10).",
     )
+    if plugins is None:
+        plugins, _errors = _filtered_plugins(_builtin_flag_map())
+    for spec in sorted(plugins, key=lambda item: item.flag):
+        group = it_group if spec.group == "it" else ics_group
+        group.add_argument(
+            spec.flag,
+            dest=spec.dest(),
+            action="store_true",
+            help=spec.help,
+        )
     return parser
 
 
@@ -920,6 +1206,8 @@ def _analyze_paths(
     export_sqlite_path: Path | None = None,
     export_redact: bool = True,
     case_dir: Path | None = None,
+    log_config: LogConfig | None = None,
+    plugins: list[PluginSpec] | None = None,
 ) -> int:
     if not paths:
         return 1
@@ -932,6 +1220,7 @@ def _analyze_paths(
     rollups: dict[str, list[object]] = {}
     use_packets = len(ordered_steps) > 1 or (render_base_summary and len(ordered_steps) > 0)
     multi_export = len(paths) > 1 and not summarize
+    plugin_lookup = plugin_map(plugins or [])
 
     if case_dir:
         case_dir.mkdir(parents=True, exist_ok=True)
@@ -1083,6 +1372,7 @@ def _analyze_paths(
         meta = None
         step_status = show_status
         export_summaries: dict[str, object] = {}
+        _log_event(log_config, "pcap_start", path=str(path), index=idx, total=len(paths))
 
         if bpf or time_start or time_end:
             packets, meta = load_filtered_packets(
@@ -1380,7 +1670,7 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("files", []).append(files_summary)
                 else:
-                    print(render_files_summary(files_summary))
+                    print(render_files_summary(files_summary, verbose=verbose))
                 export_summaries["files"] = files_summary
             elif step == "protocols" and show_protocols:
                 proto_summary = analyze_protocols(path, show_status=step_status)
@@ -1845,6 +2135,16 @@ def _analyze_paths(
                 else:
                     print(render_iec101_103_summary(summary))
                 export_summaries["iec101_103"] = summary
+            elif step in plugin_lookup:
+                spec = plugin_lookup[step]
+                if spec.analyze is None:
+                    continue
+                summary = spec.analyze(path, show_status=step_status, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault(step, []).append(summary)
+                else:
+                    print(_render_plugin_summary(spec, summary, verbose=verbose))
+                export_summaries[spec.export_key or spec.name] = summary
         if (export_json_path or export_csv_path or export_sqlite_path) and not summarize_rollups:
             bundle = ExportBundle(path=path, summaries=export_summaries)
             if export_json_path:
@@ -1854,6 +2154,14 @@ def _analyze_paths(
             if export_sqlite_path:
                 export_sqlite(bundle, _resolve_export_path(export_sqlite_path, path, "sqlite"), redact=export_redact)
 
+        _log_event(
+            log_config,
+            "pcap_end",
+            path=str(path),
+            index=idx,
+            total=len(paths),
+            summaries=sorted(export_summaries.keys()),
+        )
         if idx < len(paths):
             print()
 
@@ -1889,7 +2197,7 @@ def _analyze_paths(
             "rpc": (merge_rpc_summaries, lambda s: render_rpc_summary(s, verbose=verbose)),
             "enip": (merge_enip_summaries, render_enip_summary),
             "cip": (merge_cip_summaries, render_cip_summary),
-            "files": (merge_files_summaries, render_files_summary),
+            "files": (merge_files_summaries, lambda s: render_files_summary(s, verbose=verbose)),
         }
         title_map = {
             "search": "SEARCH RESULTS",
@@ -1985,6 +2293,13 @@ def _analyze_paths(
             "ot_commands": "OT COMMANDS",
             "iec101_103": "IEC 101/103 ANALYSIS",
         }
+        for spec in plugin_lookup.values():
+            title_map.setdefault(spec.name, spec.title or spec.name.upper())
+            if spec.merge and spec.render:
+                merge_handlers[spec.name] = (
+                    spec.merge,
+                    lambda s, _spec=spec: _render_plugin_summary(_spec, s, verbose=verbose),
+                )
         ordered_rollups = [step for step in ordered_steps if rollups.get(step)]
         for step in ordered_rollups:
             if step in ("modbus", "dnp3", "vlan"):
@@ -2015,7 +2330,11 @@ def _analyze_paths(
             if base_rollups:
                 merged_summaries["base"] = merge_pcap_summaries(base_rollups)
             for key, values in rollups.items():
-                merged_summaries[key] = values
+                if key in plugin_lookup and plugin_lookup[key].merge:
+                    spec = plugin_lookup[key]
+                    merged_summaries[spec.export_key or spec.name] = spec.merge(values)
+                else:
+                    merged_summaries[key] = values
             bundle = ExportBundle(path=Path("ALL_PCAPS"), summaries=merged_summaries)
             if export_json_path:
                 export_json(bundle, export_json_path, redact=export_redact)
@@ -2027,16 +2346,52 @@ def _analyze_paths(
 
 
 def main() -> int:
-    parser = build_parser()
+    plugins, plugin_errors = _filtered_plugins(_builtin_flag_map())
+    parser = build_parser(plugins)
     if len(sys.argv) == 1:
         print(_build_banner())
         print("Usage: pcapper <target> [options]")
         print("Run with -h for full help and options.")
         return 0
     args = parser.parse_args()
+    config_path = find_config(getattr(args, "config", None) or os.environ.get("PCAPPER_CONFIG"))
+    config_result = load_config(config_path)
+    _apply_config_defaults(parser, args, config_result.data, sys.argv[1:])
+    log_config = _build_log_config(args)
+    _log_event(log_config, "start", version=__version__, config=str(config_result.path) if config_result.path else "")
     print(_build_banner())
 
-    ordered_steps = _ordered_steps(sys.argv)
+    if getattr(args, "list_plugins", False):
+        if plugin_errors:
+            print("Plugin load warnings:")
+            for err in plugin_errors:
+                print(f"  - {err}")
+        if not plugins:
+            print("No plugins discovered.")
+        else:
+            print("Plugins:")
+            for spec in sorted(plugins, key=lambda item: item.flag):
+                print(f"  {spec.flag} -> {spec.name} ({spec.group})")
+        _log_event(log_config, "list_plugins", count=len(plugins))
+        return 0
+
+    if getattr(args, "self_check", False):
+        result = _run_self_check(plugins, plugin_errors, config_result.path)
+        _log_event(log_config, "self_check", status="ok" if result == 0 else "fail")
+        return result
+
+    ordered_steps = _ordered_steps(sys.argv, plugins)
+    builtin_steps = list(dict.fromkeys(_builtin_flag_map().values()))
+    for step in builtin_steps:
+        value = getattr(args, step, None)
+        if step not in ordered_steps:
+            if isinstance(value, bool) and value:
+                ordered_steps.append(step)
+            elif value is not None and not isinstance(value, bool):
+                ordered_steps.append(step)
+    for spec in plugins:
+        if getattr(args, spec.dest(), False) and spec.name not in ordered_steps:
+            ordered_steps.append(spec.name)
 
     if getattr(args, "ot_commands_fast", False):
         args.ot_commands = True
@@ -2300,10 +2655,14 @@ def main() -> int:
             export_sqlite_path=export_sqlite_path,
             export_redact=export_redact,
             case_dir=case_dir,
+            log_config=log_config,
+            plugins=plugins,
         )
 
     if not args.profile:
-        return _run_analysis()
+        result = _run_analysis()
+        _log_event(log_config, "end", status="ok" if result == 0 else "fail")
+        return result
 
     import cProfile
     import io
@@ -2323,4 +2682,5 @@ def main() -> int:
             out_path = Path(args.profile_out).expanduser()
             out_path.parent.mkdir(parents=True, exist_ok=True)
             profiler.dump_stats(str(out_path))
+    _log_event(log_config, "end", status="ok" if result == 0 else "fail")
     return result
