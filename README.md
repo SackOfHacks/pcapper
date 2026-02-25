@@ -133,6 +133,55 @@ Use `--summarize` to aggregate selected analyses across all resolved target pcap
 - Summarize renders merged rollup output only (no per‑pcap sections).
 - Recursive directory traversal is enabled only with `-r/--recursive`.
 
+## Configuration
+
+Pcapper can load default flag values from a TOML config file. Lookup order:
+- `./pcapper.toml`
+- `~/.pcapper.toml`
+- `~/.config/pcapper/config.toml`
+
+You can also supply `--config PATH` or set `PCAPPER_CONFIG` to override the location.
+
+Example:
+
+```toml
+[defaults]
+no_color = true
+timeline_bins = 48
+vt = true
+log_file = "pcapper.log"
+log_json = true
+```
+
+Config keys match argparse dest names (use underscores, not dashes).
+
+## Logging
+
+Use `--log-file PATH` to emit structured events and `--log-json` for JSONL output. If no `--log-file` is provided, JSON logs are sent to stderr.
+
+## Plugins
+
+Pcapper supports analyzers via entry points under the `pcapper.plugins` group. A plugin should return one or more `PluginSpec` instances from `pcapper.plugins`.
+Only install plugins from sources you trust; plugin code is imported and executed in-process.
+
+Minimal example (in your plugin package):
+
+```python
+from pcapper.plugins import PluginSpec
+
+def register():
+    return PluginSpec(
+        name="my_analyzer",
+        flag="--my-analyzer",
+        help="Custom analyzer example",
+        group="it",
+        analyze=analyze_my_analyzer,
+        render=render_my_analyzer,
+        merge=merge_my_analyzer,
+        title="MY ANALYZER",
+    )
+```
+
 ## CLI Flag Groups
 
 Pcapper help is split into:
@@ -155,6 +204,7 @@ python -m pcapper --help
 - `--case-dir DIR`
 - `--case-name NAME`
 - `-case`
+- `--config PATH`
 - `--csv PATH`
 - `--export-raw`
 - `--export-redact`
@@ -165,6 +215,9 @@ python -m pcapper --help
 - `--ioc-file PATH`
 - `--json PATH`
 - `-l, --limit-protocols`
+- `--list-plugins`
+- `--log-file PATH`
+- `--log-json`
 - `--lookup-stream-id STREAM_ID`
 - `--no-color`
 - `--no-status`
@@ -173,6 +226,7 @@ python -m pcapper --help
 - `--profile-out PATH`
 - `-r, --recursive`
 - `--search STRING`
+- `--self-check`
 - `--show-secrets`
 - `--sqlite PATH`
 - `--streams-full`
@@ -304,6 +358,9 @@ Count: 38 flags
 - `--ot-commands-config` accepts JSON/YAML with `write_markers` and `protocol_markers` overrides (YAML requires PyYAML).
 - Use `--ot-commands-sessions` to change the number of session rows in the OT commands block.
 - VirusTotal lookups require `VT_API_KEY` and `-vt`/`--vt`.
+- Set `PCAPPER_QUOTE` to override the banner quote, or `PCAPPER_QUOTE_SEED` for deterministic rotation.
+- Output ordering is deterministic by default; set `PCAPPER_DETERMINISTIC=0` to restore Python's default Counter tie ordering.
+- Use `--self-check` for a quick dependency and environment check, and `--list-plugins` to inspect loaded plugins.
 
 ## License
 

@@ -276,6 +276,15 @@ def _format_table(rows: Iterable[list[str]]) -> str:
     if not rows:
         return "(none)"
 
+    def _cell_text(value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    rows = [[_cell_text(cell) for cell in row] for row in rows]
+
     def _visible_len(text: str) -> int:
         return len(re.sub(r"\x1b\[[0-9;]*m", "", text))
 
@@ -7073,7 +7082,7 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
     return _finalize_output(lines)
 
 
-def render_files_summary(summary: FileTransferSummary, limit: int | None = None) -> str:
+def render_files_summary(summary: FileTransferSummary, limit: int | None = None, verbose: bool = False) -> str:
     limit = _apply_verbose_limit(limit)
     lines: list[str] = []
     lines.append(SECTION_BAR)
