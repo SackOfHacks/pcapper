@@ -27,6 +27,7 @@ from .dnp3 import analyze_dnp3
 from .iec104 import analyze_iec104
 from .s7 import analyze_s7
 from .ot_risk import compute_ot_risk_posture, dedupe_findings
+from .progress import run_with_busy_status
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -64,6 +65,32 @@ class TimelineEvent:
 
 
 @dataclass(frozen=True)
+class DNSQueryDetail:
+    ts: Optional[float]
+    name: str
+    qtype: Optional[str]
+    src_ip: str
+    dst_ip: str
+    protocol: str
+    dst_port: Optional[int]
+
+
+@dataclass(frozen=True)
+class FileDownloadDetail:
+    ts: Optional[float]
+    protocol: str
+    src_ip: str
+    dst_ip: str
+    filename: str
+    file_type: str
+    size_bytes: Optional[int]
+    hostname: Optional[str]
+    content_type: Optional[str]
+    sha256: Optional[str]
+    md5: Optional[str]
+
+
+@dataclass(frozen=True)
 class TimelineSummary:
     path: Path
     target_ip: str
@@ -84,6 +111,8 @@ class TimelineSummary:
     ot_risk_score: int = 0
     ot_risk_findings: list[str] = field(default_factory=list)
     ot_storyline: list[str] = field(default_factory=list)
+    dns_queries: list[DNSQueryDetail] = field(default_factory=list)
+    file_downloads: list[FileDownloadDetail] = field(default_factory=list)
 
 
 def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSummary:
@@ -109,6 +138,8 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
             ot_risk_score=0,
             ot_risk_findings=[],
             ot_storyline=[],
+            dns_queries=[],
+            file_downloads=[],
         )
 
     target_ip = summary_list[0].target_ip
@@ -137,6 +168,10 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
     ot_bin_count = 0
     non_ot_bins: list[int] = []
     non_ot_bin_count = 0
+    merged_dns_queries: list[DNSQueryDetail] = []
+    merged_file_downloads: list[FileDownloadDetail] = []
+    seen_dns_keys: set[tuple[str, str, str, Optional[int], str]] = set()
+    seen_file_keys: set[tuple[str, str, str, str, str]] = set()
 
     for item in summary_list:
         if item.first_seen is not None:
@@ -163,6 +198,20 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
                 non_ot_bins.extend([0] * (len(item.non_ot_activity_bins) - len(non_ot_bins)))
             for idx, val in enumerate(item.non_ot_activity_bins):
                 non_ot_bins[idx] += val
+        if item.dns_queries:
+            for entry in item.dns_queries:
+                key = (entry.src_ip, entry.dst_ip, entry.name.lower(), entry.dst_port, entry.protocol)
+                if key in seen_dns_keys:
+                    continue
+                seen_dns_keys.add(key)
+                merged_dns_queries.append(entry)
+        if item.file_downloads:
+            for entry in item.file_downloads:
+                key = (entry.protocol, entry.src_ip, entry.dst_ip, entry.filename, entry.file_type)
+                if key in seen_file_keys:
+                    continue
+                seen_file_keys.add(key)
+                merged_file_downloads.append(entry)
 
     duration = None
     if first_seen is not None and last_seen is not None:
@@ -185,6 +234,8 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
         ot_activity_bin_count=ot_bin_count,
         non_ot_activity_bins=non_ot_bins,
         non_ot_activity_bin_count=non_ot_bin_count,
+        dns_queries=sorted(merged_dns_queries, key=lambda item: (item.ts is None, item.ts)),
+        file_downloads=sorted(merged_file_downloads, key=lambda item: (item.ts is None, item.ts)),
     )
     risk_score, risk_findings = _compute_ot_risk_posture(merged.events, target_ip)
     storyline = _compute_ot_storyline(merged.events, target_ip, merged.ot_protocol_counts, risk_score, risk_findings)
@@ -208,6 +259,8 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
         ot_risk_score=risk_score,
         ot_risk_findings=risk_findings,
         ot_storyline=storyline,
+        dns_queries=merged.dns_queries,
+        file_downloads=merged.file_downloads,
     )
     return merged
 
@@ -418,6 +471,30 @@ def _extract_winrm_command(payload: bytes | None) -> str | None:
 
 
 TELNET_COMMAND_RE = re.compile(r"^[#>$]\s*([A-Za-z0-9._:/\\-]+(?:\s+[^\r\n]{0,160})?)$", re.IGNORECASE | re.MULTILINE)
+TELNET_COMMAND_FALLBACK_RE = re.compile(r"^\s*([A-Za-z0-9._:/\\-]{2,}(?:\s+[^\r\n]{0,160})?)\s*$", re.IGNORECASE | re.MULTILINE)
+TELNET_COMMON_COMMANDS = {
+    "whoami",
+    "id",
+    "uname",
+    "ls",
+    "dir",
+    "pwd",
+    "cd",
+    "cat",
+    "type",
+    "ps",
+    "who",
+    "w",
+    "hostname",
+    "systeminfo",
+    "ipconfig",
+    "ifconfig",
+    "netstat",
+    "route",
+    "tracert",
+    "traceroute",
+    "ping",
+}
 
 
 def _extract_telnet_command(payload: bytes | None) -> str | None:
@@ -426,10 +503,32 @@ def _extract_telnet_command(payload: bytes | None) -> str | None:
     text = decode_payload(payload, encoding="latin-1")
     if not text:
         return None
-    match = TELNET_COMMAND_RE.search(text[:2000])
-    if not match:
-        return None
-    return match.group(1).strip()[:200]
+    view = text[:2000]
+    match = TELNET_COMMAND_RE.search(view)
+    if match:
+        return match.group(1).strip()[:200]
+
+    for line in view.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if "login:" in lower or "password:" in lower:
+            continue
+        if stripped[0] in "$#>":
+            stripped = stripped[1:].strip()
+            if stripped:
+                return stripped[:200]
+        head = stripped.split(" ", 1)[0].lower()
+        if head in TELNET_COMMON_COMMANDS or "whoami" in lower:
+            return stripped[:200]
+
+    match = TELNET_COMMAND_FALLBACK_RE.search(view)
+    if match:
+        candidate = match.group(1).strip()
+        if candidate and candidate.lower() not in {"login:", "password:"}:
+            return candidate[:200]
+    return None
 
 
 def _rpc_packet_type(payload: bytes | None) -> str | None:
@@ -763,7 +862,10 @@ def analyze_timeline(
     errors: list[str] = []
     events: list[TimelineEvent] = []
 
-    file_summary = analyze_files(path, show_status=False)
+    def _busy(desc: str, func, *args, **kwargs):
+        return run_with_busy_status(path, show_status, f"Timeline: {desc}", func, *args, **kwargs)
+
+    file_summary = _busy("Files", analyze_files, path, show_status=False)
     artifacts_for_ip = [
         art for art in file_summary.artifacts
         if art.src_ip == target_ip or art.dst_ip == target_ip
@@ -789,6 +891,7 @@ def analyze_timeline(
     seen_ldap_flows: set[tuple[str, int, str, str]] = set()
     seen_email_flows: set[tuple[str, int, str, str, str]] = set()
     seen_email_actions: set[tuple[str, int, str, str, str, str]] = set()
+    seen_telnet_flows: set[tuple[str, int, str, str]] = set()
     scan_ports: dict[str, set[int]] = defaultdict(set)
     scan_first: dict[str, float] = {}
     scan_last: dict[str, float] = {}
@@ -801,7 +904,14 @@ def analyze_timeline(
     seen_nbns_events: set[tuple[str, str, str]] = set()
     seen_snmp_events: set[tuple[str, str, int, str]] = set()
     seen_netbios_sessions: set[tuple[str, str, int]] = set()
+    dns_queries: list[DNSQueryDetail] = []
+    file_downloads: list[FileDownloadDetail] = []
+    seen_dns_queries: set[tuple[str, str, int, str, str, Optional[int]]] = set()
+    seen_file_downloads: set[tuple[str, str, str, str, str]] = set()
     tcp_handshakes: dict[tuple[str, str, int, int], list[dict[str, Optional[float]]]] = defaultdict(list)
+    seen_event_keys: set[tuple] = set()
+    seen_tcp_syns: set[tuple[str, str, int, int, int]] = set()
+    seen_tcp_synacks: set[tuple[str, str, int, int, int, int]] = set()
 
     def _new_handshake(syn_ts: Optional[float] = None, synack_ts: Optional[float] = None) -> dict[str, Optional[float]]:
         return {"syn": syn_ts, "synack": synack_ts, "ack": None}
@@ -820,6 +930,48 @@ def analyze_timeline(
             if handshake["synack"] is not None and handshake["ack"] is None:
                 return handshake
         return None
+
+    def _layer_signature(layer, limit: int = 48) -> bytes:
+        if layer is None:
+            return b""
+        try:
+            raw = bytes(layer)
+        except Exception:
+            return b""
+        return raw[:limit]
+
+    def _icmp_signature(pkt) -> tuple[str, bytes]:
+        if ICMP is not None and pkt.haslayer(ICMP):  # type: ignore[truthy-bool]
+            return ("icmp4", _layer_signature(pkt[ICMP]))  # type: ignore[index]
+        if ICMPv6EchoRequest is not None and pkt.haslayer(ICMPv6EchoRequest):  # type: ignore[truthy-bool]
+            return ("icmp6-echo-request", _layer_signature(pkt[ICMPv6EchoRequest]))  # type: ignore[index]
+        if ICMPv6EchoReply is not None and pkt.haslayer(ICMPv6EchoReply):  # type: ignore[truthy-bool]
+            return ("icmp6-echo-reply", _layer_signature(pkt[ICMPv6EchoReply]))  # type: ignore[index]
+        if ICMPv6ND_NS is not None and pkt.haslayer(ICMPv6ND_NS):  # type: ignore[truthy-bool]
+            return ("icmp6-nd-ns", _layer_signature(pkt[ICMPv6ND_NS]))  # type: ignore[index]
+        if ICMPv6ND_NA is not None and pkt.haslayer(ICMPv6ND_NA):  # type: ignore[truthy-bool]
+            return ("icmp6-nd-na", _layer_signature(pkt[ICMPv6ND_NA]))  # type: ignore[index]
+        return ("icmp", b"")
+
+    def _emit_event(
+        ts: Optional[float],
+        category: str,
+        summary: str,
+        details: str,
+        dedupe_key: tuple | None = None,
+    ) -> None:
+        if dedupe_key is None:
+            time_bucket = int(ts) if ts is not None else None
+            dedupe_key = ("event", category, summary, details, time_bucket)
+        if dedupe_key in seen_event_keys:
+            return
+        seen_event_keys.add(dedupe_key)
+        events.append(TimelineEvent(
+            ts=ts,
+            category=category,
+            summary=summary,
+            details=details,
+        ))
 
     domain_ports = {88, 464, 445, 139, 135, 593, 3268, 3269}
     ldap_ports = {389, 636, 3268, 3269}
@@ -868,12 +1020,14 @@ def analyze_timeline(
             if (src_ip == target_ip or dst_ip == target_ip):
                 label = _icmp_label(pkt)
                 if label:
-                    events.append(TimelineEvent(
+                    dedupe_key = ("icmp", src_ip, dst_ip, label, _icmp_signature(pkt))
+                    _emit_event(
                         ts=ts,
                         category="ICMP",
                         summary=label,
                         details=f"{src_ip} -> {dst_ip}",
-                    ))
+                        dedupe_key=dedupe_key,
+                    )
 
             if DNS is not None and DNSQR is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
                 dns_layer = pkt[DNS]  # type: ignore[index]
@@ -894,32 +1048,59 @@ def analyze_timeline(
                         key = (direction, name, str(qtype))
                         if key not in seen_mdns_events and (src_ip == target_ip or dst_ip == target_ip):
                             seen_mdns_events.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="mDNS",
                                 summary=f"mDNS {direction}",
                                 details=f"{src_ip} -> {dst_ip} {name} (type {qtype})",
-                            ))
+                            )
                 if getattr(dns_layer, "qr", 1) == 0 and src_ip == target_ip:
                     try:
                         qd = dns_layer.qd  # type: ignore[attr-defined]
                         qname = getattr(qd, "qname", b"")
                         qtype = getattr(qd, "qtype", None)
                         name = qname.decode("utf-8", errors="ignore").rstrip(".") if isinstance(qname, (bytes, bytearray)) else str(qname)
-                        events.append(TimelineEvent(
+                        dns_id = int(getattr(dns_layer, "id", 0) or 0)
+                        transport = "-"
+                        dst_port: Optional[int] = None
+                        if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+                            udp_layer = pkt[UDP]  # type: ignore[index]
+                            dst_port = int(getattr(udp_layer, "dport", 0) or 0) or None
+                            transport = "UDP"
+                        elif TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+                            tcp_layer = pkt[TCP]  # type: ignore[index]
+                            dst_port = int(getattr(tcp_layer, "dport", 0) or 0) or None
+                            transport = "TCP"
+                        qname_lower = name.lower()
+                        dedupe_key = ("dns-query", src_ip, dst_ip, dns_id, qname_lower, qtype)
+                        _emit_event(
                             ts=ts,
                             category="DNS",
                             summary="DNS query",
                             details=f"{target_ip} queried {name} (type {qtype})",
-                        ))
-                        qname_lower = name.lower()
+                            dedupe_key=dedupe_key,
+                        )
+                        query_key = (src_ip, dst_ip, dns_id, qname_lower, str(qtype), dst_port)
+                        if query_key not in seen_dns_queries:
+                            seen_dns_queries.add(query_key)
+                            dns_queries.append(DNSQueryDetail(
+                                ts=ts,
+                                name=name,
+                                qtype=str(qtype) if qtype is not None else None,
+                                src_ip=src_ip,
+                                dst_ip=dst_ip,
+                                protocol=transport,
+                                dst_port=dst_port,
+                            ))
                         if any(token in qname_lower for token in ("_ldap._tcp", "_kerberos._tcp", "_gc._tcp", "_msdcs")):
-                            events.append(TimelineEvent(
+                            dedupe_key = ("domain-discovery", src_ip, dst_ip, dns_id, qname_lower, qtype)
+                            _emit_event(
                                 ts=ts,
                                 category="MS Domain",
                                 summary="Domain service discovery",
                                 details=f"{target_ip} queried {name}",
-                            ))
+                                dedupe_key=dedupe_key,
+                            )
                     except Exception:
                         pass
 
@@ -958,6 +1139,8 @@ def analyze_timeline(
                 is_final_ack = is_ack and not is_syn and not is_rst and not is_fin
                 sport = int(getattr(tcp_layer, "sport", 0) or 0)
                 dport = int(getattr(tcp_layer, "dport", 0) or 0)
+                seq = int(getattr(tcp_layer, "seq", 0) or 0)
+                ack = int(getattr(tcp_layer, "ack", 0) or 0)
                 payload = None
                 try:
                     payload = bytes(tcp_layer.payload)
@@ -965,16 +1148,22 @@ def analyze_timeline(
                     payload = None
                 if (src_ip == target_ip or dst_ip == target_ip) and sport and dport:
                     if is_syn_only:
-                        key = (src_ip, dst_ip, sport, dport)
-                        tcp_handshakes[key].append(_new_handshake(syn_ts=ts))
+                        syn_key = (src_ip, dst_ip, sport, dport, seq)
+                        if syn_key not in seen_tcp_syns:
+                            seen_tcp_syns.add(syn_key)
+                            key = (src_ip, dst_ip, sport, dport)
+                            tcp_handshakes[key].append(_new_handshake(syn_ts=ts))
                     elif is_synack:
-                        key = (dst_ip, src_ip, dport, sport)
-                        bucket = tcp_handshakes[key]
-                        handshake = _find_handshake_for_synack(bucket)
-                        if handshake is None:
-                            handshake = _new_handshake()
-                            bucket.append(handshake)
-                        handshake["synack"] = ts
+                        synack_key = (src_ip, dst_ip, sport, dport, seq, ack)
+                        if synack_key not in seen_tcp_synacks:
+                            seen_tcp_synacks.add(synack_key)
+                            key = (dst_ip, src_ip, dport, sport)
+                            bucket = tcp_handshakes[key]
+                            handshake = _find_handshake_for_synack(bucket)
+                            if handshake is None:
+                                handshake = _new_handshake()
+                                bucket.append(handshake)
+                            handshake["synack"] = ts
                     elif is_final_ack:
                         key = (src_ip, dst_ip, sport, dport)
                         bucket = tcp_handshakes.get(key)
@@ -1006,12 +1195,12 @@ def analyze_timeline(
                                             detail = f"{target_ip} -> {peer_ip}:{port_key} unit {unit_id} {func_name}"
                                             if is_exc and exc_desc:
                                                 detail += f" (Exception: {exc_desc})"
-                                            events.append(TimelineEvent(
+                                            _emit_event(
                                                 ts=ts,
                                                 category="Modbus",
                                                 summary=label,
                                                 details=detail,
-                                            ))
+                                            )
                                             cmd_event_added = True
                                 elif proto in {"ENIP", "CIP"} and port_key in {44818, 2222}:
                                     enip = _parse_enip_command(payload)
@@ -1021,12 +1210,12 @@ def analyze_timeline(
                                         key = (proto, direction, peer_ip, port_key, label)
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
-                                            events.append(TimelineEvent(
+                                            _emit_event(
                                                 ts=ts,
                                                 category=proto,
                                                 summary=f"{proto} {label}",
                                                 details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            ))
+                                            )
                                             cmd_event_added = True
                                 elif proto == "OPC UA" and port_key == OPC_UA_PORT:
                                     msg = _parse_opcua_message(payload)
@@ -1035,12 +1224,12 @@ def analyze_timeline(
                                         key = (proto, direction, peer_ip, port_key, label)
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
-                                            events.append(TimelineEvent(
+                                            _emit_event(
                                                 ts=ts,
                                                 category="OPC UA",
                                                 summary=label,
                                                 details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            ))
+                                            )
                                             cmd_event_added = True
                                 elif proto == "IEC-104" and port_key == IEC104_PORT:
                                     frame = _iec104_frame_type(payload)
@@ -1049,12 +1238,12 @@ def analyze_timeline(
                                         key = (proto, direction, peer_ip, port_key, label)
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
-                                            events.append(TimelineEvent(
+                                            _emit_event(
                                                 ts=ts,
                                                 category="IEC-104",
                                                 summary=label,
                                                 details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            ))
+                                            )
                                             cmd_event_added = True
                                 elif proto == "DNP3" and port_key == DNP3_PORT:
                                     if _dnp3_frame_seen(payload):
@@ -1062,12 +1251,12 @@ def analyze_timeline(
                                         key = (proto, direction, peer_ip, port_key, label)
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
-                                            events.append(TimelineEvent(
+                                            _emit_event(
                                                 ts=ts,
                                                 category="DNP3",
                                                 summary=label,
                                                 details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            ))
+                                            )
                                             cmd_event_added = True
                                 elif proto == "S7" and port_key == S7_PORT:
                                     if _s7comm_seen(payload):
@@ -1075,70 +1264,80 @@ def analyze_timeline(
                                         key = (proto, direction, peer_ip, port_key, label)
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
-                                            events.append(TimelineEvent(
+                                            _emit_event(
                                                 ts=ts,
                                                 category="S7",
                                                 summary=label,
                                                 details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            ))
+                                            )
                                             cmd_event_added = True
 
                                 if not cmd_event_added:
                                     flow_key = (proto, direction, peer_ip, port_key)
                                     if flow_key not in seen_ot_flows:
                                         seen_ot_flows.add(flow_key)
-                                        events.append(TimelineEvent(
+                                        _emit_event(
                                             ts=ts,
                                             category=proto,
                                             summary=f"{proto} flow",
                                             details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                        ))
+                                        )
                 if src_ip == target_ip:
+                    if dport in TELNET_PORTS:
+                        key = (dst_ip, dport, "TCP", "outbound")
+                        if key not in seen_telnet_flows:
+                            seen_telnet_flows.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="Telnet",
+                                summary="Telnet connection",
+                                details=f"{target_ip} -> {dst_ip}:{dport}",
+                            )
                     if dport in {139, 445}:
                         hint = _netbios_session_hint(payload)
                         if hint:
                             key = (src_ip, dst_ip, dport)
                             if key not in seen_netbios_sessions:
                                 seen_netbios_sessions.add(key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="NetBIOS",
                                     summary=hint,
                                     details=f"{target_ip} -> {dst_ip}:{dport}",
-                                ))
+                                )
                     rpc_type = _rpc_packet_type(payload)
                     if rpc_type and dport in {135, 445, 593}:
                         key = (src_ip, dst_ip, dport, rpc_type)
                         if key not in seen_rpc_events:
                             seen_rpc_events.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="RPC",
                                 summary=f"RPC {rpc_type}",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
-                            ))
+                            )
                     ps_cmd = _extract_powershell_command(payload)
                     if ps_cmd:
                         key = (src_ip, dst_ip, dport, ps_cmd)
                         if key not in seen_ps_commands:
                             seen_ps_commands.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="PowerShell",
                                 summary="PowerShell command",
                                 details=f"{target_ip} -> {dst_ip}:{dport} {ps_cmd}",
-                            ))
+                            )
                     wmic_cmd = _extract_wmic_command(payload)
                     if wmic_cmd:
                         key = (src_ip, dst_ip, dport, wmic_cmd)
                         if key not in seen_wmic_commands:
                             seen_wmic_commands.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="WMIC",
                                 summary="WMIC command",
                                 details=f"{target_ip} -> {dst_ip}:{dport} {wmic_cmd}",
-                            ))
+                            )
                     payload_text = decode_payload(payload, encoding="latin-1") if payload else ""
                     if payload and (dport in WINRM_PORTS or (payload_text and WSMAN_RE.search(payload_text))):
                         winrm_cmd = _extract_winrm_command(payload)
@@ -1146,24 +1345,24 @@ def analyze_timeline(
                             key = (src_ip, dst_ip, dport, winrm_cmd)
                             if key not in seen_winrm_commands:
                                 seen_winrm_commands.add(key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="WinRM",
                                     summary="WinRM command",
                                     details=f"{target_ip} -> {dst_ip}:{dport} {winrm_cmd}",
-                                ))
+                                )
                     if payload and dport in TELNET_PORTS:
                         telnet_cmd = _extract_telnet_command(payload)
                         if telnet_cmd:
                             key = (src_ip, dst_ip, dport, telnet_cmd)
                             if key not in seen_telnet_commands:
                                 seen_telnet_commands.add(key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="Telnet",
                                     summary="Telnet command",
                                     details=f"{target_ip} -> {dst_ip}:{dport} {telnet_cmd}",
-                                ))
+                                )
                     if payload and payload.startswith(b"POST "):
                         try:
                             line = payload.split(b"\r\n", 1)[0].decode("latin-1", errors="ignore")
@@ -1172,140 +1371,162 @@ def analyze_timeline(
                                 if header.lower().startswith(b"host:"):
                                     host = header.decode("latin-1", errors="ignore").split(":", 1)[1].strip()
                                     break
-                            events.append(TimelineEvent(
+                            dedupe_key = ("http-post", src_ip, dst_ip, dport, seq, line, host)
+                            _emit_event(
                                 ts=ts,
                                 category="HTTP",
                                 summary="HTTP POST",
                                 details=f"{target_ip} -> {dst_ip}:{dport} {line} Host: {host}",
-                            ))
+                                dedupe_key=dedupe_key,
+                            )
                         except Exception:
-                            events.append(TimelineEvent(
+                            dedupe_key = ("http-post", src_ip, dst_ip, dport, seq)
+                            _emit_event(
                                 ts=ts,
                                 category="HTTP",
                                 summary="HTTP POST",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
-                            ))
+                                dedupe_key=dedupe_key,
+                            )
                     if dport in EMAIL_PORT_SERVICES:
                         service = EMAIL_PORT_SERVICES[dport]
                         flow_key = (dst_ip, dport, "TCP", "outbound", service)
                         if flow_key not in seen_email_flows:
                             seen_email_flows.add(flow_key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="Email",
                                 summary=f"{service} connection",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
-                            ))
+                            )
                         first_line = _decode_payload_line(payload)
                         command = _extract_email_command(service, first_line)
                         if command:
                             action_key = (dst_ip, dport, "TCP", "outbound", service, command)
                             if action_key not in seen_email_actions:
                                 seen_email_actions.add(action_key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="Email",
                                     summary=f"{service} command",
                                     details=f"{target_ip} -> {dst_ip}:{dport} {command}",
-                                ))
+                                )
                     if dport in ldap_ports:
                         key = (dst_ip, dport, "TCP", "outbound")
                         if key not in seen_ldap_flows:
                             seen_ldap_flows.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="LDAP",
                                 summary="LDAP connection",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
-                            ))
+                            )
                     if dport in domain_ports:
                         key = (dst_ip, dport, "TCP", "outbound")
                         if key not in seen_domain_flows:
                             seen_domain_flows.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="MS Domain",
                                 summary="Domain service access",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
-                            ))
+                            )
                     if is_syn_only and dport:
-                        events.append(TimelineEvent(
+                        dedupe_key = ("tcp-syn", src_ip, dst_ip, sport, dport, seq)
+                        _emit_event(
                             ts=ts,
                             category="Connection",
                             summary="TCP connect attempt",
                             details=f"{target_ip} -> {dst_ip}:{dport} (SYN)",
-                        ))
+                            dedupe_key=dedupe_key,
+                        )
                         scan_ports[dst_ip].add(dport)
                         if ts is not None:
                             scan_first.setdefault(dst_ip, ts)
                             scan_last[dst_ip] = ts
                     if is_synack and sport:
-                        events.append(TimelineEvent(
+                        dedupe_key = ("tcp-synack", src_ip, dst_ip, sport, dport, seq, ack)
+                        _emit_event(
                             ts=ts,
                             category="Connection",
                             summary="TCP SYN-ACK",
                             details=f"{target_ip} -> {dst_ip}:{sport} (SYN-ACK)",
-                        ))
+                            dedupe_key=dedupe_key,
+                        )
                 elif dst_ip == target_ip:
+                    if sport in TELNET_PORTS:
+                        key = (src_ip, sport, "TCP", "inbound")
+                        if key not in seen_telnet_flows:
+                            seen_telnet_flows.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="Telnet",
+                                summary="Telnet connection",
+                                details=f"{src_ip} -> {target_ip}:{sport}",
+                            )
                     if is_syn_only and dport:
-                        events.append(TimelineEvent(
+                        dedupe_key = ("tcp-syn", src_ip, dst_ip, sport, dport, seq)
+                        _emit_event(
                             ts=ts,
                             category="Connection",
                             summary="TCP connect attempt",
                             details=f"{src_ip} -> {target_ip}:{dport} (SYN)",
-                        ))
+                            dedupe_key=dedupe_key,
+                        )
                     if is_synack and sport:
-                        events.append(TimelineEvent(
+                        dedupe_key = ("tcp-synack", src_ip, dst_ip, sport, dport, seq, ack)
+                        _emit_event(
                             ts=ts,
                             category="Connection",
                             summary="TCP SYN-ACK",
                             details=f"{src_ip} -> {target_ip}:{sport} (SYN-ACK)",
-                        ))
+                            dedupe_key=dedupe_key,
+                        )
                     if sport in {139, 445}:
                         hint = _netbios_session_hint(payload)
                         if hint:
                             key = (src_ip, dst_ip, sport)
                             if key not in seen_netbios_sessions:
                                 seen_netbios_sessions.add(key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="NetBIOS",
                                     summary=hint,
                                     details=f"{src_ip} -> {target_ip}:{sport}",
-                                ))
+                                )
                     rpc_type = _rpc_packet_type(payload)
                     if rpc_type and sport in {135, 445, 593}:
                         key = (src_ip, dst_ip, sport, rpc_type)
                         if key not in seen_rpc_events:
                             seen_rpc_events.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="RPC",
                                 summary=f"RPC {rpc_type}",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
-                            ))
+                            )
                     ps_cmd = _extract_powershell_command(payload)
                     if ps_cmd:
                         key = (src_ip, dst_ip, sport, ps_cmd)
                         if key not in seen_ps_commands:
                             seen_ps_commands.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="PowerShell",
                                 summary="PowerShell command",
                                 details=f"{src_ip} -> {target_ip}:{sport} {ps_cmd}",
-                            ))
+                            )
                     wmic_cmd = _extract_wmic_command(payload)
                     if wmic_cmd:
                         key = (src_ip, dst_ip, sport, wmic_cmd)
                         if key not in seen_wmic_commands:
                             seen_wmic_commands.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="WMIC",
                                 summary="WMIC command",
                                 details=f"{src_ip} -> {target_ip}:{sport} {wmic_cmd}",
-                            ))
+                            )
                     payload_text = decode_payload(payload, encoding="latin-1") if payload else ""
                     if payload and (sport in WINRM_PORTS or (payload_text and WSMAN_RE.search(payload_text))):
                         winrm_cmd = _extract_winrm_command(payload)
@@ -1313,67 +1534,67 @@ def analyze_timeline(
                             key = (src_ip, dst_ip, sport, winrm_cmd)
                             if key not in seen_winrm_commands:
                                 seen_winrm_commands.add(key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="WinRM",
                                     summary="WinRM command",
                                     details=f"{src_ip} -> {target_ip}:{sport} {winrm_cmd}",
-                                ))
+                                )
                     if payload and sport in TELNET_PORTS:
                         telnet_cmd = _extract_telnet_command(payload)
                         if telnet_cmd:
                             key = (src_ip, dst_ip, sport, telnet_cmd)
                             if key not in seen_telnet_commands:
                                 seen_telnet_commands.add(key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="Telnet",
                                     summary="Telnet command",
                                     details=f"{src_ip} -> {target_ip}:{sport} {telnet_cmd}",
-                                ))
+                                )
                     if sport in EMAIL_PORT_SERVICES:
                         service = EMAIL_PORT_SERVICES[sport]
                         flow_key = (src_ip, sport, "TCP", "inbound", service)
                         if flow_key not in seen_email_flows:
                             seen_email_flows.add(flow_key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="Email",
                                 summary=f"{service} connection",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
-                            ))
+                            )
                         first_line = _decode_payload_line(payload)
                         command = _extract_email_command(service, first_line)
                         if command:
                             action_key = (src_ip, sport, "TCP", "inbound", service, command)
                             if action_key not in seen_email_actions:
                                 seen_email_actions.add(action_key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="Email",
                                     summary=f"{service} command",
                                     details=f"{src_ip} -> {target_ip}:{sport} {command}",
-                                ))
+                                )
                     if sport in ldap_ports:
                         key = (src_ip, sport, "TCP", "inbound")
                         if key not in seen_ldap_flows:
                             seen_ldap_flows.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="LDAP",
                                 summary="LDAP connection",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
-                            ))
+                            )
                     if sport in domain_ports:
                         key = (src_ip, sport, "TCP", "inbound")
                         if key not in seen_domain_flows:
                             seen_domain_flows.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="MS Domain",
                                 summary="Domain service access",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
-                            ))
+                            )
 
             if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                 udp_layer = pkt[UDP]  # type: ignore[index]
@@ -1401,143 +1622,143 @@ def analyze_timeline(
                                         key = (proto, direction, peer_ip, port_key, label)
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
-                                            events.append(TimelineEvent(
+                                            _emit_event(
                                                 ts=ts,
                                                 category="DNP3",
                                                 summary=label,
                                                 details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            ))
+                                            )
                                             cmd_event_added = True
                                 if not cmd_event_added:
                                     flow_key = (proto, direction, peer_ip, port_key)
                                     if flow_key not in seen_ot_flows:
                                         seen_ot_flows.add(flow_key)
-                                        events.append(TimelineEvent(
+                                        _emit_event(
                                             ts=ts,
                                             category=proto,
                                             summary=f"{proto} flow",
                                             details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                        ))
+                                        )
                 if src_ip == target_ip:
                     if dport:
                         key = (dst_ip, dport)
                         if key not in seen_udp_flows:
                             seen_udp_flows.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="Connection",
                                 summary="UDP flow",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
-                            ))
+                            )
                         rpc_type = _rpc_packet_type(payload)
                         if rpc_type and dport in {135, 445, 593}:
                             key = (src_ip, dst_ip, dport, rpc_type)
                             if key not in seen_rpc_events:
                                 seen_rpc_events.add(key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="RPC",
                                     summary=f"RPC {rpc_type}",
                                     details=f"{target_ip} -> {dst_ip}:{dport}",
-                                ))
+                                )
                         if dport in {137, 138, 139}:
                             action, name = _nbns_info(pkt)
                             key = ("outbound", action, name)
                             if key not in seen_nbns_events:
                                 seen_nbns_events.add(key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="NetBIOS",
                                     summary=action,
                                     details=f"{target_ip} -> {dst_ip}:{dport} {name}",
-                                ))
+                                )
                         if dport in {161, 162}:
                             snmp_type = _snmp_pdu_type(payload)
                             if snmp_type:
                                 key = (src_ip, dst_ip, dport, snmp_type)
                                 if key not in seen_snmp_events:
                                     seen_snmp_events.add(key)
-                                    events.append(TimelineEvent(
+                                    _emit_event(
                                         ts=ts,
                                         category="SNMP",
                                         summary=f"SNMP {snmp_type}",
                                         details=f"{target_ip} -> {dst_ip}:{dport}",
-                                    ))
+                                    )
                         if dport in ldap_ports:
                             key = (dst_ip, dport, "UDP", "outbound")
                             if key not in seen_ldap_flows:
                                 seen_ldap_flows.add(key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="LDAP",
                                     summary="LDAP activity",
                                     details=f"{target_ip} -> {dst_ip}:{dport}",
-                                ))
+                                )
                         if dport in domain_ports:
                             key = (dst_ip, dport, "UDP", "outbound")
                             if key not in seen_domain_flows:
                                 seen_domain_flows.add(key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="MS Domain",
                                     summary="Domain service activity",
                                     details=f"{target_ip} -> {dst_ip}:{dport}",
-                                ))
+                                )
                 elif dst_ip == target_ip:
                     rpc_type = _rpc_packet_type(payload)
                     if rpc_type and sport in {135, 445, 593}:
                         key = (src_ip, dst_ip, sport, rpc_type)
                         if key not in seen_rpc_events:
                             seen_rpc_events.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="RPC",
                                 summary=f"RPC {rpc_type}",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
-                            ))
+                            )
                     if sport in {137, 138, 139}:
                         action, name = _nbns_info(pkt)
                         key = ("inbound", action, name)
                         if key not in seen_nbns_events:
                             seen_nbns_events.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="NetBIOS",
                                 summary=action,
                                 details=f"{src_ip} -> {target_ip}:{sport} {name}",
-                            ))
+                            )
                     if sport in {161, 162}:
                         snmp_type = _snmp_pdu_type(payload)
                         if snmp_type:
                             key = (src_ip, dst_ip, sport, snmp_type)
                             if key not in seen_snmp_events:
                                 seen_snmp_events.add(key)
-                                events.append(TimelineEvent(
+                                _emit_event(
                                     ts=ts,
                                     category="SNMP",
                                     summary=f"SNMP {snmp_type}",
                                     details=f"{src_ip} -> {target_ip}:{sport}",
-                                ))
+                                )
                     if sport in ldap_ports:
                         key = (src_ip, sport, "UDP", "inbound")
                         if key not in seen_ldap_flows:
                             seen_ldap_flows.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="LDAP",
                                 summary="LDAP activity",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
-                            ))
+                            )
                     if sport in domain_ports:
                         key = (src_ip, sport, "UDP", "inbound")
                         if key not in seen_domain_flows:
                             seen_domain_flows.add(key)
-                            events.append(TimelineEvent(
+                            _emit_event(
                                 ts=ts,
                                 category="MS Domain",
                                 summary="Domain service activity",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
-                            ))
+                            )
     finally:
         status.finish()
         reader.close()
@@ -1548,12 +1769,39 @@ def analyze_timeline(
         category = "File Transfer"
         if art.protocol.upper().startswith("SMB"):
             category = "SMB"
-        events.append(TimelineEvent(
+        dedupe_key = (
+            "file-artifact",
+            art.protocol,
+            art.filename,
+            art.file_type,
+            art.src_ip,
+            art.dst_ip,
+            art.packet_index or 0,
+        )
+        _emit_event(
             ts=ts,
             category=category,
             summary="File artifact",
             details=details,
-        ))
+            dedupe_key=dedupe_key,
+        )
+        if art.dst_ip == target_ip:
+            file_key = (art.protocol, art.src_ip, art.dst_ip, art.filename, art.file_type)
+            if file_key not in seen_file_downloads:
+                seen_file_downloads.add(file_key)
+                file_downloads.append(FileDownloadDetail(
+                    ts=ts,
+                    protocol=art.protocol,
+                    src_ip=art.src_ip,
+                    dst_ip=art.dst_ip,
+                    filename=art.filename,
+                    file_type=art.file_type,
+                    size_bytes=art.size_bytes,
+                    hostname=art.hostname,
+                    content_type=art.content_type,
+                    sha256=art.sha256,
+                    md5=art.md5,
+                ))
 
     for dst_ip, ports in scan_ports.items():
         if len(ports) >= 100:
@@ -1562,12 +1810,12 @@ def analyze_timeline(
             duration = "-"
             if first is not None and last is not None:
                 duration = f"{max(0.0, last - first):.1f}s"
-            events.append(TimelineEvent(
+            _emit_event(
                 ts=last,
                 category="Recon",
                 summary="Potential port scan",
                 details=f"{target_ip} -> {dst_ip} touched {len(ports)} ports over {duration}",
-            ))
+            )
 
     for (client_ip, server_ip, client_port, server_port), handshakes in tcp_handshakes.items():
         for handshake in handshakes:
@@ -1579,15 +1827,25 @@ def analyze_timeline(
                 f"{client_ip}:{client_port} -> {server_ip}:{server_port} "
                 "(SYN/SYN-ACK seen, final ACK missing)"
             )
-            events.append(TimelineEvent(
+            dedupe_key = (
+                "tcp-handshake-incomplete",
+                client_ip,
+                server_ip,
+                client_port,
+                server_port,
+                handshake["syn"],
+                handshake["synack"],
+            )
+            _emit_event(
                 ts=handshake["synack"],
                 category="Connection",
                 summary="TCP handshake incomplete",
                 details=detail,
-            ))
+                dedupe_key=dedupe_key,
+            )
 
     if "DNP3" in ot_protocol_counts:
-        dnp3_summary = analyze_dnp3(path, show_status=False)
+        dnp3_summary = _busy("DNP3", analyze_dnp3, path, show_status=False)
         errors.extend(dnp3_summary.errors)
         seen_msgs: set[tuple[str, str, str, int, int]] = set()
         for msg in dnp3_summary.messages:
@@ -1597,45 +1855,45 @@ def analyze_timeline(
             if key in seen_msgs:
                 continue
             seen_msgs.add(key)
-            events.append(TimelineEvent(
+            _emit_event(
                 ts=msg.ts,
                 category="DNP3",
                 summary=f"DNP3 {msg.func_name}",
                 details=f"{msg.src_ip} -> {msg.dst_ip} addr {msg.src_addr}->{msg.dst_addr}",
-            ))
+            )
             if len(seen_msgs) >= 200:
                 break
         for anomaly in dnp3_summary.anomalies:
             if anomaly.src != target_ip and anomaly.dst != target_ip:
                 continue
-            events.append(TimelineEvent(
+            _emit_event(
                 ts=anomaly.ts,
                 category="DNP3",
                 summary=anomaly.title,
                 details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
-            ))
+            )
 
     if "IEC-104" in ot_protocol_counts:
-        iec_summary = analyze_iec104(path, show_status=False)
+        iec_summary = _busy("IEC-104", analyze_iec104, path, show_status=False)
         errors.extend(iec_summary.errors)
         for anomaly in iec_summary.anomalies:
             if anomaly.src != target_ip and anomaly.dst != target_ip:
                 continue
-            events.append(TimelineEvent(
+            _emit_event(
                 ts=anomaly.ts,
                 category="IEC-104",
                 summary=anomaly.title,
                 details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
-            ))
+            )
         for artifact in iec_summary.artifacts:
             if artifact.src != target_ip and artifact.dst != target_ip:
                 continue
-            events.append(TimelineEvent(
+            _emit_event(
                 ts=artifact.ts,
                 category="IEC-104",
                 summary=f"IEC-104 artifact ({artifact.kind})",
                 details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
-            ))
+            )
         if iec_summary.command_events:
             seen_cmds: set[tuple[str, str, str, int]] = set()
             for cmd_event in iec_summary.command_events:
@@ -1645,34 +1903,34 @@ def analyze_timeline(
                 if key in seen_cmds:
                     continue
                 seen_cmds.add(key)
-                events.append(TimelineEvent(
+                _emit_event(
                     ts=cmd_event.ts,
                     category="IEC-104",
                     summary=f"IEC-104 {cmd_event.command}",
                     details=f"{cmd_event.src} -> {cmd_event.dst}",
-                ))
+                )
 
     if "S7" in ot_protocol_counts:
-        s7_summary = analyze_s7(path, show_status=False)
+        s7_summary = _busy("S7", analyze_s7, path, show_status=False)
         errors.extend(s7_summary.errors)
         for anomaly in s7_summary.anomalies:
             if anomaly.src != target_ip and anomaly.dst != target_ip:
                 continue
-            events.append(TimelineEvent(
+            _emit_event(
                 ts=anomaly.ts,
                 category="S7",
                 summary=anomaly.title,
                 details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
-            ))
+            )
         for artifact in s7_summary.artifacts:
             if artifact.src != target_ip and artifact.dst != target_ip:
                 continue
-            events.append(TimelineEvent(
+            _emit_event(
                 ts=artifact.ts,
                 category="S7",
                 summary=f"S7 artifact ({artifact.kind})",
                 details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
-            ))
+            )
         if s7_summary.command_events:
             seen_cmds: set[tuple[str, str, str, int]] = set()
             for cmd_event in s7_summary.command_events:
@@ -1682,12 +1940,12 @@ def analyze_timeline(
                 if key in seen_cmds:
                     continue
                 seen_cmds.add(key)
-                events.append(TimelineEvent(
+                _emit_event(
                     ts=cmd_event.ts,
                     category="S7",
                     summary=f"S7 {cmd_event.command}",
                     details=f"{cmd_event.src} -> {cmd_event.dst}",
-                ))
+                )
 
     if categories is not None:
         events = [event for event in events if event.category in categories]
@@ -1733,4 +1991,6 @@ def analyze_timeline(
         ot_risk_score=ot_risk_score,
         ot_risk_findings=ot_risk_findings,
         ot_storyline=ot_storyline,
+        dns_queries=sorted(dns_queries, key=lambda item: (item.ts is None, item.ts)),
+        file_downloads=sorted(file_downloads, key=lambda item: (item.ts is None, item.ts)),
     )

@@ -64,6 +64,11 @@ For development:
 pip install -e .
 ```
 
+### Platform Notes
+
+- `--bpf` filtering depends on libpcap. On Windows, install Npcap and ensure Scapy can access it. If BPF is unavailable, Pcapper will fall back to non-BPF packet parsing.
+- Colored output is enabled only for TTYs. Use `--no-color` or set `NO_COLOR=1` to disable ANSI colors.
+
 ## Usage
 
 ```bash
@@ -119,6 +124,7 @@ Client                   Server                   Start                     End 
 ```
 
 Secrets/credentials are redacted by default in reports. Use `--show-secrets` to display them.
+Exports (JSON/CSV/SQLite) are redacted by default; use `--export-raw` to disable export redaction or `--export-redact` to force it.
 
 ## Summarize behavior
 
@@ -144,12 +150,14 @@ python -m pcapper --help
 
 ### General flags
 
-- `--bpf EXPR`
 - `--base`
+- `--bpf EXPR`
 - `--case-dir DIR`
 - `--case-name NAME`
 - `-case`
 - `--csv PATH`
+- `--export-raw`
+- `--export-redact`
 - `--extract FILENAME`
 - `--follow FLOW`
 - `--follow-id STREAM_ID`
@@ -160,16 +168,24 @@ python -m pcapper --help
 - `--lookup-stream-id STREAM_ID`
 - `--no-color`
 - `--no-status`
+- `--packet N`
+- `--profile`
+- `--profile-out PATH`
 - `-r, --recursive`
-- `--sqlite PATH`
 - `--search STRING`
 - `--show-secrets`
+- `--sqlite PATH`
 - `--streams-full`
 - `-summarize, --summarize`
 - `--time-end TIME`
 - `--time-start TIME`
+- `--timeline-bins N`
+- `-categories, --timeline-categories LIST`
+- `--timeline-storyline-off`
 - `-v, --verbose`
+- `-vt, --vt`
 - `--view FILENAME`
+- `-raw`
 
 ### IT/Enterprise functions (alphabetical)
 
@@ -177,6 +193,7 @@ python -m pcapper --help
 - `--beacon`
 - `--certificates`
 - `--creds`
+- `--compromised`
 - `--ctf`
 - `--dhcp`
 - `--dns`
@@ -188,6 +205,7 @@ python -m pcapper --help
 - `--health`
 - `--hostdetails`
 - `--hostname`
+- `--hosts`
 - `--http`
 - `--http2`
 - `--icmp`
@@ -207,6 +225,7 @@ python -m pcapper --help
 - `--rdp`
 - `--rpc`
 - `--routing`
+- `--secrets`
 - `--services`
 - `--sizes`
 - `--smb`
@@ -229,7 +248,7 @@ python -m pcapper --help
 - `--winrm`
 - `--wmic`
 
-Count: 55 flags
+Count: 58 flags
 
 ### OT/ICS/Industrial functions (alphabetical)
 
@@ -259,6 +278,9 @@ Count: 55 flags
 - `--odesys`
 - `--opc`
 - `--ot-commands`
+- `--ot-commands-config`
+- `--ot-commands-fast`
+- `--ot-commands-sessions`
 - `--pccc`
 - `--pcworx`
 - `--prconos`
@@ -269,15 +291,19 @@ Count: 55 flags
 - `--sv`
 - `--yokogawa`
 
-Count: 35 flags
+Count: 38 flags
 
 ## Notes
 
 - For timeline mode, supply `-ip` with `--timeline`.
-- Use `-categories` with `--timeline` to filter event categories (comma-separated). Use `-categories false` to print the supported list.
+- Use `-categories`/`--timeline-categories` with `--timeline` to filter event categories (comma-separated). Use `-categories false` or an empty value to print the supported list.
 - Timeline output always shows all events (independent of `-v`) and includes TCP SYN/SYN-ACK connection events with port visibility.
+- Use `--timeline-bins` to control OT activity sparkline resolution and `--timeline-storyline-off` to disable the storyline block.
 - If your shell expands wildcards (for example `Un*`), pcapper now accepts the resulting multiple target arguments directly.
 - Use `--no-status` for cleaner output in logs/pipelines.
+- `--ot-commands-config` accepts JSON/YAML with `write_markers` and `protocol_markers` overrides (YAML requires PyYAML).
+- Use `--ot-commands-sessions` to change the number of session rows in the OT commands block.
+- VirusTotal lookups require `VT_API_KEY` and `-vt`/`--vt`.
 
 ## License
 

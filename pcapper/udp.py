@@ -12,6 +12,7 @@ from .utils import safe_float
 from .http import analyze_http
 from .files import analyze_files
 from .services import analyze_services
+from .progress import run_with_busy_status
 
 try:
     from scapy.layers.inet import IP, UDP  # type: ignore
@@ -399,9 +400,12 @@ def analyze_udp(
             last_seen=data["last_seen"],
         ))
 
-    http_summary = analyze_http(path, show_status=False, packets=packets, meta=meta)
-    file_summary = analyze_files(path, show_status=False)
-    services_summary = analyze_services(path, show_status=False)
+    def _busy(desc: str, func, *args, **kwargs):
+        return run_with_busy_status(path, show_status, f"UDP: {desc}", func, *args, **kwargs)
+
+    http_summary = _busy("HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta)
+    file_summary = _busy("Files", analyze_files, path, show_status=False)
+    services_summary = _busy("Services", analyze_services, path, show_status=False)
 
     file_artifacts = Counter()
     for art in getattr(file_summary, "artifacts", []) or []:

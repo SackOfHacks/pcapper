@@ -130,6 +130,8 @@ def analyze_streams(
     stats = defaultdict(lambda: {"packets": 0, "bytes": 0, "first": None, "last": None})
     segments_ab: dict[tuple[str, int, str, int], list[tuple[int, bytes]]] = defaultdict(list)
     segments_ba: dict[tuple[str, int, str, int], list[tuple[int, bytes]]] = defaultdict(list)
+    segments_ab_bytes: dict[tuple[str, int, str, int], int] = defaultdict(int)
+    segments_ba_bytes: dict[tuple[str, int, str, int], int] = defaultdict(int)
     followed_client_payload: Optional[bytes] = None
     followed_server_payload: Optional[bytes] = None
     followed_client_gaps: list[dict[str, int]] | None = None
@@ -201,9 +203,25 @@ def analyze_streams(
             if payload:
                 seq = int(getattr(tcp, "seq", 0) or 0)
                 if (src_ip, sport, dst_ip, dport) == stream_key:
-                    segments_ab[stream_key].append((seq, payload))
+                    current = segments_ab_bytes[stream_key]
+                    if current < STREAM_MAX_BYTES:
+                        remaining = STREAM_MAX_BYTES - current
+                        if remaining <= 0:
+                            continue
+                        if len(payload) > remaining:
+                            payload = payload[:remaining]
+                        segments_ab[stream_key].append((seq, payload))
+                        segments_ab_bytes[stream_key] += len(payload)
                 else:
-                    segments_ba[stream_key].append((seq, payload))
+                    current = segments_ba_bytes[stream_key]
+                    if current < STREAM_MAX_BYTES:
+                        remaining = STREAM_MAX_BYTES - current
+                        if remaining <= 0:
+                            continue
+                        if len(payload) > remaining:
+                            payload = payload[:remaining]
+                        segments_ba[stream_key].append((seq, payload))
+                        segments_ba_bytes[stream_key] += len(payload)
 
     finally:
         status.finish()

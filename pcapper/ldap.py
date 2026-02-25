@@ -12,6 +12,7 @@ from .pcap_cache import PcapMeta, get_reader
 from .utils import detect_file_type, safe_float, decode_payload, counter_inc, set_add_cap
 from .dns import analyze_dns
 from .files import analyze_files
+from .progress import run_with_busy_status
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -70,7 +71,7 @@ LDAP_RESULT_CODES = {
 LDAP_RESULT_NAMES = {name.lower(): name for name in LDAP_RESULT_CODES.values()}
 
 DN_TOKEN_RE = re.compile(
-    r"(?i)\b(?:cn|ou|dc|uid|sn|o|c|l|st|samaccountname|userprincipalname|mail|member|memberof|dnshostname|serviceprincipalname)\s*=\s*[^,;]+"
+    r"(?i)\b(?:cn|ou|dc|uid|sn|givenname|displayname|o|c|l|st|samaccountname|userprincipalname|mail|member|memberof|dnshostname|serviceprincipalname)\s*=\s*[^,;]+"
 )
 FILTER_HINTS = (
     "(objectclass=",
@@ -84,7 +85,7 @@ FILTER_HINTS = (
     "mail=",
 )
 
-LDAP_USER_ATTRS = {"cn", "uid", "samaccountname", "userprincipalname", "givenname", "sn", "mail"}
+LDAP_USER_ATTRS = {"cn", "uid", "samaccountname", "userprincipalname", "givenname", "sn", "mail", "displayname"}
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)\b(password|passwd|pwd|unicodepwd|userpassword)\b\s*[:=]\s*([^\s'\";]{4,})"),
@@ -131,6 +132,8 @@ class LdapAnalysis:
     ldaps_packets: int
     public_endpoints: Counter[str]
     bind_bursts: Counter[str]
+    bind_identities: List[Dict[str, object]]
+    user_evidence: List[Dict[str, object]]
     artifacts: List[str]
     anomalies: List[str]
     detections: List[Dict[str, object]]
@@ -275,8 +278,11 @@ def analyze_ldap(
     detections: List[Dict[str, object]] = []
     anomalies: List[str] = []
 
-    dns_summary = analyze_dns(path, show_status=False, packets=packets, meta=meta)
-    files_summary = analyze_files(path, show_status=False)
+    def _busy(desc: str, func, *args, **kwargs):
+        return run_with_busy_status(path, show_status, f"LDAP: {desc}", func, *args, **kwargs)
+
+    dns_summary = _busy("DNS", analyze_dns, path, show_status=False, packets=packets, meta=meta)
+    files_summary = _busy("Files", analyze_files, path, show_status=False)
 
     ldap_domains = Counter()
     for qname, count in dns_summary.qname_counts.items():
@@ -312,6 +318,10 @@ def analyze_ldap(
     suspicious_attributes = Counter()
     public_endpoints = Counter()
     bind_buckets: dict[tuple[str, int], int] = defaultdict(int)
+    bind_identities: list[dict[str, object]] = []
+    bind_identity_seen: set[tuple[str, str, int, str]] = set()
+    user_evidence: list[dict[str, object]] = []
+    user_evidence_seen: set[tuple[str, str, int, str, str, str]] = set()
     cleartext_packets = 0
     ldaps_packets = 0
     convos: Dict[Tuple[str, str, int, str], int] = defaultdict(int)
@@ -351,10 +361,12 @@ def analyze_ldap(
             if not src_ip or not dst_ip:
                 continue
 
+            proto = None
             if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 tcp_layer = pkt[TCP]  # type: ignore[index]
                 sport = int(getattr(tcp_layer, "sport", 0) or 0)
                 dport = int(getattr(tcp_layer, "dport", 0) or 0)
+                proto = "TCP"
                 if dport in LDAP_PORTS or sport in LDAP_PORTS:
                     counter_inc(servers, dst_ip)
                     counter_inc(clients, src_ip)
@@ -399,6 +411,17 @@ def analyze_ldap(
                             if token.lower().startswith("cn="):
                                 counter_inc(ldap_users, token)
                                 set_add_cap(artifacts, token)
+                                key = (src_ip, dst_ip, dport or sport, proto or "TCP", "cn", token)
+                                if key not in user_evidence_seen:
+                                    user_evidence_seen.add(key)
+                                    user_evidence.append({
+                                        "src_ip": src_ip,
+                                        "dst_ip": dst_ip,
+                                        "dst_port": dport or sport,
+                                        "protocol": proto or "TCP",
+                                        "attr": "cn",
+                                        "value": token.partition("=")[2].strip() if "=" in token else token,
+                                    })
 
                     for value in _extract_ascii_strings(payload) + _extract_utf16le_strings(payload):
                         if not value:
@@ -424,6 +447,18 @@ def analyze_ldap(
                             key, _, val = match.partition("=")
                             key_lower = key.strip().lower()
                             val = val.strip()
+                            if key_lower in LDAP_USER_ATTRS or key_lower in {"cn", "sn"}:
+                                ev_key = (src_ip, dst_ip, dport or sport, proto or "TCP", key_lower, val)
+                                if ev_key not in user_evidence_seen:
+                                    user_evidence_seen.add(ev_key)
+                                    user_evidence.append({
+                                        "src_ip": src_ip,
+                                        "dst_ip": dst_ip,
+                                        "dst_port": dport or sport,
+                                        "protocol": proto or "TCP",
+                                        "attr": key_lower,
+                                        "value": val,
+                                    })
                             if key_lower in LDAP_USER_ATTRS:
                                 counter_inc(ldap_users, val)
                             elif key_lower == "cn":
@@ -440,6 +475,16 @@ def analyze_ldap(
                                 for identity in _extract_bind_identities(value):
                                     if identity:
                                         counter_inc(ldap_binds, identity)
+                                        key = (src_ip, dst_ip, dport or sport, identity)
+                                        if key not in bind_identity_seen:
+                                            bind_identity_seen.add(key)
+                                            bind_identities.append({
+                                                "src_ip": src_ip,
+                                                "dst_ip": dst_ip,
+                                                "dst_port": dport or sport,
+                                                "protocol": "TCP",
+                                                "identity": identity,
+                                            })
                                 if ts is not None:
                                     minute_bucket = int(ts // 60)
                                     counter_inc(bind_buckets, (src_ip, minute_bucket))
@@ -635,6 +680,8 @@ def analyze_ldap(
         ldaps_packets=ldaps_packets,
         public_endpoints=public_endpoints,
         bind_bursts=bind_bursts,
+        bind_identities=bind_identities,
+        user_evidence=user_evidence,
         artifacts=sorted(artifacts),
         anomalies=anomalies,
         detections=detections,

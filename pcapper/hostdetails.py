@@ -15,9 +15,14 @@ from .exfil import analyze_exfil
 from .files import analyze_files
 from .hostname import analyze_hostname
 from .ips import analyze_ips
+from .kerberos import analyze_kerberos
+from .netbios import analyze_netbios
+from .rpc import analyze_rpc
 from .services import analyze_services
+from .smb import analyze_smb
 from .threats import analyze_threats
 from .timeline import analyze_timeline
+from .progress import run_with_busy_status
 
 
 @dataclass(frozen=True)
@@ -37,6 +42,11 @@ class HostDetailsSummary:
     duration_seconds: Optional[float]
     mac_addresses: list[str]
     hostnames: list[str]
+    hostname_findings: list[dict[str, object]]
+    user_evidence: list[dict[str, object]]
+    file_transfers: list[dict[str, object]]
+    dns_queries: list[dict[str, object]]
+    timeline_events: list[dict[str, object]]
     peer_counts: Counter[str]
     protocol_counts: Counter[str]
     port_counts: Counter[int]
@@ -76,6 +86,59 @@ _ATTACK_KEYWORDS: dict[str, tuple[str, ...]] = {
         "hart",
         "iccp",
     ),
+}
+
+_USER_UNKNOWN = {"", "-", "unknown", "n/a", "none"}
+_WINDOWS_BUILTIN_PRINCIPALS = {
+    "access control assistance operators",
+    "account operators",
+    "administrator",
+    "administrators",
+    "allowed rodc password replication group",
+    "anonymous",
+    "authenticated users",
+    "backup operators",
+    "cert publishers",
+    "cloneable domain controllers",
+    "cryptographic operators",
+    "denied rodc password replication group",
+    "distributed com users",
+    "dnsadmins",
+    "dnsupdateproxy",
+    "domain admins",
+    "domain computers",
+    "domain controllers",
+    "domain guests",
+    "domain users",
+    "enterprise admins",
+    "enterprise key admins",
+    "enterprise read-only domain controllers",
+    "event log readers",
+    "everyone",
+    "group policy creator owners",
+    "guest",
+    "guests",
+    "hyper-v administrators",
+    "iis iusrs",
+    "incoming forest trust builders",
+    "key admins",
+    "network configuration operators",
+    "performance log users",
+    "performance monitor users",
+    "power users",
+    "pre windows 2000 compatible access",
+    "print operators",
+    "protected users",
+    "ras and ias servers",
+    "read only domain controllers",
+    "remote desktop users",
+    "remote management users",
+    "replicator",
+    "schema admins",
+    "server operators",
+    "storage replica administrators",
+    "users",
+    "windows authorization access group",
 }
 
 
@@ -170,6 +233,69 @@ def _extract_mac_values(target_ip: str, arp_summary, dhcp_summary) -> list[str]:
             macs.add(str(session.client_mac).lower())
 
     return sorted(mac for mac in macs if mac and mac != "00:00:00:00:00:00")
+
+
+def _normalize_user(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = str(value).strip()
+    if not cleaned:
+        return None
+    if cleaned.lower() in _USER_UNKNOWN:
+        return None
+    return cleaned
+
+
+def _is_builtin_windows_principal(value: str | None) -> bool:
+    if not value:
+        return False
+    cleaned = str(value).strip().lower()
+    cleaned = cleaned.replace("_", " ").replace("-", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned in _WINDOWS_BUILTIN_PRINCIPALS
+
+
+def _split_user_domain(value: str | None) -> tuple[str | None, str | None]:
+    user = _normalize_user(value)
+    if not user:
+        return None, None
+    if "\\" in user:
+        domain, _, uname = user.partition("\\")
+        return _normalize_user(uname), _normalize_user(domain)
+    if "@" in user:
+        uname, _, dom = user.partition("@")
+        return _normalize_user(uname), _normalize_user(dom)
+    return user, None
+
+
+def _parse_ldap_identity(identity: str) -> tuple[str | None, str | None, str | None]:
+    if not identity:
+        return None, None, None
+    username = None
+    full_name = None
+    domain_parts: list[str] = []
+    tokens = [tok.strip() for tok in identity.split(",") if "=" in tok]
+    for token in tokens:
+        key, _, val = token.partition("=")
+        key = key.strip().lower()
+        val = val.strip()
+        if not val:
+            continue
+        if key == "dc":
+            domain_parts.append(val)
+            continue
+        if key in {"samaccountname", "uid", "userprincipalname", "mail"}:
+            if not username:
+                username = val
+            continue
+        if key == "cn":
+            if not full_name and (" " in val or "," in val):
+                full_name = val
+            if not username:
+                username = val
+            continue
+    domain = ".".join(domain_parts) if domain_parts else None
+    return _normalize_user(username), _normalize_user(full_name), _normalize_user(domain)
 
 
 def _infer_operating_system(
@@ -345,6 +471,11 @@ def merge_hostdetails_summaries(summaries: Iterable[HostDetailsSummary]) -> Host
             duration_seconds=0.0,
             mac_addresses=[],
             hostnames=[],
+            hostname_findings=[],
+            user_evidence=[],
+            file_transfers=[],
+            dns_queries=[],
+            timeline_events=[],
             peer_counts=Counter(),
             protocol_counts=Counter(),
             port_counts=Counter(),
@@ -372,6 +503,16 @@ def merge_hostdetails_summaries(summaries: Iterable[HostDetailsSummary]) -> Host
 
     macs: set[str] = set()
     hostnames: set[str] = set()
+    hostname_findings: list[dict[str, object]] = []
+    hostname_seen: dict[tuple[str, str, str, str, str, str], int] = {}
+    user_evidence: list[dict[str, object]] = []
+    user_seen: set[tuple[str, str, str, str, str]] = set()
+    file_transfers: list[dict[str, object]] = []
+    file_seen: set[tuple[str, ...]] = set()
+    dns_queries: list[dict[str, object]] = []
+    dns_seen: set[tuple[object, ...]] = set()
+    timeline_events: list[dict[str, object]] = []
+    timeline_seen: set[tuple[object, ...]] = set()
     peer_counts: Counter[str] = Counter()
     protocol_counts: Counter[str] = Counter()
     port_counts: Counter[int] = Counter()
@@ -405,6 +546,97 @@ def merge_hostdetails_summaries(summaries: Iterable[HostDetailsSummary]) -> Host
 
         macs.update(summary.mac_addresses)
         hostnames.update(summary.hostnames)
+        for finding in summary.hostname_findings:
+            key = (
+                str(finding.get("hostname", "")),
+                str(finding.get("mapped_ip", "")),
+                str(finding.get("method", "")),
+                str(finding.get("protocol", "")),
+                str(finding.get("src_ip", "")),
+                str(finding.get("dst_ip", "")),
+            )
+            idx = hostname_seen.get(key)
+            if idx is None:
+                hostname_seen[key] = len(hostname_findings)
+                hostname_findings.append(dict(finding))
+            else:
+                existing = hostname_findings[idx]
+                existing["count"] = int(existing.get("count", 0) or 0) + int(finding.get("count", 0) or 0)
+                first_seen_val = existing.get("first_seen")
+                new_first = finding.get("first_seen")
+                if new_first is not None and (first_seen_val is None or new_first < first_seen_val):
+                    existing["first_seen"] = new_first
+                last_seen_val = existing.get("last_seen")
+                new_last = finding.get("last_seen")
+                if new_last is not None and (last_seen_val is None or new_last > last_seen_val):
+                    existing["last_seen"] = new_last
+
+        for item in summary.user_evidence:
+            key = (
+                str(item.get("username", "")),
+                str(item.get("domain", "")),
+                str(item.get("full_name", "")),
+                str(item.get("method", "")),
+                str(item.get("location", "")),
+            )
+            if key in user_seen:
+                continue
+            user_seen.add(key)
+            user_evidence.append(dict(item))
+
+        for item in summary.file_transfers:
+            key = (
+                str(item.get("direction", "")),
+                str(item.get("kind", "")),
+                str(item.get("protocol", "")),
+                str(item.get("src_ip", "")),
+                str(item.get("dst_ip", "")),
+                str(item.get("src_port", "")),
+                str(item.get("dst_port", "")),
+                str(item.get("filename", "")),
+                str(item.get("size_bytes", "")),
+                str(item.get("bytes", "")),
+                str(item.get("note", "")),
+                str(item.get("file_type", "")),
+                str(item.get("hostname", "")),
+                str(item.get("content_type", "")),
+                str(item.get("sha256", "")),
+                str(item.get("md5", "")),
+                str(item.get("first_seen", "")),
+                str(item.get("last_seen", "")),
+                str(item.get("packet_index", "")),
+            )
+            if key in file_seen:
+                continue
+            file_seen.add(key)
+            file_transfers.append(dict(item))
+
+        for query in summary.dns_queries:
+            key = (
+                query.get("ts"),
+                query.get("name"),
+                query.get("qtype"),
+                query.get("src_ip"),
+                query.get("dst_ip"),
+                query.get("protocol"),
+                query.get("dst_port"),
+            )
+            if key in dns_seen:
+                continue
+            dns_seen.add(key)
+            dns_queries.append(dict(query))
+
+        for event in summary.timeline_events:
+            key = (
+                event.get("ts"),
+                event.get("category"),
+                event.get("summary"),
+                event.get("details"),
+            )
+            if key in timeline_seen:
+                continue
+            timeline_seen.add(key)
+            timeline_events.append(dict(event))
         peer_counts.update(summary.peer_counts)
         protocol_counts.update(summary.protocol_counts)
         port_counts.update(summary.port_counts)
@@ -492,6 +724,17 @@ def merge_hostdetails_summaries(summaries: Iterable[HostDetailsSummary]) -> Host
     conversations.sort(key=lambda item: int(item.get("bytes", 0) or 0), reverse=True)
     services.sort(key=lambda item: int(item.get("packets", 0) or 0), reverse=True)
     detections.sort(key=lambda item: _severity_rank(str(item.get("severity", "info"))))
+    hostname_findings.sort(key=lambda item: int(item.get("count", 0) or 0), reverse=True)
+    dns_queries.sort(key=lambda item: (item.get("ts") is None, item.get("ts")))
+    timeline_events.sort(key=lambda item: (item.get("ts") is None, item.get("ts")))
+    file_transfers.sort(
+        key=lambda item: (
+            item.get("first_seen") is None,
+            float(item.get("first_seen") or 0.0),
+            0 if str(item.get("kind", "")) == "artifact" else 1,
+            -int(item.get("bytes") or item.get("size_bytes") or 0),
+        )
+    )
 
     return HostDetailsSummary(
         path=Path(f"ALL_PCAPS_{len(summary_list)}"),
@@ -509,6 +752,11 @@ def merge_hostdetails_summaries(summaries: Iterable[HostDetailsSummary]) -> Host
         duration_seconds=duration_seconds,
         mac_addresses=sorted(macs),
         hostnames=sorted(hostnames),
+        hostname_findings=hostname_findings,
+        user_evidence=user_evidence,
+        file_transfers=file_transfers,
+        dns_queries=dns_queries,
+        timeline_events=timeline_events,
         peer_counts=peer_counts,
         protocol_counts=protocol_counts,
         port_counts=port_counts,
@@ -540,6 +788,11 @@ def analyze_hostdetails(path: Path, target_ip: str, show_status: bool = True) ->
             duration_seconds=None,
             mac_addresses=[],
             hostnames=[],
+            hostname_findings=[],
+            user_evidence=[],
+            file_transfers=[],
+            dns_queries=[],
+            timeline_events=[],
             peer_counts=Counter(),
             protocol_counts=Counter(),
             port_counts=Counter(),
@@ -559,6 +812,14 @@ def analyze_hostdetails(path: Path, target_ip: str, show_status: bool = True) ->
     seen_detections: set[tuple[str, str, str, str]] = set()
     artifacts: list[str] = []
     seen_artifacts: set[str] = set()
+    hostname_findings: list[dict[str, object]] = []
+    user_evidence: list[dict[str, object]] = []
+    user_seen: set[tuple[str, str, str, str, str]] = set()
+    known_usernames: set[str] = set()
+    file_transfers: list[dict[str, object]] = []
+    file_seen: set[tuple[str, ...]] = set()
+    dns_queries: list[dict[str, object]] = []
+    timeline_events: list[dict[str, object]] = []
 
     def add_artifact(text: str) -> None:
         message = text.strip()
@@ -597,21 +858,146 @@ def analyze_hostdetails(path: Path, target_ip: str, show_status: bool = True) ->
         )
         _add_categories(attack_categories, summary_text, details_text)
 
+    def add_user_evidence(
+        username: str | None,
+        domain: str | None,
+        full_name: str | None,
+        method: str,
+        location: str,
+        details: str = "",
+    ) -> None:
+        user = _normalize_user(username)
+        full = _normalize_user(full_name)
+        if not user and not full:
+            return
+        if not _mentions_target(location, target_ip):
+            return
+        if user and _is_builtin_windows_principal(user):
+            return
+        if full and _is_builtin_windows_principal(full):
+            return
+        dom = _normalize_user(domain)
+        user_key = user or full or "-"
+        key = (user_key, dom or "-", full or "-", method, location)
+        if key in user_seen:
+            return
+        user_seen.add(key)
+        if user:
+            known_usernames.add(user.lower())
+        user_evidence.append({
+            "username": user or "-",
+            "domain": dom or "-",
+            "full_name": full or "-",
+            "method": method,
+            "location": location,
+            "details": details,
+        })
+
+    def add_file_transfer(
+        *,
+        direction: str,
+        kind: str,
+        protocol: str,
+        src_ip: str,
+        dst_ip: str,
+        src_port: Optional[int],
+        dst_port: Optional[int],
+        filename: str,
+        size_bytes: Optional[int],
+        bytes_count: Optional[int],
+        packets: Optional[int],
+        first_seen: Optional[float],
+        last_seen: Optional[float],
+        note: str,
+        file_type: str,
+        hostname: str | None,
+        content_type: str | None,
+        sha256: str | None,
+        md5: str | None,
+        packet_index: Optional[int] = None,
+    ) -> None:
+        key = (
+            direction,
+            kind,
+            protocol,
+            src_ip,
+            dst_ip,
+            str(src_port),
+            str(dst_port),
+            filename,
+            str(size_bytes),
+            str(bytes_count),
+            note,
+            file_type,
+            hostname or "",
+            content_type or "",
+            sha256 or "",
+            md5 or "",
+            str(first_seen),
+            str(last_seen),
+            str(packet_index),
+        )
+        if key in file_seen:
+            return
+        file_seen.add(key)
+        file_transfers.append({
+            "direction": direction,
+            "kind": kind,
+            "protocol": protocol,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "src_port": src_port,
+            "dst_port": dst_port,
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "bytes": bytes_count,
+            "packets": packets,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "note": note,
+            "file_type": file_type,
+            "hostname": hostname,
+            "content_type": content_type,
+            "sha256": sha256,
+            "md5": md5,
+            "packet_index": packet_index,
+        })
+
+    def file_direction(src_ip: str, dst_ip: str) -> str:
+        if src_ip == target_ip and dst_ip == target_ip:
+            return "loopback"
+        if src_ip == target_ip:
+            return "upload"
+        if dst_ip == target_ip:
+            return "download"
+        return "transit"
+
+    def _busy(desc: str, func, *args, **kwargs):
+        return run_with_busy_status(path, show_status, f"Host details: {desc}", func, *args, **kwargs)
+
     base_summary = analyze_pcap(path, show_status=show_status)
-    ips_summary = analyze_ips(path, show_status=False)
-    hostname_summary = analyze_hostname(path, target_ip, show_status=False)
-    services_summary = analyze_services(path, show_status=False)
-    beacon_summary = analyze_beacons(path, show_status=False)
-    exfil_summary = analyze_exfil(path, show_status=False)
-    file_summary = analyze_files(path, show_status=False)
-    threats_summary = analyze_threats(path, show_status=False)
-    timeline_summary = analyze_timeline(path, target_ip, show_status=False)
-    arp_summary = analyze_arp(path, show_status=False)
-    dhcp_summary = analyze_dhcp(path, show_status=False)
+    ips_summary = _busy("IPs", analyze_ips, path, show_status=False)
+    hostname_summary = _busy("Hostnames", analyze_hostname, path, target_ip, show_status=False, include_related=True)
+    services_summary = _busy("Services", analyze_services, path, show_status=False)
+    smb_summary = _busy("SMB", analyze_smb, path, show_status=False)
+    kerberos_summary = _busy("Kerberos", analyze_kerberos, path, show_status=False)
+    netbios_summary = _busy("NetBIOS", analyze_netbios, path, show_status=False)
+    rpc_summary = _busy("RPC", analyze_rpc, path, show_status=False)
+    beacon_summary = _busy("Beacons", analyze_beacons, path, show_status=False)
+    exfil_summary = _busy("Exfil", analyze_exfil, path, show_status=False)
+    file_summary = _busy("Files", analyze_files, path, show_status=False)
+    threats_summary = _busy("Threats", analyze_threats, path, show_status=False)
+    timeline_summary = _busy("Timeline", analyze_timeline, path, target_ip, show_status=False)
+    arp_summary = _busy("ARP", analyze_arp, path, show_status=False)
+    dhcp_summary = _busy("DHCP", analyze_dhcp, path, show_status=False)
 
     errors.extend(getattr(ips_summary, "errors", []))
     errors.extend(getattr(hostname_summary, "errors", []))
     errors.extend(getattr(services_summary, "errors", []))
+    errors.extend(getattr(smb_summary, "errors", []))
+    errors.extend(getattr(kerberos_summary, "errors", []))
+    errors.extend(getattr(netbios_summary, "errors", []))
+    errors.extend(getattr(rpc_summary, "errors", []))
     errors.extend(getattr(beacon_summary, "errors", []))
     errors.extend(getattr(exfil_summary, "errors", []))
     errors.extend(getattr(file_summary, "errors", []))
@@ -650,17 +1036,55 @@ def analyze_hostdetails(path: Path, target_ip: str, show_status: bool = True) ->
             {
                 "direction": direction,
                 "peer": peer,
+                "src_ip": conv.src,
+                "dst_ip": conv.dst,
                 "protocol": conv.protocol,
                 "packets": conv.packets,
                 "bytes": conv.bytes,
+                "first_seen": conv.first_seen,
+                "last_seen": conv.last_seen,
                 "ports": ",".join(str(port) for port in conv.ports[:8]) if conv.ports else "-",
             }
         )
 
     hostnames: set[str] = set()
     for finding in hostname_summary.findings:
-        if finding.mapped_ip == target_ip or finding.src_ip == target_ip or finding.dst_ip == target_ip:
+        involves_target = finding.mapped_ip == target_ip or finding.src_ip == target_ip or finding.dst_ip == target_ip
+        if finding.mapped_ip == target_ip:
             hostnames.add(finding.hostname)
+        if involves_target:
+            hostname_findings.append({
+                "hostname": finding.hostname,
+                "mapped_ip": finding.mapped_ip,
+                "method": finding.method,
+                "protocol": finding.protocol,
+                "confidence": finding.confidence,
+                "details": finding.details,
+                "src_ip": finding.src_ip,
+                "dst_ip": finding.dst_ip,
+                "first_seen": finding.first_seen,
+                "last_seen": finding.last_seen,
+                "count": finding.count,
+            })
+
+    for query in timeline_summary.dns_queries:
+        dns_queries.append({
+            "ts": query.ts,
+            "name": query.name,
+            "qtype": query.qtype,
+            "src_ip": query.src_ip,
+            "dst_ip": query.dst_ip,
+            "protocol": query.protocol,
+            "dst_port": query.dst_port,
+        })
+
+    for event in timeline_summary.events:
+        timeline_events.append({
+            "ts": event.ts,
+            "category": event.category,
+            "summary": event.summary,
+            "details": event.details,
+        })
 
     services: list[dict[str, object]] = []
     for asset in services_summary.assets:
@@ -688,6 +1112,76 @@ def analyze_hostdetails(path: Path, target_ip: str, show_status: bool = True) ->
         if target_ip not in str(risk.affected_asset):
             continue
         add_detection("Services", risk.severity, risk.title, risk.description)
+
+    cname_items: list[dict[str, object]] = []
+    cname_users_by_domain: dict[str, set[str]] = {}
+    for item in getattr(kerberos_summary, "principal_evidence", []) or []:
+        src_ip = str(item.get("src_ip", ""))
+        dst_ip = str(item.get("dst_ip", ""))
+        if target_ip not in {src_ip, dst_ip}:
+            continue
+        if str(item.get("kind", "")) != "CNameString":
+            continue
+        principal = str(item.get("principal", ""))
+        if not principal:
+            continue
+        user, dom = _split_user_domain(principal)
+        if not user:
+            continue
+        dom_key = dom or "-"
+        cname_users_by_domain.setdefault(dom_key, set()).add(user)
+        cname_items.append({
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "dst_port": item.get("dst_port", "-"),
+            "protocol": item.get("protocol", "-"),
+            "principal": principal,
+            "user": user,
+            "domain": dom,
+            "dom_key": dom_key,
+        })
+
+    for item in cname_items:
+        user = str(item.get("user", ""))
+        dom = item.get("domain")
+        dom_key = str(item.get("dom_key", "-"))
+        if user and user[-1].isdigit():
+            base_user = user.rstrip("0123456789")
+            if len(base_user) >= 3 and base_user in cname_users_by_domain.get(dom_key, set()):
+                user = base_user
+        dst_port = item.get("dst_port", "-")
+        proto = item.get("protocol", "-")
+        location = f"{item.get('src_ip', '-')} -> {item.get('dst_ip', '-')}:{dst_port} {proto}"
+        add_user_evidence(
+            username=user,
+            domain=dom if isinstance(dom, str) else None,
+            full_name=None,
+            method="Kerberos CNameString",
+            location=location,
+            details=str(item.get("principal", "")),
+        )
+
+    for item in getattr(rpc_summary, "samr_fullnames", []) or []:
+        src_ip = str(item.get("src_ip", ""))
+        dst_ip = str(item.get("dst_ip", ""))
+        if target_ip not in {src_ip, dst_ip}:
+            continue
+        full_name = str(item.get("full_name", "")).strip()
+        if not full_name:
+            continue
+        details_bits: list[str] = []
+        opnum = item.get("opnum")
+        if opnum is not None and str(opnum).isdigit():
+            details_bits.append(f"opnum={opnum}")
+        location = f"{src_ip} -> {dst_ip} SAMR QueryUserInfo"
+        add_user_evidence(
+            username=None,
+            domain=None,
+            full_name=full_name,
+            method="SAMR QueryUserInfo",
+            location=location,
+            details=" ".join(details_bits),
+        )
 
     for item in beacon_summary.candidates:
         if item.src_ip != target_ip and item.dst_ip != target_ip:
@@ -818,6 +1312,61 @@ def analyze_hostdetails(path: Path, target_ip: str, show_status: bool = True) ->
             f"Host generated {dhcp_summary.brute_force_sources[target_ip]} brute-force style DHCP bursts",
         )
 
+    for artifact in getattr(file_summary, "artifacts", []) or []:
+        src_ip = str(getattr(artifact, "src_ip", "") or "")
+        dst_ip = str(getattr(artifact, "dst_ip", "") or "")
+        if target_ip not in {src_ip, dst_ip}:
+            continue
+        add_file_transfer(
+            direction=file_direction(src_ip, dst_ip),
+            kind="artifact",
+            protocol=str(getattr(artifact, "protocol", "-")),
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            src_port=getattr(artifact, "src_port", None),
+            dst_port=getattr(artifact, "dst_port", None),
+            filename=str(getattr(artifact, "filename", "-") or "-"),
+            size_bytes=getattr(artifact, "size_bytes", None),
+            bytes_count=getattr(artifact, "size_bytes", None),
+            packets=None,
+            first_seen=None,
+            last_seen=None,
+            note=str(getattr(artifact, "note", "") or ""),
+            file_type=str(getattr(artifact, "file_type", "") or ""),
+            hostname=getattr(artifact, "hostname", None),
+            content_type=getattr(artifact, "content_type", None),
+            sha256=getattr(artifact, "sha256", None),
+            md5=getattr(artifact, "md5", None),
+            packet_index=getattr(artifact, "packet_index", None),
+        )
+
+    for transfer in getattr(file_summary, "candidates", []) or []:
+        src_ip = str(getattr(transfer, "src_ip", "") or "")
+        dst_ip = str(getattr(transfer, "dst_ip", "") or "")
+        if target_ip not in {src_ip, dst_ip}:
+            continue
+        add_file_transfer(
+            direction=file_direction(src_ip, dst_ip),
+            kind="candidate",
+            protocol=str(getattr(transfer, "protocol", "-")),
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            src_port=getattr(transfer, "src_port", None),
+            dst_port=getattr(transfer, "dst_port", None),
+            filename="-",
+            size_bytes=None,
+            bytes_count=getattr(transfer, "bytes", None),
+            packets=getattr(transfer, "packets", None),
+            first_seen=getattr(transfer, "first_seen", None),
+            last_seen=getattr(transfer, "last_seen", None),
+            note=str(getattr(transfer, "note", "") or ""),
+            file_type="",
+            hostname=None,
+            content_type=None,
+            sha256=None,
+            md5=None,
+        )
+
     mac_addresses = _extract_mac_values(target_ip, arp_summary, dhcp_summary)
 
     dedup_errors: list[str] = []
@@ -832,6 +1381,15 @@ def analyze_hostdetails(path: Path, target_ip: str, show_status: bool = True) ->
     conversations.sort(key=lambda item: int(item.get("bytes", 0) or 0), reverse=True)
     services.sort(key=lambda item: int(item.get("packets", 0) or 0), reverse=True)
     operating_system, os_evidence = _infer_operating_system(hostnames, services, dhcp_summary)
+    hostname_findings.sort(key=lambda item: int(item.get("count", 0) or 0), reverse=True)
+    file_transfers.sort(
+        key=lambda item: (
+            item.get("first_seen") is None,
+            float(item.get("first_seen") or 0.0),
+            0 if str(item.get("kind", "")) == "artifact" else 1,
+            -int(item.get("bytes") or item.get("size_bytes") or 0),
+        )
+    )
 
     return HostDetailsSummary(
         path=path,
@@ -849,6 +1407,11 @@ def analyze_hostdetails(path: Path, target_ip: str, show_status: bool = True) ->
         duration_seconds=base_summary.duration_seconds,
         mac_addresses=mac_addresses,
         hostnames=sorted(hostnames),
+        hostname_findings=hostname_findings,
+        user_evidence=user_evidence,
+        file_transfers=file_transfers,
+        dns_queries=dns_queries,
+        timeline_events=timeline_events,
         peer_counts=peer_counts,
         protocol_counts=protocol_counts,
         port_counts=port_counts,

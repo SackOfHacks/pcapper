@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Optional, Any
 import base64
 from collections import OrderedDict
+import hashlib
 import os
+import re
 
 
 PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
@@ -17,6 +19,41 @@ _DECODE_CACHE_MAX_BYTES = 4096
 _MAX_COUNTER_KEYS = int(os.getenv("PCAPPER_MAX_COUNTER_KEYS", "50000"))
 _MAX_SET_ITEMS = int(os.getenv("PCAPPER_MAX_SET_ITEMS", "50000"))
 _MAX_SET_VALUES = int(os.getenv("PCAPPER_MAX_SET_VALUES", "2000"))
+
+_SENSITIVE_KEYS = {
+    "_bytes_b64",
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "authorization",
+    "auth",
+    "bearer",
+    "cookie",
+    "set-cookie",
+    "session",
+    "credential",
+    "creds",
+    "private_key",
+    "ssh_key",
+    "encoded",
+    "decoded",
+}
+_SENSITIVE_KEY_RE = re.compile(
+    r"(pass(word)?|passwd|pwd|secret|token|api[_-]?key|bearer|authorization|cookie|session|credential|creds|private|ssh|encoded|decoded)",
+    re.IGNORECASE,
+)
+_SECRET_PATTERNS = [
+    re.compile(r"(?i)\b(pass(word)?|passwd|pwd|secret|token|apikey|api_key|api-key|bearer)\b\s*[:=]\s*([^\s,;]+)"),
+    re.compile(r"(?i)\bPASS\s+(\S+)"),
+    re.compile(r"(?i)\bauthorization:\s*basic\s+([A-Za-z0-9+/=]+)"),
+    re.compile(r"(?i)\bauthorization:\s*bearer\s+([A-Za-z0-9._~+/=-]+)"),
+    re.compile(r"(?i)\bproxy-authorization:\s*basic\s+([A-Za-z0-9+/=]+)"),
+]
 
 
 def decode_payload(
@@ -29,6 +66,8 @@ def decode_payload(
 ) -> str:
     if not payload:
         return ""
+    if isinstance(payload, bytearray):
+        payload = bytes(payload)
     view = payload[:limit] if limit else payload
     use_cache = cache and len(view) <= _DECODE_CACHE_MAX_BYTES
     key = (view, encoding, lower)
@@ -278,3 +317,57 @@ def parse_time_arg(value: Optional[str]) -> Optional[float]:
         return dt.timestamp()
     except Exception:
         return None
+
+
+def _secret_fingerprint(value: str) -> str:
+    digest = hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
+    return f"redacted:{digest[:8]}"
+
+
+def _redact_string(text: str) -> str:
+    if not text:
+        return text
+
+    def _repl(match: re.Match) -> str:
+        if match.lastindex is None:
+            return _secret_fingerprint(match.group(0))
+        if match.lastindex >= 3:
+            key = match.group(1)
+            value = match.group(3)
+            return f"{key}={_secret_fingerprint(value)}"
+        value = match.group(match.lastindex)
+        return f"PASS {_secret_fingerprint(value)}"
+
+    redacted = text
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub(_repl, redacted)
+    return redacted
+
+
+def redact_data(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _redact_string(value)
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for raw_key, raw_val in value.items():
+            key = str(raw_key)
+            key_lower = key.lower()
+            if key_lower in _SENSITIVE_KEYS or _SENSITIVE_KEY_RE.search(key_lower):
+                if isinstance(raw_val, str):
+                    out[key] = _secret_fingerprint(raw_val)
+                elif isinstance(raw_val, (int, float, bool)):
+                    out[key] = raw_val
+                else:
+                    out[key] = "redacted"
+                continue
+            out[key] = redact_data(raw_val)
+        return out
+    if isinstance(value, list):
+        return [redact_data(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_data(item) for item in value]
+    if isinstance(value, set):
+        return [redact_data(item) for item in value]
+    return value

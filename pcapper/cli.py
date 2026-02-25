@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import glob
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,6 +71,8 @@ from .reporting import (
     render_secrets_summary,
     render_certificates_summary,
     render_health_summary,
+    render_compromised_summary,
+    render_hosts_summary,
     render_hostname_summary,
     render_hostdetails_summary,
     render_timeline_summary,
@@ -114,7 +117,7 @@ from .reporting import (
     render_ot_commands_summary,
     render_iec101_103_summary,
 )
-from .pcap_cache import load_packets_if_allowed, load_filtered_packets, get_reader
+from .pcap_cache import load_packets_if_allowed, load_filtered_packets, get_reader, get_cache_config
 from .exporting import ExportBundle, export_json, export_csv, export_sqlite
 from .vlan import analyze_vlans
 from .icmp import analyze_icmp
@@ -169,6 +172,8 @@ from .creds import analyze_creds
 from .secrets import analyze_secrets
 from .certificates import analyze_certificates
 from .health import analyze_health, merge_health_summaries
+from .compromised import analyze_compromised, merge_compromised_summaries
+from .hosts import analyze_hosts, merge_hosts_summaries
 from .hostname import analyze_hostname, merge_hostname_summaries
 from .hostdetails import analyze_hostdetails, merge_hostdetails_summaries
 from .timeline import analyze_timeline, merge_timeline_summaries, OT_CATEGORIES, NON_OT_CATEGORIES, TIMELINE_CATEGORIES
@@ -206,7 +211,7 @@ from .opc_classic import analyze_opc_classic
 from .streams import analyze_streams
 from .ctf import analyze_ctf
 from .ioc import analyze_iocs
-from .ot_commands import analyze_ot_commands
+from .ot_commands import analyze_ot_commands, load_ot_control_config, OtControlConfig
 from .iec101_103 import analyze_iec101_103
 from .utils import parse_time_arg, hexdump
 
@@ -266,6 +271,8 @@ def _ordered_steps(argv: list[str]) -> list[str]:
         "--health": "health",
         "--hostname": "hostname",
         "--hostdetails": "hostdetails",
+        "--hosts": "hosts",
+        "--compromised": "compromised",
         "--ntlm": "ntlm",
         "--netbios": "netbios",
         "--arp": "arp",
@@ -305,6 +312,7 @@ def _ordered_steps(argv: list[str]) -> list[str]:
         "--ptp": "ptp",
         "--pcapmeta": "pcapmeta",
         "--ot-commands": "ot_commands",
+        "--ot-commands-fast": "ot_commands",
         "--iec101-103": "iec101_103",
     }
     ordered: list[str] = []
@@ -336,6 +344,35 @@ def _build_banner() -> str:
 
 def _has_glob_wildcards(value: str) -> bool:
     return any(ch in value for ch in "*?[]")
+
+
+_CASE_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9_.()\\[\\]-]")
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _sanitize_case_name(value: str) -> str:
+    raw = str(value).strip()
+    if not raw:
+        return "case"
+    base = Path(raw).name
+    base = base.replace(" ", "_")
+    base = _CASE_NAME_SAFE_RE.sub("_", base)
+    base = base.strip(" .")
+    if not base:
+        base = "case"
+    stem = Path(base).stem
+    if stem.upper() in _WINDOWS_RESERVED_NAMES:
+        suffix = Path(base).suffix
+        base = f"{stem}_"
+        if suffix:
+            base = f"{base}{suffix}"
+    if len(base) > 80:
+        base = base[:80]
+    return base
 
 
 def _expand_target_wildcard(pattern: Path, recursive: bool) -> list[Path]:
@@ -586,6 +623,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Write SQLite export of results to PATH.",
     )
+    export_redact_group = general.add_mutually_exclusive_group()
+    export_redact_group.add_argument(
+        "--export-redact",
+        action="store_true",
+        help="Force redaction of secrets in export outputs.",
+    )
+    export_redact_group.add_argument(
+        "--export-raw",
+        action="store_true",
+        help="Disable redaction in export outputs (may include secrets).",
+    )
     general.add_argument(
         "--case-dir",
         metavar="DIR",
@@ -628,6 +676,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("--beacon", "Include beaconing analysis in the output."),
         ("--certificates", "Include TLS certificate extraction and analysis."),
         ("--creds", "Scan for credential exposure (HTTP, FTP, SMTP, DNS, etc.)."),
+        ("--compromised", "Assess likely compromised hosts (multi-signal correlation)."),
         ("--secrets", "Discover reversible encoded/obfuscated secrets (base64, hex, url-encoded, JWT)."),
         ("--dhcp", "Include DHCP analysis (leases, options, clients/servers, attacks, anomalies)."),
         ("--dns", "Include DNS analysis in the output."),
@@ -641,6 +690,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Deep host-centric threat hunting/forensics for a target IP (services, peers, attacks, beaconing, exfil, artifacts; use with -ip).",
         ),
         ("--hostname", "Find hostnames for a target IP across DNS/HTTP/TLS/SMB/NetBIOS (use with -ip)."),
+        ("--hosts", "Include host inventory analysis (MAC/IP/hostname/OS/ports/traffic)."),
         ("--http", "Include HTTP analysis in the output."),
         ("--icmp", "Include ICMP analysis in the output."),
         ("--ips", "Include IP address intelligence and conversation analysis."),
@@ -722,11 +772,22 @@ def build_parser() -> argparse.ArgumentParser:
         ("--lldp", "Include LLDP/Profinet DCP asset discovery analysis."),
         ("--ptp", "Include IEEE 1588 PTP time-sync analysis."),
         ("--ot-commands", "Include normalized OT control/write command analysis."),
+        ("--ot-commands-fast", "Fast OT command scan (port heuristics + cached packets)."),
         ("--iec101-103", "Include IEC 60870-5-101/103 heuristic analysis."),
         ("--yokogawa", "Include Yokogawa Vnet/IP analysis."),
     ]
     for flag, help_text in sorted(ics_flags, key=lambda item: item[0]):
         ics_group.add_argument(flag, action="store_true", help=help_text)
+    ics_group.add_argument(
+        "--ot-commands-config",
+        help="Path to OT command control map config (JSON/YAML).",
+    )
+    ics_group.add_argument(
+        "--ot-commands-sessions",
+        type=int,
+        default=10,
+        help="Limit rows in OT command sessions table (default: 10).",
+    )
     return parser
 
 
@@ -775,6 +836,8 @@ def _analyze_paths(
     show_secrets: bool,
     show_certificates: bool,
     show_health: bool,
+    show_compromised: bool,
+    show_hosts: bool,
     show_hostname: bool,
     show_hostdetails: bool,
     show_timeline: bool,
@@ -845,6 +908,9 @@ def _analyze_paths(
     ioc_file: str | None = None,
     show_pcapmeta: bool = False,
     show_ot_commands: bool = False,
+    show_ot_commands_fast: bool = False,
+    ot_commands_config: OtControlConfig | None = None,
+    ot_commands_sessions_limit: int = 10,
     show_iec101_103: bool = False,
     bpf: str | None = None,
     time_start: float | None = None,
@@ -852,6 +918,7 @@ def _analyze_paths(
     export_json_path: Path | None = None,
     export_csv_path: Path | None = None,
     export_sqlite_path: Path | None = None,
+    export_redact: bool = True,
     case_dir: Path | None = None,
 ) -> int:
     if not paths:
@@ -939,6 +1006,78 @@ def _analyze_paths(
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir / f"{pcap_path.stem}.{suffix}"
 
+    requested_steps = set(ordered_steps)
+
+    def _annotate_smb_with_quic(smb_summary, quic_summary) -> None:
+        if not quic_summary or not getattr(quic_summary, "quic_packets", 0):
+            return
+        if not hasattr(smb_summary, "analysis_notes") or smb_summary.analysis_notes is None:
+            smb_summary.analysis_notes = []
+        notes: list[str] = smb_summary.analysis_notes
+        smb_servers = {srv.ip for srv in getattr(smb_summary, "servers", []) if getattr(srv, "ip", None)}
+        smb_clients = {cli.ip for cli in getattr(smb_summary, "clients", []) if getattr(cli, "ip", None)}
+        quic_servers = set(getattr(quic_summary, "servers", {}).keys())
+        quic_clients = set(getattr(quic_summary, "clients", {}).keys())
+        overlap_servers = smb_servers & quic_servers
+        overlap_clients = smb_clients & quic_clients
+
+        def _preview(ips: set[str]) -> str:
+            if not ips:
+                return "-"
+            items = sorted(ips)
+            if len(items) > 3:
+                return ", ".join(items[:3]) + f" (+{len(items) - 3} more)"
+            return ", ".join(items)
+
+        if overlap_servers or overlap_clients:
+            note = (
+                "QUIC traffic observed involving SMB endpoints "
+                f"(servers: {_preview(overlap_servers)}; clients: {_preview(overlap_clients)}). "
+                "If SMB-over-QUIC is enabled, SMB activity may be encapsulated in QUIC and not visible in TCP SMB parsing."
+            )
+        else:
+            note = (
+                "QUIC traffic observed; SMB-over-QUIC (UDP/443) can encapsulate SMB and will not appear in TCP-based SMB parsing. "
+                "Confirm SMB-over-QUIC policy or endpoint logs if suspected."
+            )
+        if note not in notes:
+            notes.append(note)
+
+    def _annotate_tls_with_quic(tls_summary, quic_summary) -> None:
+        if not quic_summary or not getattr(quic_summary, "quic_packets", 0):
+            return
+        if not hasattr(tls_summary, "analysis_notes") or tls_summary.analysis_notes is None:
+            tls_summary.analysis_notes = []
+        notes: list[str] = tls_summary.analysis_notes
+        tls_servers = set(getattr(tls_summary, "server_counts", {}).keys())
+        tls_clients = set(getattr(tls_summary, "client_counts", {}).keys())
+        quic_servers = set(getattr(quic_summary, "servers", {}).keys())
+        quic_clients = set(getattr(quic_summary, "clients", {}).keys())
+        overlap_servers = tls_servers & quic_servers
+        overlap_clients = tls_clients & quic_clients
+
+        def _preview(ips: set[str]) -> str:
+            if not ips:
+                return "-"
+            items = sorted(ips)
+            if len(items) > 3:
+                return ", ".join(items[:3]) + f" (+{len(items) - 3} more)"
+            return ", ".join(items)
+
+        if overlap_servers or overlap_clients:
+            note = (
+                "QUIC traffic observed involving TLS endpoints "
+                f"(servers: {_preview(overlap_servers)}; clients: {_preview(overlap_clients)}). "
+                "HTTP/3/TLS over QUIC will not appear in TCP TLS parsing."
+            )
+        else:
+            note = (
+                "QUIC traffic observed; HTTP/3/TLS over QUIC uses UDP/443 and is not visible in TCP TLS parsing. "
+                "Use --quic for QUIC metadata."
+            )
+        if note not in notes:
+            notes.append(note)
+
     for idx, path in enumerate(paths, start=1):
         packets = None
         meta = None
@@ -953,11 +1092,23 @@ def _analyze_paths(
                 time_start=time_start,
                 time_end=time_end,
             )
-            step_status = False
         elif use_packets:
-            packets, meta = load_packets_if_allowed(path, show_status=show_status)
+            max_file_override = None
+            enabled, max_cache, _max_file = get_cache_config()
+            if enabled and max_cache > 0 and use_packets:
+                try:
+                    size_bytes = path.stat().st_size
+                except Exception:
+                    size_bytes = 0
+                if size_bytes and size_bytes <= max_cache:
+                    max_file_override = max_cache
+            packets, meta = load_packets_if_allowed(
+                path,
+                show_status=show_status,
+                max_file_override=max_file_override,
+            )
             if packets is not None:
-                step_status = False
+                step_status = show_status
 
         if render_base_summary:
             summary = analyze_pcap(path, show_status=step_status, packets=packets, meta=meta)
@@ -1032,7 +1183,15 @@ def _analyze_paths(
                     print(render_ftp_summary(ftp_summary, verbose=verbose))
                 export_summaries["ftp"] = ftp_summary
             elif step == "tls" and show_tls:
+                quic_summary = None
+                if show_quic and "quic" in requested_steps:
+                    quic_summary = export_summaries.get("quic")
+                    if quic_summary is None:
+                        quic_summary = analyze_quic(path, show_status=step_status)
+                        export_summaries["quic"] = quic_summary
                 tls_summary = analyze_tls(path, show_status=step_status, packets=packets, meta=meta)
+                if quic_summary is not None:
+                    _annotate_tls_with_quic(tls_summary, quic_summary)
                 if summarize_rollups:
                     rollups.setdefault("tls", []).append(tls_summary)
                 else:
@@ -1172,7 +1331,9 @@ def _analyze_paths(
                     print(render_threats_summary(threat_summary, verbose=verbose))
                 export_summaries["threats"] = threat_summary
             elif step == "quic" and show_quic:
-                quic_summary = analyze_quic(path, show_status=step_status)
+                quic_summary = export_summaries.get("quic")
+                if quic_summary is None:
+                    quic_summary = analyze_quic(path, show_status=step_status)
                 if summarize_rollups:
                     rollups.setdefault("quic", []).append(quic_summary)
                 else:
@@ -1243,7 +1404,15 @@ def _analyze_paths(
                     print(render_services_summary(svc_summary))
                 export_summaries["services"] = svc_summary
             elif step == "smb" and show_smb:
+                quic_summary = None
+                if show_quic and "quic" in requested_steps:
+                    quic_summary = export_summaries.get("quic")
+                    if quic_summary is None:
+                        quic_summary = analyze_quic(path, show_status=step_status)
+                        export_summaries["quic"] = quic_summary
                 smb_summary = analyze_smb(path, show_status=step_status)
+                if quic_summary is not None:
+                    _annotate_smb_with_quic(smb_summary, quic_summary)
                 if summarize_rollups:
                     rollups.setdefault("smb", []).append(smb_summary)
                 else:
@@ -1291,6 +1460,13 @@ def _analyze_paths(
                 else:
                     print(render_health_summary(health_summary))
                 export_summaries["health"] = health_summary
+            elif step == "compromised" and show_compromised:
+                compromised_summary = analyze_compromised(path, show_status=step_status)
+                if summarize_rollups:
+                    rollups.setdefault("compromised", []).append(compromised_summary)
+                else:
+                    print(render_compromised_summary(compromised_summary, verbose=verbose))
+                export_summaries["compromised"] = compromised_summary
             elif step == "pcapmeta" and show_pcapmeta:
                 meta_summary = analyze_pcapmeta(path, show_status=step_status)
                 if summarize_rollups:
@@ -1335,6 +1511,13 @@ def _analyze_paths(
                 else:
                     print(render_opc_classic_summary(opc_summary))
                 export_summaries["opc_classic"] = opc_summary
+            elif step == "hosts" and show_hosts:
+                hosts_summary = analyze_hosts(path, show_status=step_status)
+                if summarize_rollups:
+                    rollups.setdefault("hosts", []).append(hosts_summary)
+                else:
+                    print(render_hosts_summary(hosts_summary, verbose=verbose))
+                export_summaries["hosts"] = hosts_summary
             elif step == "hostname" and show_hostname:
                 hostname_summary = analyze_hostname(path, timeline_ip, show_status=step_status)
                 if summarize_rollups:
@@ -1644,11 +1827,16 @@ def _analyze_paths(
                     print(render_ptp_summary(summary))
                 export_summaries["ptp"] = summary
             elif step == "ot_commands" and show_ot_commands:
-                summary = analyze_ot_commands(path, show_status=step_status)
+                summary = analyze_ot_commands(
+                    path,
+                    show_status=step_status,
+                    fast=show_ot_commands_fast,
+                    config=ot_commands_config,
+                )
                 if summarize_rollups:
                     rollups.setdefault("ot_commands", []).append(summary)
                 else:
-                    print(render_ot_commands_summary(summary))
+                    print(render_ot_commands_summary(summary, session_limit=ot_commands_sessions_limit))
                 export_summaries["ot_commands"] = summary
             elif step == "iec101_103" and show_iec101_103:
                 summary = analyze_iec101_103(path, show_status=step_status)
@@ -1660,11 +1848,11 @@ def _analyze_paths(
         if (export_json_path or export_csv_path or export_sqlite_path) and not summarize_rollups:
             bundle = ExportBundle(path=path, summaries=export_summaries)
             if export_json_path:
-                export_json(bundle, _resolve_export_path(export_json_path, path, "json"))
+                export_json(bundle, _resolve_export_path(export_json_path, path, "json"), redact=export_redact)
             if export_csv_path:
-                export_csv(bundle, _resolve_export_path(export_csv_path, path, "csv"))
+                export_csv(bundle, _resolve_export_path(export_csv_path, path, "csv"), redact=export_redact)
             if export_sqlite_path:
-                export_sqlite(bundle, _resolve_export_path(export_sqlite_path, path, "sqlite"))
+                export_sqlite(bundle, _resolve_export_path(export_sqlite_path, path, "sqlite"), redact=export_redact)
 
         if idx < len(paths):
             print()
@@ -1678,6 +1866,8 @@ def _analyze_paths(
         merge_handlers: dict[str, tuple[callable, callable]] = {
             "ips": (merge_ips_summaries, lambda s: render_ips_summary(s, verbose=verbose)),
             "timeline": (merge_timeline_summaries, lambda s: render_timeline_summary(s, verbose=verbose)),
+            "compromised": (merge_compromised_summaries, lambda s: render_compromised_summary(s, verbose=verbose)),
+            "hosts": (merge_hosts_summaries, lambda s: render_hosts_summary(s, verbose=verbose)),
             "hostname": (merge_hostname_summaries, lambda s: render_hostname_summary(s, verbose=verbose)),
             "hostdetails": (merge_hostdetails_summaries, lambda s: render_hostdetails_summary(s, verbose=verbose)),
             "ftp": (merge_ftp_summaries, lambda s: render_ftp_summary(s, verbose=verbose)),
@@ -1744,6 +1934,8 @@ def _analyze_paths(
             "secrets": "SECRET DISCOVERY",
             "certificates": "CERTIFICATE ANALYSIS",
             "health": "TRAFFIC HEALTH ANALYSIS",
+            "compromised": "COMPROMISE ASSESSMENT",
+            "hosts": "HOST INVENTORY",
             "hostname": "HOSTNAME DISCOVERY",
             "hostdetails": "HOST DETAILS",
             "timeline": "TIMELINE ANALYSIS",
@@ -1826,11 +2018,11 @@ def _analyze_paths(
                 merged_summaries[key] = values
             bundle = ExportBundle(path=Path("ALL_PCAPS"), summaries=merged_summaries)
             if export_json_path:
-                export_json(bundle, export_json_path)
+                export_json(bundle, export_json_path, redact=export_redact)
             if export_csv_path:
-                export_csv(bundle, export_csv_path)
+                export_csv(bundle, export_csv_path, redact=export_redact)
             if export_sqlite_path:
-                export_sqlite(bundle, export_sqlite_path)
+                export_sqlite(bundle, export_sqlite_path, redact=export_redact)
     return 0
 
 
@@ -1845,6 +2037,9 @@ def main() -> int:
     print(_build_banner())
 
     ordered_steps = _ordered_steps(sys.argv)
+
+    if getattr(args, "ot_commands_fast", False):
+        args.ot_commands = True
 
     timeline_categories, show_category_list, invalid_categories = _parse_timeline_categories(
         getattr(args, "timeline_categories", None)
@@ -1873,6 +2068,9 @@ def main() -> int:
         return 2
     if getattr(args, "packet", None) is not None and args.packet <= 0:
         print("--packet must be a positive integer.")
+        return 2
+    if getattr(args, "ot_commands_sessions", 10) <= 0:
+        print("--ot-commands-sessions must be a positive integer.")
         return 2
     if args.timeline_bins <= 0:
         print("--timeline-bins must be a positive integer.")
@@ -1903,10 +2101,18 @@ def main() -> int:
         print("Invalid --time-start or --time-end format. Use epoch seconds or ISO 8601 (e.g. 2025-01-01T00:00:00Z).")
         return 2
 
+    ot_commands_config: OtControlConfig | None = None
+    if getattr(args, "ot_commands_config", None):
+        try:
+            ot_commands_config = load_ot_control_config(Path(args.ot_commands_config).expanduser())
+        except Exception as exc:
+            print(f"Invalid --ot-commands-config: {exc}")
+            return 2
+
     case_dir = Path(args.case_dir).expanduser() if getattr(args, "case_dir", None) else None
     if case_dir:
         if args.case_name:
-            safe_name = str(args.case_name).strip().replace(" ", "_")
+            safe_name = _sanitize_case_name(args.case_name)
             case_dir = case_dir / safe_name
 
     raw_targets = args.target if isinstance(args.target, list) else [args.target]
@@ -1957,6 +2163,13 @@ def main() -> int:
     if case_dir and not (export_json_path or export_csv_path or export_sqlite_path):
         export_json_path = case_dir / "pcapper.json"
 
+    if args.export_raw:
+        export_redact = False
+    elif args.export_redact:
+        export_redact = True
+    else:
+        export_redact = not args.show_secrets
+
     def _run_analysis() -> int:
         return _analyze_paths(
             paths,
@@ -2003,6 +2216,8 @@ def main() -> int:
             show_secrets=args.show_secrets,
             show_certificates=args.certificates,
             show_health=args.health,
+            show_compromised=getattr(args, "compromised", False),
+            show_hosts=getattr(args, "hosts", False),
             show_hostname=args.hostname,
             show_hostdetails=args.hostdetails,
             show_timeline=args.timeline,
@@ -2073,6 +2288,9 @@ def main() -> int:
             ioc_file=getattr(args, "ioc_file", None),
             show_pcapmeta=getattr(args, "pcapmeta", False),
             show_ot_commands=getattr(args, "ot_commands", False),
+            show_ot_commands_fast=getattr(args, "ot_commands_fast", False),
+            ot_commands_config=ot_commands_config,
+            ot_commands_sessions_limit=getattr(args, "ot_commands_sessions", 10),
             show_iec101_103=getattr(args, "iec101_103", False),
             bpf=getattr(args, "bpf", None),
             time_start=time_start,
@@ -2080,6 +2298,7 @@ def main() -> int:
             export_json_path=export_json_path,
             export_csv_path=export_csv_path,
             export_sqlite_path=export_sqlite_path,
+            export_redact=export_redact,
             case_dir=case_dir,
         )
 

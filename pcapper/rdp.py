@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import re
+import base64
+import hashlib
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -26,6 +28,7 @@ except Exception:  # pragma: no cover
 RDP_TCP_PORTS = {3389, 3390, 3388}
 RDP_UDP_PORTS = {3389, 3390, 3391, 3392}
 MSTSHASH_RE = re.compile(r"Cookie:\s*mstshash=([^\r\n;]+)", re.IGNORECASE)
+_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 
 SUSPICIOUS_PLAINTEXT = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential indicator"),
@@ -38,6 +41,9 @@ FILE_NAME_RE = re.compile(
     r"[\w\-.()\[\]/ ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|tgz|txt|csv|log|ps1|sh|bat|py|js|jar|apk|iso|img)",
     re.IGNORECASE,
 )
+
+_TLS_PREFIXES = (b"\x16\x03",)
+_DTLS_PREFIXES = (b"\x16\xfe",)
 
 
 @dataclass(frozen=True)
@@ -85,6 +91,15 @@ class RdpSummary:
     server_udp_ports: Counter[int]
     client_names: Counter[str]
     tls_handshakes: int
+    dtls_handshakes: int
+    requested_protocols: Counter[str]
+    selected_protocols: Counter[str]
+    client_builds: Counter[str]
+    certificates: Counter[str]
+    decrypted_username: Counter[str]
+    decrypted_domain: Counter[str]
+    decrypted_client_name: Counter[str]
+    auth_evidence: list[dict[str, object]]
     plaintext_strings: Counter[str]
     suspicious_plaintext: Counter[str]
     file_artifacts: Counter[str]
@@ -96,6 +111,7 @@ class RdpSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+    analysis_notes: list[str]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -121,6 +137,15 @@ class RdpSummary:
             "server_udp_ports": dict(self.server_udp_ports),
             "client_names": dict(self.client_names),
             "tls_handshakes": self.tls_handshakes,
+            "dtls_handshakes": self.dtls_handshakes,
+            "requested_protocols": dict(self.requested_protocols),
+            "selected_protocols": dict(self.selected_protocols),
+            "client_builds": dict(self.client_builds),
+            "certificates": dict(self.certificates),
+            "decrypted_username": dict(self.decrypted_username),
+            "decrypted_domain": dict(self.decrypted_domain),
+            "decrypted_client_name": dict(self.decrypted_client_name),
+            "auth_evidence": list(self.auth_evidence),
             "plaintext_strings": dict(self.plaintext_strings),
             "suspicious_plaintext": dict(self.suspicious_plaintext),
             "file_artifacts": dict(self.file_artifacts),
@@ -153,6 +178,7 @@ class RdpSummary:
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "duration_seconds": self.duration_seconds,
+            "analysis_notes": list(self.analysis_notes),
         }
 
 
@@ -182,6 +208,15 @@ def merge_rdp_summaries(summaries: list[RdpSummary] | tuple[RdpSummary, ...] | s
             server_udp_ports=Counter(),
             client_names=Counter(),
             tls_handshakes=0,
+            dtls_handshakes=0,
+            requested_protocols=Counter(),
+            selected_protocols=Counter(),
+            client_builds=Counter(),
+            certificates=Counter(),
+            decrypted_username=Counter(),
+            decrypted_domain=Counter(),
+            decrypted_client_name=Counter(),
+            auth_evidence=[],
             plaintext_strings=Counter(),
             suspicious_plaintext=Counter(),
             file_artifacts=Counter(),
@@ -193,6 +228,7 @@ def merge_rdp_summaries(summaries: list[RdpSummary] | tuple[RdpSummary, ...] | s
             first_seen=None,
             last_seen=None,
             duration_seconds=None,
+            analysis_notes=[],
         )
 
     total_packets = 0
@@ -206,6 +242,7 @@ def merge_rdp_summaries(summaries: list[RdpSummary] | tuple[RdpSummary, ...] | s
     tcp_sessions = 0
     udp_sessions = 0
     tls_handshakes = 0
+    dtls_handshakes = 0
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -218,6 +255,15 @@ def merge_rdp_summaries(summaries: list[RdpSummary] | tuple[RdpSummary, ...] | s
     server_tcp_ports: Counter[int] = Counter()
     server_udp_ports: Counter[int] = Counter()
     client_names: Counter[str] = Counter()
+    requested_protocols: Counter[str] = Counter()
+    selected_protocols: Counter[str] = Counter()
+    client_builds: Counter[str] = Counter()
+    certificates: Counter[str] = Counter()
+    decrypted_username: Counter[str] = Counter()
+    decrypted_domain: Counter[str] = Counter()
+    decrypted_client_name: Counter[str] = Counter()
+    auth_evidence: list[dict[str, object]] = []
+    auth_evidence_seen: set[tuple[str, str, int, int, str, str, str]] = set()
     plaintext_strings: Counter[str] = Counter()
     suspicious_plaintext: Counter[str] = Counter()
     file_artifacts: Counter[str] = Counter()
@@ -254,6 +300,27 @@ def merge_rdp_summaries(summaries: list[RdpSummary] | tuple[RdpSummary, ...] | s
         server_tcp_ports.update(summary.server_tcp_ports)
         server_udp_ports.update(summary.server_udp_ports)
         client_names.update(summary.client_names)
+        requested_protocols.update(summary.requested_protocols)
+        selected_protocols.update(summary.selected_protocols)
+        client_builds.update(summary.client_builds)
+        certificates.update(summary.certificates)
+        decrypted_username.update(summary.decrypted_username)
+        decrypted_domain.update(summary.decrypted_domain)
+        decrypted_client_name.update(summary.decrypted_client_name)
+        for item in summary.auth_evidence:
+            key = (
+                str(item.get("client_ip", "")),
+                str(item.get("server_ip", "")),
+                int(item.get("client_port", 0) or 0),
+                int(item.get("server_port", 0) or 0),
+                str(item.get("username", "")),
+                str(item.get("domain", "")),
+                str(item.get("client_name", "")),
+            )
+            if key in auth_evidence_seen:
+                continue
+            auth_evidence_seen.add(key)
+            auth_evidence.append(dict(item))
         plaintext_strings.update(summary.plaintext_strings)
         suspicious_plaintext.update(summary.suspicious_plaintext)
         file_artifacts.update(summary.file_artifacts)
@@ -262,6 +329,9 @@ def merge_rdp_summaries(summaries: list[RdpSummary] | tuple[RdpSummary, ...] | s
         anomalies.extend(summary.anomalies)
         artifacts.extend(summary.artifacts)
         errors.extend(summary.errors)
+        for note in summary.analysis_notes:
+            if note not in analysis_notes:
+                analysis_notes.append(note)
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -290,6 +360,15 @@ def merge_rdp_summaries(summaries: list[RdpSummary] | tuple[RdpSummary, ...] | s
         server_udp_ports=server_udp_ports,
         client_names=client_names,
         tls_handshakes=tls_handshakes,
+        dtls_handshakes=dtls_handshakes,
+        requested_protocols=requested_protocols,
+        selected_protocols=selected_protocols,
+        client_builds=client_builds,
+        certificates=certificates,
+        decrypted_username=decrypted_username,
+        decrypted_domain=decrypted_domain,
+        decrypted_client_name=decrypted_client_name,
+        auth_evidence=auth_evidence,
         plaintext_strings=plaintext_strings,
         suspicious_plaintext=suspicious_plaintext,
         file_artifacts=file_artifacts,
@@ -301,6 +380,7 @@ def merge_rdp_summaries(summaries: list[RdpSummary] | tuple[RdpSummary, ...] | s
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        analysis_notes=analysis_notes,
     )
 
 
@@ -370,6 +450,202 @@ def _scan_plaintext(
             artifacts.append(item)
 
 
+def _read_uint16(data: bytes, offset: int) -> tuple[Optional[int], int]:
+    if offset + 2 > len(data):
+        return None, offset
+    value = int.from_bytes(data[offset:offset + 2], "little")
+    return value, offset + 2
+
+
+def _read_uint32_le(data: bytes, offset: int) -> tuple[Optional[int], int]:
+    if offset + 4 > len(data):
+        return None, offset
+    value = int.from_bytes(data[offset:offset + 4], "little")
+    return value, offset + 4
+
+
+def _parse_rdp_negotiation(payload: bytes) -> tuple[Optional[int], Optional[int]]:
+    if not payload or payload[0] != 0x03:
+        return None, None
+    if len(payload) < 7:
+        return None, None
+    if payload[1] != 0x00:
+        return None, None
+    total_len = int.from_bytes(payload[2:4], "big")
+    if total_len <= 0 or total_len > len(payload):
+        total_len = len(payload)
+    offset = 4
+    if payload[offset] != 0x02:
+        return None, None
+    offset += 1
+    tpdu_len = payload[offset]
+    offset += 1
+    if tpdu_len < 6:
+        return None, None
+    if offset + (tpdu_len - 1) > len(payload):
+        return None, None
+    offset += (tpdu_len - 1)
+    if offset >= len(payload) or payload[offset] != 0xE0:
+        return None, None
+    offset += 1
+    offset += 6
+    if offset > total_len:
+        return None, None
+    requested = None
+    selected = None
+    while offset + 4 <= total_len:
+        if payload[offset:offset + 4] == b"\x00\x00\x00\x00":
+            break
+        if offset + 4 > total_len:
+            break
+        typ = payload[offset]
+        length = payload[offset + 1]
+        if length < 4:
+            break
+        if offset + length > total_len:
+            break
+        if typ == 0x01 and length >= 8:
+            requested = int.from_bytes(payload[offset + 4:offset + 8], "little")
+        if typ == 0x02 and length >= 8:
+            selected = int.from_bytes(payload[offset + 4:offset + 8], "little")
+        offset += length
+    return requested, selected
+
+
+def _rdp_protocol_names(mask: int | None) -> list[str]:
+    if mask is None:
+        return []
+    names: list[str] = []
+    if mask & 0x00000001:
+        names.append("TLS")
+    if mask & 0x00000002:
+        names.append("NLA")
+    if mask & 0x00000004:
+        names.append("RDP")
+    if mask & 0x00000008:
+        names.append("RDSTLS")
+    return names
+
+
+def _parse_rdp_client_core_data(payload: bytes) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    if not payload:
+        return None, None, None
+    marker = b"\x01\xc0\xd8\x00"
+    idx = payload.find(marker)
+    if idx == -1:
+        return None, None, None
+    offset = idx + 4
+    if offset + 4 > len(payload):
+        return None, None, None
+    offset += 4  # total length
+    core_type, offset = _read_uint16(payload, offset)
+    core_len, offset = _read_uint16(payload, offset)
+    if core_type != 0xC001 or core_len is None:
+        return None, None, None
+    if offset + core_len - 4 > len(payload):
+        return None, None, None
+    data = payload[offset:offset + core_len - 4]
+    if len(data) < 4:
+        return None, None, None
+    version = int.from_bytes(data[:4], "little")
+    offset2 = 4
+    if offset2 + 8 > len(data):
+        return None, None, str(version)
+    offset2 += 8  # skip desktop width/height
+    if offset2 + 2 > len(data):
+        return None, None, str(version)
+    offset2 += 2  # color depth
+    if offset2 + 2 > len(data):
+        return None, None, str(version)
+    offset2 += 2  # SAS
+    if offset2 + 4 > len(data):
+        return None, None, str(version)
+    keyboard_layout = int.from_bytes(data[offset2:offset2 + 4], "little")
+    offset2 += 4
+    if offset2 + 4 > len(data):
+        return None, None, str(version)
+    client_build = int.from_bytes(data[offset2:offset2 + 4], "little")
+    offset2 += 4
+    if offset2 + 32 > len(data):
+        return None, str(client_build), str(version)
+    client_name_raw = data[offset2:offset2 + 32]
+    try:
+        client_name = client_name_raw.decode("utf-16-le", errors="ignore").rstrip("\x00")
+    except Exception:
+        client_name = None
+    return client_name or None, str(client_build), str(version)
+
+
+def _coerce_decrypted_payload(value: object | None) -> Optional[bytes]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate and len(candidate) % 4 == 0 and _BASE64_RE.match(candidate):
+            try:
+                return base64.b64decode(candidate)
+            except Exception:
+                pass
+        return candidate.encode("latin-1", errors="ignore")
+    return None
+
+
+def _find_decrypted_payload(
+    pkt: object,
+    meta: object | None,
+    pkt_index: int,
+    decrypted_payloads: dict[int, bytes] | None,
+) -> tuple[Optional[bytes], Optional[str]]:
+    if decrypted_payloads:
+        payload = _coerce_decrypted_payload(decrypted_payloads.get(pkt_index))
+        if payload:
+            return payload, "parameter"
+    if hasattr(pkt, "pcapper_rdp_decrypted"):
+        payload = _coerce_decrypted_payload(getattr(pkt, "pcapper_rdp_decrypted", None))
+        if payload:
+            return payload, "packet"
+    if meta is None:
+        return None, None
+    candidate = None
+    if isinstance(meta, dict):
+        candidate = meta.get("rdp_decrypted") or meta.get("rdp_decrypted_packets")
+    else:
+        candidate = getattr(meta, "rdp_decrypted", None) or getattr(meta, "rdp_decrypted_packets", None)
+    if isinstance(candidate, dict):
+        payload = _coerce_decrypted_payload(candidate.get(pkt_index))
+        if payload:
+            return payload, "meta"
+    if isinstance(candidate, list):
+        if 0 <= pkt_index - 1 < len(candidate):
+            payload = _coerce_decrypted_payload(candidate[pkt_index - 1])
+            if payload:
+                return payload, "meta"
+    return None, None
+
+
+def _parse_rdp_decrypted_identity(payload: bytes) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    if not payload:
+        return None, None, None
+    text = payload.decode("latin-1", errors="ignore")
+    user = None
+    domain = None
+    host = None
+    match = re.search(r"(?:username|user)\s*[:=]\s*([\\w\\-\\.@]{1,64})", text, re.IGNORECASE)
+    if match:
+        user = match.group(1)
+    match = re.search(r"(?:domain)\\s*[:=]\\s*([\\w\\-\\.]{1,64})", text, re.IGNORECASE)
+    if match:
+        domain = match.group(1)
+    match = re.search(r"(?:clientname|client_name|hostname)\\s*[:=]\\s*([\\w\\-\\.]{1,64})", text, re.IGNORECASE)
+    if match:
+        host = match.group(1)
+    return user, domain, host
+
+
 def _direction(
     src_ip: str,
     dst_ip: str,
@@ -413,6 +689,7 @@ def analyze_rdp(
     show_status: bool = True,
     packets: list[object] | None = None,
     meta: object | None = None,
+    decrypted_payloads: dict[int, bytes] | None = None,
 ) -> RdpSummary:
     errors: list[str] = []
     if (TCP is None and UDP is None) or (IP is None and IPv6 is None):
@@ -440,6 +717,15 @@ def analyze_rdp(
             server_udp_ports=Counter(),
             client_names=Counter(),
             tls_handshakes=0,
+            dtls_handshakes=0,
+            requested_protocols=Counter(),
+            selected_protocols=Counter(),
+            client_builds=Counter(),
+            certificates=Counter(),
+            decrypted_username=Counter(),
+            decrypted_domain=Counter(),
+            decrypted_client_name=Counter(),
+            auth_evidence=[],
             plaintext_strings=Counter(),
             suspicious_plaintext=Counter(),
             file_artifacts=Counter(),
@@ -451,6 +737,7 @@ def analyze_rdp(
             first_seen=None,
             last_seen=None,
             duration_seconds=None,
+            analysis_notes=[],
         )
 
     reader, status, stream, size_bytes, _file_type = get_reader(
@@ -477,16 +764,33 @@ def analyze_rdp(
     server_udp_ports: Counter[int] = Counter()
     client_names: Counter[str] = Counter()
     tls_handshakes = 0
+    dtls_handshakes = 0
+    requested_protocols: Counter[str] = Counter()
+    selected_protocols: Counter[str] = Counter()
+    client_builds: Counter[str] = Counter()
+    certificates: Counter[str] = Counter()
+    decrypted_username: Counter[str] = Counter()
+    decrypted_domain: Counter[str] = Counter()
+    decrypted_client_name: Counter[str] = Counter()
+    auth_evidence: list[dict[str, object]] = []
+    auth_evidence_seen: set[tuple[str, str, int, int, str, str, str]] = set()
 
     plaintext_strings: Counter[str] = Counter()
     suspicious_plaintext: Counter[str] = Counter()
     file_artifacts: Counter[str] = Counter()
     artifacts: list[str] = []
+    analysis_notes: list[str] = [
+        "Plaintext indicators are limited to pre-encryption or decrypted payloads.",
+        "RDP negotiation parsing is best-effort and may not decode all variants.",
+    ]
 
     short_session_counts: Counter[tuple[str, str]] = Counter()
     short_session_by_client: Counter[str] = Counter()
     short_session_targets: dict[str, set[str]] = defaultdict(set)
     pair_first_seen: dict[tuple[str, str], list[float]] = defaultdict(list)
+
+    pkt_index = 0
+    decrypted_sources: set[str] = set()
 
     try:
         for pkt in reader:
@@ -498,6 +802,7 @@ def analyze_rdp(
                 except Exception:
                     pass
 
+            pkt_index += 1
             total_packets += 1
             pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
             total_bytes += pkt_len
@@ -544,13 +849,18 @@ def analyze_rdp(
                 except Exception:
                     payload = b""
 
-            payload_prefix = payload[:64] if payload else b""
+            payload_prefix = payload[:128] if payload else b""
+            decrypted_payload, decrypt_source = _find_decrypted_payload(
+                pkt, meta, pkt_index, decrypted_payloads
+            )
+            if decrypt_source:
+                decrypted_sources.add(decrypt_source)
             is_rdp = (
                 (is_tcp and (sport in RDP_TCP_PORTS or dport in RDP_TCP_PORTS))
                 or (is_udp and (sport in RDP_UDP_PORTS or dport in RDP_UDP_PORTS))
                 or (payload_prefix and (b"Cookie: mstshash=" in payload_prefix or b"RDPUDP" in payload_prefix))
             )
-            if not is_rdp:
+            if not is_rdp and not decrypted_payload:
                 continue
 
             rdp_packets += 1
@@ -647,11 +957,56 @@ def analyze_rdp(
                     artifacts.append(text.strip())
                 if "CredSSP" in text or "NTLMSSP" in text:
                     artifacts.append(text.strip())
-                _scan_plaintext(payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts)
+                requested_mask, selected_mask = _parse_rdp_negotiation(payload_prefix)
+                for item in _rdp_protocol_names(requested_mask):
+                    requested_protocols[item] += 1
+                for item in _rdp_protocol_names(selected_mask):
+                    selected_protocols[item] += 1
+                core_client, client_build, _version = _parse_rdp_client_core_data(payload_prefix)
+                if core_client:
+                    decrypted_client_name[core_client] += 1
+                if client_build:
+                    client_builds[client_build] += 1
+                if (not payload_prefix.startswith(_TLS_PREFIXES) and not payload_prefix.startswith(_DTLS_PREFIXES)):
+                    _scan_plaintext(payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts)
 
-            if payload_prefix.startswith(b"\x16\x03"):
+            if payload_prefix.startswith(_TLS_PREFIXES):
                 tls_handshakes += 1
                 session.tls_detected = True
+            if payload_prefix.startswith(_DTLS_PREFIXES):
+                dtls_handshakes += 1
+                session.tls_detected = True
+
+            if decrypted_payload:
+                _scan_plaintext(decrypted_payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts)
+                user, domain, host = _parse_rdp_decrypted_identity(decrypted_payload)
+                if user:
+                    decrypted_username[user] += 1
+                if domain:
+                    decrypted_domain[domain] += 1
+                if host:
+                    decrypted_client_name[host] += 1
+                if user:
+                    key = (
+                        session.client_ip,
+                        session.server_ip,
+                        session.client_port,
+                        session.server_port,
+                        user,
+                        domain or "-",
+                        host or "-",
+                    )
+                    if key not in auth_evidence_seen:
+                        auth_evidence_seen.add(key)
+                        auth_evidence.append({
+                            "client_ip": session.client_ip,
+                            "server_ip": session.server_ip,
+                            "client_port": session.client_port,
+                            "server_port": session.server_port,
+                            "username": user,
+                            "domain": domain or "-",
+                            "client_name": host or "-",
+                        })
 
     except Exception as exc:
         errors.append(str(exc))
@@ -702,8 +1057,8 @@ def analyze_rdp(
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
-    non_standard_ports = [port for port in server_tcp_ports if port != 3389]
-    non_standard_ports += [port for port in server_udp_ports if port != 3389]
+    non_standard_ports = [port for port in server_tcp_ports if port not in RDP_TCP_PORTS]
+    non_standard_ports += [port for port in server_udp_ports if port not in RDP_UDP_PORTS]
     if non_standard_ports:
         detections.append({
             "severity": "info",
@@ -718,12 +1073,15 @@ def analyze_rdp(
             "details": ", ".join(str(port) for port in sorted(server_udp_ports.keys())),
         })
 
-    if suspicious_plaintext:
+    if suspicious_plaintext and (plaintext_strings or decrypted_sources):
         detections.append({
             "severity": "warning",
             "summary": "Suspicious plaintext strings observed in RDP payloads",
             "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
         })
+
+    if decrypted_sources:
+        analysis_notes.append(f"Decrypted RDP payloads provided via: {', '.join(sorted(decrypted_sources))}.")
 
     for (client_ip, server_ip), count in short_session_counts.items():
         if count >= 20:
@@ -801,6 +1159,15 @@ def analyze_rdp(
         server_udp_ports=server_udp_ports,
         client_names=client_names,
         tls_handshakes=tls_handshakes,
+        dtls_handshakes=dtls_handshakes,
+        requested_protocols=requested_protocols,
+        selected_protocols=selected_protocols,
+        client_builds=client_builds,
+        certificates=certificates,
+        decrypted_username=decrypted_username,
+        decrypted_domain=decrypted_domain,
+        decrypted_client_name=decrypted_client_name,
+        auth_evidence=auth_evidence,
         plaintext_strings=plaintext_strings,
         suspicious_plaintext=suspicious_plaintext,
         file_artifacts=file_artifacts,
@@ -812,4 +1179,5 @@ def analyze_rdp(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        analysis_notes=analysis_notes,
     )

@@ -109,6 +109,8 @@ class DhcpSummary:
     hostnames: Counter[str] = field(default_factory=Counter)
     domains: Counter[str] = field(default_factory=Counter)
     vendor_classes: Counter[str] = field(default_factory=Counter)
+    vendor_classes_by_mac: dict[str, Counter[str]] = field(default_factory=dict)
+    vendor_classes_by_ip: dict[str, Counter[str]] = field(default_factory=dict)
     client_ids: Counter[str] = field(default_factory=Counter)
     lease_servers: Counter[str] = field(default_factory=Counter)
     lease_time_buckets: Counter[str] = field(default_factory=Counter)
@@ -264,6 +266,8 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
 
     conversations: dict[tuple[str, str, str, str, int, int, str], DhcpConversation] = {}
     sessions: dict[tuple[str, str, str], DhcpSession] = {}
+    vendor_classes_by_mac: dict[str, Counter[str]] = defaultdict(Counter)
+    vendor_classes_by_ip: dict[str, Counter[str]] = defaultdict(Counter)
 
     discover_intervals: dict[str, list[float]] = defaultdict(list)
     last_discover_ts: dict[str, float] = {}
@@ -351,6 +355,8 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             vendor_class = _decode_name(option_map.get("vendor_class_id", option_map.get("vendor_class", "")))
             client_id = _decode_name(option_map.get("client_id", ""))
 
+            session_client_ip = ciaddr if ciaddr != "0.0.0.0" else src_ip
+
             relay_ip = _decode_name(option_map.get("relay_agent_Information", option_map.get("relay_agent_information", "")))
             if relay_ip:
                 summary.relay_agents[relay_ip] += 1
@@ -375,6 +381,13 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 summary.domains[domain] += 1
             if vendor_class:
                 summary.vendor_classes[vendor_class] += 1
+                vendor_classes_by_mac[chaddr][vendor_class] += 1
+                if session_client_ip and session_client_ip != "0.0.0.0":
+                    vendor_classes_by_ip[session_client_ip][vendor_class] += 1
+                if requested_ip and requested_ip != "0.0.0.0":
+                    vendor_classes_by_ip[requested_ip][vendor_class] += 1
+                if yiaddr and yiaddr != "0.0.0.0":
+                    vendor_classes_by_ip[yiaddr][vendor_class] += 1
             if client_id:
                 summary.client_ids[client_id] += 1
 
@@ -498,6 +511,8 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
 
     summary.plaintext_observed = Counter({item: count for item, count in strings_counter.most_common(30)})
     summary.files_discovered = sorted(files)[:80]
+    summary.vendor_classes_by_mac = dict(vendor_classes_by_mac)
+    summary.vendor_classes_by_ip = dict(vendor_classes_by_ip)
     summary.conversations = sorted(conversations.values(), key=lambda item: item.packets, reverse=True)
     summary.sessions = sorted(sessions.values(), key=lambda item: (item.requests + item.offers + item.acks + item.naks), reverse=True)
 
