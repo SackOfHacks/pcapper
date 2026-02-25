@@ -25,6 +25,8 @@ except Exception:  # pragma: no cover
 
 RPC_PORTS = {135, 445, 593}
 
+RESPONSE_PDU_TYPES = {"response", "bind_ack", "bind_nak", "alter_context_resp"}
+
 PDU_TYPE_MAP = {
     0x00: "request",
     0x02: "response",
@@ -51,10 +53,44 @@ RPC_INTERFACES = {
     "338cd001-2244-31f1-aaaa-900038001003": "WINREG (Remote Registry)",
 }
 
+SAMR_UUID = "12345778-1234-abcd-ef00-0123456789ac"
+# MS-SAMR: SamrQueryInformationUser (opnum 36), SamrQueryInformationUser2 (opnum 47)
+SAMR_QUERY_USER_OPNUMS = {36, 47}
+
+RPC_OPNUM_MAP: dict[str, dict[int, str]] = {
+    # Basic/common mappings; keep conservative to avoid false attribution.
+    # UUIDs are lower-case, without version suffix.
+    "e1af8308-5d1f-11c9-91a4-08002b14a0fa": {
+        3: "ept_map",
+        5: "ept_map_auth",
+    },
+}
+
 HOST_RE = re.compile(r"\b([A-Za-z0-9_.-]{2,64})\b")
 DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9_.-]{1,64})\b")
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+IPV6_RE = re.compile(r"\b(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b")
 MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})\b")
+UNC_SHARE_RE = re.compile(r"\\\\([A-Za-z0-9_.-]{1,64})\\\\([A-Za-z0-9.$_-]{1,64})")
+PIPE_REMOTE_RE = re.compile(r"\\\\([A-Za-z0-9_.-]{1,64})\\\\pipe\\\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE)
+PIPE_LOCAL_RE = re.compile(r"\\\\\\.\\\\pipe\\\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE)
+PIPE_GENERIC_RE = re.compile(r"\\pipe\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE)
+
+SAMR_FULLNAME_STOPWORDS = {
+    "administrator",
+    "administrators",
+    "admin",
+    "domain admins",
+    "domain users",
+    "enterprise admins",
+    "authenticated users",
+    "anonymous",
+    "guest",
+    "guests",
+    "default",
+    "unknown",
+}
+SAMR_NAME_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z.'-]{0,40}$")
 
 SUSPICIOUS_STRINGS = [
     (re.compile(r"powershell|cmd\.exe|wmic|winrs", re.IGNORECASE), "Command execution tooling"),
@@ -99,11 +135,15 @@ class RpcSummary:
     protocol_counts: Counter[str]
     pdu_counts: Counter[str]
     interface_counts: Counter[str]
+    command_counts: Counter[str]
+    share_counts: Counter[str]
+    pipe_counts: Counter[str]
     hostname_counts: Counter[str]
     domain_user_counts: Counter[str]
     ip_strings: Counter[str]
     mac_strings: Counter[str]
     plaintext_strings: Counter[str]
+    samr_fullnames: list[dict[str, object]]
     conversations: list[RpcConversation]
     detections: list[dict[str, object]]
     anomalies: list[dict[str, object]]
@@ -128,11 +168,15 @@ class RpcSummary:
             "protocol_counts": dict(self.protocol_counts),
             "pdu_counts": dict(self.pdu_counts),
             "interface_counts": dict(self.interface_counts),
+            "command_counts": dict(self.command_counts),
+            "share_counts": dict(self.share_counts),
+            "pipe_counts": dict(self.pipe_counts),
             "hostname_counts": dict(self.hostname_counts),
             "domain_user_counts": dict(self.domain_user_counts),
             "ip_strings": dict(self.ip_strings),
             "mac_strings": dict(self.mac_strings),
             "plaintext_strings": dict(self.plaintext_strings),
+            "samr_fullnames": list(self.samr_fullnames),
             "conversations": [
                 {
                     "client_ip": conv.client_ip,
@@ -168,6 +212,26 @@ def _rpc_pdu_type(payload: bytes | None) -> Optional[str]:
     return PDU_TYPE_MAP.get(ptype, f"0x{ptype:02x}")
 
 
+def _find_rpc_pdu(payload: bytes | None) -> tuple[Optional[str], int]:
+    if not payload or len(payload) < 16:
+        return None, 0
+    direct = _rpc_pdu_type(payload)
+    if direct:
+        return direct, 0
+
+    idx = payload.find(b"\x05")
+    while idx != -1 and idx + 16 <= len(payload):
+        minor = payload[idx + 1]
+        if minor in (0x00, 0x01):
+            ptype = payload[idx + 2]
+            if ptype in PDU_TYPE_MAP:
+                data_rep = payload[idx + 4:idx + 8]
+                if data_rep in {b"\x10\x00\x00\x00", b"\x00\x00\x00\x10"}:
+                    return PDU_TYPE_MAP.get(ptype, f"0x{ptype:02x}"), idx
+        idx = payload.find(b"\x05", idx + 1)
+    return None, 0
+
+
 def _decode_uuid_le(data: bytes) -> Optional[str]:
     if len(data) < 16:
         return None
@@ -180,12 +244,12 @@ def _decode_uuid_le(data: bytes) -> Optional[str]:
         return None
 
 
-def _parse_bind_interfaces(payload: bytes | None) -> list[str]:
+def _parse_bind_contexts(payload: bytes | None) -> list[tuple[int, str]]:
     if not payload or len(payload) < 32:
         return []
     if payload[0] != 0x05 or payload[2] != 0x0B:
         return []
-    interfaces: list[str] = []
+    contexts: list[tuple[int, str]] = []
     try:
         idx = 16
         if idx + 10 > len(payload):
@@ -198,6 +262,7 @@ def _parse_bind_interfaces(payload: bytes | None) -> list[str]:
         for _ in range(num_ctx):
             if idx + 4 > len(payload):
                 break
+            context_id = struct.unpack_from("<H", payload, idx)[0]
             idx += 2  # context_id
             num_trans = payload[idx]
             idx += 2  # num_trans + reserved
@@ -209,31 +274,133 @@ def _parse_bind_interfaces(payload: bytes | None) -> list[str]:
             idx += 4
             if uuid:
                 iface = f"{uuid} v{vers[0]}.{vers[1]}"
-                interfaces.append(iface)
+                contexts.append((context_id, iface))
             for _t in range(num_trans):
                 if idx + 20 > len(payload):
                     break
                 idx += 16 + 4
     except Exception:
-        return interfaces
-    return interfaces
+        return contexts
+    return contexts
+
+
+def _extract_utf16le_strings(payload: bytes, limit: int = 200) -> list[str]:
+    if not payload:
+        return []
+    out: list[str] = []
+    current = bytearray()
+    i = 0
+    while i + 1 < len(payload):
+        b1 = payload[i]
+        b2 = payload[i + 1]
+        if 32 <= b1 <= 126 and b2 == 0x00:
+            current.append(b1)
+            i += 2
+            continue
+        if len(current) >= 4:
+            out.append(current.decode("latin-1", errors="ignore")[:limit])
+        current = bytearray()
+        i += 1
+    if len(current) >= 4:
+        out.append(current.decode("latin-1", errors="ignore")[:limit])
+    return out
 
 
 def _extract_strings(payload: bytes, limit: int = 200) -> list[str]:
     if not payload:
         return []
     out: list[str] = []
+    seen: set[str] = set()
     current = bytearray()
     for b in payload:
         if 32 <= b <= 126:
             current.append(b)
         else:
             if len(current) >= 4:
-                out.append(current.decode("latin-1", errors="ignore")[:limit])
+                value = current.decode("latin-1", errors="ignore")[:limit]
+                if value not in seen:
+                    out.append(value)
+                    seen.add(value)
             current = bytearray()
     if len(current) >= 4:
-        out.append(current.decode("latin-1", errors="ignore")[:limit])
+        value = current.decode("latin-1", errors="ignore")[:limit]
+        if value not in seen:
+            out.append(value)
+            seen.add(value)
+
+    for value in _extract_utf16le_strings(payload, limit=limit):
+        if value not in seen:
+            out.append(value)
+            seen.add(value)
     return out
+
+
+def _rpc_is_little_endian(rpc_payload: bytes) -> bool:
+    if len(rpc_payload) < 8:
+        return True
+    data_rep = rpc_payload[4:8]
+    if data_rep == b"\x10\x00\x00\x00":
+        return True
+    if data_rep == b"\x00\x00\x00\x10":
+        return False
+    return True
+
+
+def _rpc_read_u16(payload: bytes, offset: int, le: bool) -> Optional[int]:
+    if offset + 2 > len(payload):
+        return None
+    return struct.unpack_from("<H" if le else ">H", payload, offset)[0]
+
+
+def _rpc_read_u32(payload: bytes, offset: int, le: bool) -> Optional[int]:
+    if offset + 4 > len(payload):
+        return None
+    return struct.unpack_from("<I" if le else ">I", payload, offset)[0]
+
+
+def _rpc_stub_data(rpc_payload: bytes, le: bool) -> bytes:
+    if len(rpc_payload) < 24:
+        return b""
+    frag_len = _rpc_read_u16(rpc_payload, 8, le) or len(rpc_payload)
+    auth_len = _rpc_read_u16(rpc_payload, 10, le) or 0
+    stub_end = min(len(rpc_payload), frag_len)
+    if auth_len and stub_end >= auth_len + 24:
+        stub_end = max(24, stub_end - auth_len)
+    return rpc_payload[24:stub_end]
+
+
+def _looks_like_samr_fullname(value: str) -> bool:
+    cleaned = " ".join(value.strip().split())
+    if len(cleaned) < 3 or len(cleaned) > 80:
+        return False
+    lowered = cleaned.lower()
+    if lowered in SAMR_FULLNAME_STOPWORDS:
+        return False
+    if "\\" in cleaned or "@" in cleaned:
+        return False
+    if "," in cleaned:
+        parts = [part.strip() for part in cleaned.split(",") if part.strip()]
+        if len(parts) >= 2 and all(SAMR_NAME_TOKEN_RE.match(part) for part in parts[:2]):
+            return True
+    parts = [part for part in cleaned.split() if part]
+    if len(parts) < 2:
+        return False
+    if not all(SAMR_NAME_TOKEN_RE.match(part) for part in parts[:2]):
+        return False
+    return True
+
+
+def _extract_samr_fullnames(payload: bytes) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in _extract_utf16le_strings(payload, limit=120):
+        cleaned = " ".join(value.strip().split())
+        if not cleaned or cleaned in seen:
+            continue
+        if _looks_like_samr_fullname(cleaned):
+            names.append(cleaned)
+            seen.add(cleaned)
+    return names
 
 
 def _beacon_score(times: list[float]) -> Optional[dict[str, float]]:
@@ -273,11 +440,15 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
             protocol_counts=Counter(),
             pdu_counts=Counter(),
             interface_counts=Counter(),
+            command_counts=Counter(),
+            share_counts=Counter(),
+            pipe_counts=Counter(),
             hostname_counts=Counter(),
             domain_user_counts=Counter(),
             ip_strings=Counter(),
             mac_strings=Counter(),
             plaintext_strings=Counter(),
+            samr_fullnames=[],
             conversations=[],
             detections=[],
             anomalies=[],
@@ -305,16 +476,23 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
     protocol_counts: Counter[str] = Counter()
     pdu_counts: Counter[str] = Counter()
     interface_counts: Counter[str] = Counter()
+    command_counts: Counter[str] = Counter()
+    share_counts: Counter[str] = Counter()
+    pipe_counts: Counter[str] = Counter()
     hostname_counts: Counter[str] = Counter()
     domain_user_counts: Counter[str] = Counter()
     ip_strings: Counter[str] = Counter()
     mac_strings: Counter[str] = Counter()
     plaintext_strings: Counter[str] = Counter()
+    samr_fullnames: list[dict[str, object]] = []
+    samr_seen: set[tuple[str, str, str, int, str]] = set()
 
     conv_map: dict[tuple[str, str, str, int], dict[str, object]] = {}
+    flow_contexts: dict[tuple[str, str, str, int], dict[int, str]] = {}
     artifacts: list[RpcArtifact] = []
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
+    pending_calls: dict[tuple[str, str, str, int, int], dict[str, object]] = {}
 
     dst_by_src: dict[str, set[str]] = defaultdict(set)
     request_times: dict[tuple[str, str], list[float]] = defaultdict(list)
@@ -383,32 +561,49 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
             if not proto or not payload:
                 continue
 
-            pdu_type = _rpc_pdu_type(payload)
+            pdu_type, pdu_offset = _find_rpc_pdu(payload)
             if not pdu_type and sport not in RPC_PORTS and dport not in RPC_PORTS:
                 continue
             if not pdu_type:
                 continue
 
+            rpc_payload = payload[pdu_offset:] if pdu_offset < len(payload) else payload
             rpc_packets += 1
             total_messages += 1
             protocol_counts[proto] += 1
-            server_port = dport if dport in RPC_PORTS else sport
-            server_ports[server_port] += 1
             pdu_counts[pdu_type] += 1
-            client_counts[src_ip] += 1
-            server_counts[dst_ip] += 1
-            dst_by_src[src_ip].add(dst_ip)
-            if ts is not None:
-                request_times[(src_ip, dst_ip)].append(ts)
-
-            if pdu_type in {"response", "bind_ack", "alter_context_resp"}:
-                response_bytes[(src_ip, dst_ip)] += pkt_len
+            le = _rpc_is_little_endian(rpc_payload)
+            call_id = _rpc_read_u32(rpc_payload, 12, le) if len(rpc_payload) >= 16 else None
+            is_response = pdu_type in RESPONSE_PDU_TYPES
+            if is_response:
+                client_ip = dst_ip
+                server_ip = src_ip
+                client_port = dport
+                server_port = sport
             else:
-                request_bytes[(src_ip, dst_ip)] += pkt_len
-            if pdu_type == "bind_nak":
-                bind_failures[src_ip] += 1
+                client_ip = src_ip
+                server_ip = dst_ip
+                client_port = sport
+                server_port = dport
+            server_port = int(server_port or 0)
 
-            conv_key = (src_ip, dst_ip, proto, int(server_port))
+            server_ports[server_port] += 1
+            client_counts[client_ip] += 1
+            server_counts[server_ip] += 1
+            if not is_response:
+                dst_by_src[client_ip].add(server_ip)
+                if ts is not None:
+                    request_times[(client_ip, server_ip)].append(ts)
+
+            flow_key = (client_ip, server_ip)
+            if is_response:
+                response_bytes[flow_key] += pkt_len
+            else:
+                request_bytes[flow_key] += pkt_len
+            if pdu_type == "bind_nak":
+                bind_failures[client_ip] += 1
+
+            conv_key = (client_ip, server_ip, proto, int(server_port))
             conv = conv_map.get(conv_key)
             if conv is None:
                 conv = {"packets": 0, "bytes": 0, "first_seen": ts, "last_seen": ts}
@@ -421,12 +616,66 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
                 if conv["last_seen"] is None or ts > conv["last_seen"]:
                     conv["last_seen"] = ts
 
-            for iface in _parse_bind_interfaces(payload):
-                interface_counts[iface] += 1
-                uuid = iface.split(" ", 1)[0]
-                label = RPC_INTERFACES.get(uuid)
-                if label:
-                    artifacts.append(RpcArtifact(kind="interface", detail=f"{label} ({iface})", src=src_ip, dst=dst_ip))
+            if pdu_type == "bind":
+                contexts = _parse_bind_contexts(rpc_payload)
+                if contexts:
+                    context_map = flow_contexts.setdefault(conv_key, {})
+                    for context_id, iface in contexts:
+                        context_map[context_id] = iface
+                        uuid = iface.split(" ", 1)[0]
+                        label = RPC_INTERFACES.get(uuid)
+                        display = f"{label} ({iface})" if label else iface
+                        interface_counts[display] += 1
+                        if label:
+                            artifacts.append(RpcArtifact(kind="interface", detail=f"{label} ({iface})", src=client_ip, dst=server_ip))
+
+            if pdu_type == "request" and len(rpc_payload) >= 24:
+                context_id = _rpc_read_u16(rpc_payload, 20, le) or 0
+                opnum = _rpc_read_u16(rpc_payload, 22, le) or 0
+                iface = flow_contexts.get(conv_key, {}).get(context_id)
+                iface_uuid = iface.split(" ", 1)[0] if iface else None
+                label = RPC_INTERFACES.get(iface_uuid or "", None)
+                op_map = RPC_OPNUM_MAP.get(iface_uuid or "", {})
+                op_name = op_map.get(opnum)
+                if op_name:
+                    command = f"{label or iface_uuid or 'RPC'}::{op_name}"
+                elif iface:
+                    command = f"{label or iface} opnum {opnum}"
+                else:
+                    command = f"opnum {opnum}"
+                command_counts[command] += 1
+                if call_id is not None and iface_uuid == SAMR_UUID and opnum in SAMR_QUERY_USER_OPNUMS:
+                    key = (client_ip, server_ip, proto, int(server_port), call_id)
+                    pending_calls[key] = {"opnum": opnum}
+                    if len(pending_calls) > 2048:
+                        pending_calls.clear()
+
+            if pdu_type == "response" and call_id is not None:
+                key = (client_ip, server_ip, proto, int(server_port), call_id)
+                pending = pending_calls.pop(key, None)
+                if pending and int(pending.get("opnum", -1)) in SAMR_QUERY_USER_OPNUMS:
+                    stub_data = _rpc_stub_data(rpc_payload, le)
+                    for full_name in _extract_samr_fullnames(stub_data):
+                        samr_key = (full_name.lower(), server_ip, client_ip, int(server_port), proto)
+                        if samr_key in samr_seen:
+                            continue
+                        samr_seen.add(samr_key)
+                        samr_fullnames.append({
+                            "full_name": full_name,
+                            "src_ip": server_ip,
+                            "dst_ip": client_ip,
+                            "protocol": proto,
+                            "server_port": int(server_port),
+                            "opnum": int(pending.get("opnum", -1)),
+                        })
+
+            if pdu_offset > 0 and (sport == 445 or dport == 445):
+                artifacts.append(RpcArtifact(
+                    kind="rpc_over_smb",
+                    detail=f"DCE/RPC header at offset {pdu_offset} ({pdu_type})",
+                    src=client_ip,
+                    dst=server_ip,
+                ))
 
             for item in _extract_strings(payload, limit=200):
                 plaintext_strings[item] += 1
@@ -436,8 +685,46 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
                     domain_user_counts[f"{match[0]}\\{match[1]}"] += 1
                 for match in IP_RE.findall(item):
                     ip_strings[match] += 1
+                for match in IPV6_RE.findall(item):
+                    try:
+                        ipaddress.ip_address(match)
+                    except Exception:
+                        continue
+                    ip_strings[match] += 1
                 for match in MAC_RE.findall(item):
                     mac_strings[match] += 1
+                pipe_names: set[str] = set()
+                pipe_paths: set[str] = set()
+                for match in UNC_SHARE_RE.finditer(item):
+                    server = match.group(1)
+                    share = match.group(2)
+                    if share.lower() == "pipe":
+                        continue
+                    share_path = f"\\\\{server}\\{share}"
+                    share_counts[share_path] += 1
+                    artifacts.append(RpcArtifact(kind="share", detail=share_path, src=src_ip, dst=dst_ip))
+                for match in PIPE_REMOTE_RE.finditer(item):
+                    pipe_path = f"\\\\{match.group(1)}\\pipe\\{match.group(2)}"
+                    if pipe_path not in pipe_paths:
+                        pipe_counts[pipe_path] += 1
+                        artifacts.append(RpcArtifact(kind="pipe", detail=pipe_path, src=src_ip, dst=dst_ip))
+                        pipe_paths.add(pipe_path)
+                        pipe_names.add(match.group(2).lower())
+                for match in PIPE_LOCAL_RE.finditer(item):
+                    pipe_path = f"\\\\.\\pipe\\{match.group(1)}"
+                    if pipe_path not in pipe_paths:
+                        pipe_counts[pipe_path] += 1
+                        artifacts.append(RpcArtifact(kind="pipe", detail=pipe_path, src=src_ip, dst=dst_ip))
+                        pipe_paths.add(pipe_path)
+                        pipe_names.add(match.group(1).lower())
+                for match in PIPE_GENERIC_RE.finditer(item):
+                    if match.group(1).lower() in pipe_names:
+                        continue
+                    pipe_path = f"\\pipe\\{match.group(1)}"
+                    if pipe_path not in pipe_paths:
+                        pipe_counts[pipe_path] += 1
+                        artifacts.append(RpcArtifact(kind="pipe", detail=pipe_path, src=src_ip, dst=dst_ip))
+                        pipe_paths.add(pipe_path)
                 for pattern, reason in SUSPICIOUS_STRINGS:
                     if pattern.search(item):
                         detections.append({
@@ -525,11 +812,15 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
         protocol_counts=protocol_counts,
         pdu_counts=pdu_counts,
         interface_counts=interface_counts,
+        command_counts=command_counts,
+        share_counts=share_counts,
+        pipe_counts=pipe_counts,
         hostname_counts=hostname_counts,
         domain_user_counts=domain_user_counts,
         ip_strings=ip_strings,
         mac_strings=mac_strings,
         plaintext_strings=plaintext_strings,
+        samr_fullnames=samr_fullnames,
         conversations=conversations,
         detections=detections,
         anomalies=anomalies,
@@ -558,11 +849,15 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
             protocol_counts=Counter(),
             pdu_counts=Counter(),
             interface_counts=Counter(),
+            command_counts=Counter(),
+            share_counts=Counter(),
+            pipe_counts=Counter(),
             hostname_counts=Counter(),
             domain_user_counts=Counter(),
             ip_strings=Counter(),
             mac_strings=Counter(),
             plaintext_strings=Counter(),
+            samr_fullnames=[],
             conversations=[],
             detections=[],
             anomalies=[],
@@ -587,11 +882,15 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
     protocol_counts: Counter[str] = Counter()
     pdu_counts: Counter[str] = Counter()
     interface_counts: Counter[str] = Counter()
+    command_counts: Counter[str] = Counter()
+    share_counts: Counter[str] = Counter()
+    pipe_counts: Counter[str] = Counter()
     hostname_counts: Counter[str] = Counter()
     domain_user_counts: Counter[str] = Counter()
     ip_strings: Counter[str] = Counter()
     mac_strings: Counter[str] = Counter()
     plaintext_strings: Counter[str] = Counter()
+    samr_fullnames: list[dict[str, object]] = []
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
     artifacts: list[RpcArtifact] = []
@@ -621,11 +920,15 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
         protocol_counts.update(summary.protocol_counts)
         pdu_counts.update(summary.pdu_counts)
         interface_counts.update(summary.interface_counts)
+        command_counts.update(summary.command_counts)
+        share_counts.update(summary.share_counts)
+        pipe_counts.update(summary.pipe_counts)
         hostname_counts.update(summary.hostname_counts)
         domain_user_counts.update(summary.domain_user_counts)
         ip_strings.update(summary.ip_strings)
         mac_strings.update(summary.mac_strings)
         plaintext_strings.update(summary.plaintext_strings)
+        samr_fullnames.extend(getattr(summary, "samr_fullnames", []) or [])
 
         for item in summary.detections:
             key = (str(item.get("severity", "")), str(item.get("summary", "")), str(item.get("details", "")))
@@ -688,11 +991,15 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
         protocol_counts=protocol_counts,
         pdu_counts=pdu_counts,
         interface_counts=interface_counts,
+        command_counts=command_counts,
+        share_counts=share_counts,
+        pipe_counts=pipe_counts,
         hostname_counts=hostname_counts,
         domain_user_counts=domain_user_counts,
         ip_strings=ip_strings,
         mac_strings=mac_strings,
         plaintext_strings=plaintext_strings,
+        samr_fullnames=samr_fullnames,
         conversations=conversations,
         detections=detections,
         anomalies=anomalies,

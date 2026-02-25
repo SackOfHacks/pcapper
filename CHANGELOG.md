@@ -4,7 +4,7 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-## 1.3.1 — 2026-02-19
+## 1.4.0 — 2026-02-25
 ### Added
 - RDP session tables with endpoints, timing, duration, packet counts, and size; client/server lists now render as vertical columns for readability.
 

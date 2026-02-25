@@ -12,6 +12,7 @@ from .utils import safe_float, format_bytes_as_mb, format_duration
 from .http import analyze_http
 from .dns import analyze_dns
 from .files import analyze_files
+from .progress import run_with_busy_status
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -331,9 +332,12 @@ def analyze_exfil(
             item["avg_packet_bytes"] = (bytes_sent / packets_count) if packets_count > 0 else 0.0
             item["bytes_per_second"] = (bytes_sent / duration) if duration > 0 else 0.0
 
-    http_summary = analyze_http(path, show_status=False, packets=packets, meta=meta)
-    dns_summary = analyze_dns(path, show_status=False, packets=packets, meta=meta)
-    file_summary = analyze_files(path, show_status=False)
+    def _busy(desc: str, func, *args, **kwargs):
+        return run_with_busy_status(path, show_status, f"Exfil: {desc}", func, *args, **kwargs)
+
+    http_summary = _busy("HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta)
+    dns_summary = _busy("DNS", analyze_dns, path, show_status=False, packets=packets, meta=meta)
+    file_summary = _busy("Files", analyze_files, path, show_status=False)
 
     http_post_suspects: list[dict[str, object]] = []
     post_aggregates: dict[tuple[str, str, str], dict[str, object]] = {}

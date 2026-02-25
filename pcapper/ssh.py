@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import re
+import base64
+import hashlib
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -188,6 +190,8 @@ FILE_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
 
 @dataclass(frozen=True)
 class SshConversation:
@@ -235,11 +239,19 @@ class SshSummary:
     client_software: Counter[str]
     server_software: Counter[str]
     auth_methods: Counter[str]
+    auth_usernames: Counter[str]
+    auth_evidence: list[dict[str, object]]
     kex_algorithms: Counter[str]
     host_key_algorithms: Counter[str]
     cipher_algorithms: Counter[str]
     mac_algorithms: Counter[str]
     compression_algorithms: Counter[str]
+    client_hassh: Counter[str]
+    server_hassh: Counter[str]
+    client_hassh_strings: dict[str, str]
+    server_hassh_strings: dict[str, str]
+    host_key_fingerprints: Counter[str]
+    host_key_types: Counter[str]
     message_types: Counter[str]
     client_message_types: Counter[str]
     server_message_types: Counter[str]
@@ -261,6 +273,7 @@ class SshSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+    analysis_notes: list[str]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -286,11 +299,19 @@ class SshSummary:
             "client_software": dict(self.client_software),
             "server_software": dict(self.server_software),
             "auth_methods": dict(self.auth_methods),
+            "auth_usernames": dict(self.auth_usernames),
+            "auth_evidence": list(self.auth_evidence),
             "kex_algorithms": dict(self.kex_algorithms),
             "host_key_algorithms": dict(self.host_key_algorithms),
             "cipher_algorithms": dict(self.cipher_algorithms),
             "mac_algorithms": dict(self.mac_algorithms),
             "compression_algorithms": dict(self.compression_algorithms),
+            "client_hassh": dict(self.client_hassh),
+            "server_hassh": dict(self.server_hassh),
+            "client_hassh_strings": dict(self.client_hassh_strings),
+            "server_hassh_strings": dict(self.server_hassh_strings),
+            "host_key_fingerprints": dict(self.host_key_fingerprints),
+            "host_key_types": dict(self.host_key_types),
             "message_types": dict(self.message_types),
             "client_message_types": dict(self.client_message_types),
             "server_message_types": dict(self.server_message_types),
@@ -334,6 +355,7 @@ class SshSummary:
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "duration_seconds": self.duration_seconds,
+            "analysis_notes": list(self.analysis_notes),
         }
 
 
@@ -365,11 +387,19 @@ def merge_ssh_summaries(
             client_software=Counter(),
             server_software=Counter(),
             auth_methods=Counter(),
+            auth_usernames=Counter(),
+            auth_evidence=[],
             kex_algorithms=Counter(),
             host_key_algorithms=Counter(),
             cipher_algorithms=Counter(),
             mac_algorithms=Counter(),
             compression_algorithms=Counter(),
+            client_hassh=Counter(),
+            server_hassh=Counter(),
+            client_hassh_strings={},
+            server_hassh_strings={},
+            host_key_fingerprints=Counter(),
+            host_key_types=Counter(),
             message_types=Counter(),
             client_message_types=Counter(),
             server_message_types=Counter(),
@@ -391,6 +421,7 @@ def merge_ssh_summaries(
             first_seen=None,
             last_seen=None,
             duration_seconds=None,
+            analysis_notes=[],
         )
 
     total_packets = 0
@@ -416,11 +447,20 @@ def merge_ssh_summaries(
     client_software: Counter[str] = Counter()
     server_software: Counter[str] = Counter()
     auth_methods: Counter[str] = Counter()
+    auth_usernames: Counter[str] = Counter()
+    auth_evidence: list[dict[str, object]] = []
+    auth_evidence_seen: set[tuple[str, str, int, int, str, str]] = set()
     kex_algorithms: Counter[str] = Counter()
     host_key_algorithms: Counter[str] = Counter()
     cipher_algorithms: Counter[str] = Counter()
     mac_algorithms: Counter[str] = Counter()
     compression_algorithms: Counter[str] = Counter()
+    client_hassh: Counter[str] = Counter()
+    server_hassh: Counter[str] = Counter()
+    client_hassh_strings: dict[str, str] = {}
+    server_hassh_strings: dict[str, str] = {}
+    host_key_fingerprints: Counter[str] = Counter()
+    host_key_types: Counter[str] = Counter()
     message_types: Counter[str] = Counter()
     client_message_types: Counter[str] = Counter()
     server_message_types: Counter[str] = Counter()
@@ -440,6 +480,7 @@ def merge_ssh_summaries(
     anomalies: list[dict[str, object]] = []
     artifacts: list[str] = []
     errors: list[str] = []
+    analysis_notes: list[str] = []
 
     for summary in summary_list:
         total_packets += summary.total_packets
@@ -468,11 +509,33 @@ def merge_ssh_summaries(
         client_software.update(summary.client_software)
         server_software.update(summary.server_software)
         auth_methods.update(summary.auth_methods)
+        auth_usernames.update(summary.auth_usernames)
+        for item in summary.auth_evidence:
+            key = (
+                str(item.get("client_ip", "")),
+                str(item.get("server_ip", "")),
+                int(item.get("client_port", 0) or 0),
+                int(item.get("server_port", 0) or 0),
+                str(item.get("username", "")),
+                str(item.get("method", "")),
+            )
+            if key in auth_evidence_seen:
+                continue
+            auth_evidence_seen.add(key)
+            auth_evidence.append(dict(item))
         kex_algorithms.update(summary.kex_algorithms)
         host_key_algorithms.update(summary.host_key_algorithms)
         cipher_algorithms.update(summary.cipher_algorithms)
         mac_algorithms.update(summary.mac_algorithms)
         compression_algorithms.update(summary.compression_algorithms)
+        client_hassh.update(summary.client_hassh)
+        server_hassh.update(summary.server_hassh)
+        for key, value in summary.client_hassh_strings.items():
+            client_hassh_strings.setdefault(key, value)
+        for key, value in summary.server_hassh_strings.items():
+            server_hassh_strings.setdefault(key, value)
+        host_key_fingerprints.update(summary.host_key_fingerprints)
+        host_key_types.update(summary.host_key_types)
         message_types.update(summary.message_types)
         client_message_types.update(summary.client_message_types)
         server_message_types.update(summary.server_message_types)
@@ -492,6 +555,9 @@ def merge_ssh_summaries(
         anomalies.extend(summary.anomalies)
         artifacts.extend(summary.artifacts)
         errors.extend(summary.errors)
+        for note in summary.analysis_notes:
+            if note not in analysis_notes:
+                analysis_notes.append(note)
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -520,11 +586,19 @@ def merge_ssh_summaries(
         client_software=client_software,
         server_software=server_software,
         auth_methods=auth_methods,
+        auth_usernames=auth_usernames,
+        auth_evidence=auth_evidence,
         kex_algorithms=kex_algorithms,
         host_key_algorithms=host_key_algorithms,
         cipher_algorithms=cipher_algorithms,
         mac_algorithms=mac_algorithms,
         compression_algorithms=compression_algorithms,
+        client_hassh=client_hassh,
+        server_hassh=server_hassh,
+        client_hassh_strings=client_hassh_strings,
+        server_hassh_strings=server_hassh_strings,
+        host_key_fingerprints=host_key_fingerprints,
+        host_key_types=host_key_types,
         message_types=message_types,
         client_message_types=client_message_types,
         server_message_types=server_message_types,
@@ -546,6 +620,7 @@ def merge_ssh_summaries(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        analysis_notes=analysis_notes,
     )
 
 @dataclass
@@ -568,6 +643,9 @@ class _SessionState:
     server_version: Optional[str] = None
     auth_failures: int = 0
     auth_successes: int = 0
+    saw_newkeys: bool = False
+    saw_banner: bool = False
+    saw_kexinit: bool = False
 
 
 def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
@@ -636,8 +714,8 @@ def _direction(src_ip: str, dst_ip: str, sport: int, dport: int) -> tuple[str, s
     return src_ip, dst_ip, sport, dport
 
 
-def _parse_ssh_messages(payload: bytes) -> list[tuple[int, Optional[int]]]:
-    messages: list[tuple[int, Optional[int]]] = []
+def _parse_ssh_messages(payload: bytes) -> list[tuple[int, Optional[int], bytes]]:
+    messages: list[tuple[int, Optional[int], bytes]] = []
     if not payload or payload.startswith(b"SSH-"):
         return messages
     idx = 0
@@ -652,14 +730,194 @@ def _parse_ssh_messages(payload: bytes) -> list[tuple[int, Optional[int]]]:
         if padding + 1 > pkt_len:
             break
         msg_offset = idx + 5
+        msg_len = pkt_len - padding - 1
+        if msg_len < 1 or msg_offset + msg_len > max_len:
+            break
         msg_type = payload[msg_offset]
         reason: Optional[int] = None
         if msg_type == 1 and msg_offset + 5 <= max_len:
             reason = int.from_bytes(payload[msg_offset + 1:msg_offset + 5], "big")
-        messages.append((msg_type, reason))
+        msg_payload = payload[msg_offset:msg_offset + msg_len]
+        messages.append((msg_type, reason, msg_payload))
         idx += 4 + pkt_len
     return messages
 
+
+def _read_uint32(data: bytes, offset: int) -> tuple[Optional[int], int]:
+    if offset + 4 > len(data):
+        return None, offset
+    value = int.from_bytes(data[offset:offset + 4], "big")
+    return value, offset + 4
+
+
+def _read_string(data: bytes, offset: int) -> tuple[Optional[bytes], int]:
+    length, offset = _read_uint32(data, offset)
+    if length is None:
+        return None, offset
+    if length < 0 or offset + length > len(data):
+        return None, offset
+    return data[offset:offset + length], offset + length
+
+
+def _parse_kexinit(msg_payload: bytes) -> Optional[dict[str, list[str]]]:
+    if not msg_payload or msg_payload[0] != 20:
+        return None
+    offset = 1 + 16  # skip message type + cookie
+    fields: list[list[str]] = []
+    for _ in range(10):
+        raw, offset = _read_string(msg_payload, offset)
+        if raw is None:
+            return None
+        text = raw.decode("utf-8", errors="ignore")
+        fields.append([item for item in text.split(",") if item])
+    return {
+        "kex": fields[0],
+        "hostkey": fields[1],
+        "enc_c2s": fields[2],
+        "enc_s2c": fields[3],
+        "mac_c2s": fields[4],
+        "mac_s2c": fields[5],
+        "comp_c2s": fields[6],
+        "comp_s2c": fields[7],
+        "lang_c2s": fields[8],
+        "lang_s2c": fields[9],
+    }
+
+
+def _hassh_from_kex(kex: dict[str, list[str]], *, server: bool) -> tuple[str, str]:
+    if server:
+        parts = [
+            ",".join(kex.get("kex", [])),
+            ",".join(kex.get("hostkey", [])),
+            ",".join(kex.get("enc_s2c", [])),
+            ",".join(kex.get("mac_s2c", [])),
+            ",".join(kex.get("comp_s2c", [])),
+        ]
+    else:
+        parts = [
+            ",".join(kex.get("kex", [])),
+            ",".join(kex.get("hostkey", [])),
+            ",".join(kex.get("enc_c2s", [])),
+            ",".join(kex.get("mac_c2s", [])),
+            ",".join(kex.get("comp_c2s", [])),
+        ]
+    hassh_str = ";".join(parts)
+    hassh = hashlib.md5(hassh_str.encode("utf-8", errors="ignore")).hexdigest()
+    return hassh, hassh_str
+
+
+def _parse_hostkey_fingerprint(msg_payload: bytes) -> tuple[Optional[str], Optional[str]]:
+    if not msg_payload or msg_payload[0] != 31:
+        return None, None
+    offset = 1
+    hostkey_blob, offset = _read_string(msg_payload, offset)
+    if not hostkey_blob:
+        return None, None
+    key_type_blob, _ = _read_string(hostkey_blob, 0)
+    key_type = key_type_blob.decode("utf-8", errors="ignore") if key_type_blob else None
+    digest = hashlib.sha256(hostkey_blob).digest()
+    fingerprint = "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+    return key_type, fingerprint
+
+
+def _parse_userauth_request(msg_payload: bytes) -> tuple[Optional[str], Optional[str]]:
+    if not msg_payload or msg_payload[0] != 50:
+        return None, None
+    offset = 1
+    user_raw, offset = _read_string(msg_payload, offset)
+    if user_raw is None:
+        return None, None
+    _service_raw, offset = _read_string(msg_payload, offset)
+    method_raw, _offset = _read_string(msg_payload, offset)
+    username = user_raw.decode("utf-8", errors="ignore") if user_raw else None
+    method = method_raw.decode("utf-8", errors="ignore") if method_raw else None
+    return username or None, method or None
+
+
+def _parse_channel_data(msg_payload: bytes) -> Optional[bytes]:
+    if not msg_payload:
+        return None
+    msg_type = msg_payload[0]
+    offset = 1
+    if msg_type == 94:
+        # SSH_MSG_CHANNEL_DATA
+        _recipient, offset = _read_uint32(msg_payload, offset)
+        data, _offset = _read_string(msg_payload, offset)
+        return data
+    if msg_type == 95:
+        # SSH_MSG_CHANNEL_EXTENDED_DATA
+        _recipient, offset = _read_uint32(msg_payload, offset)
+        _dtype, offset = _read_uint32(msg_payload, offset)
+        data, _offset = _read_string(msg_payload, offset)
+        return data
+    return None
+
+
+def _parse_decrypted_ssh_messages(payload: bytes) -> list[tuple[int, Optional[int], bytes]]:
+    messages = _parse_ssh_messages(payload)
+    if messages:
+        return messages
+    if not payload:
+        return []
+    msg_type = payload[0]
+    if msg_type not in SSH_MESSAGE_TYPES:
+        return []
+    reason: Optional[int] = None
+    if msg_type == 1 and len(payload) >= 5:
+        reason = int.from_bytes(payload[1:5], "big")
+    return [(msg_type, reason, payload)]
+
+
+def _coerce_decrypted_payload(value: object | None) -> Optional[bytes]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate and len(candidate) % 4 == 0 and _BASE64_RE.match(candidate):
+            try:
+                return base64.b64decode(candidate)
+            except Exception:
+                pass
+        return candidate.encode("latin-1", errors="ignore")
+    return None
+
+
+def _find_decrypted_payload(
+    pkt: object,
+    meta: object | None,
+    pkt_index: int,
+    decrypted_payloads: dict[int, bytes] | None,
+) -> tuple[Optional[bytes], Optional[str]]:
+    if decrypted_payloads:
+        payload = decrypted_payloads.get(pkt_index)
+        payload = _coerce_decrypted_payload(payload)
+        if payload:
+            return payload, "parameter"
+    if hasattr(pkt, "pcapper_ssh_decrypted"):
+        payload = _coerce_decrypted_payload(getattr(pkt, "pcapper_ssh_decrypted", None))
+        if payload:
+            return payload, "packet"
+    if meta is None:
+        return None, None
+    candidate = None
+    if isinstance(meta, dict):
+        candidate = meta.get("ssh_decrypted") or meta.get("ssh_decrypted_packets")
+    else:
+        candidate = getattr(meta, "ssh_decrypted", None) or getattr(meta, "ssh_decrypted_packets", None)
+    if isinstance(candidate, dict):
+        payload = _coerce_decrypted_payload(candidate.get(pkt_index))
+        if payload:
+            return payload, "meta"
+    if isinstance(candidate, list):
+        if 0 <= pkt_index - 1 < len(candidate):
+            payload = _coerce_decrypted_payload(candidate[pkt_index - 1])
+            if payload:
+                return payload, "meta"
+    return None, None
 
 def _scan_algorithms(text: str, counters: dict[str, Counter[str]]) -> None:
     if not text:
@@ -711,6 +969,7 @@ def analyze_ssh(
     show_status: bool = True,
     packets: list[object] | None = None,
     meta: object | None = None,
+    decrypted_payloads: dict[int, bytes] | None = None,
 ) -> SshSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
@@ -738,11 +997,19 @@ def analyze_ssh(
             client_software=Counter(),
             server_software=Counter(),
             auth_methods=Counter(),
+            auth_usernames=Counter(),
+            auth_evidence=[],
             kex_algorithms=Counter(),
             host_key_algorithms=Counter(),
             cipher_algorithms=Counter(),
             mac_algorithms=Counter(),
             compression_algorithms=Counter(),
+            client_hassh=Counter(),
+            server_hassh=Counter(),
+            client_hassh_strings={},
+            server_hassh_strings={},
+            host_key_fingerprints=Counter(),
+            host_key_types=Counter(),
             message_types=Counter(),
             client_message_types=Counter(),
             server_message_types=Counter(),
@@ -764,6 +1031,7 @@ def analyze_ssh(
             first_seen=None,
             last_seen=None,
             duration_seconds=None,
+            analysis_notes=[],
         )
 
     reader, status, stream, size_bytes, _file_type = get_reader(
@@ -792,6 +1060,9 @@ def analyze_ssh(
     server_versions: Counter[str] = Counter()
     client_software: Counter[str] = Counter()
     server_software: Counter[str] = Counter()
+    auth_usernames: Counter[str] = Counter()
+    auth_evidence: list[dict[str, object]] = []
+    auth_evidence_seen: set[tuple[str, str, int, int, str, str]] = set()
 
     message_types: Counter[str] = Counter()
     client_message_types: Counter[str] = Counter()
@@ -799,12 +1070,22 @@ def analyze_ssh(
     request_counts: Counter[str] = Counter()
     response_counts: Counter[str] = Counter()
     disconnect_reasons: Counter[str] = Counter()
+    client_hassh: Counter[str] = Counter()
+    server_hassh: Counter[str] = Counter()
+    client_hassh_strings: dict[str, str] = {}
+    server_hassh_strings: dict[str, str] = {}
+    host_key_fingerprints: Counter[str] = Counter()
+    host_key_types: Counter[str] = Counter()
 
     plaintext_strings: Counter[str] = Counter()
     suspicious_plaintext: Counter[str] = Counter()
     file_artifacts: Counter[str] = Counter()
     device_fingerprints: Counter[str] = Counter()
     artifacts: list[str] = []
+    analysis_notes: list[str] = [
+        "SSH message parsing is limited to pre-encryption handshake traffic.",
+        "Auth methods/outcomes and plaintext indicators require decrypted SSH traffic; absence does not imply no activity.",
+    ]
 
     algo_counters: dict[str, Counter[str]] = {
         "kex": Counter(),
@@ -823,6 +1104,9 @@ def analyze_ssh(
     auth_failures_by_client: Counter[str] = Counter()
     auth_successes_by_client: Counter[str] = Counter()
 
+    pkt_index = 0
+    decrypted_sources: set[str] = set()
+
     try:
         for pkt in reader:
             if stream is not None and size_bytes:
@@ -833,6 +1117,7 @@ def analyze_ssh(
                 except Exception:
                     pass
 
+            pkt_index += 1
             total_packets += 1
             pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
             total_bytes += pkt_len
@@ -880,8 +1165,14 @@ def analyze_ssh(
                 except Exception:
                     payload = b""
 
+            decrypted_payload, decrypt_source = _find_decrypted_payload(
+                pkt, meta, pkt_index, decrypted_payloads
+            )
+            if decrypt_source:
+                decrypted_sources.add(decrypt_source)
+
             is_ssh = sport in SSH_PORTS or dport in SSH_PORTS or b"SSH-" in payload[:32]
-            if not is_ssh:
+            if not is_ssh and not decrypted_payload:
                 continue
 
             ssh_packets += 1
@@ -954,6 +1245,7 @@ def analyze_ssh(
             if text:
                 version = _extract_version(text)
                 if version:
+                    session.saw_banner = True
                     if src_ip == client_ip:
                         if session.client_version is None:
                             session.client_version = version
@@ -968,30 +1260,120 @@ def analyze_ssh(
                         software = _software_from_version(version)
                         if software:
                             server_software[software] += 1
-                _scan_algorithms(text, algo_counters)
-                _scan_plaintext(payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts)
 
-            for msg_type, reason in _parse_ssh_messages(payload):
-                name = SSH_MESSAGE_TYPES.get(msg_type, f"SSH_MSG_{msg_type}")
-                message_types[name] += 1
-                if src_ip == client_ip:
-                    client_message_types[name] += 1
-                    if name in REQUEST_TYPES:
-                        request_counts[name] += 1
-                else:
-                    server_message_types[name] += 1
-                    if name in RESPONSE_TYPES:
-                        response_counts[name] += 1
-                    if msg_type == 51:
-                        session.auth_failures += 1
-                        auth_failures_by_client[client_ip] += 1
-                    if msg_type == 52:
-                        session.auth_successes += 1
-                        auth_successes_by_client[client_ip] += 1
-                if msg_type == 50 and src_ip == client_ip:
-                    auth_attempts_by_client[client_ip] += 1
-                if msg_type == 1 and reason is not None:
-                    disconnect_reasons[SSH_DISCONNECT_REASONS.get(reason, f"Reason {reason}")] += 1
+            parsed_messages: list[tuple[int, Optional[int], bytes]] = []
+            decrypted_active = False
+            if decrypted_payload:
+                parsed_messages = _parse_decrypted_ssh_messages(decrypted_payload)
+                if parsed_messages:
+                    decrypted_active = True
+            if not parsed_messages and payload and not session.saw_newkeys:
+                candidates = _parse_ssh_messages(payload)
+                if candidates:
+                    trusted = session.saw_banner
+                    if not trusted:
+                        for msg_type, _reason, _msg_payload in candidates:
+                            if msg_type in {5, 6, 20, 21, 30, 31}:
+                                trusted = True
+                                break
+                    if trusted:
+                        parsed_messages = candidates
+
+            kex_parsed = False
+            if parsed_messages:
+                for msg_type, reason, msg_payload in parsed_messages:
+                    name = SSH_MESSAGE_TYPES.get(msg_type, f"SSH_MSG_{msg_type}")
+                    message_types[name] += 1
+                    if msg_type == 20:
+                        session.saw_kexinit = True
+                        kex = _parse_kexinit(msg_payload)
+                        if kex:
+                            kex_parsed = True
+                            if src_ip == client_ip:
+                                hassh, hassh_str = _hassh_from_kex(kex, server=False)
+                                client_hassh[hassh] += 1
+                                client_hassh_strings.setdefault(hassh, hassh_str)
+                            else:
+                                hassh, hassh_str = _hassh_from_kex(kex, server=True)
+                                server_hassh[hassh] += 1
+                                server_hassh_strings.setdefault(hassh, hassh_str)
+                            for item in kex.get("kex", []):
+                                algo_counters["kex"][item] += 1
+                            for item in kex.get("hostkey", []):
+                                algo_counters["hostkey"][item] += 1
+                            for item in kex.get("enc_c2s", []):
+                                algo_counters["cipher"][item] += 1
+                            for item in kex.get("enc_s2c", []):
+                                algo_counters["cipher"][item] += 1
+                            for item in kex.get("mac_c2s", []):
+                                algo_counters["mac"][item] += 1
+                            for item in kex.get("mac_s2c", []):
+                                algo_counters["mac"][item] += 1
+                            for item in kex.get("comp_c2s", []):
+                                algo_counters["comp"][item] += 1
+                            for item in kex.get("comp_s2c", []):
+                                algo_counters["comp"][item] += 1
+                    if msg_type == 31:
+                        key_type, fingerprint = _parse_hostkey_fingerprint(msg_payload)
+                        if fingerprint:
+                            host_key_fingerprints[fingerprint] += 1
+                            if key_type:
+                                host_key_types[key_type] += 1
+                    if msg_type == 50 and decrypted_active:
+                        username, method = _parse_userauth_request(msg_payload)
+                        if method:
+                            auth_methods[method] += 1
+                        if username:
+                            auth_usernames[username] += 1
+                            key = (
+                                client_ip,
+                                server_ip,
+                                session.client_port,
+                                session.server_port,
+                                username,
+                                method or "-",
+                            )
+                            if key not in auth_evidence_seen:
+                                auth_evidence_seen.add(key)
+                                auth_evidence.append({
+                                    "client_ip": client_ip,
+                                    "server_ip": server_ip,
+                                    "client_port": session.client_port,
+                                    "server_port": session.server_port,
+                                    "username": username,
+                                    "method": method or "-",
+                                })
+                    if src_ip == client_ip:
+                        client_message_types[name] += 1
+                        if name in REQUEST_TYPES:
+                            request_counts[name] += 1
+                    else:
+                        server_message_types[name] += 1
+                        if name in RESPONSE_TYPES:
+                            response_counts[name] += 1
+                        if msg_type == 51 and decrypted_active:
+                            session.auth_failures += 1
+                            auth_failures_by_client[client_ip] += 1
+                        if msg_type == 52 and decrypted_active:
+                            session.auth_successes += 1
+                            auth_successes_by_client[client_ip] += 1
+                    if msg_type == 50 and src_ip == client_ip and decrypted_active:
+                        auth_attempts_by_client[client_ip] += 1
+                    if msg_type == 1 and reason is not None:
+                        disconnect_reasons[SSH_DISCONNECT_REASONS.get(reason, f"Reason {reason}")] += 1
+                    if msg_type == 21:
+                        session.saw_newkeys = True
+                        break
+
+            if text and not session.saw_newkeys and (session.saw_banner or session.saw_kexinit) and not kex_parsed:
+                _scan_algorithms(text, algo_counters)
+            if payload and not session.saw_newkeys and session.saw_banner:
+                _scan_plaintext(payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts)
+            if decrypted_active:
+                for msg_type, _reason, msg_payload in parsed_messages:
+                    data = _parse_channel_data(msg_payload)
+                    if data:
+                        _scan_plaintext(data, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts)
 
     except Exception as exc:
         errors.append(str(exc))
@@ -1050,7 +1432,7 @@ def analyze_ssh(
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
-    non_standard_ports = [port for port in server_ports if port not in {22, 2222}]
+    non_standard_ports = [port for port in server_ports if port not in SSH_PORTS]
     if non_standard_ports:
         detections.append({
             "severity": "info",
@@ -1080,7 +1462,7 @@ def analyze_ssh(
             "details": ", ".join(sorted(set(weak_algos))),
         })
 
-    if suspicious_plaintext:
+    if suspicious_plaintext and (algo_counters["auth"] or auth_usernames or decrypted_sources):
         detections.append({
             "severity": "warning",
             "summary": "Suspicious plaintext strings observed in SSH payloads",
@@ -1122,6 +1504,10 @@ def analyze_ssh(
             "title": "SSH disconnects observed",
             "details": ", ".join(f"{reason}({count})" for reason, count in disconnect_reasons.most_common(5)),
         })
+
+    if decrypted_sources:
+        source_text = ", ".join(sorted(decrypted_sources))
+        analysis_notes.append(f"Decrypted SSH payloads provided via: {source_text}.")
 
     for (client_ip, server_ip), times in pair_first_seen.items():
         score = _beaconing_score(times)
@@ -1175,11 +1561,19 @@ def analyze_ssh(
         client_software=client_software,
         server_software=server_software,
         auth_methods=algo_counters["auth"],
+        auth_usernames=auth_usernames,
+        auth_evidence=auth_evidence,
         kex_algorithms=algo_counters["kex"],
         host_key_algorithms=algo_counters["hostkey"],
         cipher_algorithms=algo_counters["cipher"],
         mac_algorithms=algo_counters["mac"],
         compression_algorithms=algo_counters["comp"],
+        client_hassh=client_hassh,
+        server_hassh=server_hassh,
+        client_hassh_strings=client_hassh_strings,
+        server_hassh_strings=server_hassh_strings,
+        host_key_fingerprints=host_key_fingerprints,
+        host_key_types=host_key_types,
         message_types=message_types,
         client_message_types=client_message_types,
         server_message_types=server_message_types,
@@ -1201,4 +1595,5 @@ def analyze_ssh(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        analysis_notes=analysis_notes,
     )

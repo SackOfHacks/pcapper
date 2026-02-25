@@ -24,6 +24,31 @@ MMS_PDU_TAGS = {
     0xAD: "Conclude-Error",
 }
 
+MMS_SERVICE_TAGS = {
+    0xA4: "Read",
+    0xA5: "Write",
+    0xA6: "GetVariableAccessAttributes",
+    0xA7: "DefineNamedVariable",
+    0xA8: "DefineScatteredAccess",
+    0xA9: "GetScatteredAccessAttributes",
+    0xAA: "DeleteVariableAccess",
+    0xAB: "DefineNamedVariableList",
+    0xAC: "GetNamedVariableListAttributes",
+    0xAD: "DeleteNamedVariableList",
+    0xAE: "DefineNamedType",
+    0xAF: "GetNamedTypeAttributes",
+    0xB0: "DeleteNamedType",
+    0xB1: "ReadJournal",
+    0xB2: "InitializeJournal",
+    0xB3: "ReportJournalStatus",
+    0xB4: "GetCapabilityList",
+    0xB5: "FileOpen",
+    0xB6: "FileRead",
+    0xB7: "FileClose",
+    0xB8: "FileRename",
+    0xB9: "FileDelete",
+}
+
 
 def _locate_mms_payload(payload: bytes) -> bytes:
     if len(payload) < 4:
@@ -48,7 +73,52 @@ def _parse_mms_commands(payload: bytes) -> list[str]:
         if byte in MMS_PDU_TAGS:
             commands.append(f"MMS {MMS_PDU_TAGS[byte]}")
             break
+    service = _parse_mms_service(data)
+    if service:
+        commands.append(f"MMS Service {service}")
     return commands
+
+
+def _read_ber_length(data: bytes, idx: int) -> tuple[int | None, int]:
+    if idx >= len(data):
+        return None, idx
+    first = data[idx]
+    idx += 1
+    if first < 0x80:
+        return first, idx
+    count = first & 0x7F
+    if count == 0 or idx + count > len(data):
+        return None, idx
+    length = int.from_bytes(data[idx:idx + count], "big")
+    idx += count
+    return length, idx
+
+
+def _read_ber_tlv(data: bytes, idx: int) -> tuple[int | None, bytes, int]:
+    if idx >= len(data):
+        return None, b"", idx
+    tag = data[idx]
+    idx += 1
+    length, idx = _read_ber_length(data, idx)
+    if length is None or idx + length > len(data):
+        return None, b"", idx
+    value = data[idx:idx + length]
+    return tag, value, idx + length
+
+
+def _parse_mms_service(data: bytes) -> str | None:
+    tag, value, _ = _read_ber_tlv(data, 0)
+    if tag != 0xA0 or not value:
+        return None
+    idx = 0
+    while idx < len(value):
+        inner_tag, inner_value, next_idx = _read_ber_tlv(value, idx)
+        if inner_tag is None or next_idx <= idx:
+            break
+        if inner_tag in MMS_SERVICE_TAGS:
+            return MMS_SERVICE_TAGS[inner_tag]
+        idx = next_idx
+    return None
 
 
 def _parse_commands(payload: bytes) -> list[str]:

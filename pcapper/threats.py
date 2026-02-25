@@ -863,6 +863,9 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
         anomalies = getattr(summary, "anomalies", None)
         if isinstance(anomalies, list) and anomalies:
             ot_candidates[source] = anomalies
+        protocol_packets = getattr(summary, "protocol_packets", 0) or 0
+        if protocol_packets:
+            ot_protocol_counts[source] += int(protocol_packets)
         for err in getattr(summary, "errors", []) or []:
             errors.append(f"{source}: {err}")
 

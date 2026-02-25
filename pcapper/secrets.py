@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
 import re
 import urllib.parse
 import zlib
@@ -27,6 +28,12 @@ MAX_TOKEN_LEN = 4096
 MIN_BASE64_LEN = 16
 MIN_HEX_LEN = 16
 MIN_URLENC_LEN = 12
+try:
+    MAX_DECOMPRESSED_BYTES = int(os.environ.get("PCAPPER_MAX_DECOMPRESSED_BYTES", str(10 * 1024 * 1024)))
+except Exception:
+    MAX_DECOMPRESSED_BYTES = 10 * 1024 * 1024
+if MAX_DECOMPRESSED_BYTES < 0:
+    MAX_DECOMPRESSED_BYTES = 0
 
 BASE64_RE = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{16,}={0,2}(?![A-Za-z0-9+/=])")
 BASE64URL_RE = re.compile(r"(?<![A-Za-z0-9_\-=])[A-Za-z0-9_\-]{16,}={0,2}(?![A-Za-z0-9_\-=])")
@@ -129,18 +136,29 @@ def _decode_text(data: bytes) -> str:
     return text_latin
 
 
-def _maybe_decompress(data: bytes) -> Optional[bytes]:
+def _maybe_decompress(data: bytes, max_output: int = MAX_DECOMPRESSED_BYTES) -> Optional[bytes]:
     if not data:
         return None
+    if max_output <= 0:
+        return b""
     if data.startswith(b"\x1f\x8b"):
         try:
-            import gzip
-            return gzip.decompress(data)
+            decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            out = decompressor.decompress(data, max_output + 1)
+            out += decompressor.flush()
+            if len(out) > max_output:
+                return out[:max_output]
+            return out
         except Exception:
             return None
     if data[:2] in (b"\x78\x01", b"\x78\x9c", b"\x78\xda"):
         try:
-            return zlib.decompress(data)
+            decompressor = zlib.decompressobj()
+            out = decompressor.decompress(data, max_output + 1)
+            out += decompressor.flush()
+            if len(out) > max_output:
+                return out[:max_output]
+            return out
         except Exception:
             return None
     return None

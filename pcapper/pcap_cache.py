@@ -13,7 +13,7 @@ try:
 except Exception:  # pragma: no cover
     sniff = None  # type: ignore
 
-from .progress import build_statusbar
+from .progress import build_statusbar, build_busy_statusbar
 from .utils import detect_file_type
 
 
@@ -168,91 +168,14 @@ def _read_pcapng_interfaces(path: Path) -> list[dict[str, object]]:
     return interfaces
 
 
-def _iface_has_name(value: object) -> bool:
-    if isinstance(value, dict):
-        for key in ("if_name", "if_description", "name", "description"):
-            if value.get(key):
-                return True
-        return False
-    for attr in ("if_name", "if_description", "name", "description"):
-        if getattr(value, attr, None):
-            return True
-    return False
-
-
-class PacketListReader:
-    def __init__(self, packets: list[object], meta: Optional[PcapMeta] = None) -> None:
-        self._packets = packets
-        self.linktype = meta.linktype if meta else None
-        self.snaplen = meta.snaplen if meta else None
-        self.interfaces = meta.interfaces if meta else None
-
-    def __iter__(self):
-        return iter(self._packets)
-
-    def __len__(self) -> int:
-        return len(self._packets)
-
-    def close(self) -> None:
-        return None
-
-
-def _reader_stream(reader: object) -> Optional[object]:
-    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-        candidate = getattr(reader, attr, None)
-        if candidate is not None:
-            return candidate
-    return None
-
-
-def _cache_config() -> tuple[bool, int, int]:
-    enabled = os.environ.get("PCAPPER_CACHE_ENABLED", "1") != "0"
-    try:
-        max_cache = int(os.environ.get("PCAPPER_CACHE_MAX_BYTES", str(256 * 1024 * 1024)))
-    except Exception:
-        max_cache = 256 * 1024 * 1024
-    try:
-        max_file = int(os.environ.get("PCAPPER_CACHE_FILE_MAX_BYTES", str(64 * 1024 * 1024)))
-    except Exception:
-        max_file = 64 * 1024 * 1024
-    if max_cache < 0:
-        max_cache = 0
-    if max_file < 0:
-        max_file = 0
-    return enabled, max_cache, max_file
-
-
-def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], PcapMeta]:
-    file_type = detect_file_type(path)
-    size_bytes = 0
-    try:
-        size_bytes = path.stat().st_size
-    except Exception:
-        size_bytes = 0
-
-    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
-    status = build_statusbar(path, enabled=show_status)
-    stream = _reader_stream(reader)
-
-    packets: list[object] = []
-    try:
-        for pkt in reader:
-            packets.append(pkt)
-            if status.enabled and stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-    finally:
-        status.finish()
-        reader.close()
-
-    linktype = getattr(reader, "linktype", None)
-    snaplen = getattr(reader, "snaplen", None)
-    interfaces = getattr(reader, "interfaces", None)
-
+def _finalize_meta(
+    path: Path,
+    file_type: str,
+    size_bytes: int,
+    linktype: object | None,
+    snaplen: object | None,
+    interfaces: object | None,
+) -> PcapMeta:
     if file_type == "pcap":
         header_linktype, header_snaplen = _read_pcap_header(path)
         if header_linktype is not None:
@@ -283,7 +206,122 @@ def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], Pc
         if snaplen is None and parsed_interfaces:
             snaplen = parsed_interfaces[0].get("snaplen")
 
-    meta = PcapMeta(
+    return PcapMeta(
+        path=path,
+        file_type=file_type,
+        size_bytes=size_bytes,
+        linktype=linktype,
+        snaplen=snaplen,
+        interfaces=interfaces,
+    )
+
+
+def _iface_has_name(value: object) -> bool:
+    if isinstance(value, dict):
+        for key in ("if_name", "if_description", "name", "description"):
+            if value.get(key):
+                return True
+        return False
+    for attr in ("if_name", "if_description", "name", "description"):
+        if getattr(value, attr, None):
+            return True
+    return False
+
+
+class PacketListReader:
+    def __init__(self, packets: list[object], meta: Optional[PcapMeta] = None) -> None:
+        self._packets = packets
+        self.linktype = meta.linktype if meta else None
+        self.snaplen = meta.snaplen if meta else None
+        self.interfaces = meta.interfaces if meta else None
+        self._pos = 0
+
+    def __iter__(self):
+        self._pos = 0
+        for pkt in self._packets:
+            self._pos += 1
+            yield pkt
+
+    def __len__(self) -> int:
+        return len(self._packets)
+
+    def tell(self) -> int:
+        return self._pos
+
+    def close(self) -> None:
+        return None
+
+
+def _reader_stream(reader: object) -> Optional[object]:
+    for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
+        candidate = getattr(reader, attr, None)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _cache_config() -> tuple[bool, int, int]:
+    enabled = os.environ.get("PCAPPER_CACHE_ENABLED", "1") != "0"
+    try:
+        max_cache = int(os.environ.get("PCAPPER_CACHE_MAX_BYTES", str(256 * 1024 * 1024)))
+    except Exception:
+        max_cache = 256 * 1024 * 1024
+    try:
+        max_file = int(os.environ.get("PCAPPER_CACHE_FILE_MAX_BYTES", str(64 * 1024 * 1024)))
+    except Exception:
+        max_file = 64 * 1024 * 1024
+    if max_cache < 0:
+        max_cache = 0
+    if max_file < 0:
+        max_file = 0
+    return enabled, max_cache, max_file
+
+
+def get_cache_config() -> tuple[bool, int, int]:
+    return _cache_config()
+
+
+def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], PcapMeta]:
+    file_type = detect_file_type(path)
+    size_bytes = 0
+    try:
+        size_bytes = path.stat().st_size
+    except Exception:
+        size_bytes = 0
+
+    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
+    status = build_statusbar(path, enabled=show_status)
+    stream = _reader_stream(reader)
+    linktype = getattr(reader, "linktype", None)
+    snaplen = getattr(reader, "snaplen", None)
+    interfaces = getattr(reader, "interfaces", None)
+    linktype = getattr(reader, "linktype", None)
+    snaplen = getattr(reader, "snaplen", None)
+    interfaces = getattr(reader, "interfaces", None)
+    linktype = getattr(reader, "linktype", None)
+    snaplen = getattr(reader, "snaplen", None)
+    interfaces = getattr(reader, "interfaces", None)
+
+    packets: list[object] = []
+    try:
+        for pkt in reader:
+            packets.append(pkt)
+            if status.enabled and stream is not None and size_bytes:
+                try:
+                    pos = stream.tell()
+                    percent = int(min(100, (pos / size_bytes) * 100))
+                    status.update(percent)
+                except Exception:
+                    pass
+    finally:
+        status.finish()
+        reader.close()
+
+    linktype = getattr(reader, "linktype", None)
+    snaplen = getattr(reader, "snaplen", None)
+    interfaces = getattr(reader, "interfaces", None)
+
+    meta = _finalize_meta(
         path=path,
         file_type=file_type,
         size_bytes=size_bytes,
@@ -315,8 +353,18 @@ def get_cached_packets(path: Path, show_status: bool = True) -> tuple[list[objec
     return packets, meta
 
 
-def load_packets_if_allowed(path: Path, show_status: bool = True) -> tuple[list[object], PcapMeta] | tuple[None, None]:
+def load_packets_if_allowed(
+    path: Path,
+    show_status: bool = True,
+    *,
+    max_file_override: int | None = None,
+) -> tuple[list[object], PcapMeta] | tuple[None, None]:
     enabled, max_cache, max_file = _cache_config()
+    if max_file_override is not None:
+        try:
+            max_file = max(max_file, int(max_file_override))
+        except Exception:
+            pass
     if not enabled or max_cache <= 0 or max_file <= 0:
         return None, None
     try:
@@ -335,30 +383,86 @@ def load_filtered_packets(
     bpf: str | None = None,
     time_start: float | None = None,
     time_end: float | None = None,
+    bpf_status: dict[str, object] | None = None,
 ) -> tuple[list[object], PcapMeta]:
+    file_type = detect_file_type(path)
+    try:
+        size_bytes = path.stat().st_size
+    except Exception:
+        size_bytes = 0
+
     if bpf and sniff is not None:
         try:
-            packets = sniff(offline=str(path), filter=bpf)
-            meta_packets, meta = load_packets(path, show_status=show_status)
-            return list(packets), meta
-        except Exception:
+            status = build_busy_statusbar(path, enabled=show_status, desc="Filtering")
+            with status:
+                packets = list(sniff(offline=str(path), filter=bpf))
+            if bpf_status is not None:
+                bpf_status["used_bpf"] = True
+            if time_start is not None or time_end is not None:
+                filtered: list[object] = []
+                for pkt in packets:
+                    ts = getattr(pkt, "time", None)
+                    if ts is None:
+                        continue
+                    if time_start is not None and ts < time_start:
+                        continue
+                    if time_end is not None and ts > time_end:
+                        continue
+                    filtered.append(pkt)
+                packets = filtered
+            meta = _finalize_meta(
+                path=path,
+                file_type=file_type,
+                size_bytes=size_bytes,
+                linktype=None,
+                snaplen=None,
+                interfaces=None,
+            )
+            return packets, meta
+        except Exception as exc:
+            if bpf_status is not None:
+                bpf_status["used_bpf"] = False
+                bpf_status["error"] = f"{type(exc).__name__}: {exc}"
             pass
+    elif bpf and bpf_status is not None:
+        bpf_status["used_bpf"] = False
+        bpf_status["error"] = "Scapy sniff unavailable (libpcap/BPF not available)."
 
-    packets, meta = load_packets(path, show_status=show_status)
-    if time_start is None and time_end is None:
-        return packets, meta
+    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
+    status = build_statusbar(path, enabled=show_status)
+    stream = _reader_stream(reader)
+    packets: list[object] = []
+    try:
+        for pkt in reader:
+            if status.enabled and stream is not None and size_bytes:
+                try:
+                    pos = stream.tell()
+                    percent = int(min(100, (pos / size_bytes) * 100))
+                    status.update(percent)
+                except Exception:
+                    pass
+            if time_start is not None or time_end is not None:
+                ts = getattr(pkt, "time", None)
+                if ts is None:
+                    continue
+                if time_start is not None and ts < time_start:
+                    continue
+                if time_end is not None and ts > time_end:
+                    continue
+            packets.append(pkt)
+    finally:
+        status.finish()
+        reader.close()
 
-    filtered: list[object] = []
-    for pkt in packets:
-        ts = getattr(pkt, "time", None)
-        if ts is None:
-            continue
-        if time_start is not None and ts < time_start:
-            continue
-        if time_end is not None and ts > time_end:
-            continue
-        filtered.append(pkt)
-    return filtered, meta
+    meta = _finalize_meta(
+        path=path,
+        file_type=file_type,
+        size_bytes=size_bytes,
+        linktype=linktype,
+        snaplen=snaplen,
+        interfaces=interfaces,
+    )
+    return packets, meta
 
 
 def has_cached_packets(path: Path) -> bool:
@@ -373,10 +477,10 @@ def get_reader(
     show_status: bool = True,
 ) -> tuple[object, object, Optional[object], int, str]:
     if packets is not None:
-        size_bytes = meta.size_bytes if meta else 0
+        size_bytes = len(packets)
         reader = PacketListReader(packets, meta)
         status = build_statusbar(path, enabled=show_status)
-        return reader, status, None, size_bytes, (meta.file_type if meta else detect_file_type(path))
+        return reader, status, reader, size_bytes, (meta.file_type if meta else detect_file_type(path))
 
     enabled, max_cache, max_file = _cache_config()
     file_type = meta.file_type if meta else detect_file_type(path)
@@ -389,8 +493,8 @@ def get_reader(
     if cache_allowed:
         cached_packets, cached_meta = get_cached_packets(path, show_status=show_status)
         reader = PacketListReader(cached_packets, cached_meta)
-        status = build_statusbar(path, enabled=False)
-        return reader, status, None, cached_meta.size_bytes, cached_meta.file_type
+        status = build_statusbar(path, enabled=show_status)
+        return reader, status, reader, len(cached_packets), cached_meta.file_type
 
     reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
     status = build_statusbar(path, enabled=show_status)

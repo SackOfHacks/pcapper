@@ -6,11 +6,13 @@ from pathlib import Path
 from typing import Optional
 import hashlib
 import math
+import ipaddress
 
 from .pcap_cache import get_reader
 from .utils import safe_float
 from .http import analyze_http
-from .certificates import analyze_certificates
+from .certificates import analyze_certificates, CertificateInfo
+from .progress import run_with_busy_status
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -31,6 +33,9 @@ except Exception:  # pragma: no cover
 
 TLS_PORTS = {443, 8443, 9443, 4433}
 SUSPICIOUS_TLDS = {".ru", ".cn", ".top", ".xyz", ".gq", ".tk", ".ml", ".ga"}
+TLS_CONTENT_TYPES = {20, 21, 22, 23}
+WEAK_CIPHER_MARKERS = ("RC4", "3DES", "DES", "NULL", "EXPORT", "MD5", "ANON")
+ECH_EXTENSION_IDS = {0xFE0D}
 
 
 @dataclass(frozen=True)
@@ -50,15 +55,25 @@ class TlsSummary:
     path: Path
     total_packets: int
     tls_packets: int
+    tls_like_packets: int
     client_hellos: int
     server_hellos: int
+    ech_hellos: int
+    ech_sni_missing: int
+    sni_missing_total: int
+    sni_missing_no_ech: int
     versions: Counter[str]
     cipher_suites: Counter[str]
+    weak_ciphers: Counter[str]
     sni_counts: Counter[str]
     alpn_counts: Counter[str]
     ja3_counts: Counter[str]
     ja4_counts: Counter[str]
     ja4s_counts: Counter[str]
+    sni_to_ja3: dict[str, Counter[str]]
+    sni_to_ja4: dict[str, Counter[str]]
+    ja3_to_sni: dict[str, Counter[str]]
+    ja4_to_sni: dict[str, Counter[str]]
     client_counts: Counter[str]
     server_counts: Counter[str]
     server_ports: Counter[int]
@@ -85,10 +100,13 @@ class TlsSummary:
     http_servers: Counter[str]
     cert_subjects: Counter[str]
     cert_issuers: Counter[str]
+    cert_sans: Counter[str]
     cert_count: int
     weak_certs: int
     expired_certs: int
     self_signed_certs: int
+    cert_artifacts: list[CertificateInfo]
+    analysis_notes: list[str]
     detections: list[dict[str, object]]
     artifacts: list[str]
     errors: list[str]
@@ -101,15 +119,25 @@ class TlsSummary:
             "path": str(self.path),
             "total_packets": self.total_packets,
             "tls_packets": self.tls_packets,
+            "tls_like_packets": self.tls_like_packets,
             "client_hellos": self.client_hellos,
             "server_hellos": self.server_hellos,
+            "ech_hellos": self.ech_hellos,
+            "ech_sni_missing": self.ech_sni_missing,
+            "sni_missing_total": self.sni_missing_total,
+            "sni_missing_no_ech": self.sni_missing_no_ech,
             "versions": dict(self.versions),
             "cipher_suites": dict(self.cipher_suites),
+            "weak_ciphers": dict(self.weak_ciphers),
             "sni_counts": dict(self.sni_counts),
             "alpn_counts": dict(self.alpn_counts),
             "ja3_counts": dict(self.ja3_counts),
             "ja4_counts": dict(self.ja4_counts),
             "ja4s_counts": dict(self.ja4s_counts),
+            "sni_to_ja3": {sni: dict(counter) for sni, counter in self.sni_to_ja3.items()},
+            "sni_to_ja4": {sni: dict(counter) for sni, counter in self.sni_to_ja4.items()},
+            "ja3_to_sni": {ja3: dict(counter) for ja3, counter in self.ja3_to_sni.items()},
+            "ja4_to_sni": {ja4: dict(counter) for ja4, counter in self.ja4_to_sni.items()},
             "client_counts": dict(self.client_counts),
             "server_counts": dict(self.server_counts),
             "server_ports": dict(self.server_ports),
@@ -150,10 +178,31 @@ class TlsSummary:
             "http_servers": dict(self.http_servers),
             "cert_subjects": dict(self.cert_subjects),
             "cert_issuers": dict(self.cert_issuers),
+            "cert_sans": dict(self.cert_sans),
             "cert_count": self.cert_count,
             "weak_certs": self.weak_certs,
             "expired_certs": self.expired_certs,
             "self_signed_certs": self.self_signed_certs,
+            "cert_artifacts": [
+                {
+                    "subject": cert.subject,
+                    "issuer": cert.issuer,
+                    "serial": cert.serial,
+                    "not_before": cert.not_before,
+                    "not_after": cert.not_after,
+                    "sig_algo": cert.sig_algo,
+                    "pubkey_type": cert.pubkey_type,
+                    "pubkey_size": cert.pubkey_size,
+                    "san": cert.san,
+                    "sha1": cert.sha1,
+                    "sha256": cert.sha256,
+                    "src_ip": cert.src_ip,
+                    "dst_ip": cert.dst_ip,
+                    "sni": cert.sni,
+                }
+                for cert in self.cert_artifacts
+            ],
+            "analysis_notes": list(self.analysis_notes),
             "detections": list(self.detections),
             "artifacts": list(self.artifacts),
             "errors": list(self.errors),
@@ -245,6 +294,14 @@ def _extract_alpn(ext: object) -> list[str]:
     return []
 
 
+def _is_ech_extension(ext: object) -> bool:
+    name = ext.__class__.__name__
+    if "EncryptedClientHello" in name or name == "ECH":
+        return True
+    ext_type = _tls_extension_type(ext)
+    return ext_type in ECH_EXTENSION_IDS
+
+
 def _tls_version_label(value: object) -> str:
     try:
         ver = int(value)
@@ -258,6 +315,38 @@ def _tls_version_label(value: object) -> str:
         0x0304: "TLS1.3",
     }
     return mapping.get(ver, f"0x{ver:04x}")
+
+
+def _looks_like_tls_record(payload: bytes) -> bool:
+    if not payload or len(payload) < 5:
+        return False
+    content_type = payload[0]
+    if content_type not in TLS_CONTENT_TYPES:
+        return False
+    if payload[1] != 0x03:
+        return False
+    length = int.from_bytes(payload[3:5], "big")
+    if length <= 0:
+        return False
+    if length > 0x4000 + 2048:
+        return False
+    return True
+
+
+def _tls_handshake_type(payload: bytes) -> Optional[int]:
+    if len(payload) < 6:
+        return None
+    if payload[0] != 22:
+        return None
+    return payload[5]
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except Exception:
+        return False
 
 
 def _shannon_entropy(value: str) -> float:
@@ -377,21 +466,33 @@ def analyze_tls(
     meta: object | None = None,
 ) -> TlsSummary:
     errors: list[str] = []
+    if TLS is None and TLSClientHello is None and TLSServerHello is None:
+        errors.append("Scapy TLS layers unavailable; install scapy[tls] for TLS handshake parsing.")
     if IP is None and IPv6 is None:
         errors.append("Scapy IP layers unavailable; install scapy for TLS analysis.")
         return TlsSummary(
             path=path,
             total_packets=0,
             tls_packets=0,
+            tls_like_packets=0,
             client_hellos=0,
             server_hellos=0,
+            ech_hellos=0,
+            ech_sni_missing=0,
+            sni_missing_total=0,
+            sni_missing_no_ech=0,
             versions=Counter(),
             cipher_suites=Counter(),
+            weak_ciphers=Counter(),
             sni_counts=Counter(),
             alpn_counts=Counter(),
             ja3_counts=Counter(),
             ja4_counts=Counter(),
             ja4s_counts=Counter(),
+            sni_to_ja3={},
+            sni_to_ja4={},
+            ja3_to_sni={},
+            ja4_to_sni={},
             client_counts=Counter(),
             server_counts=Counter(),
             server_ports=Counter(),
@@ -417,10 +518,13 @@ def analyze_tls(
             http_servers=Counter(),
             cert_subjects=Counter(),
             cert_issuers=Counter(),
+            cert_sans=Counter(),
             cert_count=0,
             weak_certs=0,
             expired_certs=0,
             self_signed_certs=0,
+            cert_artifacts=[],
+            analysis_notes=[],
             detections=[],
             artifacts=[],
             errors=errors,
@@ -435,10 +539,14 @@ def analyze_tls(
 
     total_packets = 0
     tls_packets = 0
+    tls_like_packets = 0
     client_hellos = 0
     server_hellos = 0
+    ech_hellos = 0
+    ech_sni_missing = 0
     versions: Counter[str] = Counter()
     cipher_suites: Counter[str] = Counter()
+    weak_ciphers: Counter[str] = Counter()
     sni_counts: Counter[str] = Counter()
     alpn_counts: Counter[str] = Counter()
     ja3_counts: Counter[str] = Counter()
@@ -447,6 +555,10 @@ def analyze_tls(
     client_counts: Counter[str] = Counter()
     server_counts: Counter[str] = Counter()
     server_ports: Counter[int] = Counter()
+    sni_to_ja3: dict[str, Counter[str]] = defaultdict(Counter)
+    sni_to_ja4: dict[str, Counter[str]] = defaultdict(Counter)
+    ja3_to_sni: dict[str, Counter[str]] = defaultdict(Counter)
+    ja4_to_sni: dict[str, Counter[str]] = defaultdict(Counter)
 
     conversations: dict[tuple[str, str, int], dict[str, object]] = defaultdict(lambda: {
         "packets": 0,
@@ -458,6 +570,8 @@ def analyze_tls(
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+    analysis_notes: list[str] = []
+    sni_ip_literals: set[str] = set()
 
     try:
         for pkt in reader:
@@ -496,17 +610,22 @@ def analyze_tls(
             tcp_layer = pkt[TCP]  # type: ignore[index]
             sport = int(getattr(tcp_layer, "sport", 0))
             dport = int(getattr(tcp_layer, "dport", 0))
+            payload = bytes(getattr(tcp_layer, "payload", b""))
 
             is_tls_layer = TLS is not None and pkt.haslayer(TLS)  # type: ignore[truthy-bool]
             is_tls_handshake = (
                 (TLSClientHello is not None and pkt.haslayer(TLSClientHello))
                 or (TLSServerHello is not None and pkt.haslayer(TLSServerHello))
             )
-            if not is_tls_layer and not is_tls_handshake:
+            is_tls_like = _looks_like_tls_record(payload)
+            if not is_tls_layer and not is_tls_handshake and not is_tls_like:
                 continue
 
-            tls_packets += 1
+            tls_like_packets += 1
+            if is_tls_layer or is_tls_handshake:
+                tls_packets += 1
 
+            handshake_type = _tls_handshake_type(payload) if is_tls_like and not (dport in TLS_PORTS or sport in TLS_PORTS) else None
             if dport in TLS_PORTS:
                 client = src_ip or "-"
                 server = dst_ip or "-"
@@ -515,6 +634,14 @@ def analyze_tls(
                 client = dst_ip or "-"
                 server = src_ip or "-"
                 server_port = sport
+            elif handshake_type == 2:
+                client = dst_ip or "-"
+                server = src_ip or "-"
+                server_port = sport
+            elif handshake_type == 1:
+                client = src_ip or "-"
+                server = dst_ip or "-"
+                server_port = dport
             else:
                 client = src_ip or "-"
                 server = dst_ip or "-"
@@ -540,15 +667,24 @@ def analyze_tls(
                 versions[_tls_version_label(getattr(client_hello, "version", "?"))] += 1
                 sni_val = None
                 alpn_vals: list[str] = []
+                ech_present = False
                 for ext in _iter_tls_extensions(client_hello):
                     if sni_val is None:
                         sni_val = _extract_sni(ext)
                     if not alpn_vals:
                         alpn_vals = _extract_alpn(ext)
+                    if not ech_present and _is_ech_extension(ext):
+                        ech_present = True
                 if sni_val:
                     sni_counts[sni_val] += 1
                     if convo.get("sni") is None:
                         convo["sni"] = sni_val
+                    if _is_ip_literal(sni_val):
+                        sni_ip_literals.add(sni_val)
+                if ech_present:
+                    ech_hellos += 1
+                    if not sni_val:
+                        ech_sni_missing += 1
                 for alpn in alpn_vals:
                     alpn_counts[alpn] += 1
 
@@ -556,10 +692,16 @@ def analyze_tls(
                 if ja3:
                     ja3_hash = hashlib.md5(ja3.encode("utf-8", errors="ignore")).hexdigest()
                     ja3_counts[ja3_hash] += 1
+                    if sni_val:
+                        sni_to_ja3[sni_val][ja3_hash] += 1
+                        ja3_to_sni[ja3_hash][sni_val] += 1
 
                 ja4 = _ja4_from_client_hello(client_hello, sni_val, alpn_vals)
                 if ja4:
                     ja4_counts[ja4] += 1
+                    if sni_val:
+                        sni_to_ja4[sni_val][ja4] += 1
+                        ja4_to_sni[ja4][sni_val] += 1
 
             if TLSServerHello is not None and pkt.haslayer(TLSServerHello):  # type: ignore[truthy-bool]
                 server_hello = pkt[TLSServerHello]  # type: ignore[index]
@@ -569,6 +711,9 @@ def analyze_tls(
                 if cipher is not None:
                     cipher_name = str(cipher)
                     cipher_suites[cipher_name] += 1
+                    upper = cipher_name.upper()
+                    if any(marker in upper for marker in WEAK_CIPHER_MARKERS):
+                        weak_ciphers[cipher_name] += 1
 
                 ja4s = _ja4s_from_server_hello(server_hello)
                 if ja4s:
@@ -597,8 +742,26 @@ def analyze_tls(
             sni=data.get("sni"),
         ))
 
-    http_summary = analyze_http(path, show_status=False, packets=packets, meta=meta)
-    cert_summary = analyze_certificates(path, show_status=False)
+    def _busy(desc: str, func, *args, **kwargs):
+        return run_with_busy_status(path, show_status, f"TLS: {desc}", func, *args, **kwargs)
+
+    http_summary = _busy("HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta)
+    cert_summary = _busy("Certificates", analyze_certificates, path, show_status=False)
+
+    if tls_like_packets and tls_packets == 0:
+        analysis_notes.append(
+            "TLS record headers detected without parsed TLS handshakes; ensure scapy TLS support or provide full streams."
+        )
+    elif tls_like_packets > tls_packets:
+        analysis_notes.append(
+            f"{tls_like_packets - tls_packets} TLS-like packet(s) were detected without full handshake parsing."
+        )
+    if client_hellos and not server_hellos:
+        analysis_notes.append("Client hellos observed without any server hellos (possible blocked/failed handshakes).")
+    if ech_hellos:
+        analysis_notes.append("ECH (Encrypted ClientHello) observed; SNI may be intentionally hidden.")
+    if http_summary.total_requests or http_summary.total_responses:
+        analysis_notes.append("HTTP statistics are capture-wide; use --http for full plaintext context.")
 
     detections: list[dict[str, object]] = []
     legacy_versions = [v for v in ("SSLv3", "TLS1.0", "TLS1.1") if versions.get(v)]
@@ -609,12 +772,35 @@ def analyze_tls(
             "details": f"Versions: {', '.join(legacy_versions)}",
         })
 
-    missing_sni = client_hellos - sum(sni_counts.values())
-    if client_hellos and missing_sni > 0:
+    missing_sni_total = client_hellos - sum(sni_counts.values())
+    missing_sni_no_ech = max(0, missing_sni_total - ech_sni_missing)
+    if ech_hellos:
+        detections.append({
+            "severity": "info",
+            "summary": "ECH (Encrypted ClientHello) observed",
+            "details": f"{ech_hellos} client hello(s) advertise ECH.",
+        })
+    if client_hellos and missing_sni_no_ech > 0:
         detections.append({
             "severity": "info",
             "summary": "TLS handshakes without SNI",
-            "details": f"{missing_sni} client hello(s) missing SNI.",
+            "details": f"{missing_sni_no_ech} client hello(s) missing SNI (excluding ECH).",
+        })
+    if ech_sni_missing:
+        detections.append({
+            "severity": "info",
+            "summary": "SNI hidden by ECH",
+            "details": f"{ech_sni_missing} client hello(s) omitted SNI but advertised ECH.",
+        })
+
+    if client_hellos and server_hellos < client_hellos:
+        failed = client_hellos - server_hellos
+        ratio = failed / client_hellos
+        severity = "high" if ratio >= 0.7 else ("warning" if ratio >= 0.3 and failed >= 5 else "info")
+        detections.append({
+            "severity": severity,
+            "summary": "TLS handshake failures",
+            "details": f"{failed} client hello(s) without server hello response.",
         })
 
     high_entropy_sni = [sni for sni, count in sni_counts.items() if len(sni) >= 12 and _shannon_entropy(sni) >= 3.5]
@@ -631,6 +817,30 @@ def analyze_tls(
             "severity": "high",
             "summary": "Suspicious SNI TLDs observed",
             "details": ", ".join(suspicious_sni[:5]),
+        })
+
+    if sni_ip_literals:
+        detections.append({
+            "severity": "warning",
+            "summary": "SNI uses IP literal",
+            "details": ", ".join(sorted(sni_ip_literals)[:5]),
+        })
+
+    non_standard_ports = [port for port in server_ports if port not in TLS_PORTS]
+    if non_standard_ports:
+        ports_text = ", ".join(str(port) for port in sorted(non_standard_ports)[:8])
+        detections.append({
+            "severity": "info",
+            "summary": "TLS on non-standard ports",
+            "details": f"Ports: {ports_text}",
+        })
+
+    if weak_ciphers:
+        top_weak = ", ".join(name for name, _count in weak_ciphers.most_common(5))
+        detections.append({
+            "severity": "warning",
+            "summary": "Weak TLS cipher suites observed",
+            "details": top_weak,
         })
 
     if not alpn_counts and client_hellos:
@@ -683,15 +893,25 @@ def analyze_tls(
         path=path,
         total_packets=total_packets,
         tls_packets=tls_packets,
+        tls_like_packets=tls_like_packets,
         client_hellos=client_hellos,
         server_hellos=server_hellos,
+        ech_hellos=ech_hellos,
+        ech_sni_missing=ech_sni_missing,
+        sni_missing_total=missing_sni_total,
+        sni_missing_no_ech=missing_sni_no_ech,
         versions=versions,
         cipher_suites=cipher_suites,
+        weak_ciphers=weak_ciphers,
         sni_counts=sni_counts,
         alpn_counts=alpn_counts,
         ja3_counts=ja3_counts,
         ja4_counts=ja4_counts,
         ja4s_counts=ja4s_counts,
+        sni_to_ja3={key: Counter(val) for key, val in sni_to_ja3.items()},
+        sni_to_ja4={key: Counter(val) for key, val in sni_to_ja4.items()},
+        ja3_to_sni={key: Counter(val) for key, val in ja3_to_sni.items()},
+        ja4_to_sni={key: Counter(val) for key, val in ja4_to_sni.items()},
         client_counts=client_counts,
         server_counts=server_counts,
         server_ports=server_ports,
@@ -718,10 +938,13 @@ def analyze_tls(
         http_servers=http_summary.server_counts,
         cert_subjects=cert_summary.subjects,
         cert_issuers=cert_summary.issuers,
+        cert_sans=cert_summary.sas,
         cert_count=cert_summary.cert_count,
         weak_certs=len(cert_summary.weak_keys),
         expired_certs=len(cert_summary.expired),
         self_signed_certs=len(cert_summary.self_signed),
+        cert_artifacts=list(cert_summary.artifacts),
+        analysis_notes=analysis_notes,
         detections=detections,
         artifacts=artifacts,
         errors=errors + http_summary.errors + cert_summary.errors,

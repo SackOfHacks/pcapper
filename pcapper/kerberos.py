@@ -27,6 +27,77 @@ SPN_RE = re.compile(r"\b([A-Za-z0-9._-]{2,}/[A-Za-z0-9._-]{2,})(?:@([A-Za-z0-9.-
 ERR_RE = re.compile(r"\bKDC_ERR_[A-Z0-9_]+\b")
 REQ_RE = re.compile(r"\b(AS-REQ|AS-REP|TGS-REQ|TGS-REP|KRB_ERROR|S4U2SELF|S4U2PROXY|PA-ENC-TIMESTAMP)\b", re.IGNORECASE)
 
+CNAME_SUFFIXES = (
+    ".local",
+    ".lan",
+    ".corp",
+    ".internal",
+    ".intra",
+    ".private",
+    ".home",
+    ".lab",
+    ".test",
+    ".example",
+    ".com",
+    ".net",
+    ".org",
+    ".edu",
+    ".gov",
+    ".mil",
+    ".int",
+    ".co.uk",
+    ".org.uk",
+    ".gov.uk",
+    ".ac.uk",
+)
+CNAME_USER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{2,32}$")
+
+
+def _split_cname_concat(value: str) -> Optional[tuple[str, str]]:
+    text = str(value or "").strip()
+    if len(text) < 6 or "@" in text or "\\" in text:
+        return None
+    lower = text.lower()
+    best: tuple[int, str, str] | None = None
+    for suffix in CNAME_SUFFIXES:
+        start = 0
+        while True:
+            idx = lower.find(suffix, start)
+            if idx == -1:
+                break
+            end = idx + len(suffix)
+            if end >= len(text):
+                start = idx + 1
+                continue
+            realm = text[:end]
+            user = text[end:]
+            if not CNAME_USER_RE.fullmatch(user):
+                start = idx + 1
+                continue
+            if realm.count(".") < 1:
+                start = idx + 1
+                continue
+            if not any(ch.isalpha() for ch in realm):
+                start = idx + 1
+                continue
+            score = 0
+            if user.islower():
+                score += 3
+            if user.isalpha():
+                score += 1
+            if "." not in user:
+                score += 2
+            if realm.isupper():
+                score += 2
+            if any(ch.isdigit() for ch in user):
+                score -= 1
+            if best is None or score > best[0] or (score == best[0] and len(realm) > len(best[1])):
+                best = (score, realm, user)
+            start = idx + 1
+    if not best:
+        return None
+    return best[2], best[1]
+
 
 @dataclass(frozen=True)
 class KerberosConversation:
@@ -41,6 +112,8 @@ class KerberosConversation:
 class KerberosAnalysis:
     path: Path
     duration: float
+    first_seen: Optional[float]
+    last_seen: Optional[float]
     total_packets: int
     servers: Counter[str]
     clients: Counter[str]
@@ -57,6 +130,7 @@ class KerberosAnalysis:
     public_endpoints: Counter[str]
     suspicious_attributes: Counter[str]
     bind_bursts: Counter[str]
+    principal_evidence: List[Dict[str, object]]
     artifacts: List[str]
     anomalies: List[str]
     detections: List[Dict[str, object]]
@@ -141,6 +215,8 @@ def analyze_kerberos(
     udp_packets = 0
     bind_buckets: Dict[Tuple[str, int], int] = defaultdict(int)
     suspicious_attributes = Counter()
+    principal_evidence: List[Dict[str, object]] = []
+    principal_seen: set[tuple[str, str, int, str, str]] = set()
 
     try:
         for pkt in reader:
@@ -219,8 +295,38 @@ def analyze_kerberos(
                 for match in UPN_RE.finditer(value):
                     user = match.group(1)
                     realm = match.group(2)
-                    principals[f"{user}@{realm}"] += 1
+                    principal = f"{user}@{realm}"
+                    principals[principal] += 1
                     realms[realm] += 1
+                    key = (src_ip, dst_ip, dport or sport, proto, principal)
+                    if key not in principal_seen:
+                        principal_seen.add(key)
+                        principal_evidence.append({
+                            "src_ip": src_ip,
+                            "dst_ip": dst_ip,
+                            "dst_port": dport or sport,
+                            "protocol": proto,
+                            "principal": principal,
+                            "kind": "UPN",
+                        })
+
+                cname = _split_cname_concat(value)
+                if cname:
+                    user, realm = cname
+                    principal = f"{user}@{realm}"
+                    principals[principal] += 1
+                    realms[realm] += 1
+                    key = (src_ip, dst_ip, dport or sport, proto, principal)
+                    if key not in principal_seen:
+                        principal_seen.add(key)
+                        principal_evidence.append({
+                            "src_ip": src_ip,
+                            "dst_ip": dst_ip,
+                            "dst_port": dport or sport,
+                            "protocol": proto,
+                            "principal": principal,
+                            "kind": "CNameString",
+                        })
 
                 for match in SPN_RE.finditer(value):
                     spn = match.group(1)
@@ -344,6 +450,8 @@ def analyze_kerberos(
     return KerberosAnalysis(
         path=path,
         duration=duration,
+        first_seen=first_seen,
+        last_seen=last_seen,
         total_packets=total_packets,
         servers=servers,
         clients=clients,
@@ -360,6 +468,7 @@ def analyze_kerberos(
         public_endpoints=public_endpoints,
         suspicious_attributes=suspicious_attributes,
         bind_bursts=bind_bursts,
+        principal_evidence=principal_evidence,
         artifacts=sorted(artifacts),
         anomalies=anomalies,
         detections=detections,

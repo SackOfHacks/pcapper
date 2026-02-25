@@ -26,6 +26,8 @@ ASDU_TYPES = {
     51: "C_BO_NA_1 (Bitstring command)",
 }
 
+CONTROL_ASDU_TYPES = {45, 46, 47, 48, 49, 50, 51}
+
 CAUSES = {
     1: "Periodic",
     2: "Background",
@@ -87,6 +89,8 @@ def _parse_commands(payload: bytes) -> list[str]:
         type_id = payload[6]
         type_name = ASDU_TYPES.get(type_id, f"ASDU {type_id}")
         cmds.append(type_name)
+        if type_id in CONTROL_ASDU_TYPES:
+            cmds.append("Control ASDU")
     asdu_cmds, _ = _parse_asdu(payload)
     for cmd in asdu_cmds:
         if cmd not in cmds:

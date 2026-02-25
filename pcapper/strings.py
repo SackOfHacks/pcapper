@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+import os
 import re
 
 try:
@@ -34,6 +35,12 @@ SUSPICIOUS_PATTERNS = [
 URL_PATTERN = re.compile(r"https?://[^\s'\"]+", re.IGNORECASE)
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 DOMAIN_PATTERN = re.compile(r"\b([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}\b")
+try:
+    MAX_PAYLOAD_SCAN = int(os.getenv("PCAPPER_STRINGS_MAX_BYTES", "16384"))
+except Exception:
+    MAX_PAYLOAD_SCAN = 16384
+if MAX_PAYLOAD_SCAN < 0:
+    MAX_PAYLOAD_SCAN = 0
 
 
 @dataclass(frozen=True)
@@ -189,6 +196,10 @@ def analyze_strings(path: Path, show_status: bool = True, max_unique: int = 5000
 
             if not payload:
                 continue
+            if MAX_PAYLOAD_SCAN == 0:
+                continue
+            if len(payload) > MAX_PAYLOAD_SCAN:
+                payload = payload[:MAX_PAYLOAD_SCAN]
 
             src, dst = _get_ip_pair(pkt)
 

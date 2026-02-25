@@ -1325,31 +1325,6 @@ class FileExtractor:
                     packet_index=sess["first_packet"], note="TFTP Transfer", file_type=ftype, payload=data
                 ))
 
-        # 3. Candidates
-        for (s, d, p, sp, dp), info in self.flows.items():
-            # Check if this flow produced artifacts
-            # This is O(N*M), maybe optimize later
-            
-            # Determine protocol
-            proto = "UNKNOWN"
-            hint = self.flow_protocol_hints.get((s, d, p, sp, dp))
-            if hint:
-                proto = hint.most_common(1)[0][0]
-            if proto == "UNKNOWN":
-                proto = _flow_protocol(sp, dp)
-
-            if proto not in FILE_TRANSFER_PROTOCOLS:
-                continue
-            
-            self.candidates.append(FileTransfer(
-                protocol=proto, src_ip=s, dst_ip=d, src_port=sp, dst_port=dp,
-                packets=info["packets"], bytes=info["bytes"],
-                first_seen=info["first_seen"], last_seen=info.get("last_seen"),
-                note=None
-            ))
-        
-        self.candidates.sort(key=lambda x: x.bytes, reverse=True)
-        
         # Sort artifacts to surface interesting files first
         # 1. Non generic filenames (not http_response.bin, not extracted_pe_N.exe if possible, but PEs are good)
         # 2. Known Extensions (exe, zip, pdf, etc)

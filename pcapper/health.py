@@ -9,6 +9,7 @@ import math
 from .pcap_cache import get_reader
 from .utils import detect_file_type, safe_float
 from .certificates import analyze_certificates
+from .progress import run_with_busy_status
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -684,7 +685,14 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
     expired_certs = 0
     self_signed_certs = 0
     try:
-        cert_summary = analyze_certificates(path, show_status=False)
+        cert_summary = run_with_busy_status(
+            path,
+            show_status,
+            "Health: Certificates",
+            analyze_certificates,
+            path,
+            show_status=False,
+        )
         expired_certs = len(cert_summary.expired)
         self_signed_certs = len(cert_summary.self_signed)
         errors.extend(cert_summary.errors)

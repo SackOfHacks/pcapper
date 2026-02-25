@@ -82,8 +82,11 @@ def _is_valid_hostname(value: str) -> bool:
 
 def _decode_name(value: object) -> str:
     if isinstance(value, (bytes, bytearray)):
-        return value.decode("utf-8", errors="ignore").strip(".")
-    return str(value).strip(".")
+        text = value.decode("utf-8", errors="ignore")
+    else:
+        text = str(value)
+    text = text.replace("\x00", "").strip(".")
+    return text
 
 
 def _decode_nbns_level1_name(value: object) -> Optional[str]:
@@ -197,6 +200,13 @@ def _extract_ports(pkt) -> tuple[Optional[int], Optional[int]]:
         except Exception:
             return None, None
     return None, None
+
+
+def _safe_dns_attr(dns_layer, attr: str, default=None):
+    try:
+        return getattr(dns_layer, attr)
+    except Exception:
+        return default
 
 
 def _extract_nbns_hostnames(pkt, payload: bytes) -> list[str]:
@@ -380,12 +390,28 @@ def _extract_dhcp_hostnames(pkt, src_ip: str, dst_ip: str) -> list[tuple[str, st
         except Exception:
             continue
 
+    options = getattr(dhcp_layer, "options", None)
+    if not isinstance(options, (list, tuple)):
+        return results
+
+    option_map: dict[str, object] = {}
+    for option in options:
+        if not isinstance(option, tuple) or len(option) < 2:
+            continue
+        key = str(option[0]).strip().lower()
+        if key and key not in {"end", "pad"}:
+            option_map[key] = option[1]
+
+    requested_ip = _decode_name(option_map.get("requested_addr", option_map.get("requested-address", "")))
+
     mapped_candidates: list[str] = []
     if bootp_layer is not None:
         mapped_candidates.extend([
             str(getattr(bootp_layer, "ciaddr", "") or ""),
             str(getattr(bootp_layer, "yiaddr", "") or ""),
         ])
+    if requested_ip:
+        mapped_candidates.append(requested_ip)
     mapped_candidates.extend([src_ip, dst_ip])
 
     mapped_ip = src_ip
@@ -400,10 +426,6 @@ def _extract_dhcp_hostnames(pkt, src_ip: str, dst_ip: str) -> list[tuple[str, st
             continue
         mapped_ip = str(ip_obj)
         break
-
-    options = getattr(dhcp_layer, "options", None)
-    if not isinstance(options, (list, tuple)):
-        return results
 
     option_meta = {
         "hostname": ("DHCP hostname option", "MEDIUM"),
@@ -644,10 +666,22 @@ def _record_finding(
     return True
 
 
-def _matches_target_mapping(mapped_ip: str, target_ip: str | None, target_filter_enabled: bool) -> bool:
+def _matches_target_mapping(
+    mapped_ip: str,
+    target_ip: str | None,
+    target_filter_enabled: bool,
+    allow_related: bool = False,
+    packet_relevant: bool = False,
+) -> bool:
     if not target_filter_enabled:
         return True
-    return bool(target_ip) and mapped_ip == target_ip
+    if not target_ip:
+        return False
+    if mapped_ip == target_ip:
+        return True
+    if allow_related and packet_relevant and mapped_ip:
+        return True
+    return False
 
 
 def merge_hostname_summaries(summaries: list[HostnameSummary]) -> HostnameSummary:
@@ -701,7 +735,12 @@ def merge_hostname_summaries(summaries: list[HostnameSummary]) -> HostnameSummar
     return merged
 
 
-def analyze_hostname(path: Path, target_ip: str | None, show_status: bool = True) -> HostnameSummary:
+def analyze_hostname(
+    path: Path,
+    target_ip: str | None,
+    show_status: bool = True,
+    include_related: bool = False,
+) -> HostnameSummary:
     summary = HostnameSummary(path=path, target_ip=target_ip)
     target_filter_enabled = bool(target_ip)
     if target_filter_enabled:
@@ -733,11 +772,20 @@ def analyze_hostname(path: Path, target_ip: str | None, show_status: bool = True
             src_ip, dst_ip = _extract_ip_pair(pkt)
             sport, dport = _extract_ports(pkt)
 
-            packet_relevant = target_filter_enabled and (src_ip == target_ip or dst_ip == target_ip)
+            flow_relevant = target_filter_enabled and (src_ip == target_ip or dst_ip == target_ip)
+            packet_relevant = flow_relevant
             found_evidence = False
+            def _match(mapped_ip: str) -> bool:
+                return _matches_target_mapping(
+                    mapped_ip,
+                    target_ip,
+                    target_filter_enabled,
+                    allow_related=include_related,
+                    packet_relevant=flow_relevant,
+                )
 
             for host_value, method, confidence, mapped_ip, details in _extract_dhcp_hostnames(pkt, src_ip, dst_ip):
-                if _matches_target_mapping(mapped_ip, target_ip, target_filter_enabled) and _record_finding(
+                if _match(mapped_ip) and _record_finding(
                     findings_map,
                     hostname=host_value,
                     mapped_ip=mapped_ip,
@@ -755,79 +803,83 @@ def analyze_hostname(path: Path, target_ip: str | None, show_status: bool = True
                     summary.method_counts[method] += 1
 
             if DNS is not None and pkt.haslayer(DNS):
-                dns_layer = pkt[DNS]
-                qd = getattr(dns_layer, "qd", None)
-                if qd is not None:
-                    qname = _decode_name(getattr(qd, "qname", "")).lower()
-                    qtype = int(getattr(qd, "qtype", 0) or 0)
-                    if reverse_ptr and reverse_ptr in qname and qtype == 12:
-                        packet_relevant = True
-
-                if int(getattr(dns_layer, "qr", 0) or 0) == 1:
-                    an = getattr(dns_layer, "an", None)
-                    rr_count = int(getattr(dns_layer, "ancount", 0) or 0)
-                    current = an
-                    for _ in range(rr_count):
-                        if current is None:
-                            break
-                        rr_name = _decode_name(getattr(current, "rrname", ""))
-                        rr_type = int(getattr(current, "type", 0) or 0)
-                        rr_data = getattr(current, "rdata", None)
-                        rr_data_text = _decode_name(rr_data)
-
-                        if rr_type in {1, 28} and (not target_filter_enabled or rr_data_text == target_ip):
+                try:
+                    dns_layer = pkt[DNS]
+                except Exception:
+                    dns_layer = None
+                if dns_layer is not None:
+                    qd = _safe_dns_attr(dns_layer, "qd", None)
+                    if qd is not None:
+                        qname = _decode_name(_safe_dns_attr(qd, "qname", "")).lower()
+                        qtype = int(_safe_dns_attr(qd, "qtype", 0) or 0)
+                        if reverse_ptr and reverse_ptr in qname and qtype == 12:
                             packet_relevant = True
-                            method = "DNS A/AAAA mapping"
-                            port_pair = {sport, dport}
-                            if 5353 in port_pair:
-                                protocol = "mDNS"
-                            elif 5355 in port_pair:
-                                protocol = "LLMNR"
-                            else:
+
+                    if int(_safe_dns_attr(dns_layer, "qr", 0) or 0) == 1:
+                        an = _safe_dns_attr(dns_layer, "an", None)
+                        rr_count = int(_safe_dns_attr(dns_layer, "ancount", 0) or 0)
+                        current = an
+                        for _ in range(rr_count):
+                            if current is None:
+                                break
+                            rr_name = _decode_name(getattr(current, "rrname", ""))
+                            rr_type = int(getattr(current, "type", 0) or 0)
+                            rr_data = getattr(current, "rdata", None)
+                            rr_data_text = _decode_name(rr_data)
+
+                            if rr_type in {1, 28} and (not target_filter_enabled or rr_data_text == target_ip):
+                                packet_relevant = True
+                                method = "DNS A/AAAA mapping"
+                                port_pair = {sport, dport}
+                                if 5353 in port_pair:
+                                    protocol = "mDNS"
+                                elif 5355 in port_pair:
+                                    protocol = "LLMNR"
+                                else:
+                                    protocol = "DNS"
+                                if _match(rr_data_text) and _record_finding(
+                                    findings_map,
+                                    hostname=rr_name,
+                                    mapped_ip=rr_data_text,
+                                    protocol=protocol,
+                                    method=method,
+                                    confidence="HIGH",
+                                    details=f"{rr_name} resolved to {rr_data_text}",
+                                    src_ip=src_ip,
+                                    dst_ip=dst_ip,
+                                    ts=ts,
+                                ):
+                                    found_evidence = True
+                                    summary.protocol_counts[protocol] += 1
+                                    summary.method_counts[method] += 1
+
+                            ptr_ip = _ptr_name_to_ip(rr_name)
+                            if rr_type == 12 and ((target_filter_enabled and reverse_ptr and reverse_ptr in rr_name.lower()) or (not target_filter_enabled and bool(ptr_ip))):
+                                packet_relevant = True
+                                method = "DNS PTR reverse lookup"
                                 protocol = "DNS"
-                            if _matches_target_mapping(rr_data_text, target_ip, target_filter_enabled) and _record_finding(
-                                findings_map,
-                                hostname=rr_name,
-                                mapped_ip=rr_data_text,
-                                protocol=protocol,
-                                method=method,
-                                confidence="HIGH",
-                                details=f"{rr_name} resolved to {rr_data_text}",
-                                src_ip=src_ip,
-                                dst_ip=dst_ip,
-                                ts=ts,
-                            ):
-                                found_evidence = True
-                                summary.protocol_counts[protocol] += 1
-                                summary.method_counts[method] += 1
+                                mapped_ip = target_ip if target_filter_enabled else ptr_ip
+                                if _match(str(mapped_ip)) and _record_finding(
+                                    findings_map,
+                                    hostname=rr_data_text,
+                                    mapped_ip=str(mapped_ip),
+                                    protocol=protocol,
+                                    method=method,
+                                    confidence="HIGH",
+                                    details=f"PTR {rr_name} -> {rr_data_text}",
+                                    src_ip=src_ip,
+                                    dst_ip=dst_ip,
+                                    ts=ts,
+                                ):
+                                    found_evidence = True
+                                    summary.protocol_counts[protocol] += 1
+                                    summary.method_counts[method] += 1
 
-                        ptr_ip = _ptr_name_to_ip(rr_name)
-                        if rr_type == 12 and ((target_filter_enabled and reverse_ptr and reverse_ptr in rr_name.lower()) or (not target_filter_enabled and bool(ptr_ip))):
-                            packet_relevant = True
-                            method = "DNS PTR reverse lookup"
-                            protocol = "DNS"
-                            mapped_ip = target_ip if target_filter_enabled else ptr_ip
-                            if _matches_target_mapping(str(mapped_ip), target_ip, target_filter_enabled) and _record_finding(
-                                findings_map,
-                                hostname=rr_data_text,
-                                mapped_ip=str(mapped_ip),
-                                protocol=protocol,
-                                method=method,
-                                confidence="HIGH",
-                                details=f"PTR {rr_name} -> {rr_data_text}",
-                                src_ip=src_ip,
-                                dst_ip=dst_ip,
-                                ts=ts,
-                            ):
-                                found_evidence = True
-                                summary.protocol_counts[protocol] += 1
-                                summary.method_counts[method] += 1
-
-                        current = getattr(current, "payload", None)
+                            current = getattr(current, "payload", None)
 
             payload = _extract_payload(pkt)
             for host_value, method, confidence, mapped_ip, details in _extract_arp_hostnames(pkt, payload, src_ip, dst_ip):
-                if _matches_target_mapping(mapped_ip, target_ip, target_filter_enabled) and _record_finding(
+                if _match(mapped_ip) and _record_finding(
                     findings_map,
                     hostname=host_value,
                     mapped_ip=mapped_ip,
@@ -849,7 +901,7 @@ def analyze_hostname(path: Path, target_ip: str | None, show_status: bool = True
                 if host_header:
                     method = "HTTP Host header"
                     protocol = "HTTP"
-                    if _matches_target_mapping(dst_ip, target_ip, target_filter_enabled) and _record_finding(
+                    if _match(dst_ip) and _record_finding(
                         findings_map,
                         hostname=host_header,
                         mapped_ip=dst_ip,
@@ -869,7 +921,7 @@ def analyze_hostname(path: Path, target_ip: str | None, show_status: bool = True
                 if authority_host:
                     method = "HTTP absolute/CONNECT authority"
                     protocol = "HTTP"
-                    if _matches_target_mapping(dst_ip, target_ip, target_filter_enabled) and _record_finding(
+                    if _match(dst_ip) and _record_finding(
                         findings_map,
                         hostname=authority_host,
                         mapped_ip=dst_ip,
@@ -890,7 +942,7 @@ def analyze_hostname(path: Path, target_ip: str | None, show_status: bool = True
                     method = "NTLM workstation field"
                     protocol = "SMB/NTLM"
                     detail = f"NTLM auth context user={user or '-'} domain={domain or '-'}"
-                    if _matches_target_mapping(src_ip, target_ip, target_filter_enabled) and _record_finding(
+                    if _match(src_ip) and _record_finding(
                         findings_map,
                         hostname=workstation,
                         mapped_ip=src_ip,
@@ -914,7 +966,7 @@ def analyze_hostname(path: Path, target_ip: str | None, show_status: bool = True
                         elif method in {"SMTP server banner", "IMAP server banner", "POP server banner"}:
                             mapped_ip = src_ip if sport in MAIL_SERVER_PORTS else dst_ip
 
-                        if _matches_target_mapping(mapped_ip, target_ip, target_filter_enabled) and _record_finding(
+                        if _match(mapped_ip) and _record_finding(
                             findings_map,
                             hostname=host_value,
                             mapped_ip=mapped_ip,
@@ -933,7 +985,7 @@ def analyze_hostname(path: Path, target_ip: str | None, show_status: bool = True
                 if (sport in SMB_PORTS) or (dport in SMB_PORTS):
                     for unc_host in _extract_unc_hostnames(payload):
                         mapped_ip = dst_ip if dport in SMB_PORTS else src_ip
-                        if _matches_target_mapping(mapped_ip, target_ip, target_filter_enabled) and _record_finding(
+                        if _match(mapped_ip) and _record_finding(
                             findings_map,
                             hostname=unc_host,
                             mapped_ip=mapped_ip,
@@ -954,7 +1006,7 @@ def analyze_hostname(path: Path, target_ip: str | None, show_status: bool = True
                 if sni:
                     method = "TLS SNI"
                     protocol = "HTTPS/TLS"
-                    if _matches_target_mapping(dst_ip, target_ip, target_filter_enabled) and _record_finding(
+                    if _match(dst_ip) and _record_finding(
                         findings_map,
                         hostname=sni,
                         mapped_ip=dst_ip,
@@ -972,7 +1024,7 @@ def analyze_hostname(path: Path, target_ip: str | None, show_status: bool = True
 
             for cert_hostname, method, confidence in _extract_tls_certificate_hostnames(pkt, payload):
                 mapped_ip = src_ip
-                if _matches_target_mapping(mapped_ip, target_ip, target_filter_enabled) and _record_finding(
+                if _match(mapped_ip) and _record_finding(
                     findings_map,
                     hostname=cert_hostname,
                     mapped_ip=mapped_ip,
@@ -993,7 +1045,7 @@ def analyze_hostname(path: Path, target_ip: str | None, show_status: bool = True
                 port_pair = {int(pkt[UDP].sport), int(pkt[UDP].dport)}
                 if 137 in port_pair and payload:
                     for token in _extract_nbns_hostnames(pkt, payload):
-                        if _matches_target_mapping(src_ip, target_ip, target_filter_enabled) and _record_finding(
+                        if _match(src_ip) and _record_finding(
                             findings_map,
                             hostname=token,
                             mapped_ip=src_ip,

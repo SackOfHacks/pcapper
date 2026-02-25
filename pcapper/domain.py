@@ -7,12 +7,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .pcap_cache import PcapMeta, get_reader
-
 from .utils import detect_file_type, safe_float
 from .dns import analyze_dns
 from .netbios import analyze_netbios
 from .ntlm import analyze_ntlm
 from .files import analyze_files
+from .progress import run_with_busy_status
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -162,10 +162,13 @@ def analyze_domain(
     detections: List[Dict[str, object]] = []
     anomalies: List[str] = []
 
-    dns_summary = analyze_dns(path, show_status=False, packets=packets, meta=meta)
-    netbios_summary = analyze_netbios(path, show_status=False)
-    ntlm_summary = analyze_ntlm(path, show_status=False)
-    files_summary = analyze_files(path, show_status=False)
+    def _busy(desc: str, func, *args, **kwargs):
+        return run_with_busy_status(path, show_status, f"Domain: {desc}", func, *args, **kwargs)
+
+    dns_summary = _busy("DNS", analyze_dns, path, show_status=False, packets=packets, meta=meta)
+    netbios_summary = _busy("NetBIOS", analyze_netbios, path, show_status=False)
+    ntlm_summary = _busy("NTLM", analyze_ntlm, path, show_status=False)
+    files_summary = _busy("Files", analyze_files, path, show_status=False)
 
     domains = Counter()
     for qname, count in dns_summary.qname_counts.items():

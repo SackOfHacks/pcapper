@@ -17,7 +17,6 @@ ANSI_WHITE = "\x1b[37m"
 ANSI_BLACK = "\x1b[30m"
 ANSI_BLUE_BG = "\x1b[104m"
 ANSI_RED_BG = "\x1b[41m"
-ANSI_RED_BG = "\x1b[41m"
 
 _COLOR_OVERRIDE: bool | None = None
 
@@ -92,12 +91,6 @@ def reverse_header(text: str, enabled: bool | None = None) -> str:
     if not use_color(enabled):
         return text
     return f"{ANSI_BLUE_BG}{ANSI_WHITE}{ANSI_BOLD}{text}{ANSI_RESET}"
-
-
-def danger_bg(text: str, enabled: bool | None = None) -> str:
-    if not use_color(enabled):
-        return text
-    return f"{ANSI_RED_BG}{ANSI_WHITE}{ANSI_BOLD}{text}{ANSI_RESET}"
 
 
 def danger_bg(text: str, enabled: bool | None = None) -> str:

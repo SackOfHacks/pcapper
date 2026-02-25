@@ -198,6 +198,7 @@ class NetbiosAnalysis:
     artifacts: List[str] = field(default_factory=list)
     files_discovered: List[str] = field(default_factory=list)
     observed_users: Counter[str] = field(default_factory=Counter)
+    user_evidence: List[Dict[str, object]] = field(default_factory=list)
     anomalies: List[NetbiosAnomaly] = field(default_factory=list)
     name_conflicts: int = 0
     browser_elections: int = 0
@@ -281,6 +282,7 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
     smb_session_setup_attempts: Counter[str] = Counter()
     smb_negative_sessions: Counter[str] = Counter()
     src_distinct_destinations: Dict[str, Set[str]] = defaultdict(set)
+    user_evidence_seen: Set[Tuple[str, str, str, str, int, int]] = set()
 
     keepalive_last_ts: Dict[str, float] = {}
     keepalive_intervals: Dict[str, List[float]] = defaultdict(list)
@@ -571,6 +573,20 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                                 analysis.smb_users[user] += 1
                                 analysis.smb_sources[src_ip] += 1
                                 analysis.smb_destinations[dst_ip] += 1
+                                key = (src_ip, dst_ip, user, domain or "", sport, dport)
+                                if key not in user_evidence_seen:
+                                    user_evidence_seen.add(key)
+                                    analysis.user_evidence.append({
+                                        "src_ip": src_ip,
+                                        "dst_ip": dst_ip,
+                                        "src_port": sport,
+                                        "dst_port": dport,
+                                        "username": user,
+                                        "domain": domain,
+                                        "workstation": workstation,
+                                        "method": "NetBIOS SMB Session Setup",
+                                        "details": cmd_name or "SMB over NetBIOS",
+                                    })
                             if domain:
                                 analysis.smb_domains[domain] += 1
                             if workstation:
