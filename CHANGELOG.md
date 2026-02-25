@@ -4,6 +4,10 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 1.4.3 — 2026-02-25
+### Fixed
+- Summary renderers now accept and propagate `verbose` to avoid NameError crashes in `--files`, `--ldap`, and related OT/ICS summaries.
+
 ## 1.4.2 — 2026-02-25
 ### Fixed
 - `--files` table rendering now tolerates missing values (no NoneType crashes).
