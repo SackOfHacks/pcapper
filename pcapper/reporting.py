@@ -1062,7 +1062,7 @@ def render_vlan_rollup(summaries: Iterable[VlanSummary], limit: int = 20, verbos
     )
     return render_vlan_summary(rollup_summary, limit=limit, verbose=verbose)
 
-def render_domain_summary(summary: "DomainAnalysis", limit: int = 25) -> str:
+def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: bool = False) -> str:
     limit = _apply_verbose_limit(limit)
     from .domain import DomainAnalysis
 
@@ -1227,7 +1227,7 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25) -> str:
     return _finalize_output(lines)
 
 
-def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25) -> str:
+def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25, verbose: bool = False) -> str:
     limit = _apply_verbose_limit(limit)
     from .ldap import LdapAnalysis
 
@@ -1437,7 +1437,7 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25) -> str:
     return _finalize_output(lines)
 
 
-def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25) -> str:
+def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25, verbose: bool = False) -> str:
     limit = _apply_verbose_limit(limit)
     from .kerberos import KerberosAnalysis
 
@@ -12503,7 +12503,7 @@ def render_routing_summary(summary: RoutingSummary, limit: int = 200, verbose: b
     return _finalize_output(lines)
 
 
-def render_goose_summary(summary: GooseSummary) -> str:
+def render_goose_summary(summary: GooseSummary, verbose: bool = False) -> str:
     lines = [header("GOOSE ANALYSIS")]
     lines.append(_format_kv("GOOSE Packets", str(summary.goose_packets)))
     lines.append(_format_kv("Top Sources", _format_counter(summary.src_macs, 5)))
@@ -12548,7 +12548,7 @@ def render_goose_summary(summary: GooseSummary) -> str:
     return _finalize_output(lines)
 
 
-def render_sv_summary(summary: SvSummary) -> str:
+def render_sv_summary(summary: SvSummary, verbose: bool = False) -> str:
     lines = [header("SV ANALYSIS")]
     lines.append(_format_kv("SV Packets", str(summary.sv_packets)))
     lines.append(_format_kv("Top Sources", _format_counter(summary.src_macs, 5)))
@@ -12587,7 +12587,7 @@ def render_sv_summary(summary: SvSummary) -> str:
     return _finalize_output(lines)
 
 
-def render_lldp_dcp_summary(summary: LldpDcpSummary) -> str:
+def render_lldp_dcp_summary(summary: LldpDcpSummary, verbose: bool = False) -> str:
     lines = [header("LLDP/DCP ANALYSIS")]
     lines.append(_format_kv("LLDP Packets", str(summary.lldp_packets)))
     lines.append(_format_kv("DCP Packets", str(summary.dcp_packets)))
@@ -12630,7 +12630,7 @@ def render_lldp_dcp_summary(summary: LldpDcpSummary) -> str:
     return _finalize_output(lines)
 
 
-def render_ptp_summary(summary: PtpSummary) -> str:
+def render_ptp_summary(summary: PtpSummary, verbose: bool = False) -> str:
     lines = [header("PTP ANALYSIS")]
     lines.append(_format_kv("PTP Packets", str(summary.ptp_packets)))
     lines.append(_format_kv("Message Types", _format_counter(summary.msg_types, 6)))
@@ -12717,7 +12717,7 @@ def render_ioc_summary(summary: IocSummary) -> str:
     return _finalize_output(lines)
 
 
-def render_ot_commands_summary(summary: OtCommandSummary, session_limit: int = 10) -> str:
+def render_ot_commands_summary(summary: OtCommandSummary, session_limit: int = 10, verbose: bool = False) -> str:
     lines = [header("OT COMMANDS")]
     if getattr(summary, "fast_mode", False):
         lines.append(_format_kv("Mode", "FAST (port heuristic)"))
@@ -12767,7 +12767,7 @@ def render_ot_commands_summary(summary: OtCommandSummary, session_limit: int = 1
     return _finalize_output(lines)
 
 
-def render_iec101_103_summary(summary: Iec101103Summary) -> str:
+def render_iec101_103_summary(summary: Iec101103Summary, verbose: bool = False) -> str:
     lines = [header("IEC 101/103 ANALYSIS")]
     lines.append(_format_kv("Candidate Packets", str(summary.candidate_packets)))
     lines.append(_format_kv("Top Clients", _format_counter(summary.client_counts, 5)))

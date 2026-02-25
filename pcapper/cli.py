@@ -1841,21 +1841,21 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("domain", []).append(domain_summary)
                 else:
-                    print(render_domain_summary(domain_summary))
+                    print(render_domain_summary(domain_summary, verbose=verbose))
                 export_summaries["domain"] = domain_summary
             elif step == "ldap" and show_ldap:
                 ldap_summary = analyze_ldap(path, show_status=step_status, packets=packets, meta=meta)
                 if summarize_rollups:
                     rollups.setdefault("ldap", []).append(ldap_summary)
                 else:
-                    print(render_ldap_summary(ldap_summary))
+                    print(render_ldap_summary(ldap_summary, verbose=verbose))
                 export_summaries["ldap"] = ldap_summary
             elif step == "kerberos" and show_kerberos:
                 kerberos_summary = analyze_kerberos(path, show_status=step_status, packets=packets, meta=meta)
                 if summarize_rollups:
                     rollups.setdefault("kerberos", []).append(kerberos_summary)
                 else:
-                    print(render_kerberos_summary(kerberos_summary))
+                    print(render_kerberos_summary(kerberos_summary, verbose=verbose))
                 export_summaries["kerberos"] = kerberos_summary
             elif step == "ntlm" and show_ntlm:
                 ntlm_summary = analyze_ntlm(path, show_status=step_status)
@@ -2093,28 +2093,28 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("goose", []).append(summary)
                 else:
-                    print(render_goose_summary(summary))
+                    print(render_goose_summary(summary, verbose=verbose))
                 export_summaries["goose"] = summary
             elif step == "sv" and show_sv:
                 summary = analyze_sv(path, show_status=step_status)
                 if summarize_rollups:
                     rollups.setdefault("sv", []).append(summary)
                 else:
-                    print(render_sv_summary(summary))
+                    print(render_sv_summary(summary, verbose=verbose))
                 export_summaries["sv"] = summary
             elif step == "lldp" and show_lldp:
                 summary = analyze_lldp_dcp(path, show_status=step_status)
                 if summarize_rollups:
                     rollups.setdefault("lldp", []).append(summary)
                 else:
-                    print(render_lldp_dcp_summary(summary))
+                    print(render_lldp_dcp_summary(summary, verbose=verbose))
                 export_summaries["lldp"] = summary
             elif step == "ptp" and show_ptp:
                 summary = analyze_ptp(path, show_status=step_status)
                 if summarize_rollups:
                     rollups.setdefault("ptp", []).append(summary)
                 else:
-                    print(render_ptp_summary(summary))
+                    print(render_ptp_summary(summary, verbose=verbose))
                 export_summaries["ptp"] = summary
             elif step == "ot_commands" and show_ot_commands:
                 summary = analyze_ot_commands(
@@ -2126,14 +2126,14 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("ot_commands", []).append(summary)
                 else:
-                    print(render_ot_commands_summary(summary, session_limit=ot_commands_sessions_limit))
+                    print(render_ot_commands_summary(summary, session_limit=ot_commands_sessions_limit, verbose=verbose))
                 export_summaries["ot_commands"] = summary
             elif step == "iec101_103" and show_iec101_103:
                 summary = analyze_iec101_103(path, show_status=step_status)
                 if summarize_rollups:
                     rollups.setdefault("iec101_103", []).append(summary)
                 else:
-                    print(render_iec101_103_summary(summary))
+                    print(render_iec101_103_summary(summary, verbose=verbose))
                 export_summaries["iec101_103"] = summary
             elif step in plugin_lookup:
                 spec = plugin_lookup[step]

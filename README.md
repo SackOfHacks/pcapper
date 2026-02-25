@@ -125,6 +125,7 @@ Client                   Server                   Start                     End 
 
 Secrets/credentials are redacted by default in reports. Use `--show-secrets` to display them.
 Exports (JSON/CSV/SQLite) are redacted by default; use `--export-raw` to disable export redaction or `--export-redact` to force it.
+Use `-v/--verbose` to include additional evidence lines in summaries (for example file artifacts, LDAP anomalies, and OT/ICS command details).
 
 ## Summarize behavior
 
