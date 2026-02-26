@@ -7,7 +7,11 @@ import struct
 from pathlib import Path
 from typing import Iterable, Optional
 
-from scapy.utils import PcapReader, PcapNgReader
+try:
+    from scapy.utils import PcapReader, PcapNgReader
+except Exception:  # pragma: no cover
+    PcapReader = None  # type: ignore[assignment,misc]
+    PcapNgReader = None  # type: ignore[assignment,misc]
 try:
     from scapy.all import sniff  # type: ignore
 except Exception:  # pragma: no cover
@@ -295,12 +299,6 @@ def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], Pc
     linktype = getattr(reader, "linktype", None)
     snaplen = getattr(reader, "snaplen", None)
     interfaces = getattr(reader, "interfaces", None)
-    linktype = getattr(reader, "linktype", None)
-    snaplen = getattr(reader, "snaplen", None)
-    interfaces = getattr(reader, "interfaces", None)
-    linktype = getattr(reader, "linktype", None)
-    snaplen = getattr(reader, "snaplen", None)
-    interfaces = getattr(reader, "interfaces", None)
 
     packets: list[object] = []
     try:
@@ -316,10 +314,6 @@ def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], Pc
     finally:
         status.finish()
         reader.close()
-
-    linktype = getattr(reader, "linktype", None)
-    snaplen = getattr(reader, "snaplen", None)
-    interfaces = getattr(reader, "interfaces", None)
 
     meta = _finalize_meta(
         path=path,
@@ -431,6 +425,9 @@ def load_filtered_packets(
     reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
     status = build_statusbar(path, enabled=show_status)
     stream = _reader_stream(reader)
+    linktype = getattr(reader, "linktype", None)
+    snaplen = getattr(reader, "snaplen", None)
+    interfaces = getattr(reader, "interfaces", None)
     packets: list[object] = []
     try:
         for pkt in reader:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from collections import Counter
-import heapq
 import numbers
 from typing import Any
 
@@ -32,22 +31,19 @@ def _stable_most_common(self: Counter, n: int | None = None):  # type: ignore[ov
 
     def _sort_key(item: tuple[Any, Any]) -> tuple[float, tuple[int, Any]]:
         key, count = item
-        return (_count_value(count), _stable_key(key))
+        return (-_count_value(count), _stable_key(key))
+
+    items.sort(key=_sort_key)
 
     if n is None:
-        items.sort(key=lambda item: (-_sort_key(item)[0], _sort_key(item)[1]))
         return items
     try:
         n = int(n)
     except Exception:
-        items.sort(key=lambda item: (-_sort_key(item)[0], _sort_key(item)[1]))
         return items
     if n <= 0:
         return []
-    if n >= len(items):
-        items.sort(key=lambda item: (-_sort_key(item)[0], _sort_key(item)[1]))
-        return items[:n]
-    return heapq.nlargest(n, items, key=_sort_key)
+    return items[:n]
 
 
 if os.environ.get("PCAPPER_DETERMINISTIC", "1") != "0":
