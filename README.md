@@ -35,6 +35,18 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
+## Current Release: v1.4.5
+
+Latest additions in this release:
+- TCP stream carving (`--carve`) with signature-based extraction.
+- Obfuscation/tunneling heuristics (`--obfuscation`) for high-entropy and encoded payloads.
+- Cross-PCAP correlation (`--correlate`) for repeated hosts/services.
+- Case provenance metadata (`case.json`) with hashes, timestamps, and analyst attribution.
+- Control-loop validation (`--control-loop`) for Modbus/DNP3 value change behavior.
+- Safety PLC/SIS protocol detection (`--safety`) with Triconex/TriStation heuristics.
+- Baseline snapshot and drift comparison (`--baseline-save`, `--baseline-compare`).
+- Rule-pack evaluation (`--rules`) and IOC enrichment (`--ioc-file`).
+
 ## OT/ICS Command Center
 
 Industrial networks are first-class here: deep protocol coverage, safety-conscious detections, and context that reads like an OT incident timeline instead of a raw packet dump.
@@ -46,6 +58,8 @@ What you get:
 - OT-aware timing/jitter insights for control traffic.
 - Analyst-friendly outputs tuned for plant floors, substations, and mixed IT/OT environments.
 - Control-command visibility for safety/availability impacts (writes, downloads, starts/stops).
+- Control-loop validation on Modbus/DNP3 value changes (rate-of-change, oscillation, outliers).
+- Safety PLC/SIS protocol detection (Triconex/TriStation heuristics).
 - OT/ICS-centric threat and anomaly rollups with evidence lines for fast triage.
 - Device fingerprinting across IT/OT/IoT traffic (vendor/model/OS/firmware/software) for asset-aware triage.
 - Remote-access session visibility (RDP/SSH/WinRM/VNC/TeamViewer/Telnet) with endpoints, timing, and data volume.
@@ -134,6 +148,137 @@ Use `--summarize` to aggregate selected analyses across all resolved target pcap
 - Summarize renders merged rollup output only (no per‑pcap sections).
 - Recursive directory traversal is enabled only with `-r/--recursive`.
 
+## Decryption
+
+Pcapper can drive a tshark-based TLS/SSH decryption workflow when key logs are available.
+
+Example:
+
+```bash
+python -m pcapper capture.pcap --tls --decrypt --tls-keylog ~/sslkeys.log --decrypt-out decrypted/
+```
+
+Notes:
+- `tshark` must be installed and on `PATH`.
+- TLS uses NSS `SSLKEYLOGFILE` format. SSH decryption depends on tshark keylog support.
+
+## Stream Carving
+
+Reassemble TCP streams and carve common file signatures.
+
+```bash
+python -m pcapper capture.pcap --carve --carve-out carved/
+```
+
+## Obfuscation Heuristics
+
+Detect high‑entropy or encoded payloads that may indicate tunneling or obfuscation.
+
+```bash
+python -m pcapper capture.pcap --obfuscation
+```
+
+## Control-Loop Validation
+
+Analyze Modbus/DNP3 value changes for rapid shifts, oscillations, and outliers.
+
+```bash
+python -m pcapper capture.pcap --control-loop
+```
+
+## Safety PLC Detection
+
+Detect safety PLC/SIS protocol traffic (Triconex/TriStation heuristics).
+
+```bash
+python -m pcapper capture.pcap --safety
+```
+
+## Kill-Chain Timeline Tags
+
+Timeline output includes attribution tags and causal links between related events.
+
+```bash
+python -m pcapper capture.pcap --timeline -ip 10.0.0.5
+```
+
+## LOLBAS Recognition
+
+File transfer analysis highlights living-off-the-land binary artifacts when observed.
+
+```bash
+python -m pcapper capture.pcap --files
+```
+
+## Correlation
+
+Correlate repeated hosts/services across multiple pcaps.
+
+```bash
+python -m pcapper captures/*.pcap --correlate --summarize
+```
+
+## Case Metadata
+
+When using `--case-dir`, Pcapper writes `case.json` with analyst info, hashes, timestamps, and CLI options.
+
+## Baselines
+
+Snapshot asset and command baselines, then compare for drift.
+
+```bash
+python -m pcapper capture.pcap --baseline-save baseline.json
+python -m pcapper capture.pcap --baseline-compare baseline.json
+```
+
+## Rules
+
+Apply rule packs to detections.
+
+```bash
+python -m pcapper capture.pcap --rules rules.json
+```
+
+Minimal `rules.json` example:
+
+```json
+[
+  {
+    "id": "OT_CONTROL_WRITE",
+    "title": "OT control writes",
+    "severity": "high",
+    "match": {
+      "all": [
+        {"field": "source", "op": "in", "value": ["ot_commands", "iec104", "modbus", "dnp3", "s7"]}
+      ],
+      "any": [
+        {"field": "summary", "op": "regex", "value": "control|write"},
+        {"field": "details", "op": "regex", "value": "setpoint|operate"}
+      ]
+    }
+  }
+]
+```
+
+## IOC Enrichment
+
+You can provide enriched IOC metadata via JSON.
+
+```json
+{
+  "indicators": [
+    {
+      "value": "1.2.3.4",
+      "type": "ip",
+      "source": "VendorX",
+      "confidence": 80,
+      "mitre": ["TA0011"],
+      "tags": ["c2"]
+    }
+  ]
+}
+```
+
 ## Configuration
 
 Pcapper can load default flag values from a TOML config file. Lookup order:
@@ -201,12 +346,26 @@ python -m pcapper --help
 ### General flags
 
 - `--base`
+- `--baseline-compare PATH`
+- `--baseline-fast`
+- `--baseline-save PATH`
 - `--bpf EXPR`
 - `--case-dir DIR`
 - `--case-name NAME`
+- `--case-id ID`
+- `--case-analyst NAME`
+- `--case-notes TEXT`
 - `-case`
 - `--config PATH`
 - `--csv PATH`
+- `--carve`
+- `--carve-limit N`
+- `--carve-max-bytes N`
+- `--carve-out DIR`
+- `--carve-stream-bytes N`
+- `--decrypt`
+- `--decrypt-limit N`
+- `--decrypt-out DIR`
 - `--export-raw`
 - `--export-redact`
 - `--extract FILENAME`
@@ -225,10 +384,14 @@ python -m pcapper --help
 - `--packet N`
 - `--profile`
 - `--profile-out PATH`
+- `--rules PATH`
 - `-r, --recursive`
 - `--search STRING`
 - `--self-check`
 - `--show-secrets`
+- `--correlate`
+- `--correlate-min N`
+- `--ssh-keylog PATH`
 - `--sqlite PATH`
 - `--streams-full`
 - `-summarize, --summarize`
@@ -237,6 +400,7 @@ python -m pcapper --help
 - `--timeline-bins N`
 - `-categories, --timeline-categories LIST`
 - `--timeline-storyline-off`
+- `--tls-keylog PATH`
 - `-v, --verbose`
 - `-vt, --vt`
 - `--view FILENAME`
@@ -272,6 +436,7 @@ python -m pcapper --help
 - `--nfs`
 - `--ntlm`
 - `--ntp`
+- `--obfuscation`
 - `--opc-classic`
 - `--pcapmeta`
 - `--powershell`
@@ -310,6 +475,7 @@ Count: 58 flags
 - `--bacnet`
 - `--cip`
 - `--coap`
+- `--control-loop`
 - `--crimson`
 - `--csp`
 - `--df1`
@@ -342,11 +508,12 @@ Count: 58 flags
 - `--profinet`
 - `--ptp`
 - `--s7`
+- `--safety`
 - `--srtp`
 - `--sv`
 - `--yokogawa`
 
-Count: 38 flags
+Count: 40 flags
 
 ## Notes
 

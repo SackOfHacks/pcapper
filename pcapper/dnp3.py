@@ -293,9 +293,10 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
     objects: list[dict[str, object]] = []
     details: list[str] = []
     idx = 0
-    def _decode_values(group: int, variation: int, raw: bytes, count: int | None) -> Optional[str]:
+    def _decode_values(group: int, variation: int, raw: bytes, count: int | None) -> tuple[Optional[str], list[object]]:
+        values_out: list[object] = []
         if count is None or count <= 0:
-            return None
+            return None, values_out
 
         # Layout map: (flags_size, value_type, value_size, time_size)
         layout: dict[tuple[int, int], tuple[int, str, int, int]] = {
@@ -367,11 +368,11 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
 
         layout_key = (group, variation)
         if layout_key not in layout:
-            return None
+            return None, values_out
         flags_size, value_type, value_size, time_size = layout[layout_key]
         element_size = flags_size + value_size + time_size
         if element_size <= 0:
-            return None
+            return None, values_out
         max_values = min(count, 4)
         values: list[str] = []
         for i in range(max_values):
@@ -402,12 +403,13 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
                     val = None
             if val is not None:
                 values.append(str(val))
+                values_out.append(val)
         if not values:
-            return None
+            return None, values_out
         suffix = ""
         if count > len(values):
             suffix = f" (+{count - len(values)} more)"
-        return f"[{', '.join(values)}]{suffix}"
+        return f"[{', '.join(values)}]{suffix}", values_out
     while idx + 3 <= len(data):
         group = data[idx]
         variation = data[idx + 1]
@@ -457,10 +459,12 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
             break
         if idx + data_len > len(data):
             break
-        value_preview = _decode_values(group, variation, data[idx:idx + data_len], count)
+        value_preview, values_out = _decode_values(group, variation, data[idx:idx + data_len], count)
         if value_preview:
             summary = f"{summary} values={value_preview}"
             objects[-1]["summary"] = summary
+        if values_out:
+            objects[-1]["values"] = values_out
         idx += data_len
     return objects, details
 
@@ -506,6 +510,7 @@ class Dnp3Analysis:
     object_counts: Counter[str] = field(default_factory=Counter)
     object_group_counts: Counter[str] = field(default_factory=Counter)
     anomalies: List[Dnp3Anomaly] = field(default_factory=list)
+    value_changes: List[dict[str, object]] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     
     @property
@@ -570,6 +575,8 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
     anomalies: List[Dnp3Anomaly] = []
     object_counts: Counter[str] = Counter()
     object_group_counts: Counter[str] = Counter()
+    value_changes: List[dict[str, object]] = []
+    last_values: dict[tuple[int, int, int], object] = {}
     errors: List[str] = []
     max_anomalies = 200
 
@@ -818,6 +825,35 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                             if group_id is not None:
                                 group_name = OBJECT_GROUPS.get(group_id, f"Group {group_id}")
                                 object_group_counts[group_name] += 1
+                        for item in obj_items:
+                            values = item.get("values")
+                            if not values:
+                                continue
+                            group_id = item.get("group")
+                            variation = item.get("variation")
+                            start_index = item.get("start") or 0
+                            if not isinstance(group_id, int) or not isinstance(variation, int):
+                                continue
+                            for offset, value in enumerate(values):
+                                if len(value_changes) >= 200:
+                                    break
+                                index = start_index + offset
+                                key = (group_id, variation, index)
+                                prev = last_values.get(key)
+                                if prev is not None and prev != value:
+                                    value_changes.append(
+                                        {
+                                            "group": group_id,
+                                            "variation": variation,
+                                            "index": index,
+                                            "old": prev,
+                                            "new": value,
+                                            "src": src_ip,
+                                            "dst": dst_ip,
+                                            "ts": ts,
+                                        }
+                                    )
+                                last_values[key] = value
                         if obj_items and func_code in {2, 3, 4, 5, 6}:
                             for item in obj_items:
                                 group_id = item.get("group")
@@ -1007,5 +1043,6 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
         object_counts=object_counts,
         object_group_counts=object_group_counts,
         anomalies=anomalies,
+        value_changes=value_changes,
         errors=errors
     )

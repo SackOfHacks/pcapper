@@ -15,6 +15,7 @@ from .icmp import analyze_icmp
 from .dns import analyze_dns
 from .beacon import analyze_beacons
 from .files import analyze_files
+from .carving import analyze_carving
 from .modbus import analyze_modbus
 from .dnp3 import analyze_dnp3
 from .iec104 import analyze_iec104
@@ -45,6 +46,9 @@ from .hart import analyze_hart
 from .prconos import analyze_prconos
 from .iccp import analyze_iccp
 from .creds import analyze_creds
+from .obfuscation import analyze_obfuscation
+from .control_loop import build_control_loop_summary
+from .safety import SAFETY_PORTS
 from .http import analyze_http
 from .tls import analyze_tls
 from .ldap import analyze_ldap
@@ -124,6 +128,7 @@ OT_PORTS: dict[int, str] = {
     34378: "Yokogawa Vnet/IP",
     34379: "Yokogawa Vnet/IP",
     34380: "Yokogawa Vnet/IP",
+    1502: "Triconex/SIS",
 }
 
 try:
@@ -593,6 +598,15 @@ SUSPICIOUS_PAYLOAD_MARKERS = [
     "wget ",
     "curl ",
     "nc ",
+    "rundll32",
+    "regsvr32",
+    "mshta",
+    "bitsadmin",
+    "wmic",
+    "schtasks",
+    "msiexec",
+    "cscript",
+    "wscript",
 ]
 
 FAILED_AUTH_PATTERNS_BYTES = [pattern.encode("utf-8", errors="ignore") for pattern in FAILED_AUTH_PATTERNS]
@@ -789,6 +803,8 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     dns_summary = analyze_dns(path, show_status=show_status)
     beacon_summary = analyze_beacons(path, show_status=show_status)
     files_summary = analyze_files(path, show_status=show_status)
+    obfuscation_summary = analyze_obfuscation(path, show_status=show_status)
+    carving_summary = analyze_carving(path, show_status=show_status)
     http_summary = analyze_http(path, show_status=show_status)
     creds_summary = analyze_creds(path, show_status=show_status)
     tls_summary = analyze_tls(path, show_status=show_status)
@@ -869,6 +885,15 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
         for err in getattr(summary, "errors", []) or []:
             errors.append(f"{source}: {err}")
 
+    control_loop_summary = build_control_loop_summary(
+        path,
+        {
+            "Modbus": getattr(ot_summaries.get("Modbus"), "value_changes", []) or [],
+            "DNP3": getattr(ot_summaries.get("DNP3"), "value_changes", []) or [],
+        },
+        errors=[],
+    )
+
     for item in icmp_summary.detections:
         detections.append({
             "source": "ICMP",
@@ -917,6 +942,9 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     _append_detection_items(detections, "PTP", ptp_summary.detections)
     _append_detection_items(detections, "LLDP/DCP", lldp_summary.detections)
     _append_detection_items(detections, "OPC Classic", opc_classic_summary.detections)
+    _append_detection_items(detections, "Obfuscation", obfuscation_summary.detections)
+    _append_detection_items(detections, "Carving", carving_summary.detections)
+    _append_detection_items(detections, "ControlLoop", control_loop_summary.detections)
 
     _append_anomaly_items(detections, "NTLM", ntlm_summary.anomalies)
     _append_anomaly_items(detections, "Syslog", syslog_summary.anomalies)
@@ -1020,6 +1048,9 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     errors.extend(ptp_summary.errors)
     errors.extend(lldp_summary.errors)
     errors.extend(opc_classic_summary.errors)
+    errors.extend(obfuscation_summary.errors)
+    errors.extend(carving_summary.errors)
+    errors.extend(control_loop_summary.errors)
 
     smb1_sources: Counter[str] = Counter()
     smb1_destinations: Counter[str] = Counter()
@@ -1171,10 +1202,17 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     auth_attempts: Counter[tuple[str, str, str]] = Counter()
     auth_failures: Counter[tuple[str, str, str]] = Counter()
     lateral_targets: dict[str, set[str]] = defaultdict(set)
+    lateral_service_targets: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
 
     outbound_bytes_public: Counter[tuple[str, str]] = Counter()
     outbound_public_dests_by_src: dict[str, set[str]] = defaultdict(set)
     suspicious_payload_sources: Counter[str] = Counter()
+    command_markers: dict[str, set[str]] = defaultdict(set)
+
+    safety_sources: Counter[str] = Counter()
+    safety_destinations: Counter[str] = Counter()
+    safety_services: Counter[str] = Counter()
+    safety_pairs: set[tuple[str, str]] = set()
 
     dns_tunnel_sources: Counter[str] = Counter()
     dns_txt_query_sources: Counter[str] = Counter()
@@ -1230,6 +1268,9 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             payload_lower = payload_data.lower() if payload_data else b""
             if payload_lower and any(marker in payload_lower for marker in SUSPICIOUS_PAYLOAD_MARKERS_BYTES):
                 counter_inc(suspicious_payload_sources, src_ip)
+                for marker_text, marker_bytes in zip(SUSPICIOUS_PAYLOAD_MARKERS, SUSPICIOUS_PAYLOAD_MARKERS_BYTES):
+                    if marker_bytes in payload_lower:
+                        command_markers[src_ip].add(marker_text)
 
             if DNS is not None and DNSQR is not None and pkt.haslayer(DNS):
                 dns_layer = pkt[DNS]
@@ -1297,6 +1338,14 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
                 lateral_service = LATERAL_PORTS.get(dport)
                 if lateral_service and _is_private_ip(src_ip) and _is_private_ip(dst_ip):
                     setdict_add(lateral_targets, src_ip, dst_ip)
+                    lateral_service_targets[src_ip][lateral_service].add(dst_ip)
+
+                safety_service = SAFETY_PORTS.get(dport) or SAFETY_PORTS.get(sport)
+                if safety_service:
+                    safety_sources[src_ip] += 1
+                    safety_destinations[dst_ip] += 1
+                    safety_services[safety_service] += 1
+                    safety_pairs.add((src_ip, dst_ip))
 
                 if dport in WEB_PORTS and payload_lower.startswith((b"post ", b"put ")):
                     if _is_private_ip(src_ip) and _is_public_ip(dst_ip):
@@ -1338,6 +1387,13 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
                 if dport:
                     counter_inc(udp_target_counts, dst_ip)
                     setdict_add(src_ports, src_ip, dport)
+
+                safety_service = SAFETY_PORTS.get(dport) or SAFETY_PORTS.get(sport)
+                if safety_service:
+                    safety_sources[src_ip] += 1
+                    safety_destinations[dst_ip] += 1
+                    safety_services[safety_service] += 1
+                    safety_pairs.add((src_ip, dst_ip))
 
     finally:
         status.finish()
@@ -1587,6 +1643,78 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             "summary": "Potential lateral movement",
             "details": "Private source(s) reached many internal hosts over admin/lateral protocols (SMB/RDP/WinRM/etc).",
             "top_sources": sorted(lateral_hits, key=lambda item: item[1], reverse=True)[:8],
+        })
+
+    lateral_chain_hits: list[tuple[str, int, int, str]] = []
+    for src, services in lateral_service_targets.items():
+        if not services:
+            continue
+        service_count = len(services)
+        targets: set[str] = set()
+        service_summary: list[str] = []
+        for svc, svc_targets in services.items():
+            targets.update(svc_targets)
+            service_summary.append(f"{svc}({len(svc_targets)})")
+        if service_count >= 2 and len(targets) >= 5:
+            lateral_chain_hits.append((src, service_count, len(targets), ", ".join(sorted(service_summary))))
+    if lateral_chain_hits:
+        top = sorted(lateral_chain_hits, key=lambda item: (item[1], item[2]), reverse=True)[:6]
+        detections.append({
+            "source": "Lateral",
+            "severity": "high" if top and top[0][2] >= 10 else "warning",
+            "summary": "Lateral movement chain indicators",
+            "details": "Sources used multiple lateral protocols across internal targets.",
+            "top_sources": [(src, targets) for src, _svc_count, targets, _ in top],
+            "evidence": [f"{src} services={svc_count} targets={targets} [{svc_detail}]" for src, svc_count, targets, svc_detail in top],
+        })
+
+    if creds_summary.hits:
+        cred_sources: Counter[str] = Counter(hit.src_ip for hit in creds_summary.hits)
+        chain_hits: list[tuple[str, int, int, int]] = []
+        for src, cred_count in cred_sources.items():
+            lateral_count = len(lateral_targets.get(src, set()))
+            auth_count = sum(count for (s, _d, _svc), count in auth_attempts.items() if s == src)
+            if lateral_count >= 3 or auth_count >= 15:
+                chain_hits.append((src, cred_count, lateral_count, auth_count))
+        if chain_hits:
+            top = sorted(chain_hits, key=lambda item: (item[2], item[3], item[1]), reverse=True)[:6]
+            detections.append({
+                "source": "Credential",
+                "severity": "high",
+                "summary": "Credential access chaining indicators",
+                "details": "Credential exposure coincides with lateral movement/auth activity.",
+                "top_sources": [(src, cred_count) for src, cred_count, _lat, _auth in top],
+                "evidence": [
+                    f"{src} creds={cred_count} lateral_targets={lat} auth_attempts={auth}"
+                    for src, cred_count, lat, auth in top
+                ],
+            })
+
+    command_chain_hits = [(src, len(markers)) for src, markers in command_markers.items() if len(markers) >= 3]
+    if command_chain_hits:
+        top = sorted(command_chain_hits, key=lambda item: item[1], reverse=True)[:6]
+        evidence = [
+            f"{src} markers={','.join(sorted(command_markers.get(src, set())))}"
+            for src, _count in top
+        ]
+        detections.append({
+            "source": "Execution",
+            "severity": "warning",
+            "summary": "Command sequence anomalies detected",
+            "details": "Multiple distinct tooling/command markers observed from the same source.",
+            "top_sources": top,
+            "evidence": evidence,
+        })
+
+    if safety_pairs:
+        public_exposed = any(_is_public_ip(src) or _is_public_ip(dst) for src, dst in safety_pairs)
+        detections.append({
+            "source": "Safety",
+            "severity": "high" if public_exposed else "warning",
+            "summary": "Safety PLC/SIS traffic detected",
+            "details": f"{len(safety_pairs)} safety flow(s) observed across {len(safety_services)} service(s).",
+            "top_sources": safety_sources.most_common(6),
+            "top_destinations": safety_destinations.most_common(6),
         })
 
     if udp_target_counts:

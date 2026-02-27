@@ -299,6 +299,7 @@ OT_PORT_PROTOCOLS: dict[int, str] = {
     1217: "CODESYS",
     5683: "CoAP",
     5684: "CoAP",
+    1502: "Triconex/SIS",
 }
 
 for _port in PROFINET_PORTS:
@@ -323,6 +324,7 @@ OT_CATEGORIES = {
     "ProConOS",
     "CODESYS",
     "CoAP",
+    "Triconex/SIS",
 }
 
 NON_OT_CATEGORIES = {
