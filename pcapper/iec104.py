@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import ipaddress
+import struct
 
 from .industrial_helpers import (
     IndustrialAnalysis,
@@ -137,6 +138,35 @@ def _parse_asdu(payload: bytes) -> tuple[list[str], list[tuple[str, str]]]:
         ioa = asdu[6] | (asdu[7] << 8) | (asdu[8] << 16)
         artifacts.append(("iec104_ioa", str(ioa)))
         commands.append(f"IOA {ioa}")
+        if type_id in CONTROL_ASDU_TYPES and len(asdu) >= 10:
+            cmd_byte = asdu[9]
+            select = bool(cmd_byte & 0x80)
+            mode = "SELECT" if select else "EXECUTE"
+            if type_id == 45:
+                state = "ON" if cmd_byte & 0x01 else "OFF"
+                commands.append(f"SC {mode} {state}")
+                artifacts.append(("iec104_command", f"SC {mode} {state} IOA {ioa}"))
+            elif type_id == 46:
+                state_code = cmd_byte & 0x03
+                state = {0: "OFF", 1: "ON", 2: "OFF", 3: "ON"}.get(state_code, f"STATE {state_code}")
+                commands.append(f"DC {mode} {state}")
+                artifacts.append(("iec104_command", f"DC {mode} {state} IOA {ioa}"))
+            elif type_id == 47:
+                state_code = cmd_byte & 0x03
+                commands.append(f"RC {mode} {state_code}")
+                artifacts.append(("iec104_command", f"RC {mode} code={state_code} IOA {ioa}"))
+            elif type_id in {48, 49, 50}:
+                value_text = None
+                if type_id in {48, 49} and len(asdu) >= 12:
+                    value_text = str(int.from_bytes(asdu[9:11], "little", signed=True))
+                if type_id == 50 and len(asdu) >= 14:
+                    try:
+                        value_text = f"{struct.unpack('<f', asdu[9:13])[0]:.3f}"
+                    except Exception:
+                        value_text = None
+                if value_text is not None:
+                    commands.append(f"Setpoint {value_text}")
+                    artifacts.append(("iec104_setpoint", f"IOA {ioa} value={value_text}"))
     return commands, artifacts
 
 

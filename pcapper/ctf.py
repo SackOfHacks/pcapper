@@ -31,6 +31,15 @@ FLAG_PATTERNS = [
     re.compile(r"(picoCTF\{[^}]{4,}\})", re.IGNORECASE),
 ]
 
+FILE_HINT_PATTERNS = [
+    re.compile(r"(flag\\.txt)$", re.IGNORECASE),
+    re.compile(r"(root\\.txt)$", re.IGNORECASE),
+    re.compile(r"(user\\.txt)$", re.IGNORECASE),
+    re.compile(r"(proof\\.txt)$", re.IGNORECASE),
+    re.compile(r"(flag\\b)", re.IGNORECASE),
+    re.compile(r"(ctf\\b)", re.IGNORECASE),
+]
+
 
 @dataclass(frozen=True)
 class CtfHit:
@@ -47,6 +56,7 @@ class CtfSummary:
     hits: list[CtfHit]
     decoded_hits: list[str]
     token_counts: Counter[str]
+    file_hints: list[str]
     errors: list[str]
     first_seen: Optional[float]
     last_seen: Optional[float]
@@ -108,6 +118,7 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
     hits: list[CtfHit] = []
     decoded_hits: list[str] = []
     token_counts: Counter[str] = Counter()
+    file_hints: list[str] = []
     errors: list[str] = []
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -161,6 +172,19 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
         status.finish()
         reader.close()
 
+    try:
+        from .files import analyze_files
+
+        file_summary = analyze_files(path, show_status=False)
+        for art in file_summary.artifacts:
+            name = (art.filename or "").lower()
+            if not name:
+                continue
+            if any(pattern.search(name) for pattern in FILE_HINT_PATTERNS):
+                file_hints.append(f"{art.filename} {art.src_ip}->{art.dst_ip} {art.protocol}")
+    except Exception:
+        pass
+
     duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
     return CtfSummary(
         path=path,
@@ -168,6 +192,7 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
         hits=hits,
         decoded_hits=decoded_hits[:50],
         token_counts=token_counts,
+        file_hints=file_hints,
         errors=errors,
         first_seen=first_seen,
         last_seen=last_seen,

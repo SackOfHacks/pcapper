@@ -63,6 +63,26 @@ S7_USERDATA_FUNCTIONS = {
     (0x0B, 0x01): "ProgramInfo",
 }
 
+AREA_NAMES = {
+    0x81: "I",
+    0x82: "Q",
+    0x83: "M",
+    0x84: "DB",
+    0x85: "DI",
+    0x86: "L",
+    0x87: "V",
+}
+
+TRANSPORT_NAMES = {
+    0x03: "BIT",
+    0x04: "BYTE",
+    0x05: "WORD",
+    0x06: "DWORD",
+    0x07: "INT",
+    0x08: "DINT",
+    0x09: "REAL",
+}
+
 
 def _parse_commands(payload: bytes) -> list[str]:
     if not payload:
@@ -85,6 +105,33 @@ def _parse_commands(payload: bytes) -> list[str]:
                     cmds.append(func_name)
                 else:
                     cmds.append(f"Function 0x{func_code:02x}")
+
+                if func_code in {0x04, 0x05} and param_len >= 2:
+                    item_count = payload[param_start + 1]
+                    item_offset = param_start + 2
+                    for _ in range(item_count):
+                        if item_offset + 12 > len(payload):
+                            break
+                        if payload[item_offset] != 0x12:
+                            break
+                        spec_len = payload[item_offset + 1]
+                        if spec_len < 0x0A:
+                            break
+                        transport = payload[item_offset + 3]
+                        length = int.from_bytes(payload[item_offset + 4:item_offset + 6], "big")
+                        db_num = int.from_bytes(payload[item_offset + 6:item_offset + 8], "big")
+                        area = payload[item_offset + 8]
+                        addr = int.from_bytes(payload[item_offset + 9:item_offset + 12], "big")
+                        byte_offset = addr // 8
+                        bit_offset = addr % 8
+                        area_name = AREA_NAMES.get(area, f"AREA0x{area:02x}")
+                        transport_name = TRANSPORT_NAMES.get(transport, f"T0x{transport:02x}")
+                        if area_name == "DB":
+                            addr_text = f"DB{db_num}.DBX{byte_offset}.{bit_offset}"
+                        else:
+                            addr_text = f"{area_name}{byte_offset}.{bit_offset}"
+                        cmds.append(f"{func_name} {addr_text} len={length} {transport_name}")
+                        item_offset += 12
 
                 if rosctr == 0x07 and param_len >= 8:
                     if param_start + 6 <= len(payload):

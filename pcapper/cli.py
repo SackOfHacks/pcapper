@@ -17,7 +17,16 @@ from .analyzer import analyze_pcap, merge_pcap_summaries
 from .coloring import set_color_override
 from .discovery import find_pcaps, is_supported_pcap
 from .config import find_config, load_config
+from .baseline import build_baseline, compare_baseline, load_baseline
+from .carving import analyze_carving, merge_carve_summaries
+from .control_loop import analyze_control_loop, merge_control_loop_summaries
+from .decryption import DecryptConfig, DecryptSummary, decrypt_tls, decrypt_ssh
+from .correlation import correlate
+from .obfuscation import analyze_obfuscation, merge_obfuscation_summaries
 from .plugins import load_plugins, plugin_map, PluginSpec
+from .rules import Rule, load_rules, collect_detections, apply_rules, merge_rules_summaries
+from .safety import analyze_safety, merge_safety_summaries
+from .provenance import build_case_metadata
 from .reporting import (
     render_summary,
     render_vlan_summary,
@@ -118,6 +127,14 @@ from .reporting import (
     render_ptp_summary,
     render_opc_classic_summary,
     render_streams_summary,
+    render_rules_summary,
+    render_baseline_delta,
+    render_decrypt_summary,
+    render_carve_summary,
+    render_obfuscation_summary,
+    render_control_loop_summary,
+    render_safety_summary,
+    render_correlation_summary,
     render_ctf_summary,
     render_ioc_summary,
     render_ot_commands_summary,
@@ -219,7 +236,7 @@ from .ctf import analyze_ctf
 from .ioc import analyze_iocs
 from .ot_commands import analyze_ot_commands, load_ot_control_config, OtControlConfig
 from .iec101_103 import analyze_iec101_103
-from .utils import parse_time_arg, hexdump
+from .utils import parse_time_arg, hexdump, safe_write_text
 
 _PLUGIN_SPECS: list[PluginSpec] | None = None
 _PLUGIN_ERRORS: list[str] = []
@@ -272,6 +289,8 @@ def _builtin_flag_map() -> dict[str, str]:
         "--vpn": "vpn",
         "--opc-classic": "opc_classic",
         "--streams": "streams",
+        "--carve": "carve",
+        "--obfuscation": "obfuscation",
         "--ctf": "ctf",
         "--ioc": "ioc",
         "--files": "files",
@@ -331,6 +350,8 @@ def _builtin_flag_map() -> dict[str, str]:
         "--pcapmeta": "pcapmeta",
         "--ot-commands": "ot_commands",
         "--ot-commands-fast": "ot_commands",
+        "--control-loop": "control_loop",
+        "--safety": "safety",
         "--iec101-103": "iec101_103",
     }
 
@@ -885,6 +906,52 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Only include packets at/before this time (epoch or ISO 8601).",
     )
     general.add_argument(
+        "--baseline-save",
+        metavar="PATH",
+        help="Write baseline snapshot (hosts/services/OT commands) to PATH (JSON).",
+    )
+    general.add_argument(
+        "--baseline-compare",
+        metavar="PATH",
+        help="Compare current run to baseline snapshot at PATH and report drift.",
+    )
+    general.add_argument(
+        "--baseline-fast",
+        action="store_true",
+        help="Use fast OT command scanning when building a baseline.",
+    )
+    general.add_argument(
+        "--rules",
+        metavar="PATH",
+        help="Apply rule pack (JSON/YAML) to detections.",
+    )
+    general.add_argument(
+        "--tls-keylog",
+        metavar="PATH",
+        help="TLS key log file (NSS SSLKEYLOGFILE) for decryption workflows.",
+    )
+    general.add_argument(
+        "--ssh-keylog",
+        metavar="PATH",
+        help="SSH key log file for decryption workflows (tshark required).",
+    )
+    general.add_argument(
+        "--decrypt",
+        action="store_true",
+        help="Attempt TLS/SSH decryption with tshark and write decrypted streams.",
+    )
+    general.add_argument(
+        "--decrypt-out",
+        metavar="DIR",
+        help="Output directory for decrypted streams (default: ./decrypted or case dir).",
+    )
+    general.add_argument(
+        "--decrypt-limit",
+        type=int,
+        default=50,
+        help="Max decrypted streams per protocol (default: 50).",
+    )
+    general.add_argument(
         "--json",
         metavar="PATH",
         help="Write JSON export of results to PATH.",
@@ -921,6 +988,21 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Optional name for the case package directory.",
     )
     general.add_argument(
+        "--case-id",
+        metavar="ID",
+        help="Optional case identifier for provenance metadata.",
+    )
+    general.add_argument(
+        "--case-analyst",
+        metavar="NAME",
+        help="Analyst name for provenance metadata (or set PCAPPER_ANALYST).",
+    )
+    general.add_argument(
+        "--case-notes",
+        metavar="TEXT",
+        help="Freeform notes stored in case metadata.",
+    )
+    general.add_argument(
         "--follow",
         metavar="FLOW",
         help="Follow a TCP stream (use with --streams). Format: src_ip:src_port->dst_ip:dst_port",
@@ -941,13 +1023,53 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Dump every stream line in stream analysis (not just top 10).",
     )
     general.add_argument(
+        "--carve",
+        action="store_true",
+        help="Enable generic TCP stream reassembly + file signature carving.",
+    )
+    general.add_argument(
+        "--carve-out",
+        metavar="DIR",
+        help="Output directory for carved files (default: ./carved or case dir).",
+    )
+    general.add_argument(
+        "--carve-limit",
+        type=int,
+        default=100,
+        help="Max carved files per run (default: 100).",
+    )
+    general.add_argument(
+        "--carve-max-bytes",
+        type=int,
+        default=2 * 1024 * 1024,
+        help="Max bytes per carved file (default: 2097152).",
+    )
+    general.add_argument(
+        "--carve-stream-bytes",
+        type=int,
+        default=8 * 1024 * 1024,
+        help="Max bytes reassembled per TCP stream (default: 8388608).",
+    )
+    general.add_argument(
         "--ioc-file",
         metavar="PATH",
         help="Path to IOC list file (use with --ioc).",
     )
+    general.add_argument(
+        "--correlate",
+        action="store_true",
+        help="Correlate hosts/services across multiple pcaps (auto-enables --hosts/--services).",
+    )
+    general.add_argument(
+        "--correlate-min",
+        type=int,
+        default=2,
+        help="Minimum pcaps for correlation inclusion (default: 2).",
+    )
 
     it_group = parser.add_argument_group("IT/ENTERPRISE FUNCTIONS")
     it_flags = [
+        ("--obfuscation", "Detect high-entropy or encoded payloads (tunneling/obfuscation heuristics)."),
         ("--arp", "Include ARP analysis (conversations, poisoning signals, anomalies, artifacts)."),
         ("--beacon", "Include beaconing analysis in the output."),
         ("--certificates", "Include TLS certificate extraction and analysis."),
@@ -1018,6 +1140,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--bacnet", "Include BACnet analysis (BVLC functions, endpoints, anomalies)."),
         ("--cip", "Include CIP analysis (object operations)."),
         ("--coap", "Include CoAP analysis (RESTful IoT/ICS)."),
+        ("--control-loop", "Analyze control-loop value changes (rate-of-change, oscillation, outliers)."),
         ("--crimson", "Include Crimson V3 analysis (HMI/tag traffic)."),
         ("--csp", "Include CSP analysis (ControlNet service protocol)."),
         ("--df1", "Include Allen-Bradley DF1 analysis (serial framing)."),
@@ -1042,6 +1165,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--prconos", "Include ProConOS analysis (ProSoft protocol)."),
         ("--profinet", "Include Profinet analysis (RT/PNIO, endpoints, anomalies)."),
         ("--s7", "Include Siemens S7 analysis (TPKT/COTP, jobs, anomalies)."),
+        ("--safety", "Include safety PLC/SIS protocol detection (Triconex/TriStation)."),
         ("--srtp", "Include GE SRTP analysis (PLC communications)."),
         ("--goose", "Include IEC 61850 GOOSE analysis (L2 events)."),
         ("--sv", "Include IEC 61850 Sampled Values analysis (L2)."),
@@ -1163,6 +1287,8 @@ def _analyze_paths(
     show_hart: bool,
     show_prconos: bool,
     show_iccp: bool,
+    show_control_loop: bool,
+    show_safety: bool,
     verbose: bool,
     extract_name: str | None,
     view_name: str | None,
@@ -1189,6 +1315,12 @@ def _analyze_paths(
     follow_stream_id: str | None = None,
     lookup_stream_id: str | None = None,
     streams_full: bool = False,
+    show_carve: bool = False,
+    carve_out: Path | None = None,
+    carve_limit: int = 100,
+    carve_max_bytes: int = 2 * 1024 * 1024,
+    carve_stream_bytes: int = 8 * 1024 * 1024,
+    show_obfuscation: bool = False,
     show_ctf: bool = False,
     show_ioc: bool = False,
     ioc_file: str | None = None,
@@ -1208,6 +1340,12 @@ def _analyze_paths(
     case_dir: Path | None = None,
     log_config: LogConfig | None = None,
     plugins: list[PluginSpec] | None = None,
+    ruleset: list[Rule] | None = None,
+    baseline_save: Path | None = None,
+    baseline_compare: Path | None = None,
+    decrypt_config: DecryptConfig | None = None,
+    correlate_requested: bool = False,
+    correlate_min: int = 2,
 ) -> int:
     if not paths:
         return 1
@@ -1218,6 +1356,14 @@ def _analyze_paths(
     modbus_rollups = []
     dnp3_rollups = []
     rollups: dict[str, list[object]] = {}
+    baseline_requested = bool(baseline_save or baseline_compare)
+    baseline_host_summaries: list[object] = []
+    baseline_service_summaries: list[object] = []
+    baseline_ot_summaries: list[object] = []
+    correlate_host_summaries: list[object] = []
+    correlate_service_summaries: list[object] = []
+    rules_rollups: list[object] = []
+    decrypt_rollups: list[object] = []
     use_packets = len(ordered_steps) > 1 or (render_base_summary and len(ordered_steps) > 0)
     multi_export = len(paths) > 1 and not summarize
     plugin_lookup = plugin_map(plugins or [])
@@ -1294,6 +1440,11 @@ def _analyze_paths(
         out_dir = base
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir / f"{pcap_path.stem}.{suffix}"
+
+    def _resolve_misc_path(path: Path) -> Path:
+        if case_dir and not path.is_absolute():
+            return case_dir / path
+        return path
 
     requested_steps = set(ordered_steps)
 
@@ -1693,6 +1844,10 @@ def _analyze_paths(
                 else:
                     print(render_services_summary(svc_summary))
                 export_summaries["services"] = svc_summary
+                if baseline_requested:
+                    baseline_service_summaries.append(svc_summary)
+                if correlate_requested:
+                    correlate_service_summaries.append(svc_summary)
             elif step == "smb" and show_smb:
                 quic_summary = None
                 if show_quic and "quic" in requested_steps:
@@ -1722,6 +1877,13 @@ def _analyze_paths(
                 else:
                     print(render_strings_summary(strings_summary))
                 export_summaries["strings"] = strings_summary
+            elif step == "obfuscation" and show_obfuscation:
+                ob_summary = analyze_obfuscation(path, show_status=step_status)
+                if summarize_rollups:
+                    rollups.setdefault("obfuscation", []).append(ob_summary)
+                else:
+                    print(render_obfuscation_summary(ob_summary))
+                export_summaries["obfuscation"] = ob_summary
             elif step == "creds" and show_creds:
                 creds_summary = analyze_creds(path, show_status=step_status, packets=packets, meta=meta)
                 if summarize_rollups:
@@ -1780,6 +1942,22 @@ def _analyze_paths(
                 else:
                     print(render_streams_summary(stream_summary))
                 export_summaries["streams"] = stream_summary
+            elif step == "carve" and show_carve:
+                base_dir = _resolve_misc_path(carve_out) if carve_out else ((case_dir / "carved") if case_dir else Path("carved"))
+                out_dir = base_dir / (path.stem if len(paths) > 1 else "")
+                carve_summary = analyze_carving(
+                    path,
+                    show_status=step_status,
+                    output_dir=out_dir,
+                    stream_max_bytes=carve_stream_bytes,
+                    carve_max_bytes=carve_max_bytes,
+                    carve_limit=carve_limit,
+                )
+                if summarize_rollups:
+                    rollups.setdefault("carve", []).append(carve_summary)
+                else:
+                    print(render_carve_summary(carve_summary))
+                export_summaries["carve"] = carve_summary
             elif step == "ctf" and show_ctf:
                 ctf_summary = analyze_ctf(path, show_status=step_status)
                 if summarize_rollups:
@@ -1808,6 +1986,10 @@ def _analyze_paths(
                 else:
                     print(render_hosts_summary(hosts_summary, verbose=verbose))
                 export_summaries["hosts"] = hosts_summary
+                if baseline_requested:
+                    baseline_host_summaries.append(hosts_summary)
+                if correlate_requested:
+                    correlate_host_summaries.append(hosts_summary)
             elif step == "hostname" and show_hostname:
                 hostname_summary = analyze_hostname(path, timeline_ip, show_status=step_status)
                 if summarize_rollups:
@@ -1899,6 +2081,13 @@ def _analyze_paths(
                 else:
                     print(render_dnp3_summary(dnp3_summary))
                 export_summaries["dnp3"] = dnp3_summary
+            elif step == "control_loop" and show_control_loop:
+                control_summary = analyze_control_loop(path, show_status=step_status)
+                if summarize_rollups:
+                    rollups.setdefault("control_loop", []).append(control_summary)
+                else:
+                    print(render_control_loop_summary(control_summary))
+                export_summaries["control_loop"] = control_summary
             elif step == "iec104" and show_iec104:
                 summary = analyze_iec104(path, show_status=step_status)
                 if summarize_rollups:
@@ -2088,6 +2277,13 @@ def _analyze_paths(
                 else:
                     print(render_iccp_summary(summary))
                 export_summaries["iccp"] = summary
+            elif step == "safety" and show_safety:
+                summary = analyze_safety(path, show_status=step_status)
+                if summarize_rollups:
+                    rollups.setdefault("safety", []).append(summary)
+                else:
+                    print(render_safety_summary(summary))
+                export_summaries["safety"] = summary
             elif step == "goose" and show_goose:
                 summary = analyze_goose(path, show_status=step_status)
                 if summarize_rollups:
@@ -2128,6 +2324,8 @@ def _analyze_paths(
                 else:
                     print(render_ot_commands_summary(summary, session_limit=ot_commands_sessions_limit, verbose=verbose))
                 export_summaries["ot_commands"] = summary
+                if baseline_requested:
+                    baseline_ot_summaries.append(summary)
             elif step == "iec101_103" and show_iec101_103:
                 summary = analyze_iec101_103(path, show_status=step_status)
                 if summarize_rollups:
@@ -2145,6 +2343,36 @@ def _analyze_paths(
                 else:
                     print(_render_plugin_summary(spec, summary, verbose=verbose))
                 export_summaries[spec.export_key or spec.name] = summary
+        if ruleset:
+            rules_summary = apply_rules(path, ruleset, collect_detections(export_summaries))
+            if summarize_rollups:
+                rules_rollups.append(rules_summary)
+            else:
+                print(render_rules_summary(rules_summary))
+            export_summaries["rules"] = rules_summary
+
+        if decrypt_config and decrypt_config.enabled:
+            decrypt_summaries = []
+            if decrypt_config.tls_keylog:
+                tls_out_dir = decrypt_config.output_dir / (path.stem if len(paths) > 1 else "")
+                tls_out_dir = tls_out_dir / "tls"
+                decrypt_summaries.append(
+                    decrypt_tls(path, decrypt_config.tls_keylog, tls_out_dir, decrypt_config.limit)
+                )
+            if decrypt_config.ssh_keylog:
+                ssh_out_dir = decrypt_config.output_dir / (path.stem if len(paths) > 1 else "")
+                ssh_out_dir = ssh_out_dir / "ssh"
+                decrypt_summaries.append(
+                    decrypt_ssh(path, decrypt_config.ssh_keylog, ssh_out_dir, decrypt_config.limit)
+                )
+            if decrypt_summaries:
+                if summarize_rollups:
+                    decrypt_rollups.extend(decrypt_summaries)
+                else:
+                    for summary in decrypt_summaries:
+                        print(render_decrypt_summary(summary))
+                export_summaries["decrypt"] = decrypt_summaries
+
         if (export_json_path or export_csv_path or export_sqlite_path) and not summarize_rollups:
             bundle = ExportBundle(path=path, summaries=export_summaries)
             if export_json_path:
@@ -2164,6 +2392,17 @@ def _analyze_paths(
         )
         if idx < len(paths):
             print()
+
+    correlation_summary = None
+    if correlate_requested:
+        if len(paths) > 1:
+            correlation_summary = correlate(
+                correlate_host_summaries,
+                correlate_service_summaries,
+                min_count=max(2, int(correlate_min or 2)),
+            )
+        else:
+            print("Correlation requires multiple pcaps.")
 
     if summarize_rollups:
         if base_rollups:
@@ -2198,6 +2437,10 @@ def _analyze_paths(
             "enip": (merge_enip_summaries, render_enip_summary),
             "cip": (merge_cip_summaries, render_cip_summary),
             "files": (merge_files_summaries, lambda s: render_files_summary(s, verbose=verbose)),
+            "obfuscation": (merge_obfuscation_summaries, render_obfuscation_summary),
+            "carve": (merge_carve_summaries, render_carve_summary),
+            "control_loop": (merge_control_loop_summaries, render_control_loop_summary),
+            "safety": (merge_safety_summaries, render_safety_summary),
         }
         title_map = {
             "search": "SEARCH RESULTS",
@@ -2289,6 +2532,10 @@ def _analyze_paths(
             "streams": "STREAM ANALYSIS",
             "ctf": "CTF ANALYSIS",
             "ioc": "IOC ANALYSIS",
+            "obfuscation": "OBFUSCATION / TUNNELING",
+            "carve": "STREAM CARVING",
+            "control_loop": "CONTROL LOOP ANALYSIS",
+            "safety": "SAFETY SYSTEMS",
             "pcapmeta": "PCAP METADATA",
             "ot_commands": "OT COMMANDS",
             "iec101_103": "IEC 101/103 ANALYSIS",
@@ -2335,6 +2582,10 @@ def _analyze_paths(
                     merged_summaries[spec.export_key or spec.name] = spec.merge(values)
                 else:
                     merged_summaries[key] = values
+            if rules_rollups:
+                merged_summaries["rules"] = merge_rules_summaries(rules_rollups)
+            if correlation_summary:
+                merged_summaries["correlation"] = correlation_summary
             bundle = ExportBundle(path=Path("ALL_PCAPS"), summaries=merged_summaries)
             if export_json_path:
                 export_json(bundle, export_json_path, redact=export_redact)
@@ -2342,6 +2593,62 @@ def _analyze_paths(
                 export_csv(bundle, export_csv_path, redact=export_redact)
             if export_sqlite_path:
                 export_sqlite(bundle, export_sqlite_path, redact=export_redact)
+        if rules_rollups:
+            merged_rules = merge_rules_summaries(rules_rollups)
+            print(render_rules_summary(merged_rules))
+        if decrypt_rollups:
+            merged_by_proto: dict[str, DecryptSummary] = {}
+            for item in decrypt_rollups:
+                proto = getattr(item, "protocol", "UNKNOWN")
+                existing = merged_by_proto.get(proto)
+                if existing is None:
+                    merged_by_proto[proto] = DecryptSummary(
+                        path=Path("ALL_PCAPS"),
+                        protocol=proto,
+                        keylog_path=getattr(item, "keylog_path", None),
+                        output_dir=getattr(item, "output_dir", Path("decrypted")),
+                        stream_count=getattr(item, "stream_count", 0),
+                        outputs=list(getattr(item, "outputs", []) or []),
+                        errors=list(getattr(item, "errors", []) or []),
+                        notes=list(getattr(item, "notes", []) or []),
+                    )
+                else:
+                    merged_by_proto[proto] = DecryptSummary(
+                        path=Path("ALL_PCAPS"),
+                        protocol=proto,
+                        keylog_path=existing.keylog_path,
+                        output_dir=existing.output_dir,
+                        stream_count=existing.stream_count + getattr(item, "stream_count", 0),
+                        outputs=list(existing.outputs) + list(getattr(item, "outputs", []) or []),
+                        errors=list(existing.errors) + list(getattr(item, "errors", []) or []),
+                        notes=list(existing.notes) + list(getattr(item, "notes", []) or []),
+                    )
+            for summary in merged_by_proto.values():
+                print(render_decrypt_summary(summary))
+
+    if correlation_summary:
+        print(render_correlation_summary(correlation_summary, min_count=correlate_min, verbose=verbose))
+
+    if baseline_requested:
+        current_baseline = build_baseline(
+            __version__,
+            [str(item) for item in paths],
+            baseline_host_summaries,
+            baseline_service_summaries,
+            baseline_ot_summaries,
+        )
+        if baseline_save:
+            out_path = _resolve_misc_path(Path(baseline_save).expanduser())
+            safe_write_text(out_path, json.dumps(current_baseline.to_dict(), indent=2), encoding="utf-8", context="baseline save")
+            print(f"Baseline saved to {out_path}")
+        if baseline_compare:
+            compare_path = _resolve_misc_path(Path(baseline_compare).expanduser())
+            try:
+                baseline_loaded = load_baseline(compare_path)
+                delta = compare_baseline(current_baseline, baseline_loaded)
+                print(render_baseline_delta(delta))
+            except Exception as exc:
+                print(f"Baseline compare error: {exc}")
     return 0
 
 
@@ -2357,9 +2664,32 @@ def main() -> int:
     config_path = find_config(getattr(args, "config", None) or os.environ.get("PCAPPER_CONFIG"))
     config_result = load_config(config_path)
     _apply_config_defaults(parser, args, config_result.data, sys.argv[1:])
+    baseline_save = getattr(args, "baseline_save", None)
+    baseline_compare = getattr(args, "baseline_compare", None)
+    baseline_requested = bool(baseline_save or baseline_compare)
+    if baseline_requested:
+        args.hosts = True
+        args.services = True
+        args.ot_commands = True
+        if getattr(args, "baseline_fast", False):
+            args.ot_commands_fast = True
+
+    correlate_requested = bool(getattr(args, "correlate", False))
+    if correlate_requested:
+        args.hosts = True
+        args.services = True
+
+    ruleset: list[Rule] | None = None
+    rules_errors: list[str] = []
+    if getattr(args, "rules", None):
+        ruleset, rules_errors = load_rules(Path(args.rules).expanduser())
     log_config = _build_log_config(args)
     _log_event(log_config, "start", version=__version__, config=str(config_result.path) if config_result.path else "")
     print(_build_banner())
+    if rules_errors:
+        print("Rule load warnings:")
+        for err in rules_errors:
+            print(f"  - {err}")
 
     if getattr(args, "list_plugins", False):
         if plugin_errors:
@@ -2430,6 +2760,18 @@ def main() -> int:
     if args.timeline_bins <= 0:
         print("--timeline-bins must be a positive integer.")
         return 2
+    if getattr(args, "carve_limit", 1) <= 0:
+        print("--carve-limit must be a positive integer.")
+        return 2
+    if getattr(args, "carve_max_bytes", 1) <= 0:
+        print("--carve-max-bytes must be a positive integer.")
+        return 2
+    if getattr(args, "carve_stream_bytes", 1) <= 0:
+        print("--carve-stream-bytes must be a positive integer.")
+        return 2
+    if getattr(args, "correlate_min", 1) <= 0:
+        print("--correlate-min must be a positive integer.")
+        return 2
     if args.profile_out and not args.profile:
         print("--profile-out requires --profile.")
         return 2
@@ -2469,6 +2811,23 @@ def main() -> int:
         if args.case_name:
             safe_name = _sanitize_case_name(args.case_name)
             case_dir = case_dir / safe_name
+
+    decrypt_config: DecryptConfig | None = None
+    if getattr(args, "decrypt", False):
+        tls_keylog = Path(args.tls_keylog).expanduser() if getattr(args, "tls_keylog", None) else None
+        ssh_keylog = Path(args.ssh_keylog).expanduser() if getattr(args, "ssh_keylog", None) else None
+        output_dir = Path(args.decrypt_out).expanduser() if getattr(args, "decrypt_out", None) else None
+        if output_dir is None:
+            output_dir = (case_dir / "decrypted") if case_dir else Path("decrypted")
+        decrypt_config = DecryptConfig(
+            enabled=True,
+            tls_keylog=tls_keylog,
+            ssh_keylog=ssh_keylog,
+            output_dir=output_dir,
+            limit=int(getattr(args, "decrypt_limit", 50) or 50),
+        )
+        if not tls_keylog and not ssh_keylog:
+            print("Decrypt requested but no keylog file provided (--tls-keylog/--ssh-keylog).")
 
     raw_targets = args.target if isinstance(args.target, list) else [args.target]
     paths: list[Path] = []
@@ -2613,6 +2972,8 @@ def main() -> int:
             show_hart=args.hart,
             show_prconos=args.prconos,
             show_iccp=args.iccp,
+            show_control_loop=getattr(args, "control_loop", False),
+            show_safety=getattr(args, "safety", False),
             verbose=args.verbose,
             extract_name=args.extract,
             view_name=args.view,
@@ -2638,6 +2999,12 @@ def main() -> int:
             follow_stream_id=getattr(args, "follow_id", None),
             lookup_stream_id=getattr(args, "lookup_stream_id", None),
             streams_full=getattr(args, "streams_full", False),
+            show_carve=getattr(args, "carve", False),
+            carve_out=Path(args.carve_out).expanduser() if getattr(args, "carve_out", None) else None,
+            carve_limit=getattr(args, "carve_limit", 100),
+            carve_max_bytes=getattr(args, "carve_max_bytes", 2 * 1024 * 1024),
+            carve_stream_bytes=getattr(args, "carve_stream_bytes", 8 * 1024 * 1024),
+            show_obfuscation=getattr(args, "obfuscation", False),
             show_ctf=getattr(args, "ctf", False),
             show_ioc=getattr(args, "ioc", False),
             ioc_file=getattr(args, "ioc_file", None),
@@ -2657,10 +3024,44 @@ def main() -> int:
             case_dir=case_dir,
             log_config=log_config,
             plugins=plugins,
+            ruleset=ruleset,
+            baseline_save=baseline_save,
+            baseline_compare=baseline_compare,
+            decrypt_config=decrypt_config,
+            correlate_requested=getattr(args, "correlate", False),
+            correlate_min=getattr(args, "correlate_min", 2),
         )
 
+    def _write_case_metadata(end_time: datetime) -> None:
+        if not case_dir:
+            return
+        try:
+            case_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        case_id = getattr(args, "case_id", None) or getattr(args, "case_name", None)
+        if not case_id:
+            case_id = end_time.strftime("case-%Y%m%d-%H%M%S")
+        analyst = getattr(args, "case_analyst", None) or os.environ.get("PCAPPER_ANALYST", "")
+        notes = getattr(args, "case_notes", None) or ""
+        metadata = build_case_metadata(
+            case_id=str(case_id),
+            analyst=str(analyst),
+            notes=str(notes),
+            version=__version__,
+            argv=list(sys.argv),
+            config_path=str(config_result.path) if config_result.path else "",
+            inputs=paths,
+            start_time=run_start,
+            end_time=end_time,
+        )
+        safe_write_text(case_dir / "case.json", json.dumps(metadata.to_dict(), indent=2), encoding="utf-8", context="case metadata")
+
+    run_start = datetime.now(timezone.utc)
     if not args.profile:
         result = _run_analysis()
+        run_end = datetime.now(timezone.utc)
+        _write_case_metadata(run_end)
         _log_event(log_config, "end", status="ok" if result == 0 else "fail")
         return result
 
@@ -2682,5 +3083,7 @@ def main() -> int:
             out_path = Path(args.profile_out).expanduser()
             out_path.parent.mkdir(parents=True, exist_ok=True)
             profiler.dump_stats(str(out_path))
+    run_end = datetime.now(timezone.utc)
+    _write_case_metadata(run_end)
     _log_event(log_config, "end", status="ok" if result == 0 else "fail")
     return result

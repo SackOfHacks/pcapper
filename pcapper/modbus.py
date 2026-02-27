@@ -151,6 +151,7 @@ class ModbusAnalysis:
     messages: List[ModbusMessage] = field(default_factory=list)
     artifacts: List[ModbusArtifact] = field(default_factory=list)
     anomalies: List[ModbusAnomaly] = field(default_factory=list)
+    value_changes: List[dict[str, object]] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     
     @property
@@ -264,6 +265,18 @@ def _parse_modbus_request_info(func_code: int, pdu: bytes) -> tuple[Optional[str
             qty = int.from_bytes(pdu[3:5], "big")
             byte_count = pdu[5]
             detail = f"{_format_register_range(reg_type, addr, qty)} qty={qty} bytes={byte_count}"
+            data = pdu[6:6 + byte_count] if len(pdu) >= 6 + byte_count else pdu[6:]
+            if func_code == 15 and data:
+                set_bits = sum(bin(b).count("1") for b in data)
+                detail = f"{detail} set={set_bits}/{qty}"
+            if func_code == 16 and data:
+                values = []
+                for idx in range(0, min(len(data), 12), 2):
+                    if idx + 2 <= len(data):
+                        values.append(int.from_bytes(data[idx:idx + 2], "big"))
+                if values:
+                    preview = ", ".join(str(v) for v in values[:6])
+                    detail = f"{detail} values=[{preview}]"
             return detail, reg_type, addr, qty
         if func_code == 22 and len(pdu) >= 7:
             addr = int.from_bytes(pdu[1:3], "big")
@@ -459,6 +472,8 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     asset_write_targets: Dict[Tuple[str, int], Set[str]] = defaultdict(set)
     asset_write_counts: Counter[Tuple[str, int]] = Counter()
     write_target_anoms_seen: Set[str] = set()
+    last_values: Dict[Tuple[str, int, str, int], int] = {}
+    value_changes: List[dict[str, object]] = []
 
     try:
         with status as pbar:
@@ -638,6 +653,16 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                 src_write_requests[src_ip] += 1
                                 if request_detail:
                                     write_details[(func_name, unit_id, src_ip, dst_ip)] = request_detail
+                                    artifact_key = f"write:{func_name}:{request_detail}:{src_ip}:{dst_ip}"
+                                    if artifact_key not in seen_artifacts and len(artifacts) < 200:
+                                        seen_artifacts.add(artifact_key)
+                                        artifacts.append(ModbusArtifact(
+                                            kind="write",
+                                            detail=f"{func_name} {request_detail}",
+                                            src=src_ip,
+                                            dst=dst_ip,
+                                            ts=ts or 0.0,
+                                        ))
                                 asset_key = (dst_ip, unit_id)
                                 asset_write_counts[asset_key] += 1
                                 target = _format_register_range(reg_type, addr, qty)
@@ -658,6 +683,98 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                                         ts=ts or 0.0,
                                                     )
                                                 )
+                                if reg_type and addr is not None:
+                                    max_values = 8
+                                    if original_func in {5, 6} and len(pdu) >= 5:
+                                        value = int.from_bytes(pdu[3:5], "big")
+                                        key = (dst_ip, unit_id, reg_type, addr)
+                                        prev = last_values.get(key)
+                                        if prev is not None and prev != value and len(value_changes) < 200:
+                                            value_changes.append(
+                                                {
+                                                    "target": f"{dst_ip} Unit {unit_id} {reg_type}[{addr}]",
+                                                    "old": prev,
+                                                    "new": value,
+                                                    "src": src_ip,
+                                                    "dst": dst_ip,
+                                                    "ts": ts,
+                                                    "func": func_name,
+                                                }
+                                            )
+                                        last_values[key] = value
+                                    elif original_func in {15, 16} and len(pdu) >= 6:
+                                        byte_count = pdu[5]
+                                        data = pdu[6:6 + byte_count]
+                                        if reg_type == "coil":
+                                            total = int(qty or 0)
+                                            for bit_index in range(min(total, max_values)):
+                                                byte_idx = bit_index // 8
+                                                bit_off = bit_index % 8
+                                                if byte_idx >= len(data):
+                                                    break
+                                                value = 1 if (data[byte_idx] >> bit_off) & 1 else 0
+                                                target_idx = addr + bit_index
+                                                key = (dst_ip, unit_id, reg_type, target_idx)
+                                                prev = last_values.get(key)
+                                                if prev is not None and prev != value and len(value_changes) < 200:
+                                                    value_changes.append(
+                                                        {
+                                                            "target": f"{dst_ip} Unit {unit_id} {reg_type}[{target_idx}]",
+                                                            "old": prev,
+                                                            "new": value,
+                                                            "src": src_ip,
+                                                            "dst": dst_ip,
+                                                            "ts": ts,
+                                                            "func": func_name,
+                                                        }
+                                                    )
+                                                last_values[key] = value
+                                    elif original_func == 23 and len(pdu) >= 10:
+                                        byte_count = pdu[9]
+                                        data = pdu[10:10 + byte_count]
+                                        for idx in range(min(int(qty or 0), max_values)):
+                                            start = idx * 2
+                                            if start + 2 > len(data):
+                                                break
+                                            value = int.from_bytes(data[start:start + 2], "big")
+                                            target_idx = addr + idx
+                                            key = (dst_ip, unit_id, reg_type, target_idx)
+                                            prev = last_values.get(key)
+                                            if prev is not None and prev != value and len(value_changes) < 200:
+                                                value_changes.append(
+                                                    {
+                                                        "target": f"{dst_ip} Unit {unit_id} {reg_type}[{target_idx}]",
+                                                        "old": prev,
+                                                        "new": value,
+                                                        "src": src_ip,
+                                                        "dst": dst_ip,
+                                                        "ts": ts,
+                                                        "func": func_name,
+                                                    }
+                                                )
+                                            last_values[key] = value
+                                        else:
+                                            for idx in range(min(int(qty or 0), max_values)):
+                                                start = idx * 2
+                                                if start + 2 > len(data):
+                                                    break
+                                                value = int.from_bytes(data[start:start + 2], "big")
+                                                target_idx = addr + idx
+                                                key = (dst_ip, unit_id, reg_type, target_idx)
+                                                prev = last_values.get(key)
+                                                if prev is not None and prev != value and len(value_changes) < 200:
+                                                    value_changes.append(
+                                                        {
+                                                            "target": f"{dst_ip} Unit {unit_id} {reg_type}[{target_idx}]",
+                                                            "old": prev,
+                                                            "new": value,
+                                                            "src": src_ip,
+                                                            "dst": dst_ip,
+                                                            "ts": ts,
+                                                            "func": func_name,
+                                                        }
+                                                    )
+                                                last_values[key] = value
 
                             # Diagnostic functions can be risky
                             if original_func in DIAGNOSTIC_FUNCTIONS:
@@ -1018,5 +1135,6 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
         messages=messages,
         artifacts=artifacts,
         anomalies=anomalies,
+        value_changes=value_changes,
         errors=errors
     )

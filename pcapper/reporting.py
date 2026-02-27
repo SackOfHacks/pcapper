@@ -307,7 +307,7 @@ def _filtered_detections(summary, verbose: bool) -> list[dict[str, object]]:
         filtered = []
         for item in detections:
             severity = str(item.get("severity") or "info").lower()
-            if severity in {"warning", "warn", "medium", "info", "informational"}:
+            if severity in {"info", "informational"}:
                 continue
             filtered.append(item)
         detections = filtered
@@ -7061,6 +7061,15 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
         if verbose:
             lines.append(SUBSECTION_BAR)
             lines.append(header("Tactic Mapping (Hunt View)"))
+            mitre_map = {
+                "Reconnaissance": "TA0043",
+                "Credential Access": "TA0006",
+                "Lateral Movement": "TA0008",
+                "Command & Control": "TA0011",
+                "Exfiltration": "TA0010",
+                "Execution": "TA0002",
+                "Impact": "TA0040",
+            }
             tactic_counts: Counter[str] = Counter()
             tactic_examples: dict[str, list[str]] = {}
             for item in detections:
@@ -7071,7 +7080,11 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
                     tactic_examples[tactic].append(str(item.get("summary", "")))
 
             for tactic, count in tactic_counts.most_common():
-                lines.append(f"- {label(tactic)}: {count}")
+                tactic_label = label(tactic)
+                mitre = mitre_map.get(tactic)
+                if mitre:
+                    tactic_label = f"{tactic_label} ({mitre})"
+                lines.append(f"- {tactic_label}: {count}")
                 examples = [value for value in tactic_examples.get(tactic, []) if value]
                 if examples:
                     lines.append(muted(f"  Examples: {'; '.join(examples)}"))
@@ -9760,6 +9773,60 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
                 tokens[idx] = token.replace(stripped, ok(stripped))
         return " ".join(tokens)
 
+    def _extract_ips(text: str) -> list[str]:
+        candidates: list[str] = []
+        for token in re.split(r"[\s,;()\[\]{}<>]", text):
+            if not token:
+                continue
+            value = token.strip(".,;:|")
+            if ":" in value and not value.startswith("[") and value.count(":") == 1:
+                host_part, port_part = value.rsplit(":", 1)
+                if port_part.isdigit():
+                    value = host_part
+            value = value.strip("[]")
+            try:
+                ipaddress.ip_address(value)
+            except Exception:
+                continue
+            candidates.append(value)
+        return candidates
+
+    def _event_tags(item: TimelineEvent) -> list[str]:
+        text = f"{item.category} {item.summary} {item.details}".lower()
+        tags: list[str] = []
+        if any(token in text for token in ("scan", "recon", "probe", "enumeration", "icmp", "arp", "nbns", "mdns")):
+            tags.append("Recon")
+        if any(token in text for token in ("dns", "hostname", "domain", "netbios", "whoami", "ipconfig")):
+            tags.append("Discovery")
+        if any(token in text for token in ("auth", "login", "credential", "ntlm", "kerberos", "password")):
+            tags.append("Credential")
+        if any(token in text for token in ("smb", "rdp", "winrm", "wmic", "ssh", "rpc", "lateral", "pivot")):
+            tags.append("Lateral")
+        if any(token in text for token in ("powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "bitsadmin", "wmic", "schtasks", "msiexec")):
+            tags.append("Execution")
+            tags.append("LOLBAS")
+        if any(token in text for token in ("beacon", "c2", "command and control")):
+            tags.append("C2")
+        if any(token in text for token in ("exfil", "tunnel", "dns txt", "http post", "upload")):
+            tags.append("Exfil")
+        if any(token in text for token in ("write", "setpoint", "operate", "trip", "shutdown", "stop", "start")) and item.category in {"Modbus", "DNP3", "IEC-104", "S7", "CIP", "ENIP", "BACnet", "OPC UA", "PROFINET", "Triconex/SIS"}:
+            tags.append("OT Control")
+        if any(token in text for token in ("dos", "flood", "impact", "disruption")):
+            tags.append("Impact")
+        if any(token in text for token in (".exe", ".dll", ".ps1", ".vbs", ".bat", ".scr", ".js")):
+            tags.append("Payload")
+        if not tags:
+            return []
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for tag in tags:
+            if tag in seen:
+                continue
+            seen.add(tag)
+            ordered.append(tag)
+        return ordered[:3]
+
     if summary.dns_queries:
         lines.append(SUBSECTION_BAR)
         lines.append(header("DNS Queries Performed"))
@@ -9802,14 +9869,38 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
     lines.append(SUBSECTION_BAR)
     lines.append(header("Activity Timeline"))
     lines.append(muted("Time | Category | Summary | Details"))
+    tag_counts: Counter[str] = Counter()
+    last_event_by_actor: dict[str, tuple[float, str, str]] = {}
     for event in summary.events[:event_limit]:
         severity = _severity_for_event(event)
         summary_text = event.summary
+        tags = _event_tags(event)
+        for tag in tags:
+            tag_counts[tag] += 1
+        if tags:
+            summary_text = f"[{'] ['.join(tags)}] {summary_text}"
         if severity == "malicious":
-            summary_text = danger(event.summary)
+            summary_text = danger(summary_text)
         elif severity == "suspicious":
-            summary_text = warn(event.summary)
+            summary_text = warn(summary_text)
         details_text = _highlight_ips(_redact_in_text(event.details), summary.target_ip)
+        actor_ip = None
+        if event.ts is not None:
+            ips = _extract_ips(event.details)
+            if ips:
+                if summary.target_ip in ips and len(ips) > 1:
+                    actor_ip = next((ip for ip in ips if ip != summary.target_ip), None)
+                else:
+                    actor_ip = ips[0]
+            if actor_ip:
+                prev = last_event_by_actor.get(actor_ip)
+                if prev:
+                    prev_ts, prev_cat, prev_summary = prev
+                    dt = float(event.ts) - float(prev_ts)
+                    if 0 <= dt <= 600:
+                        link = f"linked to {prev_cat}: {_truncate_text(prev_summary, max_len=48)} (+{dt:.0f}s)"
+                        details_text = f"{details_text} | {link}"
+                last_event_by_actor[actor_ip] = (float(event.ts), event.category, event.summary)
         lines.append(f"{format_ts(event.ts)} | {event.category} | {summary_text} | {details_text}")
 
     if summary.category_counts:
@@ -9820,6 +9911,12 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
             categories = categories[:_limit_value(12)]
         for name, count in categories:
             lines.append(muted(f"- {name}: {count}"))
+
+    if tag_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Kill-Chain Tags"))
+        for tag, count in tag_counts.most_common():
+            lines.append(muted(f"- {tag}: {count}"))
 
     if summary.ot_protocol_counts:
         lines.append(SUBSECTION_BAR)
@@ -10918,6 +11015,22 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
                 rows.append([exc, str(count)])
             lines.append(_format_table(rows))
 
+    if getattr(summary, "value_changes", None):
+        if summary.value_changes:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Write Value Changes (Preview)"))
+            rows = [["Target", "Old", "New", "Src", "Dst", "TS"]]
+            for item in summary.value_changes[:_limit_value(8)]:
+                rows.append([
+                    str(item.get("target", "")),
+                    str(item.get("old", "")),
+                    str(item.get("new", "")),
+                    str(item.get("src", "")),
+                    str(item.get("dst", "")),
+                    format_ts(item.get("ts")),
+                ])
+            lines.append(_format_table(rows))
+
     # 5. Anomalies
     if summary.anomalies:
         lines.append(SUBSECTION_BAR)
@@ -11209,6 +11322,7 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
     Render DNP3 analysis results.
     """
     from .dnp3 import Dnp3Analysis
+    from .utils import format_ts
 
     if not summary:
         return ""
@@ -11246,6 +11360,26 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Object Variations"))
         lines.append(_format_kv("Objects", _format_counter(summary.object_counts, 6)))
+
+    if getattr(summary, "value_changes", None):
+        if summary.value_changes:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Value Changes (Preview)"))
+            rows = [["Point", "Old", "New", "Src", "Dst", "TS"]]
+            for item in summary.value_changes[:_limit_value(8)]:
+                group = item.get("group")
+                variation = item.get("variation")
+                index = item.get("index")
+                label = f"{group}.{variation}[{index}]"
+                rows.append([
+                    label,
+                    str(item.get("old", "")),
+                    str(item.get("new", "")),
+                    str(item.get("src", "")),
+                    str(item.get("dst", "")),
+                    format_ts(item.get("ts")),
+                ])
+            lines.append(_format_table(rows))
 
     # 3. Addresses
     lines.append(SUBSECTION_BAR)
@@ -12706,6 +12840,9 @@ def render_ctf_summary(summary: CtfSummary) -> str:
         lines.append(_format_kv("Top Tokens", _format_counter(summary.token_counts, 6)))
     if summary.decoded_hits:
         lines.append(_format_kv("Decoded Hits", "; ".join(summary.decoded_hits[:_limit_value(5)])))
+    if getattr(summary, "file_hints", None):
+        if summary.file_hints:
+            lines.append(_format_kv("File Hints", "; ".join(summary.file_hints[:_limit_value(5)])))
     return _finalize_output(lines)
 
 
@@ -12714,6 +12851,285 @@ def render_ioc_summary(summary: IocSummary) -> str:
     lines.append(_format_kv("IP Hits", _format_counter(summary.ip_hits, 6)))
     lines.append(_format_kv("Domain Hits", _format_counter(summary.domain_hits, 6)))
     lines.append(_format_kv("Hash Hits", _format_counter(summary.hash_hits, 6)))
+    if getattr(summary, "source_counts", None):
+        if summary.source_counts:
+            lines.append(_format_kv("Sources", _format_counter(summary.source_counts, 6)))
+    if getattr(summary, "tag_counts", None):
+        if summary.tag_counts:
+            lines.append(_format_kv("Tags", _format_counter(summary.tag_counts, 6)))
+    if getattr(summary, "mitre_counts", None):
+        if summary.mitre_counts:
+            lines.append(_format_kv("MITRE", _format_counter(summary.mitre_counts, 6)))
+    if getattr(summary, "avg_confidence", None) is not None:
+        lines.append(_format_kv("Avg Confidence", f"{summary.avg_confidence:.1f}"))
+    return _finalize_output(lines)
+
+
+def render_obfuscation_summary(summary) -> str:
+    from .obfuscation import ObfuscationSummary
+
+    if not summary:
+        return ""
+    lines = [header("OBFUSCATION / TUNNELING")]
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("Payload Bytes", str(summary.total_payload_bytes)))
+    lines.append(_format_kv("High Entropy Hits", str(len(summary.high_entropy_hits))))
+    lines.append(_format_kv("Base64 Hits", str(len(summary.base64_hits))))
+    lines.append(_format_kv("Hex Hits", str(len(summary.hex_hits))))
+    if summary.source_counts:
+        lines.append(_format_kv("Top Sources", _format_counter(summary.source_counts, 6)))
+    if summary.destination_counts:
+        lines.append(_format_kv("Top Destinations", _format_counter(summary.destination_counts, 6)))
+    if summary.high_entropy_hits:
+        lines.append(header("High-Entropy Samples"))
+        rows = [["Src", "Dst", "Len", "Entropy"]]
+        for hit in summary.high_entropy_hits[:_limit_value(6)]:
+            rows.append([hit.src, hit.dst, str(hit.length), f"{hit.entropy:.2f}"])
+        lines.append(_format_table(rows))
+    if summary.base64_hits:
+        lines.append(header("Base64 Samples"))
+        for hit in summary.base64_hits[:_limit_value(4)]:
+            lines.append(muted(f"{hit.src}:{hit.src_port} -> {hit.dst}:{hit.dst_port} len={hit.length} sample={hit.sample}"))
+    if summary.hex_hits:
+        lines.append(header("Hex Samples"))
+        for hit in summary.hex_hits[:_limit_value(4)]:
+            lines.append(muted(f"{hit.src}:{hit.src_port} -> {hit.dst}:{hit.dst_port} len={hit.length} sample={hit.sample}"))
+    return _finalize_output(lines)
+
+
+def render_control_loop_summary(summary) -> str:
+    from .control_loop import ControlLoopSummary
+
+    if not summary:
+        return ""
+    lines = [header("CONTROL LOOP ANALYSIS")]
+    lines.append(_format_kv("Value Changes", str(summary.total_changes)))
+    lines.append(_format_kv("Targets", str(summary.total_targets)))
+    if summary.kind_counts:
+        lines.append(_format_kv("Findings", _format_counter(summary.kind_counts, 6)))
+    if summary.source_counts:
+        lines.append(_format_kv("Top Sources", _format_counter(summary.source_counts, 6)))
+    if summary.destination_counts:
+        lines.append(_format_kv("Top Destinations", _format_counter(summary.destination_counts, 6)))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
+    if summary.findings:
+        rows = [["Proto", "Target", "Kind", "Delta", "Src", "Dst"]]
+        for item in summary.findings[:_limit_value(10)]:
+            delta = item.delta
+            delta_text = f"{delta:.1f}" if isinstance(delta, (int, float)) else "-"
+            rows.append([
+                item.protocol,
+                item.target,
+                item.kind,
+                delta_text,
+                item.src or "-",
+                item.dst or "-",
+            ])
+        lines.append(_format_table(rows))
+    return _finalize_output(lines)
+
+
+def render_safety_summary(summary) -> str:
+    from .safety import SafetySummary
+
+    if not summary:
+        return ""
+    lines = [header("SAFETY SYSTEMS")]
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("Hits", str(len(summary.hits))))
+    if summary.service_counts:
+        lines.append(_format_kv("Services", _format_counter(summary.service_counts, 6)))
+    if summary.source_counts:
+        lines.append(_format_kv("Top Sources", _format_counter(summary.source_counts, 6)))
+    if summary.destination_counts:
+        lines.append(_format_kv("Top Destinations", _format_counter(summary.destination_counts, 6)))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
+    if summary.hits:
+        rows = [["Proto", "Service", "Src", "Dst"]]
+        for hit in summary.hits[:_limit_value(10)]:
+            rows.append([
+                hit.protocol,
+                hit.service,
+                f"{hit.src}:{hit.src_port}",
+                f"{hit.dst}:{hit.dst_port}",
+            ])
+        lines.append(_format_table(rows))
+    return _finalize_output(lines)
+
+
+def render_carve_summary(summary) -> str:
+    from .carving import CarveSummary
+
+    if not summary:
+        return ""
+    lines = [header("STREAM CARVING")]
+    lines.append(_format_kv("Streams", str(summary.total_streams)))
+    lines.append(_format_kv("Hits", str(summary.total_hits)))
+    if summary.extracted:
+        lines.append(_format_kv("Extracted", str(len(summary.extracted))))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
+    if summary.hits:
+        rows = [["Stream", "Dir", "Type", "Len", "Src", "Dst"]]
+        for hit in summary.hits[:_limit_value(10)]:
+            rows.append([
+                hit.stream_id,
+                hit.direction,
+                hit.file_type,
+                str(hit.length),
+                f"{hit.src}:{hit.src_port}",
+                f"{hit.dst}:{hit.dst_port}",
+            ])
+        lines.append(_format_table(rows))
+    return _finalize_output(lines)
+
+
+def render_correlation_summary(summary, min_count: int = 2, verbose: bool = False) -> str:
+    from .correlation import CorrelationSummary
+
+    if not summary:
+        return ""
+    lines = [header("CORRELATION (MULTI-PCAP)")]
+    lines.append(_format_kv("PCAPs", str(summary.total_pcaps)))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
+    if summary.host_counts:
+        lines.append(_format_kv("Hosts Seen", str(len(summary.host_counts))))
+        rows = [["Host", "PCAPs"]]
+        for ip, count in summary.host_counts.most_common(_limit_value(10)):
+            if count < min_count:
+                continue
+            rows.append([ip, str(count)])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+    if summary.service_counts:
+        rows = [["Service", "PCAPs"]]
+        for svc, count in summary.service_counts.most_common(_limit_value(10)):
+            if count < min_count:
+                continue
+            rows.append([svc, str(count)])
+        if len(rows) > 1:
+            lines.append(header("Repeated Services"))
+            lines.append(_format_table(rows))
+    if verbose:
+        if summary.host_presence:
+            lines.append(header("Host Presence"))
+            for ip, pcaps in list(summary.host_presence.items())[:_limit_value(6)]:
+                lines.append(muted(f"{ip}: {', '.join(pcaps)}"))
+    return _finalize_output(lines)
+
+
+def render_rules_summary(summary) -> str:
+    from .rules import RulesSummary
+
+    if not summary:
+        return ""
+    lines = [header("RULES ANALYSIS")]
+    lines.append(_format_kv("Rules Loaded", str(summary.total_rules)))
+    lines.append(_format_kv("Matches", str(summary.total_matches)))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
+    if summary.hits:
+        lines.append(header("Rule Hits"))
+        rows = [["Rule", "Severity", "Count", "Sources"]]
+        for hit in summary.hits[:_limit_value(10)]:
+            sources = ", ".join(hit.sources) if hit.sources else "-"
+            rows.append([hit.title, hit.severity.upper(), str(hit.count), sources])
+        lines.append(_format_table(rows))
+        for hit in summary.hits[:_limit_value(5)]:
+            if hit.examples:
+                lines.append(muted(f"{hit.title} examples:"))
+                for example in hit.examples[:_limit_value(3)]:
+                    lines.append(muted(f"  {example}"))
+    return _finalize_output(lines)
+
+
+def render_baseline_delta(delta) -> str:
+    from .baseline import BaselineDelta
+
+    if not delta:
+        return ""
+    lines = [header("BASELINE DRIFT")]
+    lines.append(_format_kv("Baseline Version", delta.baseline_version or "-"))
+    lines.append(_format_kv("Current Version", delta.current_version or "-"))
+    if delta.notes:
+        lines.append(_format_kv("Notes", "; ".join(delta.notes)))
+    lines.append(_format_kv("New Hosts", str(len(delta.new_hosts))))
+    lines.append(_format_kv("Missing Hosts", str(len(delta.missing_hosts))))
+    lines.append(_format_kv("Host Changes", str(len(delta.host_changes))))
+    lines.append(_format_kv("New Services", str(len(delta.new_services))))
+    lines.append(_format_kv("Missing Services", str(len(delta.missing_services))))
+    lines.append(_format_kv("Service Changes", str(len(delta.service_changes))))
+    lines.append(_format_kv("New OT Commands", str(len(delta.new_ot_commands))))
+    lines.append(_format_kv("Missing OT Commands", str(len(delta.missing_ot_commands))))
+    lines.append(_format_kv("OT Command Changes", str(len(delta.ot_command_changes))))
+    lines.append(_format_kv("New Control Targets", str(len(delta.new_control_targets))))
+    lines.append(_format_kv("Missing Control Targets", str(len(delta.missing_control_targets))))
+
+    if delta.new_hosts:
+        lines.append(header("New Hosts"))
+        lines.append(muted(", ".join(delta.new_hosts[:_limit_value(10)])))
+    if delta.missing_hosts:
+        lines.append(header("Missing Hosts"))
+        lines.append(muted(", ".join(delta.missing_hosts[:_limit_value(10)])))
+    if delta.host_changes:
+        lines.append(header("Host Changes"))
+        rows = [["Host", "Change"]]
+        for item in delta.host_changes[:_limit_value(8)]:
+            ip = item.get("ip", "")
+            changes = []
+            if item.get("new_hostnames"):
+                changes.append(f"new_hostnames={len(item.get('new_hostnames'))}")
+            if item.get("missing_hostnames"):
+                changes.append(f"missing_hostnames={len(item.get('missing_hostnames'))}")
+            if item.get("new_ports"):
+                changes.append(f"new_ports={len(item.get('new_ports'))}")
+            if item.get("missing_ports"):
+                changes.append(f"missing_ports={len(item.get('missing_ports'))}")
+            if item.get("os_change"):
+                changes.append("os_change")
+            rows.append([str(ip), ", ".join(changes)])
+        lines.append(_format_table(rows))
+    if delta.service_changes:
+        lines.append(header("Service Changes"))
+        rows = [["Service", "Change"]]
+        for item in delta.service_changes[:_limit_value(8)]:
+            label = f"{item.get('ip')}:{item.get('port')}/{item.get('protocol')}"
+            change = f"{item.get('from_service')} -> {item.get('to_service')}"
+            if item.get("from_software") or item.get("to_software"):
+                change = f"{change} ({item.get('from_software')} -> {item.get('to_software')})"
+            rows.append([label, change])
+        lines.append(_format_table(rows))
+    if delta.ot_command_changes:
+        lines.append(header("OT Command Drift"))
+        rows = [["Command", "Baseline", "Current", "Delta"]]
+        for item in delta.ot_command_changes[:_limit_value(8)]:
+            rows.append([
+                str(item.get("command", "")),
+                str(item.get("baseline", "")),
+                str(item.get("current", "")),
+                str(item.get("delta", "")),
+            ])
+        lines.append(_format_table(rows))
+    return _finalize_output(lines)
+
+
+def render_decrypt_summary(summary) -> str:
+    from .decryption import DecryptSummary
+
+    if not summary:
+        return ""
+    lines = [header(f"{summary.protocol} DECRYPTION")]
+    lines.append(_format_kv("Streams", str(summary.stream_count)))
+    lines.append(_format_kv("Output Dir", str(summary.output_dir)))
+    if summary.outputs:
+        lines.append(_format_kv("Outputs", str(len(summary.outputs))))
+    if summary.notes:
+        lines.append(_format_kv("Notes", "; ".join(summary.notes)))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
     return _finalize_output(lines)
 
 

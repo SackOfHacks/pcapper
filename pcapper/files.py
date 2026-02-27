@@ -168,6 +168,26 @@ WINDOWS_RESERVED_NAMES = {
 }
 
 MAX_FILENAME_LENGTH = 200
+
+LOLBAS_BINARIES = {
+    "bitsadmin.exe",
+    "certutil.exe",
+    "cmd.exe",
+    "cscript.exe",
+    "msbuild.exe",
+    "mshta.exe",
+    "msiexec.exe",
+    "net.exe",
+    "net1.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "regsvr32.exe",
+    "rundll32.exe",
+    "schtasks.exe",
+    "svchost.exe",
+    "wmic.exe",
+    "wscript.exe",
+}
 try:
     MAX_DECOMPRESSED_BYTES = int(os.environ.get("PCAPPER_MAX_DECOMPRESSED_BYTES", str(10 * 1024 * 1024)))
 except Exception:
@@ -244,6 +264,23 @@ def _extension_mismatch(filename: str, file_type: str) -> Optional[tuple[str, se
     if ext in expected:
         return None
     return ext, expected
+
+
+def _normalize_basename(name: str) -> str:
+    base = Path(name).name
+    base = base.split("?", 1)[0].split("#", 1)[0]
+    return base.strip().lower()
+
+
+def _is_lolbas_filename(name: str) -> bool:
+    base = _normalize_basename(name)
+    if not base:
+        return False
+    if base in LOLBAS_BINARIES:
+        return True
+    if f"{base}.exe" in LOLBAS_BINARIES:
+        return True
+    return False
 
 def _normalize_filename(name: str) -> str:
     try:
@@ -2514,6 +2551,14 @@ def _collect_extension_mismatches(artifacts: List[FileArtifact]) -> List[Tuple[s
     return mismatches
 
 
+def _collect_lolbas_hits(artifacts: List[FileArtifact]) -> List[FileArtifact]:
+    hits: List[FileArtifact] = []
+    for art in artifacts:
+        if _is_lolbas_filename(art.filename):
+            hits.append(art)
+    return hits
+
+
 # --- Entry Point ---
 
 def analyze_files(
@@ -2554,6 +2599,25 @@ def analyze_files(
                 "details": f"{len(mismatches)} file(s) where extension does not match detected type. Examples: {examples}",
                 "source": "Files",
             })
+        lolbas_hits = _collect_lolbas_hits(artifacts)
+        if lolbas_hits:
+            tool_counts = Counter(_normalize_basename(hit.filename) for hit in lolbas_hits)
+            src_counts = Counter(hit.src_ip for hit in lolbas_hits if hit.src_ip)
+            dst_counts = Counter(hit.dst_ip for hit in lolbas_hits if hit.dst_ip)
+            evidence = [
+                f"{_normalize_basename(hit.filename)} {hit.protocol} {hit.src_ip}->{hit.dst_ip}"
+                for hit in lolbas_hits[:8]
+            ]
+            detections.append({
+                "severity": "warning",
+                "summary": "LOLBAS tooling artifacts observed",
+                "details": f"{len(lolbas_hits)} artifact(s) matched known living-off-the-land binaries.",
+                "source": "Files",
+                "top_sources": src_counts.most_common(5),
+                "top_destinations": dst_counts.most_common(5),
+                "evidence": evidence,
+                "tools": tool_counts.most_common(6),
+            })
         return FileTransferSummary(
             path=dpkt_summary.path,
             total_candidates=dpkt_summary.total_candidates,
@@ -2580,6 +2644,25 @@ def analyze_files(
             "summary": "File extension/type mismatch detected",
             "details": f"{len(mismatches)} file(s) where extension does not match detected type. Examples: {examples}",
             "source": "Files",
+        })
+    lolbas_hits = _collect_lolbas_hits(artifacts)
+    if lolbas_hits:
+        tool_counts = Counter(_normalize_basename(hit.filename) for hit in lolbas_hits)
+        src_counts = Counter(hit.src_ip for hit in lolbas_hits if hit.src_ip)
+        dst_counts = Counter(hit.dst_ip for hit in lolbas_hits if hit.dst_ip)
+        evidence = [
+            f"{_normalize_basename(hit.filename)} {hit.protocol} {hit.src_ip}->{hit.dst_ip}"
+            for hit in lolbas_hits[:8]
+        ]
+        detections.append({
+            "severity": "warning",
+            "summary": "LOLBAS tooling artifacts observed",
+            "details": f"{len(lolbas_hits)} artifact(s) matched known living-off-the-land binaries.",
+            "source": "Files",
+            "top_sources": src_counts.most_common(5),
+            "top_destinations": dst_counts.most_common(5),
+            "evidence": evidence,
+            "tools": tool_counts.most_common(6),
         })
 
     return FileTransferSummary(

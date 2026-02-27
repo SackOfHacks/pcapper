@@ -4,6 +4,25 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+## 1.4.5 — 2026-02-27
+### Added
+- TCP stream carving with signature-based extraction and configurable limits (`--carve`).
+- Obfuscation/tunneling heuristics for high-entropy and encoded payloads (`--obfuscation`).
+- Cross-pcap correlation of repeated hosts/services (`--correlate`).
+- Case provenance metadata (`case.json`) with hashes, timestamps, and analyst info.
+- Deeper OT semantics: IEC-104 control/setpoint decoding, S7 address parsing, Modbus/DNP3 value change previews.
+- Threats/compromise scoring now incorporates obfuscation and carving detections with evidence lines.
+- Control-loop validation for Modbus/DNP3 value changes (`--control-loop`).
+- Safety PLC/SIS protocol detection with Triconex/TriStation heuristics (`--safety`).
+- Kill-chain timeline tags with causal linkage hints for related events.
+- LOLBAS artifact detection across file transfer summaries.
+- CTF analysis now surfaces file-name hints when flag-like artifacts are observed.
+
+### Changed
+- Release metadata updated to `v1.4.5` across package/docs for commit readiness.
+
 ## 1.4.3 — 2026-02-25
 ### Fixed
 - Summary renderers now accept and propagate `verbose` to avoid NameError crashes in `--files`, `--ldap`, and related OT/ICS summaries.
