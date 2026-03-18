@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from numbers import Real
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from .pcap_cache import PcapMeta, get_reader
 

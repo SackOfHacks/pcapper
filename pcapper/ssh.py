@@ -1322,7 +1322,7 @@ def analyze_ssh(
                     if msg_type == 50 and decrypted_active:
                         username, method = _parse_userauth_request(msg_payload)
                         if method:
-                            auth_methods[method] += 1
+                            algo_counters["auth"][method] += 1
                         if username:
                             auth_usernames[username] += 1
                             key = (

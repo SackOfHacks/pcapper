@@ -230,6 +230,46 @@ def _extract_filename(headers: dict[str, str], uri: str) -> Optional[str]:
     return None
 
 
+def _expected_type_from_filename(
+    filename: str | None,
+    content_type: str | None,
+) -> Optional[str]:
+    ext = ""
+    if filename and "." in filename:
+        ext = "." + filename.lower().rsplit(".", 1)[-1]
+    if ext in {".exe", ".dll", ".sys", ".scr"}:
+        return "EXE/DLL"
+    if ext in {".zip", ".rar", ".7z", ".iso", ".img"}:
+        return "ZIP/Office"
+    if ext == ".pdf":
+        return "PDF"
+    if ext == ".png":
+        return "PNG"
+    if ext in {".jpg", ".jpeg"}:
+        return "JPG"
+    if ext == ".gif":
+        return "GIF"
+
+    ctype = (content_type or "").lower()
+    if "pdf" in ctype:
+        return "PDF"
+    if "zip" in ctype:
+        return "ZIP/Office"
+    if "msword" in ctype or "word" in ctype:
+        return "DOC"
+    if "excel" in ctype:
+        return "XLS"
+    if "powerpoint" in ctype:
+        return "PPT"
+    if "png" in ctype:
+        return "PNG"
+    if "jpeg" in ctype or "jpg" in ctype:
+        return "JPG"
+    if "gif" in ctype:
+        return "GIF"
+    return None
+
+
 def _extract_tokens(text: str) -> list[str]:
     tokens: list[str] = []
     patterns = [
@@ -861,40 +901,10 @@ def analyze_http(
                             if not fname:
                                 uri = req_info.get("uri", "")
                                 fname = _extract_filename({}, uri) or fname
-                        ext = ""
-                        if fname and "." in fname:
-                            ext = "." + fname.lower().split(".")[-1]
-                        expected_type = None
-                        if ext in {".exe", ".dll", ".sys", ".scr"}:
-                            expected_type = "EXE/DLL"
-                        elif ext in {".zip", ".rar", ".7z", ".iso", ".img"}:
-                            expected_type = "ZIP/Office"
-                        elif ext in {".pdf"}:
-                            expected_type = "PDF"
-                        elif ext in {".png"}:
-                            expected_type = "PNG"
-                        elif ext in {".jpg", ".jpeg"}:
-                            expected_type = "JPG"
-                        elif ext in {".gif"}:
-                            expected_type = "GIF"
-                        elif not expected_type:
-                            ctype = headers.get("content-type", "").lower()
-                            if "pdf" in ctype:
-                                expected_type = "PDF"
-                            elif "zip" in ctype:
-                                expected_type = "ZIP/Office"
-                            elif "msword" in ctype or "word" in ctype:
-                                expected_type = "DOC"
-                            elif "excel" in ctype:
-                                expected_type = "XLS"
-                            elif "powerpoint" in ctype:
-                                expected_type = "PPT"
-                            elif "png" in ctype:
-                                expected_type = "PNG"
-                            elif "jpeg" in ctype or "jpg" in ctype:
-                                expected_type = "JPG"
-                            elif "gif" in ctype:
-                                expected_type = "GIF"
+                        expected_type = _expected_type_from_filename(
+                            fname,
+                            headers.get("content-type", ""),
+                        )
                         mismatch = bool(
                             body_complete
                             and expected_type
@@ -942,6 +952,8 @@ def analyze_http(
 
     # Use dpkt-based file discovery to align with --files parsing
     try:
+        from .files import analyze_files
+
         dpkt_summary = analyze_files(path, show_status=False)
     except Exception:
         dpkt_summary = None

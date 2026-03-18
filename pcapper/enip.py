@@ -18,6 +18,11 @@ from .cip import (
     CIP_CLASS_NAMES,
     CIP_ATTRIBUTE_NAMES,
     CIP_SERVICE_NAMES,
+    ENIP_STATUS_CODES,
+    ENIP_ENUMERATION_COMMANDS,
+    ENIP_CIP_COMMANDS,
+    CPF_ITEM_TYPES,
+    CIP_RECON_STATUS_CODES,
     CONTROL_SERVICE_CODES,
     PROGRAM_SERVICE_CODES,
     WRITE_SERVICE_CODES,
@@ -31,6 +36,9 @@ from .cip import (
     _extract_symbol,
     _parse_tag_payload,
     _decode_cip_data_type,
+    _parse_multiple_service_packet,
+    _match_sensitive_tag,
+    _parse_enip_details as _parse_enip_details_base,
 )
 from .equipment import equipment_artifacts
 from .device_detection import device_fingerprint_from_fields
@@ -126,6 +134,14 @@ class ENIPAnalysis:
     sessions: Counter[str] = field(default_factory=Counter)
     enip_commands: Counter[str] = field(default_factory=Counter)
     cip_services: Counter[str] = field(default_factory=Counter)
+    high_risk_services: Counter[str] = field(default_factory=Counter)
+    suspicious_services: Counter[str] = field(default_factory=Counter)
+    source_risky_commands: Counter[str] = field(default_factory=Counter)
+    source_enum_commands: Counter[str] = field(default_factory=Counter)
+    source_enip_enum_commands: Counter[str] = field(default_factory=Counter)
+    source_recon_commands: Counter[str] = field(default_factory=Counter)
+    server_error_responses: Counter[str] = field(default_factory=Counter)
+    service_error_counts: Counter[str] = field(default_factory=Counter)
     service_endpoints: dict[str, Counter[str]] = field(default_factory=dict)
     class_ids: Counter[int] = field(default_factory=Counter)
     instance_ids: Counter[int] = field(default_factory=Counter)
@@ -213,6 +229,14 @@ def merge_enip_summaries(summaries: list[ENIPAnalysis]) -> ENIPAnalysis:
         merged.sessions.update(summary.sessions)
         merged.enip_commands.update(summary.enip_commands)
         merged.cip_services.update(summary.cip_services)
+        merged.high_risk_services.update(summary.high_risk_services)
+        merged.suspicious_services.update(summary.suspicious_services)
+        merged.source_risky_commands.update(summary.source_risky_commands)
+        merged.source_enum_commands.update(summary.source_enum_commands)
+        merged.source_enip_enum_commands.update(summary.source_enip_enum_commands)
+        merged.source_recon_commands.update(summary.source_recon_commands)
+        merged.server_error_responses.update(summary.server_error_responses)
+        merged.service_error_counts.update(summary.service_error_counts)
         merged.class_ids.update(summary.class_ids)
         merged.instance_ids.update(summary.instance_ids)
         merged.attribute_ids.update(summary.attribute_ids)
@@ -307,44 +331,22 @@ def _is_public_ip(value: str) -> bool:
 
 
 def _parse_cpf(data: bytes) -> tuple[Optional[bytes], bool]:
-    if len(data) < 6:
-        return None, False
-    ptr = 0
-    ptr += 4
-    ptr += 2
-    if ptr + 2 > len(data):
-        return None, False
-    item_count = int.from_bytes(data[ptr:ptr + 2], "little")
-    ptr += 2
-    cip_payload: Optional[bytes] = None
-    is_connected = False
-    for _ in range(item_count):
-        if ptr + 4 > len(data):
-            break
-        item_type = int.from_bytes(data[ptr:ptr + 2], "little")
-        item_length = int.from_bytes(data[ptr + 2:ptr + 4], "little")
-        ptr += 4
-        item_data = data[ptr:ptr + item_length]
-        ptr += item_length
-        if item_type in {0x00B1, 0x00B2, 0x00B4}:
-            cip_payload = item_data
-            if item_type != 0x00B1:
-                is_connected = True
-    return cip_payload, is_connected
+    info = _parse_enip_details_base(
+        b"\x6f\x00" + len(data).to_bytes(2, "little") + b"\x00" * 20 + data
+    )
+    payload = info.get("cip_payload")
+    return (payload if isinstance(payload, (bytes, bytearray)) else None, bool(info.get("is_connected", False)))
 
 
 def _parse_enip(payload: bytes) -> tuple[Optional[int], Optional[str], Optional[int], Optional[bytes], bool]:
-    if len(payload) < 24:
-        return None, None, None, payload, False
-    command = int.from_bytes(payload[0:2], "little")
-    length = int.from_bytes(payload[2:4], "little")
-    status = int.from_bytes(payload[8:12], "little")
-    encap_data = payload[24:24 + length]
-    is_connected = False
-    cip_payload = encap_data or None
-    if command in {0x006F, 0x0070}:
-        cip_payload, is_connected = _parse_cpf(encap_data)
-    return command, ENIP_COMMANDS.get(command), status, cip_payload, is_connected
+    info = _parse_enip_details_base(payload)
+    return (
+        info.get("command"),  # type: ignore[return-value]
+        info.get("command_name"),  # type: ignore[return-value]
+        info.get("status"),  # type: ignore[return-value]
+        info.get("cip_payload"),  # type: ignore[return-value]
+        bool(info.get("is_connected", False)),
+    )
 
 
 def _parse_list_identity_response(data: bytes, src_ip: str) -> list[IdentityInfo]:
@@ -553,17 +555,23 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
     src_requests: Counter[str] = Counter()
     src_responses: Counter[str] = Counter()
     src_commands: dict[str, Counter[str]] = defaultdict(Counter)
+    src_enip_commands: dict[str, Counter[str]] = defaultdict(Counter)
+    failed_pairs: Counter[str] = Counter()
     nonstandard_sessions: Counter[str] = Counter()
     src_control_commands: Counter[str] = Counter()
     src_program_commands: Counter[str] = Counter()
     src_write_commands: Counter[str] = Counter()
+    src_register_commands: Counter[str] = Counter()
+    src_unregister_commands: Counter[str] = Counter()
     src_enum_commands: Counter[str] = Counter()
     src_high_risk_commands: Counter[str] = Counter()
+    src_recon_errors: Counter[str] = Counter()
     identity_keys: set[tuple[str, int | None, int | None, int | None, str | None]] = set()
     asset_write_targets: dict[str, set[str]] = defaultdict(set)
     asset_write_counts: Counter[str] = Counter()
     write_target_anoms_seen: set[str] = set()
     security_sessions_seen: set[str] = set()
+    sensitive_write_seen: set[str] = set()
 
     try:
         with status as pbar:
@@ -648,11 +656,32 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                 if ts is not None:
                     session_last_ts[session_key] = ts
 
-                encap_command, encap_name, encap_status, cip_payload, is_connected = _parse_enip(payload)
+                request_like = (dport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}) and (
+                    sport not in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
+                )
+                response_like = (sport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}) and (
+                    dport not in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
+                )
+
+                enip = _parse_enip_details_base(payload)
+                encap_command = enip.get("command")
+                encap_name = enip.get("command_name")
+                encap_status = enip.get("status")
+                cip_payload = enip.get("cip_payload")
+                is_connected = bool(enip.get("is_connected", False))
+                encap_data = enip.get("encap_data")
+                session_handle = enip.get("session_handle")
+                is_cip_carrier = bool(enip.get("is_cip_carrier", False))
+                cpf_item_types = enip.get("cpf_item_types")
+                cpf_malformed = bool(enip.get("cpf_malformed", False))
+                length_mismatch = bool(enip.get("length_mismatch", False))
+
                 if encap_command is not None:
-                    cmd_label = encap_name or f"Encap 0x{encap_command:04x}"
+                    cmd_label = str(encap_name or f"Encap 0x{int(encap_command):04x}")
+                    actor_ip = src_ip if request_like else dst_ip if response_like else src_ip
                     analysis.enip_commands[cmd_label] += 1
-                    src_commands[src_ip][cmd_label] += 1
+                    src_commands[actor_ip][cmd_label] += 1
+                    src_enip_commands[actor_ip][cmd_label] += 1
 
                     if cmd_label in SUSPICIOUS_ENIP_COMMANDS and len(analysis.anomalies) < max_anomalies:
                         analysis.anomalies.append(
@@ -665,16 +694,76 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                 ts=ts or 0.0,
                             )
                         )
+                    if cmd_label in ENIP_ENUMERATION_COMMANDS:
+                        analysis.source_enip_enum_commands[actor_ip] += 1
+                        analysis.source_enum_commands[actor_ip] += 1
+                    if cmd_label == "RegisterSession":
+                        src_register_commands[actor_ip] += 1
+                    elif cmd_label == "UnregisterSession":
+                        src_unregister_commands[actor_ip] += 1
+
+                    if session_handle and len(analysis.artifacts) < 200:
+                        session_key = f"enip_session:{actor_ip}:{session_handle}:{cmd_label}"
+                        if session_key not in seen_artifacts:
+                            seen_artifacts.add(session_key)
+                            analysis.artifacts.append(
+                                IndustrialArtifact(
+                                    kind="enip_session",
+                                    detail=f"{cmd_label} session=0x{int(session_handle):08x}",
+                                    src=src_ip,
+                                    dst=dst_ip,
+                                    ts=ts or 0.0,
+                                )
+                            )
 
                 if encap_status is not None:
-                    status_label = f"0x{encap_status:08x}"
-                    analysis.status_codes[status_label] += 1
-                    if encap_status != 0 and len(analysis.anomalies) < max_anomalies:
+                    status_text = str(enip.get("status_text") or f"0x{int(encap_status):08x}")
+                    analysis.status_codes[f"ENIP:{status_text}"] += 1
+                    if int(encap_status) != 0 and len(analysis.anomalies) < max_anomalies:
                         analysis.anomalies.append(
                             IndustrialAnomaly(
                                 severity="LOW",
                                 title="ENIP Error Status",
-                                description=f"Encapsulation status {status_label}.",
+                                description=f"Encapsulation status {status_text}.",
+                                src=src_ip,
+                                dst=dst_ip,
+                                ts=ts or 0.0,
+                            )
+                        )
+
+                if length_mismatch and len(analysis.anomalies) < max_anomalies:
+                    analysis.anomalies.append(
+                        IndustrialAnomaly(
+                            severity="MEDIUM",
+                            title="Malformed ENIP Length",
+                            description="ENIP declared payload length does not match observed payload size.",
+                            src=src_ip,
+                            dst=dst_ip,
+                            ts=ts or 0.0,
+                        )
+                    )
+
+                if is_cip_carrier and cpf_malformed and len(analysis.anomalies) < max_anomalies:
+                    analysis.anomalies.append(
+                        IndustrialAnomaly(
+                            severity="MEDIUM",
+                            title="Malformed ENIP CPF",
+                            description="Common Packet Format item table appears truncated or malformed.",
+                            src=src_ip,
+                            dst=dst_ip,
+                            ts=ts or 0.0,
+                        )
+                    )
+
+                if is_cip_carrier and isinstance(cpf_item_types, list) and cpf_item_types and len(analysis.artifacts) < 200:
+                    item_names = [CPF_ITEM_TYPES.get(int(code), f"0x{int(code):04x}") for code in cpf_item_types[:4]]
+                    cpf_key = f"cpf_items:{','.join(str(int(code)) for code in cpf_item_types[:6])}"
+                    if cpf_key not in seen_artifacts:
+                        seen_artifacts.add(cpf_key)
+                        analysis.artifacts.append(
+                            IndustrialArtifact(
+                                kind="enip_cpf",
+                                detail=", ".join(item_names),
                                 src=src_ip,
                                 dst=dst_ip,
                                 ts=ts or 0.0,
@@ -686,14 +775,17 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                 else:
                     analysis.unconnected_packets += 1
 
-                if cip_payload is None:
-                    cip_payload = payload
+                parse_payload = b""
+                if is_cip_carrier and isinstance(cip_payload, (bytes, bytearray)):
+                    parse_payload = bytes(cip_payload)
+                elif encap_command is None and isinstance(cip_payload, (bytes, bytearray)):
+                    parse_payload = bytes(cip_payload)
 
-                if cip_payload:
+                if encap_data:
                     identities = []
                     if encap_command == 0x0063:
-                        identities.extend(_parse_list_identity_response(cip_payload, src_ip))
-                    identities.extend(_scan_identity_items(cip_payload, src_ip))
+                        identities.extend(_parse_list_identity_response(bytes(encap_data), src_ip))
+                    identities.extend(_scan_identity_items(bytes(encap_data), src_ip))
                     for ident in identities:
                         key = (
                             ident.src_ip,
@@ -733,7 +825,7 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                 (
                     service,
                     service_name,
-                    is_request,
+                    cip_is_request,
                     general_status,
                     status_text,
                     class_id,
@@ -741,12 +833,13 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                     attribute_id,
                     path_str,
                     cip_payload,
-                ) = _parse_cip_message(cip_payload)
+                ) = _parse_cip_message(parse_payload)
                 if service is not None and not service_name:
                     service_name = f"Service 0x{service & 0x7F:02x}"
 
                 service_code = (service & 0x7F) if service is not None else None
                 tag_name = _extract_symbol(path_str)
+                is_request = bool(cip_is_request) if service is not None else (request_like or not response_like)
                 data_type_code, element_count, tag_offset = _parse_tag_payload(service_code, is_request, cip_payload)
                 data_type_name = _decode_cip_data_type(data_type_code)
                 if is_request:
@@ -762,12 +855,20 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
 
                 if service_name:
                     analysis.cip_services[service_name] += 1
+                    actor_ip = src_ip if is_request else dst_ip
+                    src_commands[actor_ip][service_name] += 1
                     endpoints = analysis.service_endpoints.setdefault(service_name, Counter())
                     endpoints[f"{src_ip} -> {dst_ip}"] += 1
                     if is_request and service_code is not None:
                         is_write_service = service_code in WRITE_SERVICE_CODES or service_code in HIGH_RISK_SERVICE_CODES
+                        if service_code in HIGH_RISK_SERVICE_CODES:
+                            analysis.high_risk_services[service_name] += 1
+                            analysis.source_risky_commands[src_ip] += 1
                         if is_write_service:
                             src_write_commands[src_ip] += 1
+                        elif service_code in ENUMERATION_SERVICE_CODES:
+                            analysis.suspicious_services[service_name] += 1
+                            analysis.source_enum_commands[src_ip] += 1
                         if service_code in CONTROL_SERVICE_CODES:
                             src_control_commands[src_ip] += 1
                         if service_code in PROGRAM_SERVICE_CODES:
@@ -776,6 +877,55 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                             src_enum_commands[src_ip] += 1
                         if service_code in HIGH_RISK_SERVICE_CODES:
                             src_high_risk_commands[src_ip] += 1
+
+                        if service_code == 0x0A:
+                            sub_codes = _parse_multiple_service_packet(cip_payload)
+                            if sub_codes:
+                                sub_names = [CIP_SERVICE_NAMES.get(code, f"Service 0x{code:02x}") for code in sub_codes]
+                                msp_detail = ", ".join(sub_names[:6])
+                                if len(sub_names) > 6:
+                                    msp_detail = f"{msp_detail} (+{len(sub_names) - 6})"
+                                msp_key = f"msp:{src_ip}:{dst_ip}:{msp_detail}"
+                                if msp_key not in seen_artifacts and len(analysis.artifacts) < 200:
+                                    seen_artifacts.add(msp_key)
+                                    analysis.artifacts.append(
+                                        IndustrialArtifact(
+                                            kind="cip_multi_service",
+                                            detail=msp_detail,
+                                            src=src_ip,
+                                            dst=dst_ip,
+                                            ts=ts or 0.0,
+                                        )
+                                    )
+                                for sub_code, sub_name in zip(sub_codes, sub_names):
+                                    msp_service_name = f"MSP/{sub_name}"
+                                    analysis.cip_services[msp_service_name] += 1
+                                    msp_eps = analysis.service_endpoints.setdefault(msp_service_name, Counter())
+                                    msp_eps[f"{src_ip} -> {dst_ip}"] += 1
+                                    if sub_code in HIGH_RISK_SERVICE_CODES:
+                                        analysis.high_risk_services[msp_service_name] += 1
+                                        analysis.source_risky_commands[src_ip] += 1
+                                    if sub_code in ENUMERATION_SERVICE_CODES:
+                                        analysis.suspicious_services[msp_service_name] += 1
+                                        analysis.source_enum_commands[src_ip] += 1
+                                    if sub_code in CONTROL_SERVICE_CODES:
+                                        src_control_commands[src_ip] += 1
+                                    if sub_code in PROGRAM_SERVICE_CODES:
+                                        src_program_commands[src_ip] += 1
+                                    if sub_code in WRITE_SERVICE_CODES or sub_code in HIGH_RISK_SERVICE_CODES:
+                                        src_write_commands[src_ip] += 1
+
+                                if any(code in HIGH_RISK_SERVICE_CODES for code in sub_codes) and len(analysis.anomalies) < max_anomalies:
+                                    analysis.anomalies.append(
+                                        IndustrialAnomaly(
+                                            severity="HIGH",
+                                            title="CIP Multi-Service High-Risk Bundle",
+                                            description=f"Multiple_Service_Packet includes high-risk operation(s): {msp_detail}",
+                                            src=src_ip,
+                                            dst=dst_ip,
+                                            ts=ts or 0.0,
+                                        )
+                                    )
 
                         if is_write_service:
                             asset_key = dst_ip
@@ -809,6 +959,35 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                                     ts=ts or 0.0,
                                                 )
                                             )
+
+                        sensitive_token = _match_sensitive_tag(tag_name if is_write_service else None)
+                        if sensitive_token:
+                            sensitive_key = f"{src_ip}:{dst_ip}:{tag_name}:{service_name}:{sensitive_token}"
+                            if sensitive_key not in sensitive_write_seen and len(analysis.anomalies) < max_anomalies:
+                                sensitive_write_seen.add(sensitive_key)
+                                severity = "HIGH" if sensitive_token in {"safety", "sif", "estop", "trip", "interlock"} else "MEDIUM"
+                                analysis.anomalies.append(
+                                    IndustrialAnomaly(
+                                        severity=severity,
+                                        title="CIP Sensitive Tag Write",
+                                        description=f"Write-like operation to sensitive tag '{tag_name}' (keyword: {sensitive_token}).",
+                                        src=src_ip,
+                                        dst=dst_ip,
+                                        ts=ts or 0.0,
+                                    )
+                                )
+                            artifact_key = f"sensitive_tag_write:{tag_name}:{sensitive_token}:{service_name}"
+                            if artifact_key not in seen_artifacts and len(analysis.artifacts) < 200:
+                                seen_artifacts.add(artifact_key)
+                                analysis.artifacts.append(
+                                    IndustrialArtifact(
+                                        kind="tag_sensitive_write",
+                                        detail=f"tag={tag_name} service={service_name} keyword={sensitive_token}",
+                                        src=src_ip,
+                                        dst=dst_ip,
+                                        ts=ts or 0.0,
+                                    )
+                                )
 
                 if class_id is not None:
                     analysis.class_ids[class_id] += 1
@@ -849,6 +1028,18 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                     ts=ts or 0.0,
                                 )
                             )
+                        if is_request and service_code in WRITE_SERVICE_CODES | CONTROL_SERVICE_CODES | HIGH_RISK_SERVICE_CODES:
+                            if len(analysis.anomalies) < max_anomalies:
+                                analysis.anomalies.append(
+                                    IndustrialAnomaly(
+                                        severity="HIGH",
+                                        title="CIP Safety Object Control/Write",
+                                        description=f"Write/control service {service_name or service_code} targeted safety class {class_id}.",
+                                        src=src_ip,
+                                        dst=dst_ip,
+                                        ts=ts or 0.0,
+                                    )
+                                )
                     if class_id in CIP_SECURITY_CLASS_IDS:
                         security_key = f"cip_security:{class_id}"
                         if security_key not in seen_artifacts and len(analysis.artifacts) < 200:
@@ -862,22 +1053,45 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                     ts=ts or 0.0,
                                 )
                             )
+                        if is_request and service_code in WRITE_SERVICE_CODES | CONTROL_SERVICE_CODES | HIGH_RISK_SERVICE_CODES:
+                            if len(analysis.anomalies) < max_anomalies:
+                                analysis.anomalies.append(
+                                    IndustrialAnomaly(
+                                        severity="HIGH",
+                                        title="CIP Security Object Modification",
+                                        description=f"Write/control service {service_name or service_code} targeted CIP Security class {class_id}.",
+                                        src=src_ip,
+                                        dst=dst_ip,
+                                        ts=ts or 0.0,
+                                    )
+                                )
                 if instance_id is not None:
                     analysis.instance_ids[instance_id] += 1
                 if attribute_id is not None:
                     analysis.attribute_ids[attribute_id] += 1
 
-                if general_status is not None and general_status != 0x00 and len(analysis.anomalies) < max_anomalies:
-                    analysis.anomalies.append(
-                        IndustrialAnomaly(
-                            severity="LOW",
-                            title="CIP Error Response",
-                            description=f"General status {status_text or f'0x{general_status:02x}'}.",
-                            src=src_ip,
-                            dst=dst_ip,
-                            ts=ts or 0.0,
+                if general_status is not None:
+                    cip_status_text = status_text or CIP_GENERAL_STATUS.get(general_status) or f"0x{general_status:02x}"
+                    analysis.status_codes[f"CIP:{cip_status_text}"] += 1
+                    if general_status != 0x00 and len(analysis.anomalies) < max_anomalies:
+                        analysis.anomalies.append(
+                            IndustrialAnomaly(
+                                severity="LOW",
+                                title="CIP Error Response",
+                                description=f"General status {cip_status_text}.",
+                                src=src_ip,
+                                dst=dst_ip,
+                                ts=ts or 0.0,
+                            )
                         )
-                    )
+                        if service_name:
+                            analysis.service_error_counts[service_name] += 1
+                        if not is_request:
+                            analysis.server_error_responses[src_ip] += 1
+                            failed_pairs[f"{dst_ip} -> {src_ip}"] += 1
+                            if general_status in CIP_RECON_STATUS_CODES:
+                                src_recon_errors[dst_ip] += 1
+                                analysis.source_recon_commands[dst_ip] += 1
 
                 if tag_name:
                     key = f"tag:{tag_name}"
@@ -918,7 +1132,8 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                             )
 
                 if encap_command in {0x0004, 0x0063}:
-                    ascii_text = _format_ascii(cip_payload, limit=180)
+                    identity_payload = encap_data if isinstance(encap_data, (bytes, bytearray)) else cip_payload
+                    ascii_text = _format_ascii(bytes(identity_payload), limit=180) if identity_payload else ""
                     if ascii_text:
                         key = f"identity:{ascii_text}"
                         if key not in seen_artifacts and len(analysis.artifacts) < 200:
@@ -1007,7 +1222,7 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                 )
             )
 
-        if req_count >= 50 and any(cmd in SUSPICIOUS_ENIP_COMMANDS for cmd in src_commands.get(src, {})):
+        if req_count >= 50 and any(cmd in SUSPICIOUS_ENIP_COMMANDS for cmd in src_enip_commands.get(src, {})):
             if len(analysis.anomalies) < max_anomalies:
                 analysis.anomalies.append(
                     IndustrialAnomaly(
@@ -1019,6 +1234,20 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         ts=0.0,
                     )
                 )
+
+    for src, enum_count in analysis.source_enip_enum_commands.items():
+        unique_dsts = len(src_dst_counts.get(src, {}))
+        if enum_count >= 20 and unique_dsts >= 4 and len(analysis.anomalies) < max_anomalies:
+            analysis.anomalies.append(
+                IndustrialAnomaly(
+                    severity="MEDIUM",
+                    title="ENIP Discovery Sweep",
+                    description=f"{enum_count} ENIP discovery/session enumeration commands across {unique_dsts} endpoints.",
+                    src=src,
+                    dst="*",
+                    ts=0.0,
+                )
+            )
 
     for src, enum_count in src_enum_commands.items():
         unique_dsts = len(src_dst_counts.get(src, {}))
@@ -1034,6 +1263,64 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         ts=0.0,
                     )
                 )
+
+    for server, error_count in analysis.server_error_responses.items():
+        resp_count = src_responses.get(server, 0)
+        error_ratio = (error_count / resp_count) if resp_count else 0.0
+        if error_count >= 20 and error_ratio >= 0.4 and len(analysis.anomalies) < max_anomalies:
+            analysis.anomalies.append(
+                IndustrialAnomaly(
+                    severity="MEDIUM",
+                    title="ENIP/CIP Server Error Flood",
+                    description=f"Server produced {error_count} failed responses ({error_ratio:.0%} failure rate).",
+                    src=server,
+                    dst="*",
+                    ts=0.0,
+                )
+            )
+
+    for pair, error_count in failed_pairs.items():
+        if error_count >= 10 and len(analysis.anomalies) < max_anomalies:
+            client, server = pair.split(" -> ", 1)
+            analysis.anomalies.append(
+                IndustrialAnomaly(
+                    severity="HIGH",
+                    title="Repeated Failed ENIP/CIP Operations",
+                    description=f"{error_count} failed responses for client/server pair.",
+                    src=client,
+                    dst=server,
+                    ts=0.0,
+                )
+            )
+
+    for src, register_count in src_register_commands.items():
+        unregister_count = src_unregister_commands.get(src, 0)
+        if register_count >= 20 and unregister_count <= max(1, register_count // 10):
+            if len(analysis.anomalies) < max_anomalies:
+                analysis.anomalies.append(
+                    IndustrialAnomaly(
+                        severity="MEDIUM",
+                        title="ENIP Session Churn",
+                        description=f"{register_count} RegisterSession vs {unregister_count} UnregisterSession commands.",
+                        src=src,
+                        dst="*",
+                        ts=0.0,
+                    )
+                )
+
+    for src, recon_count in src_recon_errors.items():
+        unique_dsts = len(src_dst_counts.get(src, {}))
+        if recon_count >= 10 and unique_dsts >= 3 and len(analysis.anomalies) < max_anomalies:
+            analysis.anomalies.append(
+                IndustrialAnomaly(
+                    severity="MEDIUM",
+                    title="CIP Reconnaissance Error Pattern",
+                    description=f"{recon_count} path/service/attribute errors returned from {unique_dsts} endpoints.",
+                    src=src,
+                    dst="*",
+                    ts=0.0,
+                )
+            )
 
     for session_key, intervals in session_intervals.items():
         if len(intervals) < 6:

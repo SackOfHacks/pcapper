@@ -291,7 +291,7 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
             [],
             Counter(),
             Counter(),
-            [f"Error opening pcap: {e}"],
+            [f"Error opening pcap: {exc}"],
         )
 
     size_bytes = size_bytes

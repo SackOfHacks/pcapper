@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from collections import Counter, defaultdict
+from datetime import datetime
 from functools import lru_cache
 import ipaddress
 import math
@@ -612,6 +613,28 @@ SUSPICIOUS_PAYLOAD_MARKERS = [
 FAILED_AUTH_PATTERNS_BYTES = [pattern.encode("utf-8", errors="ignore") for pattern in FAILED_AUTH_PATTERNS]
 SUSPICIOUS_PAYLOAD_MARKERS_BYTES = [pattern.encode("utf-8", errors="ignore") for pattern in SUSPICIOUS_PAYLOAD_MARKERS]
 
+OBFUSCATION_IOC_KINDS = {
+    "ioc_url",
+    "ioc_domain",
+    "ioc_ipv4",
+    "ioc_email",
+    "ioc_hash",
+}
+
+OT_SENSITIVE_ARTIFACT_TOKENS = (
+    "safety",
+    "security",
+    "firmware",
+    "program",
+    "download",
+    "write",
+    "override",
+    "estop",
+    "trip",
+    "interlock",
+    "sensitive",
+)
+
 
 @lru_cache(maxsize=100000)
 def _is_private_ip(value: str) -> bool:
@@ -663,30 +686,221 @@ def _threats_storyline(
     ot_protocol_counts: dict[str, int],
     risk_score: int,
     risk_findings: list[str],
+    first_seen: Optional[float] = None,
+    last_seen: Optional[float] = None,
+    duration_seconds: Optional[float] = None,
 ) -> list[str]:
     if not detections:
         return ["No notable threat detections observed."]
-    top_protocols = sorted(ot_protocol_counts.items(), key=lambda item: (-item[1], item[0]))[:4]
-    storyline: list[str] = []
-    if top_protocols:
-        proto_text = ", ".join(f"{name} ({count})" for name, count in top_protocols)
-        storyline.append(f"OT protocols present: {proto_text}.")
-    if risk_score:
-        storyline.append(f"OT risk posture scored {risk_score}/100.")
-    if risk_findings:
-        storyline.append("Key signals: " + "; ".join(risk_findings[:3]))
+
+    def _fmt_time(value: Optional[float]) -> str:
+        if value is None:
+            return "unknown time"
+        try:
+            return datetime.fromtimestamp(float(value)).strftime("%H:%M:%S")
+        except Exception:
+            return "unknown time"
+
+    def _extract_first_int(text: str) -> int:
+        match = re.search(r"\b(\d{1,9})\b", text)
+        if not match:
+            return 0
+        try:
+            return int(match.group(1))
+        except Exception:
+            return 0
+
+    def _extract_flow_triplet(text: str) -> tuple[str, str, str]:
+        pattern = r"(\d{1,3}(?:\.\d{1,3}){3})\s*->\s*(\d{1,3}(?:\.\d{1,3}){3})([^,;]*)"
+        match = re.search(pattern, text)
+        if not match:
+            return "", "", ""
+        return match.group(1), match.group(2), match.group(3).strip()
+
+    def _stage_for_item(item: dict[str, object]) -> str:
+        source = str(item.get("source", "")).lower()
+        summary = str(item.get("summary", "")).lower()
+        details = str(item.get("details", "")).lower()
+        blob = f"{source} {summary} {details}"
+        if any(token in blob for token in ("scan", "sweep", "recon", "enumeration", "probing")):
+            return "recon"
+        if any(token in blob for token in ("brute-force", "credential", "auth", "password")):
+            return "access"
+        if any(token in blob for token in ("lateral", "smb", "rdp", "winrm", "ssh")):
+            return "movement"
+        if any(token in blob for token in ("beacon", "c2", "command and control")):
+            return "c2"
+        if any(token in blob for token in ("exfil", "outbound", "transfer", "dns tunn")):
+            return "exfil"
+        return "other"
+
+    def _narrative_for_item(item: dict[str, object]) -> str:
+        summary = str(item.get("summary", "")).strip()
+        details = str(item.get("details", "")).strip()
+        evidence = item.get("evidence")
+        evidence_list = [str(value) for value in evidence] if isinstance(evidence, list) else []
+        evidence_blob = "; ".join(evidence_list[:2])
+        blob = f"{details}; {evidence_blob}".strip("; ")
+
+        if "port sweep" in summary.lower():
+            src, dst, suffix = _extract_flow_triplet(blob or details)
+            count = _extract_first_int(suffix or details)
+            if src and dst and count:
+                return f"{src} scanned {dst} across about {count} destination ports."
+            if src and dst:
+                return f"{src} performed a broad port sweep against {dst}."
+
+        if "host sweep" in summary.lower():
+            match = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})\s*->\s*\*:(\d+)\s*\((\d+)\s+hosts\)", blob or details)
+            if match:
+                return (
+                    f"{match.group(1)} probed port {match.group(2)} across {match.group(3)} internal hosts "
+                    "in host-sweep behavior."
+                )
+
+        if "beacon" in summary.lower() or "c2" in summary.lower():
+            src, dst, suffix = _extract_flow_triplet(blob or details)
+            count_match = re.search(r"count=(\d+)", blob)
+            if src and dst and count_match:
+                return f"Periodic beacon traffic was observed from {src} to {dst} ({count_match.group(1)} callbacks)."
+            if src and dst:
+                return f"Periodic beacon traffic was observed from {src} to {dst}."
+
+        if "large outbound" in summary.lower() or "transfer" in summary.lower():
+            src, dst, _suffix = _extract_flow_triplet(details)
+            bytes_sent = _extract_first_int(details)
+            if src and dst and bytes_sent:
+                return f"{src} transferred roughly {bytes_sent} bytes outbound to {dst}."
+            if src and dst:
+                return f"A large outbound transfer occurred from {src} to {dst}."
+
+        if details:
+            return f"{summary}: {details}"
+        return summary
+
+    def _extract_all_flow_pairs(item: dict[str, object]) -> list[tuple[str, str]]:
+        details = str(item.get("details", "") or "")
+        evidence = item.get("evidence")
+        evidence_text = ""
+        if isinstance(evidence, list):
+            evidence_text = "; ".join(str(value) for value in evidence[:6])
+        elif isinstance(evidence, str):
+            evidence_text = evidence
+        blob = f"{details}; {evidence_text}"
+        pairs: list[tuple[str, str]] = []
+        for match in re.finditer(r"(\d{1,3}(?:\.\d{1,3}){3})\s*->\s*(\d{1,3}(?:\.\d{1,3}){3})", blob):
+            src_ip = match.group(1)
+            dst_ip = match.group(2)
+            if src_ip and dst_ip and src_ip != dst_ip:
+                pairs.append((src_ip, dst_ip))
+        return list(dict.fromkeys(pairs))
 
     severity_order = {"critical": 0, "high": 1, "warning": 2, "info": 3}
     sorted_dets = sorted(
         detections,
-        key=lambda item: (severity_order.get(str(item.get("severity", "info")).lower(), 99)),
+        key=lambda item: (
+            severity_order.get(str(item.get("severity", "info")).lower(), 99),
+            -_extract_first_int(str(item.get("details", ""))),
+        ),
     )
-    top = sorted_dets[:3]
-    if top:
-        examples = "; ".join(str(item.get("summary", "")) for item in top if item.get("summary"))
-        if examples:
-            storyline.append(f"Top detections: {examples}.")
-    return storyline
+
+    staged: dict[str, dict[str, object]] = {}
+    stage_order = ["recon", "access", "movement", "c2", "exfil"]
+    for item in sorted_dets:
+        stage = _stage_for_item(item)
+        if stage in stage_order and stage not in staged:
+            staged[stage] = item
+
+    timeline_markers: list[str] = []
+    if first_seen is not None:
+        timeline_markers.append(f"at {_fmt_time(first_seen)}")
+    if last_seen is not None and last_seen != first_seen:
+        timeline_markers.append(f"through {_fmt_time(last_seen)}")
+    window_text = " ".join(timeline_markers).strip()
+
+    storyline: list[str] = []
+    if window_text:
+        if duration_seconds is not None and duration_seconds > 0:
+            storyline.append(f"During the capture window {window_text} ({duration_seconds:.1f}s), we observed this sequence:")
+        else:
+            storyline.append(f"During the capture window {window_text}, we observed this sequence:")
+    else:
+        storyline.append("During this capture, we observed this sequence:")
+
+    stage_prefixes = {
+        "recon": "First,",
+        "access": "Then,",
+        "movement": "Next,",
+        "c2": "After that,",
+        "exfil": "Finally,",
+    }
+    for stage in stage_order:
+        item = staged.get(stage)
+        if not item:
+            continue
+        sentence = _narrative_for_item(item)
+        prefix = stage_prefixes.get(stage, "Then,")
+        storyline.append(f"{prefix} {sentence}")
+
+    # Pivot hint: if host B appears as destination from host A, and B also acts as an active
+    # source in recon/movement/C2/exfil detections, narrate potential host-to-host chaining.
+    source_activity: dict[str, set[str]] = defaultdict(set)
+    source_example: dict[str, str] = {}
+    observed_pairs: list[tuple[str, str]] = []
+    for item in sorted_dets:
+        stage = _stage_for_item(item)
+        pairs = _extract_all_flow_pairs(item)
+        for src_ip, dst_ip in pairs:
+            observed_pairs.append((src_ip, dst_ip))
+            source_activity[src_ip].add(stage)
+            source_example.setdefault(src_ip, str(item.get("summary", "")).strip())
+
+    pivot_stage_names = {
+        "recon": "reconnaissance",
+        "movement": "lateral movement",
+        "c2": "command-and-control",
+        "exfil": "exfiltration",
+    }
+    pivot_signal_stages = ("recon", "movement", "c2", "exfil")
+    pivot_sentence = ""
+    for src_ip, dst_ip in observed_pairs:
+        dst_stages = source_activity.get(dst_ip, set())
+        stage_hit = next((name for name in pivot_signal_stages if name in dst_stages), "")
+        if not stage_hit:
+            continue
+        stage_label = pivot_stage_names.get(stage_hit, stage_hit)
+        dst_example = source_example.get(dst_ip, "follow-on network activity")
+        pivot_sentence = (
+            f"Possible pivot behavior: after traffic from {src_ip} to {dst_ip}, {dst_ip} also "
+            f"showed {stage_label} signals ({dst_example})."
+        )
+        break
+    if pivot_sentence:
+        storyline.append(pivot_sentence)
+
+    if len(storyline) <= 1:
+        top = sorted_dets[:2]
+        for idx, item in enumerate(top):
+            prefix = "Then," if idx else "First,"
+            storyline.append(f"{prefix} {_narrative_for_item(item)}")
+
+    top_protocols = sorted(ot_protocol_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+    if top_protocols:
+        proto_text = ", ".join(f"{name}({count})" for name, count in top_protocols)
+        storyline.append(f"OT protocol context seen in the same capture: {proto_text}.")
+
+    if risk_score:
+        posture = "low"
+        if risk_score >= 60:
+            posture = "high"
+        elif risk_score >= 25:
+            posture = "medium"
+        storyline.append(f"Overall OT risk posture for this capture was {risk_score}/100 ({posture}).")
+
+    if risk_findings:
+        storyline.append("Supporting risk signals: " + "; ".join(risk_findings[:3]))
+
+    return storyline[:8]
 
 
 def _tcp_is_syn(flags: object) -> bool:
@@ -716,6 +930,202 @@ def _dedupe_evidence(values: list[str], limit: int = 8) -> list[str]:
         if len(output) >= limit:
             break
     return output
+
+
+_NOISY_DETECTION_SUMMARIES = {
+    "Beacon candidate flow",
+    "Suspicious file artifact",
+    "OT protocol activity observed",
+    "High TXT-query activity",
+}
+
+
+_HIGH_VALUE_SUMMARY_TOKENS = (
+    "critical",
+    "brute-force",
+    "multi-stage",
+    "correlation",
+    "beaconing",
+    "c2",
+    "credential",
+    "lateral",
+    "exfil",
+    "ot control",
+    "internet-exposed",
+    "threat-intel",
+)
+
+
+def _dedupe_ranked_pairs(values: object, *, limit: int = 10) -> list[tuple[str, int]]:
+    if not isinstance(values, list):
+        return []
+    merged: Counter[str] = Counter()
+    for pair in values:
+        if not isinstance(pair, tuple) or len(pair) < 2:
+            continue
+        label = str(pair[0]).strip()
+        if not label:
+            continue
+        try:
+            score = int(pair[1])
+        except Exception:
+            score = 0
+        merged[label] += score
+    return merged.most_common(limit)
+
+
+def _parse_detail_count(details: str) -> int:
+    numbers = re.findall(r"\b(\d{1,6})\b", details)
+    if not numbers:
+        return 0
+    try:
+        return max(int(value) for value in numbers)
+    except Exception:
+        return 0
+
+
+def _detection_signal_score(item: dict[str, object]) -> int:
+    severity = str(item.get("severity", "info")).lower()
+    summary = str(item.get("summary", "")).strip()
+    details = str(item.get("details", "")).strip()
+
+    base = {
+        "critical": 5,
+        "high": 4,
+        "warning": 2,
+        "info": 0,
+    }.get(severity, 0)
+
+    evidence = item.get("evidence")
+    evidence_count = len(evidence) if isinstance(evidence, list) else (1 if isinstance(evidence, str) and evidence.strip() else 0)
+    top_sources = _dedupe_ranked_pairs(item.get("top_sources"), limit=8)
+    top_destinations = _dedupe_ranked_pairs(item.get("top_destinations"), limit=8)
+    top_clients = _dedupe_ranked_pairs(item.get("top_clients"), limit=8)
+    top_servers = _dedupe_ranked_pairs(item.get("top_servers"), limit=8)
+    max_peer_count = 0
+    for pairs in (top_sources, top_destinations, top_clients, top_servers):
+        if pairs:
+            max_peer_count = max(max_peer_count, int(pairs[0][1]))
+
+    score = base
+    if evidence_count >= 2:
+        score += 1
+    if max_peer_count >= 3:
+        score += 1
+    if _parse_detail_count(details) >= 5:
+        score += 1
+
+    lowered_summary = summary.lower()
+    if any(token in lowered_summary for token in _HIGH_VALUE_SUMMARY_TOKENS):
+        score += 1
+
+    if summary in _NOISY_DETECTION_SUMMARIES:
+        score -= 2
+    if severity == "warning" and not evidence_count and max_peer_count <= 1 and _parse_detail_count(details) < 5:
+        score -= 1
+
+    return score
+
+
+def _merge_detection_items(primary: dict[str, object], secondary: dict[str, object]) -> dict[str, object]:
+    merged = dict(primary)
+
+    for key in ("top_sources", "top_destinations", "top_clients", "top_servers"):
+        merged[key] = _dedupe_ranked_pairs(list(primary.get(key, []) or []) + list(secondary.get(key, []) or []), limit=10)
+        if not merged[key]:
+            merged.pop(key, None)
+
+    evidence_values: list[str] = []
+    for value in (primary.get("evidence"), secondary.get("evidence")):
+        if isinstance(value, list):
+            evidence_values.extend(str(item) for item in value)
+        elif isinstance(value, str) and value.strip():
+            evidence_values.append(value)
+    deduped_evidence = _dedupe_evidence(evidence_values, limit=10)
+    if deduped_evidence:
+        merged["evidence"] = deduped_evidence
+    else:
+        merged.pop("evidence", None)
+
+    if not str(merged.get("details", "")).strip():
+        merged["details"] = str(secondary.get("details", "")).strip()
+
+    return merged
+
+
+def _curate_threat_detections(detections: list[dict[str, object]]) -> list[dict[str, object]]:
+    if not detections:
+        return []
+
+    curated: list[dict[str, object]] = []
+    merged_by_key: dict[tuple[str, str, str, str], dict[str, object]] = {}
+
+    for raw in detections:
+        if not isinstance(raw, dict):
+            continue
+
+        source = str(raw.get("source", "Threats")).strip() or "Threats"
+        severity = _normalize_severity(raw.get("severity", "info"))
+        summary = str(raw.get("summary", "")).strip()
+        details = str(raw.get("details", "")).strip()
+        if not summary:
+            continue
+
+        item: dict[str, object] = {
+            **raw,
+            "source": source,
+            "severity": severity,
+            "summary": summary,
+            "details": details,
+        }
+
+        item["top_sources"] = _dedupe_ranked_pairs(item.get("top_sources"), limit=10)
+        item["top_destinations"] = _dedupe_ranked_pairs(item.get("top_destinations"), limit=10)
+        item["top_clients"] = _dedupe_ranked_pairs(item.get("top_clients"), limit=10)
+        item["top_servers"] = _dedupe_ranked_pairs(item.get("top_servers"), limit=10)
+
+        for key in ("top_sources", "top_destinations", "top_clients", "top_servers"):
+            if not item[key]:
+                item.pop(key, None)
+
+        evidence_values: list[str] = []
+        evidence = item.get("evidence")
+        if isinstance(evidence, list):
+            evidence_values.extend(str(value) for value in evidence)
+        elif isinstance(evidence, str) and evidence.strip():
+            evidence_values.append(evidence)
+        deduped_evidence = _dedupe_evidence(evidence_values, limit=10)
+        if deduped_evidence:
+            item["evidence"] = deduped_evidence
+        else:
+            item.pop("evidence", None)
+
+        signal = _detection_signal_score(item)
+        if severity == "info":
+            continue
+        if severity == "warning" and signal < 3:
+            continue
+
+        key = (source, severity, summary, details)
+        existing = merged_by_key.get(key)
+        if existing is None:
+            merged_by_key[key] = item
+        else:
+            merged_by_key[key] = _merge_detection_items(existing, item)
+
+    curated.extend(merged_by_key.values())
+
+    severity_order = {"critical": 0, "high": 1, "warning": 2, "info": 3}
+    curated.sort(
+        key=lambda item: (
+            severity_order.get(str(item.get("severity", "info")).lower(), 99),
+            -_detection_signal_score(item),
+            str(item.get("source", "")),
+            str(item.get("summary", "")),
+        )
+    )
+
+    return curated[:60]
 
 
 def _filename_from_summary(summary_text: str) -> str:
@@ -873,6 +1283,15 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
         "ICCP": analyze_iccp(path, show_status=show_status),
     }
     ot_protocol_counts: Counter[str] = Counter()
+    ot_enip_enum_sources: Counter[str] = Counter()
+    ot_recon_error_sources: Counter[str] = Counter()
+    ot_server_error_sources: Counter[str] = Counter()
+    ot_service_error_counts: Counter[str] = Counter()
+    ot_artifact_kind_counts: Counter[str] = Counter()
+    ot_artifact_sources: Counter[str] = Counter()
+    ot_artifact_destinations: Counter[str] = Counter()
+    ot_artifact_evidence: list[str] = []
+    ot_sensitive_artifact_hits = 0
 
     ot_candidates: dict[str, list[object]] = {}
     for source, summary in ot_summaries.items():
@@ -1101,6 +1520,39 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
                 "top_destinations": [(candidate.dst_ip, candidate.count)],
             })
 
+        external_beacon_candidates = [
+            candidate
+            for candidate in beacon_summary.candidates
+            if _is_private_ip(candidate.src_ip)
+            and _is_public_ip(candidate.dst_ip)
+            and float(getattr(candidate, "score", 0.0) or 0.0) >= 0.72
+            and int(getattr(candidate, "count", 0) or 0) >= 15
+        ]
+        if external_beacon_candidates:
+            top = sorted(
+                external_beacon_candidates,
+                key=lambda item: (float(getattr(item, "score", 0.0) or 0.0), int(getattr(item, "count", 0) or 0)),
+                reverse=True,
+            )[:8]
+            beacon_evidence = []
+            for candidate in top:
+                beacon_evidence.append(
+                    f"{candidate.src_ip}->{candidate.dst_ip} {candidate.proto}:{candidate.src_port or '-'}->{candidate.dst_port or '-'} "
+                    f"count={candidate.count} interval={candidate.mean_interval:.2f}s jitter={candidate.jitter:.2f} score={candidate.score:.2f}"
+                )
+            detections.append({
+                "source": "C2",
+                "severity": "high" if top and float(getattr(top[0], "score", 0.0) or 0.0) >= 0.85 else "warning",
+                "summary": "Probable external beaconing/C2 activity",
+                "details": (
+                    f"{len(external_beacon_candidates)} periodic private->public beacon flow(s) identified "
+                    "with stable timing behavior."
+                ),
+                "top_sources": Counter(candidate.src_ip for candidate in top).most_common(6),
+                "top_destinations": Counter(candidate.dst_ip for candidate in top).most_common(6),
+                "evidence": _dedupe_evidence(beacon_evidence, limit=8),
+            })
+
     # Suspicious file download detection
     suspicious_exts = {
         ".exe", ".dll", ".ps1", ".bat", ".vbs", ".js", ".scr",
@@ -1189,6 +1641,48 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             "top_destinations": smb1_destinations.most_common(10),
         })
 
+    suspicious_hash_evidence: list[str] = []
+    suspicious_hash_sources: Counter[str] = Counter()
+    suspicious_hash_destinations: Counter[str] = Counter()
+    suspicious_hash_values: set[str] = set()
+    for artifact in files_summary.artifacts:
+        file_type = str(getattr(artifact, "file_type", "") or "").upper()
+        filename = str(getattr(artifact, "filename", "") or "")
+        lowered_name = filename.lower()
+        ext = f".{lowered_name.rsplit('.', 1)[-1]}" if "." in lowered_name else ""
+        is_suspicious_type = (
+            file_type in {"EXE/DLL", "ARCHIVE", "ZIP/OFFICE"}
+            or ext in suspicious_exts
+            or "extracted_pe" in lowered_name
+        )
+        hash_value = str(getattr(artifact, "sha256", "") or getattr(artifact, "md5", "") or "").lower()
+        if not is_suspicious_type or not hash_value:
+            continue
+        suspicious_hash_values.add(hash_value)
+        src_ip = str(getattr(artifact, "src_ip", "") or "")
+        dst_ip = str(getattr(artifact, "dst_ip", "") or "")
+        if src_ip:
+            suspicious_hash_sources[src_ip] += 1
+        if dst_ip:
+            suspicious_hash_destinations[dst_ip] += 1
+        if len(suspicious_hash_evidence) < 12:
+            suspicious_hash_evidence.append(
+                f"{filename or '-'} sha={hash_value[:20]}... type={file_type or '-'} {src_ip or '?'}->{dst_ip or '?'}"
+            )
+    if suspicious_hash_values:
+        detections.append({
+            "source": "Files",
+            "severity": "high" if len(suspicious_hash_values) >= 5 else "warning",
+            "summary": "Suspicious file hash IOC artifacts",
+            "details": (
+                f"{len(suspicious_hash_values)} unique file hash IOC candidate(s) captured from "
+                f"{sum(suspicious_hash_sources.values())} suspicious artifact event(s)."
+            ),
+            "top_sources": suspicious_hash_sources.most_common(6),
+            "top_destinations": suspicious_hash_destinations.most_common(6),
+            "evidence": _dedupe_evidence(suspicious_hash_evidence, limit=10),
+        })
+
     reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
 
     src_counts: Counter[str] = Counter()
@@ -1208,6 +1702,7 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     outbound_public_dests_by_src: dict[str, set[str]] = defaultdict(set)
     suspicious_payload_sources: Counter[str] = Counter()
     command_markers: dict[str, set[str]] = defaultdict(set)
+    credential_exposure_sources: Counter[str] = Counter()
 
     safety_sources: Counter[str] = Counter()
     safety_destinations: Counter[str] = Counter()
@@ -1222,6 +1717,7 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
     last_seen: Optional[float] = None
     total_packets = 0
     control_command_total = 0
+    external_beacon_candidates: list[object] = []
 
     try:
         for pkt in reader:
@@ -1528,6 +2024,45 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
                         limit=8,
                     ),
                 })
+        if hasattr(summary_obj, "source_enip_enum_commands"):
+            enum_enip = getattr(summary_obj, "source_enip_enum_commands", Counter())
+            if isinstance(enum_enip, Counter) and enum_enip:
+                for ip_value, count in enum_enip.items():
+                    ot_enip_enum_sources[str(ip_value)] += int(count)
+        if hasattr(summary_obj, "source_recon_commands"):
+            recon_counts = getattr(summary_obj, "source_recon_commands", Counter())
+            if isinstance(recon_counts, Counter) and recon_counts:
+                for ip_value, count in recon_counts.items():
+                    ot_recon_error_sources[str(ip_value)] += int(count)
+        if hasattr(summary_obj, "server_error_responses"):
+            server_errors = getattr(summary_obj, "server_error_responses", Counter())
+            if isinstance(server_errors, Counter) and server_errors:
+                for ip_value, count in server_errors.items():
+                    ot_server_error_sources[str(ip_value)] += int(count)
+        if hasattr(summary_obj, "service_error_counts"):
+            service_errors = getattr(summary_obj, "service_error_counts", Counter())
+            if isinstance(service_errors, Counter) and service_errors:
+                for service_name, count in service_errors.items():
+                    ot_service_error_counts[f"{source}:{service_name}"] += int(count)
+        artifacts = getattr(summary_obj, "artifacts", None)
+        if isinstance(artifacts, list) and artifacts:
+            for artifact in artifacts[:80]:
+                kind = str(getattr(artifact, "kind", "") or "artifact")
+                detail = str(getattr(artifact, "detail", "") or "")
+                src = str(getattr(artifact, "src", "") or "")
+                dst = str(getattr(artifact, "dst", "") or "")
+                ot_artifact_kind_counts[f"{source}:{kind}"] += 1
+                if src:
+                    ot_artifact_sources[src] += 1
+                if dst:
+                    ot_artifact_destinations[dst] += 1
+                if len(ot_artifact_evidence) < 24:
+                    ot_artifact_evidence.append(
+                        f"{source}:{kind} {src or '?'}->{dst or '?'} {detail[:120] or '-'}"
+                    )
+                lowered_blob = f"{kind} {detail}".lower()
+                if any(token in lowered_blob for token in OT_SENSITIVE_ARTIFACT_TOKENS):
+                    ot_sensitive_artifact_hits += 1
 
     if ot_protocol_counts:
         proto_text = ", ".join(f"{name} ({count})" for name, count in ot_protocol_counts.most_common(8))
@@ -1536,6 +2071,68 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             "severity": "info",
             "summary": "OT protocol activity observed",
             "details": proto_text or "-",
+        })
+
+    if ot_enip_enum_sources:
+        enip_enum_total = sum(ot_enip_enum_sources.values())
+        detections.append({
+            "source": "OT/ICS",
+            "severity": "high" if enip_enum_total >= 80 else "warning",
+            "summary": "ENIP session/discovery reconnaissance telemetry",
+            "details": f"{enip_enum_total} ENIP discovery/session command(s) observed across OT analyzers.",
+            "top_sources": ot_enip_enum_sources.most_common(10),
+        })
+
+    if ot_recon_error_sources:
+        recon_total = sum(ot_recon_error_sources.values())
+        detections.append({
+            "source": "OT/ICS",
+            "severity": "high" if recon_total >= 40 else "warning",
+            "summary": "OT reconnaissance error telemetry observed",
+            "details": (
+                f"{recon_total} recon-style OT protocol error response(s) detected "
+                "(path/service/attribute errors)."
+            ),
+            "top_sources": ot_recon_error_sources.most_common(10),
+            "evidence": _dedupe_evidence(
+                [f"{name}({count})" for name, count in ot_service_error_counts.most_common(10)],
+                limit=10,
+            ),
+        })
+
+    if ot_server_error_sources:
+        server_error_total = sum(ot_server_error_sources.values())
+        detections.append({
+            "source": "OT/ICS",
+            "severity": "high" if server_error_total >= 60 else "warning",
+            "summary": "OT server error response surge",
+            "details": (
+                f"{server_error_total} OT server-side failed responses recorded; "
+                "possible malformed command abuse or reconnaissance."
+            ),
+            "top_sources": ot_server_error_sources.most_common(10),
+            "evidence": _dedupe_evidence(
+                [f"{name}({count})" for name, count in ot_service_error_counts.most_common(8)],
+                limit=8,
+            ),
+        })
+
+    if ot_artifact_kind_counts:
+        artifact_total = sum(ot_artifact_kind_counts.values())
+        detections.append({
+            "source": "OT/ICS",
+            "severity": "high" if ot_sensitive_artifact_hits >= 3 else "warning",
+            "summary": "OT/ICS artifact and IOC trail observed",
+            "details": (
+                f"{artifact_total} OT artifact event(s) across {len(ot_artifact_kind_counts)} kind bucket(s); "
+                f"{ot_sensitive_artifact_hits} sensitive artifact hit(s)."
+            ),
+            "top_sources": ot_artifact_sources.most_common(8),
+            "top_destinations": ot_artifact_destinations.most_common(8),
+            "evidence": _dedupe_evidence(
+                [f"{name}({count})" for name, count in ot_artifact_kind_counts.most_common(10)] + ot_artifact_evidence,
+                limit=12,
+            ),
         })
 
     if public_ot_pairs:
@@ -1569,6 +2166,29 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             "details": f"{sum(control_commands.values())} control-like command(s) detected.",
             "evidence": _dedupe_evidence(top_cmds, limit=10),
         })
+
+    if public_ot_pairs and control_commands:
+        exposed_pairs = [
+            (proto, src, dst)
+            for proto, src, dst in public_ot_pairs
+            if _is_public_ip(src) or _is_public_ip(dst)
+        ]
+        if exposed_pairs:
+            top_pairs = sorted(exposed_pairs)[:10]
+            detections.append({
+                "source": "OT/ICS",
+                "severity": "critical" if control_command_total >= 10 else "high",
+                "summary": "Potential internet-exposed OT control activity",
+                "details": (
+                    f"{len(exposed_pairs)} public-facing OT flow(s) coincide with "
+                    f"{control_command_total} control/program operation(s)."
+                ),
+                "evidence": _dedupe_evidence(
+                    [f"{proto} {src}->{dst}" for proto, src, dst in top_pairs]
+                    + [f"{cmd}({count})" for cmd, count in control_commands.most_common(6)],
+                    limit=10,
+                ),
+            })
 
     vertical_scan_hits: list[tuple[str, str, int]] = []
     for (src_ip, dst_ip), ports in pair_ports.items():
@@ -1670,6 +2290,7 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
 
     if creds_summary.hits:
         cred_sources: Counter[str] = Counter(hit.src_ip for hit in creds_summary.hits)
+        credential_exposure_sources.update(cred_sources)
         chain_hits: list[tuple[str, int, int, int]] = []
         for src, cred_count in cred_sources.items():
             lateral_count = len(lateral_targets.get(src, set()))
@@ -1715,6 +2336,11 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             "details": f"{len(safety_pairs)} safety flow(s) observed across {len(safety_services)} service(s).",
             "top_sources": safety_sources.most_common(6),
             "top_destinations": safety_destinations.most_common(6),
+            "evidence": _dedupe_evidence(
+                [f"{service}({count})" for service, count in safety_services.most_common(6)]
+                + [f"{src}->{dst}" for src, dst in sorted(safety_pairs)[:6]],
+                limit=8,
+            ),
         })
 
     if udp_target_counts:
@@ -1802,12 +2428,158 @@ def analyze_threats(path: Path, show_status: bool = True) -> ThreatSummary:
             "evidence": _dedupe_evidence([f"{src} marker_hits={count}" for src, count in suspicious_payload_sources.most_common(10)], limit=10),
         })
 
+    if obfuscation_summary.artifacts:
+        obf_ioc_sources: Counter[str] = Counter()
+        obf_ioc_destinations: Counter[str] = Counter()
+        obf_ioc_kind_counts: Counter[str] = Counter()
+        obf_ioc_evidence: list[str] = []
+        attack_artifact_hits = 0
+        for artifact in obfuscation_summary.artifacts:
+            kind = str(getattr(artifact, "kind", "") or "").lower()
+            if kind not in OBFUSCATION_IOC_KINDS and kind != "attack":
+                continue
+            value = str(getattr(artifact, "value", "") or "")
+            if not value:
+                continue
+            src = str(getattr(artifact, "src", "") or "")
+            dst = str(getattr(artifact, "dst", "") or "")
+            confidence = str(getattr(artifact, "confidence", "") or "-")
+            obf_ioc_kind_counts[kind] += 1
+            if src:
+                obf_ioc_sources[src] += 1
+            if dst:
+                obf_ioc_destinations[dst] += 1
+            if kind == "attack":
+                attack_artifact_hits += 1
+            if len(obf_ioc_evidence) < 12:
+                obf_ioc_evidence.append(
+                    f"{kind}:{value} conf={confidence} {src or '?'}->{dst or '?'}"
+                )
+        if obf_ioc_kind_counts:
+            detections.append({
+                "source": "Obfuscation",
+                "severity": "high" if attack_artifact_hits >= 3 else "warning",
+                "summary": "Recovered IOC/attack artifacts from encoded payloads",
+                "details": (
+                    f"{sum(obf_ioc_kind_counts.values())} IOC/attack artifact(s) recovered "
+                    f"across {len(obf_ioc_kind_counts)} artifact type(s)."
+                ),
+                "top_sources": obf_ioc_sources.most_common(6),
+                "top_destinations": obf_ioc_destinations.most_common(6),
+                "evidence": _dedupe_evidence(
+                    [f"{name}({count})" for name, count in obf_ioc_kind_counts.most_common(8)] + obf_ioc_evidence,
+                    limit=10,
+                ),
+            })
+
+    if dns_summary.vt_results:
+        vt_suspicious: list[dict[str, object]] = []
+        for domain, result in dns_summary.vt_results.items():
+            malicious = int(result.get("malicious", 0) or 0)
+            suspicious = int(result.get("suspicious", 0) or 0)
+            if malicious > 0 or suspicious > 0:
+                vt_suspicious.append({
+                    "domain": domain,
+                    "malicious": malicious,
+                    "suspicious": suspicious,
+                    "reputation": result.get("reputation", 0),
+                })
+        if vt_suspicious:
+            vt_suspicious.sort(
+                key=lambda item: (int(item["malicious"]), int(item["suspicious"])),
+                reverse=True,
+            )
+            detections.append({
+                "source": "DNS/Intel",
+                "severity": "critical" if int(vt_suspicious[0]["malicious"]) > 0 else "warning",
+                "summary": "Threat-intel positive DNS IOC domains",
+                "details": (
+                    f"{len(vt_suspicious)} queried domain(s) scored suspicious/malicious by VT-style intelligence."
+                ),
+                "evidence": _dedupe_evidence(
+                    [
+                        f"{item['domain']} mal={item['malicious']} susp={item['suspicious']} rep={item['reputation']}"
+                        for item in vt_suspicious[:10]
+                    ],
+                    limit=10,
+                ),
+            })
+
+    source_stages: dict[str, set[str]] = defaultdict(set)
+    for src, _dst, _ports in vertical_scan_hits:
+        source_stages[src].add("Recon")
+    for src, _targets, _ports in horizontal_scan_hits:
+        source_stages[src].add("Recon")
+    for src, count in dns_tunnel_sources.items():
+        if count >= 10:
+            source_stages[src].add("Recon")
+    for src, _count in ot_enip_enum_sources.items():
+        source_stages[src].add("Recon")
+    for src, _count in ot_recon_error_sources.items():
+        source_stages[src].add("Recon")
+    for src, _dst, _svc, _count in brute_force_hits:
+        source_stages[src].add("Credential")
+    for src, _dst, _svc, _count in auth_failure_hits:
+        source_stages[src].add("Credential")
+    for src, _count in credential_exposure_sources.items():
+        source_stages[src].add("Credential")
+    for src, _targets in lateral_hits:
+        source_stages[src].add("Lateral")
+    for src, _svc_count, _targets, _svc_detail in lateral_chain_hits:
+        source_stages[src].add("Lateral")
+    for src, _count in suspicious_payload_sources.items():
+        source_stages[src].add("Execution")
+    for src, _count in command_chain_hits:
+        source_stages[src].add("Execution")
+    for candidate in external_beacon_candidates:
+        source_stages[str(getattr(candidate, "src_ip", ""))].add("C2")
+    for src, _dst, _bytes in exfil_pairs:
+        source_stages[src].add("Exfil")
+    for src, _dst_count in broad_egress:
+        source_stages[src].add("Exfil")
+
+    multi_stage_hits = [
+        (src, sorted(stages))
+        for src, stages in source_stages.items()
+        if len(stages) >= 3
+    ]
+    if multi_stage_hits:
+        top_multi = sorted(multi_stage_hits, key=lambda item: len(item[1]), reverse=True)[:8]
+        critical_combo = {"Credential", "Execution", "Lateral"}
+        severity = "high"
+        if any(critical_combo.issubset(set(stages)) for _src, stages in top_multi):
+            severity = "critical"
+        detections.append({
+            "source": "Correlation",
+            "severity": severity,
+            "summary": "Multi-stage intrusion behavior correlation",
+            "details": (
+                f"{len(multi_stage_hits)} source(s) exhibited >=3 attack stages "
+                "(recon/credential/execution/lateral/C2/exfil)."
+            ),
+            "top_sources": [(src, len(stages)) for src, stages in top_multi],
+            "evidence": _dedupe_evidence(
+                [f"{src} stages={','.join(stages)} markers={','.join(sorted(command_markers.get(src, set())))}" for src, stages in top_multi],
+                limit=8,
+            ),
+        })
+
+    detections = _curate_threat_detections(detections)
+
     risk_score, risk_findings = _ot_risk_posture_from_detections(
         detections,
         public_ot_flows=len(public_ot_pairs),
         control_hits=control_command_total,
     )
-    storyline = _threats_storyline(detections, dict(ot_protocol_counts), risk_score, risk_findings)
+    storyline = _threats_storyline(
+        detections,
+        dict(ot_protocol_counts),
+        risk_score,
+        risk_findings,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        duration_seconds=duration_seconds,
+    )
 
     return ThreatSummary(
         path=path,

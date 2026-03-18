@@ -553,10 +553,83 @@ def analyze_tcp(
     if outbound_flow_bytes:
         top_outbound = outbound_flow_bytes.most_common(1)[0]
         if top_outbound[1] >= 10_000_000:
+            flow_src, flow_dst = top_outbound[0]
+            flow_bytes = int(top_outbound[1])
+            flow_conversations = [
+                convo for convo in conversation_rows
+                if convo.src_ip == flow_src and convo.dst_ip == flow_dst
+            ]
+            flow_packets = sum(convo.packets for convo in flow_conversations)
+            flow_port_counts: Counter[int] = Counter(convo.dst_port for convo in flow_conversations)
+
+            flow_first_values = [
+                float(convo.first_seen)
+                for convo in flow_conversations
+                if convo.first_seen is not None
+            ]
+            flow_last_values = [
+                float(convo.last_seen)
+                for convo in flow_conversations
+                if convo.last_seen is not None
+            ]
+            flow_first_seen = min(flow_first_values) if flow_first_values else None
+            flow_last_seen = max(flow_last_values) if flow_last_values else None
+            flow_duration = None
+            if flow_first_seen is not None and flow_last_seen is not None:
+                flow_duration = max(0.0, flow_last_seen - flow_first_seen)
+
+            evidence: list[str] = []
+            if flow_port_counts:
+                top_ports = ", ".join(
+                    f"{port}({count})" for port, count in flow_port_counts.most_common(8)
+                )
+                evidence.append(f"ports={top_ports}")
+            if flow_first_seen is not None and flow_last_seen is not None:
+                evidence.append(
+                    f"window={flow_first_seen:.3f}->{flow_last_seen:.3f} duration={flow_duration:.1f}s"
+                )
+
+            http_flow_downloads = [
+                entry for entry in getattr(http_summary, "downloads", [])
+                if str(entry.get("src", "")) == flow_src and str(entry.get("dst", "")) == flow_dst
+            ]
+            for entry in http_flow_downloads[:6]:
+                filename = str(entry.get("filename", "-") or "-")
+                content_type = str(entry.get("content_type", "-") or "-")
+                size_value = entry.get("size")
+                size_text = str(size_value) if isinstance(size_value, int) and size_value >= 0 else "-"
+                evidence.append(f"http_download {filename} size={size_text} ctype={content_type}")
+
+            file_flow_artifacts = [
+                artifact for artifact in getattr(file_summary, "artifacts", [])
+                if str(getattr(artifact, "src_ip", "")) == flow_src
+                and str(getattr(artifact, "dst_ip", "")) == flow_dst
+            ]
+            for artifact in file_flow_artifacts[:6]:
+                filename = str(getattr(artifact, "filename", "-") or "-")
+                file_type = str(getattr(artifact, "file_type", "UNKNOWN") or "UNKNOWN")
+                protocol = str(getattr(artifact, "protocol", "-") or "-")
+                size_bytes = getattr(artifact, "size_bytes", None)
+                size_text = str(size_bytes) if isinstance(size_bytes, int) and size_bytes >= 0 else "-"
+                evidence.append(
+                    f"file_artifact {protocol} {filename} type={file_type} size={size_text}"
+                )
+
             detections.append({
                 "severity": "high",
                 "summary": "Large outbound TCP transfer",
-                "details": f"{top_outbound[0][0]} -> {top_outbound[0][1]} sent {top_outbound[1]} bytes.",
+                "details": f"{flow_src} -> {flow_dst} sent {flow_bytes} bytes.",
+                "top_sources": [(flow_src, flow_packets or 1)],
+                "top_destinations": [(flow_dst, flow_packets or 1)],
+                "transfer_src": flow_src,
+                "transfer_dst": flow_dst,
+                "transfer_bytes": flow_bytes,
+                "transfer_packets": flow_packets,
+                "transfer_ports": flow_port_counts.most_common(10),
+                "transfer_first_seen": flow_first_seen,
+                "transfer_last_seen": flow_last_seen,
+                "transfer_duration": flow_duration,
+                "evidence": evidence[:10],
             })
 
     artifacts: list[str] = []

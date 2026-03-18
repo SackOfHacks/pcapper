@@ -35,7 +35,7 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
-## Current Release: v1.4.5
+## Current Release: v1.5.0
 
 Latest additions in this release:
 - TCP stream carving (`--carve`) with signature-based extraction.

@@ -774,36 +774,28 @@ def analyze_tls(
 
     missing_sni_total = client_hellos - sum(sni_counts.values())
     missing_sni_no_ech = max(0, missing_sni_total - ech_sni_missing)
-    if ech_hellos:
+    if client_hellos >= 20 and missing_sni_no_ech >= 10 and (missing_sni_no_ech / max(client_hellos, 1)) >= 0.35:
         detections.append({
-            "severity": "info",
-            "summary": "ECH (Encrypted ClientHello) observed",
-            "details": f"{ech_hellos} client hello(s) advertise ECH.",
-        })
-    if client_hellos and missing_sni_no_ech > 0:
-        detections.append({
-            "severity": "info",
-            "summary": "TLS handshakes without SNI",
-            "details": f"{missing_sni_no_ech} client hello(s) missing SNI (excluding ECH).",
-        })
-    if ech_sni_missing:
-        detections.append({
-            "severity": "info",
-            "summary": "SNI hidden by ECH",
-            "details": f"{ech_sni_missing} client hello(s) omitted SNI but advertised ECH.",
+            "severity": "warning",
+            "summary": "High rate of TLS handshakes without SNI",
+            "details": f"{missing_sni_no_ech}/{client_hellos} client hello(s) missing SNI (excluding ECH).",
         })
 
-    if client_hellos and server_hellos < client_hellos:
+    if client_hellos >= 20 and server_hellos < client_hellos:
         failed = client_hellos - server_hellos
         ratio = failed / client_hellos
-        severity = "high" if ratio >= 0.7 else ("warning" if ratio >= 0.3 and failed >= 5 else "info")
-        detections.append({
-            "severity": severity,
-            "summary": "TLS handshake failures",
-            "details": f"{failed} client hello(s) without server hello response.",
-        })
+        if failed >= 10 and ratio >= 0.35:
+            severity = "high" if ratio >= 0.65 else "warning"
+            detections.append({
+                "severity": severity,
+                "summary": "TLS handshake failures",
+                "details": f"{failed}/{client_hellos} client hello(s) without server hello response.",
+            })
 
-    high_entropy_sni = [sni for sni, count in sni_counts.items() if len(sni) >= 12 and _shannon_entropy(sni) >= 3.5]
+    high_entropy_sni = [
+        sni for sni, count in sni_counts.items()
+        if count >= 3 and len(sni) >= 18 and _shannon_entropy(sni) >= 3.85
+    ]
     if high_entropy_sni:
         detections.append({
             "severity": "warning",
@@ -811,7 +803,10 @@ def analyze_tls(
             "details": ", ".join(high_entropy_sni[:5]),
         })
 
-    suspicious_sni = [sni for sni in sni_counts if any(sni.endswith(tld) for tld in SUSPICIOUS_TLDS)]
+    suspicious_sni = [
+        sni for sni, count in sni_counts.items()
+        if count >= 2 and any(sni.endswith(tld) for tld in SUSPICIOUS_TLDS)
+    ]
     if suspicious_sni:
         detections.append({
             "severity": "high",
@@ -819,19 +814,22 @@ def analyze_tls(
             "details": ", ".join(suspicious_sni[:5]),
         })
 
-    if sni_ip_literals:
+    if len(sni_ip_literals) >= 2:
         detections.append({
             "severity": "warning",
             "summary": "SNI uses IP literal",
             "details": ", ".join(sorted(sni_ip_literals)[:5]),
         })
 
-    non_standard_ports = [port for port in server_ports if port not in TLS_PORTS]
+    non_standard_ports = [
+        (port, count) for port, count in server_ports.items()
+        if port not in TLS_PORTS and count >= 20
+    ]
     if non_standard_ports:
-        ports_text = ", ".join(str(port) for port in sorted(non_standard_ports)[:8])
+        ports_text = ", ".join(f"{port}({count})" for port, count in sorted(non_standard_ports)[:8])
         detections.append({
-            "severity": "info",
-            "summary": "TLS on non-standard ports",
+            "severity": "warning",
+            "summary": "Significant TLS on non-standard ports",
             "details": f"Ports: {ports_text}",
         })
 
@@ -843,40 +841,24 @@ def analyze_tls(
             "details": top_weak,
         })
 
-    if not alpn_counts and client_hellos:
-        detections.append({
-            "severity": "info",
-            "summary": "No ALPN advertised",
-            "details": "TLS handshakes missing ALPN hints (could indicate legacy clients).",
-        })
-    if any(alpn.startswith("h2") for alpn in alpn_counts):
-        detections.append({
-            "severity": "info",
-            "summary": "HTTP/2 ALPN observed",
-            "details": "TLS ALPN indicates HTTP/2 usage (h2).",
-        })
-    if any(alpn.startswith("h3") for alpn in alpn_counts):
-        detections.append({
-            "severity": "info",
-            "summary": "HTTP/3 ALPN observed",
-            "details": "TLS ALPN indicates HTTP/3/QUIC usage (h3).",
-        })
-
     if cert_summary.self_signed:
+        sev = "warning" if len(cert_summary.self_signed) >= 3 else "info"
         detections.append({
-            "severity": "warning",
+            "severity": sev,
             "summary": "Self-signed TLS certificates observed",
             "details": f"Count: {len(cert_summary.self_signed)}",
         })
     if cert_summary.expired:
+        sev = "high" if len(cert_summary.expired) >= 3 else "warning"
         detections.append({
-            "severity": "warning",
+            "severity": sev,
             "summary": "Expired TLS certificates observed",
             "details": f"Count: {len(cert_summary.expired)}",
         })
     if cert_summary.weak_keys:
+        sev = "high" if len(cert_summary.weak_keys) >= 2 else "warning"
         detections.append({
-            "severity": "warning",
+            "severity": sev,
             "summary": "Weak TLS certificate keys",
             "details": f"Count: {len(cert_summary.weak_keys)}",
         })
