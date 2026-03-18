@@ -11,8 +11,20 @@ from pcapper.goose import analyze_goose
 from pcapper.ethercat import analyze_ethercat
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "ot"
+REQUIRED_FIXTURES = [
+    "modbus_rw.pcap",
+    "cip_tag_rw.pcap",
+    "profinet_dcp.pcap",
+    "goose_sequence.pcap",
+    "ethercat_mailbox.pcap",
+]
+MISSING_FIXTURES = [name for name in REQUIRED_FIXTURES if not (FIXTURES / name).is_file()]
 
 
+@unittest.skipIf(
+    bool(MISSING_FIXTURES),
+    f"Missing OT fixture pcaps under {FIXTURES}: {', '.join(MISSING_FIXTURES)}",
+)
 class TestOTFixtures(unittest.TestCase):
     def test_modbus_fixture(self) -> None:
         summary = analyze_modbus(FIXTURES / "modbus_rw.pcap", show_status=False)

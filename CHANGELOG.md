@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 1.5.0 — 2026-02-27
+### Changed
+- Release metadata updated to `v1.5.0` across package/docs for branch preparation.
+
 ## 1.4.5 — 2026-02-27
 ### Added
 - TCP stream carving with signature-based extraction and configurable limits (`--carve`).

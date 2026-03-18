@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 import ipaddress
 
 from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol

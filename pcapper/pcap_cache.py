@@ -431,6 +431,9 @@ def load_filtered_packets(
     reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
     status = build_statusbar(path, enabled=show_status)
     stream = _reader_stream(reader)
+    linktype = getattr(reader, "linktype", None)
+    snaplen = getattr(reader, "snaplen", None)
+    interfaces = getattr(reader, "interfaces", None)
     packets: list[object] = []
     try:
         for pkt in reader:
@@ -453,6 +456,10 @@ def load_filtered_packets(
     finally:
         status.finish()
         reader.close()
+
+    linktype = getattr(reader, "linktype", linktype)
+    snaplen = getattr(reader, "snaplen", snaplen)
+    interfaces = getattr(reader, "interfaces", interfaces)
 
     meta = _finalize_meta(
         path=path,

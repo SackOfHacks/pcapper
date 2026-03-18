@@ -272,6 +272,7 @@ def merge_rdp_summaries(summaries: list[RdpSummary] | tuple[RdpSummary, ...] | s
     anomalies: list[dict[str, object]] = []
     artifacts: list[str] = []
     errors: list[str] = []
+    analysis_notes: list[str] = []
 
     for summary in summary_list:
         total_packets += summary.total_packets
