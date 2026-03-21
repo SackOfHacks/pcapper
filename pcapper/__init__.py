@@ -9,7 +9,7 @@ import numbers
 from typing import Any
 
 __all__ = ["__version__"]
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 
 def _stable_key(value: Any) -> tuple[int, Any]:

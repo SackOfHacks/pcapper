@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Protocol
 
 from .models import PcapSummary
 from .utils import format_bytes_as_mb, format_duration, format_speed_bps, format_ts, sparkline, hexdump, decode_payload, safe_float
-from .coloring import danger, header, label, muted, ok, warn, highlight, orange, danger_bg
+from .coloring import danger, header, label, muted, ok, warn, highlight, orange, danger_bg, warn_bg
 from .vlan import VlanSummary, VlanStat
 from .icmp import IcmpSummary
 from .dns import DnsSummary, PUBLIC_DNS_RESOLVERS
@@ -6414,6 +6414,110 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
     lines.append(_format_kv("End", format_ts(summary.last_seen)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
 
+    def _exfil_verdict() -> tuple[str, str, list[str], int]:
+        reasons: list[str] = []
+        score = 0
+
+        total = int(summary.total_bytes or 0)
+        outbound = int(summary.outbound_bytes or 0)
+        outbound_ratio = (outbound / max(total, 1)) if total > 0 else 0.0
+        if outbound >= 5_000_000:
+            score += 2
+            reasons.append(f"Outbound volume {format_bytes_as_mb(outbound)} exceeds high-risk threshold")
+        if total >= 2_000_000 and outbound_ratio >= 0.60:
+            score += 1
+            reasons.append(f"Outbound ratio is {outbound_ratio * 100:.1f}% of capture bytes")
+
+        if summary.outbound_flows:
+            top = summary.outbound_flows[0]
+            top_bytes = int(top.get("bytes", 0) or 0)
+            if top_bytes >= 5_000_000:
+                score += 2
+                reasons.append(
+                    f"Dominant outbound flow {top.get('src')}->{top.get('dst')} carried {format_bytes_as_mb(top_bytes)}"
+                )
+
+        if summary.top_external_dsts and outbound >= 3_000_000:
+            dst, dst_bytes = summary.top_external_dsts.most_common(1)[0]
+            share = dst_bytes / max(outbound, 1)
+            if share >= 0.70:
+                score += 1
+                reasons.append(
+                    f"{dst} received {share * 100:.1f}% of outbound bytes ({format_bytes_as_mb(dst_bytes)})"
+                )
+
+        if summary.dns_tunnel_suspects:
+            score += 2
+            reasons.append(f"DNS tunneling heuristics triggered by {len(summary.dns_tunnel_suspects)} source(s)")
+        if summary.http_post_suspects:
+            score += 1
+            reasons.append(f"Large HTTP POST channels detected ({len(summary.http_post_suspects)})")
+        if summary.file_exfil_suspects:
+            high_risk_files = [item for item in summary.file_exfil_suspects if int(item.get("risk_score", 0) or 0) >= 5]
+            score += 2 if high_risk_files else 1
+            reasons.append(
+                f"Suspicious file transfer suspects detected ({len(summary.file_exfil_suspects)}; high-risk={len(high_risk_files)})"
+            )
+        if summary.ot_flows:
+            large_ot = [item for item in summary.ot_flows if int(item.get("bytes", 0) or 0) >= 1_000_000]
+            if large_ot:
+                score += 1
+                reasons.append(f"Large OT/ICS control-port transfers observed ({len(large_ot)})")
+
+        if score >= 7:
+            verdict = "YES - exfiltration activity is likely occurring in this PCAP based on corroborated indicators."
+            confidence = "High"
+        elif score >= 5:
+            verdict = "LIKELY - exfiltration activity is suspected with multiple supporting indicators."
+            confidence = "Medium"
+        elif score >= 3:
+            verdict = "POSSIBLE - weak-to-moderate exfiltration indicators are present."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - current heuristics do not show convincing exfiltration activity."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence exfiltration heuristic crossed its threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _exfil_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Reasons:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Protocol Checks"))
+
+    protocol_labels = [
+        ("dns", "DNS"),
+        ("http_https", "HTTP/HTTPS"),
+        ("icmp", "ICMP"),
+        ("ftp", "FTP"),
+        ("smtp", "SMTP"),
+        ("websockets", "WebSockets"),
+        ("ntp", "NTP"),
+    ]
+    protocol_checks = getattr(summary, "protocol_exfil_checks", {}) or {}
+    for key, label_text in protocol_labels:
+        evidence = protocol_checks.get(key, []) if isinstance(protocol_checks, dict) else []
+        lines.append(label(f"{label_text} Exfil Check"))
+        if evidence:
+            lines.append(warn(f"Yes, there is evidence for {label_text} exfil, here is the evidence:"))
+            for item in evidence[:_limit_value(8 if verbose else 5)]:
+                lines.append(muted(f"- {_redact_in_text(str(item))}"))
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text} exfil in this capture."))
+
     if summary.outbound_flows:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Outbound Flows (Private -> Public)"))
@@ -6433,6 +6537,10 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
                 f"{format_bytes_as_mb(int(bytes_per_second * 60))}/min" if bytes_per_second > 0 else "-",
             ])
         lines.append(_format_table(rows))
+        if summary.top_external_dsts:
+            top_dst, top_bytes = summary.top_external_dsts.most_common(1)[0]
+            share = (top_bytes / max(int(summary.outbound_bytes or 0), 1)) * 100.0
+            lines.append(muted(f"Primary external destination: {top_dst} ({format_bytes_as_mb(top_bytes)}, {share:.1f}% of outbound)"))
 
     if getattr(summary, "internal_flows", None):
         lines.append(SUBSECTION_BAR)
@@ -6491,18 +6599,22 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
 
     if summary.http_post_suspects:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Large HTTP POST Payloads"))
-        rows = [["Src", "Dst", "Host", "URI", "Bytes", "Requests", "Mode", "Content-Type"]]
+        lines.append(header("Large HTTP POST Payloads (Evidence)"))
+        rows = [["Src", "Dst", "Host", "URI", "Bytes", "Requests", "Mode", "Content-Type", "Assessment"]]
         for item in summary.http_post_suspects[:limit]:
+            bytes_val = int(item.get("bytes", 0) or 0)
+            req_val = int(item.get("requests", 1) or 1)
+            assessment = "high" if bytes_val >= 5_000_000 or req_val >= 30 else "medium"
             rows.append([
                 str(item.get("src", "-")),
                 str(item.get("dst", "-")),
                 str(item.get("host", "-")),
                 str(item.get("uri", "-")),
-                format_bytes_as_mb(int(item.get("bytes", 0))) if str(item.get("bytes", "")).isdigit() else str(item.get("bytes", "-")),
-                str(item.get("requests", 1)),
+                format_bytes_as_mb(bytes_val),
+                str(req_val),
                 str(item.get("mode", "single")),
                 str(item.get("content_type", "-")),
+                assessment,
             ])
         lines.append(_format_table(rows))
 
@@ -6521,25 +6633,31 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
 
     if getattr(summary, "file_exfil_suspects", None):
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Potential Exfil File Transfers"))
-        rows = [["Src", "Dst", "Proto", "File", "Size", "Packet", "Note"]]
+        lines.append(header("Potential Exfil File Transfers (Evidence)"))
+        rows = [["Src", "Dst", "Proto", "File", "Type", "Size", "Risk", "Packet", "Note"]]
         for item in summary.file_exfil_suspects[:limit]:
             size_val = item.get("size")
+            risk_score = int(item.get("risk_score", 0) or 0)
+            risk_text = "high" if risk_score >= 5 else "medium" if risk_score >= 3 else "low"
+            reasons = item.get("risk_reasons", [])
+            reason_text = ", ".join(str(r) for r in reasons[:3]) if isinstance(reasons, list) and reasons else "-"
             rows.append([
                 str(item.get("src", "-")),
                 str(item.get("dst", "-")),
                 str(item.get("protocol", "-")),
                 str(item.get("filename", "-")),
+                str(item.get("file_type", "-") or "-"),
                 format_bytes_as_mb(int(size_val)) if isinstance(size_val, int) else "-",
+                f"{risk_text} ({risk_score})",
                 str(item.get("packet", "-")),
-                str(item.get("note", "-")) if item.get("note") else "-",
+                reason_text if reason_text != "-" else (str(item.get("note", "-")) if item.get("note") else "-"),
             ])
         lines.append(_format_table(rows))
 
     detections = _filtered_detections(summary, verbose)
     if detections:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Detections"))
+        lines.append(header("Detections (Ranked Evidence)"))
         for item in detections:
             severity = str(item.get("severity", "info")).lower()
             summary_text = str(item.get("summary", ""))
@@ -9609,6 +9727,10 @@ def render_hostdetails_summary(summary: HostDetailsSummary, limit: int = 20, ver
                 summary_text = danger(summary_text)
             elif severity == "suspicious":
                 summary_text = warn(summary_text)
+            summary_text = summary_text.replace(
+                "[C2] [Payload] File artifact",
+                warn_bg("[C2] [Payload] File artifact"),
+            )
             lines.append(
                 f"{format_ts(event.get('ts'))} | {category} | {summary_text} | {details_text}"
             )
@@ -9776,6 +9898,9 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
                 return "suspicious"
         return "info"
 
+    def _highlight_c2_payload_file_artifact(text: str) -> str:
+        return text.replace("[C2] [Payload] File artifact", warn_bg("[C2] [Payload] File artifact"))
+
     def _highlight_ips(text: str, target_ip: str) -> str:
         tokens = text.split()
         for idx, token in enumerate(tokens):
@@ -9909,6 +10034,7 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
             summary_text = danger(summary_text)
         elif severity == "suspicious":
             summary_text = warn(summary_text)
+        summary_text = _highlight_c2_payload_file_artifact(summary_text)
         details_text = _highlight_ips(_redact_in_text(event.details), summary.target_ip)
         actor_ip = None
         if event.ts is not None:

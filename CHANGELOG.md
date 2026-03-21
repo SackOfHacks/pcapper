@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 1.5.1 — 2026-03-21
+### Changed
+- Release metadata updated to `v1.5.1` across package/docs.
+
 ## 1.5.0 — 2026-02-27
 ### Changed
 - Release metadata updated to `v1.5.0` across package/docs for branch preparation.
