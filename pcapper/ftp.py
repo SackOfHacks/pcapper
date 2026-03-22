@@ -129,6 +129,38 @@ class FtpSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+    deterministic_checks: dict[str, list[str]] = None
+    sequence_violations: list[dict[str, object]] = None
+    control_data_integrity: list[dict[str, object]] = None
+    auth_abuse_profiles: list[dict[str, object]] = None
+    exfil_profiles: list[dict[str, object]] = None
+    lateral_clusters: list[dict[str, object]] = None
+    host_attack_paths: list[dict[str, object]] = None
+    incident_clusters: list[dict[str, object]] = None
+    campaign_indicators: list[dict[str, object]] = None
+    benign_context: list[str] = None
+
+    def __post_init__(self) -> None:
+        if self.deterministic_checks is None:
+            object.__setattr__(self, "deterministic_checks", {})
+        if self.sequence_violations is None:
+            object.__setattr__(self, "sequence_violations", [])
+        if self.control_data_integrity is None:
+            object.__setattr__(self, "control_data_integrity", [])
+        if self.auth_abuse_profiles is None:
+            object.__setattr__(self, "auth_abuse_profiles", [])
+        if self.exfil_profiles is None:
+            object.__setattr__(self, "exfil_profiles", [])
+        if self.lateral_clusters is None:
+            object.__setattr__(self, "lateral_clusters", [])
+        if self.host_attack_paths is None:
+            object.__setattr__(self, "host_attack_paths", [])
+        if self.incident_clusters is None:
+            object.__setattr__(self, "incident_clusters", [])
+        if self.campaign_indicators is None:
+            object.__setattr__(self, "campaign_indicators", [])
+        if self.benign_context is None:
+            object.__setattr__(self, "benign_context", [])
 
 
 def merge_ftp_summaries(
@@ -193,6 +225,16 @@ def merge_ftp_summaries(
     transfers: list[FtpTransfer] = []
     detections: list[dict[str, object]] = []
     errors: list[str] = []
+    deterministic_checks: dict[str, list[str]] = defaultdict(list)
+    sequence_violations: list[dict[str, object]] = []
+    control_data_integrity: list[dict[str, object]] = []
+    auth_abuse_profiles: list[dict[str, object]] = []
+    exfil_profiles: list[dict[str, object]] = []
+    lateral_clusters: list[dict[str, object]] = []
+    host_attack_paths: list[dict[str, object]] = []
+    incident_clusters: list[dict[str, object]] = []
+    campaign_indicators: list[dict[str, object]] = []
+    benign_context: list[str] = []
 
     for summary in summary_list:
         total_packets += summary.total_packets
@@ -225,6 +267,19 @@ def merge_ftp_summaries(
         transfers.extend(summary.transfers)
         detections.extend(summary.detections)
         errors.extend(summary.errors)
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+        for key, values in checks.items():
+            for value in values or []:
+                deterministic_checks[str(key)].append(str(value))
+        sequence_violations.extend(list(getattr(summary, "sequence_violations", []) or []))
+        control_data_integrity.extend(list(getattr(summary, "control_data_integrity", []) or []))
+        auth_abuse_profiles.extend(list(getattr(summary, "auth_abuse_profiles", []) or []))
+        exfil_profiles.extend(list(getattr(summary, "exfil_profiles", []) or []))
+        lateral_clusters.extend(list(getattr(summary, "lateral_clusters", []) or []))
+        host_attack_paths.extend(list(getattr(summary, "host_attack_paths", []) or []))
+        incident_clusters.extend(list(getattr(summary, "incident_clusters", []) or []))
+        campaign_indicators.extend(list(getattr(summary, "campaign_indicators", []) or []))
+        benign_context.extend(list(getattr(summary, "benign_context", []) or []))
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -259,7 +314,206 @@ def merge_ftp_summaries(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        deterministic_checks={k: list(dict.fromkeys(v)) for k, v in deterministic_checks.items()},
+        sequence_violations=sequence_violations,
+        control_data_integrity=control_data_integrity,
+        auth_abuse_profiles=auth_abuse_profiles,
+        exfil_profiles=exfil_profiles,
+        lateral_clusters=lateral_clusters,
+        host_attack_paths=host_attack_paths,
+        incident_clusters=incident_clusters,
+        campaign_indicators=campaign_indicators,
+        benign_context=list(dict.fromkeys(benign_context)),
     )
+
+
+def _build_ftp_hunting_context(
+    *,
+    transfers: list[FtpTransfer],
+    detections: list[dict[str, object]],
+    login_attempts: dict[tuple[str, str], dict[str, object]],
+    client_servers_seen: dict[str, set[str]],
+    username_servers: dict[str, set[str]],
+    data_expectations: list[dict[str, object]],
+) -> dict[str, object]:
+    deterministic_checks: dict[str, list[str]] = {
+        "cleartext_credential_exposure": [],
+        "anonymous_or_guest_abuse": [],
+        "bruteforce_or_spray": [],
+        "active_passive_mode_abuse": [],
+        "data_channel_integrity": [],
+        "high_risk_file_staging": [],
+        "ftps_downgrade_or_weak_protection": [],
+        "ftp_exfiltration_signal": [],
+    }
+
+    sequence_violations: list[dict[str, object]] = []
+    control_data_integrity: list[dict[str, object]] = []
+    auth_abuse_profiles: list[dict[str, object]] = []
+    exfil_profiles: list[dict[str, object]] = []
+    lateral_clusters: list[dict[str, object]] = []
+    host_attack_paths: list[dict[str, object]] = []
+    incident_clusters: list[dict[str, object]] = []
+    campaign_indicators: list[dict[str, object]] = []
+    benign_context: list[str] = []
+
+    username_to_clients: dict[str, set[str]] = defaultdict(set)
+    filename_by_client: dict[str, Counter[str]] = defaultdict(Counter)
+
+    for det in detections:
+        summary_text = str(det.get("summary", "") or "").lower()
+        details_text = str(det.get("details", "") or "")
+        if "cleartext credential" in summary_text:
+            deterministic_checks["cleartext_credential_exposure"].append(details_text)
+        if "anonymous ftp login" in summary_text:
+            deterministic_checks["anonymous_or_guest_abuse"].append(details_text)
+        if "brute-force" in summary_text or "password spraying" in summary_text:
+            deterministic_checks["bruteforce_or_spray"].append(details_text)
+        if "bounce/fxp" in summary_text:
+            deterministic_checks["active_passive_mode_abuse"].append(details_text)
+        if "tls upgrade requested" in summary_text:
+            deterministic_checks["ftps_downgrade_or_weak_protection"].append(details_text)
+
+    for (client_ip, server_ip), stats in login_attempts.items():
+        attempts = int(stats.get("attempts", 0) or 0)
+        fails = int(stats.get("fails", 0) or 0)
+        success = int(stats.get("success", 0) or 0)
+        users = set(stats.get("users", set()) or set())
+        for user in users:
+            username_to_clients[str(user)].add(str(client_ip))
+        if attempts >= 5 and fails >= max(3, attempts // 2):
+            profile = {
+                "client": client_ip,
+                "server": server_ip,
+                "attempts": attempts,
+                "fails": fails,
+                "users": len(users),
+                "success": success,
+            }
+            auth_abuse_profiles.append(profile)
+            deterministic_checks["bruteforce_or_spray"].append(
+                f"{client_ip}->{server_ip} attempts={attempts} fails={fails} users={len(users)}"
+            )
+
+    for expected in data_expectations:
+        cmd = str(expected.get("command", "") or "")
+        filename = str(expected.get("filename", "") or "")
+        client_ip = str(expected.get("client_ip", "") or "")
+        server_ip = str(expected.get("server_ip", "") or "")
+        if cmd in {"STOR", "APPE", "RETR"} and not filename:
+            issue = {
+                "client": client_ip,
+                "server": server_ip,
+                "command": cmd,
+                "reason": "Data command without filename context",
+            }
+            sequence_violations.append(issue)
+            control_data_integrity.append(issue)
+            deterministic_checks["data_channel_integrity"].append(
+                f"{client_ip}->{server_ip} {cmd} without filename context"
+            )
+
+    high_risk_exts = {".exe", ".dll", ".ps1", ".bat", ".cmd", ".vbs", ".js", ".hta", ".zip", ".rar", ".7z"}
+    transfer_by_filename: dict[str, list[FtpTransfer]] = defaultdict(list)
+    for transfer in transfers:
+        if transfer.filename:
+            transfer_by_filename[str(transfer.filename).lower()].append(transfer)
+            filename_by_client[str(transfer.client_ip)][str(transfer.filename).lower()] += 1
+
+        ext = Path(transfer.filename or "").suffix.lower()
+        if ext in high_risk_exts:
+            deterministic_checks["high_risk_file_staging"].append(
+                f"{transfer.client_ip}->{transfer.server_ip} {transfer.direction} {transfer.filename} {transfer.bytes} bytes"
+            )
+
+        if transfer.direction == "upload" and transfer.bytes >= 1_000_000 and _is_public_ip(str(transfer.server_ip)):
+            exfil_profiles.append(
+                {
+                    "client": transfer.client_ip,
+                    "server": transfer.server_ip,
+                    "bytes": int(transfer.bytes),
+                    "filename": transfer.filename or "-",
+                }
+            )
+            deterministic_checks["ftp_exfiltration_signal"].append(
+                f"{transfer.client_ip} uploaded {transfer.bytes} bytes to public server {transfer.server_ip}"
+            )
+
+    for name, entries in transfer_by_filename.items():
+        unique_servers = sorted({entry.server_ip for entry in entries if entry.server_ip})
+        unique_clients = sorted({entry.client_ip for entry in entries if entry.client_ip})
+        if len(unique_servers) >= 3 and len(unique_clients) >= 1:
+            cluster = {
+                "filename": name,
+                "clients": unique_clients,
+                "servers": unique_servers,
+                "count": len(entries),
+            }
+            lateral_clusters.append(cluster)
+            deterministic_checks["high_risk_file_staging"].append(
+                f"Filename {name} propagated across {len(unique_servers)} servers"
+            )
+
+    for username, clients in username_to_clients.items():
+        if len(clients) >= 3:
+            campaign_indicators.append(
+                {
+                    "indicator": "Shared FTP account across clients",
+                    "value": username,
+                    "hosts": sorted(clients),
+                }
+            )
+
+    for client, servers in client_servers_seen.items():
+        indicators: list[str] = []
+        if len(servers) >= 10:
+            indicators.append("High server fan-out FTP probing")
+        if any(profile.get("client") == client for profile in auth_abuse_profiles):
+            indicators.append("Auth abuse profile")
+        if any(profile.get("client") == client for profile in exfil_profiles):
+            indicators.append("Public upload exfil signal")
+        if indicators:
+            host_attack_paths.append(
+                {
+                    "host": client,
+                    "steps": indicators,
+                    "targets": sorted(list(servers))[:8],
+                    "confidence": "high" if len(indicators) >= 2 else "medium",
+                }
+            )
+            incident_clusters.append(
+                {
+                    "cluster": f"ftp-{client}",
+                    "host": client,
+                    "indicators": indicators,
+                    "target_count": len(servers),
+                    "confidence": "high" if len(indicators) >= 2 else "medium",
+                }
+            )
+
+    for user, servers in username_servers.items():
+        if len(servers) >= 5:
+            deterministic_checks["anonymous_or_guest_abuse"].append(
+                f"User {user} reused across {len(servers)} servers"
+            )
+
+    if not deterministic_checks["ftp_exfiltration_signal"]:
+        benign_context.append("No strong FTP public-destination exfiltration pattern detected")
+    if not deterministic_checks["data_channel_integrity"]:
+        benign_context.append("No major FTP control/data integrity anomalies detected")
+
+    return {
+        "deterministic_checks": deterministic_checks,
+        "sequence_violations": sequence_violations,
+        "control_data_integrity": control_data_integrity,
+        "auth_abuse_profiles": auth_abuse_profiles,
+        "exfil_profiles": exfil_profiles,
+        "lateral_clusters": lateral_clusters,
+        "host_attack_paths": host_attack_paths,
+        "incident_clusters": incident_clusters,
+        "campaign_indicators": campaign_indicators,
+        "benign_context": benign_context,
+    }
 
 
 @dataclass
@@ -991,6 +1245,44 @@ def analyze_ftp(
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
 
+    enriched = _build_ftp_hunting_context(
+        transfers=transfers,
+        detections=detections,
+        login_attempts=login_attempts,
+        client_servers_seen=client_servers_seen,
+        username_servers=username_servers,
+        data_expectations=data_expectations,
+    )
+
+    checks = enriched["deterministic_checks"]
+    if checks.get("ftp_exfiltration_signal"):
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Deterministic FTP exfiltration signals",
+                "details": "; ".join(checks.get("ftp_exfiltration_signal", [])[:3]),
+                "source": "FTP",
+            }
+        )
+    if checks.get("data_channel_integrity"):
+        detections.append(
+            {
+                "severity": "medium",
+                "summary": "FTP control/data integrity anomalies",
+                "details": "; ".join(checks.get("data_channel_integrity", [])[:3]),
+                "source": "FTP",
+            }
+        )
+    if checks.get("bruteforce_or_spray"):
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Deterministic FTP auth abuse signals",
+                "details": "; ".join(checks.get("bruteforce_or_spray", [])[:3]),
+                "source": "FTP",
+            }
+        )
+
     return FtpSummary(
         path=path,
         total_packets=total_packets,
@@ -1020,4 +1312,14 @@ def analyze_ftp(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        deterministic_checks=enriched["deterministic_checks"],
+        sequence_violations=enriched["sequence_violations"],
+        control_data_integrity=enriched["control_data_integrity"],
+        auth_abuse_profiles=enriched["auth_abuse_profiles"],
+        exfil_profiles=enriched["exfil_profiles"],
+        lateral_clusters=enriched["lateral_clusters"],
+        host_attack_paths=enriched["host_attack_paths"],
+        incident_clusters=enriched["incident_clusters"],
+        campaign_indicators=enriched["campaign_indicators"],
+        benign_context=enriched["benign_context"],
     )

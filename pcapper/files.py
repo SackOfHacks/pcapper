@@ -8,9 +8,10 @@ import struct
 import zlib
 import email
 import socket
+import ipaddress
 from email import policy
 from collections import defaultdict, Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Any, Set
 from urllib.parse import unquote, urlsplit
@@ -87,6 +88,17 @@ class FileTransferSummary:
     views: List[Any]
     detections: List[Dict[str, str]]
     errors: List[str]
+    deterministic_checks: Dict[str, List[str]] = field(default_factory=dict)
+    reconstruction_issues: List[Dict[str, Any]] = field(default_factory=list)
+    masquerade_signals: List[Dict[str, Any]] = field(default_factory=list)
+    archive_abuse_signals: List[Dict[str, Any]] = field(default_factory=list)
+    exfil_signals: List[Dict[str, Any]] = field(default_factory=list)
+    lateral_copy_clusters: List[Dict[str, Any]] = field(default_factory=list)
+    auth_file_correlations: List[Dict[str, Any]] = field(default_factory=list)
+    lineage_chains: List[Dict[str, Any]] = field(default_factory=list)
+    incident_clusters: List[Dict[str, Any]] = field(default_factory=list)
+    campaign_indicators: List[Dict[str, Any]] = field(default_factory=list)
+    benign_context: List[str] = field(default_factory=list)
 
 
 def merge_files_summaries(summaries: List[FileTransferSummary]) -> FileTransferSummary:
@@ -97,11 +109,36 @@ def merge_files_summaries(summaries: List[FileTransferSummary]) -> FileTransferS
     artifacts: List[FileArtifact] = []
     detections: List[Dict[str, str]] = []
     errors: List[str] = []
+    deterministic_checks: Dict[str, List[str]] = defaultdict(list)
+    reconstruction_issues: List[Dict[str, Any]] = []
+    masquerade_signals: List[Dict[str, Any]] = []
+    archive_abuse_signals: List[Dict[str, Any]] = []
+    exfil_signals: List[Dict[str, Any]] = []
+    lateral_copy_clusters: List[Dict[str, Any]] = []
+    auth_file_correlations: List[Dict[str, Any]] = []
+    lineage_chains: List[Dict[str, Any]] = []
+    incident_clusters: List[Dict[str, Any]] = []
+    campaign_indicators: List[Dict[str, Any]] = []
+    benign_context: List[str] = []
     for summary in summaries:
         candidates.extend(summary.candidates)
         artifacts.extend(summary.artifacts)
         detections.extend(summary.detections)
         errors.extend(summary.errors)
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+        for key, values in checks.items():
+            for value in values or []:
+                deterministic_checks[str(key)].append(str(value))
+        reconstruction_issues.extend(list(getattr(summary, "reconstruction_issues", []) or []))
+        masquerade_signals.extend(list(getattr(summary, "masquerade_signals", []) or []))
+        archive_abuse_signals.extend(list(getattr(summary, "archive_abuse_signals", []) or []))
+        exfil_signals.extend(list(getattr(summary, "exfil_signals", []) or []))
+        lateral_copy_clusters.extend(list(getattr(summary, "lateral_copy_clusters", []) or []))
+        auth_file_correlations.extend(list(getattr(summary, "auth_file_correlations", []) or []))
+        lineage_chains.extend(list(getattr(summary, "lineage_chains", []) or []))
+        incident_clusters.extend(list(getattr(summary, "incident_clusters", []) or []))
+        campaign_indicators.extend(list(getattr(summary, "campaign_indicators", []) or []))
+        benign_context.extend(list(getattr(summary, "benign_context", []) or []))
     return FileTransferSummary(
         path=Path("ALL_PCAPS"),
         total_candidates=total_candidates,
@@ -111,6 +148,17 @@ def merge_files_summaries(summaries: List[FileTransferSummary]) -> FileTransferS
         views=[],
         detections=detections,
         errors=sorted(set(errors)),
+        deterministic_checks={k: list(dict.fromkeys(v)) for k, v in deterministic_checks.items()},
+        reconstruction_issues=reconstruction_issues,
+        masquerade_signals=masquerade_signals,
+        archive_abuse_signals=archive_abuse_signals,
+        exfil_signals=exfil_signals,
+        lateral_copy_clusters=lateral_copy_clusters,
+        auth_file_correlations=auth_file_correlations,
+        lineage_chains=lineage_chains,
+        incident_clusters=incident_clusters,
+        campaign_indicators=campaign_indicators,
+        benign_context=list(dict.fromkeys(benign_context)),
     )
 
 # --- Helper Functions ---
@@ -2559,6 +2607,232 @@ def _collect_lolbas_hits(artifacts: List[FileArtifact]) -> List[FileArtifact]:
     return hits
 
 
+def _is_public_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(value)
+        return not (ip.is_private or ip.is_loopback or ip.is_multicast or ip.is_link_local)
+    except Exception:
+        return False
+
+
+def _build_files_hunting_context(
+    artifacts: List[FileArtifact],
+    detections: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    checks: Dict[str, List[str]] = {
+        "reconstruction_confidence": [],
+        "multi_signal_masquerade": [],
+        "archive_container_abuse": [],
+        "macro_script_lolbas_staging": [],
+        "exfiltration_file_movement": [],
+        "lateral_copy_propagation": [],
+        "auth_file_correlation": [],
+        "reputation_or_prevalence_outlier": [],
+    }
+
+    reconstruction_issues: List[Dict[str, Any]] = []
+    masquerade_signals: List[Dict[str, Any]] = []
+    archive_abuse_signals: List[Dict[str, Any]] = []
+    exfil_signals: List[Dict[str, Any]] = []
+    lateral_copy_clusters: List[Dict[str, Any]] = []
+    auth_file_correlations: List[Dict[str, Any]] = []
+    lineage_chains: List[Dict[str, Any]] = []
+    incident_clusters: List[Dict[str, Any]] = []
+    campaign_indicators: List[Dict[str, Any]] = []
+    benign_context: List[str] = []
+
+    hash_counter = Counter(art.sha256 for art in artifacts if art.sha256)
+    by_src: Dict[str, List[FileArtifact]] = defaultdict(list)
+    by_sha: Dict[str, List[FileArtifact]] = defaultdict(list)
+    for art in artifacts:
+        by_src[str(art.src_ip)].append(art)
+        if art.sha256:
+            by_sha[art.sha256].append(art)
+
+    for art in artifacts:
+        confidence = 0
+        reasons: List[str] = []
+        if art.payload:
+            confidence += 2
+            reasons.append("payload present")
+        if art.file_type and art.file_type != "UNKNOWN":
+            confidence += 1
+            reasons.append(f"typed as {art.file_type}")
+        if art.size_bytes and art.size_bytes > 0:
+            confidence += 1
+            reasons.append("positive size")
+        if art.sha256:
+            confidence += 1
+            reasons.append("hash available")
+        if confidence <= 2:
+            item = {
+                "filename": art.filename,
+                "src": art.src_ip,
+                "dst": art.dst_ip,
+                "confidence": confidence,
+                "reasons": reasons,
+            }
+            reconstruction_issues.append(item)
+            checks["reconstruction_confidence"].append(
+                f"Low-confidence reconstruction for {art.filename} ({art.src_ip}->{art.dst_ip})"
+            )
+
+    for art in artifacts:
+        expected = _expected_extensions_for_type(art.file_type or "")
+        ext = Path(art.filename or "").suffix.lower()
+        mismatch = bool(expected and ext and ext not in expected)
+        ctype = (art.content_type or "").lower()
+        if mismatch or (art.file_type == "EXE/DLL" and "text" in ctype):
+            signal = {
+                "filename": art.filename,
+                "type": art.file_type,
+                "content_type": art.content_type or "-",
+                "src": art.src_ip,
+                "dst": art.dst_ip,
+            }
+            masquerade_signals.append(signal)
+            checks["multi_signal_masquerade"].append(
+                f"Masquerade signal {art.filename} type={art.file_type} ctype={art.content_type or '-'}"
+            )
+
+    suspicious_stage_exts = {".js", ".jse", ".vbs", ".vbe", ".ps1", ".cmd", ".bat", ".hta", ".dll", ".exe", ".scr"}
+    archive_exts = {".zip", ".rar", ".7z", ".gz", ".tgz", ".iso", ".img"}
+    for src_ip, src_arts in by_src.items():
+        staged = []
+        archive_hits = []
+        for art in src_arts:
+            ext = Path(art.filename or "").suffix.lower()
+            if ext in archive_exts or (art.file_type or "").upper() in {"ZIP/OFFICE", "GZIP"}:
+                archive_hits.append(art)
+            if ext in suspicious_stage_exts or _is_lolbas_filename(art.filename):
+                staged.append(art)
+        if archive_hits and staged:
+            chain = {
+                "src": src_ip,
+                "archive_count": len(archive_hits),
+                "staging_count": len(staged),
+                "archive_examples": [a.filename for a in archive_hits[:3]],
+                "staging_examples": [a.filename for a in staged[:3]],
+            }
+            archive_abuse_signals.append(chain)
+            lineage_chains.append({
+                "src": src_ip,
+                "steps": [
+                    "archive/container transfer",
+                    "script or lolbas stage file transfer",
+                ],
+                "evidence": [a.filename for a in (archive_hits + staged)[:5]],
+            })
+            checks["archive_container_abuse"].append(
+                f"{src_ip} transferred archives and staged scripts/binaries"
+            )
+            checks["macro_script_lolbas_staging"].append(
+                f"{src_ip} staged possible execution artifacts ({len(staged)})"
+            )
+
+    outbound_counter: Counter[str] = Counter()
+    outbound_bytes: Counter[str] = Counter()
+    for art in artifacts:
+        if _is_public_ip(str(art.dst_ip)):
+            outbound_counter[str(art.src_ip)] += 1
+            outbound_bytes[str(art.src_ip)] += int(art.size_bytes or 0)
+            exfil_signals.append({
+                "src": art.src_ip,
+                "dst": art.dst_ip,
+                "filename": art.filename,
+                "size": int(art.size_bytes or 0),
+                "type": art.file_type,
+            })
+    for src_ip, count in outbound_counter.items():
+        if count >= 2:
+            checks["exfiltration_file_movement"].append(
+                f"{src_ip} transferred {count} file artifact(s) to public destinations ({outbound_bytes[src_ip]} bytes)"
+            )
+
+    for sha256, grouped in by_sha.items():
+        if len(grouped) < 2:
+            continue
+        src_hosts = sorted({a.src_ip for a in grouped if a.src_ip})
+        dst_hosts = sorted({a.dst_ip for a in grouped if a.dst_ip})
+        if len(dst_hosts) >= 2:
+            cluster = {
+                "sha256": sha256,
+                "count": len(grouped),
+                "src_hosts": src_hosts,
+                "dst_hosts": dst_hosts,
+                "filenames": sorted({a.filename for a in grouped if a.filename})[:6],
+            }
+            lateral_copy_clusters.append(cluster)
+            checks["lateral_copy_propagation"].append(
+                f"Hash {sha256[:12]} propagated to {len(dst_hosts)} destination hosts"
+            )
+            campaign_indicators.append({
+                "indicator": "Shared artifact hash across hosts",
+                "value": sha256,
+                "hosts": dst_hosts,
+            })
+
+    auth_blobs = " ".join(
+        f"{str(d.get('summary', ''))} {str(d.get('details', ''))}".lower() for d in detections
+    )
+    auth_markers = ("ntlm", "logon", "kerberos", "authentication")
+    if any(marker in auth_blobs for marker in auth_markers):
+        for src_ip, values in by_src.items():
+            if values:
+                auth_file_correlations.append({
+                    "src": src_ip,
+                    "files": len(values),
+                    "marker": "authentication anomaly nearby",
+                })
+                checks["auth_file_correlation"].append(
+                    f"{src_ip} file activity correlated with auth anomaly signals"
+                )
+
+    for art in artifacts:
+        if art.sha256 and hash_counter.get(art.sha256, 0) == 1:
+            checks["reputation_or_prevalence_outlier"].append(
+                f"Rare artifact hash observed once: {art.sha256[:12]} filename={art.filename}"
+            )
+
+    for src_ip, src_arts in by_src.items():
+        if not src_arts:
+            continue
+        findings: List[str] = []
+        if any(str(a.file_type).upper() in {"EXE/DLL", "ELF"} for a in src_arts):
+            findings.append("binary payload transfer")
+        if any(_is_public_ip(str(a.dst_ip)) for a in src_arts):
+            findings.append("public destination transfer")
+        if any(_is_lolbas_filename(a.filename) for a in src_arts):
+            findings.append("LOLBAS filename present")
+        if findings:
+            incident_clusters.append({
+                "cluster": f"files-{src_ip}",
+                "src": src_ip,
+                "artifacts": len(src_arts),
+                "findings": findings,
+                "confidence": "high" if len(findings) >= 2 else "medium",
+            })
+
+    if not checks["lateral_copy_propagation"]:
+        benign_context.append("No strong hash-based lateral propagation pattern detected")
+    if not checks["exfiltration_file_movement"]:
+        benign_context.append("No high-volume public-destination file transfer pattern detected")
+
+    return {
+        "deterministic_checks": checks,
+        "reconstruction_issues": reconstruction_issues,
+        "masquerade_signals": masquerade_signals,
+        "archive_abuse_signals": archive_abuse_signals,
+        "exfil_signals": exfil_signals,
+        "lateral_copy_clusters": lateral_copy_clusters,
+        "auth_file_correlations": auth_file_correlations,
+        "lineage_chains": lineage_chains,
+        "incident_clusters": incident_clusters,
+        "campaign_indicators": campaign_indicators,
+        "benign_context": benign_context,
+    }
+
+
 # --- Entry Point ---
 
 def analyze_files(
@@ -2618,6 +2892,7 @@ def analyze_files(
                 "evidence": evidence,
                 "tools": tool_counts.most_common(6),
             })
+        enriched = _build_files_hunting_context(artifacts, detections)
         return FileTransferSummary(
             path=dpkt_summary.path,
             total_candidates=dpkt_summary.total_candidates,
@@ -2627,6 +2902,17 @@ def analyze_files(
             views=dpkt_summary.views,
             detections=detections,
             errors=dpkt_summary.errors,
+            deterministic_checks=enriched["deterministic_checks"],
+            reconstruction_issues=enriched["reconstruction_issues"],
+            masquerade_signals=enriched["masquerade_signals"],
+            archive_abuse_signals=enriched["archive_abuse_signals"],
+            exfil_signals=enriched["exfil_signals"],
+            lateral_copy_clusters=enriched["lateral_copy_clusters"],
+            auth_file_correlations=enriched["auth_file_correlations"],
+            lineage_chains=enriched["lineage_chains"],
+            incident_clusters=enriched["incident_clusters"],
+            campaign_indicators=enriched["campaign_indicators"],
+            benign_context=enriched["benign_context"],
         )
 
     artifacts = [
@@ -2665,6 +2951,8 @@ def analyze_files(
             "tools": tool_counts.most_common(6),
         })
 
+    enriched = _build_files_hunting_context(artifacts, detections)
+
     return FileTransferSummary(
         path=dpkt_summary.path,
         total_candidates=dpkt_summary.total_candidates,
@@ -2674,4 +2962,15 @@ def analyze_files(
         views=dpkt_summary.views,
         detections=detections,
         errors=dpkt_summary.errors,
+        deterministic_checks=enriched["deterministic_checks"],
+        reconstruction_issues=enriched["reconstruction_issues"],
+        masquerade_signals=enriched["masquerade_signals"],
+        archive_abuse_signals=enriched["archive_abuse_signals"],
+        exfil_signals=enriched["exfil_signals"],
+        lateral_copy_clusters=enriched["lateral_copy_clusters"],
+        auth_file_correlations=enriched["auth_file_correlations"],
+        lineage_chains=enriched["lineage_chains"],
+        incident_clusters=enriched["incident_clusters"],
+        campaign_indicators=enriched["campaign_indicators"],
+        benign_context=enriched["benign_context"],
     )

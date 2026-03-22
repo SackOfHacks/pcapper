@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from collections import Counter
+from collections import Counter, defaultdict
 import ipaddress
+import math
 import re
 
 from .pcap_cache import get_reader
@@ -42,6 +43,8 @@ class HostnameFinding:
     dst_ip: str
     first_seen: Optional[float]
     last_seen: Optional[float]
+    first_packet: Optional[int]
+    last_packet: Optional[int]
     count: int = 1
 
 
@@ -54,7 +57,302 @@ class HostnameSummary:
     findings: list[HostnameFinding] = field(default_factory=list)
     protocol_counts: Counter[str] = field(default_factory=Counter)
     method_counts: Counter[str] = field(default_factory=Counter)
+    analyst_verdict: str = ""
+    analyst_confidence: str = "low"
+    analyst_reasons: list[str] = field(default_factory=list)
+    deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
+    conflict_profiles: list[dict[str, object]] = field(default_factory=list)
+    drift_profiles: list[dict[str, object]] = field(default_factory=list)
+    suspicious_name_profiles: list[dict[str, object]] = field(default_factory=list)
+    cross_protocol_corroboration: list[dict[str, object]] = field(default_factory=list)
+    risk_matrix: list[dict[str, str]] = field(default_factory=list)
+    investigation_pivots: list[dict[str, object]] = field(default_factory=list)
+    false_positive_context: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+
+def _shannon_entropy(value: str) -> float:
+    if not value:
+        return 0.0
+    freq = Counter(value)
+    total = len(value)
+    return -sum((count / total) * math.log2(count / total) for count in freq.values())
+
+
+def _is_public_ip(value: str) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address(value)
+        return not (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_multicast
+            or ip_obj.is_link_local
+            or ip_obj.is_unspecified
+        )
+    except Exception:
+        return False
+
+
+def _build_hostname_hunting_context(findings: list[HostnameFinding]) -> dict[str, object]:
+    checks: dict[str, list[str]] = {
+        "hostname_collision_or_spoofing": [],
+        "ip_alias_or_fronting_anomaly": [],
+        "cross_protocol_corroboration": [],
+        "hostname_temporal_drift": [],
+        "protocol_identity_mismatch": [],
+        "ad_naming_privilege_abuse": [],
+        "suspicious_naming_pattern": [],
+        "boundary_leak_or_cross_zone": [],
+        "evidence_provenance": [],
+    }
+
+    by_host: dict[str, list[HostnameFinding]] = defaultdict(list)
+    by_ip: dict[str, list[HostnameFinding]] = defaultdict(list)
+    for finding in findings:
+        by_host[finding.hostname].append(finding)
+        by_ip[finding.mapped_ip].append(finding)
+
+    conflict_profiles: list[dict[str, object]] = []
+    drift_profiles: list[dict[str, object]] = []
+    suspicious_name_profiles: list[dict[str, object]] = []
+    corroboration_profiles: list[dict[str, object]] = []
+    pivots: list[dict[str, object]] = []
+
+    for hostname, rows in by_host.items():
+        unique_ips = sorted({item.mapped_ip for item in rows if item.mapped_ip})
+        unique_methods = sorted({item.method for item in rows if item.method})
+        unique_protocols = sorted({item.protocol for item in rows if item.protocol})
+        evidence_count = sum(int(item.count or 0) for item in rows)
+        first_seen_vals = [item.first_seen for item in rows if isinstance(item.first_seen, (int, float))]
+        last_seen_vals = [item.last_seen for item in rows if isinstance(item.last_seen, (int, float))]
+        first_pkt_vals = [item.first_packet for item in rows if isinstance(item.first_packet, int)]
+        last_pkt_vals = [item.last_packet for item in rows if isinstance(item.last_packet, int)]
+
+        if len(unique_ips) >= 2:
+            conflict_profiles.append(
+                {
+                    "type": "hostname_to_many_ips",
+                    "hostname": hostname,
+                    "ip_count": len(unique_ips),
+                    "ips": unique_ips,
+                    "methods": unique_methods,
+                    "protocols": unique_protocols,
+                    "evidence": evidence_count,
+                }
+            )
+            checks["hostname_collision_or_spoofing"].append(
+                f"{hostname} observed on {len(unique_ips)} IPs: {', '.join(unique_ips[:5])}"
+            )
+
+            if first_seen_vals and last_seen_vals and min(first_seen_vals) < max(last_seen_vals):
+                drift_profiles.append(
+                    {
+                        "hostname": hostname,
+                        "first_seen": min(first_seen_vals),
+                        "last_seen": max(last_seen_vals),
+                        "ip_count": len(unique_ips),
+                        "ips": unique_ips,
+                        "methods": unique_methods,
+                    }
+                )
+                checks["hostname_temporal_drift"].append(
+                    f"{hostname} reassigned/drifted across {len(unique_ips)} IPs over capture timeline"
+                )
+
+        if len(unique_protocols) >= 2:
+            corroboration_profiles.append(
+                {
+                    "hostname": hostname,
+                    "ip_count": len(unique_ips),
+                    "protocols": unique_protocols,
+                    "methods": unique_methods,
+                    "evidence": evidence_count,
+                    "confidence": "high" if len(unique_protocols) >= 3 else "medium",
+                }
+            )
+            checks["cross_protocol_corroboration"].append(
+                f"{hostname} corroborated by protocols={','.join(unique_protocols[:4])}"
+            )
+
+        text = hostname.lower()
+        dot_parts = [part for part in text.split(".") if part]
+        label0 = dot_parts[0] if dot_parts else text
+        entropy = _shannon_entropy(label0)
+        reasons: list[str] = []
+        if text.startswith("xn--"):
+            reasons.append("punycode")
+        if any(token in text for token in ("dc", "ldap", "krbtgt", "admin", "backup", "svc", "domain")):
+            reasons.append("privileged_or_domain_pattern")
+        if len(label0) >= 18 and entropy >= 3.6:
+            reasons.append(f"high_entropy_label={entropy:.2f}")
+        if dot_parts and dot_parts[-1] in {"top", "gq", "tk", "ml", "ga", "xyz"}:
+            reasons.append("suspicious_tld")
+
+        if reasons:
+            suspicious_name_profiles.append(
+                {
+                    "hostname": hostname,
+                    "reasons": reasons,
+                    "entropy": round(entropy, 2),
+                    "ips": unique_ips[:8],
+                    "evidence": evidence_count,
+                }
+            )
+            if "privileged_or_domain_pattern" in reasons:
+                checks["ad_naming_privilege_abuse"].append(
+                    f"{hostname} appears privileged/domain-like; mapped to {', '.join(unique_ips[:3]) or '-'}"
+                )
+            checks["suspicious_naming_pattern"].append(
+                f"{hostname} flags={','.join(reasons)}"
+            )
+
+        if any(_is_public_ip(item.dst_ip) or _is_public_ip(item.mapped_ip) for item in rows):
+            checks["boundary_leak_or_cross_zone"].append(
+                f"{hostname} observed with public boundary context"
+            )
+
+        if first_pkt_vals or last_pkt_vals:
+            pivots.append(
+                {
+                    "hostname": hostname,
+                    "mapped_ips": unique_ips[:6],
+                    "methods": unique_methods[:4],
+                    "protocols": unique_protocols[:4],
+                    "first_packet": min(first_pkt_vals) if first_pkt_vals else None,
+                    "last_packet": max(last_pkt_vals) if last_pkt_vals else None,
+                }
+            )
+
+    for mapped_ip, rows in by_ip.items():
+        if not mapped_ip:
+            continue
+        hostnames = sorted({item.hostname for item in rows if item.hostname})
+        if len(hostnames) >= 4:
+            checks["ip_alias_or_fronting_anomaly"].append(
+                f"{mapped_ip} mapped to many hostnames ({len(hostnames)})"
+            )
+            conflict_profiles.append(
+                {
+                    "type": "ip_to_many_hostnames",
+                    "ip": mapped_ip,
+                    "host_count": len(hostnames),
+                    "hostnames": hostnames,
+                    "methods": sorted({item.method for item in rows if item.method}),
+                    "protocols": sorted({item.protocol for item in rows if item.protocol}),
+                    "evidence": sum(int(item.count or 0) for item in rows),
+                }
+            )
+
+        method_set = {item.method for item in rows if item.method}
+        if "DNS PTR reverse lookup" in method_set and not any(
+            value in method_set
+            for value in ("DNS A/AAAA mapping", "TLS SNI", "TLS certificate SAN", "HTTP Host header")
+        ):
+            checks["protocol_identity_mismatch"].append(
+                f"{mapped_ip} has reverse-name evidence but weak forward corroboration"
+            )
+
+    checks["evidence_provenance"].append(
+        f"{sum(int(item.count or 0) for item in findings)} evidence row observation(s) with flow attribution"
+    )
+
+    score = 0
+    score += 2 if checks["hostname_collision_or_spoofing"] else 0
+    score += 1 if checks["ip_alias_or_fronting_anomaly"] else 0
+    score += 1 if checks["protocol_identity_mismatch"] else 0
+    score += 1 if checks["hostname_temporal_drift"] else 0
+    score += 1 if checks["ad_naming_privilege_abuse"] else 0
+    score += 1 if checks["suspicious_naming_pattern"] else 0
+    score += 1 if checks["boundary_leak_or_cross_zone"] else 0
+    score += 1 if checks["cross_protocol_corroboration"] else 0
+
+    reasons: list[str] = []
+    if checks["hostname_collision_or_spoofing"]:
+        reasons.append("Hostname collisions suggest spoofing/poisoning risk")
+    if checks["protocol_identity_mismatch"]:
+        reasons.append("Protocol identity mismatch observed")
+    if checks["hostname_temporal_drift"]:
+        reasons.append("Temporal hostname-to-IP drift observed")
+    if checks["ad_naming_privilege_abuse"]:
+        reasons.append("Privileged/domain naming abuse indicators observed")
+    if checks["boundary_leak_or_cross_zone"]:
+        reasons.append("Internal naming appears on boundary/public context")
+    if checks["cross_protocol_corroboration"]:
+        reasons.append("Multi-protocol corroboration available for key names")
+
+    if score >= 7:
+        verdict = "YES - HIGH-CONFIDENCE HOSTNAME SPOOFING/ABUSE SIGNALS DETECTED"
+        confidence = "high"
+    elif score >= 4:
+        verdict = "LIKELY - MULTIPLE CORROBORATING HOSTNAME RISK INDICATORS DETECTED"
+        confidence = "medium"
+    elif score >= 2:
+        verdict = "POSSIBLE - SUSPICIOUS HOSTNAME SIGNALS REQUIRE VALIDATION"
+        confidence = "medium"
+    else:
+        verdict = "NO STRONG SIGNAL - NO CONVINCING HOSTNAME ABUSE PATTERN FROM CURRENT HEURISTICS"
+        confidence = "low"
+
+    false_positive_context: list[str] = []
+    if not checks["hostname_collision_or_spoofing"]:
+        false_positive_context.append("No strong same-hostname multi-IP collision pattern crossed threshold")
+    if not checks["ip_alias_or_fronting_anomaly"]:
+        false_positive_context.append("No high-volume many-hostnames-per-IP fronting pattern crossed threshold")
+    if checks["cross_protocol_corroboration"] and not checks["protocol_identity_mismatch"]:
+        false_positive_context.append("Multi-protocol naming evidence appears internally consistent")
+
+    matrix: list[dict[str, str]] = [
+        {
+            "category": "Hostname Collision/Spoofing",
+            "risk": "High" if checks["hostname_collision_or_spoofing"] else "None",
+            "confidence": "High" if checks["hostname_collision_or_spoofing"] else "Low",
+            "evidence": str(len(checks["hostname_collision_or_spoofing"])) if checks["hostname_collision_or_spoofing"] else "No matching detections",
+        },
+        {
+            "category": "Temporal Drift",
+            "risk": "Medium" if checks["hostname_temporal_drift"] else "None",
+            "confidence": "Medium" if checks["hostname_temporal_drift"] else "Low",
+            "evidence": str(len(checks["hostname_temporal_drift"])) if checks["hostname_temporal_drift"] else "No matching detections",
+        },
+        {
+            "category": "Protocol Identity Mismatch",
+            "risk": "Medium" if checks["protocol_identity_mismatch"] else "None",
+            "confidence": "Medium" if checks["protocol_identity_mismatch"] else "Low",
+            "evidence": str(len(checks["protocol_identity_mismatch"])) if checks["protocol_identity_mismatch"] else "No matching detections",
+        },
+        {
+            "category": "AD/Privileged Naming Abuse",
+            "risk": "Medium" if checks["ad_naming_privilege_abuse"] else "None",
+            "confidence": "Medium" if checks["ad_naming_privilege_abuse"] else "Low",
+            "evidence": str(len(checks["ad_naming_privilege_abuse"])) if checks["ad_naming_privilege_abuse"] else "No matching detections",
+        },
+        {
+            "category": "Suspicious Naming Pattern",
+            "risk": "Low" if checks["suspicious_naming_pattern"] else "None",
+            "confidence": "Low" if checks["suspicious_naming_pattern"] else "Low",
+            "evidence": str(len(checks["suspicious_naming_pattern"])) if checks["suspicious_naming_pattern"] else "No matching detections",
+        },
+        {
+            "category": "Boundary Leakage/Cross-Zone",
+            "risk": "Medium" if checks["boundary_leak_or_cross_zone"] else "None",
+            "confidence": "Medium" if checks["boundary_leak_or_cross_zone"] else "Low",
+            "evidence": str(len(checks["boundary_leak_or_cross_zone"])) if checks["boundary_leak_or_cross_zone"] else "No matching detections",
+        },
+    ]
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons if reasons else ["No high-confidence hostname threat heuristic crossed threshold"],
+        "deterministic_checks": checks,
+        "conflict_profiles": conflict_profiles[:40],
+        "drift_profiles": drift_profiles[:30],
+        "suspicious_name_profiles": suspicious_name_profiles[:40],
+        "cross_protocol_corroboration": corroboration_profiles[:40],
+        "risk_matrix": matrix,
+        "investigation_pivots": pivots[:40],
+        "false_positive_context": false_positive_context[:8],
+    }
 
 
 def _normalize_hostname(value: str) -> str:
@@ -634,6 +932,7 @@ def _record_finding(
     src_ip: str,
     dst_ip: str,
     ts: Optional[float],
+    packet_index: Optional[int],
 ) -> bool:
     normalized = _normalize_hostname(hostname)
     if not _is_valid_hostname(normalized):
@@ -653,6 +952,8 @@ def _record_finding(
             dst_ip=dst_ip,
             first_seen=ts,
             last_seen=ts,
+            first_packet=packet_index,
+            last_packet=packet_index,
             count=1,
         )
         return True
@@ -663,6 +964,11 @@ def _record_finding(
             existing.first_seen = ts
         if existing.last_seen is None or ts > existing.last_seen:
             existing.last_seen = ts
+    if packet_index is not None:
+        if existing.first_packet is None or packet_index < existing.first_packet:
+            existing.first_packet = packet_index
+        if existing.last_packet is None or packet_index > existing.last_packet:
+            existing.last_packet = packet_index
     return True
 
 
@@ -713,6 +1019,8 @@ def merge_hostname_summaries(summaries: list[HostnameSummary]) -> HostnameSummar
                     dst_ip=finding.dst_ip,
                     first_seen=finding.first_seen,
                     last_seen=finding.last_seen,
+                    first_packet=finding.first_packet,
+                    last_packet=finding.last_packet,
                     count=finding.count,
                 )
             else:
@@ -721,6 +1029,10 @@ def merge_hostname_summaries(summaries: list[HostnameSummary]) -> HostnameSummar
                     existing.first_seen = finding.first_seen
                 if finding.last_seen is not None and (existing.last_seen is None or finding.last_seen > existing.last_seen):
                     existing.last_seen = finding.last_seen
+                if finding.first_packet is not None and (existing.first_packet is None or finding.first_packet < existing.first_packet):
+                    existing.first_packet = finding.first_packet
+                if finding.last_packet is not None and (existing.last_packet is None or finding.last_packet > existing.last_packet):
+                    existing.last_packet = finding.last_packet
 
         for err in summary.errors:
             if err in seen_errors:
@@ -732,6 +1044,21 @@ def merge_hostname_summaries(summaries: list[HostnameSummary]) -> HostnameSummar
         merged_map.values(),
         key=lambda item: (-item.count, item.hostname, item.method),
     )
+    merged_context = _build_hostname_hunting_context(merged.findings)
+    merged.analyst_verdict = str(merged_context.get("analyst_verdict", ""))
+    merged.analyst_confidence = str(merged_context.get("analyst_confidence", "low"))
+    merged.analyst_reasons = [str(v) for v in list(merged_context.get("analyst_reasons", []) or [])]
+    merged.deterministic_checks = {
+        str(key): [str(v) for v in list(values or [])]
+        for key, values in dict(merged_context.get("deterministic_checks", {}) or {}).items()
+    }
+    merged.conflict_profiles = list(merged_context.get("conflict_profiles", []) or [])
+    merged.drift_profiles = list(merged_context.get("drift_profiles", []) or [])
+    merged.suspicious_name_profiles = list(merged_context.get("suspicious_name_profiles", []) or [])
+    merged.cross_protocol_corroboration = list(merged_context.get("cross_protocol_corroboration", []) or [])
+    merged.risk_matrix = [dict(item) for item in list(merged_context.get("risk_matrix", []) or []) if isinstance(item, dict)]
+    merged.investigation_pivots = list(merged_context.get("investigation_pivots", []) or [])
+    merged.false_positive_context = [str(v) for v in list(merged_context.get("false_positive_context", []) or [])]
     return merged
 
 
@@ -762,6 +1089,7 @@ def analyze_hostname(
     try:
         for pkt in reader:
             summary.total_packets += 1
+            packet_index = summary.total_packets
             if stream is not None and size_bytes:
                 try:
                     status.update(int(min(100, (stream.tell() / size_bytes) * 100)))
@@ -796,6 +1124,7 @@ def analyze_hostname(
                     src_ip=src_ip,
                     dst_ip=dst_ip,
                     ts=ts,
+                    packet_index=packet_index,
                 ):
                     found_evidence = True
                     packet_relevant = True
@@ -848,6 +1177,7 @@ def analyze_hostname(
                                     src_ip=src_ip,
                                     dst_ip=dst_ip,
                                     ts=ts,
+                                    packet_index=packet_index,
                                 ):
                                     found_evidence = True
                                     summary.protocol_counts[protocol] += 1
@@ -870,6 +1200,7 @@ def analyze_hostname(
                                     src_ip=src_ip,
                                     dst_ip=dst_ip,
                                     ts=ts,
+                                    packet_index=packet_index,
                                 ):
                                     found_evidence = True
                                     summary.protocol_counts[protocol] += 1
@@ -890,6 +1221,7 @@ def analyze_hostname(
                     src_ip=src_ip,
                     dst_ip=dst_ip,
                     ts=ts,
+                    packet_index=packet_index,
                 ):
                     found_evidence = True
                     packet_relevant = True
@@ -912,6 +1244,7 @@ def analyze_hostname(
                         src_ip=src_ip,
                         dst_ip=dst_ip,
                         ts=ts,
+                        packet_index=packet_index,
                     ):
                         found_evidence = True
                         summary.protocol_counts[protocol] += 1
@@ -932,6 +1265,7 @@ def analyze_hostname(
                         src_ip=src_ip,
                         dst_ip=dst_ip,
                         ts=ts,
+                        packet_index=packet_index,
                     ):
                         found_evidence = True
                         summary.protocol_counts[protocol] += 1
@@ -953,6 +1287,7 @@ def analyze_hostname(
                         src_ip=src_ip,
                         dst_ip=dst_ip,
                         ts=ts,
+                        packet_index=packet_index,
                     ):
                         found_evidence = True
                         summary.protocol_counts[protocol] += 1
@@ -977,6 +1312,7 @@ def analyze_hostname(
                             src_ip=src_ip,
                             dst_ip=dst_ip,
                             ts=ts,
+                            packet_index=packet_index,
                         ):
                             found_evidence = True
                             summary.protocol_counts["SMTP/IMAP/POP"] += 1
@@ -996,6 +1332,7 @@ def analyze_hostname(
                             src_ip=src_ip,
                             dst_ip=dst_ip,
                             ts=ts,
+                            packet_index=packet_index,
                         ):
                             found_evidence = True
                             summary.protocol_counts["SMB"] += 1
@@ -1017,6 +1354,7 @@ def analyze_hostname(
                         src_ip=src_ip,
                         dst_ip=dst_ip,
                         ts=ts,
+                        packet_index=packet_index,
                     ):
                         found_evidence = True
                         summary.protocol_counts[protocol] += 1
@@ -1035,6 +1373,7 @@ def analyze_hostname(
                     src_ip=src_ip,
                     dst_ip=dst_ip,
                     ts=ts,
+                    packet_index=packet_index,
                 ):
                     found_evidence = True
                     packet_relevant = True
@@ -1056,6 +1395,7 @@ def analyze_hostname(
                             src_ip=src_ip,
                             dst_ip=dst_ip,
                             ts=ts,
+                            packet_index=packet_index,
                         ):
                             found_evidence = True
                             summary.protocol_counts["NETBIOS"] += 1
@@ -1079,4 +1419,19 @@ def analyze_hostname(
         findings_map.values(),
         key=lambda item: (-item.count, item.hostname, item.method),
     )
+    context = _build_hostname_hunting_context(summary.findings)
+    summary.analyst_verdict = str(context.get("analyst_verdict", ""))
+    summary.analyst_confidence = str(context.get("analyst_confidence", "low"))
+    summary.analyst_reasons = [str(v) for v in list(context.get("analyst_reasons", []) or [])]
+    summary.deterministic_checks = {
+        str(key): [str(v) for v in list(values or [])]
+        for key, values in dict(context.get("deterministic_checks", {}) or {}).items()
+    }
+    summary.conflict_profiles = list(context.get("conflict_profiles", []) or [])
+    summary.drift_profiles = list(context.get("drift_profiles", []) or [])
+    summary.suspicious_name_profiles = list(context.get("suspicious_name_profiles", []) or [])
+    summary.cross_protocol_corroboration = list(context.get("cross_protocol_corroboration", []) or [])
+    summary.risk_matrix = [dict(item) for item in list(context.get("risk_matrix", []) or []) if isinstance(item, dict)]
+    summary.investigation_pivots = list(context.get("investigation_pivots", []) or [])
+    summary.false_positive_context = [str(v) for v in list(context.get("false_positive_context", []) or [])]
     return summary

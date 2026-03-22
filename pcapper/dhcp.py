@@ -122,6 +122,16 @@ class DhcpSummary:
     exfil_candidates: Counter[str] = field(default_factory=Counter)
     probe_sources: Counter[str] = field(default_factory=Counter)
     brute_force_sources: Counter[str] = field(default_factory=Counter)
+    policy_tampering: list[dict[str, object]] = field(default_factory=list)
+    transaction_violations: list[dict[str, object]] = field(default_factory=list)
+    lease_conflicts: list[dict[str, object]] = field(default_factory=list)
+    relay_anomalies: list[dict[str, object]] = field(default_factory=list)
+    server_policy_profiles: list[dict[str, object]] = field(default_factory=list)
+    client_abuse_profiles: list[dict[str, object]] = field(default_factory=list)
+    timeline: list[dict[str, object]] = field(default_factory=list)
+    risk_factors: Counter[str] = field(default_factory=Counter)
+    deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
+    benign_context: list[str] = field(default_factory=list)
     artifacts: list[DhcpArtifact] = field(default_factory=list)
     anomalies: list[DhcpAnomaly] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -251,6 +261,32 @@ def _lease_bucket(seconds: int) -> str:
     return ">7d"
 
 
+def _option_value_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (bytes, bytearray, str)):
+        text = _decode_name(value)
+        return [text] if text else []
+    if isinstance(value, (list, tuple)):
+        out: list[str] = []
+        for item in value:
+            text = _decode_name(item)
+            if text:
+                out.append(text)
+        return out
+    text = _decode_name(value)
+    return [text] if text else []
+
+
+def _first_option(option_map: dict[str, object], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        if key in option_map:
+            values = _option_value_list(option_map.get(key))
+            if values:
+                return ",".join(values[:4])
+    return ""
+
+
 def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
     if DHCP is None or BOOTP is None or UDP is None:
         return DhcpSummary(path=path, errors=["Scapy unavailable (DHCP/BOOTP/UDP layer missing)"])
@@ -276,12 +312,32 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
     src_unique_client_macs: dict[str, set[str]] = defaultdict(set)
     offer_servers_by_client: dict[str, set[str]] = defaultdict(set)
     nak_by_server: Counter[str] = Counter()
+    xid_client_requests: dict[str, set[int]] = defaultdict(set)
+    xid_server_seen: dict[str, set[int]] = defaultdict(set)
+    yiaddr_clients: dict[str, set[str]] = defaultdict(set)
+    relay_to_servers: dict[str, set[str]] = defaultdict(set)
+    relay_to_clients: dict[str, set[str]] = defaultdict(set)
+    client_hostname_set: dict[str, set[str]] = defaultdict(set)
+    client_id_set: dict[str, set[str]] = defaultdict(set)
+    client_vendor_set: dict[str, set[str]] = defaultdict(set)
+    server_policy_values: dict[str, dict[str, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
 
     exfil_signals: Counter[str] = Counter()
     strings_counter: Counter[str] = Counter()
     files: set[str] = set()
     seen_device_artifacts: set[str] = set()
     max_anomalies = 250
+
+    deterministic_checks: dict[str, list[str]] = {
+        "transaction_integrity_violation": [],
+        "rogue_competing_server_evidence": [],
+        "starvation_exhaustion_behavior": [],
+        "option_tampering_router_dns_routes_wpad_pxe": [],
+        "relay_abuse_option82": [],
+        "lease_conflict_duplicate_assignment": [],
+        "beacon_periodic_dhcp": [],
+        "likely_benign_failover_context": [],
+    }
 
     def _append_anomaly(severity: str, title: str, description: str, src: str, dst: str, ts: float) -> None:
         if len(summary.anomalies) >= max_anomalies:
@@ -391,6 +447,38 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             if client_id:
                 summary.client_ids[client_id] += 1
 
+            if hostname:
+                client_hostname_set[chaddr].add(hostname)
+            if client_id:
+                client_id_set[chaddr].add(client_id)
+            if vendor_class:
+                client_vendor_set[chaddr].add(vendor_class)
+
+            server_key = server_id or src_ip or siaddr
+            if relay_ip:
+                relay_to_servers[relay_ip].add(server_key)
+                relay_to_clients[relay_ip].add(chaddr)
+
+            router_opt = _first_option(option_map, ("router",))
+            dns_opt = _first_option(option_map, ("name_server", "domain_name_server"))
+            domain_opt = _first_option(option_map, ("domain", "domain_name"))
+            wpad_opt = _first_option(option_map, ("wpad", "option_252", "proxy_autodiscovery"))
+            routes_opt = _first_option(option_map, ("classless_static_routes", "static_route", "ms_classless_static_routes"))
+            tftp_opt = _first_option(option_map, ("tftp_server_name",))
+            bootfile_opt = _first_option(option_map, ("bootfile_name", "file"))
+
+            for policy_key, policy_val in (
+                ("router", router_opt),
+                ("dns", dns_opt),
+                ("domain", domain_opt),
+                ("wpad", wpad_opt),
+                ("routes", routes_opt),
+                ("tftp", tftp_opt),
+                ("bootfile", bootfile_opt),
+            ):
+                if policy_val:
+                    server_policy_values[server_key][policy_key][policy_val] += 1
+
             for value, source_label in (
                 (vendor_class, "DHCP vendor class"),
                 (hostname, "DHCP hostname"),
@@ -448,14 +536,22 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
 
             if msg_type == "REQUEST":
                 session.requests += 1
+                if xid:
+                    xid_client_requests[chaddr].add(xid)
             elif msg_type == "OFFER":
                 session.offers += 1
                 offer_servers_by_client[chaddr].add(server_id or src_ip)
+                if xid:
+                    xid_server_seen[chaddr].add(xid)
             elif msg_type == "ACK":
                 session.acks += 1
+                if xid:
+                    xid_server_seen[chaddr].add(xid)
             elif msg_type == "NAK":
                 session.naks += 1
                 nak_by_server[server_id or src_ip] += 1
+                if xid:
+                    xid_server_seen[chaddr].add(xid)
 
             if session.first_seen is None or ts < session.first_seen:
                 session.first_seen = ts
@@ -473,6 +569,25 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             if requested_ip:
                 client_requested_ips[chaddr].add(requested_ip)
             src_unique_client_macs[src_ip].add(chaddr)
+
+            if yiaddr and yiaddr != "0.0.0.0" and msg_type in {"OFFER", "ACK"}:
+                yiaddr_clients[yiaddr].add(chaddr)
+
+            if msg_type in _SERVER_MSG_TYPES and xid and xid not in xid_client_requests.get(chaddr, set()):
+                summary.transaction_violations.append(
+                    {
+                        "server": server_key,
+                        "client_mac": chaddr,
+                        "xid": xid,
+                        "type": msg_type,
+                        "src": src_ip,
+                        "dst": dst_ip,
+                        "ts": ts,
+                    }
+                )
+                deterministic_checks["transaction_integrity_violation"].append(
+                    f"{msg_type} xid={xid} server={server_key} client={chaddr} without prior REQUEST"
+                )
 
             # Exfil/abuse heuristics for option values
             for value in (hostname, domain, vendor_class, client_id):
@@ -517,6 +632,53 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
     summary.sessions = sorted(sessions.values(), key=lambda item: (item.requests + item.offers + item.acks + item.naks), reverse=True)
 
     # Threat hunting detections
+    if summary.duration > 0 and summary.dhcp_packets >= 400:
+        overall_pps = summary.dhcp_packets / summary.duration
+        if overall_pps >= 80.0:
+            summary.attacks["DHCP Flood Attack"] += 1
+            summary.threat_summary["DHCP Flood Attack"] += 1
+            summary.risk_factors["Elevated DHCP packets-per-second"] += 1
+            deterministic_checks["starvation_exhaustion_behavior"].append(
+                f"overall_dhcp_rate={overall_pps:.2f}pps packets={summary.dhcp_packets} duration={summary.duration:.2f}s"
+            )
+            _append_anomaly(
+                "HIGH",
+                "High DHCP Packet Rate",
+                f"Capture shows elevated DHCP packet rate ({overall_pps:.2f} pkt/s, total={summary.dhcp_packets}).",
+                "-",
+                "-",
+                0.0,
+            )
+
+    if summary.duration > 0:
+        flood_sources: list[tuple[str, int, float]] = []
+        for src_ip, count in summary.src_ips.items():
+            if count < 150:
+                continue
+            pps = count / summary.duration
+            if pps >= 25.0:
+                flood_sources.append((src_ip, int(count), float(pps)))
+
+        if flood_sources:
+            flood_sources.sort(key=lambda item: item[2], reverse=True)
+            summary.attacks["DHCP Flood Attack"] += len(flood_sources)
+            summary.threat_summary["DHCP Flood Attack"] += len(flood_sources)
+            for src_ip, count, pps in flood_sources[:10]:
+                summary.brute_force_sources[src_ip] += count
+                deterministic_checks["starvation_exhaustion_behavior"].append(
+                    f"flood_source={src_ip} packets={count} rate={pps:.2f}pps"
+                )
+            top_src, top_count, top_pps = flood_sources[0]
+            summary.risk_factors["High-rate DHCP source activity"] += len(flood_sources)
+            _append_anomaly(
+                "HIGH",
+                "DHCP Flood Source Detected",
+                f"Top source {top_src} sent {top_count} DHCP packets at {top_pps:.2f} pkt/s; suspicious sources={len(flood_sources)}.",
+                top_src,
+                "-",
+                0.0,
+            )
+
     for client_mac, req_ips in client_requested_ips.items():
         unique_ip_count = len(req_ips)
         unique_xid_count = len(client_xids.get(client_mac, set()))
@@ -525,6 +687,10 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             summary.attacks["DHCP Starvation"] += 1
             summary.threat_summary["DHCP Starvation"] += 1
             summary.brute_force_sources[client_mac] += req_count
+            summary.risk_factors["High DHCP request/XID churn"] += 1
+            deterministic_checks["starvation_exhaustion_behavior"].append(
+                f"{client_mac} req={req_count} xids={unique_xid_count} requested_ips={unique_ip_count}"
+            )
             _append_anomaly(
                 "HIGH",
                 "DHCP Starvation Pattern",
@@ -538,6 +704,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             summary.attacks["Lease Brute Force/Enumeration"] += 1
             summary.threat_summary["Lease Brute Force/Enumeration"] += 1
             summary.brute_force_sources[client_mac] += unique_ip_count
+            summary.risk_factors["Large requested-address spread"] += 1
             _append_anomaly(
                 "MEDIUM",
                 "DHCP Lease Brute Force",
@@ -551,6 +718,10 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
     if len(offer_servers) >= 2:
         summary.attacks["Rogue DHCP Server"] += 1
         summary.threat_summary["Rogue DHCP Server"] += 1
+        deterministic_checks["rogue_competing_server_evidence"].append(
+            f"Competing servers observed: {', '.join(offer_servers[:8])}"
+        )
+        summary.risk_factors["Multiple active DHCP servers"] += 1
         _append_anomaly(
             "HIGH",
             "Multiple DHCP Servers Detected",
@@ -564,6 +735,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
         if count >= 20:
             summary.attacks["DHCP NAK Flooding"] += 1
             summary.threat_summary["DHCP NAK Flooding"] += 1
+            summary.risk_factors["High NAK response volume"] += 1
             _append_anomaly(
                 "HIGH",
                 "DHCP NAK Flood",
@@ -578,6 +750,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             summary.attacks["DHCP Probing/Scanning"] += 1
             summary.threat_summary["DHCP Probing/Scanning"] += 1
             summary.probe_sources[src_ip] += len(macs)
+            summary.risk_factors["One source touched many client MACs"] += 1
             _append_anomaly(
                 "MEDIUM",
                 "DHCP Client Sweep",
@@ -598,6 +771,9 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
         if 3.0 <= avg <= 180.0 and cv <= 0.2:
             summary.beacon_candidates[client_mac] += len(intervals)
             summary.threat_summary["DHCP Beaconing"] += 1
+            deterministic_checks["beacon_periodic_dhcp"].append(
+                f"{client_mac} avg={avg:.2f}s cv={cv:.2f} n={len(intervals)}"
+            )
             _append_anomaly(
                 "MEDIUM",
                 "Periodic DHCP Beacon",
@@ -612,6 +788,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             continue
         summary.attacks["DHCP Option Exfiltration"] += 1
         summary.threat_summary["DHCP Option Exfiltration"] += 1
+        summary.risk_factors["High-entropy DHCP option payloads"] += 1
         _append_anomaly(
             "HIGH",
             "Potential DHCP Option Exfiltration",
@@ -650,5 +827,135 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 summary.threat_summary["Public DHCP Infrastructure Exposure"] += 1
         except Exception:
             continue
+
+    for yiaddr, clients in yiaddr_clients.items():
+        if yiaddr == "0.0.0.0" or len(clients) < 2:
+            continue
+        clients_sorted = sorted(clients)
+        summary.lease_conflicts.append({"ip": yiaddr, "clients": clients_sorted, "count": len(clients_sorted)})
+        deterministic_checks["lease_conflict_duplicate_assignment"].append(
+            f"{yiaddr} assigned to multiple clients: {', '.join(clients_sorted[:6])}"
+        )
+        summary.risk_factors["Duplicate lease assignment"] += 1
+
+    for relay, servers in relay_to_servers.items():
+        if len(servers) >= 3:
+            clients = sorted(relay_to_clients.get(relay, set()))
+            summary.relay_anomalies.append(
+                {
+                    "relay": relay,
+                    "servers": sorted(servers),
+                    "server_count": len(servers),
+                    "clients": clients[:12],
+                    "client_count": len(clients),
+                }
+            )
+            deterministic_checks["relay_abuse_option82"].append(
+                f"relay={relay} forwarded to {len(servers)} servers clients={len(clients)}"
+            )
+            summary.risk_factors["Relay mapped to many servers"] += 1
+
+    dominant_by_policy: dict[str, str] = {}
+    for policy in ("router", "dns", "domain", "wpad", "routes", "tftp", "bootfile"):
+        aggregate: Counter[str] = Counter()
+        for server, values in server_policy_values.items():
+            policy_counter = values.get(policy, Counter())
+            aggregate.update(policy_counter)
+        if aggregate:
+            dominant_by_policy[policy] = aggregate.most_common(1)[0][0]
+
+    for server, policy_map in server_policy_values.items():
+        profile: dict[str, object] = {"server": server}
+        drift_hits: list[str] = []
+        for policy, policy_counter in policy_map.items():
+            if not policy_counter:
+                continue
+            top_value, top_count = policy_counter.most_common(1)[0]
+            profile[f"{policy}_value"] = top_value
+            profile[f"{policy}_count"] = top_count
+            if len(policy_counter) >= 2:
+                drift_hits.append(f"{policy} changed {len(policy_counter)}x")
+            dominant = dominant_by_policy.get(policy)
+            if dominant and top_value != dominant and top_count >= 2:
+                drift_hits.append(f"{policy} diverges from baseline")
+
+        if drift_hits:
+            summary.policy_tampering.append(
+                {
+                    "server": server,
+                    "drift": drift_hits,
+                }
+            )
+            deterministic_checks["option_tampering_router_dns_routes_wpad_pxe"].append(
+                f"server={server} " + "; ".join(drift_hits[:3])
+            )
+            summary.risk_factors["DHCP option policy drift"] += 1
+
+        summary.server_policy_profiles.append(profile)
+
+    for client_mac in set(summary.client_details.keys()):
+        hostname_count = len(client_hostname_set.get(client_mac, set()))
+        client_id_count = len(client_id_set.get(client_mac, set()))
+        vendor_count = len(client_vendor_set.get(client_mac, set()))
+        req_count = int(summary.client_details.get(client_mac, 0) or 0)
+        profile = {
+            "client_mac": client_mac,
+            "requests": req_count,
+            "hostname_count": hostname_count,
+            "client_id_count": client_id_count,
+            "vendor_class_count": vendor_count,
+            "requested_ip_count": len(client_requested_ips.get(client_mac, set())),
+            "xid_count": len(client_xids.get(client_mac, set())),
+        }
+        summary.client_abuse_profiles.append(profile)
+        if hostname_count >= 4 or client_id_count >= 4 or vendor_count >= 3:
+            deterministic_checks["starvation_exhaustion_behavior"].append(
+                f"{client_mac} identity churn hostnames={hostname_count} client_ids={client_id_count} vendors={vendor_count}"
+            )
+
+    if len(summary.server_details) == 2 and not summary.policy_tampering and not summary.lease_conflicts:
+        deterministic_checks["likely_benign_failover_context"].append(
+            "Dual DHCP servers with no policy drift or duplicate lease conflicts"
+        )
+        summary.benign_context.append("Dual-server DHCP may reflect HA/failover behavior")
+
+    for violation in summary.transaction_violations[:120]:
+        summary.timeline.append(
+            {
+                "ts": violation.get("ts", 0.0),
+                "event": "transaction_violation",
+                "detail": f"{violation.get('type')} xid={violation.get('xid')} client={violation.get('client_mac')}",
+                "src": violation.get("src", "-"),
+                "dst": violation.get("dst", "-"),
+            }
+        )
+
+    for anomaly in summary.anomalies[:120]:
+        summary.timeline.append(
+            {
+                "ts": anomaly.ts,
+                "event": "anomaly",
+                "detail": f"[{anomaly.severity}] {anomaly.title}",
+                "src": anomaly.src,
+                "dst": anomaly.dst,
+            }
+        )
+
+    summary.timeline.sort(key=lambda item: float(item.get("ts", 0.0) or 0.0))
+    summary.server_policy_profiles.sort(key=lambda item: str(item.get("server", "")))
+    summary.client_abuse_profiles.sort(
+        key=lambda item: (
+            int(item.get("requests", 0) or 0),
+            int(item.get("requested_ip_count", 0) or 0),
+            int(item.get("xid_count", 0) or 0),
+        ),
+        reverse=True,
+    )
+    summary.deterministic_checks = {key: values[:50] for key, values in deterministic_checks.items()}
+    summary.policy_tampering = summary.policy_tampering[:50]
+    summary.transaction_violations = summary.transaction_violations[:120]
+    summary.lease_conflicts = summary.lease_conflicts[:60]
+    summary.relay_anomalies = summary.relay_anomalies[:50]
+    summary.benign_context = summary.benign_context[:25]
 
     return summary

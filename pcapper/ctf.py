@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 from collections import Counter
 import base64
 import binascii
+import ipaddress
 import re
 import urllib.parse
 
@@ -15,12 +16,16 @@ from .utils import safe_float
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
+    from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore
     from scapy.packet import Raw  # type: ignore
 except Exception:  # pragma: no cover
     IP = None  # type: ignore
     TCP = None  # type: ignore
     UDP = None  # type: ignore
     IPv6 = None  # type: ignore
+    DNS = None  # type: ignore
+    DNSQR = None  # type: ignore
+    DNSRR = None  # type: ignore
     Raw = None  # type: ignore
 
 
@@ -39,6 +44,28 @@ FILE_HINT_PATTERNS = [
     re.compile(r"(flag\\b)", re.IGNORECASE),
     re.compile(r"(ctf\\b)", re.IGNORECASE),
 ]
+
+SECRETISH_PATTERNS = [
+    re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+]
+
+HTTP_METHOD_RE = re.compile(r"^(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD|TRACE|CONNECT)\s+([^\s]+)", re.IGNORECASE)
+GENERIC_TOKEN_RE = re.compile(r"[A-Za-z0-9%+/=_:.-]{10,}")
+
+
+def _pattern_name(pattern: re.Pattern[str]) -> str:
+    text = pattern.pattern.lower()
+    if "flag\\{" in text:
+        return "flag{}"
+    if "ctf\\{" in text:
+        return "ctf{}"
+    if "htb\\{" in text:
+        return "htb{}"
+    if "picoctf\\{" in text:
+        return "picoctf{}"
+    return "ctf-pattern"
 
 
 @dataclass(frozen=True)
@@ -61,6 +88,12 @@ class CtfSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+    confidence_counts: Counter[str] = field(default_factory=Counter)
+    candidate_findings: list[dict[str, object]] = field(default_factory=list)
+    deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
+    timeline: list[dict[str, object]] = field(default_factory=list)
+    hunting_pivots: list[dict[str, object]] = field(default_factory=list)
+    false_positive_context: list[str] = field(default_factory=list)
 
 
 def _extract_payload(pkt) -> bytes:
@@ -112,6 +145,112 @@ def _decode_candidates(text: str) -> list[str]:
     return results
 
 
+def _iter_decode_candidates(token: str, max_depth: int = 3) -> list[tuple[str, str]]:
+    queue: list[tuple[str, str, int]] = [(token, "raw", 0)]
+    seen: set[str] = {token}
+    out: list[tuple[str, str]] = []
+
+    while queue:
+        value, chain, depth = queue.pop(0)
+        out.append((value, chain))
+        if depth >= max_depth:
+            continue
+
+        # URL decode
+        try:
+            url_dec = urllib.parse.unquote(value)
+            if url_dec and url_dec != value and url_dec not in seen:
+                seen.add(url_dec)
+                queue.append((url_dec, f"{chain}->url", depth + 1))
+        except Exception:
+            pass
+
+        # Hex decode
+        try:
+            if len(value) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", value):
+                hex_dec = binascii.unhexlify(value).decode("utf-8", errors="ignore")
+                if hex_dec and hex_dec not in seen:
+                    seen.add(hex_dec)
+                    queue.append((hex_dec, f"{chain}->hex", depth + 1))
+        except Exception:
+            pass
+
+        # Base64 decode (std/urlsafe)
+        if len(value) >= 8 and re.fullmatch(r"[A-Za-z0-9_+/=-]+", value):
+            for decoder_name, decoder in (("b64", base64.b64decode), ("b64url", base64.urlsafe_b64decode)):
+                try:
+                    padded = value + ("=" * (-len(value) % 4))
+                    dec = decoder(padded).decode("utf-8", errors="ignore")
+                    if dec and dec not in seen:
+                        seen.add(dec)
+                        queue.append((dec, f"{chain}->{decoder_name}", depth + 1))
+                except Exception:
+                    pass
+
+    # Bound returned candidates to avoid pathological payloads.
+    return out[:24]
+
+
+def _is_public_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_global
+    except Exception:
+        return False
+
+
+def _is_secretish_token(value: str) -> bool:
+    if any(pattern.search(value) for pattern in SECRETISH_PATTERNS):
+        return True
+    if len(value) >= 32 and value.lower().startswith(("ghp_", "glpat-", "xoxb-", "xoxp-", "sk_")):
+        return True
+    return False
+
+
+def _candidate_score(value: str, chain: str, source: str, external: bool, reassembled: bool) -> tuple[int, str]:
+    score = 0
+    lower = value.lower()
+
+    matched = any(pattern.search(value) for pattern in FLAG_PATTERNS)
+    if matched:
+        score += 4
+    if chain != "raw":
+        score += 1
+    if source == "dns":
+        score += 1
+    if source == "http":
+        score += 1
+    if external:
+        score += 1
+    if reassembled:
+        score += 1
+    if _is_secretish_token(value) and not matched:
+        score -= 2
+    if any(prefix in lower for prefix in ("flag{", "ctf{", "htb{", "picoctf{")):
+        score += 2
+
+    if score >= 6:
+        return score, "high"
+    if score >= 3:
+        return score, "medium"
+    return score, "low"
+
+
+def _proto_label(pkt) -> str:
+    if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+        try:
+            dport = int(pkt[TCP].dport)  # type: ignore[index]
+            return f"TCP/{dport}"
+        except Exception:
+            return "TCP"
+    if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+        try:
+            dport = int(pkt[UDP].dport)  # type: ignore[index]
+            return f"UDP/{dport}"
+        except Exception:
+            return "UDP"
+    return "OTHER"
+
+
 def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
     reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
     total_packets = 0
@@ -122,9 +261,112 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
     errors: list[str] = []
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+    confidence_counts: Counter[str] = Counter()
+    candidate_findings: list[dict[str, object]] = []
+    timeline: list[dict[str, object]] = []
+    false_positive_context: list[str] = []
+    source_counts: Counter[str] = Counter()
+    destination_counts: Counter[str] = Counter()
+    protocol_counts: Counter[str] = Counter()
+    token_to_sources: dict[str, set[str]] = {}
+    token_to_dests: dict[str, set[str]] = {}
+    flow_text_tail: dict[tuple[str, str, str], str] = {}
+    seen_finding_keys: set[tuple[str, int, str, str]] = set()
+
+    deterministic_checks: dict[str, list[str]] = {
+        "flag_wrapper_pattern_present": [],
+        "decoded_wrapper_pattern_present": [],
+        "multi_source_corroboration": [],
+        "stream_reassembled_match": [],
+        "external_replay_exfil_behavior": [],
+        "challenge_file_hint_correlation": [],
+        "likely_secret_not_flag": [],
+    }
+
+    def _record_candidate(
+        *,
+        value: str,
+        decode_chain: str,
+        source: str,
+        context: str,
+        packet_number: int,
+        ts: Optional[float],
+        src_ip: str,
+        dst_ip: str,
+        protocol: str,
+        reassembled: bool = False,
+    ) -> None:
+        if not value.strip():
+            return
+        external = _is_public_ip(dst_ip)
+        score, confidence = _candidate_score(value, decode_chain, source, external, reassembled)
+        key = (value[:96], packet_number, src_ip, dst_ip)
+        if key in seen_finding_keys:
+            return
+        seen_finding_keys.add(key)
+
+        confidence_counts[confidence] += 1
+        source_counts[src_ip] += 1
+        destination_counts[dst_ip] += 1
+        protocol_counts[protocol] += 1
+
+        normalized = value.strip().lower()
+        token_to_sources.setdefault(normalized, set()).add(src_ip)
+        token_to_dests.setdefault(normalized, set()).add(dst_ip)
+
+        finding = {
+            "candidate": value,
+            "normalized": normalized[:120],
+            "score": score,
+            "confidence": confidence,
+            "decode_chain": decode_chain,
+            "source": source,
+            "reassembled": reassembled,
+            "packet": packet_number,
+            "ts": ts,
+            "src": src_ip,
+            "dst": dst_ip,
+            "protocol": protocol,
+            "context": context[:180],
+        }
+        candidate_findings.append(finding)
+        timeline.append({
+            "ts": ts,
+            "event": "candidate",
+            "candidate": value[:80],
+            "confidence": confidence,
+            "src": src_ip,
+            "dst": dst_ip,
+            "protocol": protocol,
+            "packet": packet_number,
+        })
+
+        if _is_secretish_token(value) and not any(pattern.search(value) for pattern in FLAG_PATTERNS):
+            deterministic_checks["likely_secret_not_flag"].append(
+                f"pkt={packet_number} {src_ip}->{dst_ip} token looked secret-like (not CTF wrapper)"
+            )
+            false_positive_context.append(
+                f"Likely secret-like token (downranked): pkt={packet_number} {src_ip}->{dst_ip} {value[:40]}"
+            )
+
+        for pattern in FLAG_PATTERNS:
+            m = pattern.search(value)
+            if not m:
+                continue
+            matched_value = m.group(1)
+            token_counts[matched_value] += 1
+            hits.append(CtfHit(src_ip=src_ip, dst_ip=dst_ip, protocol=protocol, context=matched_value))
+            deterministic_checks["flag_wrapper_pattern_present"].append(
+                f"pkt={packet_number} {_pattern_name(pattern)} {src_ip}->{dst_ip}"
+            )
+            if decode_chain != "raw":
+                decoded_hits.append(value)
+                deterministic_checks["decoded_wrapper_pattern_present"].append(
+                    f"pkt={packet_number} {_pattern_name(pattern)} via {decode_chain}"
+                )
 
     try:
-        for pkt in reader:
+        for pkt_index, pkt in enumerate(reader, start=1):
             if stream is not None and size_bytes:
                 try:
                     pos = stream.tell()
@@ -151,22 +393,118 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
             if not src_ip or not dst_ip:
                 continue
 
+            protocol = _proto_label(pkt)
+
             payload = _extract_payload(pkt)
             if not payload:
                 continue
             text = payload.decode("latin-1", errors="ignore")
 
+            # Raw payload wrapper checks.
             for pattern in FLAG_PATTERNS:
                 for match in pattern.findall(text):
-                    token_counts[match] += 1
-                    hits.append(CtfHit(src_ip=src_ip, dst_ip=dst_ip, protocol="payload", context=match))
+                    _record_candidate(
+                        value=match,
+                        decode_chain="raw",
+                        source="payload",
+                        context="raw payload wrapper match",
+                        packet_number=pkt_index,
+                        ts=ts,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        protocol=protocol,
+                    )
 
-            for token in re.findall(r"[A-Za-z0-9+/=]{12,}", text):
-                decoded = _decode_candidates(token)
-                for value in decoded:
-                    for pattern in FLAG_PATTERNS:
-                        if pattern.search(value):
-                            decoded_hits.append(value)
+            # HTTP-aware extraction for URI/body candidates.
+            lines = text.splitlines()
+            if lines:
+                method_match = HTTP_METHOD_RE.match(lines[0].strip())
+                if method_match:
+                    uri = method_match.group(2)
+                    for token in GENERIC_TOKEN_RE.findall(uri):
+                        for value, chain in _iter_decode_candidates(token):
+                            if any(pattern.search(value) for pattern in FLAG_PATTERNS):
+                                _record_candidate(
+                                    value=value,
+                                    decode_chain=chain,
+                                    source="http",
+                                    context=f"http-uri token={token[:40]}",
+                                    packet_number=pkt_index,
+                                    ts=ts,
+                                    src_ip=src_ip,
+                                    dst_ip=dst_ip,
+                                    protocol=protocol,
+                                )
+
+            # Generic token decode pipeline.
+            token_budget = 80
+            seen_tokens: set[str] = set()
+            for token in GENERIC_TOKEN_RE.findall(text):
+                if token in seen_tokens:
+                    continue
+                seen_tokens.add(token)
+                if len(seen_tokens) > token_budget:
+                    break
+                for value, chain in _iter_decode_candidates(token):
+                    if any(pattern.search(value) for pattern in FLAG_PATTERNS):
+                        _record_candidate(
+                            value=value,
+                            decode_chain=chain,
+                            source="payload",
+                            context=f"decoded token={token[:40]}",
+                            packet_number=pkt_index,
+                            ts=ts,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            protocol=protocol,
+                        )
+
+            # Simple stream-boundary reconstruction to catch split wrappers.
+            flow_key = (src_ip, dst_ip, protocol)
+            prior = flow_text_tail.get(flow_key, "")
+            combined = (prior + text)[-8192:]
+            for pattern in FLAG_PATTERNS:
+                for match in pattern.findall(combined):
+                    if match not in text and match in combined:
+                        deterministic_checks["stream_reassembled_match"].append(
+                            f"pkt={pkt_index} flow={src_ip}->{dst_ip} protocol={protocol}"
+                        )
+                        _record_candidate(
+                            value=match,
+                            decode_chain="raw",
+                            source="reassembly",
+                            context="flow tail reassembly",
+                            packet_number=pkt_index,
+                            ts=ts,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            protocol=protocol,
+                            reassembled=True,
+                        )
+            flow_text_tail[flow_key] = combined[-256:]
+
+            if DNS is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
+                try:
+                    dns_layer = pkt[DNS]  # type: ignore[index]
+                    qd = getattr(dns_layer, "qd", None)
+                    if qd is not None and hasattr(qd, "qname"):
+                        qname = str(getattr(qd, "qname", b"")).strip("b'").strip("'")
+                        if qname:
+                            for value, chain in _iter_decode_candidates(qname):
+                                if any(pattern.search(value) for pattern in FLAG_PATTERNS):
+                                    _record_candidate(
+                                        value=value,
+                                        decode_chain=chain,
+                                        source="dns",
+                                        context=f"dns-qname={qname[:80]}",
+                                        packet_number=pkt_index,
+                                        ts=ts,
+                                        src_ip=src_ip,
+                                        dst_ip=dst_ip,
+                                        protocol=protocol,
+                                    )
+                except Exception:
+                    pass
 
     finally:
         status.finish()
@@ -181,9 +519,49 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
             if not name:
                 continue
             if any(pattern.search(name) for pattern in FILE_HINT_PATTERNS):
-                file_hints.append(f"{art.filename} {art.src_ip}->{art.dst_ip} {art.protocol}")
+                line = f"{art.filename} {art.src_ip}->{art.dst_ip} {art.protocol}"
+                file_hints.append(line)
+                deterministic_checks["challenge_file_hint_correlation"].append(line)
     except Exception:
         pass
+
+    # Multi-source corroboration and replay/exfil style behavior for candidates.
+    for token, srcs in token_to_sources.items():
+        if len(srcs) >= 2:
+            deterministic_checks["multi_source_corroboration"].append(
+                f"candidate={token[:48]} seen from {len(srcs)} sources"
+            )
+
+    for token, dsts in token_to_dests.items():
+        public_dsts = [dst for dst in dsts if _is_public_ip(dst)]
+        if len(dsts) >= 2 or len(public_dsts) >= 1:
+            deterministic_checks["external_replay_exfil_behavior"].append(
+                f"candidate={token[:48]} dsts={len(dsts)} public={len(public_dsts)}"
+            )
+
+    candidate_findings.sort(
+        key=lambda item: (
+            int(item.get("score", 0) or 0),
+            str(item.get("confidence", "")) == "high",
+            int(item.get("packet", 0) or 0),
+        ),
+        reverse=True,
+    )
+
+    hunting_pivots: list[dict[str, object]] = []
+    for item in candidate_findings[:40]:
+        hunting_pivots.append(
+            {
+                "packet": item.get("packet", "-"),
+                "src": item.get("src", "-"),
+                "dst": item.get("dst", "-"),
+                "protocol": item.get("protocol", "-"),
+                "candidate": str(item.get("candidate", "-"))[:64],
+                "decode_chain": item.get("decode_chain", "raw"),
+            }
+        )
+
+    timeline.sort(key=lambda item: float(item.get("ts", 0.0) or 0.0))
 
     duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
     return CtfSummary(
@@ -197,4 +575,10 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration,
+        confidence_counts=confidence_counts,
+        candidate_findings=candidate_findings[:200],
+        deterministic_checks={key: value[:40] for key, value in deterministic_checks.items()},
+        timeline=timeline[:200],
+        hunting_pivots=hunting_pivots[:80],
+        false_positive_context=false_positive_context[:30],
     )

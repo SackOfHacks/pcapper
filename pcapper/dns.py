@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict, OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 import math
@@ -175,6 +175,15 @@ class DnsSummary:
     duration_seconds: Optional[float]
     detections: list[dict[str, str | list[tuple[str, int]] | int]]
     errors: list[str]
+    deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
+    resolver_drift: list[dict[str, object]] = field(default_factory=list)
+    client_abuse_profiles: list[dict[str, object]] = field(default_factory=list)
+    ttl_outliers: list[dict[str, object]] = field(default_factory=list)
+    cname_anomalies: list[dict[str, object]] = field(default_factory=list)
+    transaction_violations: list[dict[str, object]] = field(default_factory=list)
+    amplification_candidates: list[dict[str, object]] = field(default_factory=list)
+    timeline: list[dict[str, object]] = field(default_factory=list)
+    benign_context: list[str] = field(default_factory=list)
 
 
 def _shannon_entropy(value: str) -> float:
@@ -427,6 +436,14 @@ def analyze_dns(
     client_txt_queries: Counter[str] = Counter()
     client_nxdomain: Counter[str] = Counter()
     base_domain_priv_pub: dict[str, set[str]] = defaultdict(set)
+    client_resolvers: dict[str, Counter[str]] = defaultdict(Counter)
+    pending_queries: dict[tuple[str, str, int], dict[str, object]] = {}
+    orphan_responses: list[dict[str, object]] = []
+    qname_ttl_values: dict[str, list[int]] = defaultdict(list)
+    cname_targets: dict[str, set[str]] = defaultdict(set)
+    one_off_high_entropy: list[tuple[str, int, int]] = []
+    flow_query_bytes: Counter[tuple[str, str]] = Counter()
+    flow_response_bytes: Counter[tuple[str, str]] = Counter()
     opcode_counts: Counter[int] = Counter()
     flag_counts: Counter[str] = Counter()
     edns0_opt_count = 0
@@ -437,6 +454,19 @@ def analyze_dns(
     llmnr_server_counts: Counter[str] = Counter()
     query_sizes: list[int] = []
     response_sizes: list[int] = []
+
+    deterministic_checks: dict[str, list[str]] = {
+        "dns_tunneling_indicators": [],
+        "dga_like_behavior": [],
+        "fast_flux_or_rebinding": [],
+        "zone_transfer_attempt": [],
+        "resolver_policy_violation": [],
+        "dnssec_or_integrity_anomaly": [],
+        "amplification_abuse_signal": [],
+        "likely_benign_cdn_rotation": [],
+    }
+    timeline: list[dict[str, object]] = []
+    benign_context: list[str] = []
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -539,11 +569,37 @@ def analyze_dns(
                 if getattr(dns_layer, "qr", 0) == 0:
                     counter_inc(client_counts, src_ip)
                     counter_inc(server_counts, dst_ip)
+                    counter_inc(client_resolvers[src_ip], dst_ip)
+                    flow_query_bytes[(src_ip, dst_ip)] += pkt_len
                 else:
                     counter_inc(client_counts, dst_ip)
                     counter_inc(server_counts, src_ip)
+                    flow_response_bytes[(dst_ip, src_ip)] += pkt_len
                     if rcode is not None and int(rcode) == 3:
                         counter_inc(client_nxdomain, dst_ip)
+
+                if src_ip and dst_ip:
+                    dns_id = int(getattr(dns_layer, "id", 0) or 0)
+                    if getattr(dns_layer, "qr", 0) == 0:
+                        pending_queries[(src_ip, dst_ip, dns_id)] = {
+                            "ts": ts,
+                            "src": src_ip,
+                            "dst": dst_ip,
+                            "id": dns_id,
+                        }
+                    else:
+                        match_key = (dst_ip, src_ip, dns_id)
+                        if match_key in pending_queries:
+                            pending_queries.pop(match_key, None)
+                        elif dns_id != 0:
+                            orphan_responses.append(
+                                {
+                                    "ts": ts,
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "id": dns_id,
+                                }
+                            )
 
                 if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                     if dst_ip.startswith("224.") or dst_ip.startswith("ff02::"):
@@ -665,6 +721,9 @@ def analyze_dns(
                                 rrname_bytes = rrname if isinstance(rrname, (bytes, bytearray)) else str(rrname).encode("utf-8", errors="ignore")
                                 rrname_str = decode_payload(rrname_bytes, encoding="utf-8").strip(".")
                                 setdict_add(answers_by_qname, rrname_str, str(rdata), max_values=MAX_DNS_UNIQUE)
+                                rr_ttl = int(getattr(rr, "ttl", 0) or 0)
+                                if rr_ttl > 0:
+                                    qname_ttl_values[rrname_str].append(rr_ttl)
                                 if rrtype in {1, 28}:  # A or AAAA
                                     setdict_add(base_domain_answers, _base_domain(rrname_str), str(rdata), max_values=MAX_DNS_UNIQUE)
                                     try:
@@ -678,6 +737,13 @@ def analyze_dns(
                                 if is_mdns:
                                     if rrtype == 33:
                                         counter_inc(mdns_service_counts, rrname_str)
+                                if rrtype == 5 and rrname_str:
+                                    try:
+                                        target = str(rdata).strip(".")
+                                    except Exception:
+                                        target = str(rdata)
+                                    if target:
+                                        set_add_cap(cname_targets[rrname_str], target, max_size=MAX_DNS_UNIQUE)
                                     if rrtype == 12:
                                         try:
                                             service_name = str(rdata).strip(".")
@@ -775,6 +841,9 @@ def analyze_dns(
                 "top_clients": client_counts.most_common(3),
                 "top_servers": server_counts.most_common(3),
             })
+            deterministic_checks["dga_like_behavior"].append(
+                f"NXDOMAIN ratio high: {nxdomain}/{total_packets}"
+            )
 
         servfail = rcode_counts.get("2", 0)
         if servfail > 50 and total_packets > 0 and (servfail / total_packets) > 0.2:
@@ -811,6 +880,9 @@ def analyze_dns(
                 "top_clients": client_counts.most_common(3),
                 "top_servers": server_counts.most_common(3),
             })
+            deterministic_checks["dns_tunneling_indicators"].append(
+                f"High-entropy/long qnames count={len(suspicious_qnames)}"
+            )
 
         client_suspects: list[str] = []
         for client, total in client_counts.items():
@@ -835,6 +907,7 @@ def analyze_dns(
                 "top_clients": client_counts.most_common(3),
                 "top_servers": server_counts.most_common(3),
             })
+            deterministic_checks["dga_like_behavior"].extend(client_suspects[:8])
 
         for base, count in base_domain_counts.items():
             if count > 1000:
@@ -886,6 +959,9 @@ def analyze_dns(
                 "top_clients": client_counts.most_common(3),
                 "top_servers": server_counts.most_common(3),
             })
+            deterministic_checks["fast_flux_or_rebinding"].append(
+                f"Rebinding domains: {sample}"
+            )
 
         if zone_transfer_requests:
             sample = ", ".join(sorted(list(zone_transfer_requests))[:5])
@@ -897,6 +973,7 @@ def analyze_dns(
                 "top_clients": client_counts.most_common(3),
                 "top_servers": server_counts.most_common(3),
             })
+            deterministic_checks["zone_transfer_attempt"].append(sample)
 
         txt_queries = qtype_counts.get(16, 0)
         if txt_queries > 100 and total_packets > 0 and (txt_queries / total_packets) > 0.2:
@@ -912,6 +989,9 @@ def analyze_dns(
                 "top_clients": client_counts.most_common(3),
                 "top_servers": server_counts.most_common(3),
             })
+            deterministic_checks["dns_tunneling_indicators"].append(
+                f"TXT-heavy ratio: {txt_queries}/{total_packets}"
+            )
 
         ptr_queries = qtype_counts.get(12, 0)
         if ptr_queries > 50 and total_packets > 0 and (ptr_queries / total_packets) > 0.2:
@@ -1048,6 +1128,7 @@ def analyze_dns(
                 "details": f"Public resolvers: {resolver_details}. In OT/ICS networks, direct public DNS usage is often a policy violation.",
                 "top_clients": client_counts.most_common(3),
             })
+            deterministic_checks["resolver_policy_violation"].append(resolver_details)
 
         if local_unicast_qname_counts:
             sample = ", ".join(sorted(list(local_unicast_qname_counts))[:5])
@@ -1206,6 +1287,146 @@ def analyze_dns(
                     "summary": "VirusTotal DNS reputation",
                     "vt_findings": vt_findings,
                 })
+
+    for domain, answers in base_domain_answers.items():
+        if len(answers) >= 15:
+            deterministic_checks["fast_flux_or_rebinding"].append(
+                f"{domain} has {len(answers)} unique answers"
+            )
+
+    ttl_outliers: list[dict[str, object]] = []
+    for qname, ttls in qname_ttl_values.items():
+        if len(ttls) < 5:
+            continue
+        unique_ttl = len(set(ttls))
+        min_ttl = min(ttls)
+        max_ttl = max(ttls)
+        if unique_ttl >= 4 or min_ttl <= 30:
+            ttl_outliers.append({
+                "qname": qname,
+                "samples": len(ttls),
+                "unique_ttl": unique_ttl,
+                "min_ttl": min_ttl,
+                "max_ttl": max_ttl,
+            })
+    ttl_outliers.sort(key=lambda item: (int(item.get("unique_ttl", 0)), int(item.get("samples", 0))), reverse=True)
+    for item in ttl_outliers[:20]:
+        deterministic_checks["fast_flux_or_rebinding"].append(
+            f"TTL outlier {item.get('qname')} unique={item.get('unique_ttl')} min={item.get('min_ttl')} max={item.get('max_ttl')}"
+        )
+
+    cname_anomalies: list[dict[str, object]] = []
+    for qname, targets in cname_targets.items():
+        if len(targets) >= 4:
+            cname_anomalies.append({
+                "qname": qname,
+                "target_count": len(targets),
+                "targets": sorted(targets)[:8],
+            })
+            deterministic_checks["dnssec_or_integrity_anomaly"].append(
+                f"CNAME target churn {qname} targets={len(targets)}"
+            )
+    cname_anomalies.sort(key=lambda item: int(item.get("target_count", 0)), reverse=True)
+
+    transaction_violations: list[dict[str, object]] = orphan_responses[:120]
+    for item in transaction_violations[:20]:
+        deterministic_checks["dnssec_or_integrity_anomaly"].append(
+            f"Orphan response id={item.get('id')} {item.get('src')}->{item.get('dst')}"
+        )
+
+    amplification_candidates: list[dict[str, object]] = []
+    for flow, qbytes in flow_query_bytes.items():
+        rbytes = int(flow_response_bytes.get(flow, 0) or 0)
+        if qbytes <= 0 or rbytes <= 0:
+            continue
+        ratio = rbytes / max(qbytes, 1)
+        if ratio >= 8.0 and rbytes >= 20_000:
+            amplification_candidates.append(
+                {
+                    "client": flow[0],
+                    "resolver": flow[1],
+                    "query_bytes": qbytes,
+                    "response_bytes": rbytes,
+                    "ratio": round(ratio, 2),
+                }
+            )
+            deterministic_checks["amplification_abuse_signal"].append(
+                f"{flow[0]}->{flow[1]} amplification ratio={ratio:.2f}"
+            )
+    amplification_candidates.sort(key=lambda item: float(item.get("ratio", 0.0) or 0.0), reverse=True)
+
+    resolver_drift: list[dict[str, object]] = []
+    for client, resolver_counter in client_resolvers.items():
+        if sum(resolver_counter.values()) < 20:
+            continue
+        resolvers = list(resolver_counter.keys())
+        if len(resolvers) < 2:
+            continue
+        has_public = any(ip in PUBLIC_DNS_RESOLVERS for ip in resolvers)
+        has_private = False
+        for ip in resolvers:
+            try:
+                if ipaddress.ip_address(ip).is_private:
+                    has_private = True
+                    break
+            except Exception:
+                continue
+        if len(resolvers) >= 3 or (has_public and has_private):
+            resolver_drift.append(
+                {
+                    "client": client,
+                    "resolver_count": len(resolvers),
+                    "public": has_public,
+                    "private": has_private,
+                    "top_resolvers": resolver_counter.most_common(5),
+                }
+            )
+            deterministic_checks["resolver_policy_violation"].append(
+                f"{client} resolver drift count={len(resolvers)} public={has_public} private={has_private}"
+            )
+    resolver_drift.sort(key=lambda item: int(item.get("resolver_count", 0)), reverse=True)
+
+    client_abuse_profiles: list[dict[str, object]] = []
+    for client, total in client_counts.items():
+        if total < 15:
+            continue
+        unique = len(client_unique_qnames.get(client, set()))
+        ratio = unique / max(total, 1)
+        entropies = client_entropy_scores.get(client, [])
+        avg_entropy = (sum(entropies) / len(entropies)) if entropies else 0.0
+        profile = {
+            "client": client,
+            "queries": int(total),
+            "unique_qnames": unique,
+            "unique_ratio": round(ratio, 2),
+            "avg_entropy": round(avg_entropy, 2),
+            "nxdomain": int(client_nxdomain.get(client, 0) or 0),
+            "txt_queries": int(client_txt_queries.get(client, 0) or 0),
+            "long_queries": int(client_long_queries.get(client, 0) or 0),
+        }
+        client_abuse_profiles.append(profile)
+    client_abuse_profiles.sort(key=lambda item: (float(item.get("unique_ratio", 0.0)), float(item.get("avg_entropy", 0.0))), reverse=True)
+
+    for name, count in qname_counts.items():
+        if count == 1 and qname_lengths.get(name, 0) >= 36 and (qname_entropy.get(name, 0) / 100.0) >= 4.1:
+            one_off_high_entropy.append((name, qname_lengths.get(name, 0), qname_entropy.get(name, 0)))
+    if one_off_high_entropy:
+        sample = ", ".join(name for name, _len_v, _ent in one_off_high_entropy[:5])
+        deterministic_checks["dga_like_behavior"].append(f"one-off high-entropy qnames: {sample}")
+
+    if any(len(answers) <= 4 for answers in base_domain_answers.values()) and base_domain_answers:
+        benign_context.append("Some answer rotation appears low-volume and may reflect normal CDN behavior")
+        deterministic_checks["likely_benign_cdn_rotation"].append("Low-cardinality answer rotation observed")
+
+    for det in detections[:120]:
+        timeline.append(
+            {
+                "ts": first_seen,
+                "event": str(det.get("type", "detection")),
+                "summary": str(det.get("summary", "")),
+                "details": str(det.get("details", "")),
+            }
+        )
 
     return DnsSummary(
         path=path,

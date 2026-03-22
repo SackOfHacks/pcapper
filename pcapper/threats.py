@@ -6,9 +6,15 @@ from typing import Optional
 from collections import Counter, defaultdict
 from datetime import datetime
 from functools import lru_cache
+import hashlib
 import ipaddress
+import json
 import math
 import re
+import shutil
+import subprocess
+import tempfile
+import time
 
 from .pcap_cache import get_reader
 from .utils import safe_float, counter_inc, setdict_add
@@ -163,6 +169,10 @@ class ThreatSummary:
     ot_risk_score: int = 0
     ot_risk_findings: list[str] = None  # type: ignore[assignment]
     storyline: list[str] = None  # type: ignore[assignment]
+    suricata_metadata: dict[str, object] = None  # type: ignore[assignment]
+    suricata_checks: dict[str, list[str]] = None  # type: ignore[assignment]
+    suricata_event_counts: dict[str, int] = None  # type: ignore[assignment]
+    suricata_pivots: dict[str, list[tuple[str, int]]] = None  # type: ignore[assignment]
 
 
 def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
@@ -182,6 +192,10 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
             ot_risk_score=0,
             ot_risk_findings=[],
             storyline=[],
+            suricata_metadata={},
+            suricata_checks={},
+            suricata_event_counts={},
+            suricata_pivots={},
         )
 
     merged_detections: list[dict[str, object]] = []
@@ -196,6 +210,12 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
     risk_scores: list[int] = []
     risk_findings: list[str] = []
     storyline: list[str] = []
+    suricata_event_counts: Counter[str] = Counter()
+    suricata_checks: dict[str, list[str]] = defaultdict(list)
+    suricata_source_counts: Counter[str] = Counter()
+    suricata_destination_counts: Counter[str] = Counter()
+    suricata_signature_counts: Counter[str] = Counter()
+    suricata_pcaps_scanned = 0
     for summary in summaries:
         merged_detections.extend(summary.detections)
         merged_errors.extend(summary.errors)
@@ -217,11 +237,57 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
             risk_findings.extend(summary.ot_risk_findings)
         if summary.storyline:
             storyline.extend(summary.storyline)
+        if summary.suricata_event_counts:
+            suricata_event_counts.update(summary.suricata_event_counts)
+        if summary.suricata_checks:
+            for key, values in summary.suricata_checks.items():
+                for value in values:
+                    suricata_checks[key].append(value)
+        if summary.suricata_pivots:
+            for ip_value, count in summary.suricata_pivots.get("top_sources", []) or []:
+                suricata_source_counts[str(ip_value)] += int(count)
+            for ip_value, count in summary.suricata_pivots.get("top_destinations", []) or []:
+                suricata_destination_counts[str(ip_value)] += int(count)
+            for sig_value, count in summary.suricata_pivots.get("top_signatures", []) or []:
+                suricata_signature_counts[str(sig_value)] += int(count)
+        if summary.suricata_metadata and summary.suricata_metadata.get("engine"):
+            suricata_pcaps_scanned += 1
 
     deduped_errors = sorted(set(merged_errors))
     duration = None
     if first_seen is not None and last_seen is not None:
         duration = max(0.0, last_seen - first_seen)
+
+    merged_suricata_checks: dict[str, list[str]] = {}
+    for key, values in suricata_checks.items():
+        deduped = []
+        seen: set[str] = set()
+        for value in values:
+            sval = str(value)
+            if sval in seen:
+                continue
+            seen.add(sval)
+            deduped.append(sval)
+            if len(deduped) >= 20:
+                break
+        merged_suricata_checks[key] = deduped
+
+    merged_suricata_metadata: dict[str, object] = {}
+    if suricata_pcaps_scanned:
+        merged_suricata_metadata = {
+            "engine": "Suricata",
+            "pcaps_scanned": suricata_pcaps_scanned,
+            "mode": "rollup",
+        }
+
+    merged_suricata_pivots: dict[str, list[tuple[str, int]]] = {}
+    if suricata_source_counts:
+        merged_suricata_pivots["top_sources"] = suricata_source_counts.most_common(10)
+    if suricata_destination_counts:
+        merged_suricata_pivots["top_destinations"] = suricata_destination_counts.most_common(10)
+    if suricata_signature_counts:
+        merged_suricata_pivots["top_signatures"] = suricata_signature_counts.most_common(10)
+
     return ThreatSummary(
         path=Path("ALL_PCAPS"),
         detections=merged_detections,
@@ -237,6 +303,10 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
         ot_risk_score=max(risk_scores) if risk_scores else 0,
         ot_risk_findings=_dedupe_evidence(risk_findings, limit=6),
         storyline=_dedupe_evidence(storyline, limit=6),
+        suricata_metadata=merged_suricata_metadata,
+        suricata_checks=merged_suricata_checks,
+        suricata_event_counts=dict(suricata_event_counts),
+        suricata_pivots=merged_suricata_pivots,
     )
 
 
@@ -249,6 +319,571 @@ def _normalize_severity(value: object) -> str:
     if text in {"MEDIUM", "WARN", "WARNING"}:
         return "warning"
     return "info"
+
+
+def _suricata_alert_severity(value: object) -> str:
+    numeric = None
+    try:
+        numeric = int(value)
+    except Exception:
+        numeric = None
+    if numeric is not None:
+        if numeric <= 1:
+            return "critical"
+        if numeric == 2:
+            return "high"
+        if numeric == 3:
+            return "warning"
+        return "info"
+    return _normalize_severity(value)
+
+
+def _file_sha256(path: Path) -> str:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return "-"
+
+
+def _suricata_tactic(signature: str, category: str) -> tuple[str, str]:
+    blob = f"{signature} {category}".lower()
+    if any(token in blob for token in ("scan", "recon", "enumeration", "sweep", "probe")):
+        return "Reconnaissance", "TA0043"
+    if any(token in blob for token in ("brute", "credential", "auth", "password", "ntlm", "kerberos")):
+        return "Credential Access", "TA0006"
+    if any(token in blob for token in ("c2", "command", "beacon", "trojan", "botnet")):
+        return "Command & Control", "TA0011"
+    if any(token in blob for token in ("lateral", "smb", "rdp", "winrm", "ssh")):
+        return "Lateral Movement", "TA0008"
+    if any(token in blob for token in ("exfil", "dns tunnel", "tunnel", "data theft")):
+        return "Exfiltration", "TA0010"
+    if any(token in blob for token in ("dos", "flood", "impact", "destruction")):
+        return "Impact", "TA0040"
+    return "Other", "-"
+
+
+def _suricata_confidence(
+    severity: str,
+    count: int,
+    uniq_sources: int,
+    uniq_destinations: int,
+    correlated_hits: int,
+) -> str:
+    points = 0
+    if severity == "critical":
+        points += 4
+    elif severity == "high":
+        points += 3
+    elif severity == "warning":
+        points += 2
+    else:
+        points += 1
+    if count >= 5:
+        points += 2
+    elif count >= 2:
+        points += 1
+    if uniq_sources >= 2:
+        points += 1
+    if uniq_destinations >= 2:
+        points += 1
+    if correlated_hits >= 2:
+        points += 2
+    elif correlated_hits == 1:
+        points += 1
+    if points >= 8:
+        return "high"
+    if points >= 5:
+        return "medium"
+    return "low"
+
+
+def _parse_suricata_eve_alerts(
+    eve_path: Path,
+    eve_types: set[str] | None = None,
+    only_sid: set[str] | None = None,
+    suppress_sid: set[str] | None = None,
+) -> tuple[list[dict[str, object]], list[str], dict[str, object]]:
+    detections: list[dict[str, object]] = []
+    errors: list[str] = []
+    if not eve_path.exists():
+        return detections, errors, {}
+
+    signature_counts: Counter[str] = Counter()
+    signature_sources: dict[str, Counter[str]] = defaultdict(Counter)
+    signature_destinations: dict[str, Counter[str]] = defaultdict(Counter)
+    signature_evidence: dict[str, list[str]] = defaultdict(list)
+    signature_sid: dict[str, str] = {}
+    signature_category: dict[str, str] = {}
+    signature_severity: dict[str, str] = {}
+    signature_correlated: Counter[str] = Counter()
+    signature_tactic: dict[str, tuple[str, str]] = {}
+
+    event_counts: Counter[str] = Counter()
+    dns_queries: Counter[str] = Counter()
+    http_hosts: Counter[str] = Counter()
+    tls_sni: Counter[str] = Counter()
+    file_names: Counter[str] = Counter()
+    anomaly_counts: Counter[str] = Counter()
+    eve_lines = 0
+
+    severity_rank = {"critical": 0, "high": 1, "warning": 2, "info": 3}
+    total_alerts = 0
+
+    try:
+        with eve_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                eve_lines += 1
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    errors.append(f"Suricata: failed to parse eve.json line {line_number}")
+                    continue
+
+                event_type = str(event.get("event_type", "")).lower()
+                if event_type:
+                    event_counts[event_type] += 1
+
+                if eve_types and event_type and event_type not in eve_types:
+                    continue
+
+                if event_type == "dns":
+                    dns_obj = event.get("dns")
+                    if isinstance(dns_obj, dict):
+                        rrname = str(dns_obj.get("rrname", "") or dns_obj.get("query", "") or "").strip().lower()
+                        if rrname:
+                            dns_queries[rrname] += 1
+                    continue
+
+                if event_type == "http":
+                    http_obj = event.get("http")
+                    if isinstance(http_obj, dict):
+                        host = str(http_obj.get("hostname", "") or "").strip().lower()
+                        if host:
+                            http_hosts[host] += 1
+                    continue
+
+                if event_type == "tls":
+                    tls_obj = event.get("tls")
+                    if isinstance(tls_obj, dict):
+                        sni_value = str(tls_obj.get("sni", "") or "").strip().lower()
+                        if sni_value:
+                            tls_sni[sni_value] += 1
+                    continue
+
+                if event_type == "fileinfo":
+                    file_obj = event.get("fileinfo")
+                    if isinstance(file_obj, dict):
+                        file_name = str(file_obj.get("filename", "") or file_obj.get("magic", "") or "").strip()
+                        if file_name:
+                            file_names[file_name] += 1
+                    continue
+
+                if event_type == "anomaly":
+                    an_obj = event.get("anomaly")
+                    if isinstance(an_obj, dict):
+                        an_name = str(an_obj.get("type", "") or an_obj.get("event", "") or "anomaly").strip().lower()
+                    else:
+                        an_name = "anomaly"
+                    anomaly_counts[an_name] += 1
+                    continue
+
+                if event_type != "alert":
+                    continue
+
+                alert = event.get("alert")
+                if not isinstance(alert, dict):
+                    continue
+
+                sid = str(alert.get("signature_id", "") or "").strip()
+                if only_sid and sid and sid not in only_sid:
+                    continue
+                if suppress_sid and sid and sid in suppress_sid:
+                    continue
+
+                signature = str(alert.get("signature", "")).strip() or "Suricata alert"
+                severity = _suricata_alert_severity(alert.get("severity", "info"))
+                src_ip = str(event.get("src_ip", "") or "")
+                dst_ip = str(event.get("dest_ip", "") or "")
+                protocol = str(event.get("proto", "") or "")
+                action = str(alert.get("action", "") or "")
+                category = str(alert.get("category", "") or "").strip()
+                correlated_hits = 0
+                for token in ("dns", "http", "tls", "file", "anomaly"):
+                    if token in signature.lower() or token in category.lower():
+                        correlated_hits += 1
+
+                total_alerts += 1
+                signature_counts[signature] += 1
+                if src_ip:
+                    signature_sources[signature][src_ip] += 1
+                if dst_ip:
+                    signature_destinations[signature][dst_ip] += 1
+                if signature not in signature_sid and alert.get("signature_id") is not None:
+                    signature_sid[signature] = str(alert.get("signature_id"))
+                if signature not in signature_category and alert.get("category"):
+                    signature_category[signature] = str(alert.get("category"))
+                signature_correlated[signature] += correlated_hits
+                if signature not in signature_tactic:
+                    signature_tactic[signature] = _suricata_tactic(signature, category)
+                if (
+                    signature not in signature_severity
+                    or severity_rank.get(severity, 99) < severity_rank.get(signature_severity[signature], 99)
+                ):
+                    signature_severity[signature] = severity
+
+                if len(signature_evidence[signature]) < 5:
+                    evidence_entry = " ".join(
+                        part
+                        for part in [
+                            f"src={src_ip}" if src_ip else "",
+                            f"dst={dst_ip}" if dst_ip else "",
+                            f"proto={protocol}" if protocol else "",
+                            f"action={action}" if action else "",
+                        ]
+                        if part
+                    )
+                    if evidence_entry:
+                        signature_evidence[signature].append(evidence_entry)
+    except Exception as exc:
+        errors.append(f"Suricata: failed to read eve.json ({type(exc).__name__}: {exc})")
+        return detections, errors, {}
+
+    if not total_alerts:
+        checks: dict[str, list[str]] = {
+            "ids_alert_presence": ["No Suricata alert events matched current filters."],
+            "engine_health": [f"eve_lines={eve_lines}"] if eve_lines else ["No eve lines read."],
+        }
+        stats: dict[str, object] = {
+            "event_counts": dict(event_counts),
+            "checks": checks,
+            "top_sources": [],
+            "top_destinations": [],
+            "top_signatures": [],
+            "eve_lines": eve_lines,
+            "dns_queries": dns_queries.most_common(8),
+            "http_hosts": http_hosts.most_common(8),
+            "tls_sni": tls_sni.most_common(8),
+            "file_names": file_names.most_common(8),
+        }
+        return detections, errors, stats
+
+    detections.append({
+        "source": "Suricata",
+        "severity": "high" if total_alerts >= 10 else "warning",
+        "summary": "Suricata IDS alerts observed",
+        "details": f"{total_alerts} alert event(s) across {len(signature_counts)} signature(s).",
+        "confidence": "high" if total_alerts >= 10 else "medium",
+        "evidence": _dedupe_evidence(
+            [f"{sig}({count})" for sig, count in signature_counts.most_common(10)],
+            limit=10,
+        ),
+    })
+
+    for signature, count in signature_counts.most_common(12):
+        sid = signature_sid.get(signature)
+        category = signature_category.get(signature)
+        tactic_name, tactic_id = signature_tactic.get(signature, ("Other", "-"))
+        uniq_src = len(signature_sources.get(signature, Counter()))
+        uniq_dst = len(signature_destinations.get(signature, Counter()))
+        confidence = _suricata_confidence(
+            signature_severity.get(signature, "warning"),
+            int(count),
+            uniq_src,
+            uniq_dst,
+            int(signature_correlated.get(signature, 0)),
+        )
+        details_bits = [f"{count} hit(s)"]
+        if sid:
+            details_bits.append(f"sid={sid}")
+        if category:
+            details_bits.append(f"category={category}")
+        details_bits.append(f"tactic={tactic_name}{f'({tactic_id})' if tactic_id != '-' else ''}")
+        details_bits.append(f"confidence={confidence}")
+        detections.append({
+            "source": "Suricata",
+            "severity": signature_severity.get(signature, "warning"),
+            "summary": f"IDS alert: {signature}",
+            "details": ", ".join(details_bits),
+            "confidence": confidence,
+            "sid": sid or "-",
+            "category": category or "-",
+            "tactic": tactic_name,
+            "top_sources": signature_sources.get(signature, Counter()).most_common(5),
+            "top_destinations": signature_destinations.get(signature, Counter()).most_common(5),
+            "evidence": _dedupe_evidence(signature_evidence.get(signature, []), limit=5),
+        })
+
+    if dns_queries:
+        detections.append({
+            "source": "Suricata",
+            "severity": "info",
+            "summary": "Suricata DNS telemetry",
+            "details": f"{sum(dns_queries.values())} DNS event(s) in eve.",
+            "evidence": _dedupe_evidence([f"{name}({count})" for name, count in dns_queries.most_common(8)], limit=8),
+        })
+    if http_hosts:
+        detections.append({
+            "source": "Suricata",
+            "severity": "info",
+            "summary": "Suricata HTTP telemetry",
+            "details": f"{sum(http_hosts.values())} HTTP event(s) in eve.",
+            "evidence": _dedupe_evidence([f"{name}({count})" for name, count in http_hosts.most_common(8)], limit=8),
+        })
+    if tls_sni:
+        detections.append({
+            "source": "Suricata",
+            "severity": "info",
+            "summary": "Suricata TLS telemetry",
+            "details": f"{sum(tls_sni.values())} TLS event(s) in eve.",
+            "evidence": _dedupe_evidence([f"{name}({count})" for name, count in tls_sni.most_common(8)], limit=8),
+        })
+    if file_names:
+        detections.append({
+            "source": "Suricata",
+            "severity": "warning" if sum(file_names.values()) >= 5 else "info",
+            "summary": "Suricata file artifact telemetry",
+            "details": f"{sum(file_names.values())} file-related event(s) in eve.",
+            "evidence": _dedupe_evidence([f"{name}({count})" for name, count in file_names.most_common(8)], limit=8),
+        })
+
+    checks: dict[str, list[str]] = {
+        "ids_alert_presence": [f"alerts={total_alerts}, signatures={len(signature_counts)}"],
+        "high_severity_alerts": [],
+        "multi_host_fanout": [],
+        "dns_suspicious_activity": [],
+        "http_c2_upload_activity": [],
+        "tls_sni_anomaly": [],
+        "file_transfer_artifacts": [],
+        "engine_health": [],
+    }
+
+    high_alert_count = sum(
+        int(count)
+        for sig_name, count in signature_counts.items()
+        if signature_severity.get(sig_name) in {"critical", "high"}
+    )
+    if high_alert_count:
+        checks["high_severity_alerts"].append(f"high_or_critical_alerts={high_alert_count}")
+    top_fanout = []
+    for sig_name, src_counter in signature_sources.items():
+        if len(src_counter) >= 2 or len(signature_destinations.get(sig_name, Counter())) >= 2:
+            top_fanout.append((sig_name, len(src_counter), len(signature_destinations.get(sig_name, Counter()))))
+    for sig_name, src_cnt, dst_cnt in sorted(top_fanout, key=lambda item: (item[1], item[2]), reverse=True)[:8]:
+        checks["multi_host_fanout"].append(f"{sig_name} src={src_cnt} dst={dst_cnt}")
+    if dns_queries:
+        checks["dns_suspicious_activity"].extend(
+            [f"{name}({count})" for name, count in dns_queries.most_common(6)]
+        )
+    if http_hosts:
+        checks["http_c2_upload_activity"].extend(
+            [f"{name}({count})" for name, count in http_hosts.most_common(6)]
+        )
+    if tls_sni:
+        checks["tls_sni_anomaly"].extend(
+            [f"{name}({count})" for name, count in tls_sni.most_common(6)]
+        )
+    if file_names:
+        checks["file_transfer_artifacts"].extend(
+            [f"{name}({count})" for name, count in file_names.most_common(6)]
+        )
+    checks["engine_health"].append(f"eve_lines={eve_lines}")
+    checks["engine_health"].append(f"parsed_event_types={len(event_counts)}")
+
+    stats: dict[str, object] = {
+        "event_counts": dict(event_counts),
+        "checks": checks,
+        "top_sources": Counter({key: int(value) for key, value in _flatten_counter_map(signature_sources).items()}).most_common(10),
+        "top_destinations": Counter({key: int(value) for key, value in _flatten_counter_map(signature_destinations).items()}).most_common(10),
+        "top_signatures": signature_counts.most_common(10),
+        "eve_lines": eve_lines,
+        "dns_queries": dns_queries.most_common(8),
+        "http_hosts": http_hosts.most_common(8),
+        "tls_sni": tls_sni.most_common(8),
+        "file_names": file_names.most_common(8),
+        "anomalies": anomaly_counts.most_common(8),
+    }
+
+    return detections, errors, stats
+
+
+def _flatten_counter_map(values: dict[str, Counter[str]]) -> Counter[str]:
+    flattened: Counter[str] = Counter()
+    for counter in values.values():
+        flattened.update(counter)
+    return flattened
+
+
+def _run_suricata_scan(
+    path: Path,
+    rules_path: Path | None = None,
+    config_path: Path | None = None,
+    eve_types: set[str] | None = None,
+    suppress_sid: set[str] | None = None,
+    only_sid: set[str] | None = None,
+) -> tuple[list[dict[str, object]], list[str], dict[str, object], dict[str, list[str]], dict[str, object]]:
+    suricata_bin = shutil.which("suricata")
+    if not suricata_bin:
+        return [], ["Suricata binary not found in PATH."], {}, {}, {}
+
+    errors: list[str] = []
+    metadata: dict[str, object] = {
+        "engine": "Suricata",
+        "binary": suricata_bin,
+        "pcap_sha256": _file_sha256(path),
+    }
+    checks: dict[str, list[str]] = {}
+    stats: dict[str, object] = {}
+
+    version_text = "-"
+    for cmd in ([suricata_bin, "--build-info"], [suricata_bin, "-V"]):
+        try:
+            version_run = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            candidate = (version_run.stdout or version_run.stderr or "").strip()
+            if candidate:
+                version_text = candidate.splitlines()[0].strip()
+                break
+        except Exception:
+            continue
+    metadata["version"] = version_text
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="pcapper-suricata-") as tmpdir:
+            output_dir = Path(tmpdir)
+            command = [suricata_bin, "-r", str(path), "-l", str(output_dir)]
+            if config_path is not None:
+                command.extend(["-c", str(config_path)])
+            if rules_path is not None:
+                command.extend(["-S", str(rules_path)])
+            metadata["command"] = " ".join(command)
+            if config_path is not None:
+                metadata["config"] = str(config_path)
+            if rules_path is not None:
+                metadata["rules"] = str(rules_path)
+                try:
+                    age_days = max(0.0, (time.time() - rules_path.stat().st_mtime) / 86400.0)
+                    metadata["rules_age_days"] = round(age_days, 2)
+                except Exception:
+                    metadata["rules_age_days"] = "-"
+
+            started = time.monotonic()
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            metadata["scan_seconds"] = round(max(0.0, time.monotonic() - started), 3)
+            metadata["exit_code"] = int(result.returncode)
+
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "").strip()
+                if err:
+                    err = err.splitlines()[-1]
+                errors.append(
+                    f"Suricata scan failed (exit {result.returncode})"
+                    + (f": {err}" if err else "")
+                )
+                return [], errors, metadata, checks, stats
+
+            eve_path = output_dir / "eve.json"
+            if not eve_path.exists():
+                errors.append("Suricata scan completed but eve.json was not produced.")
+                return [], errors, metadata, checks, stats
+
+            detections, parse_errors, parse_stats = _parse_suricata_eve_alerts(
+                eve_path,
+                eve_types=eve_types,
+                only_sid=only_sid,
+                suppress_sid=suppress_sid,
+            )
+            errors.extend(parse_errors)
+            stats = parse_stats
+            checks = parse_stats.get("checks", {}) if isinstance(parse_stats, dict) else {}
+            metadata["eve_lines"] = int(parse_stats.get("eve_lines", 0) or 0) if isinstance(parse_stats, dict) else 0
+            metadata["event_types"] = len(parse_stats.get("event_counts", {}) or {}) if isinstance(parse_stats, dict) else 0
+            return detections, errors, metadata, checks, stats
+    except Exception as exc:
+        errors.append(f"Suricata scan failed: {type(exc).__name__}: {exc}")
+        return [], errors, metadata, checks, stats
+
+
+def analyze_suricata(
+    path: Path,
+    show_status: bool = True,
+    rules_path: Path | None = None,
+    config_path: Path | None = None,
+    eve_types: set[str] | None = None,
+    suppress_sid: set[str] | None = None,
+    only_sid: set[str] | None = None,
+    strict: bool = False,
+) -> ThreatSummary:
+    del show_status  # kept for interface compatibility with other analyzers
+    detections, errors, metadata, checks, stats = _run_suricata_scan(
+        path,
+        rules_path=rules_path,
+        config_path=config_path,
+        eve_types=eve_types,
+        suppress_sid=suppress_sid,
+        only_sid=only_sid,
+    )
+    if not detections and not errors:
+        detections = [
+            {
+                "source": "Suricata",
+                "severity": "info",
+                "summary": "Suricata scan completed",
+                "details": "No IDS alerts were generated for this capture.",
+            }
+        ]
+    if strict and errors:
+        detections.insert(0, {
+            "source": "Suricata",
+            "severity": "critical",
+            "summary": "Suricata strict mode failed",
+            "details": f"Strict mode enabled and {len(errors)} scan/health error(s) occurred.",
+        })
+
+    event_counts = stats.get("event_counts", {}) if isinstance(stats, dict) else {}
+    pivots = {
+        "top_sources": stats.get("top_sources", []) if isinstance(stats, dict) else [],
+        "top_destinations": stats.get("top_destinations", []) if isinstance(stats, dict) else [],
+        "top_signatures": stats.get("top_signatures", []) if isinstance(stats, dict) else [],
+    }
+
+    return ThreatSummary(
+        path=path,
+        detections=detections,
+        errors=errors,
+        total_packets=0,
+        first_seen=None,
+        last_seen=None,
+        duration=None,
+        ot_protocol_counts={},
+        public_ot_pairs=[],
+        ot_peer_internal=[],
+        ot_peer_external=[],
+        ot_risk_score=0,
+        ot_risk_findings=[],
+        storyline=[],
+        suricata_metadata=metadata,
+        suricata_checks=checks,
+        suricata_event_counts=event_counts,
+        suricata_pivots=pivots,
+    )
 
 
 def _append_ot_anomalies(
