@@ -58,6 +58,11 @@ class CompromiseSummary:
     total_hosts: int
     compromised_hosts: list[CompromisedHost] = field(default_factory=list)
     detections: list[dict[str, object]] = field(default_factory=list)
+    incidents: list[dict[str, object]] = field(default_factory=list)
+    campaigns: list[dict[str, object]] = field(default_factory=list)
+    host_priority: list[dict[str, object]] = field(default_factory=list)
+    deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
+    benign_context: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -174,6 +179,38 @@ def _score_weight(severity: str) -> int:
     return SEVERITY_WEIGHT.get(severity, 1)
 
 
+def _classify_stage(summary: str, details: str, source: str) -> str:
+    blob = f"{summary} {details} {source}".lower()
+    if any(token in blob for token in ("scan", "recon", "sweep", "probe", "enumeration")):
+        return "recon"
+    if any(token in blob for token in ("credential", "creds", "password", "kerberos", "ntlm", "auth")):
+        return "credential"
+    if any(token in blob for token in ("beacon", "c2", "command and control", "check-in")):
+        return "c2"
+    if any(token in blob for token in ("exfil", "tunnel", "http post", "file exfil")):
+        return "exfil"
+    if any(token in blob for token in ("smb", "rdp", "winrm", "ssh", "lateral", "pivot")):
+        return "lateral"
+    if any(token in blob for token in ("secret", "token", "api key")):
+        return "secrets"
+    return "other"
+
+
+def _criticality_boost(host_record: object) -> int:
+    ports = set()
+    for item in getattr(host_record, "open_ports", []) or []:
+        try:
+            ports.add(int(getattr(item, "port", 0) or 0))
+        except Exception:
+            continue
+    boost = 0
+    if ports & {88, 389, 445, 464, 636, 3268, 3269}:
+        boost += 3
+    if ports & {3389, 5985, 5986, 22}:
+        boost += 1
+    return boost
+
+
 def _add_host_evidence(
     host_state: dict[str, dict[str, object]],
     ip_value: str,
@@ -248,6 +285,18 @@ def analyze_compromised(path: Path, show_status: bool = True) -> CompromiseSumma
 
     host_state: dict[str, dict[str, object]] = {}
     detections: list[dict[str, object]] = []
+    host_stages: dict[str, set[str]] = defaultdict(set)
+    lateral_edges: Counter[tuple[str, str]] = Counter()
+    deterministic_checks: dict[str, list[str]] = {
+        "credential_abuse": [],
+        "beacon_c2": [],
+        "exfiltration": [],
+        "lateral_movement": [],
+        "multi_stage_sequence": [],
+        "high_confidence_ioc": [],
+        "benign_automation_likely": [],
+    }
+    detection_by_host: dict[str, list[dict[str, object]]] = defaultdict(list)
 
     # 1) Threat detections (cross-module)
     for item in getattr(threat_summary, "detections", []) or []:
@@ -269,6 +318,8 @@ def analyze_compromised(path: Path, show_status: bool = True) -> CompromiseSumma
         if not ips:
             continue
         for ip_value in ips:
+            stage = _classify_stage(summary, details, str(item.get("source", "Threats")))
+            host_stages[ip_value].add(stage)
             _add_host_evidence(
                 host_state,
                 ip_value,
@@ -290,6 +341,34 @@ def analyze_compromised(path: Path, show_status: bool = True) -> CompromiseSumma
                 "evidence": evidence,
                 "iocs": sorted(iocs)[:10],
             })
+            detection_by_host[ip_value].append(detections[-1])
+
+            if stage == "lateral" and len(ips) >= 2:
+                src_guess = str(item.get("src") or "")
+                dst_guess = str(item.get("dst") or "")
+                if _valid_ip(src_guess) and _valid_ip(dst_guess):
+                    lateral_edges[(src_guess, dst_guess)] += 1
+
+            if stage == "credential":
+                deterministic_checks["credential_abuse"].append(
+                    f"{ip_value} {summary} ({str(item.get('source', 'Threats'))})"
+                )
+            if stage == "c2":
+                deterministic_checks["beacon_c2"].append(
+                    f"{ip_value} {summary}"
+                )
+            if stage == "exfil":
+                deterministic_checks["exfiltration"].append(
+                    f"{ip_value} {summary}"
+                )
+            if stage == "lateral":
+                deterministic_checks["lateral_movement"].append(
+                    f"{ip_value} {summary}"
+                )
+            if len(iocs) >= 2:
+                deterministic_checks["high_confidence_ioc"].append(
+                    f"{ip_value} IOC cluster size={len(iocs)}"
+                )
 
     # 2) Beaconing candidates
     for candidate in getattr(beacon_summary, "candidates", []) or []:
@@ -336,6 +415,11 @@ def analyze_compromised(path: Path, show_status: bool = True) -> CompromiseSumma
             "evidence": evidence,
             "iocs": sorted(iocs)[:10],
         })
+        detection_by_host[src_ip].append(detections[-1])
+        host_stages[src_ip].add("c2")
+        deterministic_checks["beacon_c2"].append(
+            f"{src_ip} beacon score={score:.2f} to {dst_ip}"
+        )
 
     # 3) Exfiltration suspects
     exfil_first = getattr(exfil_summary, "first_seen", None)
@@ -370,6 +454,11 @@ def analyze_compromised(path: Path, show_status: bool = True) -> CompromiseSumma
             "timestamp": exfil_first,
             "evidence": evidence,
         })
+        detection_by_host[src_ip].append(detections[-1])
+        host_stages[src_ip].add("exfil")
+        deterministic_checks["exfiltration"].append(
+            f"{src_ip} DNS tunnel suspect unique={item.get('unique', 0)}"
+        )
 
     for item in getattr(exfil_summary, "http_post_suspects", []) or []:
         src_ip = str(item.get("src", "") or "")
@@ -410,6 +499,8 @@ def analyze_compromised(path: Path, show_status: bool = True) -> CompromiseSumma
             "evidence": evidence,
             "iocs": sorted(iocs)[:10],
         })
+        detection_by_host[src_ip].append(detections[-1])
+        host_stages[src_ip].add("exfil")
 
     for item in getattr(exfil_summary, "file_exfil_suspects", []) or []:
         src_ip = str(item.get("src", "") or "")
@@ -449,6 +540,8 @@ def analyze_compromised(path: Path, show_status: bool = True) -> CompromiseSumma
             "evidence": evidence,
             "iocs": sorted(iocs)[:10],
         })
+        detection_by_host[src_ip].append(detections[-1])
+        host_stages[src_ip].add("exfil")
 
     # 4) Credential exposure
     for hit in getattr(creds_summary, "hits", []) or []:
@@ -486,6 +579,11 @@ def analyze_compromised(path: Path, show_status: bool = True) -> CompromiseSumma
             "evidence": evidence,
             "iocs": sorted(iocs)[:10],
         })
+        detection_by_host[src_ip].append(detections[-1])
+        host_stages[src_ip].add("credential")
+        deterministic_checks["credential_abuse"].append(
+            f"{src_ip} cleartext credential exposure"
+        )
 
     # 5) Secret exposure (tokens/keys)
     for hit in getattr(secrets_summary, "hits", []) or []:
@@ -523,11 +621,22 @@ def analyze_compromised(path: Path, show_status: bool = True) -> CompromiseSumma
             "evidence": evidence,
             "iocs": sorted(iocs)[:10],
         })
+        detection_by_host[src_ip].append(detections[-1])
+        host_stages[src_ip].add("secrets")
 
     compromised_hosts: list[CompromisedHost] = []
+    host_record_by_ip = {record.ip: record for record in hosts_summary.hosts}
+    host_priority: list[dict[str, object]] = []
     for ip_value, state in host_state.items():
         score = int(state.get("score", 0) or 0)
         severity_counts: Counter[str] = state.get("severity_counts", Counter())
+        stage_count = len(host_stages.get(ip_value, set()))
+        score += max(0, stage_count - 1)
+
+        host_record = host_record_by_ip.get(ip_value)
+        if host_record is not None:
+            score += _criticality_boost(host_record)
+
         if score < 5 and severity_counts.get("high", 0) == 0 and severity_counts.get("critical", 0) == 0:
             continue
         hostname_list = hostnames_by_ip.get(ip_value, [])
@@ -566,6 +675,22 @@ def analyze_compromised(path: Path, show_status: bool = True) -> CompromiseSumma
             )
         )
 
+        host_priority.append({
+            "host": hostname_display,
+            "ip": ip_value,
+            "score": score,
+            "stages": sorted(host_stages.get(ip_value, set())),
+            "stage_count": stage_count,
+            "ioc_count": len(ioc_list),
+            "severity": severity,
+            "detection_time": detection_time,
+        })
+
+        if stage_count >= 3:
+            deterministic_checks["multi_stage_sequence"].append(
+                f"{ip_value} stages={','.join(sorted(host_stages.get(ip_value, set())))}"
+            )
+
     compromised_hosts.sort(
         key=lambda host: (
             SEVERITY_WEIGHT.get(host.severity, 0),
@@ -574,11 +699,82 @@ def analyze_compromised(path: Path, show_status: bool = True) -> CompromiseSumma
         reverse=True,
     )
 
+    incidents: list[dict[str, object]] = []
+    incident_gap_seconds = 900.0
+    for ip_value, items in detection_by_host.items():
+        sortable = [entry for entry in items if isinstance(entry.get("timestamp"), (int, float))]
+        sortable.sort(key=lambda item: float(item.get("timestamp", 0.0) or 0.0))
+        if not sortable:
+            continue
+        cluster: list[dict[str, object]] = [sortable[0]]
+        for item in sortable[1:]:
+            prev_ts = float(cluster[-1].get("timestamp", 0.0) or 0.0)
+            ts = float(item.get("timestamp", 0.0) or 0.0)
+            if ts - prev_ts <= incident_gap_seconds:
+                cluster.append(item)
+            else:
+                incidents.append({
+                    "ip": ip_value,
+                    "first_ts": float(cluster[0].get("timestamp", 0.0) or 0.0),
+                    "last_ts": float(cluster[-1].get("timestamp", 0.0) or 0.0),
+                    "count": len(cluster),
+                    "stages": sorted({_classify_stage(str(v.get("summary", "")), str(v.get("details", "")), str(v.get("source", "")) ) for v in cluster}),
+                })
+                cluster = [item]
+        if cluster:
+            incidents.append({
+                "ip": ip_value,
+                "first_ts": float(cluster[0].get("timestamp", 0.0) or 0.0),
+                "last_ts": float(cluster[-1].get("timestamp", 0.0) or 0.0),
+                "count": len(cluster),
+                "stages": sorted({_classify_stage(str(v.get("summary", "")), str(v.get("details", "")), str(v.get("source", "")) ) for v in cluster}),
+            })
+
+    ioc_to_hosts: dict[str, set[str]] = defaultdict(set)
+    for host in compromised_hosts:
+        for ioc in host.iocs[:20]:
+            if ioc:
+                ioc_to_hosts[str(ioc)].add(host.ip)
+
+    campaigns: list[dict[str, object]] = []
+    campaign_idx = 1
+    for ioc, hosts in sorted(ioc_to_hosts.items(), key=lambda item: len(item[1]), reverse=True):
+        if len(hosts) < 2:
+            continue
+        campaigns.append({
+            "campaign_id": f"CMP-{campaign_idx:03d}",
+            "ioc": ioc,
+            "hosts": sorted(hosts),
+            "host_count": len(hosts),
+        })
+        campaign_idx += 1
+        if campaign_idx > 25:
+            break
+
+    benign_context: list[str] = []
+    for ip_value in sorted(host_state.keys()):
+        stages = host_stages.get(ip_value, set())
+        if stages == {"c2"} and len(detection_by_host.get(ip_value, [])) <= 1:
+            benign_context.append(f"{ip_value} only single C2-like signal without corroboration")
+        record = host_record_by_ip.get(ip_value)
+        if record is not None:
+            ports = {int(getattr(item, 'port', 0) or 0) for item in getattr(record, 'open_ports', []) or []}
+            if 123 in ports and stages <= {"c2", "other"}:
+                benign_context.append(f"{ip_value} periodic behavior may align with NTP/service checks")
+
+    host_priority.sort(key=lambda item: (int(item.get("score", 0) or 0), int(item.get("stage_count", 0) or 0)), reverse=True)
+    incidents.sort(key=lambda item: (float(item.get("first_ts", 0.0) or 0.0), int(item.get("count", 0) or 0)), reverse=True)
+
     return CompromiseSummary(
         path=path,
         total_hosts=len(hosts_summary.hosts),
         compromised_hosts=compromised_hosts,
         detections=detections,
+        incidents=incidents,
+        campaigns=campaigns,
+        host_priority=host_priority,
+        deterministic_checks={key: value[:40] for key, value in deterministic_checks.items()},
+        benign_context=benign_context[:20],
         errors=sorted({err for err in errors if err}),
     )
 
@@ -590,6 +786,11 @@ def merge_compromised_summaries(summaries: Iterable[CompromiseSummary]) -> Compr
 
     merged_hosts: dict[str, dict[str, object]] = {}
     detections: list[dict[str, object]] = []
+    incidents: list[dict[str, object]] = []
+    campaigns: list[dict[str, object]] = []
+    host_priority: list[dict[str, object]] = []
+    deterministic_checks: dict[str, list[str]] = defaultdict(list)
+    benign_context: list[str] = []
     errors: set[str] = set()
     total_hosts = 0
 
@@ -597,6 +798,13 @@ def merge_compromised_summaries(summaries: Iterable[CompromiseSummary]) -> Compr
         total_hosts += int(getattr(summary, "total_hosts", 0) or 0)
         errors.update(getattr(summary, "errors", []) or [])
         detections.extend(getattr(summary, "detections", []) or [])
+        incidents.extend(getattr(summary, "incidents", []) or [])
+        campaigns.extend(getattr(summary, "campaigns", []) or [])
+        host_priority.extend(getattr(summary, "host_priority", []) or [])
+        benign_context.extend(getattr(summary, "benign_context", []) or [])
+        for key, values in (getattr(summary, "deterministic_checks", {}) or {}).items():
+            for value in values or []:
+                deterministic_checks[str(key)].append(str(value))
         for host in getattr(summary, "compromised_hosts", []) or []:
             entry = merged_hosts.get(host.ip)
             if entry is None:
@@ -648,10 +856,30 @@ def merge_compromised_summaries(summaries: Iterable[CompromiseSummary]) -> Compr
         reverse=True,
     )
 
+    host_priority.sort(key=lambda item: (int(item.get("score", 0) or 0), int(item.get("stage_count", 0) or 0)), reverse=True)
+    incidents.sort(key=lambda item: (float(item.get("first_ts", 0.0) or 0.0), int(item.get("count", 0) or 0)), reverse=True)
+    dedup_checks: dict[str, list[str]] = {}
+    for key, values in deterministic_checks.items():
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+            if len(out) >= 60:
+                break
+        dedup_checks[key] = out
+
     return CompromiseSummary(
         path=Path(f"ALL_PCAPS_{len(summary_list)}"),
         total_hosts=total_hosts,
         compromised_hosts=merged_list,
         detections=detections,
+        incidents=incidents,
+        campaigns=campaigns,
+        host_priority=host_priority[:200],
+        deterministic_checks=dedup_checks,
+        benign_context=sorted(set(benign_context))[:50],
         errors=sorted(errors),
     )

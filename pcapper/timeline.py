@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 import re
 import ipaddress
+import statistics
 
 from .pcap_cache import get_reader
 from .utils import safe_float, counter_inc, decode_payload
@@ -62,6 +63,8 @@ class TimelineEvent:
     category: str
     summary: str
     details: str
+    packet_index: Optional[int] = None
+    source: str = "timeline"
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,19 @@ class TimelineSummary:
     ot_storyline: list[str] = field(default_factory=list)
     dns_queries: list[DNSQueryDetail] = field(default_factory=list)
     file_downloads: list[FileDownloadDetail] = field(default_factory=list)
+    analyst_verdict: str = ""
+    analyst_confidence: str = "low"
+    analyst_reasons: list[str] = field(default_factory=list)
+    deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
+    sequence_timeline: list[dict[str, object]] = field(default_factory=list)
+    sequence_violations: list[str] = field(default_factory=list)
+    beacon_candidates: list[dict[str, object]] = field(default_factory=list)
+    auth_abuse_profiles: list[dict[str, object]] = field(default_factory=list)
+    lateral_movement_paths: list[dict[str, object]] = field(default_factory=list)
+    exfiltration_chains: list[dict[str, object]] = field(default_factory=list)
+    ot_impact_signals: list[dict[str, object]] = field(default_factory=list)
+    evidence_anchors: list[dict[str, object]] = field(default_factory=list)
+    benign_context: list[str] = field(default_factory=list)
 
 
 def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSummary:
@@ -140,6 +156,19 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
             ot_storyline=[],
             dns_queries=[],
             file_downloads=[],
+            analyst_verdict="",
+            analyst_confidence="low",
+            analyst_reasons=[],
+            deterministic_checks={},
+            sequence_timeline=[],
+            sequence_violations=[],
+            beacon_candidates=[],
+            auth_abuse_profiles=[],
+            lateral_movement_paths=[],
+            exfiltration_chains=[],
+            ot_impact_signals=[],
+            evidence_anchors=[],
+            benign_context=[],
         )
 
     target_ip = summary_list[0].target_ip
@@ -172,6 +201,17 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
     merged_file_downloads: list[FileDownloadDetail] = []
     seen_dns_keys: set[tuple[str, str, str, Optional[int], str]] = set()
     seen_file_keys: set[tuple[str, str, str, str, str]] = set()
+    merged_reasons: list[str] = []
+    merged_checks: dict[str, list[str]] = {}
+    merged_sequence_timeline: list[dict[str, object]] = []
+    merged_sequence_violations: list[str] = []
+    merged_beacons: list[dict[str, object]] = []
+    merged_auth_abuse: list[dict[str, object]] = []
+    merged_lateral_paths: list[dict[str, object]] = []
+    merged_exfil_chains: list[dict[str, object]] = []
+    merged_ot_impact: list[dict[str, object]] = []
+    merged_anchors: list[dict[str, object]] = []
+    merged_benign: list[str] = []
 
     for item in summary_list:
         if item.first_seen is not None:
@@ -212,6 +252,38 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
                     continue
                 seen_file_keys.add(key)
                 merged_file_downloads.append(entry)
+        if item.analyst_reasons:
+            for reason in item.analyst_reasons:
+                if reason not in merged_reasons:
+                    merged_reasons.append(reason)
+        if item.deterministic_checks:
+            for key, values in item.deterministic_checks.items():
+                bucket = merged_checks.setdefault(key, [])
+                for value in values:
+                    if value not in bucket:
+                        bucket.append(value)
+        if item.sequence_timeline:
+            merged_sequence_timeline.extend(item.sequence_timeline)
+        if item.sequence_violations:
+            for value in item.sequence_violations:
+                if value not in merged_sequence_violations:
+                    merged_sequence_violations.append(value)
+        if item.beacon_candidates:
+            merged_beacons.extend(item.beacon_candidates)
+        if item.auth_abuse_profiles:
+            merged_auth_abuse.extend(item.auth_abuse_profiles)
+        if item.lateral_movement_paths:
+            merged_lateral_paths.extend(item.lateral_movement_paths)
+        if item.exfiltration_chains:
+            merged_exfil_chains.extend(item.exfiltration_chains)
+        if item.ot_impact_signals:
+            merged_ot_impact.extend(item.ot_impact_signals)
+        if item.evidence_anchors:
+            merged_anchors.extend(item.evidence_anchors)
+        if item.benign_context:
+            for value in item.benign_context:
+                if value not in merged_benign:
+                    merged_benign.append(value)
 
     duration = None
     if first_seen is not None and last_seen is not None:
@@ -239,6 +311,13 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
     )
     risk_score, risk_findings = _compute_ot_risk_posture(merged.events, target_ip)
     storyline = _compute_ot_storyline(merged.events, target_ip, merged.ot_protocol_counts, risk_score, risk_findings)
+    merged_hunt_context = _build_timeline_hunting_context(
+        merged.events,
+        target_ip,
+        merged.file_downloads,
+        risk_score,
+        risk_findings,
+    )
     merged = TimelineSummary(
         path=merged.path,
         target_ip=merged.target_ip,
@@ -261,6 +340,22 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
         ot_storyline=storyline,
         dns_queries=merged.dns_queries,
         file_downloads=merged.file_downloads,
+        analyst_verdict=str(merged_hunt_context.get("analyst_verdict", "")),
+        analyst_confidence=str(merged_hunt_context.get("analyst_confidence", "low")),
+        analyst_reasons=[str(v) for v in list(merged_hunt_context.get("analyst_reasons", merged_reasons) or [])],
+        deterministic_checks={
+            str(k): [str(v) for v in list(values or [])]
+            for k, values in dict(merged_hunt_context.get("deterministic_checks", merged_checks) or {}).items()
+        },
+        sequence_timeline=list(merged_hunt_context.get("sequence_timeline", merged_sequence_timeline) or []),
+        sequence_violations=[str(v) for v in list(merged_hunt_context.get("sequence_violations", merged_sequence_violations) or [])],
+        beacon_candidates=list(merged_hunt_context.get("beacon_candidates", merged_beacons) or []),
+        auth_abuse_profiles=list(merged_hunt_context.get("auth_abuse_profiles", merged_auth_abuse) or []),
+        lateral_movement_paths=list(merged_hunt_context.get("lateral_movement_paths", merged_lateral_paths) or []),
+        exfiltration_chains=list(merged_hunt_context.get("exfiltration_chains", merged_exfil_chains) or []),
+        ot_impact_signals=list(merged_hunt_context.get("ot_impact_signals", merged_ot_impact) or []),
+        evidence_anchors=list(merged_hunt_context.get("evidence_anchors", merged_anchors) or []),
+        benign_context=[str(v) for v in list(merged_hunt_context.get("benign_context", merged_benign) or [])],
     )
     return merged
 
@@ -332,6 +427,7 @@ NON_OT_CATEGORIES = {
     "DNS",
     "Email",
     "File Transfer",
+    "FTP",
     "HTTP",
     "ICMP",
     "LDAP",
@@ -349,6 +445,17 @@ NON_OT_CATEGORIES = {
 }
 
 TIMELINE_CATEGORIES = tuple(sorted(OT_CATEGORIES | NON_OT_CATEGORIES, key=str.casefold))
+
+
+FTP_CONTROL_PORTS = {21, 2100, 2121, 8021}
+FTP_COMMANDS = {
+    "USER", "PASS", "ACCT", "CWD", "CDUP", "PWD", "XPWD",
+    "LIST", "NLST", "MLSD", "MLST", "RETR", "STOR", "APPE",
+    "DELE", "RMD", "MKD", "RNFR", "RNTO", "TYPE", "SYST",
+    "FEAT", "STAT", "NOOP", "QUIT", "PASV", "EPSV", "PORT",
+    "EPRT", "AUTH", "PBSZ", "PROT", "SITE", "OPTS", "HOST",
+}
+FTP_RESPONSE_RE = re.compile(r"^(\d{3})(?:[ -].*)?$")
 
 
 def _decode_payload_line(payload: bytes | None) -> str:
@@ -424,6 +531,22 @@ def _extract_email_command(service: str, first_line: str) -> str | None:
         if upper.startswith(("USER", "PASS", "APOP", "AUTH", "STAT", "LIST", "RETR", "DELE", "TOP", "UIDL", "CAPA", "STLS", "QUIT", "+OK", "-ERR")):
             return first_line
     return None
+
+
+def _extract_ftp_command(first_line: str) -> str | None:
+    if not first_line:
+        return None
+    line = first_line.strip()
+    if not line:
+        return None
+
+    if FTP_RESPONSE_RE.match(line):
+        return None
+
+    command = line.split(" ", 1)[0].upper()
+    if command not in FTP_COMMANDS:
+        return None
+    return line[:200]
 
 
 def _extract_powershell_command(payload: bytes | None) -> str | None:
@@ -783,6 +906,326 @@ def _first_ts_for_category(events: list[TimelineEvent], category: str) -> Option
     return min(timestamps) if timestamps else None
 
 
+def _extract_event_ips(text: str) -> list[str]:
+    found: list[str] = []
+    for token in re.findall(r"(?:\d{1,3}\.){3}\d{1,3}", text):
+        if token not in found:
+            found.append(token)
+    return found
+
+
+def _extract_event_flow(event: TimelineEvent, target_ip: str) -> tuple[str | None, str | None, int | None]:
+    details = event.details
+    match = re.search(r"((?:\d{1,3}\.){3}\d{1,3})\s*->\s*((?:\d{1,3}\.){3}\d{1,3})(?::(\d+))?", details)
+    if not match:
+        return None, None, None
+    src, dst, port_text = match.group(1), match.group(2), match.group(3)
+    port = int(port_text) if port_text and port_text.isdigit() else None
+    actor = src
+    peer = dst
+    if src == target_ip:
+        actor, peer = src, dst
+    elif dst == target_ip:
+        actor, peer = dst, src
+    return actor, peer, port
+
+
+def _classify_timeline_stage(event: TimelineEvent) -> str | None:
+    text = f"{event.category} {event.summary} {event.details}".lower()
+    if any(token in text for token in ("scan", "recon", "probe", "icmp", "nbns", "mdns", "potential port scan")):
+        return "Recon"
+    if any(token in text for token in ("auth", "login", "kerberos", "ntlm", "ldap", "domain service", "credential", "password", "user ")):
+        return "Access"
+    if any(token in text for token in ("powershell", "wmic", "winrm", "telnet command", "execute", "cmd.exe", "rundll32", "mshta")):
+        return "Execution"
+    if any(token in text for token in ("beacon", "c2", "command and control")):
+        return "C2"
+    if any(token in text for token in ("http post", "stor ", "appe ", "upload", "file artifact", "exfil")):
+        return "Exfil"
+    if event.category in OT_CATEGORIES and any(token in text for token in ("write", "setpoint", "program", "firmware", "start", "stop", "trip", "shutdown", "operate")):
+        return "Impact"
+    return None
+
+
+def _build_timeline_hunting_context(
+    events: list[TimelineEvent],
+    target_ip: str,
+    file_downloads: list[FileDownloadDetail],
+    ot_risk_score: int,
+    ot_risk_findings: list[str],
+) -> dict[str, object]:
+    stage_order = ["Recon", "Access", "Execution", "C2", "Exfil", "Impact"]
+    stage_times: dict[str, list[float]] = {name: [] for name in stage_order}
+    stage_evidence: dict[str, list[str]] = {name: [] for name in stage_order}
+
+    auth_counter: Counter[tuple[str, str]] = Counter()
+    auth_targets: dict[str, set[str]] = defaultdict(set)
+    lateral_peers: dict[str, set[str]] = defaultdict(set)
+    lateral_admin_hits: Counter[str] = Counter()
+    beacon_samples: dict[tuple[str, str, str], list[float]] = defaultdict(list)
+    exfil_signals: list[str] = []
+    ot_impact_signals: list[dict[str, object]] = []
+    evidence_anchors: list[dict[str, object]] = []
+
+    admin_ports = {22, 23, 135, 139, 445, 3389, 5985, 5986}
+    suspicious_port = {21, 22, 23, 53, 80, 443, 445, 3389}
+
+    for event in events:
+        stage = _classify_timeline_stage(event)
+        if stage:
+            if event.ts is not None:
+                stage_times[stage].append(float(event.ts))
+            if len(stage_evidence[stage]) < 12:
+                stage_evidence[stage].append(f"{event.category}: {event.summary}")
+
+        actor, peer, port = _extract_event_flow(event, target_ip)
+        text = f"{event.summary} {event.details}".lower()
+
+        if event.packet_index is not None and ("command" in text or "http post" in text or "file artifact" in text or "scan" in text):
+            evidence_anchors.append({
+                "packet": int(event.packet_index),
+                "category": event.category,
+                "summary": event.summary,
+                "source": event.source,
+                "details": event.details,
+            })
+
+        if actor and peer and any(token in text for token in ("auth", "login", "password", "credential", "ntlm", "kerberos", "user ")):
+            auth_counter[(actor, peer)] += 1
+            auth_targets[actor].add(peer)
+
+        if actor and peer and (event.category in {"PowerShell", "WMIC", "WinRM", "RPC", "SMB", "Telnet", "Connection"}):
+            if port in admin_ports or event.category in {"PowerShell", "WMIC", "WinRM", "RPC", "SMB", "Telnet"}:
+                lateral_peers[actor].add(peer)
+                lateral_admin_hits[actor] += 1
+
+        if actor and peer and port in suspicious_port and event.ts is not None:
+            key = (peer, event.category, event.summary)
+            beacon_samples[key].append(float(event.ts))
+
+        if any(token in text for token in ("http post", "stor ", "appe ", "upload", "file artifact", "exfil")):
+            if actor == target_ip:
+                exfil_signals.append(f"{event.category} {event.summary}: {event.details}")
+
+        if event.category in OT_CATEGORIES and any(token in text for token in ("write", "setpoint", "program", "firmware", "start", "stop", "trip", "shutdown", "operate")):
+            ot_impact_signals.append({
+                "protocol": event.category,
+                "summary": event.summary,
+                "details": event.details,
+                "ts": event.ts,
+            })
+
+    stage_rows: list[dict[str, object]] = []
+    for stage in stage_order:
+        values = sorted(stage_times[stage])
+        if not values:
+            continue
+        first_ts = values[0]
+        last_ts = values[-1]
+        stage_rows.append({
+            "stage": stage,
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "count": len(values),
+            "dwell": max(0.0, last_ts - first_ts),
+            "evidence": stage_evidence[stage][:4],
+        })
+
+    stage_index = {name: idx for idx, name in enumerate(stage_order)}
+    present_stages = [item["stage"] for item in stage_rows]
+    sequence_violations: list[str] = []
+    for i in range(1, len(stage_rows)):
+        prev = stage_rows[i - 1]
+        current = stage_rows[i]
+        prev_idx = stage_index.get(str(prev["stage"]), -1)
+        cur_idx = stage_index.get(str(current["stage"]), -1)
+        if cur_idx < prev_idx:
+            sequence_violations.append(f"Stage order regression: {current['stage']} appears after {prev['stage']}")
+    if "Execution" in present_stages and "Access" not in present_stages:
+        sequence_violations.append("Execution-like activity observed without a clear access precursor")
+    if "Exfil" in present_stages and "Execution" not in present_stages:
+        sequence_violations.append("Exfiltration-like activity observed without clear execution stage")
+
+    beacon_candidates: list[dict[str, object]] = []
+    for (peer, category, summary), timestamps in beacon_samples.items():
+        times = sorted(set(timestamps))
+        if len(times) < 4:
+            continue
+        intervals = [times[idx] - times[idx - 1] for idx in range(1, len(times)) if times[idx] - times[idx - 1] > 0]
+        if len(intervals) < 3:
+            continue
+        mean_interval = statistics.fmean(intervals)
+        if mean_interval <= 0:
+            continue
+        jitter = statistics.pstdev(intervals) if len(intervals) > 1 else 0.0
+        cv = jitter / mean_interval if mean_interval else 0.0
+        if mean_interval < 5 or mean_interval > 3600:
+            continue
+        if cv > 0.35:
+            continue
+        confidence = "high" if cv <= 0.15 else "medium"
+        beacon_candidates.append({
+            "peer": peer,
+            "category": category,
+            "summary": summary,
+            "count": len(times),
+            "mean_interval": round(mean_interval, 2),
+            "jitter": round(jitter, 2),
+            "cv": round(cv, 3),
+            "confidence": confidence,
+        })
+    beacon_candidates.sort(key=lambda item: (item.get("cv", 1.0), -int(item.get("count", 0))))
+
+    auth_abuse_profiles: list[dict[str, object]] = []
+    for (src, dst), attempts in auth_counter.most_common(30):
+        if attempts < 4:
+            continue
+        auth_abuse_profiles.append({
+            "src": src,
+            "dst": dst,
+            "attempts": int(attempts),
+            "target_count": len(auth_targets.get(src, set())),
+            "confidence": "high" if attempts >= 10 else "medium",
+        })
+
+    lateral_paths: list[dict[str, object]] = []
+    for src, peers in sorted(lateral_peers.items(), key=lambda item: (-len(item[1]), item[0])):
+        if len(peers) < 2 and lateral_admin_hits.get(src, 0) < 6:
+            continue
+        lateral_paths.append({
+            "src": src,
+            "peer_count": len(peers),
+            "admin_hits": int(lateral_admin_hits.get(src, 0)),
+            "peers": sorted(peers)[:8],
+            "confidence": "high" if len(peers) >= 4 else "medium",
+        })
+
+    exfiltration_chains: list[dict[str, object]] = []
+    for detail in exfil_signals[:20]:
+        exfiltration_chains.append({
+            "signal": detail,
+            "confidence": "medium",
+        })
+    for item in file_downloads:
+        try:
+            dst = ipaddress.ip_address(item.dst_ip)
+        except Exception:
+            continue
+        if item.src_ip == target_ip and dst.is_global:
+            exfiltration_chains.append({
+                "signal": f"Outbound file transfer to public peer: {item.filename} {item.src_ip}->{item.dst_ip}",
+                "confidence": "high",
+            })
+
+    deterministic_checks: dict[str, list[str]] = {
+        "recon_to_access_sequence": [],
+        "access_to_execution_sequence": [],
+        "execution_to_c2_or_exfil": [],
+        "ot_control_after_discovery": [],
+        "beaconing_periodicity": [],
+        "authentication_abuse": [],
+        "lateral_movement_fanout": [],
+        "exfiltration_chain": [],
+        "ot_impact_signal": [],
+        "evidence_provenance": [],
+    }
+
+    if "Recon" in present_stages and "Access" in present_stages:
+        deterministic_checks["recon_to_access_sequence"].append("Recon activity observed before/with access indicators")
+    if "Access" in present_stages and "Execution" in present_stages:
+        deterministic_checks["access_to_execution_sequence"].append("Access indicators followed by execution-like commands")
+    if "Execution" in present_stages and ("C2" in present_stages or "Exfil" in present_stages):
+        deterministic_checks["execution_to_c2_or_exfil"].append("Execution activity followed by C2/exfil-like traffic")
+    if "Recon" in present_stages and ot_impact_signals:
+        deterministic_checks["ot_control_after_discovery"].append("OT control-like actions appear after discovery activity")
+    for item in beacon_candidates[:8]:
+        deterministic_checks["beaconing_periodicity"].append(
+            f"peer={item['peer']} interval={item['mean_interval']}s jitter={item['jitter']}s cv={item['cv']}"
+        )
+    for item in auth_abuse_profiles[:8]:
+        deterministic_checks["authentication_abuse"].append(
+            f"{item['src']}->{item['dst']} attempts={item['attempts']} targets={item['target_count']}"
+        )
+    for item in lateral_paths[:8]:
+        deterministic_checks["lateral_movement_fanout"].append(
+            f"{item['src']} reached {item['peer_count']} admin peers (hits={item['admin_hits']})"
+        )
+    for item in exfiltration_chains[:8]:
+        deterministic_checks["exfiltration_chain"].append(str(item.get("signal", "")))
+    for item in ot_impact_signals[:8]:
+        deterministic_checks["ot_impact_signal"].append(f"{item['protocol']} {item['summary']} :: {item['details']}")
+    if evidence_anchors:
+        deterministic_checks["evidence_provenance"].append(f"{len(evidence_anchors)} event(s) include packet/source provenance")
+
+    score = 0
+    score += 2 if deterministic_checks["execution_to_c2_or_exfil"] else 0
+    score += 2 if deterministic_checks["exfiltration_chain"] else 0
+    score += 2 if deterministic_checks["ot_impact_signal"] else 0
+    score += 1 if deterministic_checks["authentication_abuse"] else 0
+    score += 1 if deterministic_checks["lateral_movement_fanout"] else 0
+    score += 1 if deterministic_checks["beaconing_periodicity"] else 0
+    score += 1 if deterministic_checks["recon_to_access_sequence"] else 0
+    score += 1 if deterministic_checks["access_to_execution_sequence"] else 0
+    score += 1 if ot_risk_score >= 60 else 0
+
+    reasons: list[str] = []
+    if deterministic_checks["execution_to_c2_or_exfil"]:
+        reasons.append("Execution followed by C2/exfil behavior")
+    if deterministic_checks["exfiltration_chain"]:
+        reasons.append("Exfiltration chain indicators present")
+    if deterministic_checks["ot_impact_signal"]:
+        reasons.append("OT control-impact signals observed")
+    if deterministic_checks["authentication_abuse"]:
+        reasons.append("Authentication abuse profile observed")
+    if deterministic_checks["lateral_movement_fanout"]:
+        reasons.append("Lateral movement fan-out detected")
+    if deterministic_checks["beaconing_periodicity"]:
+        reasons.append("Periodic beacon-like activity detected")
+    if ot_risk_findings:
+        reasons.extend(ot_risk_findings[:2])
+    if sequence_violations:
+        reasons.extend(sequence_violations[:2])
+
+    if score >= 9:
+        verdict = "YES - STRONG TIMELINE INDICATIONS OF COMPROMISE"
+        confidence = "high"
+    elif score >= 6:
+        verdict = "LIKELY - MULTIPLE CORROBORATED SUSPICIOUS TIMELINE SIGNALS"
+        confidence = "medium"
+    elif score >= 3:
+        verdict = "POSSIBLE - SOME TIMELINE SIGNALS REQUIRE FURTHER VALIDATION"
+        confidence = "medium"
+    else:
+        verdict = "NO STRONG SIGNAL - TIMELINE HEURISTICS DID NOT CROSS CONFIDENCE THRESHOLD"
+        confidence = "low"
+
+    benign_context: list[str] = []
+    if not deterministic_checks["authentication_abuse"]:
+        benign_context.append("No strong authentication abuse concentration was observed")
+    if not deterministic_checks["beaconing_periodicity"]:
+        benign_context.append("No high-confidence periodic beaconing pattern was detected")
+    if not deterministic_checks["ot_impact_signal"] and ot_risk_score < 25:
+        benign_context.append("OT activity appears primarily monitoring/flow oriented")
+    if not exfiltration_chains:
+        benign_context.append("No convincing exfiltration chain was reconstructed from timeline evidence")
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons[:10] if reasons else ["No high-confidence timeline signals identified"],
+        "deterministic_checks": deterministic_checks,
+        "sequence_timeline": stage_rows,
+        "sequence_violations": sequence_violations,
+        "beacon_candidates": beacon_candidates[:12],
+        "auth_abuse_profiles": auth_abuse_profiles[:12],
+        "lateral_movement_paths": lateral_paths[:12],
+        "exfiltration_chains": exfiltration_chains[:16],
+        "ot_impact_signals": ot_impact_signals[:16],
+        "evidence_anchors": sorted(evidence_anchors, key=lambda item: int(item.get("packet", 0)))[:30],
+        "benign_context": benign_context[:8],
+    }
+
+
 def _read_ber_length(payload: bytes, offset: int) -> tuple[Optional[int], int]:
     if offset >= len(payload):
         return None, offset
@@ -901,6 +1344,7 @@ def analyze_timeline(
     seen_wmic_commands: set[tuple[str, str, int, str]] = set()
     seen_winrm_commands: set[tuple[str, str, int, str]] = set()
     seen_telnet_commands: set[tuple[str, str, int, str]] = set()
+    seen_ftp_commands: set[tuple[str, str, int, str]] = set()
     seen_rpc_events: set[tuple[str, str, int, str]] = set()
     seen_mdns_events: set[tuple[str, str, str]] = set()
     seen_nbns_events: set[tuple[str, str, str]] = set()
@@ -961,6 +1405,8 @@ def analyze_timeline(
         summary: str,
         details: str,
         dedupe_key: tuple | None = None,
+        packet_index: Optional[int] = None,
+        source: str = "timeline",
     ) -> None:
         if dedupe_key is None:
             time_bucket = int(ts) if ts is not None else None
@@ -968,11 +1414,16 @@ def analyze_timeline(
         if dedupe_key in seen_event_keys:
             return
         seen_event_keys.add(dedupe_key)
+        event_packet = packet_index
+        if event_packet is None and idx > 0:
+            event_packet = idx
         events.append(TimelineEvent(
             ts=ts,
             category=category,
             summary=summary,
             details=details,
+            packet_index=event_packet,
+            source=source,
         ))
 
     domain_ports = {88, 464, 445, 139, 135, 593, 3268, 3269}
@@ -1365,6 +1816,18 @@ def analyze_timeline(
                                     summary="Telnet command",
                                     details=f"{target_ip} -> {dst_ip}:{dport} {telnet_cmd}",
                                 )
+                    if payload and dport in FTP_CONTROL_PORTS:
+                        ftp_cmd = _extract_ftp_command(_decode_payload_line(payload))
+                        if ftp_cmd:
+                            key = (src_ip, dst_ip, dport, ftp_cmd)
+                            if key not in seen_ftp_commands:
+                                seen_ftp_commands.add(key)
+                                _emit_event(
+                                    ts=ts,
+                                    category="FTP",
+                                    summary="FTP command",
+                                    details=f"{target_ip} -> {dst_ip}:{dport} {ftp_cmd}",
+                                )
                     if payload and payload.startswith(b"POST "):
                         try:
                             line = payload.split(b"\r\n", 1)[0].decode("latin-1", errors="ignore")
@@ -1553,6 +2016,18 @@ def analyze_timeline(
                                     category="Telnet",
                                     summary="Telnet command",
                                     details=f"{src_ip} -> {target_ip}:{sport} {telnet_cmd}",
+                                )
+                    if payload and sport in FTP_CONTROL_PORTS:
+                        ftp_cmd = _extract_ftp_command(_decode_payload_line(payload))
+                        if ftp_cmd:
+                            key = (src_ip, dst_ip, sport, ftp_cmd)
+                            if key not in seen_ftp_commands:
+                                seen_ftp_commands.add(key)
+                                _emit_event(
+                                    ts=ts,
+                                    category="FTP",
+                                    summary="FTP command",
+                                    details=f"{src_ip} -> {target_ip}:{sport} {ftp_cmd}",
                                 )
                     if sport in EMAIL_PORT_SERVICES:
                         service = EMAIL_PORT_SERVICES[sport]
@@ -1786,6 +2261,8 @@ def analyze_timeline(
             summary="File artifact",
             details=details,
             dedupe_key=dedupe_key,
+            packet_index=art.packet_index,
+            source="files",
         )
         if art.dst_ip == target_ip:
             file_key = (art.protocol, art.src_ip, art.dst_ip, art.filename, art.file_type)
@@ -1873,6 +2350,7 @@ def analyze_timeline(
                 category="DNP3",
                 summary=anomaly.title,
                 details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
+                source="dnp3",
             )
 
     if "IEC-104" in ot_protocol_counts:
@@ -1886,6 +2364,7 @@ def analyze_timeline(
                 category="IEC-104",
                 summary=anomaly.title,
                 details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
+                source="iec104",
             )
         for artifact in iec_summary.artifacts:
             if artifact.src != target_ip and artifact.dst != target_ip:
@@ -1895,6 +2374,7 @@ def analyze_timeline(
                 category="IEC-104",
                 summary=f"IEC-104 artifact ({artifact.kind})",
                 details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
+                source="iec104",
             )
         if iec_summary.command_events:
             seen_cmds: set[tuple[str, str, str, int]] = set()
@@ -1910,6 +2390,7 @@ def analyze_timeline(
                     category="IEC-104",
                     summary=f"IEC-104 {cmd_event.command}",
                     details=f"{cmd_event.src} -> {cmd_event.dst}",
+                    source="iec104",
                 )
 
     if "S7" in ot_protocol_counts:
@@ -1923,6 +2404,7 @@ def analyze_timeline(
                 category="S7",
                 summary=anomaly.title,
                 details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
+                source="s7",
             )
         for artifact in s7_summary.artifacts:
             if artifact.src != target_ip and artifact.dst != target_ip:
@@ -1932,6 +2414,7 @@ def analyze_timeline(
                 category="S7",
                 summary=f"S7 artifact ({artifact.kind})",
                 details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
+                source="s7",
             )
         if s7_summary.command_events:
             seen_cmds: set[tuple[str, str, str, int]] = set()
@@ -1947,6 +2430,7 @@ def analyze_timeline(
                     category="S7",
                     summary=f"S7 {cmd_event.command}",
                     details=f"{cmd_event.src} -> {cmd_event.dst}",
+                    source="s7",
                 )
 
     if categories is not None:
@@ -1972,6 +2456,7 @@ def analyze_timeline(
         ot_risk_score,
         ot_risk_findings,
     )
+    hunt_context = _build_timeline_hunting_context(events, target_ip, file_downloads, ot_risk_score, ot_risk_findings)
 
     return TimelineSummary(
         path=path,
@@ -1995,4 +2480,20 @@ def analyze_timeline(
         ot_storyline=ot_storyline,
         dns_queries=sorted(dns_queries, key=lambda item: (item.ts is None, item.ts)),
         file_downloads=sorted(file_downloads, key=lambda item: (item.ts is None, item.ts)),
+        analyst_verdict=str(hunt_context.get("analyst_verdict", "")),
+        analyst_confidence=str(hunt_context.get("analyst_confidence", "low")),
+        analyst_reasons=[str(v) for v in list(hunt_context.get("analyst_reasons", []) or [])],
+        deterministic_checks={
+            str(k): [str(v) for v in list(values or [])]
+            for k, values in dict(hunt_context.get("deterministic_checks", {}) or {}).items()
+        },
+        sequence_timeline=list(hunt_context.get("sequence_timeline", []) or []),
+        sequence_violations=[str(v) for v in list(hunt_context.get("sequence_violations", []) or [])],
+        beacon_candidates=list(hunt_context.get("beacon_candidates", []) or []),
+        auth_abuse_profiles=list(hunt_context.get("auth_abuse_profiles", []) or []),
+        lateral_movement_paths=list(hunt_context.get("lateral_movement_paths", []) or []),
+        exfiltration_chains=list(hunt_context.get("exfiltration_chains", []) or []),
+        ot_impact_signals=list(hunt_context.get("ot_impact_signals", []) or []),
+        evidence_anchors=list(hunt_context.get("evidence_anchors", []) or []),
+        benign_context=[str(v) for v in list(hunt_context.get("benign_context", []) or [])],
     )

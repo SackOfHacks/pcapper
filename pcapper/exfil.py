@@ -74,6 +74,23 @@ def _shannon_entropy(value: str) -> float:
     return -sum((count / total) * math.log2(count / total) for count in freq.values())
 
 
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    vals = sorted(values)
+    mid = len(vals) // 2
+    if len(vals) % 2 == 0:
+        return (vals[mid - 1] + vals[mid]) / 2.0
+    return vals[mid]
+
+
+def _mad(values: list[float], center: float) -> float:
+    if not values:
+        return 0.0
+    deviations = [abs(v - center) for v in values]
+    return _median(deviations)
+
+
 OT_PORTS = {
     102, 502, 9600, 20000, 2404, 47808, 44818, 2222, 34962, 34963, 34964,
     4840, 1911, 4911, 5094, 18245, 18246, 20547, 1962, 5006, 5007, 5683,
@@ -409,6 +426,15 @@ def analyze_exfil(
     def _discover_http_post_exfil(post_payloads: list[dict[str, object]]) -> list[dict[str, object]]:
         suspects: list[dict[str, object]] = []
         post_aggregates: dict[tuple[str, str, str], dict[str, object]] = {}
+        suspicious_content_markers = (
+            "octet-stream",
+            "application/zip",
+            "application/gzip",
+            "x-zip",
+            "application/x-7z",
+            "application/x-rar",
+            "multipart/form-data",
+        )
         for item in post_payloads:
             src = str(item.get("src", "-"))
             dst = str(item.get("dst", "-"))
@@ -419,6 +445,8 @@ def analyze_exfil(
                 size = int(item.get("bytes", 0))
             except Exception:
                 size = 0
+            packet_id = item.get("packet")
+            sample = str(item.get("sample", "") or "").strip()
             agg_key = (src, dst, host)
             aggregate = post_aggregates.setdefault(
                 agg_key,
@@ -426,31 +454,77 @@ def analyze_exfil(
                     "bytes": 0,
                     "requests": 0,
                     "max_single": 0,
+                    "sizes": [],
                     "uris": set(),
                     "content_types": set(),
+                    "packets": set(),
+                    "samples": [],
                 },
             )
             aggregate["bytes"] = int(aggregate.get("bytes", 0)) + max(size, 0)
             aggregate["requests"] = int(aggregate.get("requests", 0)) + 1
             aggregate["max_single"] = max(int(aggregate.get("max_single", 0)), size)
+            sizes = aggregate.get("sizes")
+            if isinstance(sizes, list):
+                sizes.append(max(size, 0))
             uris = aggregate.get("uris")
             if isinstance(uris, set):
                 uris.add(uri)
             cts = aggregate.get("content_types")
             if isinstance(cts, set) and content_type and content_type != "-":
                 cts.add(content_type)
+            packets = aggregate.get("packets")
+            if isinstance(packets, set) and isinstance(packet_id, int):
+                packets.add(packet_id)
+            samples = aggregate.get("samples")
+            if isinstance(samples, list) and sample:
+                if len(samples) < 3:
+                    samples.append(sample[:120])
             if size >= 1_000_000:
+                single_risk_score = 2
+                single_reasons = [f"single_post_body={format_bytes_as_mb(size)}"]
+                if content_type and any(marker in content_type.lower() for marker in suspicious_content_markers):
+                    single_risk_score += 1
+                    single_reasons.append(f"content_type={content_type}")
                 flagged = dict(item)
                 flagged["mode"] = "single"
                 flagged["requests"] = 1
+                flagged["risk_score"] = single_risk_score
+                flagged["risk_reasons"] = single_reasons
+                flagged["packet_examples"] = str(packet_id) if isinstance(packet_id, int) else "-"
                 suspects.append(flagged)
 
         for (src, dst, host), aggregate in post_aggregates.items():
             total_post_bytes = int(aggregate.get("bytes", 0))
             request_count = int(aggregate.get("requests", 0))
-            if total_post_bytes >= 3_000_000 or (request_count >= 15 and total_post_bytes >= 1_500_000):
+            sizes = [float(v) for v in (aggregate.get("sizes") or []) if isinstance(v, (int, float))]
+            median_size = _median(sizes) if sizes else 0.0
+            mad_size = _mad(sizes, median_size) if sizes else 0.0
+            size_stability = 1.0
+            if median_size > 0:
+                size_stability = max(0.0, 1.0 - min(1.0, mad_size / median_size))
+
+            risk_score = 0
+            risk_reasons: list[str] = []
+            if total_post_bytes >= 3_000_000:
+                risk_score += 2
+                risk_reasons.append(f"aggregate_post_volume={format_bytes_as_mb(total_post_bytes)}")
+            if request_count >= 15 and total_post_bytes >= 1_500_000:
+                risk_score += 1
+                risk_reasons.append(f"high_request_count={request_count}")
+            if size_stability >= 0.85 and request_count >= 10:
+                risk_score += 1
+                risk_reasons.append(f"stable_payload_sizes={size_stability:.2f}")
+
+            content_types = sorted(str(value) for value in (aggregate.get("content_types") or set()))
+            if any(any(marker in value.lower() for marker in suspicious_content_markers) for value in content_types):
+                risk_score += 1
+                risk_reasons.append("suspicious_content_type")
+
+            if risk_score >= 2:
                 uris = sorted(str(uri) for uri in (aggregate.get("uris") or set()))
-                content_types = sorted(str(value) for value in (aggregate.get("content_types") or set()))
+                packet_examples = sorted(int(v) for v in (aggregate.get("packets") or set()) if isinstance(v, int))
+                sample_values = [str(v) for v in (aggregate.get("samples") or []) if str(v).strip()]
                 suspects.append({
                     "src": src,
                     "dst": dst,
@@ -460,10 +534,18 @@ def analyze_exfil(
                     "content_type": ", ".join(content_types[:3]) if content_types else "-",
                     "requests": request_count,
                     "mode": "aggregate",
+                    "median_size": median_size,
+                    "mad_size": mad_size,
+                    "size_stability": size_stability,
+                    "risk_score": risk_score,
+                    "risk_reasons": risk_reasons,
+                    "packet_examples": ",".join(str(v) for v in packet_examples[:5]) if packet_examples else "-",
+                    "sample": " | ".join(sample_values[:2]) if sample_values else "-",
                 })
 
         suspects.sort(
             key=lambda item: (
+                int(item.get("risk_score", 0) or 0),
                 int(item.get("bytes", 0) or 0),
                 int(item.get("requests", 0) or 0),
             ),
@@ -581,8 +663,12 @@ def analyze_exfil(
         )
 
     for item in http_post_suspects[:8]:
+        risk_score = int(item.get("risk_score", 0) or 0)
+        packet_examples = str(item.get("packet_examples", item.get("packet", "-")) or "-")
+        reason_values = item.get("risk_reasons", [])
+        reason_text = ",".join(str(v) for v in reason_values[:2]) if isinstance(reason_values, list) and reason_values else "-"
         protocol_exfil_checks["http_https"].append(
-            f"POST {item.get('src')}->{item.get('dst')} host={item.get('host')} bytes={format_bytes_as_mb(int(item.get('bytes', 0) or 0))} req={item.get('requests', 1)}"
+            f"POST {item.get('src')}->{item.get('dst')} host={item.get('host')} bytes={format_bytes_as_mb(int(item.get('bytes', 0) or 0))} req={item.get('requests', 1)} risk={risk_score} packets={packet_examples} why={reason_text}"
         )
     for flow in outbound_flows:
         dport = flow.get("dst_port")
@@ -779,12 +865,13 @@ def analyze_exfil(
     if http_post_suspects:
         aggregate_count = sum(1 for item in http_post_suspects if str(item.get("mode", "single")) == "aggregate")
         largest_http_post = max((int(item.get("bytes", 0) or 0) for item in http_post_suspects), default=0)
+        highest_risk = max((int(item.get("risk_score", 0) or 0) for item in http_post_suspects), default=0)
         detections.append({
             "severity": "warning",
             "summary": "Large HTTP POST payloads",
-            "details": f"{len(http_post_suspects)} suspicious POST channel(s); {aggregate_count} cumulative high-volume stream(s).",
+            "details": f"{len(http_post_suspects)} suspicious POST channel(s); {aggregate_count} cumulative high-volume stream(s); highest risk={highest_risk}.",
             "evidence": [
-                f"{item.get('src')}->{item.get('dst')} host={item.get('host')} bytes={format_bytes_as_mb(int(item.get('bytes', 0)))} requests={item.get('requests', 1)} mode={item.get('mode', 'single')}"
+                f"{item.get('src')}->{item.get('dst')} host={item.get('host')} bytes={format_bytes_as_mb(int(item.get('bytes', 0)))} requests={item.get('requests', 1)} mode={item.get('mode', 'single')} risk={int(item.get('risk_score', 0) or 0)} packets={item.get('packet_examples', item.get('packet', '-'))}"
                 for item in http_post_suspects[:8]
             ],
         })

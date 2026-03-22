@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections import Counter
 import logging
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+import ipaddress
 
 from .pcap_cache import get_reader
 from .utils import detect_file_type, safe_float
@@ -72,7 +74,19 @@ class CertificateSummary:
     expired: list[dict[str, object]]
     self_signed: list[dict[str, object]]
     artifacts: list[CertificateInfo]
-    errors: list[str]
+    weak_signatures: list[dict[str, object]] = field(default_factory=list)
+    eku_mismatches: list[dict[str, object]] = field(default_factory=list)
+    key_usage_issues: list[dict[str, object]] = field(default_factory=list)
+    name_mismatches: list[dict[str, object]] = field(default_factory=list)
+    validity_outliers: list[dict[str, object]] = field(default_factory=list)
+    serial_reuse: list[dict[str, object]] = field(default_factory=list)
+    fingerprint_reuse: list[dict[str, object]] = field(default_factory=list)
+    issuer_impersonation: list[dict[str, object]] = field(default_factory=list)
+    revocation_gaps: list[dict[str, object]] = field(default_factory=list)
+    chain_gaps: list[dict[str, object]] = field(default_factory=list)
+    endpoint_profiles: list[dict[str, object]] = field(default_factory=list)
+    timeline: list[dict[str, object]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSummary:
@@ -114,6 +128,18 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
             expired=[],
             self_signed=[],
             artifacts=[],
+            weak_signatures=[],
+            eku_mismatches=[],
+            key_usage_issues=[],
+            name_mismatches=[],
+            validity_outliers=[],
+            serial_reuse=[],
+            fingerprint_reuse=[],
+            issuer_impersonation=[],
+            revocation_gaps=[],
+            chain_gaps=[],
+            endpoint_profiles=[],
+            timeline=[],
             errors=errors,
         )
 
@@ -131,7 +157,22 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
     expired: list[dict[str, object]] = []
     self_signed: list[dict[str, object]] = []
     seen_fingerprints: set[str] = set()
+    fingerprint_contexts: dict[str, set[str]] = {}
+    serial_contexts: dict[str, set[str]] = {}
     tls_buffers: dict[tuple[str, str, int, int], bytearray] = {}
+    weak_signatures: list[dict[str, object]] = []
+    eku_mismatches: list[dict[str, object]] = []
+    key_usage_issues: list[dict[str, object]] = []
+    name_mismatches: list[dict[str, object]] = []
+    validity_outliers: list[dict[str, object]] = []
+    issuer_impersonation: list[dict[str, object]] = []
+    revocation_gaps: list[dict[str, object]] = []
+    chain_gaps: list[dict[str, object]] = []
+    timeline: list[dict[str, object]] = []
+
+    now_utc = datetime.now(timezone.utc)
+    suspicious_tlds = (".ru", ".cn", ".top", ".xyz", ".gq", ".tk", ".ml", ".ga")
+    brand_markers = ("microsoft", "google", "apple", "amazon", "paypal", "okta", "github", "adobe")
 
     def _collect_cert_items(payload: object) -> list[object]:
         if payload is None:
@@ -249,9 +290,21 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
             san_list = []
         san_text = ", ".join(san_list) if san_list else "-"
 
-        sha1 = cert.fingerprint(cert.signature_hash_algorithm).hex() if cert.signature_hash_algorithm else "-"
+        sha1 = cert.fingerprint(hashes.SHA1()).hex() if hashes else "-"
         sha256 = cert.fingerprint(hashes.SHA256()).hex() if hashes else "-"
+        context_key = f"{src_ip}->{dst_ip}"
+        serial_contexts.setdefault(serial, set()).add(context_key)
+        fingerprint_contexts.setdefault(sha256, set()).add(context_key)
         if sha256 in seen_fingerprints:
+            timeline.append({
+                "event": "cert_reuse",
+                "subject": subject,
+                "issuer": issuer,
+                "sha256": sha256,
+                "src": src_ip,
+                "dst": dst_ip,
+                "not_after": not_after,
+            })
             return
         seen_fingerprints.add(sha256)
 
@@ -263,15 +316,115 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
         if pubkey_size and pubkey_size < 2048:
             weak_keys.append({"subject": subject, "size": pubkey_size, "src": src_ip, "dst": dst_ip})
 
+        lower_sig = sig_algo.lower()
+        if "md5" in lower_sig or "sha1" in lower_sig:
+            weak_signatures.append({
+                "subject": subject,
+                "issuer": issuer,
+                "sig_algo": sig_algo,
+                "src": src_ip,
+                "dst": dst_ip,
+            })
+
         if hasattr(cert, "not_valid_after_utc") and hasattr(cert, "not_valid_before_utc"):
-            if cert.not_valid_after_utc < cert.not_valid_before_utc:  # type: ignore[attr-defined]
-                expired.append({"subject": subject, "reason": "invalid validity", "src": src_ip, "dst": dst_ip})
+            not_before_dt = cert.not_valid_before_utc  # type: ignore[attr-defined]
+            not_after_dt = cert.not_valid_after_utc  # type: ignore[attr-defined]
         else:
-            if cert.not_valid_after < cert.not_valid_before:
-                expired.append({"subject": subject, "reason": "invalid validity", "src": src_ip, "dst": dst_ip})
+            not_before_dt = cert.not_valid_before.replace(tzinfo=timezone.utc)
+            not_after_dt = cert.not_valid_after.replace(tzinfo=timezone.utc)
+
+        if not_after_dt < not_before_dt:
+            expired.append({"subject": subject, "reason": "invalid validity", "src": src_ip, "dst": dst_ip})
+        if now_utc > not_after_dt:
+            expired.append({"subject": subject, "reason": "expired", "src": src_ip, "dst": dst_ip})
+        if now_utc < not_before_dt:
+            validity_outliers.append({
+                "subject": subject,
+                "reason": "not_yet_valid",
+                "src": src_ip,
+                "dst": dst_ip,
+            })
+
+        validity_days = (not_after_dt - not_before_dt).total_seconds() / 86400.0
+        if validity_days <= 14:
+            validity_outliers.append({"subject": subject, "reason": "short_validity", "days": round(validity_days, 1), "src": src_ip, "dst": dst_ip})
+        elif validity_days >= 825:
+            validity_outliers.append({"subject": subject, "reason": "long_validity", "days": round(validity_days, 1), "src": src_ip, "dst": dst_ip})
+
+        try:
+            eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+            oid_names = [getattr(oid, "_name", str(oid)) for oid in eku]
+            joined = ",".join(str(v).lower() for v in oid_names)
+            if "serverauth" not in joined and "tls web server authentication" not in joined:
+                eku_mismatches.append({"subject": subject, "reason": "missing_server_auth", "eku": ", ".join(oid_names), "src": src_ip, "dst": dst_ip})
+        except Exception:
+            eku_mismatches.append({"subject": subject, "reason": "missing_eku", "src": src_ip, "dst": dst_ip})
+
+        try:
+            ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
+            if not bool(getattr(ku, "digital_signature", False) or getattr(ku, "key_encipherment", False) or getattr(ku, "key_agreement", False)):
+                key_usage_issues.append({"subject": subject, "reason": "leaf_without_tls_key_usage", "src": src_ip, "dst": dst_ip})
+        except Exception:
+            key_usage_issues.append({"subject": subject, "reason": "missing_key_usage", "src": src_ip, "dst": dst_ip})
+
+        try:
+            bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+            if bool(getattr(bc, "ca", False)):
+                chain_gaps.append({"subject": subject, "reason": "leaf_marked_as_ca", "src": src_ip, "dst": dst_ip})
+        except Exception:
+            chain_gaps.append({"subject": subject, "reason": "missing_basic_constraints", "src": src_ip, "dst": dst_ip})
+
+        if san_list:
+            if dst_ip not in san_list:
+                try:
+                    ipaddress.ip_address(dst_ip)
+                    name_mismatches.append({"subject": subject, "reason": "dst_ip_not_in_san", "dst": dst_ip, "src": src_ip})
+                except Exception:
+                    pass
+        else:
+            name_mismatches.append({"subject": subject, "reason": "missing_san", "src": src_ip, "dst": dst_ip})
+
+        lower_blob = f"{subject} {san_text}".lower()
+        if any(marker in lower_blob for marker in brand_markers):
+            suspicious = False
+            if subject == issuer:
+                suspicious = True
+            if any(name.lower().endswith(suspicious_tlds) for name in san_list):
+                suspicious = True
+            if pubkey_size and pubkey_size < 2048:
+                suspicious = True
+            if suspicious:
+                issuer_impersonation.append({"subject": subject, "issuer": issuer, "san": san_text, "src": src_ip, "dst": dst_ip})
+
+        has_aia = False
+        has_crl = False
+        try:
+            aia = cert.extensions.get_extension_for_oid(x509.ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
+            aia_items = [str(item.access_method) for item in aia]
+            has_aia = bool(aia_items)
+        except Exception:
+            has_aia = False
+        try:
+            cdp = cert.extensions.get_extension_for_oid(x509.ExtensionOID.CRL_DISTRIBUTION_POINTS).value
+            has_crl = bool(cdp)
+        except Exception:
+            has_crl = False
+        if not has_aia and not has_crl:
+            revocation_gaps.append({"subject": subject, "reason": "missing_ocsp_and_crl", "src": src_ip, "dst": dst_ip})
 
         if subject == issuer:
             self_signed.append({"subject": subject, "src": src_ip, "dst": dst_ip})
+
+        timeline.append({
+            "event": "cert_seen",
+            "subject": subject,
+            "issuer": issuer,
+            "sha256": sha256,
+            "serial": serial,
+            "src": src_ip,
+            "dst": dst_ip,
+            "not_after": not_after,
+        })
 
         artifacts.append(CertificateInfo(
             subject=subject,
@@ -408,6 +561,68 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
             except Exception:
                 pass
 
+    serial_reuse: list[dict[str, object]] = []
+    for serial_value, contexts in serial_contexts.items():
+        if len(contexts) >= 3:
+            serial_reuse.append({
+                "serial": serial_value,
+                "contexts": sorted(contexts)[:10],
+                "count": len(contexts),
+            })
+
+    fingerprint_reuse: list[dict[str, object]] = []
+    for fp, contexts in fingerprint_contexts.items():
+        if len(contexts) >= 3:
+            fingerprint_reuse.append({
+                "sha256": fp,
+                "contexts": sorted(contexts)[:10],
+                "count": len(contexts),
+            })
+
+    endpoint_profiles_map: dict[str, dict[str, object]] = {}
+    for cert in artifacts:
+        endpoint = str(cert.dst_ip)
+        profile = endpoint_profiles_map.setdefault(
+            endpoint,
+            {
+                "endpoint": endpoint,
+                "subjects": set(),
+                "issuers": set(),
+                "fingerprints": set(),
+                "not_after": [],
+                "flows": set(),
+            },
+        )
+        cast_subjects = profile.get("subjects")
+        if isinstance(cast_subjects, set):
+            cast_subjects.add(cert.subject)
+        cast_issuers = profile.get("issuers")
+        if isinstance(cast_issuers, set):
+            cast_issuers.add(cert.issuer)
+        cast_fps = profile.get("fingerprints")
+        if isinstance(cast_fps, set):
+            cast_fps.add(cert.sha256)
+        cast_dates = profile.get("not_after")
+        if isinstance(cast_dates, list):
+            cast_dates.append(cert.not_after)
+        cast_flows = profile.get("flows")
+        if isinstance(cast_flows, set):
+            cast_flows.add(f"{cert.src_ip}->{cert.dst_ip}")
+
+    endpoint_profiles: list[dict[str, object]] = []
+    for profile in endpoint_profiles_map.values():
+        endpoint_profiles.append({
+            "endpoint": profile.get("endpoint", "-"),
+            "subjects": len(profile.get("subjects", set())),
+            "issuers": len(profile.get("issuers", set())),
+            "fingerprints": len(profile.get("fingerprints", set())),
+            "flows": len(profile.get("flows", set())),
+            "latest_not_after": max(profile.get("not_after", ["-"])) if profile.get("not_after") else "-",
+        })
+    endpoint_profiles.sort(key=lambda item: int(item.get("fingerprints", 0)), reverse=True)
+
+    timeline_sorted = sorted(timeline, key=lambda item: str(item.get("not_after", "")))
+
     return CertificateSummary(
         path=path,
         total_packets=total_packets,
@@ -420,5 +635,17 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
         expired=expired,
         self_signed=self_signed,
         artifacts=artifacts,
+        weak_signatures=weak_signatures,
+        eku_mismatches=eku_mismatches,
+        key_usage_issues=key_usage_issues,
+        name_mismatches=name_mismatches,
+        validity_outliers=validity_outliers,
+        serial_reuse=serial_reuse,
+        fingerprint_reuse=fingerprint_reuse,
+        issuer_impersonation=issuer_impersonation,
+        revocation_gaps=revocation_gaps,
+        chain_gaps=chain_gaps,
+        endpoint_profiles=endpoint_profiles,
+        timeline=timeline_sorted[:200],
         errors=errors,
     )

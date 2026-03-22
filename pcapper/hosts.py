@@ -66,7 +66,318 @@ class HostSummary:
     path: Path
     total_hosts: int
     hosts: list[HostRecord] = field(default_factory=list)
+    analyst_verdict: str = ""
+    analyst_confidence: str = "low"
+    analyst_reasons: list[str] = field(default_factory=list)
+    deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
+    host_risk_profiles: list[dict[str, object]] = field(default_factory=list)
+    lateral_movement_profiles: list[dict[str, object]] = field(default_factory=list)
+    role_drift_profiles: list[dict[str, object]] = field(default_factory=list)
+    identity_drift_profiles: list[dict[str, object]] = field(default_factory=list)
+    incident_clusters: list[dict[str, object]] = field(default_factory=list)
+    investigation_pivots: list[dict[str, object]] = field(default_factory=list)
+    risk_matrix: list[dict[str, str]] = field(default_factory=list)
+    false_positive_context: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+
+def _build_hosts_hunting_context(hosts: list[HostRecord]) -> dict[str, object]:
+    checks: dict[str, list[str]] = {
+        "host_role_impersonation_or_drift": [],
+        "east_west_lateral_fanout": [],
+        "service_exposure_risk": [],
+        "identity_drift_or_collision": [],
+        "protocol_consistency_mismatch": [],
+        "boundary_cross_zone_exposure": [],
+        "beacon_or_periodic_profile": [],
+        "ot_it_boundary_crossing": [],
+        "evidence_provenance": [],
+    }
+
+    host_risk_profiles: list[dict[str, object]] = []
+    lateral_profiles: list[dict[str, object]] = []
+    role_drift_profiles: list[dict[str, object]] = []
+    identity_drift_profiles: list[dict[str, object]] = []
+    incident_clusters: list[dict[str, object]] = []
+    pivots: list[dict[str, object]] = []
+
+    hostname_to_ips: dict[str, set[str]] = defaultdict(set)
+    for host in hosts:
+        for name in host.hostnames:
+            if name:
+                hostname_to_ips[str(name)].add(str(host.ip))
+
+    mgmt_ports = {22, 23, 135, 139, 445, 3389, 5985, 5986, 389, 636}
+    ot_ports = {102, 502, 20000, 44818, 2222, 2404}
+    risky_services = {"telnet", "ftp", "smb", "rdp", "winrm", "ldap", "snmp", "rpc"}
+    role_tokens = {
+        "dc": "domain_controller",
+        "ldap": "domain_controller",
+        "backup": "backup_server",
+        "jump": "jump_host",
+        "admin": "admin_host",
+        "eng": "engineering",
+        "hmi": "hmi",
+        "plc": "plc",
+        "scada": "scada",
+    }
+
+    for host in hosts:
+        ip_text = str(host.ip)
+        hostnames = [str(v) for v in (host.hostnames or []) if str(v).strip()]
+        lower_names = [name.lower() for name in hostnames]
+        open_ports = list(host.open_ports or [])
+        os_guess = str(host.operating_system or "Unknown")
+        bytes_total = int(host.bytes_sent or 0) + int(host.bytes_recv or 0)
+        packets_total = int(host.packets_sent or 0) + int(host.packets_recv or 0)
+
+        admin_port_hits = sorted({int(getattr(port, "port", 0) or 0) for port in open_ports if int(getattr(port, "port", 0) or 0) in mgmt_ports})
+        ot_port_hits = sorted({int(getattr(port, "port", 0) or 0) for port in open_ports if int(getattr(port, "port", 0) or 0) in ot_ports})
+        risky_service_hits = sorted(
+            {
+                str(getattr(port, "service", "") or "").lower()
+                for port in open_ports
+                if str(getattr(port, "service", "") or "").lower() in risky_services
+            }
+        )
+
+        score = 0
+        reasons: list[str] = []
+
+        role_labels: set[str] = set()
+        for hostname in lower_names:
+            for token, label in role_tokens.items():
+                if token in hostname:
+                    role_labels.add(label)
+        if role_labels and admin_port_hits:
+            checks["host_role_impersonation_or_drift"].append(
+                f"{ip_text} role-like names={','.join(sorted(role_labels)[:3])} admin_ports={','.join(str(v) for v in admin_port_hits[:6])}"
+            )
+            role_drift_profiles.append(
+                {
+                    "host": ip_text,
+                    "roles": sorted(role_labels),
+                    "hostnames": hostnames[:6],
+                    "admin_ports": admin_port_hits,
+                    "os": os_guess,
+                }
+            )
+            score += 2
+            reasons.append("Role-like identity with privileged service surface")
+
+        if len(admin_port_hits) >= 3:
+            checks["east_west_lateral_fanout"].append(
+                f"{ip_text} exposes multiple lateral/admin ports: {','.join(str(v) for v in admin_port_hits)}"
+            )
+            lateral_profiles.append(
+                {
+                    "host": ip_text,
+                    "admin_port_count": len(admin_port_hits),
+                    "admin_ports": admin_port_hits,
+                    "confidence": "high" if len(admin_port_hits) >= 5 else "medium",
+                }
+            )
+            score += 2
+            reasons.append("Broad admin/lateral movement attack surface")
+
+        if risky_service_hits:
+            checks["service_exposure_risk"].append(
+                f"{ip_text} risky_services={','.join(risky_service_hits[:6])}"
+            )
+            score += 1
+            reasons.append("Risky service exposure present")
+
+        for hostname in hostnames:
+            mapped = hostname_to_ips.get(hostname, set())
+            if len(mapped) >= 2:
+                checks["identity_drift_or_collision"].append(
+                    f"{hostname} appears on {len(mapped)} hosts: {', '.join(sorted(mapped)[:5])}"
+                )
+                identity_drift_profiles.append(
+                    {
+                        "hostname": hostname,
+                        "host_count": len(mapped),
+                        "hosts": sorted(mapped)[:8],
+                    }
+                )
+                score += 1
+                reasons.append("Hostname reused across multiple hosts")
+                break
+
+        if os_guess.lower().startswith("windows") and any(port in {22, 23} for port in admin_port_hits):
+            checks["protocol_consistency_mismatch"].append(
+                f"{ip_text} windows-like fingerprint with atypical admin ports {','.join(str(v) for v in admin_port_hits)}"
+            )
+            score += 1
+            reasons.append("OS/service profile mismatch")
+
+        if _is_public_ip(ip_text) and hostnames:
+            checks["boundary_cross_zone_exposure"].append(
+                f"public host {ip_text} carries internal naming context ({hostnames[0]})"
+            )
+            score += 1
+            reasons.append("Boundary exposure with internal identity context")
+
+        duration = None
+        if host.first_seen is not None and host.last_seen is not None:
+            duration = max(0.0, float(host.last_seen) - float(host.first_seen))
+        if duration is not None and duration >= 900 and packets_total > 0 and (packets_total / max(duration, 1.0)) <= 0.2 and bytes_total >= 100_000:
+            checks["beacon_or_periodic_profile"].append(
+                f"{ip_text} low-and-slow persistence profile packets={packets_total} duration={duration:.1f}s"
+            )
+            score += 1
+            reasons.append("Possible low-and-slow periodic communications")
+
+        if ot_port_hits and (admin_port_hits or "workstation" in " ".join(lower_names) or os_guess.lower().startswith("windows")):
+            checks["ot_it_boundary_crossing"].append(
+                f"{ip_text} mixes OT ports {','.join(str(v) for v in ot_port_hits)} with IT admin traits"
+            )
+            score += 1
+            reasons.append("Potential OT/IT boundary crossing")
+
+        checks["evidence_provenance"].append(
+            f"host={ip_text} packets={packets_total} bytes={bytes_total} first={host.first_seen} last={host.last_seen}"
+        )
+
+        if score > 0:
+            if score >= 5:
+                severity = "high"
+                confidence = "high"
+            elif score >= 3:
+                severity = "medium"
+                confidence = "medium"
+            else:
+                severity = "low"
+                confidence = "low"
+
+            host_risk_profiles.append(
+                {
+                    "host": ip_text,
+                    "score": score,
+                    "severity": severity,
+                    "confidence": confidence,
+                    "os": os_guess,
+                    "hostnames": hostnames[:5],
+                    "admin_ports": admin_port_hits,
+                    "ot_ports": ot_port_hits,
+                    "risky_services": risky_service_hits,
+                    "reasons": reasons[:5],
+                }
+            )
+
+            incident_clusters.append(
+                {
+                    "cluster": f"host-{ip_text}",
+                    "host": ip_text,
+                    "indicators": reasons[:5],
+                    "target_count": len(admin_port_hits) + len(ot_port_hits),
+                    "confidence": confidence,
+                }
+            )
+
+            pivots.append(
+                {
+                    "host": ip_text,
+                    "hostnames": hostnames[:5],
+                    "os": os_guess,
+                    "ports": [f"{int(getattr(port, 'port', 0) or 0)}/{str(getattr(port, 'protocol', '-') or '-')}" for port in open_ports[:8]],
+                    "reasons": reasons[:3],
+                }
+            )
+
+    host_risk_profiles.sort(key=lambda item: (-int(item.get("score", 0) or 0), str(item.get("host", ""))))
+    lateral_profiles.sort(key=lambda item: (-int(item.get("admin_port_count", 0) or 0), str(item.get("host", ""))))
+
+    score = 0
+    score += 2 if checks["east_west_lateral_fanout"] else 0
+    score += 2 if checks["host_role_impersonation_or_drift"] else 0
+    score += 1 if checks["identity_drift_or_collision"] else 0
+    score += 1 if checks["protocol_consistency_mismatch"] else 0
+    score += 1 if checks["boundary_cross_zone_exposure"] else 0
+    score += 1 if checks["ot_it_boundary_crossing"] else 0
+    score += 1 if checks["beacon_or_periodic_profile"] else 0
+    score += 1 if checks["service_exposure_risk"] else 0
+
+    reasons: list[str] = []
+    if checks["east_west_lateral_fanout"]:
+        reasons.append("Hosts with broad lateral/admin port surface identified")
+    if checks["host_role_impersonation_or_drift"]:
+        reasons.append("Role-like identity and service role drift indicators detected")
+    if checks["identity_drift_or_collision"]:
+        reasons.append("Hostname identity collisions across hosts observed")
+    if checks["protocol_consistency_mismatch"]:
+        reasons.append("OS/service profile mismatches detected")
+    if checks["ot_it_boundary_crossing"]:
+        reasons.append("OT/IT boundary crossing signals detected")
+
+    if score >= 7:
+        verdict = "YES - HIGH-CONFIDENCE HOST RISK AND COMPROMISE-PRIORITIZATION SIGNALS DETECTED"
+        confidence = "high"
+    elif score >= 4:
+        verdict = "LIKELY - MULTIPLE CORROBORATING HOST RISK INDICATORS DETECTED"
+        confidence = "medium"
+    elif score >= 2:
+        verdict = "POSSIBLE - HOST RISK SIGNALS REQUIRE VALIDATION"
+        confidence = "medium"
+    else:
+        verdict = "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE HOST RISK PATTERN"
+        confidence = "low"
+
+    risk_matrix: list[dict[str, str]] = [
+        {
+            "category": "Role Drift/Impersonation",
+            "risk": "High" if checks["host_role_impersonation_or_drift"] else "None",
+            "confidence": "High" if checks["host_role_impersonation_or_drift"] else "Low",
+            "evidence": str(len(checks["host_role_impersonation_or_drift"])) if checks["host_role_impersonation_or_drift"] else "No matching detections",
+        },
+        {
+            "category": "Lateral Fan-out Surface",
+            "risk": "High" if checks["east_west_lateral_fanout"] else "None",
+            "confidence": "High" if checks["east_west_lateral_fanout"] else "Low",
+            "evidence": str(len(checks["east_west_lateral_fanout"])) if checks["east_west_lateral_fanout"] else "No matching detections",
+        },
+        {
+            "category": "Identity Drift/Collision",
+            "risk": "Medium" if checks["identity_drift_or_collision"] else "None",
+            "confidence": "Medium" if checks["identity_drift_or_collision"] else "Low",
+            "evidence": str(len(checks["identity_drift_or_collision"])) if checks["identity_drift_or_collision"] else "No matching detections",
+        },
+        {
+            "category": "Protocol Consistency Mismatch",
+            "risk": "Medium" if checks["protocol_consistency_mismatch"] else "None",
+            "confidence": "Medium" if checks["protocol_consistency_mismatch"] else "Low",
+            "evidence": str(len(checks["protocol_consistency_mismatch"])) if checks["protocol_consistency_mismatch"] else "No matching detections",
+        },
+        {
+            "category": "OT/IT Boundary Crossing",
+            "risk": "Medium" if checks["ot_it_boundary_crossing"] else "None",
+            "confidence": "Medium" if checks["ot_it_boundary_crossing"] else "Low",
+            "evidence": str(len(checks["ot_it_boundary_crossing"])) if checks["ot_it_boundary_crossing"] else "No matching detections",
+        },
+    ]
+
+    false_positive_context: list[str] = []
+    if not checks["east_west_lateral_fanout"]:
+        false_positive_context.append("No broad lateral/admin port fan-out pattern exceeded thresholds")
+    if not checks["identity_drift_or_collision"]:
+        false_positive_context.append("No strong hostname reuse collision detected across host identities")
+    if checks["service_exposure_risk"] and not checks["protocol_consistency_mismatch"]:
+        false_positive_context.append("Exposed services may reflect expected server roles without identity inconsistency")
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons if reasons else ["No high-confidence host risk heuristic crossed threshold"],
+        "deterministic_checks": checks,
+        "host_risk_profiles": host_risk_profiles[:40],
+        "lateral_movement_profiles": lateral_profiles[:40],
+        "role_drift_profiles": role_drift_profiles[:40],
+        "identity_drift_profiles": identity_drift_profiles[:40],
+        "incident_clusters": incident_clusters[:40],
+        "investigation_pivots": pivots[:40],
+        "risk_matrix": risk_matrix,
+        "false_positive_context": false_positive_context[:8],
+    }
 
 
 def _valid_ip(value: str) -> bool:
@@ -713,10 +1024,27 @@ def analyze_hosts(path: Path, show_status: bool = True) -> HostSummary:
         reverse=True,
     )
 
+    context = _build_hosts_hunting_context(hosts)
+
     return HostSummary(
         path=path,
         total_hosts=len(hosts),
         hosts=hosts,
+        analyst_verdict=str(context.get("analyst_verdict", "")),
+        analyst_confidence=str(context.get("analyst_confidence", "low")),
+        analyst_reasons=[str(v) for v in list(context.get("analyst_reasons", []) or [])],
+        deterministic_checks={
+            str(key): [str(v) for v in list(values or [])]
+            for key, values in dict(context.get("deterministic_checks", {}) or {}).items()
+        },
+        host_risk_profiles=list(context.get("host_risk_profiles", []) or []),
+        lateral_movement_profiles=list(context.get("lateral_movement_profiles", []) or []),
+        role_drift_profiles=list(context.get("role_drift_profiles", []) or []),
+        identity_drift_profiles=list(context.get("identity_drift_profiles", []) or []),
+        incident_clusters=list(context.get("incident_clusters", []) or []),
+        investigation_pivots=list(context.get("investigation_pivots", []) or []),
+        risk_matrix=[dict(item) for item in list(context.get("risk_matrix", []) or []) if isinstance(item, dict)],
+        false_positive_context=[str(v) for v in list(context.get("false_positive_context", []) or [])],
         errors=sorted({err for err in errors if err}),
     )
 
@@ -814,9 +1142,26 @@ def merge_hosts_summaries(summaries: Iterable[HostSummary]) -> HostSummary:
         reverse=True,
     )
 
+    context = _build_hosts_hunting_context(merged_hosts)
+
     return HostSummary(
         path=Path(f"ALL_PCAPS_{len(summary_list)}"),
         total_hosts=len(merged_hosts),
         hosts=merged_hosts,
+        analyst_verdict=str(context.get("analyst_verdict", "")),
+        analyst_confidence=str(context.get("analyst_confidence", "low")),
+        analyst_reasons=[str(v) for v in list(context.get("analyst_reasons", []) or [])],
+        deterministic_checks={
+            str(key): [str(v) for v in list(values or [])]
+            for key, values in dict(context.get("deterministic_checks", {}) or {}).items()
+        },
+        host_risk_profiles=list(context.get("host_risk_profiles", []) or []),
+        lateral_movement_profiles=list(context.get("lateral_movement_profiles", []) or []),
+        role_drift_profiles=list(context.get("role_drift_profiles", []) or []),
+        identity_drift_profiles=list(context.get("identity_drift_profiles", []) or []),
+        incident_clusters=list(context.get("incident_clusters", []) or []),
+        investigation_pivots=list(context.get("investigation_pivots", []) or []),
+        risk_matrix=[dict(item) for item in list(context.get("risk_matrix", []) or []) if isinstance(item, dict)],
+        false_positive_context=[str(v) for v in list(context.get("false_positive_context", []) or [])],
         errors=sorted(err for err in error_set if err),
     )

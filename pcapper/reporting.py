@@ -71,6 +71,7 @@ from .ctf import CtfSummary
 from .ioc import IocSummary
 from .ot_commands import OtCommandSummary
 from .iec101_103 import Iec101103Summary
+from .mitre import MitreSummary
 
 
 if TYPE_CHECKING:
@@ -97,14 +98,15 @@ class _SizeBucketLike(Protocol):
 SECTION_BAR = "=" * 72
 SUBSECTION_BAR = "-" * 72
 
-_REDACT_SECRETS = True
+_REDACT_SECRETS = False
 _VERBOSE_OUTPUT = False
 _FULL_OUTPUT_LIMIT = 1_000_000
 
 
 def set_redact_secrets(enabled: bool) -> None:
     global _REDACT_SECRETS
-    _REDACT_SECRETS = enabled
+    # Redaction is intentionally disabled globally.
+    _REDACT_SECRETS = False
 
 
 def set_verbose_output(enabled: bool) -> None:
@@ -132,9 +134,7 @@ def _secret_fingerprint(value: str) -> str:
 def _redact_secret(value: str | None) -> str:
     if value is None:
         return "-"
-    if not _REDACT_SECRETS:
-        return value
-    return _secret_fingerprint(value)
+    return value
 
 
 _SECRET_PATTERNS = [
@@ -209,21 +209,7 @@ _HTTP_STATUS_TEXT = {
 
 
 def _redact_in_text(text: str) -> str:
-    if not _REDACT_SECRETS or not text:
-        return text
-
-    def _repl(match: re.Match) -> str:
-        if match.lastindex and match.lastindex >= 3:
-            key = match.group(1)
-            value = match.group(3)
-            return f"{key}={_secret_fingerprint(value)}"
-        value = match.group(match.lastindex or 1)
-        return f"PASS {_secret_fingerprint(value)}"
-
-    redacted = text
-    for pattern in _SECRET_PATTERNS:
-        redacted = pattern.sub(_repl, redacted)
-    return redacted
+    return text
 
 
 def _http_status_text(value: object) -> str:
@@ -309,15 +295,96 @@ def _format_table(rows: Iterable[list[str]]) -> str:
     def _visible_len(text: str) -> int:
         return len(re.sub(r"\x1b\[[0-9;]*m", "", text))
 
+    def _hard_wrap_visible(text: str, width: int) -> list[str]:
+        if width <= 0:
+            return [text]
+        if not text:
+            return [""]
+        chunks: list[str] = []
+        visible_count = 0
+        current: list[str] = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            # Preserve ANSI color sequences without counting them toward visible width.
+            if ch == "\x1b":
+                m = re.match(r"\x1b\[[0-9;]*m", text[i:])
+                if m:
+                    seq = m.group(0)
+                    current.append(seq)
+                    i += len(seq)
+                    continue
+            if ch == "\n":
+                chunks.append("".join(current))
+                current = []
+                visible_count = 0
+                i += 1
+                continue
+            current.append(ch)
+            visible_count += 1
+            i += 1
+            if visible_count >= width:
+                chunks.append("".join(current))
+                current = []
+                visible_count = 0
+        chunks.append("".join(current))
+        return chunks or [""]
+
+    def _wrap_cell_lines(text: str, width: int) -> list[str]:
+        if width <= 0:
+            return [text]
+        if not text:
+            return [""]
+
+        max_visible = max(_visible_len(part) for part in text.splitlines() or [text])
+        if max_visible <= width and "\n" not in text:
+            return [text]
+
+        wrapped: list[str] = []
+        for base_line in (text.splitlines() or [text]):
+            if not base_line:
+                wrapped.append("")
+                continue
+            plain_line = re.sub(r"\x1b\[[0-9;]*m", "", base_line)
+            if _visible_len(base_line) <= width:
+                wrapped.append(base_line)
+                continue
+            # For whitespace-rich text, wrap on words; for long tokens, fall back to hard-wrap.
+            if re.search(r"\s", plain_line):
+                # Keep no line longer than width while preserving words when possible.
+                word_wrapped = textwrap.wrap(
+                    base_line,
+                    width=width,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                )
+                if word_wrapped:
+                    for seg in word_wrapped:
+                        if _visible_len(seg) <= width:
+                            wrapped.append(seg)
+                        else:
+                            wrapped.extend(_hard_wrap_visible(seg, width))
+                    continue
+            wrapped.extend(_hard_wrap_visible(base_line, width))
+        return wrapped or [""]
+
     widths = [max(_visible_len(row[i]) for row in rows) for i in range(len(rows[0]))]
-    lines = []
+    # Cap cell width globally so very long values don't destroy table readability.
+    max_col_width = 56
+    wrapped_widths = [min(width, max_col_width) for width in widths]
+
+    lines: list[str] = []
     for row in rows:
-        parts = []
-        for idx, value in enumerate(row):
-            pad = widths[idx] - _visible_len(value)
-            parts.append(value + (" " * max(0, pad)))
-        line = "  ".join(parts)
-        lines.append(line)
+        wrapped_cells = [_wrap_cell_lines(value, wrapped_widths[idx]) for idx, value in enumerate(row)]
+        row_height = max((len(cell_lines) for cell_lines in wrapped_cells), default=1)
+
+        for line_idx in range(row_height):
+            parts: list[str] = []
+            for idx, cell_lines in enumerate(wrapped_cells):
+                value = cell_lines[line_idx] if line_idx < len(cell_lines) else ""
+                pad = wrapped_widths[idx] - _visible_len(value)
+                parts.append(value + (" " * max(0, pad)))
+            lines.append("  ".join(parts))
     return "\n".join(lines)
 
 def _filtered_detections(summary, verbose: bool) -> list[dict[str, object]]:
@@ -572,8 +639,8 @@ def _highlight_public_ips(text: str) -> str:
     return _IPV6_RE.sub(_replace_ipv6, text)
 
 
-def _finalize_output(lines: list[str]) -> str:
-    if lines and not _VERBOSE_OUTPUT:
+def _finalize_output(lines: list[str], show_truncation_note: bool = True) -> str:
+    if lines and show_truncation_note and not _VERBOSE_OUTPUT:
         lines.append(muted("Output is summarized/truncated. Use -v to view all output."))
     return _highlight_public_ips("\n".join(lines))
 
@@ -1104,6 +1171,144 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
     lines.append(_format_kv("Duration", f"{summary.duration:.2f}s"))
     lines.append(_format_kv("Total Packets", str(summary.total_packets)))
 
+    def _domain_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+
+        def _count_check(key: str) -> int:
+            items = checks.get(key, []) if isinstance(checks, dict) else []
+            return len([v for v in (items or []) if str(v).strip()])
+
+        high_impact = {
+            "dcsync_replication_activity": 4,
+            "kerberos_ticket_abuse": 3,
+            "ntlm_downgrade_or_relay_exposure": 3,
+            "ldap_bind_risk": 2,
+            "auth_sequence_plausibility": 2,
+            "dc_role_consistency": 2,
+            "name_resolution_poisoning_context": 1,
+            "privileged_account_spread": 1,
+        }
+
+        for key, weight in high_impact.items():
+            count = _count_check(key)
+            if not count:
+                continue
+            score += min(4, weight + min(2, count - 1))
+            reasons.append(f"{key.replace('_', ' ')} evidence ({count})")
+
+        high_count = sum(1 for item in (summary.detections or []) if str(item.get("severity", "")).lower() in {"high", "critical"})
+        warning_count = sum(1 for item in (summary.detections or []) if str(item.get("severity", "")).lower() == "warning")
+        if high_count:
+            score += min(3, high_count)
+            reasons.append(f"High-severity domain detections observed ({high_count})")
+        if warning_count >= 2:
+            score += 1
+            reasons.append(f"Multiple warning-level domain detections observed ({warning_count})")
+
+        if score >= 8:
+            verdict = "YES - high-confidence malicious or compromised domain activity is present."
+            confidence = "High"
+        elif score >= 5:
+            verdict = "LIKELY - suspicious domain activity with compromise indicators is present."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - risky domain behavior is present; corroboration recommended."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing malicious domain pattern from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence domain threat heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _domain_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    if summary.clients:
+        lines.append(muted("Who:"))
+        lines.append(muted("- Top initiating hosts"))
+        for ip, count in summary.clients.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_highlight_public_ips(str(ip))}: {int(count)}"))
+    if summary.servers:
+        lines.append(muted("Where:"))
+        lines.append(muted("- Top domain infrastructure targets"))
+        for ip, count in summary.servers.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_highlight_public_ips(str(ip))}: {int(count)}"))
+    if summary.detections:
+        lines.append(muted("What:"))
+        lines.append(muted("- Top domain detections"))
+        for item in summary.detections[:_limit_value(6)]:
+            lines.append(
+                muted(
+                    f"- [{str(item.get('severity', 'info')).upper()}] {_redact_in_text(str(item.get('summary', '-')))}"
+                )
+            )
+    if getattr(summary, "incident_clusters", None):
+        lines.append(muted("When:"))
+        lines.append(muted("- Incident cluster context"))
+        for item in list(summary.incident_clusters or [])[:_limit_value(4)]:
+            lines.append(
+                muted(
+                    f"- {_redact_in_text(str(item.get('cluster', '-')))} host={_highlight_public_ips(str(item.get('host', '-')))} "
+                    f"signals={len(item.get('indicators', []) if isinstance(item.get('indicators', []), list) else [])}"
+                )
+            )
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Domain Security Checks"))
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+    check_labels = [
+        ("dc_role_consistency", "DC Role Consistency"),
+        ("kerberos_ticket_abuse", "Kerberos Ticket Abuse"),
+        ("dcsync_replication_activity", "DCSync/Replication-like Activity"),
+        ("ldap_bind_risk", "LDAP Bind Risk"),
+        ("ntlm_downgrade_or_relay_exposure", "NTLM Downgrade/Relay Exposure"),
+        ("auth_sequence_plausibility", "Authentication Sequence Plausibility"),
+        ("name_resolution_poisoning_context", "Name Resolution Poisoning Context"),
+        ("privileged_account_spread", "Privileged Account Spread"),
+    ]
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
+        evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence_items[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+
+            if key in {"dcsync_replication_activity", "kerberos_ticket_abuse", "ntlm_downgrade_or_relay_exposure"}:
+                risk = "High"
+                conf_level = "High"
+            elif key in {"ldap_bind_risk", "auth_sequence_plausibility", "dc_role_consistency"}:
+                risk = "Medium"
+                conf_level = "Medium"
+            else:
+                risk = "Low"
+                conf_level = "Medium"
+            matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Domain Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
+
     if summary.domains:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Domain Names"))
@@ -1151,6 +1356,89 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
         for convo in summary.conversations[:limit]:
             rows.append([convo.src_ip, convo.dst_ip, str(convo.dst_port), convo.proto, str(convo.packets)])
         lines.append(_format_table(rows))
+
+    if getattr(summary, "host_attack_paths", None):
+        paths = list(summary.host_attack_paths or [])
+        if paths:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Host-Centric Attack Paths"))
+            rows = [["Host", "Confidence", "Targets", "Steps"]]
+            for item in paths[:limit]:
+                targets = item.get("targets", [])
+                step_values = item.get("steps", [])
+                target_text = ", ".join(str(v) for v in targets[:3]) if isinstance(targets, list) and targets else "-"
+                steps_text = "; ".join(str(v) for v in step_values[:3]) if isinstance(step_values, list) and step_values else "-"
+                rows.append([
+                    _highlight_public_ips(str(item.get("host", "-"))),
+                    str(item.get("confidence", "-")),
+                    _truncate_text(target_text, 40),
+                    _truncate_text(steps_text, 80),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "incident_clusters", None):
+        clusters = list(summary.incident_clusters or [])
+        if clusters:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Incident Clusters"))
+            rows = [["Cluster", "Host", "Signals", "Targets", "Confidence"]]
+            for item in clusters[:limit]:
+                signals = item.get("indicators", [])
+                rows.append([
+                    str(item.get("cluster", "-")),
+                    _highlight_public_ips(str(item.get("host", "-"))),
+                    str(len(signals) if isinstance(signals, list) else 0),
+                    str(item.get("target_count", "-")),
+                    str(item.get("confidence", "-")),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "campaign_indicators", None):
+        campaigns = list(summary.campaign_indicators or [])
+        if campaigns:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Shared Campaign Indicators"))
+            rows = [["Indicator", "Value", "Hosts"]]
+            for item in campaigns[:limit]:
+                hosts = item.get("hosts", [])
+                host_text = ", ".join(_highlight_public_ips(str(v)) for v in hosts[:4]) if isinstance(hosts, list) else "-"
+                rows.append([
+                    _truncate_text(str(item.get("indicator", "-")), 40),
+                    _truncate_text(str(item.get("value", "-")), 40),
+                    _truncate_text(host_text or "-", 60),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "dc_role_drift", None):
+        drift = list(summary.dc_role_drift or [])
+        if drift:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("DC Role Drift Signals"))
+            rows = [["Server", "Service Mix", "Packets"]]
+            for item in drift[:limit]:
+                services = item.get("services", [])
+                svc_text = ", ".join(str(v) for v in services) if isinstance(services, list) else "-"
+                rows.append([
+                    _highlight_public_ips(str(item.get("server", "-"))),
+                    _truncate_text(svc_text, 60),
+                    str(item.get("packets", "-")),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "sequence_violations", None):
+        seq = list(summary.sequence_violations or [])
+        if seq:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Sequence Plausibility Violations"))
+            rows = [["Source", "Reason", "Lateral Hits", "Auth Signals"]]
+            for item in seq[:limit]:
+                rows.append([
+                    _highlight_public_ips(str(item.get("src", "-"))),
+                    _truncate_text(str(item.get("reason", "-")), 56),
+                    str(item.get("lateral_hits", "-")),
+                    str(item.get("auth_signals", "-")),
+                ])
+            lines.append(_format_table(rows))
 
     if summary.urls:
         lines.append(SUBSECTION_BAR)
@@ -1243,6 +1531,14 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
             lines.append(f"{marker} {summary_text}")
             if details:
                 lines.append(muted(f"  {details}"))
+
+    if getattr(summary, "benign_context", None):
+        benign_notes = [str(v) for v in (summary.benign_context or []) if str(v).strip()]
+        if benign_notes:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("False-Positive Context"))
+            for note in benign_notes[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(note)}"))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
@@ -1675,7 +1971,8 @@ def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25, verbos
 
 
 def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = False) -> str:
-    limit = _apply_verbose_limit(limit)
+    verbose = True
+    limit = _FULL_OUTPUT_LIMIT
     def _icmpv4_type_name(type_id: int) -> str:
         return {
             0: "Echo Reply",
@@ -1816,17 +2113,271 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         pps = summary.total_packets / summary.duration_seconds if summary.duration_seconds else 0.0
         lines.append(_format_kv("ICMP Rate", f"{pps:.1f} pkt/s"))
 
+    verdict = str(getattr(summary, "analyst_verdict", "") or "")
+    confidence = str(getattr(summary, "analyst_confidence", "") or "").upper()
+    reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or [])]
+    if verdict:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Analyst Verdict"))
+        if confidence:
+            lines.append(_format_kv("Verdict", f"{verdict} (confidence: {confidence})"))
+        else:
+            lines.append(_format_kv("Verdict", verdict))
+        for reason in reasons[:_limit_value(8)]:
+            lines.append(muted(f"- {reason}"))
+
     if summary.errors:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Errors"))
         for err in summary.errors:
             lines.append(danger(f"- {err}"))
 
+    checks = dict(getattr(summary, "deterministic_checks", {}) or {})
+    if checks:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Deterministic ICMP Security Checks"))
+        check_labels = {
+            "icmp_request_reply_asymmetry": "ICMP request/reply asymmetry",
+            "icmp_recon_sweep_behavior": "ICMP recon/sweep behavior",
+            "icmp_control_plane_abuse": "ICMP control-plane abuse",
+            "icmp_fragmentation_pmtud_abuse": "ICMP fragmentation/PMTUD abuse",
+            "icmp_periodic_cadence": "ICMP periodic cadence",
+            "icmp_tunneling_signal": "ICMP tunneling/covert signal",
+            "icmp_zone_boundary_exposure": "ICMP zone boundary exposure",
+            "icmp_ot_boundary_crossing": "ICMP OT boundary crossing",
+            "icmp_role_drift": "ICMP role drift",
+            "cross_signal_corroboration": "Cross-signal corroboration",
+            "evidence_provenance": "Evidence provenance",
+        }
+        for key, label in check_labels.items():
+            values = [str(v) for v in list(checks.get(key, []) or [])]
+            if values:
+                lines.append(warn(f"[!] {label}: {len(values)}"))
+                for item in values[:_limit_value(8)]:
+                    lines.append(muted(f"  - {item}"))
+            else:
+                lines.append(ok(f"[ ] {label}: none"))
+
+    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
+    if risk_matrix:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("ICMP Risk Matrix"))
+        rows = [["Category", "Risk", "Confidence", "Evidence"]]
+        for row in risk_matrix[:_limit_value(12)]:
+            if not isinstance(row, dict):
+                continue
+            rows.append([
+                str(row.get("category", "")),
+                str(row.get("risk", "")),
+                str(row.get("confidence", "")),
+                str(row.get("evidence", "")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    asymmetry_profiles = list(getattr(summary, "asymmetry_profiles", []) or [])
+    if asymmetry_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("ICMP Asymmetry Matrix"))
+        rows = [["Scope", "Requests", "Replies", "Reply Ratio", "Confidence"]]
+        for profile in asymmetry_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("scope", "-")),
+                str(profile.get("requests", "-")),
+                str(profile.get("replies", "-")),
+                str(profile.get("reply_ratio", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    recon_profiles = list(getattr(summary, "recon_profiles", []) or [])
+    if recon_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Recon Indicators"))
+        rows = [["Source", "Targets", "Packets", "Confidence"]]
+        for profile in recon_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("source", "-")),
+                str(profile.get("targets", "-")),
+                str(profile.get("packets", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    control_plane_profiles = list(getattr(summary, "control_plane_profiles", []) or [])
+    if control_plane_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("ICMP Control-Plane Abuse"))
+        rows = [["Type", "Count", "Confidence"]]
+        for profile in control_plane_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("type", "-")),
+                str(profile.get("count", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    fragmentation_profiles = list(getattr(summary, "fragmentation_profiles", []) or [])
+    if fragmentation_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Fragmentation/Path-MTU Anomalies"))
+        rows = [["Packet Too Big", "Fragmentation Related", "Confidence"]]
+        for profile in fragmentation_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("packet_too_big", "-")),
+                str(profile.get("fragmentation_related", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    cadence_profiles = list(getattr(summary, "cadence_profiles", []) or [])
+    if cadence_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("ICMP Cadence Anomalies"))
+        rows = [["Flow", "Packets", "Duration", "PPS", "Confidence"]]
+        for profile in cadence_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("flow", "-")),
+                str(profile.get("packets", "-")),
+                str(profile.get("duration_s", "-")),
+                str(profile.get("pps", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    tunneling_profiles = list(getattr(summary, "tunneling_profiles", []) or [])
+    if tunneling_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Encapsulation/Tunneling Suspicion"))
+        rows = [["Entropy", "Size", "Count", "Preview", "Confidence"]]
+        for profile in tunneling_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("entropy", "-")),
+                str(profile.get("size", "-")),
+                str(profile.get("count", "-")),
+                str(profile.get("preview", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    zone_profiles = list(getattr(summary, "zone_profiles", []) or [])
+    if zone_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Zone Posture (East-West / North-South)"))
+        rows = [["Src", "Dst", "Zone", "Packets", "Confidence"]]
+        for profile in zone_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("src", "-")),
+                str(profile.get("dst", "-")),
+                str(profile.get("zone", "-")),
+                str(profile.get("packets", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    role_profiles = list(getattr(summary, "role_drift_profiles", []) or [])
+    if role_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Role Drift by ICMP Behavior"))
+        rows = [["Host", "Dst", "Packets", "Reason", "Confidence"]]
+        for profile in role_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("host", "-")),
+                str(profile.get("dst", "-")),
+                str(profile.get("packets", "-")),
+                str(profile.get("reason", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    ot_profiles = list(getattr(summary, "ot_boundary_profiles", []) or [])
+    if ot_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OT Boundary Crossing Profiles"))
+        rows = [["Src", "Dst", "Packets", "Confidence"]]
+        for profile in ot_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("src", "-")),
+                str(profile.get("dst", "-")),
+                str(profile.get("packets", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    corroborated_findings = list(getattr(summary, "corroborated_findings", []) or [])
+    if corroborated_findings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Corroborated Findings"))
+        rows = [["Host", "Score", "Confidence", "Reasons"]]
+        for finding in corroborated_findings[:limit]:
+            if not isinstance(finding, dict):
+                continue
+            rows.append([
+                str(finding.get("host", "-")),
+                str(finding.get("score", "-")),
+                str(finding.get("confidence", "-")),
+                ", ".join(str(v) for v in list(finding.get("reasons", []) or [])) or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    pivots = list(getattr(summary, "investigation_pivots", []) or [])
+    if pivots:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Hunt Pivots"))
+        rows = [["Flow", "Protocol", "Packets", "Bytes", "Reasons"]]
+        for pivot in pivots[:limit]:
+            if not isinstance(pivot, dict):
+                continue
+            rows.append([
+                str(pivot.get("flow", "-")),
+                str(pivot.get("protocol", "-")),
+                str(pivot.get("packets", "-")),
+                format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
+                ", ".join(str(v) for v in list(pivot.get("reasons", []) or [])) or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
+    if false_positive_context:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for item in false_positive_context[:_limit_value(8)]:
+            lines.append(muted(f"- {item}"))
+
     if summary.type_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("ICMP Types"))
         rows = [["Type", "Packets"]]
-        for name, count in summary.type_counts.most_common(limit):
+        for name, count in summary.type_counts.most_common(_FULL_OUTPUT_LIMIT):
             rows.append([_type_label(name), str(count)])
         lines.append(_format_table(rows))
 
@@ -1834,7 +2385,7 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         lines.append(SUBSECTION_BAR)
         lines.append(header("ICMP Codes"))
         rows = [["Type:Code", "Packets"]]
-        for name, count in summary.code_counts.most_common(limit):
+        for name, count in summary.code_counts.most_common(_FULL_OUTPUT_LIMIT):
             rows.append([_code_label(name), str(count)])
         lines.append(_format_table(rows))
 
@@ -1855,7 +2406,7 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         lines.append(SUBSECTION_BAR)
         lines.append(header("ICMP Conversations"))
         rows = [["Src", "Dst", "Proto", "Packets", "Bytes", "First Seen", "Last Seen"]]
-        for convo in sorted(summary.conversations, key=lambda c: c.get("packets", 0), reverse=True)[:_limit_value(12)]:
+        for convo in sorted(summary.conversations, key=lambda c: c.get("packets", 0), reverse=True):
             rows.append([
                 str(convo.get("src", "-")),
                 str(convo.get("dst", "-")),
@@ -1871,7 +2422,7 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         lines.append(SUBSECTION_BAR)
         lines.append(header("ICMP Echo Sessions"))
         rows = [["Src", "Dst", "ID", "Requests", "Replies", "Packets", "First Seen", "Last Seen"]]
-        for sess in summary.sessions[:_limit_value(12)]:
+        for sess in summary.sessions:
             rows.append([
                 str(sess.get("src", "-")),
                 str(sess.get("dst", "-")),
@@ -1907,10 +2458,10 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         lines.append(f"Sources: {', '.join(sorted(summary.src_ips)) if summary.src_ips else '-'}")
         lines.append(f"Destinations: {', '.join(sorted(summary.dst_ips)) if summary.dst_ips else '-'}")
         if summary.src_ip_counts:
-            top_sources = ", ".join(f"{ip}({count})" for ip, count in summary.src_ip_counts.most_common(_limit_value(10)))
+            top_sources = ", ".join(f"{ip}({count})" for ip, count in summary.src_ip_counts.most_common(_FULL_OUTPUT_LIMIT))
             lines.append(f"Top Sources: {top_sources}")
         if summary.dst_ip_counts:
-            top_dests = ", ".join(f"{ip}({count})" for ip, count in summary.dst_ip_counts.most_common(_limit_value(10)))
+            top_dests = ", ".join(f"{ip}({count})" for ip, count in summary.dst_ip_counts.most_common(_FULL_OUTPUT_LIMIT))
             lines.append(f"Top Destinations: {top_dests}")
 
     detections = _filtered_detections(summary, verbose)
@@ -1934,23 +2485,23 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("ICMP Artifacts"))
-        lines.append(muted(", ".join(summary.artifacts[:_limit_value(30)])))
+        lines.append(muted(", ".join(summary.artifacts)))
 
     if summary.observed_users:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Users"))
         rows = [["User", "Count"]]
-        for name, count in summary.observed_users.most_common(_limit_value(10)):
+        for name, count in summary.observed_users.most_common(_FULL_OUTPUT_LIMIT):
             rows.append([name, str(count)])
         lines.append(_format_table(rows))
 
     if summary.files_discovered:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Files Discovered"))
-        lines.append(muted(", ".join(summary.files_discovered[:_limit_value(20)])))
+        lines.append(muted(", ".join(summary.files_discovered)))
 
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -2033,6 +2584,141 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
     lines.append(_format_kv("Unique QNames", str(summary.unique_qnames)))
     lines.append(_format_kv("First Seen", format_ts(summary.first_seen)))
     lines.append(_format_kv("Last Seen", format_ts(summary.last_seen)))
+
+    def _dns_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        detections = list(getattr(summary, "detections", []) or [])
+        warn_count = sum(1 for item in detections if str(item.get("severity", "")).lower() == "warning")
+        if warn_count:
+            score += min(3, warn_count)
+            reasons.append(f"Warning-level DNS detections observed ({warn_count})")
+
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+        high_signal_keys = (
+            "dns_tunneling_indicators",
+            "dga_like_behavior",
+            "fast_flux_or_rebinding",
+            "zone_transfer_attempt",
+            "dnssec_or_integrity_anomaly",
+            "amplification_abuse_signal",
+        )
+        for key in high_signal_keys:
+            values = checks.get(key, []) if isinstance(checks, dict) else []
+            if values:
+                score += 1
+                reasons.append(f"{key.replace('_', ' ')} evidence observed ({len(values)})")
+
+        if getattr(summary, "transaction_violations", None):
+            score += 2
+            reasons.append(f"Transaction integrity violations observed ({len(summary.transaction_violations)})")
+        if getattr(summary, "resolver_drift", None):
+            score += 1
+            reasons.append(f"Resolver drift observed ({len(summary.resolver_drift)} clients)")
+
+        if score >= 8:
+            verdict = "YES - high-confidence suspicious DNS abuse or compromise indicators are present."
+            confidence = "High"
+        elif score >= 5:
+            verdict = "LIKELY - significant suspicious DNS behavior is present."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - weak-to-moderate suspicious DNS indicators are present."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing high-risk DNS threat pattern from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence DNS threat heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _dns_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    # Add concrete context for immediate triage.
+    if summary.client_counts:
+        lines.append(muted("Who:"))
+        lines.append(muted("- Top querying clients"))
+        for client, count in summary.client_counts.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_highlight_public_ips(str(client))}: {int(count)}"))
+    if summary.server_counts:
+        lines.append(muted("Where:"))
+        lines.append(muted("- Top DNS servers"))
+        for server, count in summary.server_counts.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_highlight_public_ips(str(server))}: {int(count)}"))
+    if summary.qname_counts:
+        lines.append(muted("What:"))
+        lines.append(muted("- Top queried names"))
+        for qname, count in summary.qname_counts.most_common(_limit_value(6)):
+            lines.append(muted(f"- {_redact_in_text(str(qname))}: {int(count)}"))
+    if getattr(summary, "transaction_violations", None):
+        tv = list(summary.transaction_violations or [])
+        if tv:
+            lines.append(muted("When:"))
+            lines.append(muted("- Transaction integrity violations"))
+            for item in tv[:_limit_value(6)]:
+                lines.append(
+                    muted(
+                        f"- id={item.get('id', '-')} {_highlight_public_ips(str(item.get('src', '-')))}"
+                        f"->{_highlight_public_ips(str(item.get('dst', '-')))} at {format_ts(item.get('ts'))}"
+                    )
+                )
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic DNS Security Checks"))
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+    check_labels = [
+        ("dns_tunneling_indicators", "DNS Tunneling Indicators"),
+        ("dga_like_behavior", "DGA-like Behavior"),
+        ("fast_flux_or_rebinding", "Fast-Flux/Rebinding"),
+        ("zone_transfer_attempt", "Zone Transfer Attempt"),
+        ("resolver_policy_violation", "Resolver Policy Violation"),
+        ("dnssec_or_integrity_anomaly", "DNSSEC/Integrity Anomaly"),
+        ("amplification_abuse_signal", "Amplification Abuse Signal"),
+        ("likely_benign_cdn_rotation", "Likely Benign CDN Rotation"),
+    ]
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
+        evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            if key == "likely_benign_cdn_rotation":
+                lines.append(ok(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                matrix_rows.append([label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"])
+            else:
+                lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                if key in {"dns_tunneling_indicators", "dga_like_behavior", "fast_flux_or_rebinding", "zone_transfer_attempt"}:
+                    risk = "High"
+                    conf_level = "High"
+                elif key in {"resolver_policy_violation", "dnssec_or_integrity_anomaly", "amplification_abuse_signal"}:
+                    risk = "Medium"
+                    conf_level = "Medium"
+                else:
+                    risk = "Low"
+                    conf_level = "Low"
+                matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+            for item in evidence_items[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("DNS Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
     if summary.edns0_opt_count:
         lines.append(_format_kv("EDNS0 OPT Records", str(summary.edns0_opt_count)))
     if summary.mdns_packets:
@@ -2060,10 +2746,10 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         for name, count in summary.type_counts.most_common(limit):
             try:
                 type_id = int(name)
-                label = f"{_dns_type_name(type_id)} ({type_id})"
+                type_label = f"{_dns_type_name(type_id)} ({type_id})"
             except Exception:
-                label = str(name)
-            rows.append([label, str(count)])
+                type_label = str(name)
+            rows.append([type_label, str(count)])
         lines.append(_format_table(rows))
 
     if summary.rcode_counts:
@@ -2073,10 +2759,10 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         for name, count in summary.rcode_counts.most_common(limit):
             try:
                 rcode_id = int(name)
-                label = f"{_dns_rcode_name(rcode_id)} ({rcode_id})"
+                rcode_label = f"{_dns_rcode_name(rcode_id)} ({rcode_id})"
             except Exception:
-                label = str(name)
-            rows.append([label, str(count)])
+                rcode_label = str(name)
+            rows.append([rcode_label, str(count)])
         lines.append(_format_table(rows))
 
     if summary.opcode_counts:
@@ -2084,8 +2770,8 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         lines.append(header("DNS Opcodes"))
         rows = [["Opcode", "Count"]]
         for opcode, count in summary.opcode_counts.most_common(limit):
-            label = f"{_dns_opcode_name(int(opcode))} ({opcode})"
-            rows.append([label, str(count)])
+            opcode_label = f"{_dns_opcode_name(int(opcode))} ({opcode})"
+            rows.append([opcode_label, str(count)])
         lines.append(_format_table(rows))
 
     if summary.flag_counts:
@@ -2190,6 +2876,121 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
                     sample += "..."
                 rows.append([name, str(len(answers)), sample or "-"])
             lines.append(_format_table(rows))
+
+    if getattr(summary, "resolver_drift", None):
+        if summary.resolver_drift:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Resolver Drift Profiles"))
+            rows = [["Client", "Resolvers", "Public", "Private", "Top Resolvers"]]
+            for item in summary.resolver_drift[:limit]:
+                tops = item.get("top_resolvers", [])
+                top_text = ", ".join(f"{ip}({count})" for ip, count in (tops[:3] if isinstance(tops, list) else []))
+                rows.append([
+                    str(item.get("client", "-")),
+                    str(item.get("resolver_count", "-")),
+                    str(item.get("public", "-")),
+                    str(item.get("private", "-")),
+                    top_text or "-",
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "client_abuse_profiles", None):
+        if summary.client_abuse_profiles:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Client Abuse Profiles"))
+            rows = [["Client", "Queries", "Unique", "Unique Ratio", "Avg Entropy", "NXDOMAIN", "TXT", "Long"]]
+            for item in summary.client_abuse_profiles[:limit]:
+                rows.append([
+                    str(item.get("client", "-")),
+                    str(item.get("queries", "-")),
+                    str(item.get("unique_qnames", "-")),
+                    str(item.get("unique_ratio", "-")),
+                    str(item.get("avg_entropy", "-")),
+                    str(item.get("nxdomain", "-")),
+                    str(item.get("txt_queries", "-")),
+                    str(item.get("long_queries", "-")),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "ttl_outliers", None):
+        if summary.ttl_outliers:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("TTL Outliers"))
+            rows = [["QName", "Samples", "Unique TTL", "Min TTL", "Max TTL"]]
+            for item in summary.ttl_outliers[:limit]:
+                rows.append([
+                    _truncate_text(str(item.get("qname", "-")), 64),
+                    str(item.get("samples", "-")),
+                    str(item.get("unique_ttl", "-")),
+                    str(item.get("min_ttl", "-")),
+                    str(item.get("max_ttl", "-")),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "cname_anomalies", None):
+        if summary.cname_anomalies:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("CNAME Anomalies"))
+            rows = [["QName", "Targets", "Sample Targets"]]
+            for item in summary.cname_anomalies[:limit]:
+                targets = item.get("targets", [])
+                target_text = ", ".join(str(v) for v in (targets[:3] if isinstance(targets, list) else []))
+                rows.append([
+                    _truncate_text(str(item.get("qname", "-")), 64),
+                    str(item.get("target_count", "-")),
+                    _truncate_text(target_text or "-", 80),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "transaction_violations", None):
+        if summary.transaction_violations:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Transaction Integrity Violations"))
+            rows = [["DNS ID", "Source", "Destination", "Time"]]
+            for item in summary.transaction_violations[:limit]:
+                rows.append([
+                    str(item.get("id", "-")),
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    format_ts(item.get("ts")),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "amplification_candidates", None):
+        if summary.amplification_candidates:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Amplification Candidates"))
+            rows = [["Client", "Resolver", "Query Bytes", "Response Bytes", "Ratio"]]
+            for item in summary.amplification_candidates[:limit]:
+                rows.append([
+                    str(item.get("client", "-")),
+                    str(item.get("resolver", "-")),
+                    str(item.get("query_bytes", "-")),
+                    str(item.get("response_bytes", "-")),
+                    str(item.get("ratio", "-")),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "timeline", None):
+        if summary.timeline:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Attack Timeline"))
+            rows = [["Time", "Event", "Summary", "Details"]]
+            for item in summary.timeline[:limit]:
+                rows.append([
+                    format_ts(item.get("ts")),
+                    str(item.get("event", "-")),
+                    _truncate_text(_redact_in_text(str(item.get("summary", "-"))), 56),
+                    _truncate_text(_redact_in_text(str(item.get("details", "-"))), 90),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "benign_context", None):
+        if summary.benign_context:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("False-Positive Context"))
+            for item in summary.benign_context[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     if summary.base_domain_answers:
         candidates = [(name, answers) for name, answers in summary.base_domain_answers.items() if len(answers) > 1]
@@ -2333,10 +3134,10 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         count_threshold = max(50, int(total_packets * 0.25)) if total_packets else 50
 
         for item in summary.packet_length_stats:
-            label = str(item.get("bucket", "-"))
+            bucket_label = str(item.get("bucket", "-"))
             count = int(item.get("count", 0) or 0)
             pct = (count / total_packets * 100) if total_packets else 0.0
-            low, high = _bucket_range(label)
+            low, high = _bucket_range(bucket_label)
             is_short = (high is not None and high <= 100)
             is_long = (low >= 1201)
             notes: list[str] = []
@@ -2352,10 +3153,10 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
                 notes.append("high count")
             if pct > dominant_pct:
                 dominant_pct = pct
-                dominant_bucket = label
+                dominant_bucket = bucket_label
             if notes:
                 outlier_rows.append([
-                    label,
+                    bucket_label,
                     str(count),
                     f"{pct:.1f}%",
                     ", ".join(notes),
@@ -2509,6 +3310,154 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
     lines.append(_format_kv("End", format_ts(summary.last_seen)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
     lines.append(_format_kv("TLS ClientHello", str(summary.tls_client_hellos)))
+
+    verdict = str(getattr(summary, "analyst_verdict", "") or "")
+    confidence = str(getattr(summary, "analyst_confidence", "") or "").upper()
+    reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or [])]
+    if verdict:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Analyst Verdict"))
+        if confidence:
+            lines.append(_format_kv("Verdict", f"{verdict} (confidence: {confidence})"))
+        else:
+            lines.append(_format_kv("Verdict", verdict))
+        for reason in reasons[:_limit_value(8)]:
+            lines.append(muted(f"- {reason}"))
+
+    checks = dict(getattr(summary, "deterministic_checks", {}) or {})
+    if checks:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Deterministic IPS Security Checks"))
+        check_labels = {
+            "indicator_quality_gate": "Indicator quality gate",
+            "recency_and_persistence": "Recency and persistence",
+            "boundary_cross_zone_contact": "Boundary cross-zone contact",
+            "internal_critical_asset_contact": "Internal critical asset contact",
+            "corroborated_multi_signal_hit": "Corroborated multi-signal hit",
+            "infrastructure_clustering": "Infrastructure clustering",
+            "intent_heuristics": "Intent heuristics",
+            "evidence_provenance": "Evidence provenance",
+        }
+        for key, label in check_labels.items():
+            values = [str(v) for v in list(checks.get(key, []) or [])]
+            if values:
+                lines.append(warn(f"[!] {label}: {len(values)}"))
+                for item in values[:_limit_value(8)]:
+                    lines.append(muted(f"  - {item}"))
+            else:
+                lines.append(ok(f"[ ] {label}: none"))
+
+    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
+    if risk_matrix:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("IPS Risk Matrix"))
+        rows = [["Category", "Risk", "Confidence", "Evidence"]]
+        for row in risk_matrix[:_limit_value(12)]:
+            if not isinstance(row, dict):
+                continue
+            rows.append([
+                str(row.get("category", "")),
+                str(row.get("risk", "")),
+                str(row.get("confidence", "")),
+                str(row.get("evidence", "")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    priority_asset_profiles = list(getattr(summary, "priority_asset_profiles", []) or [])
+    if priority_asset_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Priority Asset Impact"))
+        rows = [["IP", "Score", "Peers", "Ports", "Packets Sent", "Confidence"]]
+        for item in priority_asset_profiles[:limit]:
+            if not isinstance(item, dict):
+                continue
+            rows.append([
+                str(item.get("ip", "-")),
+                str(item.get("score", "-")),
+                str(item.get("peers", "-")),
+                str(item.get("ports", "-")),
+                str(item.get("packets_sent", "-")),
+                str(item.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    exposure_profiles = list(getattr(summary, "exposure_profiles", []) or [])
+    if exposure_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Exposure Posture"))
+        rows = [["Src", "Dst", "Protocol", "Direction", "Packets", "Bytes", "Confidence"]]
+        for item in exposure_profiles[:limit]:
+            if not isinstance(item, dict):
+                continue
+            rows.append([
+                str(item.get("src", "-")),
+                str(item.get("dst", "-")),
+                str(item.get("protocol", "-")),
+                str(item.get("direction", "-")),
+                str(item.get("packets", "-")),
+                str(item.get("bytes", "-")),
+                str(item.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    corroborated_findings = list(getattr(summary, "corroborated_findings", []) or [])
+    if corroborated_findings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Corroborated Findings"))
+        rows = [["IP", "Score", "Confidence", "Reasons"]]
+        for item in corroborated_findings[:limit]:
+            if not isinstance(item, dict):
+                continue
+            reasons_text = "; ".join(str(v) for v in list(item.get("reasons", []) or [])[:3])
+            rows.append([
+                str(item.get("ip", "-")),
+                str(item.get("score", "-")),
+                str(item.get("confidence", "-")),
+                reasons_text or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    infrastructure_clusters = list(getattr(summary, "infrastructure_clusters", []) or [])
+    if infrastructure_clusters:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Infrastructure Clusters"))
+        rows = [["Cluster", "IP Count", "IPs", "Confidence"]]
+        for item in infrastructure_clusters[:limit]:
+            if not isinstance(item, dict):
+                continue
+            ips = ",".join(str(v) for v in list(item.get("ips", []) or [])[:_limit_value(5)])
+            rows.append([
+                str(item.get("cluster", "-")),
+                str(item.get("ip_count", "-")),
+                ips or "-",
+                str(item.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    intent_profiles = list(getattr(summary, "intent_profiles", []) or [])
+    if intent_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Intent Heuristics"))
+        rows = [["Src", "Dst", "Protocol", "Ports", "Intent", "Confidence"]]
+        for item in intent_profiles[:limit]:
+            if not isinstance(item, dict):
+                continue
+            ports = ",".join(str(v) for v in list(item.get("ports", []) or [])[:_limit_value(6)])
+            rows.append([
+                str(item.get("src", "-")),
+                str(item.get("dst", "-")),
+                str(item.get("protocol", "-")),
+                ports or "-",
+                str(item.get("intent", "-")),
+                str(item.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("IP Protocol Utilization"))
@@ -2718,6 +3667,27 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
             ])
         lines.append(_format_table(rows))
 
+    pivots = list(getattr(summary, "investigation_pivots", []) or [])
+    if pivots:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Hunt Pivots"))
+        rows = [["Flow", "Proto", "Packets", "Bytes", "Ports", "Reasons"]]
+        for item in pivots[:limit]:
+            if not isinstance(item, dict):
+                continue
+            ports = ",".join(str(v) for v in list(item.get("ports", []) or [])[:_limit_value(6)])
+            reasons_text = "; ".join(str(v) for v in list(item.get("reasons", []) or [])[:3])
+            rows.append([
+                str(item.get("flow", "-")),
+                str(item.get("protocol", "-")),
+                str(item.get("packets", "-")),
+                format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
+                ports or "-",
+                reasons_text or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
     if verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Endpoint Timing"))
@@ -2797,12 +3767,22 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
             rows.append([ip, source, signal, "; ".join(details) or "-"])
         lines.append(_format_table(rows))
 
+    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or [])]
+    if false_positive_context:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for item in false_positive_context[:_limit_value(8)]:
+            lines.append(muted(f"- {item}"))
+
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
 def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = False) -> str:
-    limit = _apply_verbose_limit(limit)
+    limit = _FULL_OUTPUT_LIMIT
+    verbose = True
+    _limit_value = lambda value: _FULL_OUTPUT_LIMIT
+    _truncate_text = lambda text, max_len=0: str(text)
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"HTTP ANALYSIS :: {summary.path.name}"))
@@ -2821,6 +3801,252 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
     lines.append(_format_kv("Start", format_ts(summary.first_seen)))
     lines.append(_format_kv("End", format_ts(summary.last_seen)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+
+    def _http_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        detections = list(getattr(summary, "detections", []) or [])
+        suspicious_ua_markers = (
+            "sqlmap",
+            "nikto",
+            "nmap",
+            "acunetix",
+            "python-requests",
+            "curl",
+            "wget",
+            "masscan",
+        )
+
+        critical_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "critical")
+        high_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "high")
+        warning_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "warning")
+
+        if critical_count:
+            score += min(4, critical_count * 2)
+            reasons.append(f"Critical HTTP findings detected ({critical_count})")
+        if high_count:
+            score += min(3, high_count)
+            reasons.append(f"High-severity HTTP findings detected ({high_count})")
+        if warning_count >= 2:
+            score += 1
+            reasons.append(f"Multiple warning-level HTTP findings detected ({warning_count})")
+
+        if summary.downloads:
+            mismatch_count = sum(1 for item in summary.downloads if bool(item.get("mismatch")))
+            if mismatch_count:
+                score += 3
+                reasons.append(f"HTTP download type mismatches observed ({mismatch_count})")
+
+        suspicious_ua_hits = sum(
+            int(count) for ua, count in summary.user_agents.items() if any(tag in ua.lower() for tag in suspicious_ua_markers)
+        )
+        if suspicious_ua_hits:
+            score += 1
+            reasons.append(f"Suspicious scanner/tool user-agents observed ({suspicious_ua_hits})")
+
+        risky_method_hits = int(summary.method_counts.get("TRACE", 0)) + int(summary.method_counts.get("CONNECT", 0))
+        if risky_method_hits:
+            score += 1
+            reasons.append(f"Risky HTTP methods observed ({risky_method_hits})")
+
+        if summary.referrer_token_counts:
+            token_hits = sum(int(v) for v in summary.referrer_token_counts.values())
+            if token_hits:
+                score += 1
+                reasons.append(f"Potential token leakage in referrers ({token_hits})")
+
+        vt_mal = 0
+        vt_sus = 0
+        for det in detections:
+            findings = det.get("vt_findings")
+            if not isinstance(findings, list):
+                continue
+            for item in findings:
+                if not isinstance(item, dict):
+                    continue
+                vt_mal += int(item.get("malicious", 0) or 0)
+                vt_sus += int(item.get("suspicious", 0) or 0)
+        if vt_mal > 0:
+            score += 3
+            reasons.append(f"VirusTotal malicious verdicts present (sum={vt_mal})")
+        elif vt_sus > 0:
+            score += 1
+            reasons.append(f"VirusTotal suspicious verdicts present (sum={vt_sus})")
+
+        if score >= 7:
+            verdict = "YES - high-confidence malicious or compromised HTTP activity is present."
+            confidence = "High"
+        elif score >= 4:
+            verdict = "LIKELY - suspicious HTTP activity with compromise indicators is present."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - potentially risky HTTP activity is present; corroboration recommended."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing malicious HTTP pattern from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence HTTP threat heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _http_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(10)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    # Add concrete context for immediate triage.
+    if summary.host_counts:
+        lines.append(muted("Where:"))
+        lines.append(muted("- Top HTTP hosts"))
+        for host, count in summary.host_counts.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_redact_in_text(str(host))}: {int(count)}"))
+    if summary.client_counts:
+        lines.append(muted("Who:"))
+        lines.append(muted("- Top source clients"))
+        for client, count in summary.client_counts.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_highlight_public_ips(str(client))}: {int(count)}"))
+    if summary.server_counts:
+        lines.append(muted("Where:"))
+        lines.append(muted("- Top target servers"))
+        for server, count in summary.server_counts.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_highlight_public_ips(str(server))}: {int(count)}"))
+    suspicious_downloads = [item for item in summary.downloads if bool(item.get("mismatch"))]
+    if suspicious_downloads:
+        lines.append(muted("What:"))
+        lines.append(muted("- Suspicious downloads"))
+        for item in suspicious_downloads[:_limit_value(6)]:
+            lines.append(
+                muted(
+                    f"- {_highlight_public_ips(str(item.get('src', '-')))}"
+                    f"->{_highlight_public_ips(str(item.get('dst', '-')))} "
+                    f"file={_redact_in_text(str(item.get('filename', '-')))} "
+                    f"type={_redact_in_text(str(item.get('content_type', '-')))}"
+                )
+            )
+    if summary.detections:
+        lines.append(muted("What:"))
+        lines.append(muted("- Top detections"))
+        for det in summary.detections[:_limit_value(6)]:
+            lines.append(
+                muted(
+                    f"- [{str(det.get('severity', 'info')).upper()}] "
+                    f"{_redact_in_text(str(det.get('summary', '-')))}"
+                )
+            )
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Threat & Compromise Overview"))
+    detection_counts = Counter(str(item.get("severity", "info")).lower() for item in (summary.detections or []))
+    lines.append(_format_kv("Critical Findings", str(detection_counts.get("critical", 0))))
+    lines.append(_format_kv("High Findings", str(detection_counts.get("high", 0))))
+    lines.append(_format_kv("Warning Findings", str(detection_counts.get("warning", 0))))
+    lines.append(_format_kv("Suspicious Downloads", str(sum(1 for item in summary.downloads if bool(item.get("mismatch"))))))
+    lines.append(_format_kv("POST Payload Samples", str(len(summary.post_payloads))))
+    lines.append(_format_kv("Unique Session Tokens", str(len(summary.session_tokens))))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic HTTP Security Checks"))
+
+    detection_items = list(getattr(summary, "detections", []) or [])
+
+    def _matching_detections(keywords: tuple[str, ...]) -> list[dict[str, object]]:
+        matches: list[dict[str, object]] = []
+        for det in detection_items:
+            summary_text = str(det.get("summary", "") or "")
+            details_text = str(det.get("details", "") or "")
+            blob = f"{summary_text} {details_text}".lower()
+            if any(key in blob for key in keywords):
+                matches.append(det)
+        return matches
+
+    def _matching_detection_lines(keywords: tuple[str, ...], limit_lines: int = 4) -> list[str]:
+        out: list[str] = []
+        for det in _matching_detections(keywords):
+            summary_text = str(det.get("summary", "") or "")
+            details_text = str(det.get("details", "") or "")
+            line = summary_text
+            if details_text:
+                line = f"{summary_text}: {details_text}"
+            out.append(_redact_in_text(line))
+            artifacts = det.get("artifacts")
+            if isinstance(artifacts, list) and artifacts:
+                out.append(_redact_in_text("artifacts=" + ", ".join(str(v) for v in artifacts[:3])))
+            if len(out) >= limit_lines:
+                break
+        return out[:limit_lines]
+
+    checks: list[tuple[str, tuple[str, ...]]] = [
+        ("Authentication Abuse", ("authentication abuse", "authorization schemes")),
+        ("Suspicious Upload Activity", ("upload profile", "upload")),
+        ("Web Shell/Dropper Behavior", ("web shell", "dropper")),
+        ("HTTP Beaconing/C2-like Check-ins", ("periodic http check-in", "check-in behavior")),
+        ("URI/Token Obfuscation", ("high-entropy uri/token", "entropy")),
+        ("Host Header / Fronting Anomalies", ("host header / destination anomalies", "host-to-ip churn")),
+        ("Method Misuse/Tunneling", ("method misuse/tunneling", "risky http methods")),
+        ("User-Agent Impersonation", ("browser ua impersonation", "suspicious user agents")),
+        ("Session Token Replay", ("token replay", "token leakage")),
+        ("Burst/Fan-out Reconnaissance", ("burst/fan-out reconnaissance", "single http uri reached many targets")),
+        ("Content-Type/Payload Mismatch", ("content-type/payload mismatch", "file type discrepancies")),
+        ("Threat Intelligence Reputation", ("threat intelligence", "virustotal")),
+    ]
+
+    def _matrix_rating_for_keywords(keywords: tuple[str, ...]) -> tuple[str, str, str]:
+        matches = _matching_detections(keywords)
+        if not matches:
+            return "None", "Low", "No matching detections"
+
+        severity_weight = {"critical": 4, "high": 3, "warning": 2, "info": 1}
+        weight_to_label = {4: "Critical", 3: "High", 2: "Warning", 1: "Info", 0: "Info"}
+
+        max_weight = 0
+        for det in matches:
+            sev = str(det.get("severity", "info") or "info").lower()
+            max_weight = max(max_weight, severity_weight.get(sev, 1))
+
+        evidence_count = len(matches)
+        score = max_weight + min(3, evidence_count)
+
+        if score >= 7:
+            risk = "High"
+            confidence = "High"
+        elif score >= 5:
+            risk = "Medium"
+            confidence = "Medium"
+        else:
+            risk = "Low"
+            confidence = "Low"
+
+        severity_label = weight_to_label.get(max_weight, "Info")
+        evidence_note = f"{evidence_count} detection(s), max severity={severity_label}"
+        return risk, confidence, evidence_note
+
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for label_text, keywords in checks:
+        lines.append(label(label_text))
+        evidence_lines = _matching_detection_lines(keywords)
+        if evidence_lines:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence_lines:
+                lines.append(muted(f"- {item}"))
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+
+        risk, confidence_level, evidence_note = _matrix_rating_for_keywords(keywords)
+        matrix_rows.append([label_text, risk, confidence_level, evidence_note])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("HTTP Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
 
     if summary.method_counts:
         lines.append(SUBSECTION_BAR)
@@ -3305,7 +4531,7 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
                     lines.append(muted(f"    ... {len(evidence) - shown} more"))
 
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -3330,6 +4556,141 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
     lines.append(_format_kv("Start", format_ts(summary.first_seen)))
     lines.append(_format_kv("End", format_ts(summary.last_seen)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+
+    def _ftp_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+        detections = list(getattr(summary, "detections", []) or [])
+
+        def _check_count(key: str) -> int:
+            values = checks.get(key, []) if isinstance(checks, dict) else []
+            return len([v for v in (values or []) if str(v).strip()])
+
+        weighted_checks = {
+            "cleartext_credential_exposure": 3,
+            "anonymous_or_guest_abuse": 2,
+            "bruteforce_or_spray": 3,
+            "active_passive_mode_abuse": 2,
+            "data_channel_integrity": 3,
+            "high_risk_file_staging": 3,
+            "ftps_downgrade_or_weak_protection": 1,
+            "ftp_exfiltration_signal": 4,
+        }
+        for key, weight in weighted_checks.items():
+            count = _check_count(key)
+            if count:
+                score += min(4, weight + min(2, count - 1))
+                reasons.append(f"{key.replace('_', ' ')} evidence ({count})")
+
+        high_count = sum(1 for d in detections if str(d.get("severity", "")).lower() in {"high", "critical"})
+        med_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "medium")
+        if high_count:
+            score += min(3, high_count)
+            reasons.append(f"High-severity FTP detections observed ({high_count})")
+        if med_count >= 2:
+            score += 1
+            reasons.append(f"Multiple medium-severity FTP detections observed ({med_count})")
+
+        if score >= 8:
+            verdict = "YES - high-confidence malicious or compromised FTP activity is present."
+            confidence = "High"
+        elif score >= 5:
+            verdict = "LIKELY - suspicious FTP activity with compromise indicators is present."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - risky FTP behavior is present; corroboration recommended."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing malicious FTP pattern from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence FTP threat heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _ftp_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    if summary.client_counts:
+        lines.append(muted("Who:"))
+        lines.append(muted("- Top FTP clients"))
+        for client, count in summary.client_counts.most_common(_limit_value(6)):
+            lines.append(muted(f"- {_highlight_public_ips(str(client))}: {int(count)}"))
+    if summary.server_counts:
+        lines.append(muted("Where:"))
+        lines.append(muted("- Top FTP servers"))
+        for server, count in summary.server_counts.most_common(_limit_value(6)):
+            lines.append(muted(f"- {_highlight_public_ips(str(server))}: {int(count)}"))
+    if summary.command_counts:
+        lines.append(muted("What:"))
+        lines.append(muted("- Top FTP commands"))
+        for cmd, count in summary.command_counts.most_common(_limit_value(6)):
+            lines.append(muted(f"- {cmd}: {int(count)}"))
+    if getattr(summary, "incident_clusters", None):
+        clusters = list(summary.incident_clusters or [])
+        if clusters:
+            lines.append(muted("When:"))
+            lines.append(muted("- Incident cluster context"))
+            for item in clusters[:_limit_value(4)]:
+                lines.append(
+                    muted(
+                        f"- {_redact_in_text(str(item.get('cluster', '-')))} host={_highlight_public_ips(str(item.get('host', '-')))} "
+                        f"signals={len(item.get('indicators', []) if isinstance(item.get('indicators', []), list) else [])}"
+                    )
+                )
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic FTP Security Checks"))
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+    check_labels = [
+        ("cleartext_credential_exposure", "Cleartext Credential Exposure"),
+        ("anonymous_or_guest_abuse", "Anonymous/Guest Abuse"),
+        ("bruteforce_or_spray", "Bruteforce/Spray Behavior"),
+        ("active_passive_mode_abuse", "Active/Passive Mode Abuse"),
+        ("data_channel_integrity", "Data Channel Integrity"),
+        ("high_risk_file_staging", "High-Risk File Staging"),
+        ("ftps_downgrade_or_weak_protection", "FTPS Downgrade/Weak Protection"),
+        ("ftp_exfiltration_signal", "FTP Exfiltration Signal"),
+    ]
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
+        evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence_items[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+
+            if key in {"cleartext_credential_exposure", "bruteforce_or_spray", "data_channel_integrity", "high_risk_file_staging", "ftp_exfiltration_signal"}:
+                risk = "High"
+                conf_level = "High"
+            elif key in {"anonymous_or_guest_abuse", "active_passive_mode_abuse"}:
+                risk = "Medium"
+                conf_level = "Medium"
+            else:
+                risk = "Low"
+                conf_level = "Low"
+            matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("FTP Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
 
     if summary.server_ports:
         lines.append(SUBSECTION_BAR)
@@ -3424,6 +4785,55 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
             )
         lines.append(_format_table(rows))
 
+    if getattr(summary, "host_attack_paths", None):
+        paths = list(summary.host_attack_paths or [])
+        if paths:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Host-Centric Attack Paths"))
+            rows = [["Host", "Confidence", "Targets", "Steps"]]
+            for item in paths[:limit]:
+                targets = item.get("targets", [])
+                steps = item.get("steps", [])
+                rows.append([
+                    _highlight_public_ips(str(item.get("host", "-"))),
+                    str(item.get("confidence", "-")),
+                    _truncate_text(", ".join(str(v) for v in targets[:4]) if isinstance(targets, list) else str(targets), 52),
+                    _truncate_text("; ".join(str(v) for v in steps[:3]) if isinstance(steps, list) else str(steps), 70),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "incident_clusters", None):
+        clusters = list(summary.incident_clusters or [])
+        if clusters:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Incident Clusters"))
+            rows = [["Cluster", "Host", "Signals", "Targets", "Confidence"]]
+            for item in clusters[:limit]:
+                indicators = item.get("indicators", [])
+                rows.append([
+                    str(item.get("cluster", "-")),
+                    _highlight_public_ips(str(item.get("host", "-"))),
+                    str(len(indicators) if isinstance(indicators, list) else 0),
+                    str(item.get("target_count", "-")),
+                    str(item.get("confidence", "-")),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "campaign_indicators", None):
+        campaigns = list(summary.campaign_indicators or [])
+        if campaigns:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Shared Campaign Indicators"))
+            rows = [["Indicator", "Value", "Hosts"]]
+            for item in campaigns[:limit]:
+                hosts = item.get("hosts", [])
+                rows.append([
+                    _truncate_text(str(item.get("indicator", "-")), 40),
+                    _truncate_text(_redact_in_text(str(item.get("value", "-"))), 40),
+                    _truncate_text(", ".join(_highlight_public_ips(str(v)) for v in hosts[:4]) if isinstance(hosts, list) else "-", 70),
+                ])
+            lines.append(_format_table(rows))
+
     detections = _filtered_detections(summary, verbose)
     if detections:
         lines.append(SUBSECTION_BAR)
@@ -3451,12 +4861,23 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
                 f"USER {hit.username or '-'} PASS {_redact_secret(hit.password)}"
             )
 
+    if getattr(summary, "benign_context", None):
+        notes = [str(v) for v in (summary.benign_context or []) if str(v).strip()]
+        if notes:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("False-Positive Context"))
+            for note in notes[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(note)}"))
+
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
 def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = False) -> str:
-    limit = _apply_verbose_limit(limit)
+    limit = _FULL_OUTPUT_LIMIT
+    verbose = True
+    _limit_value = lambda value: _FULL_OUTPUT_LIMIT
+    _truncate_text = lambda text, max_len=0: str(text)
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"TLS/HTTPS ANALYSIS :: {summary.path.name}"))
@@ -3486,6 +4907,204 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
     lines.append(_format_kv("Start", format_ts(summary.first_seen)))
     lines.append(_format_kv("End", format_ts(summary.last_seen)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+
+    def _tls_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        detections = list(getattr(summary, "detections", []) or [])
+
+        critical_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "critical")
+        high_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "high")
+        warning_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "warning")
+        if critical_count:
+            score += min(4, critical_count * 2)
+            reasons.append(f"Critical TLS findings detected ({critical_count})")
+        if high_count:
+            score += min(3, high_count)
+            reasons.append(f"High-severity TLS findings detected ({high_count})")
+        if warning_count >= 2:
+            score += 1
+            reasons.append(f"Multiple warning-level TLS findings detected ({warning_count})")
+
+        if summary.weak_certs:
+            score += 2
+            reasons.append(f"Weak certificate keys detected ({summary.weak_certs})")
+        if summary.expired_certs:
+            score += 2
+            reasons.append(f"Expired certificates detected ({summary.expired_certs})")
+        if summary.self_signed_certs:
+            score += 1
+            reasons.append(f"Self-signed certificates detected ({summary.self_signed_certs})")
+        if summary.weak_ciphers:
+            score += 1
+            reasons.append(f"Weak cipher suites detected ({sum(summary.weak_ciphers.values())})")
+        if summary.sni_missing_no_ech >= 10 and summary.client_hellos:
+            score += 1
+            reasons.append(
+                f"SNI missing (excluding ECH) for {summary.sni_missing_no_ech}/{summary.client_hellos} client hellos"
+            )
+
+        if score >= 7:
+            verdict = "YES - high-confidence TLS security risks or compromise indicators are present."
+            confidence = "High"
+        elif score >= 4:
+            verdict = "LIKELY - significant TLS security issues are present and warrant response."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - TLS security issues are present; corroboration recommended."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing high-risk TLS compromise pattern from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence TLS threat heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _tls_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(10)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    # Add concrete context for immediate triage.
+    if summary.server_counts:
+        lines.append(muted("Where:"))
+        lines.append(muted("- Top TLS servers"))
+        for server, count in summary.server_counts.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_highlight_public_ips(str(server))}: {int(count)}"))
+    if summary.client_counts:
+        lines.append(muted("Who:"))
+        lines.append(muted("- Top TLS clients"))
+        for client, count in summary.client_counts.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_highlight_public_ips(str(client))}: {int(count)}"))
+    if summary.sni_counts:
+        lines.append(muted("Where:"))
+        lines.append(muted("- Top SNI targets"))
+        for sni, count in summary.sni_counts.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_redact_in_text(str(sni))}: {int(count)}"))
+    if summary.weak_ciphers:
+        lines.append(muted("What:"))
+        lines.append(muted("- Weak cipher evidence"))
+        for cipher_name, count in summary.weak_ciphers.most_common(_limit_value(6)):
+            lines.append(muted(f"- {_redact_in_text(str(cipher_name))}: {int(count)}"))
+    if summary.detections:
+        lines.append(muted("What:"))
+        lines.append(muted("- Top TLS detections"))
+        for det in summary.detections[:_limit_value(6)]:
+            lines.append(
+                muted(
+                    f"- [{str(det.get('severity', 'info')).upper()}] "
+                    f"{_redact_in_text(str(det.get('summary', '-')))}"
+                )
+            )
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Threat & Compromise Overview"))
+    detection_counts = Counter(str(item.get("severity", "info")).lower() for item in (summary.detections or []))
+    lines.append(_format_kv("Critical Findings", str(detection_counts.get("critical", 0))))
+    lines.append(_format_kv("High Findings", str(detection_counts.get("high", 0))))
+    lines.append(_format_kv("Warning Findings", str(detection_counts.get("warning", 0))))
+    lines.append(_format_kv("Weak Certificates", str(summary.weak_certs)))
+    lines.append(_format_kv("Expired Certificates", str(summary.expired_certs)))
+    lines.append(_format_kv("Self-Signed Certificates", str(summary.self_signed_certs)))
+    lines.append(_format_kv("Weak Cipher Observations", str(sum(summary.weak_ciphers.values()))))
+    lines.append(_format_kv("SNI Missing (no ECH)", f"{summary.sni_missing_no_ech}/{max(summary.client_hellos, 1)}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic TLS Security Checks"))
+
+    detection_items = list(getattr(summary, "detections", []) or [])
+
+    def _matching_tls_detections(keywords: tuple[str, ...]) -> list[dict[str, object]]:
+        matches: list[dict[str, object]] = []
+        for det in detection_items:
+            summary_text = str(det.get("summary", "") or "")
+            details_text = str(det.get("details", "") or "")
+            blob = f"{summary_text} {details_text}".lower()
+            if any(key in blob for key in keywords):
+                matches.append(det)
+        return matches
+
+    def _matching_tls_lines(keywords: tuple[str, ...], limit_lines: int = 4) -> list[str]:
+        out: list[str] = []
+        for det in _matching_tls_detections(keywords):
+            summary_text = str(det.get("summary", "") or "")
+            details_text = str(det.get("details", "") or "")
+            line = summary_text
+            if details_text:
+                line = f"{summary_text}: {details_text}"
+            out.append(_redact_in_text(line))
+            if len(out) >= limit_lines:
+                break
+        return out[:limit_lines]
+
+    def _tls_matrix_rating_for_keywords(keywords: tuple[str, ...]) -> tuple[str, str, str]:
+        matches = _matching_tls_detections(keywords)
+        if not matches:
+            return "None", "Low", "No matching detections"
+
+        severity_weight = {"critical": 4, "high": 3, "warning": 2, "info": 1}
+        weight_to_label = {4: "Critical", 3: "High", 2: "Warning", 1: "Info", 0: "Info"}
+        max_weight = 0
+        for det in matches:
+            sev = str(det.get("severity", "info") or "info").lower()
+            max_weight = max(max_weight, severity_weight.get(sev, 1))
+
+        evidence_count = len(matches)
+        score = max_weight + min(3, evidence_count)
+        if score >= 7:
+            risk = "High"
+            confidence_level = "High"
+        elif score >= 5:
+            risk = "Medium"
+            confidence_level = "Medium"
+        else:
+            risk = "Low"
+            confidence_level = "Low"
+
+        evidence_note = f"{evidence_count} detection(s), max severity={weight_to_label.get(max_weight, 'Info')}"
+        return risk, confidence_level, evidence_note
+
+    tls_checks: list[tuple[str, tuple[str, ...]]] = [
+        ("Certificate Pinning Drift", ("certificate pinning drift", "cert rotation")),
+        ("JA3/JA4 Novelty", ("ja3 novelty", "ja4 novelty", "rarity spike")),
+        ("Fingerprint Cardinality Anomalies", ("cardinality anomaly", "ja3 to sni", "sni to ja3")),
+        ("Cipher Downgrade Inconsistency", ("cipher downgrade inconsistency",)),
+        ("ALPN Mismatch/Anomalies", ("alpn mismatch", "alpn missing anomaly", "uncommon protocol tokens")),
+        ("Certificate Validity Outliers", ("certificate validity outliers",)),
+        ("Issuer/SAN Impersonation", ("impersonation heuristics", "issuer/san")),
+        ("Handshake Periodicity", ("handshake periodicity",)),
+        ("Session Resumption Abuse", ("session resumption-heavy", "session resumption")),
+        ("SNI Evasion/Anomaly", ("sni missing", "high-entropy sni", "suspicious sni", "sni uses ip literal")),
+        ("Legacy/Weak TLS Crypto", ("legacy tls versions", "weak tls cipher", "weak tls certificate keys")),
+        ("TLS Handshake Failure Pattern", ("tls handshake failures", "without server hello")),
+    ]
+
+    tls_matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for label_text, keywords in tls_checks:
+        lines.append(label(label_text))
+        evidence_lines = _matching_tls_lines(keywords)
+        if evidence_lines:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence_lines:
+                lines.append(muted(f"- {item}"))
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+        risk, confidence_level, evidence_note = _tls_matrix_rating_for_keywords(keywords)
+        tls_matrix_rows.append([label_text, risk, confidence_level, evidence_note])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("TLS Risk Matrix"))
+    lines.append(_format_table(tls_matrix_rows))
 
     tls_total_bytes = sum(max(0, int(conv.bytes)) for conv in summary.conversations)
     lines.append(_format_kv("TLS Bytes (Conversations)", str(tls_total_bytes)))
@@ -3576,6 +5195,15 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             rows.append([version, str(count)])
         lines.append(_format_table(rows))
 
+    if summary.cipher_suites:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Cipher Suites"))
+        rows = [["Cipher", "Count", "Class"]]
+        for name, count in summary.cipher_suites.most_common(_limit_value(limit)):
+            klass = "weak" if name in summary.weak_ciphers else "modern"
+            rows.append([str(name), str(count), klass])
+        lines.append(_format_table(rows))
+
     if summary.weak_ciphers:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Weak/Legacy Ciphers"))
@@ -3637,6 +5265,28 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             rows.append([_truncate_text(_redact_in_text(str(sni)), 96), str(count)])
         lines.append(_format_table(rows))
 
+    if summary.ja3_counts or summary.ja4_counts or summary.ja4s_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TLS Fingerprint Intelligence"))
+        if summary.ja3_counts:
+            rows = [["JA3", "Count"]]
+            for fp, count in summary.ja3_counts.most_common(_limit_value(limit)):
+                rows.append([str(fp), str(count)])
+            lines.append(label("Top JA3"))
+            lines.append(_format_table(rows))
+        if summary.ja4_counts:
+            rows = [["JA4", "Count"]]
+            for fp, count in summary.ja4_counts.most_common(_limit_value(limit)):
+                rows.append([str(fp), str(count)])
+            lines.append(label("Top JA4"))
+            lines.append(_format_table(rows))
+        if summary.ja4s_counts:
+            rows = [["JA4S", "Count"]]
+            for fp, count in summary.ja4s_counts.most_common(_limit_value(limit)):
+                rows.append([str(fp), str(count)])
+            lines.append(label("Top JA4S"))
+            lines.append(_format_table(rows))
+
     if summary.artifacts and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("TLS Artifacts"))
@@ -3644,7 +5294,7 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             lines.append(muted(f"- {_truncate_text(_redact_in_text(str(item)), 96)}"))
 
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -5785,7 +7435,8 @@ def render_rpc_summary(summary: RpcSummary, limit: int = 12, verbose: bool = Fal
 
 
 def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = False) -> str:
-    limit = _apply_verbose_limit(limit)
+    verbose = True
+    limit = _FULL_OUTPUT_LIMIT
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"TCP ANALYSIS :: {summary.path.name}"))
@@ -5796,6 +7447,19 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         lines.append(header("Errors"))
         for err in summary.errors:
             lines.append(danger(f"- {err}"))
+
+    verdict = str(getattr(summary, "analyst_verdict", "") or "")
+    confidence = str(getattr(summary, "analyst_confidence", "") or "").upper()
+    reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or [])]
+    if verdict:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Analyst Verdict"))
+        if confidence:
+            lines.append(_format_kv("Verdict", f"{verdict} (confidence: {confidence})"))
+        else:
+            lines.append(_format_kv("Verdict", verdict))
+        for reason in reasons[:_limit_value(8)]:
+            lines.append(muted(f"- {reason}"))
 
     tcp_packet_ratio = (summary.tcp_packets / summary.total_packets) if summary.total_packets else 0.0
     tcp_byte_ratio = (summary.tcp_bytes / summary.total_bytes) if summary.total_bytes else 0.0
@@ -5825,6 +7489,231 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
     lines.append(_format_kv("Avg TCP Payload Size", f"{avg_tcp_payload:.1f} bytes"))
     lines.append(_format_kv("TCP Packets/sec", f"{tcp_pps:.2f}"))
     lines.append(_format_kv("TCP Bytes/sec", f"{tcp_bps:.2f}"))
+
+    checks = dict(getattr(summary, "deterministic_checks", {}) or {})
+    if checks:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Deterministic TCP Security Checks"))
+        check_labels = {
+            "session_state_integrity": "Session state integrity",
+            "handshake_asymmetry_or_recon": "Handshake asymmetry/recon",
+            "rst_teardown_abuse": "RST/teardown abuse",
+            "tcp_periodic_cadence": "TCP periodic cadence",
+            "lateral_movement_surface": "Lateral movement surface",
+            "egress_exfil_outlier": "Egress exfil outlier",
+            "service_role_drift": "Service role drift",
+            "transport_window_or_retrans_abuse": "Transport retrans/window abuse",
+            "cross_signal_corroboration": "Cross-signal corroboration",
+            "evidence_provenance": "Evidence provenance",
+        }
+        for key, label in check_labels.items():
+            values = [str(v) for v in list(checks.get(key, []) or [])]
+            if values:
+                lines.append(warn(f"[!] {label}: {len(values)}"))
+                for item in values[:_limit_value(8)]:
+                    lines.append(muted(f"  - {item}"))
+            else:
+                lines.append(ok(f"[ ] {label}: none"))
+
+    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
+    if risk_matrix:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TCP Risk Matrix"))
+        rows = [["Category", "Risk", "Confidence", "Evidence"]]
+        for row in risk_matrix[:_limit_value(12)]:
+            if not isinstance(row, dict):
+                continue
+            rows.append([
+                str(row.get("category", "")),
+                str(row.get("risk", "")),
+                str(row.get("confidence", "")),
+                str(row.get("evidence", "")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    session_profiles = list(getattr(summary, "session_integrity_profiles", []) or [])
+    if session_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Session State Integrity"))
+        rows = [["Flow", "Issue", "Packets", "Confidence"]]
+        for profile in session_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("flow", "-")),
+                str(profile.get("issue", "-")),
+                str(profile.get("packets", 0)),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    recon_profiles = list(getattr(summary, "recon_profiles", []) or [])
+    if recon_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Recon and Scan Indicators"))
+        rows = [["Source", "Port", "Unique Ports", "Targets", "Confidence"]]
+        for profile in recon_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("source", "-")),
+                str(profile.get("port", "-")),
+                str(profile.get("unique_ports", "-")),
+                str(profile.get("targets", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    teardown_profiles = list(getattr(summary, "teardown_profiles", []) or [])
+    if teardown_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Connection Teardown Anomalies"))
+        rows = [["Flow", "RST", "FIN", "Confidence"]]
+        for profile in teardown_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("flow", "-")),
+                str(profile.get("rst", 0)),
+                str(profile.get("fin", 0)),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    cadence_profiles = list(getattr(summary, "cadence_profiles", []) or [])
+    if cadence_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TCP Cadence Anomalies"))
+        rows = [["Flow", "Packets", "Duration", "PPS", "Avg Packet"]]
+        for profile in cadence_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("flow", "-")),
+                str(profile.get("packets", 0)),
+                str(profile.get("duration_s", "-")),
+                str(profile.get("pps", "-")),
+                str(profile.get("avg_packet", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    lateral_profiles = list(getattr(summary, "lateral_movement_profiles", []) or [])
+    if lateral_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Lateral Movement Candidates"))
+        rows = [["Source", "Targets", "Admin Ports", "Confidence"]]
+        for profile in lateral_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("source", "-")),
+                str(profile.get("targets", "-")),
+                str(profile.get("admin_ports", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    egress_profiles = list(getattr(summary, "egress_outlier_profiles", []) or [])
+    if egress_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Egress Outlier Matrix"))
+        rows = [["Src", "Dst", "Bytes", "Confidence"]]
+        for profile in egress_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("src", "-")),
+                str(profile.get("dst", "-")),
+                format_bytes_as_mb(int(profile.get("bytes", 0) or 0)),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    role_profiles = list(getattr(summary, "role_drift_profiles", []) or [])
+    if role_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Role Drift by TCP Behavior"))
+        rows = [["Host", "Dst", "Port", "Reason", "Confidence"]]
+        for profile in role_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("host", "-")),
+                str(profile.get("dst", "-")),
+                str(profile.get("port", "-")),
+                str(profile.get("reason", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    transport_profiles = list(getattr(summary, "transport_abuse_profiles", []) or [])
+    if transport_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Transport Reliability Anomalies"))
+        rows = [["Host", "Type", "Count", "Confidence"]]
+        for profile in transport_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("host", "-")),
+                str(profile.get("type", "-")),
+                str(profile.get("count", 0)),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    corroborated_findings = list(getattr(summary, "corroborated_findings", []) or [])
+    if corroborated_findings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Corroborated Findings"))
+        rows = [["Host", "Score", "Confidence", "Reasons"]]
+        for finding in corroborated_findings[:limit]:
+            if not isinstance(finding, dict):
+                continue
+            rows.append([
+                str(finding.get("host", "-")),
+                str(finding.get("score", "-")),
+                str(finding.get("confidence", "-")),
+                ", ".join(str(v) for v in list(finding.get("reasons", []) or [])) or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    pivots = list(getattr(summary, "investigation_pivots", []) or [])
+    if pivots:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Hunt Pivots"))
+        rows = [["Flow", "Packets", "Bytes", "SYN", "SYN-ACK", "RST", "Reasons"]]
+        for pivot in pivots[:limit]:
+            if not isinstance(pivot, dict):
+                continue
+            rows.append([
+                str(pivot.get("flow", "-")),
+                str(pivot.get("packets", 0)),
+                format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
+                str(pivot.get("syn", 0)),
+                str(pivot.get("syn_ack", 0)),
+                str(pivot.get("rst", 0)),
+                ", ".join(str(v) for v in list(pivot.get("reasons", []) or [])) or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
+    if false_positive_context:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for item in false_positive_context[:_limit_value(8)]:
+            lines.append(muted(f"- {item}"))
 
     if summary.packet_size_hist or summary.payload_size_hist:
         lines.append(SUBSECTION_BAR)
@@ -5875,11 +7764,11 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         rows = [["Client", "Server"]]
         client_list = [
             f"{ip}({summary.client_counts[ip]}/{format_bytes_as_mb(client_bytes.get(ip, 0))})"
-            for ip, _count in summary.client_counts.most_common(_limit_value(10))
+            for ip, _count in summary.client_counts.most_common(_FULL_OUTPUT_LIMIT)
         ]
         server_list = [
             f"{ip}({summary.server_counts[ip]}/{format_bytes_as_mb(server_bytes.get(ip, 0))})"
-            for ip, _count in summary.server_counts.most_common(_limit_value(10))
+            for ip, _count in summary.server_counts.most_common(_FULL_OUTPUT_LIMIT)
         ]
         max_rows = max(len(client_list), len(server_list), 1)
         for idx in range(max_rows):
@@ -5905,7 +7794,7 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         port_destinations = summary.port_destinations if isinstance(summary.port_destinations, dict) else {}
         for port, count in summary.port_counts.most_common(limit):
             dsts = port_destinations.get(port, Counter())
-            dst_text = ", ".join(f"{ip}({cnt})" for ip, cnt in dsts.most_common(_limit_value(3))) or "-"
+            dst_text = ", ".join(f"{ip}({cnt})" for ip, cnt in dsts.most_common(_FULL_OUTPUT_LIMIT)) or "-"
             rows.append([str(port), str(count), dst_text])
         lines.append(_format_table(rows))
 
@@ -5957,15 +7846,16 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Artifacts"))
-        for item in summary.artifacts[:limit]:
+        for item in summary.artifacts:
             lines.append(muted(f"- {item}"))
 
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = False) -> str:
-    limit = _apply_verbose_limit(limit)
+    verbose = True
+    limit = _FULL_OUTPUT_LIMIT
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"UDP ANALYSIS :: {summary.path.name}"))
@@ -5976,6 +7866,19 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         lines.append(header("Errors"))
         for err in summary.errors:
             lines.append(danger(f"- {err}"))
+
+    verdict = str(getattr(summary, "analyst_verdict", "") or "")
+    confidence = str(getattr(summary, "analyst_confidence", "") or "").upper()
+    reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or [])]
+    if verdict:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Analyst Verdict"))
+        if confidence:
+            lines.append(_format_kv("Verdict", f"{verdict} (confidence: {confidence})"))
+        else:
+            lines.append(_format_kv("Verdict", verdict))
+        for reason in reasons[:_limit_value(8)]:
+            lines.append(muted(f"- {reason}"))
 
     udp_packet_ratio = (summary.udp_packets / summary.total_packets) if summary.total_packets else 0.0
     udp_byte_ratio = (summary.udp_bytes / summary.total_bytes) if summary.total_bytes else 0.0
@@ -6005,6 +7908,253 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
     lines.append(_format_kv("Avg UDP Payload Size", f"{avg_udp_payload:.1f} bytes"))
     lines.append(_format_kv("UDP Packets/sec", f"{udp_pps:.2f}"))
     lines.append(_format_kv("UDP Bytes/sec", f"{udp_bps:.2f}"))
+
+    checks = dict(getattr(summary, "deterministic_checks", {}) or {})
+    if checks:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Deterministic UDP Security Checks"))
+        check_labels = {
+            "udp_request_response_asymmetry": "UDP request/response asymmetry",
+            "reflection_amplification_risk": "Reflection/amplification risk",
+            "udp_recon_scan_behavior": "UDP recon/scan behavior",
+            "udp_periodic_cadence": "UDP periodic cadence",
+            "udp_tunneling_signal": "UDP tunneling/covert signal",
+            "udp_zone_boundary_exposure": "UDP zone boundary exposure",
+            "ot_udp_boundary_crossing": "OT UDP boundary crossing",
+            "udp_role_drift": "UDP role drift",
+            "udp_transport_fragmentation_reliability": "UDP transport/reliability abuse",
+            "cross_signal_corroboration": "Cross-signal corroboration",
+            "evidence_provenance": "Evidence provenance",
+        }
+        for key, label in check_labels.items():
+            values = [str(v) for v in list(checks.get(key, []) or [])]
+            if values:
+                lines.append(warn(f"[!] {label}: {len(values)}"))
+                for item in values[:_limit_value(8)]:
+                    lines.append(muted(f"  - {item}"))
+            else:
+                lines.append(ok(f"[ ] {label}: none"))
+
+    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
+    if risk_matrix:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("UDP Risk Matrix"))
+        rows = [["Category", "Risk", "Confidence", "Evidence"]]
+        for row in risk_matrix[:_limit_value(12)]:
+            if not isinstance(row, dict):
+                continue
+            rows.append([
+                str(row.get("category", "")),
+                str(row.get("risk", "")),
+                str(row.get("confidence", "")),
+                str(row.get("evidence", "")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    asymmetry_profiles = list(getattr(summary, "asymmetry_profiles", []) or [])
+    if asymmetry_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("UDP Asymmetry Matrix"))
+        rows = [["Flow", "Packets", "Avg Packet", "Confidence"]]
+        for profile in asymmetry_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("flow", "-")),
+                str(profile.get("packets", 0)),
+                str(profile.get("avg_packet", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    amplification_profiles = list(getattr(summary, "amplification_profiles", []) or [])
+    if amplification_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Reflection/Amplification Candidates"))
+        rows = [["Client", "Server", "Port", "Ratio", "Confidence"]]
+        for profile in amplification_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("client", "-")),
+                str(profile.get("server", "-")),
+                str(profile.get("port", "-")),
+                str(profile.get("ratio", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    recon_profiles = list(getattr(summary, "recon_profiles", []) or [])
+    if recon_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Recon Indicators"))
+        rows = [["Source", "Port", "Unique Ports", "Targets", "Confidence"]]
+        for profile in recon_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("source", "-")),
+                str(profile.get("port", "-")),
+                str(profile.get("unique_ports", "-")),
+                str(profile.get("targets", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    cadence_profiles = list(getattr(summary, "cadence_profiles", []) or [])
+    if cadence_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("UDP Cadence Anomalies"))
+        rows = [["Flow", "Packets", "Duration", "PPS", "Avg Packet"]]
+        for profile in cadence_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("flow", "-")),
+                str(profile.get("packets", 0)),
+                str(profile.get("duration_s", "-")),
+                str(profile.get("pps", "-")),
+                str(profile.get("avg_packet", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    tunneling_profiles = list(getattr(summary, "tunneling_profiles", []) or [])
+    if tunneling_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Encapsulation/Tunneling Suspicion"))
+        rows = [["Host", "Queries", "Unique Ratio", "Avg Len", "Entropy", "Confidence"]]
+        for profile in tunneling_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("host", "-")),
+                str(profile.get("queries", 0)),
+                str(profile.get("unique_ratio", "-")),
+                str(profile.get("avg_len", "-")),
+                str(profile.get("avg_entropy", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    zone_profiles = list(getattr(summary, "zone_profiles", []) or [])
+    if zone_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Zone Posture (East-West / North-South)"))
+        rows = [["Src", "Dst", "Port", "Zone", "Packets", "Confidence"]]
+        for profile in zone_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("src", "-")),
+                str(profile.get("dst", "-")),
+                str(profile.get("port", "-")),
+                str(profile.get("zone", "-")),
+                str(profile.get("packets", 0)),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    role_profiles = list(getattr(summary, "role_drift_profiles", []) or [])
+    if role_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Role Drift by UDP Behavior"))
+        rows = [["Host", "Dst", "Port", "Reason", "Confidence"]]
+        for profile in role_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("host", "-")),
+                str(profile.get("dst", "-")),
+                str(profile.get("port", "-")),
+                str(profile.get("reason", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    ot_profiles = list(getattr(summary, "ot_boundary_profiles", []) or [])
+    if ot_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OT Boundary Crossing Profiles"))
+        rows = [["Src", "Dst", "Port", "Packets", "Confidence"]]
+        for profile in ot_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("src", "-")),
+                str(profile.get("dst", "-")),
+                str(profile.get("port", "-")),
+                str(profile.get("packets", 0)),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    transport_profiles = list(getattr(summary, "transport_profiles", []) or [])
+    if transport_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("UDP Transport Reliability Anomalies"))
+        rows = [["Src", "Dst", "Type", "Bytes", "Confidence"]]
+        for profile in transport_profiles[:limit]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("src", "-")),
+                str(profile.get("dst", "-")),
+                str(profile.get("type", "-")),
+                format_bytes_as_mb(int(profile.get("bytes", 0) or 0)),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    corroborated_findings = list(getattr(summary, "corroborated_findings", []) or [])
+    if corroborated_findings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Corroborated Findings"))
+        rows = [["Host", "Score", "Confidence", "Reasons"]]
+        for finding in corroborated_findings[:limit]:
+            if not isinstance(finding, dict):
+                continue
+            rows.append([
+                str(finding.get("host", "-")),
+                str(finding.get("score", "-")),
+                str(finding.get("confidence", "-")),
+                ", ".join(str(v) for v in list(finding.get("reasons", []) or [])) or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    pivots = list(getattr(summary, "investigation_pivots", []) or [])
+    if pivots:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Hunt Pivots"))
+        rows = [["Flow", "Packets", "Bytes", "Reasons"]]
+        for pivot in pivots[:limit]:
+            if not isinstance(pivot, dict):
+                continue
+            rows.append([
+                str(pivot.get("flow", "-")),
+                str(pivot.get("packets", 0)),
+                format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
+                ", ".join(str(v) for v in list(pivot.get("reasons", []) or [])) or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
+    if false_positive_context:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for item in false_positive_context[:_limit_value(8)]:
+            lines.append(muted(f"- {item}"))
 
     if summary.packet_size_hist or summary.payload_size_hist:
         lines.append(SUBSECTION_BAR)
@@ -6051,11 +8201,11 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         rows = [["Client", "Server"]]
         client_list = [
             f"{ip}({summary.client_counts[ip]}/{format_bytes_as_mb(client_bytes.get(ip, 0))})"
-            for ip, _count in summary.client_counts.most_common(_limit_value(10))
+            for ip, _count in summary.client_counts.most_common(_FULL_OUTPUT_LIMIT)
         ]
         server_list = [
             f"{ip}({summary.server_counts[ip]}/{format_bytes_as_mb(server_bytes.get(ip, 0))})"
-            for ip, _count in summary.server_counts.most_common(_limit_value(10))
+            for ip, _count in summary.server_counts.most_common(_FULL_OUTPUT_LIMIT)
         ]
         max_rows = max(len(client_list), len(server_list))
         for idx in range(max_rows):
@@ -6081,7 +8231,7 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         port_destinations = summary.port_destinations if isinstance(summary.port_destinations, dict) else {}
         for port, count in summary.port_counts.most_common(limit):
             dsts = port_destinations.get(port, Counter())
-            dst_text = ", ".join(f"{ip}({cnt})" for ip, cnt in dsts.most_common(_limit_value(3))) or "-"
+            dst_text = ", ".join(f"{ip}({cnt})" for ip, cnt in dsts.most_common(_FULL_OUTPUT_LIMIT)) or "-"
             rows.append([str(port), str(count), dst_text])
         lines.append(_format_table(rows))
 
@@ -6133,11 +8283,11 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Artifacts"))
-        for item in summary.artifacts[:limit]:
+        for item in summary.artifacts:
             lines.append(muted(f"- {item}"))
 
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def _udp_bucket_ranges() -> list[tuple[str, int, int]]:
@@ -6395,7 +8545,11 @@ def render_udp_rollup(summaries: Iterable[UdpSummary], limit: int = 12, verbose:
 
 
 def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool = False) -> str:
-    limit = _apply_verbose_limit(limit)
+    # Analyst-heavy output: always render full detail regardless of -v.
+    limit = _FULL_OUTPUT_LIMIT
+    verbose = True
+    _limit_value = lambda value: _FULL_OUTPUT_LIMIT
+    _truncate_text = lambda text, max_len=0: str(text)
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"EXFILTRATION ANALYSIS :: {summary.path.name}"))
@@ -6447,8 +8601,37 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
                 )
 
         if summary.dns_tunnel_suspects:
-            score += 2
-            reasons.append(f"DNS tunneling heuristics triggered by {len(summary.dns_tunnel_suspects)} source(s)")
+            strongest_dns_confidence = 0
+            for item in summary.dns_tunnel_suspects:
+                try:
+                    total = int(item.get("total", 0) or 0)
+                    unique = int(item.get("unique", 0) or 0)
+                    long_q = int(item.get("long", 0) or 0)
+                    entropy = float(item.get("avg_entropy", 0.0) or 0.0)
+                    max_label = int(item.get("max_label", 0) or 0)
+                except Exception:
+                    continue
+
+                confidence_points = 0
+                if total >= 50 and unique >= int(total * 0.85):
+                    confidence_points += 1
+                if long_q >= 20:
+                    confidence_points += 1
+                if entropy >= 3.6:
+                    confidence_points += 1
+                if max_label >= 45:
+                    confidence_points += 1
+                if confidence_points > strongest_dns_confidence:
+                    strongest_dns_confidence = confidence_points
+
+            if strongest_dns_confidence >= 2:
+                score += 4
+                reasons.append(
+                    f"High-confidence DNS tunneling heuristics triggered by {len(summary.dns_tunnel_suspects)} source(s)"
+                )
+            else:
+                score += 3
+                reasons.append(f"DNS tunneling heuristics triggered by {len(summary.dns_tunnel_suspects)} source(s)")
         if summary.http_post_suspects:
             score += 1
             reasons.append(f"Large HTTP POST channels detected ({len(summary.http_post_suspects)})")
@@ -6491,9 +8674,60 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
     else:
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
-    lines.append(muted("Reasons:"))
+    lines.append(muted("Why confidence:"))
     for reason in verdict_reasons[:_limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    # Add concrete evidence context directly in the verdict block for analyst triage.
+    if summary.outbound_flows:
+        lines.append(muted("Where:"))
+        lines.append(muted("- Dominant outbound flows"))
+        for item in summary.outbound_flows[:_limit_value(6)]:
+            lines.append(
+                muted(
+                    f"- {item.get('src', '-')}->{item.get('dst', '-')} "
+                    f"proto={item.get('proto', '-')} dport={item.get('dst_port', '-')} "
+                    f"bytes={format_bytes_as_mb(int(item.get('bytes', 0) or 0))} "
+                    f"packets={int(item.get('packets', 0) or 0)}"
+                )
+            )
+
+    if summary.dns_tunnel_suspects:
+        lines.append(muted("What:"))
+        lines.append(muted("- DNS tunnel suspects"))
+        for item in summary.dns_tunnel_suspects[:_limit_value(6)]:
+            lines.append(
+                muted(
+                    f"- src={item.get('src', '-')} total={item.get('total', '-')} unique={item.get('unique', '-')} "
+                    f"long={item.get('long', '-')} entropy={item.get('avg_entropy', '-')} max_label={item.get('max_label', '-')}"
+                )
+            )
+
+    if summary.http_post_suspects:
+        lines.append(muted("What:"))
+        lines.append(muted("- HTTP POST exfil channels"))
+        for item in summary.http_post_suspects[:_limit_value(6)]:
+            lines.append(
+                muted(
+                    f"- {item.get('src', '-')}->{item.get('dst', '-')} host={item.get('host', '-')} "
+                    f"uri={item.get('uri', '-')} bytes={format_bytes_as_mb(int(item.get('bytes', 0) or 0))} "
+                    f"req={int(item.get('requests', 0) or 0)} risk={int(item.get('risk_score', 0) or 0)}"
+                )
+            )
+
+    if getattr(summary, "file_exfil_suspects", None):
+        file_suspects = list(summary.file_exfil_suspects or [])
+        if file_suspects:
+            lines.append(muted("What:"))
+            lines.append(muted("- File exfil suspects"))
+            for item in file_suspects[:_limit_value(6)]:
+                lines.append(
+                    muted(
+                        f"- {item.get('src', '-')}->{item.get('dst', '-')} file={item.get('filename', '-')} "
+                        f"type={item.get('file_type', '-') or '-'} size={format_bytes_as_mb(int(item.get('size', 0) or 0))} "
+                        f"risk={int(item.get('risk_score', 0) or 0)} packet={item.get('packet', '-')}"
+                    )
+                )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Deterministic Protocol Checks"))
@@ -6600,11 +8834,13 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
     if summary.http_post_suspects:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Large HTTP POST Payloads (Evidence)"))
-        rows = [["Src", "Dst", "Host", "URI", "Bytes", "Requests", "Mode", "Content-Type", "Assessment"]]
+        rows = [["Src", "Dst", "Host", "URI", "Bytes", "Req", "Mode", "Risk", "Packets", "Assessment"]]
         for item in summary.http_post_suspects[:limit]:
             bytes_val = int(item.get("bytes", 0) or 0)
             req_val = int(item.get("requests", 1) or 1)
-            assessment = "high" if bytes_val >= 5_000_000 or req_val >= 30 else "medium"
+            risk_score = int(item.get("risk_score", 0) or 0)
+            packet_examples = str(item.get("packet_examples", item.get("packet", "-")) or "-")
+            assessment = "high" if risk_score >= 3 or bytes_val >= 5_000_000 or req_val >= 30 else "medium"
             rows.append([
                 str(item.get("src", "-")),
                 str(item.get("dst", "-")),
@@ -6613,10 +8849,25 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
                 format_bytes_as_mb(bytes_val),
                 str(req_val),
                 str(item.get("mode", "single")),
-                str(item.get("content_type", "-")),
+                str(risk_score),
+                packet_examples,
                 assessment,
             ])
         lines.append(_format_table(rows))
+
+        lines.append(muted("HTTP POST Evidence Details:"))
+        for item in summary.http_post_suspects[:_limit_value(10 if verbose else 6)]:
+            risk_score = int(item.get("risk_score", 0) or 0)
+            risk_reasons = item.get("risk_reasons", [])
+            reason_text = ", ".join(str(v) for v in risk_reasons[:3]) if isinstance(risk_reasons, list) and risk_reasons else "-"
+            packet_examples = str(item.get("packet_examples", item.get("packet", "-")) or "-")
+            lines.append(muted(
+                f"- {item.get('src')}->{item.get('dst')} host={item.get('host')} risk={risk_score} "
+                f"why={_redact_in_text(reason_text)} packets={packet_examples}"
+            ))
+            sample_text = str(item.get("sample", "") or "").strip()
+            if sample_text and sample_text != "-":
+                lines.append(muted(f"  sample={_redact_in_text(sample_text[:120])}"))
 
     if summary.file_artifacts:
         lines.append(SUBSECTION_BAR)
@@ -6685,7 +8936,7 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
             lines.append(muted(f"- {item}"))
 
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_sizes_summary(summary: SizeSummary, limit: int = 12, verbose: bool = False) -> str:
@@ -6764,6 +9015,104 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
 
     lines.append(_format_kv("Packets", str(summary.total_packets)))
     lines.append(_format_kv("Candidates", str(summary.candidate_count)))
+
+    if getattr(summary, "campaign_summaries", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Beacon Campaign Summary"))
+        rows = [["Campaign", "Host", "Cadence", "Flows", "Destinations", "Channels", "Max Score"]]
+        for item in summary.campaign_summaries[:limit]:
+            rows.append([
+                str(item.get("campaign_id", "-")),
+                str(item.get("host", "-")),
+                str(item.get("cadence_family", "-")),
+                str(item.get("flows", "-")),
+                str(item.get("destinations", "-")),
+                str(item.get("channels", "-")),
+                str(item.get("max_score", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if getattr(summary, "host_rollups", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Host-Centric Verdict Rollup"))
+        rows = [["Host", "Candidates", "Channels", "Destinations", "Top Cadence", "Max Score"]]
+        for item in summary.host_rollups[:limit]:
+            channels = item.get("channels", [])
+            channel_text = ",".join(str(v) for v in channels) if isinstance(channels, list) else str(channels)
+            rows.append([
+                str(item.get("host", "-")),
+                str(item.get("candidate_count", "-")),
+                channel_text or "-",
+                str(item.get("destinations", "-")),
+                f"{float(item.get('top_cadence_s', 0.0) or 0.0):.2f}s",
+                str(item.get("max_score", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    def _beacon_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        candidates = list(getattr(summary, "candidates", []) or [])
+        checks = getattr(summary, "protocol_beacon_checks", {}) or {}
+        http_posts = list(getattr(summary, "http_post_beacons", []) or [])
+
+        if candidates:
+            top_score = max((float(item.score) for item in candidates), default=0.0)
+            if top_score >= 0.85:
+                score += 2
+                reasons.append(f"Top beacon candidate score is {top_score:.2f}")
+            elif top_score >= 0.70:
+                score += 1
+                reasons.append(f"Top beacon candidate score is {top_score:.2f}")
+            if len(candidates) >= 3:
+                score += 1
+                reasons.append(f"Multiple beacon candidates detected ({len(candidates)})")
+
+        protocol_hits = 0
+        if isinstance(checks, dict):
+            for key in ("dns", "http_https", "icmp", "ntp"):
+                values = checks.get(key, [])
+                if isinstance(values, list) and values:
+                    protocol_hits += 1
+        if protocol_hits:
+            score += min(2, protocol_hits)
+            reasons.append(f"Deterministic checks found evidence in {protocol_hits} protocol channel(s)")
+
+        if http_posts:
+            max_http_risk = max((int(item.get("risk_score", 0) or 0) for item in http_posts), default=0)
+            score += 2 if max_http_risk >= 3 else 1
+            reasons.append(f"HTTP POST beacon channels detected ({len(http_posts)}; max risk={max_http_risk})")
+
+        if score >= 6:
+            verdict = "YES - beaconing activity is likely occurring in this capture."
+            confidence = "High"
+        elif score >= 4:
+            verdict = "LIKELY - beaconing indicators are present with corroborating evidence."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - weak-to-moderate beaconing indicators are present."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - current heuristics do not show convincing beaconing activity."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No beaconing heuristic crossed a high-confidence threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _beacon_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Reasons:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     if summary.errors:
         lines.append(SUBSECTION_BAR)
@@ -6881,11 +9230,140 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
                 for evidence in evidence_items[:_limit_value(8)]:
                     lines.append(muted(f"    - {_redact_in_text(str(evidence))}"))
 
+    checks = getattr(summary, "protocol_beacon_checks", {}) or {}
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Beacon Checks"))
+    protocol_labels = [
+        ("dns", "DNS"),
+        ("http_https", "HTTP/HTTPS"),
+        ("icmp", "ICMP"),
+        ("ntp", "NTP"),
+    ]
+    for key, proto_label in protocol_labels:
+        evidence = checks.get(key) if isinstance(checks, dict) else []
+        evidence_items = [str(item) for item in (evidence or []) if str(item).strip()]
+        if evidence_items:
+            lines.append(danger(f"Yes, there is evidence for {proto_label} beaconing, here is the evidence:"))
+            for item in evidence_items[:_limit_value(10)]:
+                lines.append(muted(f"  - {_redact_in_text(item)}"))
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {proto_label} beaconing."))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Beacon Category Checks"))
+    category_checks = getattr(summary, "deterministic_category_checks", {}) or {}
+    category_labels = [
+        ("single_target_periodic_c2", "Single-Target Periodic C2"),
+        ("multi_target_synchronized", "Multi-Target Synchronized Beaconing"),
+        ("cross_protocol_cadence", "Cross-Protocol Cadence Reuse"),
+        ("burst_sleep_pattern", "Burst-Sleep Beacon Profile"),
+        ("low_slow_persistence", "Low-and-Slow Persistence"),
+        ("benign_periodic_likely", "Likely Benign Periodic Pattern"),
+    ]
+
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in category_labels:
+        evidence = category_checks.get(key, []) if isinstance(category_checks, dict) else []
+        evidence_items = [str(item) for item in (evidence or []) if str(item).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            if key == "benign_periodic_likely":
+                lines.append(ok(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            else:
+                lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence_items[:_limit_value(10 if verbose else 6)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+            if key == "benign_periodic_likely":
+                matrix_rows.append([label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"])
+            elif key in {"multi_target_synchronized", "cross_protocol_cadence"}:
+                matrix_rows.append([label_text, "High", "High", f"{len(evidence_items)} signal(s)"])
+            elif key in {"single_target_periodic_c2", "low_slow_persistence"}:
+                matrix_rows.append([label_text, "Medium", "Medium", f"{len(evidence_items)} signal(s)"])
+            else:
+                matrix_rows.append([label_text, "Medium", "Low", f"{len(evidence_items)} signal(s)"])
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Beacon Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
+
+    if summary.candidates:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Beacon Timeline Heatmap"))
+        for item in summary.candidates[:limit]:
+            cadence = f"{item.mean_interval:.1f}s"
+            lines.append(
+                f"{item.src_ip}->{item.dst_ip} [{item.proto}] cadence={cadence} {sparkline(item.timeline)}"
+            )
+
+    pivots = list(getattr(summary, "beacon_pivots", []) or [])
+    if pivots:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Actionable Hunting Pivots"))
+        rows = [["Src", "Dst", "Proto", "Interval", "Score", "URI Hash", "First", "Last"]]
+        for item in pivots[:limit]:
+            rows.append([
+                str(item.get("src", "-")),
+                str(item.get("dst", "-")),
+                str(item.get("proto", "-")),
+                f"{float(item.get('interval', 0.0) or 0.0):.2f}s",
+                str(item.get("score", "-")),
+                str(item.get("uri_template_hash", "-")),
+                format_ts(item.get("first_seen")),
+                format_ts(item.get("last_seen")),
+            ])
+        lines.append(_format_table(rows))
+
+    explainability = list(getattr(summary, "explainability", []) or [])
+    if explainability:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Explainability"))
+        for item in explainability[:_limit_value(12 if verbose else 8)]:
+            lines.append(muted(f"- {_redact_in_text(str(item))}"))
+
+    http_post_beacons = list(getattr(summary, "http_post_beacons", []) or [])
+    if http_post_beacons:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("HTTP POST Beacon Discovery"))
+        rows = [["Source", "Destination", "Host", "URI(s)", "Req", "Bytes", "Stability", "Linked", "Risk", "Packets"]]
+        for item in http_post_beacons[:_limit_value(10)]:
+            rows.append([
+                str(item.get("src", "-")),
+                str(item.get("dst", "-")),
+                str(item.get("host", "-")),
+                str(item.get("uri", "-")),
+                str(int(item.get("requests", 0) or 0)),
+                str(int(item.get("bytes", 0) or 0)),
+                f"{float(item.get('size_stability', 0.0) or 0.0):.2f}",
+                f"{float(item.get('linked_beacon_score', 0.0) or 0.0):.2f}",
+                str(int(item.get("risk_score", 0) or 0)),
+                str(item.get("packet_examples", "-")),
+            ])
+        lines.append(_format_table(rows))
+        lines.append(muted("HTTP POST Beacon Evidence Details:"))
+        for item in http_post_beacons[:_limit_value(10 if verbose else 6)]:
+            reason_values = item.get("risk_reasons", [])
+            reason_text = ", ".join(str(v) for v in reason_values[:3]) if isinstance(reason_values, list) and reason_values else "-"
+            lines.append(muted(
+                f"- {item.get('src')}->{item.get('dst')} host={item.get('host')} risk={int(item.get('risk_score', 0) or 0)} "
+                f"why={_redact_in_text(reason_text)}"
+            ))
+            sample_text = str(item.get("sample", "") or "").strip()
+            if sample_text and sample_text != "-":
+                lines.append(muted(f"  sample={_redact_in_text(sample_text[:120])}"))
+
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
 def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str:
+    # Analyst-heavy output: always render full detail regardless of -v.
+    verbose = True
+    _limit_value = lambda value: _FULL_OUTPUT_LIMIT
+    _truncate_text = lambda text, max_len=0: str(text)
+
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"THREATS OVERVIEW :: {summary.path.name}"))
@@ -6971,6 +9449,7 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
             "ssh",
             "rpc",
             "snmp",
+            "suricata",
         }
         if source in network_sources:
             return True
@@ -7002,6 +9481,85 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
         return any(token in blob for token in strong_network_tokens)
 
     detections = [item for item in detections if _is_network_attack_detection(item)]
+
+    def _threats_verdict() -> tuple[str, str, list[str], int]:
+        reasons: list[str] = []
+        score = 0
+        sev = Counter(str(item.get("severity", "info")).lower() for item in detections)
+        if sev.get("critical", 0):
+            score += min(4, int(sev.get("critical", 0) or 0) * 2)
+            reasons.append(f"Critical detections observed ({int(sev.get('critical', 0) or 0)})")
+        if sev.get("high", 0):
+            score += min(3, int(sev.get("high", 0) or 0))
+            reasons.append(f"High-severity detections observed ({int(sev.get('high', 0) or 0)})")
+        if len(detections) >= 8:
+            score += 1
+            reasons.append(f"Detection volume is elevated ({len(detections)})")
+        if summary.public_ot_pairs:
+            score += 1
+            reasons.append(f"Public OT/ICS communication pairs observed ({len(summary.public_ot_pairs)})")
+        if getattr(summary, "suricata_metadata", None):
+            score += 1
+            reasons.append("Suricata corroboration is present")
+
+        if score >= 7:
+            return "YES - high-confidence network attack activity is present.", "High", reasons, score
+        if score >= 4:
+            return "LIKELY - suspicious network attack activity is present.", "Medium", reasons, score
+        if score >= 2:
+            return "POSSIBLE - weak-to-moderate attack indicators are present.", "Low", reasons, score
+        return "NO STRONG SIGNAL - no convincing high-confidence attack pattern from current heuristics.", "Low", reasons if reasons else ["No high-confidence heuristic crossed threshold"], score
+
+    verdict, confidence, verdict_reasons, verdict_score = _threats_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    if detections:
+        lines.append(muted("What:"))
+        lines.append(muted("- Top detections"))
+        for item in detections[:_limit_value(8)]:
+            lines.append(
+                muted(
+                    f"- [{str(item.get('severity', 'info')).upper()}] {_redact_in_text(str(item.get('summary', '-')))} "
+                    f"(source={item.get('source', '-')})"
+                )
+            )
+
+    source_counter: Counter[str] = Counter()
+    destination_counter: Counter[str] = Counter()
+    for item in detections:
+        for key, target_counter in (("top_sources", source_counter), ("top_clients", source_counter), ("top_destinations", destination_counter), ("top_servers", destination_counter)):
+            values = item.get(key)
+            if not isinstance(values, list):
+                continue
+            for pair in values[:_limit_value(6)]:
+                if isinstance(pair, tuple) and len(pair) >= 2:
+                    try:
+                        target_counter[str(pair[0])] += int(pair[1])
+                    except Exception:
+                        continue
+
+    if source_counter:
+        lines.append(muted("Who:"))
+        lines.append(muted("- Top suspected sources"))
+        for ip_value, count in source_counter.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_highlight_public_ips(str(ip_value))}: {int(count)}"))
+    if destination_counter:
+        lines.append(muted("Where:"))
+        lines.append(muted("- Top targeted destinations"))
+        for ip_value, count in destination_counter.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_highlight_public_ips(str(ip_value))}: {int(count)}"))
+
     lines.append(SUBSECTION_BAR)
     lines.append(header("Overview"))
     lines.append(_format_kv("Scope", "Network-based attacks only"))
@@ -7043,6 +9601,97 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
         if summary.ot_peer_external:
             external_list = ", ".join(f"{ip}({count})" for ip, count in summary.ot_peer_external[:_limit_value(10)])
             lines.append(muted(f"External: {_highlight_public_ips(external_list)}"))
+
+    suricata_mode = bool(getattr(summary, "suricata_metadata", None)) or any(
+        str(item.get("source", "")).strip().lower() == "suricata" for item in detections
+    )
+    if suricata_mode:
+        suricata_metadata = getattr(summary, "suricata_metadata", {}) or {}
+        suricata_checks = getattr(summary, "suricata_checks", {}) or {}
+        suricata_event_counts = getattr(summary, "suricata_event_counts", {}) or {}
+        suricata_pivots = getattr(summary, "suricata_pivots", {}) or {}
+
+        if suricata_metadata:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Suricata Run Metadata"))
+            for key, label_text in (
+                ("engine", "Engine"),
+                ("version", "Version"),
+                ("binary", "Binary"),
+                ("rules", "Rules"),
+                ("rules_age_days", "Rules Age (days)"),
+                ("config", "Config"),
+                ("scan_seconds", "Scan Duration (s)"),
+                ("exit_code", "Exit Code"),
+                ("pcap_sha256", "PCAP SHA256"),
+                ("eve_lines", "EVE Lines"),
+                ("event_types", "Event Types Parsed"),
+                ("pcaps_scanned", "PCAPs Scanned"),
+            ):
+                if key in suricata_metadata and suricata_metadata.get(key) not in {None, ""}:
+                    lines.append(_format_kv(label_text, str(suricata_metadata.get(key))))
+
+        if suricata_checks:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Deterministic Suricata Checks"))
+            check_labels = [
+                ("ids_alert_presence", "IDS Alert Presence"),
+                ("high_severity_alerts", "High-Severity Alert Cluster"),
+                ("multi_host_fanout", "Multi-Host Fanout"),
+                ("dns_suspicious_activity", "DNS Suspicious Activity"),
+                ("http_c2_upload_activity", "HTTP C2/Upload Activity"),
+                ("tls_sni_anomaly", "TLS SNI/Handshake Anomaly"),
+                ("file_transfer_artifacts", "File Transfer Artifacts"),
+                ("engine_health", "Engine Health"),
+            ]
+            matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+            for key, label_text in check_labels:
+                evidence_items = suricata_checks.get(key, []) if isinstance(suricata_checks, dict) else []
+                evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
+                lines.append(label(label_text))
+                if evidence_items:
+                    lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                    for item in evidence_items[:_limit_value(8 if verbose else 5)]:
+                        lines.append(muted(f"- {_redact_in_text(item)}"))
+                    risk = "High" if key in {"high_severity_alerts", "multi_host_fanout", "ids_alert_presence"} else "Medium"
+                    confidence_level = "High" if len(evidence_items) >= 2 else "Medium"
+                    if key == "engine_health":
+                        risk = "Low"
+                        confidence_level = "Medium"
+                    matrix_rows.append([label_text, risk, confidence_level, f"{len(evidence_items)} signal(s)"])
+                else:
+                    lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+                    matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Suricata Risk Matrix"))
+            lines.append(_format_table(matrix_rows))
+
+        if suricata_event_counts:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Suricata Event Coverage"))
+            rows = [["Event Type", "Count"]]
+            for event_name, count in sorted(suricata_event_counts.items(), key=lambda item: (-int(item[1]), str(item[0]))):
+                rows.append([str(event_name), str(count)])
+            lines.append(_format_table(rows))
+
+        if suricata_pivots:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Suricata Analyst Pivots"))
+            top_sources = suricata_pivots.get("top_sources", []) if isinstance(suricata_pivots, dict) else []
+            top_destinations = suricata_pivots.get("top_destinations", []) if isinstance(suricata_pivots, dict) else []
+            top_signatures = suricata_pivots.get("top_signatures", []) if isinstance(suricata_pivots, dict) else []
+            if top_sources:
+                lines.append(muted("Top Sources:"))
+                for ip_value, count in top_sources[:_limit_value(10)]:
+                    lines.append(muted(f"- {_highlight_public_ips(str(ip_value))}: {int(count)}"))
+            if top_destinations:
+                lines.append(muted("Top Destinations:"))
+                for ip_value, count in top_destinations[:_limit_value(10)]:
+                    lines.append(muted(f"- {_highlight_public_ips(str(ip_value))}: {int(count)}"))
+            if top_signatures:
+                lines.append(muted("Top Signatures:"))
+                for sig_value, count in top_signatures[:_limit_value(10)]:
+                    lines.append(muted(f"- {_redact_in_text(str(sig_value))}: {int(count)}"))
 
     if detections:
         severity_counts: Counter[str] = Counter(str(item.get("severity", "info")).lower() for item in detections)
@@ -7236,7 +9885,259 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
         lines.append(muted("No notable threats detected."))
 
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
+
+
+def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
+    # MITRE is an analyst-first report: always render full detail regardless of -v.
+    verbose = True
+    _limit_value = lambda value: _FULL_OUTPUT_LIMIT
+    _truncate_text = lambda text, max_len=0: str(text)
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"MITRE ATT&CK MAPPING :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("ATT&CK Corpus"))
+    lines.append(_format_kv("Enterprise Corpus", str(getattr(summary, "attack_enterprise_version", "-"))))
+    lines.append(_format_kv("ICS Corpus", str(getattr(summary, "attack_ics_version", "-"))))
+    lines.append(_format_kv("Mapping Pack", str(getattr(summary, "mapping_pack_version", "-"))))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Executive Assessment"))
+    verdict = str(getattr(summary, "executive_verdict", "") or "LOW-CONFIDENCE SIGNAL")
+    confidence = str(getattr(summary, "executive_confidence", "low") or "low")
+    if verdict.startswith("LIKELY"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", confidence))
+    for reason in (getattr(summary, "executive_reasons", []) or [])[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(str(reason))}"))
+
+    checks = getattr(summary, "checks", {}) or {}
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Checks"))
+    check_labels = [
+        ("cross_signal_corroboration", "Cross-Signal Corroboration"),
+        ("sequence_plausibility", "Sequence Plausibility"),
+        ("ics_process_impact", "ICS Process/Safety Impact"),
+        ("host_boundary_activity", "Host Boundary Activity"),
+    ]
+    matrix_rows = [["Check", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence = checks.get(key, []) if isinstance(checks, dict) else []
+        evidence_items = [str(v) for v in (evidence or []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence_items[:_limit_value(8 if verbose else 5)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+            risk = "High" if key in {"cross_signal_corroboration", "ics_process_impact"} else "Medium"
+            conf_level = "High" if len(evidence_items) >= 2 else "Medium"
+            matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching evidence"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("MITRE Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors[:_limit_value(10)]:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Coverage"))
+    lines.append(_format_kv("Total Detections", str(summary.total_detections)))
+    lines.append(_format_kv("Mapped to ATT&CK", str(summary.mapped_detections)))
+    if summary.total_detections > 0:
+        ratio = (float(summary.mapped_detections) / float(summary.total_detections)) * 100.0
+        lines.append(_format_kv("Mapping Ratio", f"{ratio:.1f}%"))
+    if summary.first_seen is not None:
+        lines.append(_format_kv("First Seen", format_ts(summary.first_seen)))
+    if summary.last_seen is not None:
+        lines.append(_format_kv("Last Seen", format_ts(summary.last_seen)))
+    if summary.duration_seconds is not None:
+        lines.append(_format_kv("Duration", f"{summary.duration_seconds:.1f}s"))
+    lines.append(_format_kv("Framework Split", _format_counter(summary.framework_counts, 4)))
+    lines.append(_format_kv("Top Tactics", _format_counter(summary.tactic_counts, 8, key_max=56)))
+    lines.append(_format_kv("Top Techniques", _format_counter(summary.technique_counts, 10, key_max=64)))
+    lines.append(_format_kv("Top Procedures", _format_counter(summary.procedure_counts, 8, key_max=70)))
+
+    technique_heat = list(getattr(summary, "technique_heat", []) or [])
+    if technique_heat:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Technique Heat Table"))
+        rows = [["Framework", "Tactic", "Technique", "Count", "Hosts", "Sources", "Evidence", "Confidence", "First", "Last"]]
+        for item in technique_heat[:_limit_value(30 if verbose else 14)]:
+            rows.append([
+                str(item.get("framework", "-")),
+                str(item.get("tactic", "-")),
+                f"{item.get('technique', '-')} ({item.get('technique_id', '-')})",
+                str(item.get("count", "-")),
+                str(item.get("host_count", "-")),
+                str(item.get("source_count", "-")),
+                str(item.get("evidence_count", "-")),
+                str(item.get("confidence", "-")),
+                format_ts(item.get("first_seen")),
+                format_ts(item.get("last_seen")),
+            ])
+        lines.append(_format_table(rows))
+
+    host_paths = getattr(summary, "host_attack_paths", {}) or {}
+    host_roles = getattr(summary, "host_roles", {}) or {}
+    if host_paths:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Host-Centric ATT&CK Chains"))
+        rows = [["Host", "Role(s)", "Chain Length", "Chain Preview"]]
+        for host, chain in list(host_paths.items())[:_limit_value(24 if verbose else 10)]:
+            role_text = ",".join(host_roles.get(host, [])[:4]) if isinstance(host_roles, dict) else "-"
+            preview = " -> ".join(chain[:3]) if chain else "-"
+            rows.append([
+                str(host),
+                role_text or "-",
+                str(len(chain)),
+                _truncate_text(preview, 120),
+            ])
+        lines.append(_format_table(rows))
+
+    sequence_issues = list(getattr(summary, "sequence_issues", []) or [])
+    if sequence_issues:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Sequence Plausibility Warnings"))
+        for item in sequence_issues[:_limit_value(10 if verbose else 6)]:
+            lines.append(warn(f"- {_redact_in_text(str(item))}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Attack Path Visualization"))
+    if summary.attack_path:
+        unique_nodes: list[str] = []
+        seen_nodes: set[str] = set()
+        for edge in summary.attack_path[:_limit_value(40 if verbose else 20)]:
+            lines.append(f"  {muted('->')} {edge}")
+            for node in [part.strip() for part in edge.split("->") if part.strip()]:
+                if node not in seen_nodes:
+                    seen_nodes.add(node)
+                    unique_nodes.append(node)
+        if unique_nodes:
+            lines.append(muted("Path Nodes:"))
+            for idx, node in enumerate(unique_nodes[:_limit_value(18 if verbose else 10)], start=1):
+                lines.append(muted(f"  {idx:02d}. {node}"))
+    else:
+        lines.append(muted("No attack chain could be inferred from current detections."))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Evidence and Artifacts/IOC"))
+    lines.append(_format_kv("IOC Highlights", _format_counter(summary.ioc_counts, 12, key_max=56)))
+    lines.append(_format_kv("Artifact Highlights", _format_counter(summary.artifact_counts, 12, key_max=56)))
+    total_evidence_items = sum(len(hit.evidence) for hit in summary.hits)
+    total_packet_refs = sum(len(list(getattr(hit, "packet_refs", []) or [])) for hit in summary.hits)
+    total_flow_refs = sum(len(list(getattr(hit, "flow_refs", []) or [])) for hit in summary.hits)
+    total_host_refs = sum(len(list(getattr(hit, "host_refs", []) or [])) for hit in summary.hits)
+    lines.append(_format_kv("Evidence Entries", str(total_evidence_items)))
+    lines.append(_format_kv("Packet References", str(total_packet_refs)))
+    lines.append(_format_kv("Flow References", str(total_flow_refs)))
+    lines.append(_format_kv("Host References", str(total_host_refs)))
+
+    if summary.hits:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Evidence Deep Dive"))
+        rows = [["Technique", "Source", "Severity", "Confidence", "Evidence", "Packets", "Flows", "Hosts"]]
+        for hit in summary.hits[:_limit_value(200)]:
+            rows.append([
+                f"{hit.technique} ({hit.technique_id})",
+                str(hit.source),
+                str(hit.severity),
+                str(hit.confidence),
+                str(len(hit.evidence)),
+                str(len(list(getattr(hit, "packet_refs", []) or []))),
+                str(len(list(getattr(hit, "flow_refs", []) or []))),
+                str(len(list(getattr(hit, "host_refs", []) or []))),
+            ])
+        lines.append(_format_table(rows))
+
+    pivots = list(getattr(summary, "investigation_pivots", []) or [])
+    if pivots:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Investigation Pivots"))
+        rows = [["Technique", "Source", "Hosts", "Flows", "Packets", "IOC/Artifact"]]
+        for item in pivots[:_limit_value(18 if verbose else 8)]:
+            hosts = item.get("hosts", [])
+            flows = item.get("flows", [])
+            packets = item.get("packets", [])
+            iocs = item.get("iocs", [])
+            artifacts = item.get("artifacts", [])
+            ioc_art = ", ".join([str(v) for v in (iocs[:2] if isinstance(iocs, list) else [])] + [str(v) for v in (artifacts[:2] if isinstance(artifacts, list) else [])])
+            rows.append([
+                f"{item.get('technique_id', '-')} {item.get('tactic', '-')}",
+                str(item.get("source", "-")),
+                ",".join(str(v) for v in (hosts[:3] if isinstance(hosts, list) else [])) or "-",
+                ",".join(str(v) for v in (flows[:2] if isinstance(flows, list) else [])) or "-",
+                ",".join(str(v) for v in (packets[:4] if isinstance(packets, list) else [])) or "-",
+                _truncate_text(ioc_art or "-", 120),
+            ])
+        lines.append(_format_table(rows))
+
+    alternates = list(getattr(summary, "alternate_explanations", []) or [])
+    if alternates:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Alternative Explanations"))
+        for item in alternates[:_limit_value(8)]:
+            lines.append(muted(f"- {_redact_in_text(str(item))}"))
+
+    if summary.hits:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TTP Details"))
+        max_hits = _limit_value(200)
+        for hit in summary.hits[:max_hits]:
+            title = (
+                f"[{hit.framework.upper()}] {hit.tactic} ({hit.tactic_id}) -> "
+                f"{hit.technique} ({hit.technique_id})"
+            )
+            lines.append(label(title))
+            lines.append(muted(f"  Procedure: {hit.procedure}"))
+            lines.append(muted(f"  Source/Severity/Confidence: {hit.source} / {hit.severity} / {hit.confidence}"))
+            lines.append(muted(f"  Occurrence: {hit.occurrence}"))
+            lines.append(muted(f"  First/Last Seen: {format_ts(hit.first_seen)} / {format_ts(hit.last_seen)}"))
+            lines.append(muted(f"  Corroborating Sources: {int(getattr(hit, 'corroborating_sources', 0) or 0)}"))
+            if getattr(hit, "rationale", ""):
+                lines.append(muted(f"  Rationale: {_truncate_text(_redact_in_text(str(hit.rationale)), 260)}"))
+            if getattr(hit, "matched_keywords", None):
+                lines.append(muted(f"  Matched Keywords: {', '.join(list(getattr(hit, 'matched_keywords', []) or [])[:8])}"))
+            if getattr(hit, "packet_refs", None):
+                lines.append(muted(f"  Packet Refs: {', '.join(list(getattr(hit, 'packet_refs', []) or [])[:8])}"))
+            if getattr(hit, "flow_refs", None):
+                lines.append(muted(f"  Flow Refs: {', '.join(list(getattr(hit, 'flow_refs', []) or [])[:4])}"))
+            if getattr(hit, "host_refs", None):
+                lines.append(muted(f"  Host Refs: {', '.join(list(getattr(hit, 'host_refs', []) or [])[:8])}"))
+            if getattr(hit, "contradictory_signals", None):
+                lines.append(muted(f"  Contradictions: {', '.join(list(getattr(hit, 'contradictory_signals', []) or []))}"))
+            if hit.details:
+                lines.append(muted(f"  Explanation: {_truncate_text(_redact_in_text(hit.details), 240)}"))
+            if hit.evidence:
+                lines.append(muted("  Evidence:"))
+                for idx, evidence in enumerate(hit.evidence[:_limit_value(200)], start=1):
+                    lines.append(muted(f"    {idx:02d}. {_redact_in_text(str(evidence))}"))
+            if hit.artifacts:
+                lines.append(muted(f"  Artifacts: {', '.join(hit.artifacts[:_limit_value(40)])}"))
+            if hit.iocs:
+                lines.append(muted(f"  IOC: {', '.join(hit.iocs[:_limit_value(40)])}"))
+        hidden = max(0, len(summary.hits) - max_hits)
+        if hidden:
+            lines.append(muted(f"{hidden} additional mapped TTP entries suppressed for readability."))
+    else:
+        lines.append(muted("No MITRE ATT&CK TTP mappings were derived from this capture."))
+
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_files_summary(summary: FileTransferSummary, limit: int | None = None, verbose: bool = False) -> str:
@@ -7253,6 +10154,146 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
             lines.append(danger(f"- {err}"))
 
     effective_limit = limit if limit is not None else max(len(summary.artifacts), 0)
+
+    def _files_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        detections = list(getattr(summary, "detections", []) or [])
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+
+        def _check_count(key: str) -> int:
+            values = checks.get(key, []) if isinstance(checks, dict) else []
+            return len([v for v in (values or []) if str(v).strip()])
+
+        high_weight_checks = {
+            "multi_signal_masquerade": 3,
+            "archive_container_abuse": 3,
+            "macro_script_lolbas_staging": 3,
+            "exfiltration_file_movement": 3,
+            "lateral_copy_propagation": 4,
+            "auth_file_correlation": 2,
+            "reputation_or_prevalence_outlier": 1,
+            "reconstruction_confidence": 1,
+        }
+        for key, base_weight in high_weight_checks.items():
+            count = _check_count(key)
+            if not count:
+                continue
+            score += min(4, base_weight + min(2, count - 1))
+            reasons.append(f"{key.replace('_', ' ')} evidence ({count})")
+
+        high_findings = sum(1 for d in detections if str(d.get("severity", "")).lower() in {"high", "critical"})
+        warn_findings = sum(1 for d in detections if str(d.get("severity", "")).lower() == "warning")
+        if high_findings:
+            score += min(3, high_findings)
+            reasons.append(f"High-severity file detections observed ({high_findings})")
+        if warn_findings >= 2:
+            score += 1
+            reasons.append(f"Multiple warning-level file detections observed ({warn_findings})")
+
+        if score >= 8:
+            verdict = "YES - high-confidence malicious file activity is present."
+            confidence = "High"
+        elif score >= 5:
+            verdict = "LIKELY - suspicious file activity with compromise indicators is present."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - risky file-transfer behavior is present; corroboration recommended."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing malicious file pattern from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence file threat heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _files_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    if summary.artifacts:
+        lines.append(muted("Who:"))
+        lines.append(muted("- Top source hosts by artifact count"))
+        src_counts = Counter(item.src_ip for item in summary.artifacts if item.src_ip)
+        for ip, count in src_counts.most_common(_limit_value(6)):
+            lines.append(muted(f"- {_highlight_public_ips(str(ip))}: {int(count)}"))
+
+        lines.append(muted("Where:"))
+        lines.append(muted("- Top destinations by artifact count"))
+        dst_counts = Counter(item.dst_ip for item in summary.artifacts if item.dst_ip)
+        for ip, count in dst_counts.most_common(_limit_value(6)):
+            lines.append(muted(f"- {_highlight_public_ips(str(ip))}: {int(count)}"))
+
+        lines.append(muted("What:"))
+        lines.append(muted("- Top transferred filenames"))
+        name_counts = Counter(item.filename for item in summary.artifacts if item.filename)
+        for name, count in name_counts.most_common(_limit_value(6)):
+            lines.append(muted(f"- {_redact_in_text(str(name))}: {int(count)}"))
+
+    if getattr(summary, "incident_clusters", None):
+        clusters = list(summary.incident_clusters or [])
+        if clusters:
+            lines.append(muted("When:"))
+            lines.append(muted("- Incident cluster context"))
+            for item in clusters[:_limit_value(4)]:
+                lines.append(
+                    muted(
+                        f"- {_redact_in_text(str(item.get('cluster', '-')))} src={_highlight_public_ips(str(item.get('src', '-')))} "
+                        f"findings={len(item.get('findings', []) if isinstance(item.get('findings', []), list) else [])}"
+                    )
+                )
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Files Security Checks"))
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+    check_labels = [
+        ("reconstruction_confidence", "Reconstruction Confidence"),
+        ("multi_signal_masquerade", "Multi-signal Masquerade"),
+        ("archive_container_abuse", "Archive/Container Abuse"),
+        ("macro_script_lolbas_staging", "Macro/Script/LOLBAS Staging"),
+        ("exfiltration_file_movement", "Exfiltration File Movement"),
+        ("lateral_copy_propagation", "Lateral Copy Propagation"),
+        ("auth_file_correlation", "Auth-to-File Correlation"),
+        ("reputation_or_prevalence_outlier", "Reputation/Prevalence Outliers"),
+    ]
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
+        evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence_items[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+
+            if key in {"multi_signal_masquerade", "archive_container_abuse", "macro_script_lolbas_staging", "exfiltration_file_movement", "lateral_copy_propagation"}:
+                risk = "High"
+                conf_level = "High"
+            elif key in {"auth_file_correlation", "reputation_or_prevalence_outlier"}:
+                risk = "Medium"
+                conf_level = "Medium"
+            else:
+                risk = "Low"
+                conf_level = "Low"
+            matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Files Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
 
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
@@ -7314,6 +10355,55 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
             ])
         lines.append(_format_table(rows))
 
+    if getattr(summary, "lineage_chains", None):
+        chains = list(summary.lineage_chains or [])
+        if chains:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Artifact Lineage Chains"))
+            rows = [["Source", "Steps", "Evidence"]]
+            for item in chains[:effective_limit]:
+                steps = item.get("steps", [])
+                evidence = item.get("evidence", [])
+                rows.append([
+                    _highlight_public_ips(str(item.get("src", "-"))),
+                    _truncate_text("; ".join(str(v) for v in steps[:3]) if isinstance(steps, list) else str(steps), 70),
+                    _truncate_text(", ".join(_redact_in_text(str(v)) for v in evidence[:4]) if isinstance(evidence, list) else _redact_in_text(str(evidence)), 90),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "incident_clusters", None):
+        clusters = list(summary.incident_clusters or [])
+        if clusters:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Incident Clusters"))
+            rows = [["Cluster", "Source", "Artifacts", "Findings", "Confidence"]]
+            for item in clusters[:effective_limit]:
+                findings = item.get("findings", [])
+                rows.append([
+                    str(item.get("cluster", "-")),
+                    _highlight_public_ips(str(item.get("src", "-"))),
+                    str(item.get("artifacts", "-")),
+                    _truncate_text("; ".join(str(v) for v in findings[:3]) if isinstance(findings, list) else str(findings), 76),
+                    str(item.get("confidence", "-")),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "campaign_indicators", None):
+        campaigns = list(summary.campaign_indicators or [])
+        if campaigns:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Shared Campaign Indicators"))
+            rows = [["Indicator", "Value", "Hosts"]]
+            for item in campaigns[:effective_limit]:
+                hosts = item.get("hosts", [])
+                host_text = ", ".join(_highlight_public_ips(str(v)) for v in hosts[:4]) if isinstance(hosts, list) else "-"
+                rows.append([
+                    _truncate_text(str(item.get("indicator", "-")), 42),
+                    _truncate_text(_redact_in_text(str(item.get("value", "-"))), 42),
+                    _truncate_text(host_text or "-", 68),
+                ])
+            lines.append(_format_table(rows))
+
     if summary.extracted:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Extracted Files"))
@@ -7354,11 +10444,21 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
             if details:
                 lines.append(muted(f"  {details}"))
 
+    if getattr(summary, "benign_context", None):
+        notes = [str(v) for v in (summary.benign_context or []) if str(v).strip()]
+        if notes:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("False-Positive Context"))
+            for note in notes[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(note)}"))
+
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
 def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) -> str:
+    # Protocol output is intentionally always full-detail for analyst workflows.
+    verbose = True
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"PROTOCOL & CONVERSATION ANALYSIS :: {summary.path.name}"))
@@ -7369,6 +10469,19 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         lines.append(header("Errors"))
         for err in summary.errors:
             lines.append(danger(f"- {err}"))
+
+    verdict = str(getattr(summary, "analyst_verdict", "") or "")
+    confidence = str(getattr(summary, "analyst_confidence", "") or "").upper()
+    reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or [])]
+    if verdict:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Analyst Verdict"))
+        if confidence:
+            lines.append(_format_kv("Verdict", f"{verdict} (confidence: {confidence})"))
+        else:
+            lines.append(_format_kv("Verdict", verdict))
+        for reason in reasons:
+            lines.append(muted(f"- {reason}"))
 
     lines.append(_format_kv("Total Packets", str(summary.total_packets)))
     lines.append(_format_kv("Duration", format_duration(summary.duration)))
@@ -7399,6 +10512,201 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
             pct = (count / summary.total_packets * 100) if summary.total_packets else 0
             rows.append([name, str(count), f"{pct:.1f}%"])
         lines.append(_format_table(rows))
+
+    checks = dict(getattr(summary, "deterministic_checks", {}) or {})
+    if checks:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Deterministic Protocol Security Checks"))
+        check_labels = {
+            "protocol_identity_mismatch": "Protocol identity mismatch",
+            "anomalous_protocol_sequence": "Anomalous protocol sequence",
+            "boundary_cross_zone_protocol": "Boundary cross-zone protocol",
+            "tunneling_or_encapsulation_signal": "Tunneling/encapsulation signal",
+            "periodic_beacon_profile": "Periodic beacon profile",
+            "role_inversion_signal": "Role inversion signal",
+            "ot_protocol_boundary_crossing": "OT protocol boundary crossing",
+            "rare_or_low_prevalence_protocol": "Rare/low-prevalence protocol",
+            "cross_protocol_corroboration": "Cross-protocol corroboration",
+            "evidence_provenance": "Evidence provenance",
+        }
+        for key, label in check_labels.items():
+            values = [str(v) for v in list(checks.get(key, []) or [])]
+            if values:
+                lines.append(warn(f"[!] {label}: {len(values)}"))
+                for item in values:
+                    lines.append(muted(f"  - {item}"))
+            else:
+                lines.append(ok(f"[ ] {label}: none"))
+
+    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
+    if risk_matrix:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Protocol Risk Matrix"))
+        rows = [["Category", "Risk", "Confidence", "Evidence"]]
+        for row in risk_matrix:
+            if not isinstance(row, dict):
+                continue
+            rows.append([
+                str(row.get("category", "")),
+                str(row.get("risk", "")),
+                str(row.get("confidence", "")),
+                str(row.get("evidence", "")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    corroborated_findings = list(getattr(summary, "corroborated_findings", []) or [])
+    if corroborated_findings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Corroborated Findings"))
+        rows = [["Host", "Score", "Confidence", "Reasons"]]
+        for finding in corroborated_findings:
+            if not isinstance(finding, dict):
+                continue
+            rows.append([
+                str(finding.get("host", "-")),
+                str(finding.get("score", 0)),
+                str(finding.get("confidence", "-")),
+                ", ".join(str(v) for v in list(finding.get("reasons", []) or [])) or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    sequence_profiles = list(getattr(summary, "sequence_profiles", []) or [])
+    if sequence_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Protocol Sequence Integrity"))
+        rows = [["Entity", "Sequence", "Evidence", "Confidence"]]
+        for profile in sequence_profiles:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("entity", "-")),
+                " -> ".join(str(v) for v in list(profile.get("sequence", []) or [])) or "-",
+                str(profile.get("evidence_count", 0)),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    zone_profiles = list(getattr(summary, "zone_protocol_profiles", []) or [])
+    if zone_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Zone Posture (East-West / North-South)"))
+        rows = [["Src", "Dst", "Proto", "Zone", "Packets", "Confidence"]]
+        for profile in zone_profiles:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("src", "-")),
+                str(profile.get("dst", "-")),
+                str(profile.get("protocol", "-")),
+                str(profile.get("zone_pair", "-")),
+                str(profile.get("packets", 0)),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    baseline_profiles = list(getattr(summary, "baseline_drift_profiles", []) or [])
+    if baseline_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Baseline Drift"))
+        rows = [["Protocol", "Baseline", "Current %", "Status"]]
+        for profile in baseline_profiles:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("protocol", "-")),
+                str(profile.get("baseline_prevalence", "-")),
+                str(profile.get("current_prevalence_pct", "-")),
+                str(profile.get("status", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    tunneling_profiles = list(getattr(summary, "tunneling_profiles", []) or [])
+    if tunneling_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Encapsulation/Tunneling Suspicion"))
+        rows = [["Src", "Dst", "Proto", "Avg Payload", "Packets", "Confidence"]]
+        for profile in tunneling_profiles:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("src", "-")),
+                str(profile.get("dst", "-")),
+                str(profile.get("protocol", "-")),
+                str(profile.get("avg_payload", "-")),
+                str(profile.get("packets", 0)),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    beacon_profiles = list(getattr(summary, "beacon_profiles", []) or [])
+    if beacon_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Protocol Cadence Anomalies"))
+        rows = [["Src", "Dst", "Proto", "Packets", "Duration", "PPS"]]
+        for profile in beacon_profiles:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("src", "-")),
+                str(profile.get("dst", "-")),
+                str(profile.get("protocol", "-")),
+                str(profile.get("packets", 0)),
+                str(profile.get("duration_s", "-")),
+                str(profile.get("pps", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    role_profiles = list(getattr(summary, "role_inversion_profiles", []) or [])
+    if role_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Role Drift by Protocol"))
+        rows = [["Host", "Protocol", "Protocol Count", "Zone", "Confidence"]]
+        for profile in role_profiles:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("host", "-")),
+                str(profile.get("protocol", "-")),
+                str(profile.get("protocol_count", 0)),
+                str(profile.get("zone", "-")),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    pivots = list(getattr(summary, "investigation_pivots", []) or [])
+    if pivots:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Hunt Pivots"))
+        rows = [["Conversation", "Protocol", "Packets", "Bytes", "Reasons"]]
+        for pivot in pivots:
+            if not isinstance(pivot, dict):
+                continue
+            rows.append([
+                str(pivot.get("conversation", "-")),
+                str(pivot.get("protocol", "-")),
+                str(pivot.get("packets", 0)),
+                format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
+                ", ".join(str(v) for v in list(pivot.get("reasons", []) or [])) or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    false_positive_context = [
+        str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()
+    ]
+    if false_positive_context:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for item in false_positive_context:
+            lines.append(muted(f"- {item}"))
 
     # 2. Hierarchy
     lines.append(SUBSECTION_BAR)
@@ -7490,7 +10798,7 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
                     item[0][1],
                 ),
             )
-            limit = _limit_value(8)
+            limit = len(grouped_items)
             for (sev, a_type, desc), data in grouped_items[:limit]:
                 sev_color = danger if sev in ("HIGH", "CRITICAL") else warn if sev == "MEDIUM" else muted
                 lines.append(sev_color(f"[{sev}] {a_type}: {desc} (x{data['count']})"))
@@ -7498,8 +10806,6 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
                 if examples:
                     for ex in examples:
                         lines.append(muted(f"  example: {ex}"))
-            if len(grouped_items) > limit:
-                lines.append(muted(f"... {len(grouped_items) - limit} more anomaly patterns (use -v for full list)"))
     else:
         lines.append(SUBSECTION_BAR)
         lines.append(ok("No clear anomalies detected."))
@@ -7508,14 +10814,13 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
     lines.append(SUBSECTION_BAR)
     lines.append(header("Top Conversations (by volume)"))
     
-    sorted_convs = sorted(summary.conversations, key=lambda c: c.bytes, reverse=True)[:_limit_value(10)]
+    sorted_convs = sorted(summary.conversations, key=lambda c: c.bytes, reverse=True)
     
     rows = [["Src", "Dst", "Proto", "Packets", "Bytes", "Duration", "Ports"]]
     for c in sorted_convs:
         # Sort ports by value for consistent display
         ports_list = sorted(list(c.ports))
-        ports_str = ",".join(map(str, ports_list[:_limit_value(4)]))
-        if len(ports_list) > 4: ports_str += "..."
+        ports_str = ",".join(map(str, ports_list))
         
         dur = format_duration(c.end_ts - c.start_ts)
         rows.append([
@@ -7528,10 +10833,10 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         # 5. Top Endpoints
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Endpoints"))
-        sorted_eps = sorted(summary.endpoints, key=lambda e: e.bytes_sent + e.bytes_recv, reverse=True)[:_limit_value(10)]
+        sorted_eps = sorted(summary.endpoints, key=lambda e: e.bytes_sent + e.bytes_recv, reverse=True)
         rows = [["Address", "Sent", "Recv", "Total Bytes", "Protocols"]]
         for e in sorted_eps:
-             protos = ",".join(list(e.protocols)[:_limit_value(4)])
+             protos = ",".join(sorted(str(p) for p in list(e.protocols)))
              rows.append([
                  e.address, 
                  str(e.packets_sent), 
@@ -7542,7 +10847,7 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_services_summary(summary: ServiceSummary) -> str:
@@ -7609,40 +10914,183 @@ def render_services_summary(summary: ServiceSummary) -> str:
     if not summary.risks:
         lines.append(ok("No high-confidence service risks detected."))
     else:
-        if _VERBOSE_OUTPUT:
-            for risk in sorted(summary.risks, key=lambda x: x.severity):
-                sev_color = danger if risk.severity in ("CRITICAL", "HIGH") else warn
-                if risk.severity == "LOW":
-                    sev_color = muted
-                
-                lines.append(sev_color(f"[{risk.severity}] {risk.title}"))
-                lines.append(f"  Target: {risk.affected_asset}")
-                lines.append(muted(f"  Details: {risk.description}"))
-                lines.append("")
+        for risk in sorted(summary.risks, key=lambda x: x.severity):
+            sev_color = danger if risk.severity in ("CRITICAL", "HIGH") else warn
+            if risk.severity == "LOW":
+                sev_color = muted
+            lines.append(sev_color(f"[{risk.severity}] {risk.title}"))
+            lines.append(f"  Target: {risk.affected_asset}")
+            lines.append(muted(f"  Details: {risk.description}"))
+            lines.append("")
+
+    verdict = str(getattr(summary, "analyst_verdict", "") or "")
+    confidence = str(getattr(summary, "analyst_confidence", "") or "").upper()
+    reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or [])]
+    if verdict:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Analyst Verdict"))
+        if confidence:
+            lines.append(_format_kv("Verdict", f"{verdict} (confidence: {confidence})"))
         else:
-            severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-            grouped: dict[tuple[str, str, str], list[str]] = {}
-            for risk in summary.risks:
-                key = (risk.severity, risk.title, risk.description)
-                grouped.setdefault(key, []).append(risk.affected_asset)
+            lines.append(_format_kv("Verdict", verdict))
+        if reasons:
+            for reason in reasons:
+                lines.append(muted(f"- {reason}"))
 
-            def _sort_key(item: tuple[tuple[str, str, str], list[str]]) -> tuple[int, int]:
-                sev = item[0][0]
-                return (severity_order.get(sev, 99), -len(item[1]))
+    checks = dict(getattr(summary, "deterministic_checks", {}) or {})
+    if checks:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Deterministic Service Security Checks"))
+        check_labels = {
+            "service_identity_mismatch": "Service identity mismatch",
+            "rare_or_newly_exposed_service": "Rare/newly exposed service",
+            "lateral_admin_surface": "Lateral admin surface",
+            "public_edge_admin_exposure": "Public edge admin exposure",
+            "service_drift_or_churn": "Service drift/churn",
+            "beacon_or_periodic_service_profile": "Beacon/periodic profile",
+            "ot_it_boundary_mix": "OT/IT boundary mix",
+            "udp_amplification_readiness": "UDP amplification readiness",
+            "legacy_or_weak_service_hygiene": "Legacy/weak hygiene",
+            "evidence_provenance": "Evidence provenance",
+        }
+        for key, label in check_labels.items():
+            values = [str(v) for v in list(checks.get(key, []) or [])]
+            if values:
+                lines.append(warn(f"[!] {label}: {len(values)}"))
+                for item in values:
+                    lines.append(muted(f"  - {item}"))
+            else:
+                lines.append(ok(f"[ ] {label}: none"))
 
-            for (severity, title, desc), assets in sorted(grouped.items(), key=_sort_key)[:_limit_value(12)]:
-                sev_color = danger if severity in ("CRITICAL", "HIGH") else warn
-                if severity == "LOW":
-                    sev_color = muted
-                sample = ", ".join(sorted(set(assets))[:_limit_value(3)])
-                lines.append(sev_color(f"[{severity}] {title} (x{len(assets)})"))
-                if sample:
-                    lines.append(muted(f"  Targets: {sample}"))
-                lines.append(muted(f"  Details: {desc}"))
-                lines.append("")
+    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
+    if risk_matrix:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Service Risk Matrix"))
+        rows = [["Category", "Risk", "Confidence", "Evidence"]]
+        for row in risk_matrix:
+            if not isinstance(row, dict):
+                continue
+            rows.append([
+                str(row.get("category", "")),
+                str(row.get("risk", "")),
+                str(row.get("confidence", "")),
+                str(row.get("evidence", "")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    mismatch_profiles = list(getattr(summary, "service_mismatch_profiles", []) or [])
+    if mismatch_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Service Mismatch Profiles"))
+        rows = [["Asset", "Service", "Software", "Reasons"]]
+        for profile in mismatch_profiles:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("asset", "-")),
+                str(profile.get("service", "-")),
+                str(profile.get("software", "-")),
+                ", ".join(str(v) for v in list(profile.get("reasons", []) or [])) or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    drift_profiles = list(getattr(summary, "service_drift_profiles", []) or [])
+    if drift_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Service Drift Profiles"))
+        rows = [["Host", "Service", "Ports", "Banner Count"]]
+        for profile in drift_profiles:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("host", "-")),
+                str(profile.get("service", "-")),
+                ",".join(str(v) for v in list(profile.get("ports", []) or [])) or "-",
+                str(profile.get("banner_count", 0)),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    lateral_profiles = list(getattr(summary, "lateral_surface_profiles", []) or [])
+    if lateral_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Lateral Surface Profiles"))
+        rows = [["Host", "Admin Ports", "Count", "Confidence"]]
+        for profile in lateral_profiles:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("host", "-")),
+                ",".join(str(v) for v in list(profile.get("admin_ports", []) or [])) or "-",
+                str(profile.get("admin_port_count", 0)),
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    boundary_profiles = list(getattr(summary, "boundary_exposure_profiles", []) or [])
+    if boundary_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Boundary Exposure Profiles"))
+        rows = [["Asset", "Service", "Clients", "Packets"]]
+        for profile in boundary_profiles:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("asset", "-")),
+                str(profile.get("service", "-")),
+                str(profile.get("clients", 0)),
+                str(profile.get("packets", 0)),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    ot_it_profiles = list(getattr(summary, "ot_it_crossing_profiles", []) or [])
+    if ot_it_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OT/IT Crossing Profiles"))
+        rows = [["Host", "OT Ports", "Admin Ports", "Confidence"]]
+        for profile in ot_it_profiles:
+            if not isinstance(profile, dict):
+                continue
+            rows.append([
+                str(profile.get("host", "-")),
+                ",".join(str(v) for v in list(profile.get("ot_ports", []) or [])) or "-",
+                ",".join(str(v) for v in list(profile.get("admin_ports", []) or [])) or "-",
+                str(profile.get("confidence", "-")),
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    pivots = list(getattr(summary, "investigation_pivots", []) or [])
+    if pivots:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Hunt Pivots"))
+        rows = [["Asset", "Service", "Clients", "Packets", "Reasons"]]
+        for pivot in pivots:
+            if not isinstance(pivot, dict):
+                continue
+            rows.append([
+                str(pivot.get("asset", "-")),
+                str(pivot.get("service", "-")),
+                str(pivot.get("clients", 0)),
+                str(pivot.get("packets", 0)),
+                ", ".join(str(v) for v in list(pivot.get("reasons", []) or [])) or "-",
+            ])
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
+    if false_positive_context:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for item in false_positive_context:
+            lines.append(muted(f"- {item}"))
 
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
@@ -8729,6 +12177,171 @@ def render_creds_summary(summary: CredentialSummary, show_secrets: bool = False)
     lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
     lines.append(_format_kv("Matches", str(summary.matches)))
 
+    def _creds_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        high_conf = int(getattr(summary, "confidence_counts", Counter()).get("high", 0))
+        medium_conf = int(getattr(summary, "confidence_counts", Counter()).get("medium", 0))
+        if high_conf:
+            score += min(3, high_conf)
+            reasons.append(f"High-confidence credential exposures observed ({high_conf})")
+        if medium_conf >= 3:
+            score += 1
+            reasons.append(f"Multiple medium-confidence exposures observed ({medium_conf})")
+        if getattr(summary, "auth_abuse_sequences", None):
+            score += 2
+            reasons.append(f"Authentication abuse sequence indicators observed ({len(summary.auth_abuse_sequences)})")
+        if getattr(summary, "replay_candidates", None):
+            score += 2
+            reasons.append(f"Credential replay candidates observed ({len(summary.replay_candidates)})")
+        if getattr(summary, "token_fanout", None):
+            score += 2
+            reasons.append(f"Token fan-out misuse observed ({len(summary.token_fanout)})")
+        if getattr(summary, "privileged_exposures", None):
+            score += 2
+            reasons.append(f"Privileged-account credential exposure observed ({len(summary.privileged_exposures)})")
+        if getattr(summary, "external_exposures", None):
+            score += 1
+            reasons.append(f"Credential material exposed to public destinations ({len(summary.external_exposures)})")
+
+        if score >= 8:
+            verdict = "YES - high-confidence credential compromise exposure is present."
+            confidence = "High"
+        elif score >= 5:
+            verdict = "LIKELY - significant credential exposure risk is present."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - weak-to-moderate credential exposure indicators are present."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing high-risk credential exposure pattern from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence credential exposure heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _creds_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Reasons:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Credential Security Checks"))
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+    check_labels = [
+        ("plaintext_credential_exposure", "Plaintext Credential Exposure"),
+        ("auth_abuse_pattern", "Authentication Abuse Pattern"),
+        ("credential_replay", "Credential Replay Behavior"),
+        ("privileged_account_exposure", "Privileged Account Exposure"),
+        ("token_misuse_fanout", "Token Misuse/Fan-out"),
+        ("external_destination_exposure", "External Destination Exposure"),
+        ("likely_benign_test_credentials", "Likely Benign Test Credentials"),
+    ]
+
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
+        evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            if key == "likely_benign_test_credentials":
+                lines.append(ok(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                matrix_rows.append([label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"])
+            else:
+                lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                risk = "High" if key in {"auth_abuse_pattern", "credential_replay", "token_misuse_fanout", "privileged_account_exposure"} else "Medium"
+                conf = "High" if key in {"credential_replay", "token_misuse_fanout"} else "Medium"
+                matrix_rows.append([label_text, risk, conf, f"{len(evidence_items)} signal(s)"])
+            for item in evidence_items[:_limit_value(8 if show_secrets else 5)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Credential Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
+
+    if getattr(summary, "auth_abuse_sequences", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Authentication Abuse Sequences"))
+        rows = [["Source", "Events", "Users", "Targets"]]
+        for item in summary.auth_abuse_sequences[:_limit_value(12)]:
+            rows.append([
+                str(item.get("src", "-")),
+                str(item.get("events", "-")),
+                str(item.get("users", "-")),
+                str(item.get("dsts", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if getattr(summary, "replay_candidates", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Credential Replay Candidates"))
+        rows = [["Type", "Value", "Destinations", "Top Targets"]]
+        for item in summary.replay_candidates[:_limit_value(12)]:
+            dsts = item.get("dsts", [])
+            dst_text = ", ".join(str(v) for v in dsts[:_limit_value(4)]) if isinstance(dsts, list) else str(dsts)
+            rows.append([
+                str(item.get("type", "-")),
+                _truncate_text(str(item.get("value", "-")), 28),
+                str(item.get("dst_count", "-")),
+                dst_text or "-",
+            ])
+        lines.append(_format_table(rows))
+
+    if getattr(summary, "token_fanout", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Token Fan-out Misuse"))
+        rows = [["Token", "Destinations", "Top Targets"]]
+        for item in summary.token_fanout[:_limit_value(12)]:
+            dsts = item.get("dsts", [])
+            dst_text = ", ".join(str(v) for v in dsts[:_limit_value(4)]) if isinstance(dsts, list) else str(dsts)
+            rows.append([
+                _truncate_text(str(item.get("token", "-")), 28),
+                str(item.get("dst_count", "-")),
+                dst_text or "-",
+            ])
+        lines.append(_format_table(rows))
+
+    if getattr(summary, "privileged_exposures", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Privileged Account Exposures"))
+        rows = [["User", "Source", "Destination", "Type", "Packet"]]
+        for item in summary.privileged_exposures[:_limit_value(12)]:
+            rows.append([
+                str(item.get("user", "-")),
+                str(item.get("src", "-")),
+                str(item.get("dst", "-")),
+                str(item.get("kind", "-")),
+                str(item.get("pkt", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if getattr(summary, "external_exposures", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("External Destination Exposures"))
+        rows = [["Source", "Destination", "Type", "User", "Packet"]]
+        for item in summary.external_exposures[:_limit_value(12)]:
+            rows.append([
+                str(item.get("src", "-")),
+                str(item.get("dst", "-")),
+                str(item.get("kind", "-")),
+                str(item.get("user", "-")),
+                str(item.get("pkt", "-")),
+            ])
+        lines.append(_format_table(rows))
+
     if summary.kind_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Match Types"))
@@ -8849,6 +12462,156 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
     lines.append(_format_kv("TLS Packets", str(summary.tls_packets)))
     lines.append(_format_kv("Certificates", str(summary.cert_count)))
 
+    def _cert_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        if summary.weak_keys:
+            score += min(2, len(summary.weak_keys))
+            reasons.append(f"Weak key certificates detected ({len(summary.weak_keys)})")
+        if summary.weak_signatures:
+            score += min(2, len(summary.weak_signatures))
+            reasons.append(f"Weak signature algorithms detected ({len(summary.weak_signatures)})")
+        if summary.expired:
+            score += 1
+            reasons.append(f"Expired/invalid certificates detected ({len(summary.expired)})")
+        if summary.eku_mismatches or summary.key_usage_issues:
+            score += 1
+            reasons.append("EKU/KeyUsage mismatches observed")
+        if summary.name_mismatches:
+            score += 1
+            reasons.append(f"Name/SAN mismatches observed ({len(summary.name_mismatches)})")
+        if summary.issuer_impersonation:
+            score += 2
+            reasons.append(f"Issuer/SAN impersonation signals observed ({len(summary.issuer_impersonation)})")
+        if summary.fingerprint_reuse or summary.serial_reuse:
+            score += 1
+            reasons.append("Fingerprint/serial reuse across contexts observed")
+
+        if score >= 7:
+            verdict = "YES - high-confidence certificate security risks or interception indicators are present."
+            confidence = "High"
+        elif score >= 4:
+            verdict = "LIKELY - significant certificate anomalies are present and require investigation."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - certificate anomalies are present; corroboration recommended."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing high-risk certificate abuse pattern from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence certificate threat heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _cert_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(10)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Certificate Security Checks"))
+
+    checks: list[tuple[str, list[dict[str, object]]]] = [
+        ("Chain/Trust Gaps", list(getattr(summary, "chain_gaps", []) or [])),
+        ("Weak Signature Algorithms", list(getattr(summary, "weak_signatures", []) or [])),
+        ("EKU/KeyUsage Mismatch", list(getattr(summary, "eku_mismatches", []) or []) + list(getattr(summary, "key_usage_issues", []) or [])),
+        ("Name/SAN Mismatch", list(getattr(summary, "name_mismatches", []) or [])),
+        ("Validity Outliers", list(getattr(summary, "validity_outliers", []) or [])),
+        ("Issuer/SAN Impersonation", list(getattr(summary, "issuer_impersonation", []) or [])),
+        ("Fingerprint/Serial Reuse", list(getattr(summary, "fingerprint_reuse", []) or []) + list(getattr(summary, "serial_reuse", []) or [])),
+        ("Revocation Posture Gaps", list(getattr(summary, "revocation_gaps", []) or [])),
+    ]
+
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for label_text, evidence_items in checks:
+        lines.append(label(label_text))
+        if evidence_items:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence_items[:_limit_value(6)]:
+                if isinstance(item, dict):
+                    if "subject" in item and "reason" in item:
+                        ev = f"subject={item.get('subject')} reason={item.get('reason')} src={item.get('src', '-')} dst={item.get('dst', '-')}"
+                    elif "sha256" in item:
+                        ev = f"sha256={item.get('sha256')} contexts={item.get('count')}"
+                    elif "serial" in item:
+                        ev = f"serial={item.get('serial')} contexts={item.get('count')}"
+                    else:
+                        ev = ", ".join(f"{k}={v}" for k, v in item.items())
+                else:
+                    ev = str(item)
+                lines.append(muted(f"- {_redact_in_text(ev)}"))
+
+            if label_text in {"Weak Signature Algorithms", "Issuer/SAN Impersonation", "Fingerprint/Serial Reuse"}:
+                matrix_rows.append([label_text, "High", "High", f"{len(evidence_items)} signal(s)"])
+            elif label_text in {"Chain/Trust Gaps", "EKU/KeyUsage Mismatch", "Name/SAN Mismatch", "Validity Outliers"}:
+                matrix_rows.append([label_text, "Medium", "Medium", f"{len(evidence_items)} signal(s)"])
+            else:
+                matrix_rows.append([label_text, "Low", "Low", f"{len(evidence_items)} signal(s)"])
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Certificate Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
+
+    endpoint_profiles = list(getattr(summary, "endpoint_profiles", []) or [])
+    if endpoint_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Endpoint Certificate Profiles"))
+        rows = [["Endpoint", "Certs", "Subjects", "Issuers", "Flows", "Latest NotAfter"]]
+        for item in endpoint_profiles[:_limit_value(12)]:
+            rows.append([
+                str(item.get("endpoint", "-")),
+                str(item.get("fingerprints", "-")),
+                str(item.get("subjects", "-")),
+                str(item.get("issuers", "-")),
+                str(item.get("flows", "-")),
+                str(item.get("latest_not_after", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    timeline = list(getattr(summary, "timeline", []) or [])
+    if timeline:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Certificate Timeline"))
+        rows = [["Event", "Subject", "Issuer", "Src", "Dst", "NotAfter"]]
+        for item in timeline[:_limit_value(15)]:
+            rows.append([
+                str(item.get("event", "-")),
+                _truncate_text(str(item.get("subject", "-")), 48),
+                _truncate_text(str(item.get("issuer", "-")), 48),
+                str(item.get("src", "-")),
+                str(item.get("dst", "-")),
+                str(item.get("not_after", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Actionable Hunting Pivots"))
+        rows = [["SHA256", "Serial", "Subject", "Issuer", "SAN", "Flow"]]
+        for cert in summary.artifacts[:_limit_value(12)]:
+            rows.append([
+                cert.sha256[:12],
+                cert.serial,
+                _truncate_text(cert.subject, 30),
+                _truncate_text(cert.issuer, 30),
+                _truncate_text(cert.san, 24),
+                f"{cert.src_ip}->{cert.dst_ip}",
+            ])
+        lines.append(_format_table(rows))
+
     if summary.subjects:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Subjects"))
@@ -8958,6 +12721,163 @@ def render_health_summary(summary: HealthSummary) -> str:
         lines.append(header("Errors"))
         for err in summary.errors:
             lines.append(danger(f"- {err}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    verdict = summary.analyst_verdict or "NO STRONG SIGNAL - no convincing high-confidence health risk pattern from current heuristics"
+    confidence = (summary.analyst_confidence or "low").strip().lower()
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", confidence.capitalize()))
+    if summary.analyst_reasons:
+        lines.append(muted("Why confidence:"))
+        for reason in summary.analyst_reasons[:_limit_value(8)]:
+            lines.append(muted(f"- {_redact_in_text(str(reason))}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Health Security Checks"))
+    checks = summary.deterministic_checks or {}
+    check_labels = [
+        ("syn_scan_or_exhaustion", "SYN Scan or Service Exhaustion"),
+        ("tcp_reset_storm", "TCP Reset Storm"),
+        ("persistent_zero_window", "Persistent Zero-Window"),
+        ("udp_reflection_amplification", "UDP Reflection/Amplification"),
+        ("qos_marking_anomaly", "QoS Marking Anomaly"),
+        ("snmp_exposure_risk", "SNMP Exposure Risk"),
+        ("ot_cycle_instability", "OT Cycle-Time Instability"),
+        ("certificate_hygiene_risk", "Certificate Hygiene Risk"),
+        ("sequence_degradation_chain", "Sequence Degradation Chain"),
+        ("zone_policy_drift", "Peer Trust Zoning Drift"),
+        ("evidence_provenance", "Evidence Provenance"),
+    ]
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence_items = [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence_items[:_limit_value(6)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+            risk = "High" if key in {"udp_reflection_amplification", "snmp_exposure_risk", "ot_cycle_instability", "sequence_degradation_chain"} else "Medium"
+            conf = "High" if key in {"snmp_exposure_risk", "evidence_provenance"} else "Medium"
+            matrix_rows.append([label_text, risk, conf, f"{len(evidence_items)} signal(s)"])
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Health Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
+
+    sequence_rows = list(getattr(summary, "sequence_findings", []) or [])
+    if sequence_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Sequence-Based Degradation Checks"))
+        rows = [["Sequence", "Confidence", "Details"]]
+        for item in sequence_rows[:_limit_value(10)]:
+            rows.append([
+                str(item.get("sequence", "-")),
+                str(item.get("confidence", "-")).upper(),
+                _truncate_text(str(item.get("details", "-")), 90),
+            ])
+        lines.append(_format_table(rows))
+
+    host_rows = list(getattr(summary, "host_risk_profiles", []) or [])
+    if host_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Per-Host Risk Profiles"))
+        rows = [["Host", "Score", "Severity", "Confidence", "SYN", "RST", "ZeroWin", "Targets", "Reasons"]]
+        for item in host_rows[:_limit_value(12)]:
+            reasons = item.get("reasons", [])
+            reason_text = " | ".join(str(v) for v in reasons[:3]) if isinstance(reasons, list) else str(reasons)
+            rows.append([
+                str(item.get("host", "-")),
+                str(item.get("score", "-")),
+                str(item.get("severity", "-")).upper(),
+                str(item.get("confidence", "-")).upper(),
+                str(item.get("syn", "-")),
+                str(item.get("rst", "-")),
+                str(item.get("zero_window", "-")),
+                str(item.get("targets", "-")),
+                _truncate_text(reason_text or "-", 72),
+            ])
+        lines.append(_format_table(rows))
+
+    outlier_rows = list(getattr(summary, "outlier_windows", []) or [])
+    if outlier_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Temporal Outlier Windows"))
+        rows = [["Metric", "Window Start", "Window End", "Value", "Baseline", "Threshold", "Sample"]]
+        for item in outlier_rows[:_limit_value(12)]:
+            rows.append([
+                str(item.get("metric", "-")),
+                format_ts(item.get("window_start")),
+                format_ts(item.get("window_end")),
+                str(item.get("value", "-")),
+                str(item.get("baseline", "-")),
+                str(item.get("threshold", "-")),
+                _truncate_text(str(item.get("sample", "-")), 72),
+            ])
+        lines.append(_format_table(rows))
+
+    snmp_rows = list(getattr(summary, "snmp_risks", []) or [])
+    if snmp_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("SNMP Security Analytics"))
+        rows = [["Risk", "Details"]]
+        for item in snmp_rows[:_limit_value(10)]:
+            rows.append([
+                str(item.get("risk", "-")),
+                _truncate_text(str(item.get("details", "-")), 96),
+            ])
+        lines.append(_format_table(rows))
+
+    ot_rows = list(getattr(summary, "ot_risk_profiles", []) or [])
+    if ot_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OT Health Safety Checks"))
+        rows = [["Family", "Session", "Avg(s)", "Std(s)", "CV", "Samples", "Severity"]]
+        for item in ot_rows[:_limit_value(10)]:
+            rows.append([
+                str(item.get("family", "-")),
+                _truncate_text(str(item.get("session", "-")), 44),
+                f"{float(item.get('avg', 0.0)):.3f}",
+                f"{float(item.get('std', 0.0)):.3f}",
+                f"{float(item.get('cv', 0.0)):.2f}",
+                str(item.get("count", "-")),
+                str(item.get("severity", "-")).upper(),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.zone_anomalies:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Peer Trust Zoning Checks"))
+        for item in summary.zone_anomalies[:_limit_value(10)]:
+            lines.append(muted(f"- {_redact_in_text(str(item))}"))
+
+    anchors = list(getattr(summary, "evidence_anchors", []) or [])
+    if anchors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Evidence Anchors"))
+        rows = [["Packet", "Signal", "Details"]]
+        for item in anchors[:_limit_value(12)]:
+            rows.append([
+                str(item.get("packet", "-")),
+                str(item.get("signal", "-")),
+                _truncate_text(str(item.get("details", "-")), 88),
+            ])
+        lines.append(_format_table(rows))
+
+    benign = list(getattr(summary, "benign_context", []) or [])
+    if benign:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for item in benign[:_limit_value(8)]:
+            lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Retransmissions"))
@@ -9083,7 +13003,12 @@ def render_health_summary(summary: HealthSummary) -> str:
 
 
 def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verbose: bool = False) -> str:
-    limit = _apply_verbose_limit(limit)
+    # Analyst-heavy output: always render full detail regardless of -v.
+    limit = _FULL_OUTPUT_LIMIT
+    verbose = True
+    _limit_value = lambda value: _FULL_OUTPUT_LIMIT
+    _truncate_text = lambda text, max_len=0: str(text)
+
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"COMPROMISE ASSESSMENT :: {summary.path.name}"))
@@ -9100,11 +13025,207 @@ def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verb
     lines.append(_format_kv("Total Hosts", str(summary.total_hosts)))
     lines.append(_format_kv("Compromised Hosts", str(len(summary.compromised_hosts))))
 
+    def _compromised_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        high_hosts = [host for host in summary.compromised_hosts if host.severity in {"high", "critical"}]
+        if high_hosts:
+            score += min(4, len(high_hosts))
+            reasons.append(f"High-severity compromised hosts identified ({len(high_hosts)})")
+        if getattr(summary, "incidents", None):
+            score += 1
+            reasons.append(f"Incident clusters detected ({len(summary.incidents)})")
+        if getattr(summary, "campaigns", None):
+            score += 2
+            reasons.append(f"Shared campaign indicators across hosts ({len(summary.campaigns)})")
+
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+        staged = checks.get("multi_stage_sequence", []) if isinstance(checks, dict) else []
+        if staged:
+            score += 2
+            reasons.append(f"Multi-stage compromise sequencing observed ({len(staged)})")
+
+        if score >= 7:
+            verdict = "YES - high-confidence host compromise activity is present."
+            confidence = "High"
+        elif score >= 4:
+            verdict = "LIKELY - multiple compromise indicators are present."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - weak-to-moderate compromise indicators are present."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing high-confidence compromise pattern from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence compromise heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _compromised_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    # Add concrete evidence context directly in the verdict block for analyst triage.
+    if summary.compromised_hosts:
+        lines.append(muted("Who:"))
+        lines.append(muted("- Compromised hosts"))
+        for host in summary.compromised_hosts[:_limit_value(8)]:
+            lines.append(
+                muted(
+                    f"- {(host.hostname or '-')} ({host.ip}) severity={host.severity} "
+                    f"score={host.score} detected={format_ts(host.detection_time)}"
+                )
+            )
+
+    incidents = list(getattr(summary, "incidents", []) or [])
+    if incidents:
+        lines.append(muted("When:"))
+        lines.append(muted("- Incident clusters"))
+        for item in incidents[:_limit_value(8)]:
+            stages = item.get("stages", [])
+            stage_text = ",".join(str(v) for v in stages[:5]) if isinstance(stages, list) else str(stages)
+            lines.append(
+                muted(
+                    f"- host={item.get('ip', '-')} events={item.get('count', '-')} "
+                    f"window={format_ts(item.get('first_ts'))}..{format_ts(item.get('last_ts'))} "
+                    f"stages={stage_text or '-'}"
+                )
+            )
+
+    campaigns = list(getattr(summary, "campaigns", []) or [])
+    if campaigns:
+        lines.append(muted("What:"))
+        lines.append(muted("- Shared campaign indicators"))
+        for item in campaigns[:_limit_value(8)]:
+            hosts = item.get("hosts", [])
+            host_text = ", ".join(str(v) for v in hosts[:_limit_value(5)]) if isinstance(hosts, list) else str(hosts)
+            lines.append(
+                muted(
+                    f"- {item.get('campaign_id', '-')} ioc={_redact_in_text(str(item.get('ioc', '-')))} "
+                    f"host_count={item.get('host_count', '-')} hosts={host_text or '-'}"
+                )
+            )
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Compromise Checks"))
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+    check_labels = [
+        ("credential_abuse", "Credential Abuse Evidence"),
+        ("beacon_c2", "Beacon/C2 Evidence"),
+        ("exfiltration", "Exfiltration Evidence"),
+        ("lateral_movement", "Lateral Movement Evidence"),
+        ("multi_stage_sequence", "Multi-Stage Sequence Evidence"),
+        ("high_confidence_ioc", "High-Confidence IOC Correlation"),
+        ("benign_automation_likely", "Likely Benign Automation"),
+    ]
+
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
+        evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            if key == "benign_automation_likely":
+                lines.append(ok(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                risk = "Low"
+                conf_level = "Medium"
+            else:
+                lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                risk = "High" if key in {"multi_stage_sequence", "high_confidence_ioc"} else "Medium"
+                conf_level = "High" if key in {"multi_stage_sequence", "high_confidence_ioc"} else "Medium"
+            for item in evidence_items[:_limit_value(8 if verbose else 5)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+            matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Compromise Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
+
+    priority_rows = list(getattr(summary, "host_priority", []) or [])
+    if priority_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Host Priority Queue"))
+        rows = [["Host", "IP", "Score", "Severity", "Stages", "IOC Count", "Detection Time"]]
+        for item in priority_rows[:limit]:
+            stages = item.get("stages", [])
+            stage_text = ",".join(stages) if isinstance(stages, list) else str(stages)
+            rows.append([
+                str(item.get("host", "-")),
+                str(item.get("ip", "-")),
+                str(item.get("score", "-")),
+                str(item.get("severity", "-")),
+                stage_text or "-",
+                str(item.get("ioc_count", "-")),
+                format_ts(item.get("detection_time")),
+            ])
+        lines.append(_format_table(rows))
+
+    incidents = list(getattr(summary, "incidents", []) or [])
+    if incidents:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Incident Timeline"))
+        rows = [["Host IP", "First", "Last", "Events", "Stages", "Duration"]]
+        for item in incidents[:limit]:
+            first_ts = item.get("first_ts")
+            last_ts = item.get("last_ts")
+            duration = None
+            if isinstance(first_ts, (int, float)) and isinstance(last_ts, (int, float)):
+                duration = max(0.0, float(last_ts) - float(first_ts))
+            stages = item.get("stages", [])
+            rows.append([
+                str(item.get("ip", "-")),
+                format_ts(first_ts),
+                format_ts(last_ts),
+                str(item.get("count", "-")),
+                ",".join(str(v) for v in stages) if isinstance(stages, list) else str(stages),
+                format_duration(duration),
+            ])
+        lines.append(_format_table(rows))
+
+    campaigns = list(getattr(summary, "campaigns", []) or [])
+    if campaigns:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Campaign Correlation"))
+        rows = [["Campaign", "Shared IOC", "Host Count", "Hosts"]]
+        for item in campaigns[:limit]:
+            hosts = item.get("hosts", [])
+            host_text = ", ".join(str(v) for v in hosts[:_limit_value(4)]) if isinstance(hosts, list) else str(hosts)
+            if isinstance(hosts, list) and len(hosts) > _limit_value(4):
+                host_text += "..."
+            rows.append([
+                str(item.get("campaign_id", "-")),
+                _truncate_text(str(item.get("ioc", "-")), 48),
+                str(item.get("host_count", "-")),
+                host_text or "-",
+            ])
+        lines.append(_format_table(rows))
+
+    benign_context = list(getattr(summary, "benign_context", []) or [])
+    if benign_context:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for item in benign_context[:_limit_value(10 if verbose else 6)]:
+            lines.append(muted(f"- {_redact_in_text(str(item))}"))
+
     if not summary.compromised_hosts:
         lines.append(SUBSECTION_BAR)
         lines.append(ok("No hosts met compromise thresholds based on available evidence."))
         lines.append(SECTION_BAR)
-        return _finalize_output(lines)
+        return _finalize_output(lines, show_truncation_note=False)
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Compromised Hosts"))
@@ -9131,7 +13252,7 @@ def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verb
     lines.append(muted("- Evidence and IOCs are extracted from high-signal detections (beaconing, exfil, creds, threats)."))
 
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = False) -> str:
@@ -9164,6 +13285,69 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
     lines.append(_format_kv("Hosts w/ Hostname", str(with_hostnames)))
     lines.append(_format_kv("Hosts w/ OS Guess", str(with_os)))
     lines.append(_format_kv("Total Host Traffic", format_bytes_as_mb(total_bytes)))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    verdict = str(getattr(summary, "analyst_verdict", "") or "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE HOST RISK PATTERN")
+    confidence = str(getattr(summary, "analyst_confidence", "low") or "low").capitalize()
+    reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or []) if str(v).strip()]
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", confidence))
+    lines.append(muted("Why confidence:"))
+    for reason in reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Host Security Checks"))
+    check_labels = [
+        ("host_role_impersonation_or_drift", "Host Role Impersonation or Drift"),
+        ("east_west_lateral_fanout", "East-West Lateral Fan-out"),
+        ("service_exposure_risk", "Service Exposure Risk"),
+        ("identity_drift_or_collision", "Identity Drift or Collision"),
+        ("protocol_consistency_mismatch", "Protocol Consistency Mismatch"),
+        ("boundary_cross_zone_exposure", "Boundary Cross-Zone Exposure"),
+        ("beacon_or_periodic_profile", "Beacon or Periodic Profile"),
+        ("ot_it_boundary_crossing", "OT/IT Boundary Crossing"),
+        ("evidence_provenance", "Evidence Provenance"),
+    ]
+    for key, label_text in check_labels:
+        lines.append(label(label_text))
+        values = [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
+        if values:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for value in values[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(value)}"))
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Host Risk Matrix"))
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    matrix_items = list(getattr(summary, "risk_matrix", []) or [])
+    if matrix_items:
+        for item in matrix_items[:_limit_value(12)]:
+            matrix_rows.append([
+                str(item.get("category", "-")),
+                str(item.get("risk", "-")),
+                str(item.get("confidence", "-")),
+                str(item.get("evidence", "-")),
+            ])
+    else:
+        for key, label_text in check_labels[:6]:
+            evidence_count = len([str(v) for v in list(checks.get(key, []) or []) if str(v).strip()])
+            matrix_rows.append([
+                label_text,
+                "Medium" if evidence_count else "None",
+                "Medium" if evidence_count else "Low",
+                str(evidence_count) if evidence_count else "No matching detections",
+            ])
+    lines.append(_format_table(matrix_rows))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Host Table"))
@@ -9220,6 +13404,111 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
         if not verbose and len(summary.hosts) > limit:
             lines.append(muted(f"... {len(summary.hosts) - limit} additional hosts"))
 
+    host_risks = list(getattr(summary, "host_risk_profiles", []) or [])
+    if host_risks:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Priority Host Queue"))
+        rows = [["Host", "Score", "Severity", "Confidence", "OS", "Reasons"]]
+        for item in host_risks[:_limit_value(limit if verbose else 15)]:
+            reasons_val = item.get("reasons", [])
+            rows.append([
+                str(item.get("host", "-")),
+                str(item.get("score", "-")),
+                str(item.get("severity", "-")),
+                str(item.get("confidence", "-")),
+                _truncate_text(str(item.get("os", "-")), 32),
+                _truncate_text(", ".join(str(v) for v in (reasons_val[:3] if isinstance(reasons_val, list) else [])) or "-", 90),
+            ])
+        lines.append(_format_table(rows))
+
+    lateral_profiles = list(getattr(summary, "lateral_movement_profiles", []) or [])
+    if lateral_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Lateral Movement Analytics"))
+        rows = [["Host", "Admin Ports", "Port Count", "Confidence"]]
+        for item in lateral_profiles[:_limit_value(limit if verbose else 12)]:
+            ports = item.get("admin_ports", [])
+            rows.append([
+                str(item.get("host", "-")),
+                ", ".join(str(v) for v in (ports[:8] if isinstance(ports, list) else [])) or "-",
+                str(item.get("admin_port_count", "-")),
+                str(item.get("confidence", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    role_drift = list(getattr(summary, "role_drift_profiles", []) or [])
+    if role_drift:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Role Drift Profiles"))
+        rows = [["Host", "Roles", "Hostnames", "Admin Ports", "OS"]]
+        for item in role_drift[:_limit_value(limit if verbose else 12)]:
+            roles = item.get("roles", [])
+            hostnames = item.get("hostnames", [])
+            admin_ports = item.get("admin_ports", [])
+            rows.append([
+                str(item.get("host", "-")),
+                _truncate_text(", ".join(str(v) for v in (roles[:4] if isinstance(roles, list) else [])) or "-", 50),
+                _truncate_text(", ".join(str(v) for v in (hostnames[:3] if isinstance(hostnames, list) else [])) or "-", 70),
+                _truncate_text(", ".join(str(v) for v in (admin_ports[:8] if isinstance(admin_ports, list) else [])) or "-", 40),
+                _truncate_text(str(item.get("os", "-")), 28),
+            ])
+        lines.append(_format_table(rows))
+
+    identity_drift = list(getattr(summary, "identity_drift_profiles", []) or [])
+    if identity_drift:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Identity Drift Profiles"))
+        rows = [["Hostname", "Host Count", "Hosts"]]
+        for item in identity_drift[:_limit_value(limit if verbose else 12)]:
+            hosts = item.get("hosts", [])
+            rows.append([
+                _truncate_text(str(item.get("hostname", "-")), 50),
+                str(item.get("host_count", "-")),
+                _truncate_text(", ".join(str(v) for v in (hosts[:6] if isinstance(hosts, list) else [])) or "-", 90),
+            ])
+        lines.append(_format_table(rows))
+
+    clusters = list(getattr(summary, "incident_clusters", []) or [])
+    if clusters:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Incident Clusters"))
+        rows = [["Cluster", "Host", "Indicators", "Targets", "Confidence"]]
+        for item in clusters[:_limit_value(limit if verbose else 12)]:
+            indicators = item.get("indicators", [])
+            rows.append([
+                str(item.get("cluster", "-")),
+                str(item.get("host", "-")),
+                str(len(indicators) if isinstance(indicators, list) else 0),
+                str(item.get("target_count", "-")),
+                str(item.get("confidence", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    pivots = list(getattr(summary, "investigation_pivots", []) or [])
+    if pivots:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Hunt Pivots"))
+        rows = [["Host", "Hostnames", "OS", "Ports", "Why"]]
+        for item in pivots[:_limit_value(limit if verbose else 12)]:
+            hostnames = item.get("hostnames", [])
+            ports = item.get("ports", [])
+            reasons_val = item.get("reasons", [])
+            rows.append([
+                str(item.get("host", "-")),
+                _truncate_text(", ".join(str(v) for v in (hostnames[:3] if isinstance(hostnames, list) else [])) or "-", 60),
+                _truncate_text(str(item.get("os", "-")), 28),
+                _truncate_text(", ".join(str(v) for v in (ports[:6] if isinstance(ports, list) else [])) or "-", 80),
+                _truncate_text(", ".join(str(v) for v in (reasons_val[:3] if isinstance(reasons_val, list) else [])) or "-", 90),
+            ])
+        lines.append(_format_table(rows))
+
+    false_positive = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
+    if false_positive:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for note in false_positive[:_limit_value(8)]:
+            lines.append(muted(f"- {_redact_in_text(note)}"))
+
     if verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("OS Evidence"))
@@ -9270,6 +13559,69 @@ def render_hostname_summary(summary: HostnameSummary, limit: int = 25, verbose: 
     lines.append(_format_kv("Hostnames Found", str(len({item.hostname for item in summary.findings}))))
     lines.append(_format_kv("Evidence Rows", str(sum(item.count for item in summary.findings))))
 
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    verdict = str(getattr(summary, "analyst_verdict", "") or "NO STRONG SIGNAL - NO CONVINCING HOSTNAME ABUSE PATTERN FROM CURRENT HEURISTICS")
+    confidence = str(getattr(summary, "analyst_confidence", "low") or "low").capitalize()
+    reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or []) if str(v).strip()]
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", confidence))
+    lines.append(muted("Why confidence:"))
+    for reason in reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Hostname Security Checks"))
+    check_labels = [
+        ("hostname_collision_or_spoofing", "Hostname Collision or Spoofing"),
+        ("ip_alias_or_fronting_anomaly", "IP Alias or Fronting Anomaly"),
+        ("cross_protocol_corroboration", "Cross-Protocol Corroboration"),
+        ("hostname_temporal_drift", "Hostname Temporal Drift"),
+        ("protocol_identity_mismatch", "Protocol Identity Mismatch"),
+        ("ad_naming_privilege_abuse", "AD/Privileged Naming Abuse"),
+        ("suspicious_naming_pattern", "Suspicious Naming Pattern"),
+        ("boundary_leak_or_cross_zone", "Boundary Leakage/Cross-Zone"),
+        ("evidence_provenance", "Evidence Provenance"),
+    ]
+    for key, label_text in check_labels:
+        lines.append(label(label_text))
+        values = [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
+        if values:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for value in values[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(value)}"))
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Hostname Risk Matrix"))
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    matrix_items = list(getattr(summary, "risk_matrix", []) or [])
+    if matrix_items:
+        for item in matrix_items[:_limit_value(12)]:
+            matrix_rows.append([
+                str(item.get("category", "-")),
+                str(item.get("risk", "-")),
+                str(item.get("confidence", "-")),
+                str(item.get("evidence", "-")),
+            ])
+    else:
+        for key, label_text in check_labels[:8]:
+            evidence_count = len([str(v) for v in list(checks.get(key, []) or []) if str(v).strip()])
+            matrix_rows.append([
+                label_text,
+                "Medium" if evidence_count else "None",
+                "Medium" if evidence_count else "Low",
+                str(evidence_count) if evidence_count else "No matching detections",
+            ])
+    lines.append(_format_table(matrix_rows))
+
     if summary.protocol_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Protocol Evidence"))
@@ -9286,6 +13638,79 @@ def render_hostname_summary(summary: HostnameSummary, limit: int = 25, verbose: 
         method_limit = None if verbose else 12
         for method, count in summary.method_counts.most_common(method_limit):
             rows.append([str(method), str(count)])
+        lines.append(_format_table(rows))
+
+    conflict_profiles = list(getattr(summary, "conflict_profiles", []) or [])
+    if conflict_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Conflict Profiles"))
+        rows = [["Type", "Hostname/IP", "Scope", "Evidence", "Methods"]]
+        for item in conflict_profiles[:_limit_value(limit if verbose else 12)]:
+            profile_type = str(item.get("type", "-") or "-")
+            if profile_type == "hostname_to_many_ips":
+                identity = str(item.get("hostname", "-"))
+                scope = f"ips={int(item.get('ip_count', 0) or 0)}"
+            else:
+                identity = str(item.get("ip", "-"))
+                scope = f"hosts={int(item.get('host_count', 0) or 0)}"
+            methods = item.get("methods", [])
+            rows.append([
+                profile_type,
+                identity,
+                scope,
+                str(item.get("evidence", "-")),
+                _truncate_text(", ".join(str(v) for v in methods[:4]) if isinstance(methods, list) else "-", 70),
+            ])
+        lines.append(_format_table(rows))
+
+    drift_profiles = list(getattr(summary, "drift_profiles", []) or [])
+    if drift_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Temporal Drift Profiles"))
+        rows = [["Hostname", "First Seen", "Last Seen", "IP Count", "IPs"]]
+        for item in drift_profiles[:_limit_value(limit if verbose else 10)]:
+            ips = item.get("ips", [])
+            rows.append([
+                str(item.get("hostname", "-")),
+                format_ts(item.get("first_seen")),
+                format_ts(item.get("last_seen")),
+                str(item.get("ip_count", "-")),
+                _truncate_text(", ".join(str(v) for v in (ips[:5] if isinstance(ips, list) else [])) or "-", 80),
+            ])
+        lines.append(_format_table(rows))
+
+    corroboration = list(getattr(summary, "cross_protocol_corroboration", []) or [])
+    if corroboration:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Cross-Protocol Corroboration"))
+        rows = [["Hostname", "Protocols", "Methods", "Confidence", "Evidence"]]
+        for item in corroboration[:_limit_value(limit if verbose else 12)]:
+            protocols = item.get("protocols", [])
+            methods = item.get("methods", [])
+            rows.append([
+                str(item.get("hostname", "-")),
+                _truncate_text(", ".join(str(v) for v in (protocols[:4] if isinstance(protocols, list) else [])) or "-", 50),
+                _truncate_text(", ".join(str(v) for v in (methods[:3] if isinstance(methods, list) else [])) or "-", 70),
+                str(item.get("confidence", "-")),
+                str(item.get("evidence", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    suspicious_names = list(getattr(summary, "suspicious_name_profiles", []) or [])
+    if suspicious_names:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Suspicious Naming Analytics"))
+        rows = [["Hostname", "Reasons", "Entropy", "Evidence", "Mapped IPs"]]
+        for item in suspicious_names[:_limit_value(limit if verbose else 12)]:
+            reasons_val = item.get("reasons", [])
+            ips = item.get("ips", [])
+            rows.append([
+                str(item.get("hostname", "-")),
+                _truncate_text(", ".join(str(v) for v in (reasons_val[:4] if isinstance(reasons_val, list) else [])) or "-", 70),
+                str(item.get("entropy", "-")),
+                str(item.get("evidence", "-")),
+                _truncate_text(", ".join(str(v) for v in (ips[:4] if isinstance(ips, list) else [])) or "-", 70),
+            ])
         lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
@@ -9347,6 +13772,30 @@ def render_hostname_summary(summary: HostnameSummary, limit: int = 25, verbose: 
         if not verbose and len(summary.findings) > limit:
             lines.append(muted(f"... {len(summary.findings) - limit} additional hostname evidence rows"))
 
+    pivots = list(getattr(summary, "investigation_pivots", []) or [])
+    if pivots:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Hunt Pivots"))
+        rows = [["Hostname", "Mapped IPs", "Methods", "First Packet", "Last Packet"]]
+        for item in pivots[:_limit_value(limit if verbose else 12)]:
+            mapped_ips = item.get("mapped_ips", [])
+            methods = item.get("methods", [])
+            rows.append([
+                str(item.get("hostname", "-")),
+                _truncate_text(", ".join(str(v) for v in (mapped_ips[:4] if isinstance(mapped_ips, list) else [])) or "-", 60),
+                _truncate_text(", ".join(str(v) for v in (methods[:3] if isinstance(methods, list) else [])) or "-", 70),
+                str(item.get("first_packet", "-")),
+                str(item.get("last_packet", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
+    if false_positive_context:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for note in false_positive_context[:_limit_value(8)]:
+            lines.append(muted(f"- {_redact_in_text(note)}"))
+
     lines.append(SUBSECTION_BAR)
     lines.append(header("Forensics Notes"))
     lines.append(muted("- DNS A/AAAA and PTR mappings are strongest hostname-to-IP attribution evidence."))
@@ -9393,6 +13842,462 @@ def render_hostdetails_summary(summary: HostDetailsSummary, limit: int = 20, ver
     lines.append(_format_kv("Hostname", ", ".join(summary.hostnames[:_limit_value(8)]) if summary.hostnames else "-"))
     if summary.relevant_packets == 0:
         lines.append(warn("No host-relevant packets matched the target IP in this capture. Results may be incomplete."))
+
+    def _classify_stage(category: str, summary_text: str, details_text: str) -> str | None:
+        text = f"{category} {summary_text} {details_text}".lower()
+        if any(token in text for token in ("scan", "probe", "recon", "enumeration", "icmp", "nbns", "mdns")):
+            return "Recon"
+        if any(token in text for token in ("auth", "login", "credential", "kerberos", "ntlm", "password", "ldap", "domain service")):
+            return "Access"
+        if any(token in text for token in ("powershell", "wmic", "winrm", "telnet command", "cmd.exe", "execution")):
+            return "Execution"
+        if any(token in text for token in ("beacon", "c2", "command and control")):
+            return "C2"
+        if any(token in text for token in ("http post", "upload", "stor", "exfil", "file artifact")):
+            return "Exfil"
+        if any(token in text for token in ("write", "setpoint", "trip", "shutdown", "impact", "firmware")):
+            return "Impact"
+        return None
+
+    timeline_items = list(summary.timeline_events or [])
+    detections = list(summary.detections or [])
+    attack_categories = summary.attack_categories or Counter()
+    file_transfers = list(summary.file_transfers or [])
+    dns_items = list(summary.dns_queries or [])
+    user_items = list(summary.user_evidence or [])
+
+    stage_order = ["Recon", "Access", "Execution", "C2", "Exfil", "Impact"]
+    stage_times: dict[str, list[float]] = {name: [] for name in stage_order}
+    stage_evidence: dict[str, list[str]] = {name: [] for name in stage_order}
+    for event in timeline_items:
+        stage = _classify_stage(str(event.get("category", "")), str(event.get("summary", "")), str(event.get("details", "")))
+        if not stage:
+            continue
+        ts = event.get("ts")
+        if isinstance(ts, (int, float)):
+            stage_times[stage].append(float(ts))
+        if len(stage_evidence[stage]) < 5:
+            stage_evidence[stage].append(f"{event.get('category', '-')}: {event.get('summary', '-')}")
+
+    sequence_rows: list[dict[str, object]] = []
+    for stage in stage_order:
+        values = sorted(stage_times[stage])
+        if not values:
+            continue
+        sequence_rows.append({
+            "stage": stage,
+            "first": values[0],
+            "last": values[-1],
+            "count": len(values),
+            "dwell": max(0.0, values[-1] - values[0]),
+            "evidence": stage_evidence[stage][:3],
+        })
+
+    present_stage_names = [str(item.get("stage", "")) for item in sequence_rows]
+    sequence_violations: list[str] = []
+    if "Execution" in present_stage_names and "Access" not in present_stage_names:
+        sequence_violations.append("Execution-like activity without clear access precursor")
+    if "Exfil" in present_stage_names and "Execution" not in present_stage_names:
+        sequence_violations.append("Exfiltration-like activity without clear execution stage")
+    if "Impact" in present_stage_names and "Recon" not in present_stage_names:
+        sequence_violations.append("Impact-like activity seen without early recon/discovery evidence")
+
+    high_detection_count = sum(1 for item in detections if str(item.get("severity", "")).lower() in {"high", "critical"})
+    warning_detection_count = sum(1 for item in detections if str(item.get("severity", "")).lower() in {"warning", "warn", "medium"})
+
+    def _entropy(value: str) -> float:
+        if not value:
+            return 0.0
+        counter = Counter(value)
+        total = float(len(value))
+        import math
+        return -sum((count / total) * math.log2(count / total) for count in counter.values() if count)
+
+    high_entropy_domains: list[str] = []
+    dns_by_name: dict[str, list[float]] = {}
+    for item in dns_items:
+        name = str(item.get("name", "") or "")
+        if not name:
+            continue
+        labels = [part for part in name.split(".") if part]
+        longest = max((len(label) for label in labels), default=0)
+        ent = _entropy(name)
+        if longest >= 24 or ent >= 3.8:
+            high_entropy_domains.append(f"{name} (entropy={ent:.2f})")
+        ts = item.get("ts")
+        if isinstance(ts, (int, float)):
+            dns_by_name.setdefault(name.lower(), []).append(float(ts))
+
+    dns_periodic: list[str] = []
+    for name, timestamps in dns_by_name.items():
+        values = sorted(set(timestamps))
+        if len(values) < 4:
+            continue
+        intervals = [values[idx] - values[idx - 1] for idx in range(1, len(values)) if values[idx] - values[idx - 1] > 0]
+        if len(intervals) < 3:
+            continue
+        mean = sum(intervals) / len(intervals)
+        if mean <= 0:
+            continue
+        import math
+        variance = sum((v - mean) ** 2 for v in intervals) / len(intervals)
+        std = math.sqrt(variance)
+        cv = std / mean if mean else 1.0
+        if 3.0 <= mean <= 3600.0 and cv <= 0.35:
+            dns_periodic.append(f"{name} interval={mean:.1f}s cv={cv:.2f}")
+
+    suspicious_extensions = {".exe", ".dll", ".ps1", ".vbs", ".bat", ".scr", ".js", ".hta"}
+    risky_files: list[str] = []
+    hash_hosts: dict[str, set[str]] = {}
+    public_exfil_files: list[str] = []
+    for item in file_transfers:
+        filename = str(item.get("filename", "") or "")
+        file_type = str(item.get("file_type", "") or "")
+        ext = ""
+        if "." in filename:
+            ext = "." + filename.rsplit(".", 1)[1].lower()
+        if ext in suspicious_extensions or any(token in file_type.lower() for token in ("exe", "dll", "script", "archive")):
+            risky_files.append(f"{filename} type={file_type or '-'} dir={item.get('direction', '-')}")
+        sha256 = str(item.get("sha256", "") or "")
+        if sha256:
+            peer = str(item.get("dst_ip", "-") if str(item.get("src_ip", "")) == summary.target_ip else item.get("src_ip", "-"))
+            hash_hosts.setdefault(sha256, set()).add(peer)
+        dst_ip = str(item.get("dst_ip", "") or "")
+        src_ip = str(item.get("src_ip", "") or "")
+        if src_ip == summary.target_ip:
+            try:
+                if ipaddress.ip_address(dst_ip).is_global:
+                    public_exfil_files.append(f"{filename or '-'} -> {dst_ip}")
+            except Exception:
+                pass
+
+    propagated_hashes = [f"{digest[:12]} to {len(hosts)} hosts" for digest, hosts in hash_hosts.items() if len(hosts) >= 2]
+
+    privileged_markers = {"administrator", "domain admin", "enterprise admin", "root", "admin"}
+    privileged_users: Counter[str] = Counter()
+    user_by_method: Counter[str] = Counter()
+    for item in user_items:
+        user = str(item.get("username", "") or "").lower()
+        method = str(item.get("method", "") or "")
+        if method:
+            user_by_method[method] += 1
+        if any(marker in user for marker in privileged_markers):
+            privileged_users[user or "-"] += 1
+
+    peer_risk: Counter[str] = Counter()
+    for peer, count in summary.peer_counts.most_common(30):
+        peer_risk[peer] += int(count // 5)
+    for item in detections:
+        for ip_value, count in item.get("top_sources", []) or []:
+            peer_risk[str(ip_value)] += int(count)
+        for ip_value, count in item.get("top_destinations", []) or []:
+            peer_risk[str(ip_value)] += int(count)
+
+    attack_path_steps: list[str] = []
+    if attack_categories.get("scanning_probe", 0):
+        attack_path_steps.append("Recon/scan indicators")
+    if attack_categories.get("bruteforce_auth", 0) or privileged_users:
+        attack_path_steps.append("Access/credential indicators")
+    if attack_categories.get("malware_tooling", 0):
+        attack_path_steps.append("Execution tooling indicators")
+    if attack_categories.get("lateral_movement", 0):
+        attack_path_steps.append("Lateral movement indicators")
+    if attack_categories.get("beaconing", 0):
+        attack_path_steps.append("C2/beacon indicators")
+    if attack_categories.get("exfiltration", 0) or public_exfil_files:
+        attack_path_steps.append("Exfiltration indicators")
+    if attack_categories.get("ot_ics", 0):
+        attack_path_steps.append("OT/ICS impact pathway")
+
+    deterministic_checks: dict[str, list[str]] = {
+        "credential_abuse_concentration": [],
+        "lateral_movement_fanout": [],
+        "execution_tooling_chain": [],
+        "exfiltration_chain": [],
+        "dns_c2_periodicity": [],
+        "ot_control_impact_sequence": [],
+        "identity_privilege_spread": [],
+        "cross_zone_service_access": [],
+        "file_risk_staging": [],
+        "evidence_provenance": [],
+    }
+
+    if warning_detection_count or high_detection_count:
+        deterministic_checks["credential_abuse_concentration"].extend([
+            f"high/critical detections={high_detection_count}",
+            f"warning detections={warning_detection_count}",
+        ])
+    top_peers = summary.peer_counts.most_common(8)
+    if top_peers and len(top_peers) >= 3:
+        deterministic_checks["lateral_movement_fanout"].append(
+            f"host touched {len(summary.peer_counts)} peers; top peer volume {top_peers[0][0]}({top_peers[0][1]})"
+        )
+    if attack_categories.get("malware_tooling", 0) or any("powershell" in str(item.get("summary", "")).lower() for item in timeline_items):
+        deterministic_checks["execution_tooling_chain"].append("Execution tooling indicators present in timeline/detections")
+    deterministic_checks["exfiltration_chain"].extend(public_exfil_files[:6])
+    deterministic_checks["dns_c2_periodicity"].extend(dns_periodic[:6])
+    if attack_categories.get("ot_ics", 0):
+        deterministic_checks["ot_control_impact_sequence"].append("OT/ICS protocol indicators linked to host activity")
+    if privileged_users:
+        deterministic_checks["identity_privilege_spread"].extend([f"{user}({count})" for user, count in privileged_users.most_common(5)])
+    for conv in summary.conversations:
+        peer = str(conv.get("peer", ""))
+        if not peer:
+            continue
+        try:
+            peer_ip = ipaddress.ip_address(peer)
+            local_private = ipaddress.ip_address(summary.target_ip).is_private
+            if peer_ip.is_private != local_private:
+                deterministic_checks["cross_zone_service_access"].append(
+                    f"{summary.target_ip} -> {peer} protocol={conv.get('protocol', '-')}, ports={conv.get('ports', '-') }"
+                )
+        except Exception:
+            continue
+    deterministic_checks["file_risk_staging"].extend((risky_files + propagated_hashes)[:8])
+
+    anchor_rows: list[dict[str, object]] = []
+    for item in file_transfers:
+        pkt = item.get("packet_index")
+        if pkt is None:
+            continue
+        anchor_rows.append({
+            "packet": pkt,
+            "source": "files",
+            "signal": f"{item.get('filename', '-')}",
+            "details": f"{item.get('src_ip', '-')}: {item.get('src_port', '-')} -> {item.get('dst_ip', '-')}: {item.get('dst_port', '-')} {item.get('protocol', '-')}",
+        })
+    for event in timeline_items:
+        pkt = event.get("packet_index")
+        if pkt is None:
+            continue
+        anchor_rows.append({
+            "packet": pkt,
+            "source": event.get("source", "timeline"),
+            "signal": event.get("summary", "-"),
+            "details": event.get("details", "-"),
+        })
+    anchor_rows.sort(key=lambda item: (item.get("packet") is None, item.get("packet")))
+    if anchor_rows:
+        deterministic_checks["evidence_provenance"].append(f"{len(anchor_rows)} packet-anchored evidence row(s)")
+
+    verdict_score = 0
+    verdict_score += 2 if deterministic_checks["execution_tooling_chain"] else 0
+    verdict_score += 2 if deterministic_checks["exfiltration_chain"] else 0
+    verdict_score += 1 if deterministic_checks["credential_abuse_concentration"] else 0
+    verdict_score += 1 if deterministic_checks["lateral_movement_fanout"] else 0
+    verdict_score += 1 if deterministic_checks["dns_c2_periodicity"] else 0
+    verdict_score += 1 if deterministic_checks["identity_privilege_spread"] else 0
+    verdict_score += 1 if deterministic_checks["ot_control_impact_sequence"] else 0
+    verdict_score += 1 if deterministic_checks["cross_zone_service_access"] else 0
+    verdict_score += 1 if deterministic_checks["file_risk_staging"] else 0
+
+    verdict_reasons: list[str] = []
+    if deterministic_checks["execution_tooling_chain"]:
+        verdict_reasons.append("Execution tooling behavior observed")
+    if deterministic_checks["exfiltration_chain"]:
+        verdict_reasons.append("Possible host exfiltration chain observed")
+    if deterministic_checks["lateral_movement_fanout"]:
+        verdict_reasons.append("Broad peer fan-out from host")
+    if deterministic_checks["dns_c2_periodicity"]:
+        verdict_reasons.append("Beacon-like DNS periodicity observed")
+    if deterministic_checks["identity_privilege_spread"]:
+        verdict_reasons.append("Privileged identity usage pattern observed")
+    if deterministic_checks["ot_control_impact_sequence"]:
+        verdict_reasons.append("OT/ICS control-impact signals linked to host")
+    if sequence_violations:
+        verdict_reasons.extend(sequence_violations[:2])
+
+    if verdict_score >= 8:
+        host_verdict = "YES - HIGH-CONFIDENCE HOST COMPROMISE/ABUSE PATTERN DETECTED"
+        host_confidence = "high"
+    elif verdict_score >= 5:
+        host_verdict = "LIKELY - MULTIPLE CORROBORATING HOST-RISK INDICATORS DETECTED"
+        host_confidence = "medium"
+    elif verdict_score >= 3:
+        host_verdict = "POSSIBLE - HOST-RISK INDICATORS REQUIRE CORROBORATION"
+        host_confidence = "medium"
+    else:
+        host_verdict = "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE HOST ABUSE PATTERN"
+        host_confidence = "low"
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if host_verdict.startswith("YES"):
+        lines.append(danger(host_verdict))
+    elif host_verdict.startswith("LIKELY") or host_verdict.startswith("POSSIBLE"):
+        lines.append(warn(host_verdict))
+    else:
+        lines.append(ok(host_verdict))
+    lines.append(_format_kv("Confidence", f"{host_confidence.capitalize()} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Host Security Checks"))
+    check_labels = [
+        ("credential_abuse_concentration", "Credential Abuse Concentration"),
+        ("lateral_movement_fanout", "Lateral Movement Fan-Out"),
+        ("execution_tooling_chain", "Execution Tooling Chain"),
+        ("exfiltration_chain", "Exfiltration Chain"),
+        ("dns_c2_periodicity", "DNS C2/Beacon Periodicity"),
+        ("ot_control_impact_sequence", "OT Control-Impact Sequence"),
+        ("identity_privilege_spread", "Identity Privilege Spread"),
+        ("cross_zone_service_access", "Cross-Zone Service Access"),
+        ("file_risk_staging", "File-Risk Staging"),
+        ("evidence_provenance", "Evidence Provenance"),
+    ]
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence_items = [str(v) for v in deterministic_checks.get(key, []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence_items[:_limit_value(6)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+            risk = "High" if key in {"execution_tooling_chain", "exfiltration_chain", "ot_control_impact_sequence", "identity_privilege_spread"} else "Medium"
+            conf = "High" if key in {"evidence_provenance", "execution_tooling_chain"} else "Medium"
+            matrix_rows.append([label_text, risk, conf, f"{len(evidence_items)} signal(s)"])
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Host Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
+
+    if sequence_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Sequence Plausibility"))
+        rows = [["Stage", "First", "Last", "Count", "Dwell", "Evidence"]]
+        for item in sequence_rows[:_limit_value(10)]:
+            rows.append([
+                str(item.get("stage", "-")),
+                format_ts(item.get("first")),
+                format_ts(item.get("last")),
+                str(item.get("count", "-")),
+                format_duration(item.get("dwell")),
+                _truncate_text(" | ".join(str(v) for v in item.get("evidence", [])[:2]), 64),
+            ])
+        lines.append(_format_table(rows))
+    if sequence_violations:
+        lines.append(muted("Sequence violations:"))
+        for item in sequence_violations[:_limit_value(6)]:
+            lines.append(warn(f"- {_redact_in_text(item)}"))
+
+    if attack_path_steps:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Attack Path Summary"))
+        path_text = " -> ".join(attack_path_steps[:6])
+        lines.append(muted(f"- {path_text}"))
+        targets = [peer for peer, _ in summary.peer_counts.most_common(_limit_value(5))]
+        if targets:
+            lines.append(muted(f"- Primary peer targets: {', '.join(targets)}"))
+
+    if peer_risk:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Remote Host Risk"))
+        rows = [["Peer", "Risk Score", "Evidence Count"]]
+        for peer, score in peer_risk.most_common(_limit_value(10)):
+            rows.append([peer, str(score), str(summary.peer_counts.get(peer, 0))])
+        lines.append(_format_table(rows))
+
+    if user_items:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Identity Abuse Analytics"))
+        rows = [["Signal", "Details"]]
+        if privileged_users:
+            rows.append(["Privileged Identities", ", ".join(f"{user}({count})" for user, count in privileged_users.most_common(5))])
+        if user_by_method:
+            rows.append(["Identity Collection Methods", ", ".join(f"{method}({count})" for method, count in user_by_method.most_common(6))])
+        if len(rows) == 1:
+            rows.append(["Status", "No strong identity abuse concentration detected"])
+        lines.append(_format_table(rows))
+
+    if high_entropy_domains or dns_periodic:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("DNS Behavior Checks"))
+        if high_entropy_domains:
+            lines.append(muted("- High-entropy/suspicious DNS queries:"))
+            for item in high_entropy_domains[:_limit_value(6)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+        if dns_periodic:
+            lines.append(muted("- Periodic DNS patterns:"))
+            for item in dns_periodic[:_limit_value(6)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+
+    if risky_files or propagated_hashes or public_exfil_files:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("File Risk Checks"))
+        for item in (risky_files + propagated_hashes + public_exfil_files)[:_limit_value(10)]:
+            lines.append(muted(f"- {_redact_in_text(item)}"))
+
+    if anchor_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Evidence Anchors"))
+        rows = [["Packet", "Source", "Signal", "Details"]]
+        for item in anchor_rows[:_limit_value(12)]:
+            rows.append([
+                str(item.get("packet", "-")),
+                str(item.get("source", "-")),
+                _truncate_text(str(item.get("signal", "-")), 30),
+                _truncate_text(_redact_in_text(str(item.get("details", "-"))), 84),
+            ])
+        lines.append(_format_table(rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("ATT&CK Tactic Mapping"))
+    tactic_rows = [["Tactic", "Evidence"]]
+    mapping = [
+        ("TA0043 Reconnaissance", int(attack_categories.get("scanning_probe", 0))),
+        ("TA0001 Initial Access", int(attack_categories.get("bruteforce_auth", 0))),
+        ("TA0002 Execution", int(attack_categories.get("malware_tooling", 0))),
+        ("TA0008 Lateral Movement", int(attack_categories.get("lateral_movement", 0))),
+        ("TA0011 Command and Control", int(attack_categories.get("beaconing", 0))),
+        ("TA0010 Exfiltration", int(attack_categories.get("exfiltration", 0))),
+        ("TA0040 Impact", int(attack_categories.get("dos_impact", 0)) + int(attack_categories.get("ot_ics", 0))),
+    ]
+    for name, count in mapping:
+        if count > 0:
+            tactic_rows.append([name, str(count)])
+    if len(tactic_rows) == 1:
+        tactic_rows.append(["No strong tactic mapping", "0"])
+    lines.append(_format_table(tactic_rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Top Hunt Pivots"))
+    pivot_rows = [["Pivot Type", "Value"]]
+    for peer, _count in summary.peer_counts.most_common(_limit_value(3)):
+        pivot_rows.append(["Peer IP", peer])
+    for item in file_transfers[:_limit_value(3)]:
+        sha256 = str(item.get("sha256", "") or "")
+        if sha256:
+            pivot_rows.append(["File SHA256", sha256])
+    for item in dns_items[:_limit_value(3)]:
+        name = str(item.get("name", "") or "")
+        if name:
+            pivot_rows.append(["Domain", name])
+    for item in user_items[:_limit_value(3)]:
+        username = str(item.get("username", "") or "")
+        if username and username != "-":
+            pivot_rows.append(["Username", username])
+    if len(pivot_rows) == 1:
+        pivot_rows.append(["Status", "No strong pivots extracted"])
+    lines.append(_format_table(pivot_rows))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("False-Positive Context"))
+    benign_context: list[str] = []
+    if not deterministic_checks["execution_tooling_chain"]:
+        benign_context.append("No strong host execution-tooling chain was identified")
+    if not deterministic_checks["dns_c2_periodicity"]:
+        benign_context.append("No high-confidence beacon-like DNS periodicity was detected")
+    if not deterministic_checks["cross_zone_service_access"]:
+        benign_context.append("No cross-zone service access drift was detected for this host")
+    if not deterministic_checks["file_risk_staging"]:
+        benign_context.append("No strong malicious file staging chain was reconstructed")
+    for item in benign_context[:_limit_value(6)]:
+        lines.append(muted(f"- {_redact_in_text(item)}"))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Hostname Evidence"))
@@ -9868,6 +14773,176 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
         lines.append(header("OT Attack Storyline"))
         for line in summary.ot_storyline:
             lines.append(muted(f"- {line}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    verdict_text = summary.analyst_verdict or "NO STRONG SIGNAL - timeline heuristics did not cross confidence threshold"
+    confidence_text = (summary.analyst_confidence or "low").strip().lower()
+    if verdict_text.startswith("YES"):
+        lines.append(danger(verdict_text))
+    elif verdict_text.startswith("LIKELY") or verdict_text.startswith("POSSIBLE"):
+        lines.append(warn(verdict_text))
+    else:
+        lines.append(ok(verdict_text))
+    lines.append(_format_kv("Confidence", confidence_text.capitalize()))
+    if summary.analyst_reasons:
+        lines.append(muted("Why confidence:"))
+        for reason in summary.analyst_reasons[:_limit_value(10 if verbose else 6)]:
+            lines.append(muted(f"- {_redact_in_text(str(reason))}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic Timeline Security Checks"))
+    checks = summary.deterministic_checks or {}
+    check_labels = [
+        ("recon_to_access_sequence", "Recon to Access Sequence"),
+        ("access_to_execution_sequence", "Access to Execution Sequence"),
+        ("execution_to_c2_or_exfil", "Execution to C2 or Exfil Sequence"),
+        ("ot_control_after_discovery", "OT Control After Discovery"),
+        ("beaconing_periodicity", "Beaconing Periodicity"),
+        ("authentication_abuse", "Authentication Abuse"),
+        ("lateral_movement_fanout", "Lateral Movement Fan-Out"),
+        ("exfiltration_chain", "Exfiltration Chain"),
+        ("ot_impact_signal", "OT Impact Signal"),
+        ("evidence_provenance", "Evidence Provenance"),
+    ]
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence_items = [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence_items[:_limit_value(8 if verbose else 5)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+            risk = "High" if key in {"execution_to_c2_or_exfil", "exfiltration_chain", "ot_impact_signal"} else "Medium"
+            conf = "High" if key in {"execution_to_c2_or_exfil", "evidence_provenance"} else "Medium"
+            matrix_rows.append([label_text, risk, conf, f"{len(evidence_items)} signal(s)"])
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Timeline Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
+
+    sequence_rows = list(getattr(summary, "sequence_timeline", []) or [])
+    if sequence_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Sequence Plausibility Timeline"))
+        rows = [["Stage", "First Seen", "Last Seen", "Count", "Dwell", "Evidence"]]
+        for item in sequence_rows[:_limit_value(20 if verbose else 10)]:
+            evidence = item.get("evidence", [])
+            if isinstance(evidence, list):
+                evidence_text = " | ".join(str(v) for v in evidence[:3])
+            else:
+                evidence_text = str(evidence)
+            rows.append([
+                str(item.get("stage", "-")),
+                format_ts(item.get("first_ts")),
+                format_ts(item.get("last_ts")),
+                str(item.get("count", "-")),
+                format_duration(item.get("dwell")),
+                _truncate_text(evidence_text or "-", 70),
+            ])
+        lines.append(_format_table(rows))
+
+    if summary.sequence_violations:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Sequence Violations"))
+        for item in summary.sequence_violations[:_limit_value(10 if verbose else 6)]:
+            lines.append(warn(f"- {_redact_in_text(str(item))}"))
+
+    beacon_rows = list(getattr(summary, "beacon_candidates", []) or [])
+    if beacon_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Beaconing Candidates"))
+        rows = [["Peer", "Category", "Signal", "Count", "Mean Interval", "Jitter", "CV", "Confidence"]]
+        for item in beacon_rows[:_limit_value(12 if verbose else 8)]:
+            rows.append([
+                str(item.get("peer", "-")),
+                str(item.get("category", "-")),
+                _truncate_text(str(item.get("summary", "-")), 32),
+                str(item.get("count", "-")),
+                f"{item.get('mean_interval', '-')}s",
+                f"{item.get('jitter', '-')}s",
+                str(item.get("cv", "-")),
+                str(item.get("confidence", "-")).upper(),
+            ])
+        lines.append(_format_table(rows))
+
+    auth_rows = list(getattr(summary, "auth_abuse_profiles", []) or [])
+    if auth_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Authentication Abuse Profiles"))
+        rows = [["Source", "Target", "Attempts", "Target Count", "Confidence"]]
+        for item in auth_rows[:_limit_value(12 if verbose else 8)]:
+            rows.append([
+                str(item.get("src", "-")),
+                str(item.get("dst", "-")),
+                str(item.get("attempts", "-")),
+                str(item.get("target_count", "-")),
+                str(item.get("confidence", "-")).upper(),
+            ])
+        lines.append(_format_table(rows))
+
+    lateral_rows = list(getattr(summary, "lateral_movement_paths", []) or [])
+    if lateral_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Lateral Movement Paths"))
+        rows = [["Source", "Peers", "Admin Hits", "Top Peers", "Confidence"]]
+        for item in lateral_rows[:_limit_value(12 if verbose else 8)]:
+            peers = item.get("peers", [])
+            peer_text = ", ".join(str(v) for v in peers[:4]) if isinstance(peers, list) else str(peers)
+            rows.append([
+                str(item.get("src", "-")),
+                str(item.get("peer_count", "-")),
+                str(item.get("admin_hits", "-")),
+                _truncate_text(peer_text or "-", 48),
+                str(item.get("confidence", "-")).upper(),
+            ])
+        lines.append(_format_table(rows))
+
+    exfil_rows = list(getattr(summary, "exfiltration_chains", []) or [])
+    if exfil_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Exfiltration Chain Signals"))
+        for item in exfil_rows[:_limit_value(14 if verbose else 8)]:
+            lines.append(muted(f"- {_redact_in_text(str(item.get('signal', '-')))}"))
+
+    ot_impact_rows = list(getattr(summary, "ot_impact_signals", []) or [])
+    if ot_impact_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OT Impact Signals"))
+        rows = [["Protocol", "Summary", "Timestamp", "Details"]]
+        for item in ot_impact_rows[:_limit_value(14 if verbose else 8)]:
+            rows.append([
+                str(item.get("protocol", "-")),
+                _truncate_text(str(item.get("summary", "-")), 32),
+                format_ts(item.get("ts")),
+                _truncate_text(_redact_in_text(str(item.get("details", "-"))), 80),
+            ])
+        lines.append(_format_table(rows))
+
+    anchors = list(getattr(summary, "evidence_anchors", []) or [])
+    if anchors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Evidence Anchors"))
+        rows = [["Packet", "Source", "Category", "Summary", "Details"]]
+        for item in anchors[:_limit_value(18 if verbose else 10)]:
+            rows.append([
+                str(item.get("packet", "-")),
+                str(item.get("source", "-")),
+                str(item.get("category", "-")),
+                _truncate_text(str(item.get("summary", "-")), 28),
+                _truncate_text(_redact_in_text(str(item.get("details", "-"))), 72),
+            ])
+        lines.append(_format_table(rows))
+
+    benign_rows = list(getattr(summary, "benign_context", []) or [])
+    if benign_rows:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for item in benign_rows[:_limit_value(10 if verbose else 6)]:
+            lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     if summary.errors:
         lines.append(SUBSECTION_BAR)
@@ -10576,6 +15651,199 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
     lines.append(_format_kv("ARP Probes", str(summary.arp_probes)))
     lines.append(_format_kv("Unsolicited Replies", str(summary.unsolicited_replies)))
 
+    def _arp_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        high_anomalies = sum(1 for item in summary.anomalies if item.severity in {"HIGH", "CRITICAL"})
+        med_anomalies = sum(1 for item in summary.anomalies if item.severity == "MEDIUM")
+        if high_anomalies:
+            score += min(5, high_anomalies * 2)
+            reasons.append(f"High-severity ARP anomalies observed ({high_anomalies})")
+        if med_anomalies >= 2:
+            score += 1
+            reasons.append(f"Multiple medium-severity ARP anomalies observed ({med_anomalies})")
+        if summary.unsolicited_replies >= 20:
+            score += 2
+            reasons.append(f"Unsolicited ARP replies are elevated ({summary.unsolicited_replies})")
+        if getattr(summary, "gateway_ip", "") and len(getattr(summary, "gateway_mac_candidates", {})) > 1:
+            score += 2
+            reasons.append("Gateway ARP MAC mapping changed")
+        if summary.gratuitous_arp >= 25:
+            score += 1
+            reasons.append(f"Excess gratuitous ARP frames observed ({summary.gratuitous_arp})")
+
+        if score >= 7:
+            verdict = "YES - high-confidence ARP poisoning or MITM-style behavior is present."
+            confidence = "High"
+        elif score >= 4:
+            verdict = "LIKELY - suspicious ARP behavior with attack indicators is present."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - potentially malicious ARP behavior observed; corroboration recommended."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing high-risk ARP attack pattern from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence ARP attack heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _arp_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(10)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    # Add concrete context for immediate triage.
+    if summary.gateway_ip:
+        lines.append(muted("Where:"))
+        lines.append(muted(f"- Gateway under observation: {_highlight_public_ips(summary.gateway_ip)}"))
+    if summary.gateway_mac_candidates:
+        lines.append(muted("What:"))
+        lines.append(muted("- Gateway MAC candidates"))
+        for mac, count in summary.gateway_mac_candidates.most_common(_limit_value(6)):
+            lines.append(muted(f"- {mac}: {int(count)} replies"))
+    if summary.victim_conflicts:
+        lines.append(muted("Who:"))
+        lines.append(muted("- Victim conflict highlights"))
+        for ip_value, mac_counter in sorted(summary.victim_conflicts.items(), key=lambda item: sum(item[1].values()), reverse=True)[:_limit_value(6)]:
+            claims = ", ".join(f"{mac}({cnt})" for mac, cnt in mac_counter.most_common(4))
+            lines.append(muted(f"- {_highlight_public_ips(ip_value)} claimed by {claims}"))
+    if summary.anomalies:
+        lines.append(muted("When:"))
+        lines.append(muted("- Top ARP anomalies"))
+        for item in summary.anomalies[:_limit_value(6)]:
+            lines.append(muted(f"- [{item.severity}] {_redact_in_text(item.title)}: {_redact_in_text(item.description)}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Threat & Compromise Overview"))
+    lines.append(_format_kv("Threat Categories", str(sum(summary.threats.values()))))
+    lines.append(_format_kv("Anomalies", str(len(summary.anomalies))))
+    lines.append(_format_kv("High Severity Anomalies", str(sum(1 for item in summary.anomalies if item.severity in {"HIGH", "CRITICAL"}))))
+    lines.append(_format_kv("Benign Indicators", str(sum(getattr(summary, "benign_indicators", Counter()).values()))))
+    lines.append(_format_kv("Gateway Candidate", getattr(summary, "gateway_ip", "-") or "-"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic ARP Security Checks"))
+
+    def _arp_signal(*tokens: str) -> list[str]:
+        matches: list[str] = []
+        lowered_tokens = tuple(token.lower() for token in tokens)
+        for threat, count in summary.threats.items():
+            text = f"{threat}: {count}"
+            blob = text.lower()
+            if any(token in blob for token in lowered_tokens):
+                matches.append(text)
+        for item in summary.anomalies:
+            text = f"{item.title}: {item.description}"
+            blob = text.lower()
+            if any(token in blob for token in lowered_tokens):
+                matches.append(text)
+        return matches[:_limit_value(4)]
+
+    checks: list[tuple[str, tuple[str, ...]]] = [
+        ("Gateway ARP Integrity", ("gateway", "mac flip", "integrity")),
+        ("Poisoning Pair Pattern", ("poisoning pair", "claims", "high-value ips")),
+        ("Unsolicited Reply Abuse", ("unsolicited", "poisoning indicators")),
+        ("ARP Recon/Sweep Activity", ("sweep", "recon")),
+        ("ARP Flood/Storm", ("flood", "storm", "high arp traffic")),
+        ("Duplicate IP Ownership", ("ip/mac conflict", "multiple macs")),
+        ("Proxy ARP Misuse", ("proxy arp", "proxy arp-like")),
+        ("Likely Benign Failover", ("failover", "virtual mac")),
+    ]
+
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for label_text, tokens in checks:
+        lines.append(label(label_text))
+        evidence = _arp_signal(*tokens)
+        if evidence:
+            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            for item in evidence:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+            high_hits = sum(1 for item in evidence if "high" in item.lower() or "poison" in item.lower())
+            risk = "High" if high_hits > 0 else "Medium"
+            conf = "High" if len(evidence) >= 2 else "Medium"
+            matrix_rows.append([label_text, risk, conf, f"{len(evidence)} signal(s)"])
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("ARP Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
+
+    if getattr(summary, "gateway_mac_candidates", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Gateway Mapping Integrity"))
+        rows = [["Gateway IP", "Observed MAC", "Replies"]]
+        gateway_ip = getattr(summary, "gateway_ip", "-") or "-"
+        for mac, count in summary.gateway_mac_candidates.most_common(limit):
+            rows.append([gateway_ip, mac, str(count)])
+        lines.append(_format_table(rows))
+
+    if getattr(summary, "victim_conflicts", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Victim-Centric Conflict View"))
+        rows = [["Victim IP", "Claiming MACs", "Conflict Count"]]
+        for victim_ip, mac_counter in sorted(
+            summary.victim_conflicts.items(),
+            key=lambda item: sum(item[1].values()),
+            reverse=True,
+        )[:limit]:
+            mac_text = ", ".join(f"{mac}({count})" for mac, count in mac_counter.most_common(_limit_value(3)))
+            rows.append([victim_ip, mac_text or "-", str(sum(mac_counter.values()))])
+        lines.append(_format_table(rows))
+
+    if getattr(summary, "timeline", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Attack Chain Timeline"))
+        rows = [["Timestamp", "Event", "Source", "Destination"]]
+        for item in summary.timeline[:limit]:
+            rows.append([
+                format_ts(item.ts),
+                _truncate_text(_redact_in_text(item.detail), 88),
+                item.src,
+                item.dst,
+            ])
+        lines.append(_format_table(rows))
+
+    if getattr(summary, "proxy_arp_candidates", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Proxy ARP Candidates"))
+        rows = [["MAC", "Dst Targets", "Claimed IPs"]]
+        for item in summary.proxy_arp_candidates[:limit]:
+            rows.append([
+                str(item.get("mac", "-")),
+                str(item.get("dst_targets", "-")),
+                str(item.get("claimed_ips", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    if getattr(summary, "reply_latency_summary", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Reply Timing"))
+        lines.append(_format_kv("Median Reply Latency", f"{float(summary.reply_latency_summary.get('median_s', 0.0)) * 1000.0:.2f} ms"))
+        lines.append(_format_kv("p95 Reply Latency", f"{float(summary.reply_latency_summary.get('p95_s', 0.0)) * 1000.0:.2f} ms"))
+        lines.append(_format_kv("Samples", str(int(float(summary.reply_latency_summary.get('samples', 0.0))))))
+
+    if getattr(summary, "pps_by_source", None):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("ARP Rate Baseline"))
+        rows = [["Source", "Requests", "Packets/sec"]]
+        for src, count in summary.client_details.most_common(limit):
+            pps = float(summary.pps_by_source.get(src, 0.0))
+            rows.append([src, str(count), f"{pps:.2f}"])
+        lines.append(_format_table(rows))
+
     lines.append(SUBSECTION_BAR)
     lines.append(header("ARP Conversations"))
     if not summary.conversations:
@@ -10754,6 +16022,138 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
     lines.append(_format_kv("Conversations", str(len(summary.conversations))))
     lines.append(_format_kv("Sessions", str(len(summary.sessions))))
 
+    def _dhcp_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        high_anomalies = sum(1 for item in summary.anomalies if item.severity in {"HIGH", "CRITICAL"})
+        if high_anomalies:
+            score += min(4, high_anomalies)
+            reasons.append(f"High-severity DHCP anomalies observed ({high_anomalies})")
+        if summary.transaction_violations:
+            score += 2
+            reasons.append(f"Transaction integrity violations observed ({len(summary.transaction_violations)})")
+        if summary.policy_tampering:
+            score += 2
+            reasons.append(f"DHCP policy tampering/drift observed ({len(summary.policy_tampering)})")
+        if summary.lease_conflicts:
+            score += 2
+            reasons.append(f"Duplicate lease assignment conflicts observed ({len(summary.lease_conflicts)})")
+        if summary.relay_anomalies:
+            score += 1
+            reasons.append(f"Relay-agent anomalies observed ({len(summary.relay_anomalies)})")
+        if summary.attacks.get("Rogue DHCP Server", 0):
+            score += 2
+            reasons.append("Competing/rogue DHCP server evidence observed")
+        if summary.attacks.get("DHCP Starvation", 0):
+            score += 2
+            reasons.append("DHCP starvation/exhaustion behavior observed")
+
+        if score >= 8:
+            verdict = "YES - high-confidence DHCP abuse or policy-hijack activity is present."
+            confidence = "High"
+        elif score >= 5:
+            verdict = "LIKELY - significant suspicious DHCP activity is present."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - weak-to-moderate DHCP threat indicators are present."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing high-risk DHCP attack pattern from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence DHCP heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _dhcp_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Why confidence:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    # Add concrete context for immediate triage.
+    if summary.server_details:
+        lines.append(muted("Where:"))
+        lines.append(muted("- Top DHCP servers"))
+        for server, count in summary.server_details.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_highlight_public_ips(str(server))}: {int(count)} packets"))
+    if summary.client_details:
+        lines.append(muted("Who:"))
+        lines.append(muted("- Top DHCP clients"))
+        for client, count in summary.client_details.most_common(_limit_value(8)):
+            lines.append(muted(f"- {client}: {int(count)} packets"))
+    if summary.attacks:
+        lines.append(muted("What:"))
+        lines.append(muted("- Attack category hits"))
+        for attack, count in summary.attacks.most_common(_limit_value(8)):
+            lines.append(muted(f"- {_redact_in_text(str(attack))}: {int(count)}"))
+    if getattr(summary, "transaction_violations", None):
+        violations = list(summary.transaction_violations or [])
+        if violations:
+            lines.append(muted("When:"))
+            lines.append(muted("- Transaction violations"))
+            for item in violations[:_limit_value(6)]:
+                lines.append(
+                    muted(
+                        f"- {item.get('type', '-')} xid={item.get('xid', '-')} "
+                        f"server={_highlight_public_ips(str(item.get('server', '-')))} "
+                        f"client={item.get('client_mac', '-')} at {format_ts(item.get('ts'))}"
+                    )
+                )
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic DHCP Security Checks"))
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+    check_labels = [
+        ("transaction_integrity_violation", "Transaction Integrity Violation"),
+        ("rogue_competing_server_evidence", "Rogue/Competing Server Evidence"),
+        ("starvation_exhaustion_behavior", "Starvation/Exhaustion Behavior"),
+        ("option_tampering_router_dns_routes_wpad_pxe", "Option Tampering (Router/DNS/Routes/WPAD/PXE)"),
+        ("relay_abuse_option82", "Relay Abuse / Option 82 Anomaly"),
+        ("lease_conflict_duplicate_assignment", "Lease Conflict / Duplicate Assignment"),
+        ("beacon_periodic_dhcp", "Periodic DHCP Beacon Behavior"),
+        ("likely_benign_failover_context", "Likely Benign Failover Context"),
+    ]
+
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
+        evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            if key == "likely_benign_failover_context":
+                lines.append(ok(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                matrix_rows.append([label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"])
+            else:
+                lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                if key in {"transaction_integrity_violation", "option_tampering_router_dns_routes_wpad_pxe", "lease_conflict_duplicate_assignment"}:
+                    risk = "High"
+                    conf_level = "High"
+                elif key in {"rogue_competing_server_evidence", "starvation_exhaustion_behavior", "relay_abuse_option82"}:
+                    risk = "Medium"
+                    conf_level = "Medium"
+                else:
+                    risk = "Low"
+                    conf_level = "Low"
+                matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+            for item in evidence_items[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("DHCP Risk Matrix"))
+    lines.append(_format_table(matrix_rows))
+
     lines.append(SUBSECTION_BAR)
     lines.append(header("Message Type Statistics"))
     if not summary.message_types:
@@ -10920,6 +16320,123 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
                 format_ts(item.last_seen),
             ])
         lines.append(_format_table(rows))
+
+    if getattr(summary, "server_policy_profiles", None):
+        if summary.server_policy_profiles:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Server Policy Profiles"))
+            rows = [["Server", "Router", "DNS", "Domain", "WPAD", "Routes", "PXE"]]
+            for item in summary.server_policy_profiles[:limit]:
+                pxe_value = str(item.get("bootfile_value", "") or item.get("tftp_value", "") or "-")
+                rows.append([
+                    str(item.get("server", "-")),
+                    _truncate_text(str(item.get("router_value", "-")), 22),
+                    _truncate_text(str(item.get("dns_value", "-")), 22),
+                    _truncate_text(str(item.get("domain_value", "-")), 18),
+                    _truncate_text(str(item.get("wpad_value", "-")), 16),
+                    _truncate_text(str(item.get("routes_value", "-")), 18),
+                    _truncate_text(pxe_value, 18),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "client_abuse_profiles", None):
+        if summary.client_abuse_profiles:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Client Abuse Profiles"))
+            rows = [["Client MAC", "Req", "Requested IPs", "XIDs", "Hostnames", "Client IDs", "Vendors"]]
+            for item in summary.client_abuse_profiles[:limit]:
+                rows.append([
+                    str(item.get("client_mac", "-")),
+                    str(item.get("requests", "-")),
+                    str(item.get("requested_ip_count", "-")),
+                    str(item.get("xid_count", "-")),
+                    str(item.get("hostname_count", "-")),
+                    str(item.get("client_id_count", "-")),
+                    str(item.get("vendor_class_count", "-")),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "policy_tampering", None):
+        if summary.policy_tampering:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Option Policy Drift/Tampering"))
+            rows = [["Server", "Signals"]]
+            for item in summary.policy_tampering[:limit]:
+                drift = item.get("drift", [])
+                drift_text = "; ".join(str(v) for v in (drift[:3] if isinstance(drift, list) else [drift]))
+                rows.append([
+                    str(item.get("server", "-")),
+                    _truncate_text(drift_text or "-", 92),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "transaction_violations", None):
+        if summary.transaction_violations:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Transaction Integrity Violations"))
+            rows = [["Type", "Server", "Client", "XID", "Flow", "Time"]]
+            for item in summary.transaction_violations[:limit]:
+                rows.append([
+                    str(item.get("type", "-")),
+                    str(item.get("server", "-")),
+                    str(item.get("client_mac", "-")),
+                    str(item.get("xid", "-")),
+                    f"{item.get('src', '-')}->{item.get('dst', '-')}",
+                    format_ts(item.get("ts")),
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "lease_conflicts", None):
+        if summary.lease_conflicts:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Lease Conflict View"))
+            rows = [["IP", "Client Count", "Clients"]]
+            for item in summary.lease_conflicts[:limit]:
+                clients = item.get("clients", [])
+                client_text = ", ".join(str(v) for v in (clients[:4] if isinstance(clients, list) else [clients]))
+                rows.append([
+                    str(item.get("ip", "-")),
+                    str(item.get("count", "-")),
+                    client_text,
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "relay_anomalies", None):
+        if summary.relay_anomalies:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Relay Abuse Indicators"))
+            rows = [["Relay", "Servers", "Clients", "Top Servers"]]
+            for item in summary.relay_anomalies[:limit]:
+                servers = item.get("servers", [])
+                top_servers = ", ".join(str(v) for v in (servers[:3] if isinstance(servers, list) else [servers]))
+                rows.append([
+                    str(item.get("relay", "-")),
+                    str(item.get("server_count", "-")),
+                    str(item.get("client_count", "-")),
+                    top_servers,
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "timeline", None):
+        if summary.timeline:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Attack Chain Timeline"))
+            rows = [["Time", "Event", "Detail", "Flow"]]
+            for item in summary.timeline[:limit]:
+                rows.append([
+                    format_ts(item.get("ts")),
+                    str(item.get("event", "-")),
+                    _truncate_text(_redact_in_text(str(item.get("detail", "-"))), 96),
+                    f"{item.get('src', '-')}->{item.get('dst', '-')}",
+                ])
+            lines.append(_format_table(rows))
+
+    if getattr(summary, "benign_context", None):
+        if summary.benign_context:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("False-Positive Context"))
+            for item in summary.benign_context[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Artifacts"))
@@ -12997,15 +18514,189 @@ def render_streams_summary(summary: StreamSummary) -> str:
 
 
 def render_ctf_summary(summary: CtfSummary) -> str:
-    lines = [header("CTF ANALYSIS")]
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"CTF ANALYSIS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
     lines.append(_format_kv("Hits", str(len(summary.hits))))
+    lines.append(_format_kv("Decoded Hits", str(len(summary.decoded_hits))))
+    lines.append(_format_kv("Candidate Findings", str(len(getattr(summary, "candidate_findings", []) or []))))
+    lines.append(_format_kv("Start", format_ts(getattr(summary, "first_seen", None))))
+    lines.append(_format_kv("End", format_ts(getattr(summary, "last_seen", None))))
+    lines.append(_format_kv("Duration", format_duration(getattr(summary, "duration_seconds", None))))
+
+    def _ctf_verdict() -> tuple[str, str, list[str], int]:
+        score = 0
+        reasons: list[str] = []
+        high_conf = int(getattr(summary, "confidence_counts", Counter()).get("high", 0))
+        medium_conf = int(getattr(summary, "confidence_counts", Counter()).get("medium", 0))
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+
+        if high_conf:
+            score += min(4, high_conf)
+            reasons.append(f"High-confidence CTF candidates observed ({high_conf})")
+        if medium_conf >= 2:
+            score += 1
+            reasons.append(f"Multiple medium-confidence candidates observed ({medium_conf})")
+        if checks.get("decoded_wrapper_pattern_present"):
+            score += 2
+            reasons.append("Decoded wrapper-pattern matches observed")
+        if checks.get("multi_source_corroboration"):
+            score += 1
+            reasons.append("Cross-source corroboration observed")
+        if checks.get("stream_reassembled_match"):
+            score += 1
+            reasons.append("Stream-boundary reconstruction recovered wrapper match")
+        if checks.get("external_replay_exfil_behavior"):
+            score += 1
+            reasons.append("Candidate replay/exfil behavior observed")
+
+        if score >= 7:
+            verdict = "YES - high-confidence CTF flag evidence is present."
+            confidence = "High"
+        elif score >= 4:
+            verdict = "LIKELY - strong CTF evidence is present with corroboration."
+            confidence = "Medium"
+        elif score >= 2:
+            verdict = "POSSIBLE - weak-to-moderate CTF evidence is present."
+            confidence = "Low"
+        else:
+            verdict = "NO STRONG SIGNAL - no convincing high-confidence CTF evidence from current heuristics."
+            confidence = "Low"
+
+        if not reasons:
+            reasons.append("No high-confidence CTF heuristic crossed threshold")
+        return verdict, confidence, reasons, score
+
+    verdict, confidence, verdict_reasons, verdict_score = _ctf_verdict()
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if verdict.startswith("YES"):
+        lines.append(danger(verdict))
+    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+        lines.append(warn(verdict))
+    else:
+        lines.append(ok(verdict))
+    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
+    lines.append(muted("Reasons:"))
+    for reason in verdict_reasons[:_limit_value(8)]:
+        lines.append(muted(f"- {_redact_in_text(reason)}"))
+
     if summary.token_counts:
-        lines.append(_format_kv("Top Tokens", _format_counter(summary.token_counts, 6)))
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Tokens"))
+        lines.append(_format_kv("Token Frequency", _format_counter(summary.token_counts, 10)))
+
     if summary.decoded_hits:
-        lines.append(_format_kv("Decoded Hits", "; ".join(summary.decoded_hits[:_limit_value(5)])))
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Decoded Wrapper Hits"))
+        for item in summary.decoded_hits[:_limit_value(8)]:
+            lines.append(muted(f"- {_redact_in_text(item)}"))
+
     if getattr(summary, "file_hints", None):
         if summary.file_hints:
-            lines.append(_format_kv("File Hints", "; ".join(summary.file_hints[:_limit_value(5)])))
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Challenge File Hints"))
+            for item in summary.file_hints[:_limit_value(10)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic CTF Checks"))
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+    check_labels = [
+        ("flag_wrapper_pattern_present", "Flag Wrapper Pattern Present"),
+        ("decoded_wrapper_pattern_present", "Decoded Wrapper Pattern Present"),
+        ("multi_source_corroboration", "Multi-Source Corroboration"),
+        ("stream_reassembled_match", "Stream-Reassembled Match"),
+        ("external_replay_exfil_behavior", "External Replay/Exfil Behavior"),
+        ("challenge_file_hint_correlation", "Challenge File Hint Correlation"),
+        ("likely_secret_not_flag", "Likely Secret (Not Flag)"),
+    ]
+
+    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+    for key, label_text in check_labels:
+        evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
+        evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
+        lines.append(label(label_text))
+        if evidence_items:
+            if key == "likely_secret_not_flag":
+                lines.append(ok(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                matrix_rows.append([label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"])
+            else:
+                lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                risk = "High" if key in {"flag_wrapper_pattern_present", "decoded_wrapper_pattern_present", "stream_reassembled_match"} else "Medium"
+                conf_level = "High" if key in {"decoded_wrapper_pattern_present", "multi_source_corroboration"} else "Medium"
+                matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+            for item in evidence_items[:_limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+        else:
+            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("CTF Confidence Matrix"))
+    lines.append(_format_table(matrix_rows))
+
+    findings = list(getattr(summary, "candidate_findings", []) or [])
+    if findings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Candidate Provenance"))
+        rows = [["Candidate", "Score", "Confidence", "Decode", "Source", "Flow", "Packet", "Time"]]
+        for item in findings[:_limit_value(15)]:
+            rows.append([
+                _truncate_text(_redact_in_text(str(item.get("candidate", "-"))), 36),
+                str(item.get("score", "-")),
+                str(item.get("confidence", "-")),
+                str(item.get("decode_chain", "raw")),
+                str(item.get("source", "-")),
+                f"{item.get('src', '-')}->{item.get('dst', '-')}",
+                str(item.get("packet", "-")),
+                format_ts(item.get("ts")),
+            ])
+        lines.append(_format_table(rows))
+
+    timeline = list(getattr(summary, "timeline", []) or [])
+    if timeline:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Timeline"))
+        rows = [["Time", "Event", "Candidate", "Confidence", "Flow", "Packet"]]
+        for item in timeline[:_limit_value(15)]:
+            rows.append([
+                format_ts(item.get("ts")),
+                str(item.get("event", "-")),
+                _truncate_text(_redact_in_text(str(item.get("candidate", "-"))), 42),
+                str(item.get("confidence", "-")),
+                f"{item.get('src', '-')}->{item.get('dst', '-')}",
+                str(item.get("packet", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+    pivots = list(getattr(summary, "hunting_pivots", []) or [])
+    if pivots:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Actionable Hunting Pivots"))
+        rows = [["Packet", "Source", "Destination", "Proto", "Candidate", "Decode"]]
+        for item in pivots[:_limit_value(15)]:
+            rows.append([
+                str(item.get("packet", "-")),
+                str(item.get("src", "-")),
+                str(item.get("dst", "-")),
+                str(item.get("protocol", "-")),
+                _truncate_text(_redact_in_text(str(item.get("candidate", "-"))), 42),
+                str(item.get("decode_chain", "raw")),
+            ])
+        lines.append(_format_table(rows))
+
+    false_context = list(getattr(summary, "false_positive_context", []) or [])
+    if false_context:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("False-Positive Context"))
+        for item in false_context[:_limit_value(8)]:
+            lines.append(muted(f"- {_redact_in_text(item)}"))
+
+    lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 

@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 1.6.0 — 2026-03-22
+### Added
+- MITRE ATT&CK mapping workflow (`--mitre`) with Enterprise + ICS tactic/technique correlation, attack-path visualization, host-centric chains, technique heat, pivots, and deterministic checks.
+- Suricata integration (`--suricata`) with local scan execution, metadata capture, deterministic IDS checks, event coverage rollups, and analyst pivots.
+- Analyst-grade deterministic reporting sections across major summaries (verdict, confidence, deterministic checks, risk matrix, pivots, and false-positive context) for faster threat-hunting and DFIR triage.
+
+### Changed
+- Release metadata and docs updated to `v1.6.0` across package/docs.
+- CLI grouped help alignment: IT and OT/ICS command menus are now consistently organized and alphabetically sorted.
+
 ## 1.5.1 — 2026-03-21
 ### Changed
 - Release metadata updated to `v1.5.1` across package/docs.

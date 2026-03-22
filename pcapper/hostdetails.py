@@ -1084,6 +1084,8 @@ def analyze_hostdetails(path: Path, target_ip: str, show_status: bool = True) ->
             "category": event.category,
             "summary": event.summary,
             "details": event.details,
+            "packet_index": getattr(event, "packet_index", None),
+            "source": getattr(event, "source", "timeline"),
         })
 
     services: list[dict[str, object]] = []

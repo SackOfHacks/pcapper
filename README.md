@@ -4,6 +4,10 @@
 ![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
 ![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
 ![License](https://img.shields.io/badge/license-MIT-6C757D)
+![SOC](https://img.shields.io/badge/designed%20for-SOC-0F766E)
+![DFIR](https://img.shields.io/badge/designed%20for-DFIR-7C3AED)
+![OT/ICS Defenders](https://img.shields.io/badge/designed%20for-OT%2FICS%20Defenders-0B7285)
+![Purple Team](https://img.shields.io/badge/designed%20for-Purple%20Team-1D4ED8)
 
 ```text
   ____                                                    
@@ -18,6 +22,147 @@
 **Pcapper** is a modular PCAP/PCAPNG analysis CLI for fast triage and deep-dive protocol investigations across enterprise IT and ICS/OT traffic.
 
 **OT/ICS READY** — plant-floor triage in minutes, not hours.
+
+Built for blue teams, DFIR responders, and OT defenders who need fast answers with evidence-rich outputs.
+
+> Install and run in under a minute: `pip install -r requirements.txt` then `python -m pcapper capture.pcap --threats --ips --timeline -ip 10.0.0.5`
+
+## Why Teams Pick Pcapper
+
+| You Need | Pcapper Delivers |
+| --- | --- |
+| Fast first-pass triage | One-pass summaries across hosts, services, protocols, and threats |
+| Forensic depth when needed | Deterministic checks, pivots, timelines, and risk matrices |
+| OT + IT in one workflow | Industrial protocol decoding plus enterprise threat-hunting views |
+| Output that can be actioned | Analyst verdicts and evidence lines built for investigations |
+
+## Built for Real Incidents
+
+- SOC triage for suspicious captures with immediate threat signal extraction.
+- IR/DFIR workflows where explainability and deterministic evidence matter.
+- OT/ICS incident response for control-plane visibility and safety-oriented context.
+- Purple-team and lab validation with ATT&CK mapping and IDS corroboration.
+
+## Product Highlights
+
+- **Analyst-grade reporting**: verdict, confidence, deterministic checks, risk matrix, pivots, and false-positive context.
+- **MITRE ATT&CK mapping**: enterprise + ICS TTP alignment with technique heat and host-centric attack paths.
+- **Suricata integration**: local IDS execution with structured metadata, event coverage, and pivots.
+- **Protocol depth**: broad IT plus OT/ICS protocol coverage for mixed-network environments.
+- **Case-friendly exports**: JSON/CSV/SQLite plus case metadata and provenance artifacts.
+
+## 30-Second Quickstart
+
+```bash
+# 1) Install
+pip install -r requirements.txt
+
+# 2) Fast first-pass triage
+python -m pcapper capture.pcap --threats --ips --timeline -ip 10.0.0.5
+
+# 3) Deep-dive with ATT&CK + IDS corroboration
+python -m pcapper capture.pcap --mitre --suricata --services --protocols
+
+# 4) Export case-ready artifacts
+python -m pcapper capture.pcap --json out/results.json --sqlite out/results.db --case-dir case-001
+```
+
+## Top 5 Commands by Use Case
+
+```bash
+# 1) Fast triage (best first command)
+python -m pcapper capture.pcap --threats --ips --health
+
+# 2) Host-centric hunt timeline
+python -m pcapper capture.pcap --timeline -ip 10.0.0.5 --protocols --services
+
+# 3) ATT&CK + IDS corroboration
+python -m pcapper capture.pcap --mitre --suricata
+
+# 4) Exfiltration and artifact hunt
+python -m pcapper capture.pcap --exfil --files --ftp --http
+
+# 5) OT/ICS deep-dive
+python -m pcapper capture.pcap --modbus --dnp3 --iec104 --s7 --ot-commands --safety
+```
+
+## Architecture At A Glance
+
+```mermaid
+flowchart LR
+  A[PCAP / PCAPNG Input] --> B[Packet Decode + Stream Reassembly]
+  B --> C[IT + OT/ICS Protocol Analyzers]
+  C --> D[Detections + Correlation]
+  D --> E[Analyst Verdict + Deterministic Checks]
+  E --> F[Reports + Exports]
+
+  C --> C1[Enterprise: DNS/HTTP/TLS/SMB/LDAP/Kerberos]
+  C --> C2[Industrial: Modbus/DNP3/IEC104/S7/CIP/Profinet]
+  D --> D1[MITRE Mapping]
+  D --> D2[Suricata Corroboration]
+  F --> F1[CLI]
+  F --> F2[JSON/CSV/SQLite]
+  F --> F3[Case Metadata]
+```
+
+## Which Flag Should I Use?
+
+| If You Want To... | Start With |
+| --- | --- |
+| Get immediate risk triage | `--threats --ips --health` |
+| Hunt C2 or beaconing behavior | `--beacon --dns --tls --quic` |
+| Map findings to ATT&CK | `--mitre` |
+| Corroborate with IDS alerts | `--suricata` |
+| Investigate data theft | `--exfil --files --ftp --http` |
+| Investigate identity abuse | `--kerberos --ldap --ntlm --domain --creds` |
+| Track lateral movement | `--hosts --services --protocols --tcp --timeline -ip <host>` |
+| Run OT/ICS-specific triage | `--modbus --dnp3 --iec104 --s7 --ot-commands --safety` |
+| Build IR exports and evidence packs | `--json --csv --sqlite --case-dir` |
+
+## Sample Analyst Report
+
+```text
+ANALYST VERDICT
+LIKELY - MULTIPLE CORROBORATING RISK INDICATORS DETECTED (confidence: MEDIUM)
+
+DETERMINISTIC CHECKS
+[!] Indicator quality gate: 3
+  - 203.0.113.44 quality=4 AbuseIPDB score=85 reports=12
+[!] Boundary cross-zone contact: 2
+  - 10.0.0.10->203.0.113.44 TCP packets=600
+[!] Intent heuristics: 2
+  - 10.0.0.10->203.0.113.44 admin ports observed 445,3389
+
+RISK MATRIX
+Category                   Risk   Confidence   Evidence
+Indicator Quality          High   High         3
+Boundary Exposure          Medium Medium       2
+Critical Asset Contact     High   High         1
+
+TOP HUNT PIVOTS
+- flow=10.0.0.10->203.0.113.44 proto=TCP packets=600 bytes=2.9 MB
+  reasons=Lateral movement posture score; Cross-zone outbound contact
+```
+
+The goal is actionable signal, not noisy packet dumps.
+
+## Before vs After Pcapper
+
+| Traditional PCAP Workflow | With Pcapper |
+| --- | --- |
+| Manually pivot protocol by protocol | Single command gives cross-protocol triage |
+| Raw packet dumps with limited context | Deterministic checks + verdict + confidence |
+| Ad-hoc analyst notes for evidence | Built-in pivots and evidence-rich summaries |
+| Separate OT and IT tooling chains | Unified OT/ICS + enterprise workflow |
+| Time-consuming report assembly | Case-ready exports (JSON/CSV/SQLite + metadata) |
+
+## Who Uses Pcapper
+
+- SOC analysts triaging suspicious captures under time pressure.
+- Incident responders and DFIR teams building evidence-driven narratives.
+- OT/ICS defenders investigating control-network anomalies safely.
+- Purple teams validating detections and ATT&CK coverage.
+- Security engineering teams building repeatable PCAP triage runbooks.
 
 | Focus | What You Get |
 | --- | --- |
@@ -35,9 +180,11 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
-## Current Release: v1.5.0
+## Current Release: v1.6.0
 
 Latest additions in this release:
+- MITRE ATT&CK mapping (`--mitre`) across Enterprise + ICS with technique heat, host chains, and attack-path visualization.
+- Suricata IDS integration (`--suricata`) with rule/config controls and deterministic coverage checks.
 - TCP stream carving (`--carve`) with signature-based extraction.
 - Obfuscation/tunneling heuristics (`--obfuscation`) for high-entropy and encoded payloads.
 - Cross-PCAP correlation (`--correlate`) for repeated hosts/services.
@@ -137,8 +284,8 @@ Client                   Server                   Start                     End 
 ========================================================================
 ```
 
-Secrets/credentials are redacted by default in reports. Use `--show-secrets` to display them.
-Exports (JSON/CSV/SQLite) are redacted by default; use `--export-raw` to disable export redaction or `--export-redact` to force it.
+Secrets/credentials are displayed in reports by default.
+Exports (JSON/CSV/SQLite) are unredacted by default; use `--export-redact` to force export redaction when needed.
 Use `-v/--verbose` to include additional evidence lines in summaries (for example file artifacts, LDAP anomalies, and OT/ICS command details).
 
 ## Summarize behavior
@@ -350,31 +497,29 @@ python -m pcapper --help
 - `--baseline-fast`
 - `--baseline-save PATH`
 - `--bpf EXPR`
-- `--case-dir DIR`
-- `--case-name NAME`
-- `--case-id ID`
-- `--case-analyst NAME`
-- `--case-notes TEXT`
-- `-case`
-- `--config PATH`
-- `--csv PATH`
 - `--carve`
 - `--carve-limit N`
 - `--carve-max-bytes N`
 - `--carve-out DIR`
 - `--carve-stream-bytes N`
+- `--case-analyst NAME`
+- `--case-dir DIR`
+- `--case-id ID`
+- `--case-name NAME`
+- `--case-notes TEXT`
+- `--config PATH`
+- `--correlate`
+- `--correlate-min N`
+- `--csv PATH`
 - `--decrypt`
 - `--decrypt-limit N`
 - `--decrypt-out DIR`
-- `--export-raw`
 - `--export-redact`
 - `--extract FILENAME`
 - `--follow FLOW`
 - `--follow-id STREAM_ID`
-- `-ip TIMELINE_IP`
 - `--ioc-file PATH`
 - `--json PATH`
-- `-l, --limit-protocols`
 - `--list-plugins`
 - `--log-file PATH`
 - `--log-json`
@@ -385,26 +530,26 @@ python -m pcapper --help
 - `--profile`
 - `--profile-out PATH`
 - `--rules PATH`
-- `-r, --recursive`
 - `--search STRING`
 - `--self-check`
-- `--show-secrets`
-- `--correlate`
-- `--correlate-min N`
-- `--ssh-keylog PATH`
 - `--sqlite PATH`
+- `--ssh-keylog PATH`
 - `--streams-full`
-- `-summarize, --summarize`
 - `--time-end TIME`
 - `--time-start TIME`
 - `--timeline-bins N`
-- `-categories, --timeline-categories LIST`
 - `--timeline-storyline-off`
 - `--tls-keylog PATH`
+- `-categories, --timeline-categories LIST`
+- `-case`
+- `-ip TIMELINE_IP`
+- `-l, --limit-protocols`
+- `-r, --recursive`
+- `-raw`
+- `-summarize, --summarize`
 - `-v, --verbose`
 - `-vt, --vt`
 - `--view FILENAME`
-- `-raw`
 
 ### IT/Enterprise functions (alphabetical)
 
@@ -432,6 +577,7 @@ python -m pcapper --help
 - `--ips`
 - `--kerberos`
 - `--ldap`
+- `--mitre`
 - `--netbios`
 - `--nfs`
 - `--ntlm`
@@ -454,6 +600,7 @@ python -m pcapper --help
 - `--ssh`
 - `--streams`
 - `--strings`
+- `--suricata`
 - `--syslog`
 - `--tcp`
 - `--teamviewer`
@@ -468,7 +615,7 @@ python -m pcapper --help
 - `--winrm`
 - `--wmic`
 
-Count: 58 flags
+Count: 60 flags
 
 ### OT/ICS/Industrial functions (alphabetical)
 

@@ -139,6 +139,7 @@ from .reporting import (
     render_ioc_summary,
     render_ot_commands_summary,
     render_iec101_103_summary,
+    render_mitre_summary,
 )
 from .pcap_cache import load_packets_if_allowed, load_filtered_packets, get_reader, get_cache_config
 from .exporting import ExportBundle, export_json, export_csv, export_sqlite
@@ -146,7 +147,7 @@ from .vlan import analyze_vlans
 from .icmp import analyze_icmp
 from .dns import analyze_dns
 from .beacon import analyze_beacons
-from .threats import analyze_threats, merge_threats_summaries
+from .threats import analyze_suricata, analyze_threats, merge_threats_summaries
 from .files import analyze_files, merge_files_summaries
 from .protocols import analyze_protocols, merge_protocols_summaries
 from .services import analyze_services, merge_services_summaries
@@ -236,6 +237,7 @@ from .ctf import analyze_ctf
 from .ioc import analyze_iocs
 from .ot_commands import analyze_ot_commands, load_ot_control_config, OtControlConfig
 from .iec101_103 import analyze_iec101_103
+from .mitre import analyze_mitre, merge_mitre_summaries
 from .utils import parse_time_arg, hexdump, safe_write_text
 
 _PLUGIN_SPECS: list[PluginSpec] | None = None
@@ -282,6 +284,8 @@ def _builtin_flag_map() -> dict[str, str]:
         "--ips": "ips",
         "--beacon": "beacon",
         "--threats": "threats",
+        "--mitre": "mitre",
+        "--suricata": "suricata",
         "--quic": "quic",
         "--http2": "http2",
         "--encrypted-dns": "encrypted_dns",
@@ -815,11 +819,6 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Write cProfile stats to PATH (use with --profile).",
     )
     general.add_argument(
-        "--show-secrets",
-        action="store_true",
-        help="Display secrets/credentials in output (default is redacted).",
-    )
-    general.add_argument(
         "--search",
         metavar="STRING",
         help="Search packet payloads for a string (case-insensitive) and list matches.",
@@ -966,16 +965,10 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         metavar="PATH",
         help="Write SQLite export of results to PATH.",
     )
-    export_redact_group = general.add_mutually_exclusive_group()
-    export_redact_group.add_argument(
+    general.add_argument(
         "--export-redact",
         action="store_true",
         help="Force redaction of secrets in export outputs.",
-    )
-    export_redact_group.add_argument(
-        "--export-raw",
-        action="store_true",
-        help="Disable redaction in export outputs (may include secrets).",
     )
     general.add_argument(
         "--case-dir",
@@ -1113,6 +1106,8 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--teamviewer", "Include TeamViewer analysis (sessions, hints, anomalies, threats)."),
         ("--telnet", "Include Telnet analysis (sessions, credentials, anomalies, threats)."),
         ("--threats", "Include consolidated threat detections in the output."),
+        ("--mitre", "Map detections to MITRE ATT&CK (Enterprise + ICS) with TTP attack-path visualization."),
+        ("--suricata", "Run local Suricata IDS against the capture and include Suricata detections."),
         ("--quic", "Include QUIC (HTTP/3) analysis in the output."),
         ("--http2", "Include HTTP/2 analysis (cleartext/upgrade indicators)."),
         ("--encrypted-dns", "Include encrypted DNS analysis (DoH/DoT/DoQ)."),
@@ -1132,8 +1127,58 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--ioc", "Include IOC matching analysis (use with --ioc-file)."),
         ("--pcapmeta", "Include pcap metadata analysis (linktype, snaplen, interfaces)."),
     ]
-    for flag, help_text in sorted(it_flags, key=lambda item: item[0]):
-        it_group.add_argument(flag, action="store_true", help=help_text)
+    it_entries: list[tuple[str, dict[str, object]]] = [
+        (flag, {"action": "store_true", "help": help_text})
+        for flag, help_text in it_flags
+    ]
+    it_entries.extend(
+        [
+            (
+                "--suricata-config",
+                {
+                    "metavar": "PATH",
+                    "help": "Path to suricata.yaml config file (used with --suricata).",
+                },
+            ),
+            (
+                "--suricata-eve-types",
+                {
+                    "metavar": "LIST",
+                    "help": "Comma-separated eve event types to parse (e.g., alert,dns,http,tls,fileinfo,anomaly).",
+                },
+            ),
+            (
+                "--suricata-only-sid",
+                {
+                    "metavar": "LIST",
+                    "help": "Comma-separated Suricata SIDs to include exclusively.",
+                },
+            ),
+            (
+                "--suricata-rules",
+                {
+                    "metavar": "PATH",
+                    "help": "Path to Suricata rules file (used with --suricata).",
+                },
+            ),
+            (
+                "--suricata-strict",
+                {
+                    "action": "store_true",
+                    "help": "Treat Suricata scan/engine errors as fatal (non-zero exit code).",
+                },
+            ),
+            (
+                "--suricata-suppress-sid",
+                {
+                    "metavar": "LIST",
+                    "help": "Comma-separated Suricata SIDs to suppress from output.",
+                },
+            ),
+        ]
+    )
+    for flag, kwargs in sorted(it_entries, key=lambda item: item[0]):
+        it_group.add_argument(flag, **kwargs)
 
     ics_group = parser.add_argument_group("OT/ICS/INDUSTRIAL FUNCTIONS")
     ics_flags = [
@@ -1176,18 +1221,30 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--iec101-103", "Include IEC 60870-5-101/103 heuristic analysis."),
         ("--yokogawa", "Include Yokogawa Vnet/IP analysis."),
     ]
-    for flag, help_text in sorted(ics_flags, key=lambda item: item[0]):
-        ics_group.add_argument(flag, action="store_true", help=help_text)
-    ics_group.add_argument(
-        "--ot-commands-config",
-        help="Path to OT command control map config (JSON/YAML).",
+    ics_entries: list[tuple[str, dict[str, object]]] = [
+        (flag, {"action": "store_true", "help": help_text})
+        for flag, help_text in ics_flags
+    ]
+    ics_entries.extend(
+        [
+            (
+                "--ot-commands-config",
+                {
+                    "help": "Path to OT command control map config (JSON/YAML).",
+                },
+            ),
+            (
+                "--ot-commands-sessions",
+                {
+                    "type": int,
+                    "default": 10,
+                    "help": "Limit rows in OT command sessions table (default: 10).",
+                },
+            ),
+        ]
     )
-    ics_group.add_argument(
-        "--ot-commands-sessions",
-        type=int,
-        default=10,
-        help="Limit rows in OT command sessions table (default: 10).",
-    )
+    for flag, kwargs in sorted(ics_entries, key=lambda item: item[0]):
+        ics_group.add_argument(flag, **kwargs)
     if plugins is None:
         plugins, _errors = _filtered_plugins(_builtin_flag_map())
     for spec in sorted(plugins, key=lambda item: item.flag):
@@ -1234,6 +1291,14 @@ def _analyze_paths(
     show_ips: bool,
     show_beacon: bool,
     show_threats: bool,
+    show_mitre: bool,
+    show_suricata: bool,
+    suricata_rules: Path | None,
+    suricata_config: Path | None,
+    suricata_eve_types: set[str] | None,
+    suricata_suppress_sid: set[str] | None,
+    suricata_only_sid: set[str] | None,
+    suricata_strict: bool,
     show_files: bool,
     show_protocols: bool,
     show_routing: bool,
@@ -1243,7 +1308,6 @@ def _analyze_paths(
     show_strings: bool,
     show_creds: bool,
     show_secrets_scan: bool,
-    show_secrets: bool,
     show_certificates: bool,
     show_health: bool,
     show_compromised: bool,
@@ -1367,6 +1431,7 @@ def _analyze_paths(
     use_packets = len(ordered_steps) > 1 or (render_base_summary and len(ordered_steps) > 0)
     multi_export = len(paths) > 1 and not summarize
     plugin_lookup = plugin_map(plugins or [])
+    suricata_strict_failures = 0
 
     if case_dir:
         case_dir.mkdir(parents=True, exist_ok=True)
@@ -1771,6 +1836,35 @@ def _analyze_paths(
                 else:
                     print(render_threats_summary(threat_summary, verbose=verbose))
                 export_summaries["threats"] = threat_summary
+            elif step == "mitre" and show_mitre:
+                mitre_summary = analyze_mitre(
+                    path,
+                    show_status=step_status,
+                    ioc_file=Path(ioc_file).expanduser() if ioc_file else None,
+                )
+                if summarize_rollups:
+                    rollups.setdefault("mitre", []).append(mitre_summary)
+                else:
+                    print(render_mitre_summary(mitre_summary, verbose=verbose))
+                export_summaries["mitre"] = mitre_summary
+            elif step == "suricata" and show_suricata:
+                suricata_summary = analyze_suricata(
+                    path,
+                    show_status=step_status,
+                    rules_path=suricata_rules,
+                    config_path=suricata_config,
+                    eve_types=suricata_eve_types,
+                    suppress_sid=suricata_suppress_sid,
+                    only_sid=suricata_only_sid,
+                    strict=suricata_strict,
+                )
+                if summarize_rollups:
+                    rollups.setdefault("suricata", []).append(suricata_summary)
+                else:
+                    print(render_threats_summary(suricata_summary, verbose=verbose))
+                export_summaries["suricata"] = suricata_summary
+                if suricata_strict and suricata_summary.errors:
+                    suricata_strict_failures += 1
             elif step == "quic" and show_quic:
                 quic_summary = export_summaries.get("quic")
                 if quic_summary is None:
@@ -1889,14 +1983,14 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("creds", []).append(creds_summary)
                 else:
-                    print(render_creds_summary(creds_summary, show_secrets=show_secrets))
+                    print(render_creds_summary(creds_summary, show_secrets=True))
                 export_summaries["creds"] = creds_summary
             elif step == "secrets" and show_secrets_scan:
                 secrets_summary = analyze_secrets(path, show_status=step_status, packets=packets, meta=meta)
                 if summarize_rollups:
                     rollups.setdefault("secrets", []).append(secrets_summary)
                 else:
-                    print(render_secrets_summary(secrets_summary, show_secrets=show_secrets))
+                    print(render_secrets_summary(secrets_summary, show_secrets=True))
                 export_summaries["secrets"] = secrets_summary
             elif step == "certificates" and show_certificates:
                 cert_summary = analyze_certificates(path, show_status=step_status)
@@ -2431,6 +2525,8 @@ def _analyze_paths(
             "wmic": (merge_wmic_summaries, lambda s: render_wmic_summary(s, verbose=verbose)),
             "powershell": (merge_powershell_summaries, lambda s: render_powershell_summary(s, verbose=verbose)),
             "threats": (merge_threats_summaries, lambda s: render_threats_summary(s, verbose=verbose)),
+            "suricata": (merge_threats_summaries, lambda s: render_threats_summary(s, verbose=verbose)),
+            "mitre": (merge_mitre_summaries, lambda s: render_mitre_summary(s, verbose=verbose)),
             "snmp": (merge_snmp_summaries, lambda s: render_snmp_summary(s, verbose=verbose)),
             "smtp": (merge_smtp_summaries, lambda s: render_smtp_summary(s, verbose=verbose)),
             "rpc": (merge_rpc_summaries, lambda s: render_rpc_summary(s, verbose=verbose)),
@@ -2469,6 +2565,8 @@ def _analyze_paths(
             "ips": "IP INTELLIGENCE ANALYSIS",
             "beacon": "BEACON ANALYSIS",
             "threats": "THREAT DETECTIONS",
+            "suricata": "SURICATA IDS",
+            "mitre": "MITRE ATT&CK MAPPING",
             "quic": "QUIC ANALYSIS",
             "http2": "HTTP/2 ANALYSIS",
             "encrypted_dns": "ENCRYPTED DNS ANALYSIS",
@@ -2649,6 +2747,8 @@ def _analyze_paths(
                 print(render_baseline_delta(delta))
             except Exception as exc:
                 print(f"Baseline compare error: {exc}")
+    if suricata_strict and suricata_strict_failures:
+        return 2
     return 0
 
 
@@ -2741,7 +2841,7 @@ def main() -> int:
 
     if args.no_color:
         set_color_override(False)
-    set_redact_secrets(not args.show_secrets)
+    set_redact_secrets(False)
     set_verbose_output(args.verbose)
     if getattr(args, "vt", False) and not args.dns:
         args.dns = True
@@ -2877,12 +2977,10 @@ def main() -> int:
     if case_dir and not (export_json_path or export_csv_path or export_sqlite_path):
         export_json_path = case_dir / "pcapper.json"
 
-    if args.export_raw:
-        export_redact = False
-    elif args.export_redact:
+    if args.export_redact:
         export_redact = True
     else:
-        export_redact = not args.show_secrets
+        export_redact = False
 
     def _run_analysis() -> int:
         return _analyze_paths(
@@ -2918,6 +3016,14 @@ def main() -> int:
             show_ips=args.ips,
             show_beacon=args.beacon,
             show_threats=args.threats,
+            show_mitre=getattr(args, "mitre", False),
+            show_suricata=getattr(args, "suricata", False),
+            suricata_rules=Path(args.suricata_rules).expanduser() if getattr(args, "suricata_rules", None) else None,
+            suricata_config=Path(args.suricata_config).expanduser() if getattr(args, "suricata_config", None) else None,
+            suricata_eve_types={item.strip().lower() for item in str(getattr(args, "suricata_eve_types", "") or "").split(",") if item.strip()} or None,
+            suricata_suppress_sid={item.strip() for item in str(getattr(args, "suricata_suppress_sid", "") or "").split(",") if item.strip()} or None,
+            suricata_only_sid={item.strip() for item in str(getattr(args, "suricata_only_sid", "") or "").split(",") if item.strip()} or None,
+            suricata_strict=bool(getattr(args, "suricata_strict", False)),
             show_files=args.files,
             show_protocols=args.protocols,
             show_routing=args.routing,
@@ -2927,7 +3033,6 @@ def main() -> int:
             show_strings=args.strings,
             show_creds=args.creds,
             show_secrets_scan=getattr(args, "secrets", False),
-            show_secrets=args.show_secrets,
             show_certificates=args.certificates,
             show_health=args.health,
             show_compromised=getattr(args, "compromised", False),

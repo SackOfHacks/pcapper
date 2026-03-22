@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -45,6 +46,8 @@ POP_PASS_RE = re.compile(r"(?i)^PASS\s+(.+)$")
 IMAP_LOGIN_RE = re.compile(r"(?i)^\w+\s+LOGIN\s+(\"?[^\"\s]+\"?)\s+(\"?[^\"\s]+\"?)")
 SMTP_AUTH_PLAIN_RE = re.compile(r"(?i)^AUTH\s+PLAIN\s+([A-Za-z0-9+/=]+)$")
 SMTP_AUTH_LOGIN_RE = re.compile(r"(?i)^AUTH\s+LOGIN\s*([A-Za-z0-9+/=]+)?$")
+PRIV_USER_RE = re.compile(r"(?i)\b(admin|administrator|root|svc_|service|backup|dbadmin|domain\\admin|krbtgt)\b")
+PLACEHOLDER_SECRETS = {"admin", "password", "test", "123456", "changeme", "default", "qwerty"}
 
 
 @dataclass(frozen=True)
@@ -71,7 +74,14 @@ class CredentialSummary:
     truncated: bool
     kind_counts: Counter[str]
     user_counts: Counter[str]
-    errors: list[str]
+    confidence_counts: Counter[str] = field(default_factory=Counter)
+    auth_abuse_sequences: list[dict[str, object]] = field(default_factory=list)
+    replay_candidates: list[dict[str, object]] = field(default_factory=list)
+    token_fanout: list[dict[str, object]] = field(default_factory=list)
+    privileged_exposures: list[dict[str, object]] = field(default_factory=list)
+    external_exposures: list[dict[str, object]] = field(default_factory=list)
+    deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
 
 
 def _get_ip_pair(pkt: Packet) -> tuple[str, str]:
@@ -328,6 +338,7 @@ def analyze_creds(
     errors: list[str] = []
     kind_counts: Counter[str] = Counter()
     user_counts: Counter[str] = Counter()
+    confidence_counts: Counter[str] = Counter()
 
     try:
         for pkt in reader:
@@ -401,6 +412,142 @@ def analyze_creds(
             pass
 
     truncated = matches > len(hits)
+
+    auth_abuse_sequences: list[dict[str, object]] = []
+    replay_candidates: list[dict[str, object]] = []
+    token_fanout: list[dict[str, object]] = []
+    privileged_exposures: list[dict[str, object]] = []
+    external_exposures: list[dict[str, object]] = []
+    deterministic_checks: dict[str, list[str]] = {
+        "plaintext_credential_exposure": [],
+        "auth_abuse_pattern": [],
+        "credential_replay": [],
+        "privileged_account_exposure": [],
+        "token_misuse_fanout": [],
+        "external_destination_exposure": [],
+        "likely_benign_test_credentials": [],
+    }
+
+    def _is_public_ip(value: str) -> bool:
+        try:
+            return ipaddress.ip_address(value).is_global
+        except Exception:
+            return False
+
+    for hit in hits:
+        score = 0
+        secret = str(hit.secret or "")
+        user = str(hit.username or "")
+        kind_l = hit.kind.lower()
+        if "basic" in kind_l or "pass" in kind_l or "credential" in kind_l:
+            score += 2
+        elif "token" in kind_l or "bearer" in kind_l:
+            score += 1
+        if user:
+            score += 1
+        if secret and len(secret) >= 10:
+            score += 1
+        if _is_public_ip(hit.dst_ip):
+            score += 1
+
+        if score >= 4:
+            confidence = "high"
+        elif score >= 2:
+            confidence = "medium"
+        else:
+            confidence = "low"
+        confidence_counts[confidence] += 1
+
+        deterministic_checks["plaintext_credential_exposure"].append(
+            f"pkt={hit.packet_number} {hit.src_ip}->{hit.dst_ip} {hit.kind} confidence={confidence}"
+        )
+
+        if _is_public_ip(hit.dst_ip):
+            external_exposures.append({
+                "src": hit.src_ip,
+                "dst": hit.dst_ip,
+                "kind": hit.kind,
+                "user": hit.username or "-",
+                "pkt": hit.packet_number,
+            })
+            deterministic_checks["external_destination_exposure"].append(
+                f"{hit.src_ip}->{hit.dst_ip} kind={hit.kind}"
+            )
+
+        if user and PRIV_USER_RE.search(user):
+            privileged_exposures.append({
+                "src": hit.src_ip,
+                "dst": hit.dst_ip,
+                "user": user,
+                "kind": hit.kind,
+                "pkt": hit.packet_number,
+            })
+            deterministic_checks["privileged_account_exposure"].append(
+                f"{user} exposed via {hit.kind} {hit.src_ip}->{hit.dst_ip}"
+            )
+
+        if secret and secret.lower() in PLACEHOLDER_SECRETS:
+            deterministic_checks["likely_benign_test_credentials"].append(
+                f"placeholder secret on pkt={hit.packet_number} {hit.src_ip}->{hit.dst_ip}"
+            )
+
+    by_src: dict[str, list[CredentialHit]] = {}
+    for hit in hits:
+        by_src.setdefault(hit.src_ip, []).append(hit)
+    for src_ip, items in by_src.items():
+        unique_users = {str(item.username).lower() for item in items if item.username}
+        unique_dsts = {item.dst_ip for item in items}
+        if len(items) >= 8 and (len(unique_users) >= 4 or len(unique_dsts) >= 4):
+            auth_abuse_sequences.append({
+                "src": src_ip,
+                "events": len(items),
+                "users": len(unique_users),
+                "dsts": len(unique_dsts),
+            })
+            deterministic_checks["auth_abuse_pattern"].append(
+                f"{src_ip} events={len(items)} users={len(unique_users)} dsts={len(unique_dsts)}"
+            )
+
+    replay_index: dict[tuple[str, str], set[str]] = {}
+    for hit in hits:
+        key_user = str(hit.username or "").strip().lower()
+        if key_user:
+            replay_index.setdefault(("user", key_user), set()).add(hit.dst_ip)
+        key_secret = str(hit.secret or "").strip()
+        if key_secret and len(key_secret) >= 8:
+            replay_index.setdefault(("secret", key_secret), set()).add(hit.dst_ip)
+
+    for (rtype, value), dsts in replay_index.items():
+        if len(dsts) >= 3:
+            replay_candidates.append({
+                "type": rtype,
+                "value": value[:48],
+                "dst_count": len(dsts),
+                "dsts": sorted(dsts)[:8],
+            })
+            deterministic_checks["credential_replay"].append(
+                f"{rtype} reused across {len(dsts)} destinations value={value[:24]}"
+            )
+
+    token_index: dict[str, set[str]] = {}
+    for hit in hits:
+        if "token" not in hit.kind.lower() and "bearer" not in hit.kind.lower():
+            continue
+        token = str(hit.secret or "").strip()
+        if not token or len(token) < 8:
+            continue
+        token_index.setdefault(token, set()).add(hit.dst_ip)
+    for token, dsts in token_index.items():
+        if len(dsts) >= 3:
+            token_fanout.append({
+                "token": token[:24],
+                "dst_count": len(dsts),
+                "dsts": sorted(dsts)[:8],
+            })
+            deterministic_checks["token_misuse_fanout"].append(
+                f"token={token[:24]} used across {len(dsts)} destinations"
+            )
+
     return CredentialSummary(
         path=path,
         total_packets=total_packets,
@@ -409,5 +556,12 @@ def analyze_creds(
         truncated=truncated,
         kind_counts=kind_counts,
         user_counts=user_counts,
+        confidence_counts=confidence_counts,
+        auth_abuse_sequences=auth_abuse_sequences,
+        replay_candidates=replay_candidates,
+        token_fanout=token_fanout,
+        privileged_exposures=privileged_exposures,
+        external_exposures=external_exposures,
+        deterministic_checks={key: values[:40] for key, values in deterministic_checks.items()},
         errors=errors,
     )

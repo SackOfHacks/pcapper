@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+import hashlib
 import ipaddress
 
 from .pcap_cache import get_reader
 from .utils import safe_float
 from .services import COMMON_PORTS
+from .http import analyze_http
+from .dns import analyze_dns
 
 try:
     from scapy.layers.inet import IP, TCP, UDP, ICMP  # type: ignore
@@ -74,8 +77,15 @@ class BeaconSummary:
     total_packets: int
     candidate_count: int
     candidates: list[BeaconCandidate]
-    detections: list[dict[str, object]]
-    errors: list[str]
+    http_post_beacons: list[dict[str, object]]
+    protocol_beacon_checks: dict[str, list[str]]
+    deterministic_category_checks: dict[str, list[str]] = field(default_factory=dict)
+    campaign_summaries: list[dict[str, object]] = field(default_factory=list)
+    host_rollups: list[dict[str, object]] = field(default_factory=list)
+    beacon_pivots: list[dict[str, object]] = field(default_factory=list)
+    explainability: list[str] = field(default_factory=list)
+    detections: list[dict[str, object]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 def _flow_key(pkt) -> Optional[tuple[str, str, str, Optional[int], Optional[int]]]:
@@ -176,11 +186,49 @@ def _timeline(timestamps: list[float], bins: int = 32) -> list[int]:
     return counts
 
 
+def _cadence_family(mean_interval: float) -> str:
+    if mean_interval <= 0:
+        return "unknown"
+    if mean_interval < 15:
+        return "very_fast"
+    if mean_interval < 60:
+        return "fast"
+    if mean_interval < 300:
+        return "medium"
+    if mean_interval < 1800:
+        return "slow"
+    return "very_slow"
+
+
+def _burst_sleep_score(timeline: list[int]) -> float:
+    if not timeline:
+        return 0.0
+    active = sum(1 for value in timeline if value > 0)
+    idle = len(timeline) - active
+    peak = max(timeline) if timeline else 0
+    avg = (sum(timeline) / len(timeline)) if timeline else 0.0
+    if avg <= 0:
+        return 0.0
+    density = active / len(timeline)
+    burstiness = min(1.0, peak / max(avg, 1e-9) / 4.0)
+    sleepiness = min(1.0, idle / len(timeline))
+    return (0.6 * burstiness) + (0.4 * sleepiness)
+
+
 def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) -> BeaconSummary:
     errors: list[str] = []
     if IP is None and IPv6 is None:
         errors.append("Scapy IP layers unavailable; install scapy for beacon analysis.")
-        return BeaconSummary(path=path, total_packets=0, candidate_count=0, candidates=[], detections=[], errors=errors)
+        return BeaconSummary(
+            path=path,
+            total_packets=0,
+            candidate_count=0,
+            candidates=[],
+            http_post_beacons=[],
+            protocol_beacon_checks={"dns": [], "http_https": [], "icmp": [], "ntp": []},
+            detections=[],
+            errors=errors,
+        )
 
     reader, status, stream, size_bytes, _file_type = get_reader(
         path, show_status=show_status
@@ -440,7 +488,215 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
             return f"{seconds / 60:.2f}m"
         return f"{seconds:.1f}s"
 
+    http_flow_score: dict[tuple[str, str], float] = {}
+    http_flow_interval: dict[tuple[str, str], float] = {}
+    for item in candidates:
+        port_value = item.src_port or item.dst_port
+        if port_value not in {80, 443, 8080, 8443}:
+            continue
+        key = (item.src_ip, item.dst_ip)
+        prev_score = float(http_flow_score.get(key, 0.0))
+        if item.score > prev_score:
+            http_flow_score[key] = item.score
+            http_flow_interval[key] = item.mean_interval
+
+    def _discover_http_post_beacons(post_payloads: list[dict[str, object]]) -> list[dict[str, object]]:
+        aggregates: dict[tuple[str, str, str], dict[str, object]] = {}
+        suspicious_content_markers = (
+            "octet-stream",
+            "application/zip",
+            "application/gzip",
+            "x-zip",
+            "application/x-7z",
+            "application/x-rar",
+            "multipart/form-data",
+        )
+        for item in post_payloads:
+            src = str(item.get("src", "-"))
+            dst = str(item.get("dst", "-"))
+            host = str(item.get("host", "-"))
+            uri = str(item.get("uri", "-"))
+            sample = str(item.get("sample", "") or "").strip()
+            try:
+                size = int(item.get("bytes", 0) or 0)
+            except Exception:
+                size = 0
+            packet_id = item.get("packet")
+            agg_key = (src, dst, host)
+            agg = aggregates.setdefault(
+                agg_key,
+                {
+                    "src": src,
+                    "dst": dst,
+                    "host": host,
+                    "bytes": 0,
+                    "requests": 0,
+                    "sizes": [],
+                    "uris": set(),
+                    "content_types": set(),
+                    "packets": set(),
+                    "samples": [],
+                },
+            )
+            agg["bytes"] = int(agg.get("bytes", 0)) + max(size, 0)
+            agg["requests"] = int(agg.get("requests", 0)) + 1
+            sizes = agg.get("sizes")
+            if isinstance(sizes, list):
+                sizes.append(size)
+            uris = agg.get("uris")
+            if isinstance(uris, set):
+                uris.add(uri)
+            ctype = str(item.get("content_type", "-"))
+            if ctype and ctype != "-":
+                cts = agg.get("content_types")
+                if isinstance(cts, set):
+                    cts.add(ctype)
+            packets = agg.get("packets")
+            if isinstance(packets, set) and isinstance(packet_id, int):
+                packets.add(packet_id)
+            samples = agg.get("samples")
+            if isinstance(samples, list) and sample and len(samples) < 3:
+                samples.append(sample[:120])
+
+        suspects: list[dict[str, object]] = []
+        for (_src, _dst, _host), agg in aggregates.items():
+            reqs = int(agg.get("requests", 0) or 0)
+            total_bytes = int(agg.get("bytes", 0) or 0)
+            sizes = [float(v) for v in agg.get("sizes", [])] if isinstance(agg.get("sizes"), list) else []
+            median_size = _median(sizes)
+            mad_size = _mad(sizes, median_size)
+            size_stability = 1.0
+            if median_size > 0:
+                size_stability = max(0.0, 1.0 - min(1.0, mad_size / median_size))
+
+            src = str(agg.get("src", "-"))
+            dst = str(agg.get("dst", "-"))
+            pair = (src, dst)
+            linked_beacon_score = float(http_flow_score.get(pair, 0.0))
+            linked_beacon_interval = float(http_flow_interval.get(pair, 0.0))
+
+            risk_score = 0
+            risk_reasons: list[str] = []
+            if reqs >= 8:
+                risk_score += 1
+                risk_reasons.append(f"requests={reqs}")
+            if total_bytes >= 200_000:
+                risk_score += 1
+                risk_reasons.append(f"post_volume={total_bytes}")
+            if size_stability >= 0.88 and reqs >= 10:
+                risk_score += 1
+                risk_reasons.append(f"stable_sizes={size_stability:.2f}")
+            content_types = sorted(str(v) for v in agg.get("content_types", set()))
+            if any(any(marker in ctype.lower() for marker in suspicious_content_markers) for ctype in content_types):
+                risk_score += 1
+                risk_reasons.append("suspicious_content_type")
+            if linked_beacon_score >= 0.75:
+                risk_score += 2
+                risk_reasons.append(f"linked_periodic_http_score={linked_beacon_score:.2f}")
+            elif linked_beacon_score >= 0.60:
+                risk_score += 1
+                risk_reasons.append(f"linked_periodic_http_score={linked_beacon_score:.2f}")
+
+            if risk_score >= 2:
+                packet_examples = sorted(int(v) for v in (agg.get("packets") or set()) if isinstance(v, int))
+                sample_values = [str(v) for v in (agg.get("samples") or []) if str(v).strip()]
+                suspects.append(
+                    {
+                        "src": src,
+                        "dst": dst,
+                        "host": str(agg.get("host", "-")),
+                        "uri": ", ".join(sorted(str(v) for v in agg.get("uris", set()))[:3]),
+                        "bytes": total_bytes,
+                        "requests": reqs,
+                        "median_size": median_size,
+                        "mad_size": mad_size,
+                        "size_stability": size_stability,
+                        "content_type": ", ".join(content_types[:3]) if content_types else "-",
+                        "linked_beacon_score": linked_beacon_score,
+                        "linked_beacon_interval": linked_beacon_interval,
+                        "risk_score": risk_score,
+                        "risk_reasons": risk_reasons,
+                        "packet_examples": ",".join(str(v) for v in packet_examples[:5]) if packet_examples else "-",
+                        "sample": " | ".join(sample_values[:2]) if sample_values else "-",
+                    }
+                )
+
+        suspects.sort(
+            key=lambda item: (
+                int(item.get("risk_score", 0) or 0),
+                int(item.get("requests", 0) or 0),
+                int(item.get("bytes", 0) or 0),
+                float(item.get("size_stability", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        return suspects
+
+    http_summary = analyze_http(path, show_status=False)
+    dns_summary = analyze_dns(path, show_status=False)
+    http_post_beacons = _discover_http_post_beacons(list(getattr(http_summary, "post_payloads", []) or []))
+
+    protocol_beacon_checks: dict[str, list[str]] = {
+        "dns": [],
+        "http_https": [],
+        "icmp": [],
+        "ntp": [],
+    }
+    deterministic_category_checks: dict[str, list[str]] = {
+        "single_target_periodic_c2": [],
+        "multi_target_synchronized": [],
+        "cross_protocol_cadence": [],
+        "burst_sleep_pattern": [],
+        "low_slow_persistence": [],
+        "benign_periodic_likely": [],
+    }
+
+    dns_candidates = [c for c in candidates if (c.src_port or c.dst_port) == 53]
+    for item in dns_candidates[:8]:
+        protocol_beacon_checks["dns"].append(
+            f"{item.src_ip}->{item.dst_ip} count={item.count} mean={item.mean_interval:.1f}s score={item.score:.2f}"
+        )
+    txt_queries = int(getattr(dns_summary, "type_counts", Counter()).get("TXT", 0))
+    if getattr(dns_summary, "query_packets", 0) and txt_queries:
+        ratio = txt_queries / max(int(getattr(dns_summary, "query_packets", 0)), 1)
+        if ratio >= 0.2 and txt_queries >= 20:
+            protocol_beacon_checks["dns"].append(
+                f"TXT query ratio {ratio * 100:.1f}% ({txt_queries}/{getattr(dns_summary, 'query_packets', 0)})"
+            )
+
+    http_candidates = [c for c in candidates if (c.src_port or c.dst_port) in {80, 443, 8080, 8443}]
+    for item in http_candidates[:8]:
+        protocol_beacon_checks["http_https"].append(
+            f"{item.src_ip}->{item.dst_ip} {(item.src_port or item.dst_port) or '-'} count={item.count} mean={item.mean_interval:.1f}s score={item.score:.2f}"
+        )
+    for item in http_post_beacons[:8]:
+        risk_score = int(item.get("risk_score", 0) or 0)
+        reasons = item.get("risk_reasons", [])
+        reason_text = ",".join(str(v) for v in reasons[:2]) if isinstance(reasons, list) and reasons else "-"
+        protocol_beacon_checks["http_https"].append(
+            f"POST {item.get('src')}->{item.get('dst')} host={item.get('host')} requests={item.get('requests')} bytes={int(item.get('bytes', 0) or 0)} stability={float(item.get('size_stability', 0.0) or 0.0):.2f} linked_score={float(item.get('linked_beacon_score', 0.0) or 0.0):.2f} risk={risk_score} why={reason_text}"
+        )
+
+    icmp_candidates = [c for c in candidates if c.proto == "ICMP"]
+    for item in icmp_candidates[:8]:
+        protocol_beacon_checks["icmp"].append(
+            f"{item.src_ip}->{item.dst_ip} count={item.count} mean={item.mean_interval:.1f}s score={item.score:.2f}"
+        )
+
+    ntp_candidates = [
+        c for c in candidates
+        if c.proto == "UDP" and (c.src_port == 123 or c.dst_port == 123)
+    ]
+    for item in ntp_candidates[:8]:
+        protocol_beacon_checks["ntp"].append(
+            f"{item.src_ip}->{item.dst_ip} UDP/123 count={item.count} mean={item.mean_interval:.1f}s score={item.score:.2f}"
+        )
+
     detections: list[dict[str, object]] = []
+    campaign_summaries: list[dict[str, object]] = []
+    host_rollups: list[dict[str, object]] = []
+    beacon_pivots: list[dict[str, object]] = []
+    explainability: list[str] = []
     if candidates:
         severity_rank = {"info": 0, "warning": 1, "high": 2, "critical": 3}
 
@@ -536,6 +792,72 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                 ),
                 "top_sources": [(src, events) for src, _dst_count, events in fanout_rows[:5]],
             })
+            for src, dst_count, events in fanout_rows[:8]:
+                deterministic_category_checks["multi_target_synchronized"].append(
+                    f"{src} reached {dst_count} destinations with periodic flows ({events} events)"
+                )
+
+        by_src: dict[str, list[BeaconCandidate]] = defaultdict(list)
+        for item in candidates:
+            if item.score >= 0.65:
+                by_src[item.src_ip].append(item)
+        synchronized_rows: list[tuple[str, int, float]] = []
+        for src, items in by_src.items():
+            if len(items) < 2:
+                continue
+            means = sorted(float(item.mean_interval) for item in items if item.mean_interval > 0)
+            if len(means) < 2:
+                continue
+            center = _median(means)
+            close = [value for value in means if abs(value - center) / max(center, 1.0) <= 0.2]
+            if len(close) >= 2:
+                synchronized_rows.append((src, len(close), center))
+        if synchronized_rows:
+            synchronized_rows.sort(key=lambda row: row[1], reverse=True)
+            detections.append({
+                "type": "beacon_multi_target_sync",
+                "severity": "high",
+                "summary": "Synchronized multi-destination beacon cadence",
+                "details": "; ".join(
+                    f"{src} synchronized flows={count} cadence≈{cadence:.1f}s"
+                    for src, count, cadence in synchronized_rows[:5]
+                ),
+            })
+            for src, count, cadence in synchronized_rows[:8]:
+                deterministic_category_checks["multi_target_synchronized"].append(
+                    f"{src} synchronized {count} destinations around {cadence:.1f}s"
+                )
+
+        by_pair: dict[tuple[str, str], list[BeaconCandidate]] = defaultdict(list)
+        for item in candidates:
+            by_pair[(item.src_ip, item.dst_ip)].append(item)
+        cross_proto_rows: list[tuple[str, str, int, float]] = []
+        for (src, dst), items in by_pair.items():
+            protos = {item.proto for item in items}
+            if len(protos) < 2:
+                continue
+            means = [float(item.mean_interval) for item in items if item.mean_interval > 0]
+            if len(means) < 2:
+                continue
+            center = _median(means)
+            spread = _mad(means, center)
+            if center > 0 and (spread / center) <= 0.35:
+                cross_proto_rows.append((src, dst, len(protos), center))
+        if cross_proto_rows:
+            cross_proto_rows.sort(key=lambda row: row[2], reverse=True)
+            detections.append({
+                "type": "beacon_cross_protocol",
+                "severity": "high",
+                "summary": "Cross-protocol cadence reuse",
+                "details": "; ".join(
+                    f"{src}->{dst} protocols={proto_count} cadence≈{cadence:.1f}s"
+                    for src, dst, proto_count, cadence in cross_proto_rows[:6]
+                ),
+            })
+            for src, dst, proto_count, cadence in cross_proto_rows[:10]:
+                deterministic_category_checks["cross_protocol_cadence"].append(
+                    f"{src}->{dst} reused cadence {cadence:.1f}s across {proto_count} protocols"
+                )
 
         low_and_slow = [
             item
@@ -557,6 +879,30 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                 "top_sources": Counter(item.src_ip for item in low_and_slow).most_common(5),
                 "top_destinations": Counter(item.dst_ip for item in low_and_slow).most_common(5),
             })
+            for item in low_and_slow[:10]:
+                deterministic_category_checks["low_slow_persistence"].append(
+                    f"{item.src_ip}->{item.dst_ip} interval≈{item.mean_interval:.0f}s duration={_format_duration(item.duration_seconds)}"
+                )
+
+        burst_sleep = [
+            item
+            for item in candidates
+            if _burst_sleep_score(item.timeline) >= 0.65 and item.count >= 12 and item.duration_seconds >= 900
+        ]
+        if burst_sleep:
+            detections.append({
+                "type": "beacon_burst_sleep",
+                "severity": "warning",
+                "summary": "Burst-then-sleep beacon profile",
+                "details": "; ".join(
+                    f"{item.src_ip}->{item.dst_ip} cadence≈{item.mean_interval:.1f}s burst_sleep={_burst_sleep_score(item.timeline):.2f}"
+                    for item in burst_sleep[:6]
+                ),
+            })
+            for item in burst_sleep[:10]:
+                deterministic_category_checks["burst_sleep_pattern"].append(
+                    f"{item.src_ip}->{item.dst_ip} burst_sleep={_burst_sleep_score(item.timeline):.2f}"
+                )
 
         external_candidates = [item for item in candidates if _is_public(item.src_ip) or _is_public(item.dst_ip)]
         internal_candidates = [item for item in candidates if _is_private(item.src_ip) and _is_private(item.dst_ip)]
@@ -696,6 +1042,135 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
                     _candidate_evidence(item),
                 ],
             })
+
+        if http_post_beacons:
+            highest_risk = max((int(item.get("risk_score", 0) or 0) for item in http_post_beacons), default=0)
+            detections.append({
+                "type": "beacon_http_post",
+                "severity": "warning",
+                "summary": "HTTP POST beacon-like check-in activity",
+                "details": "; ".join(
+                    f"{item.get('src')}->{item.get('dst')} host={item.get('host')} req={item.get('requests')} risk={int(item.get('risk_score', 0) or 0)}"
+                    for item in http_post_beacons[:5]
+                ) + f"; highest risk={highest_risk}",
+                "evidence": [
+                    f"{item.get('src')}->{item.get('dst')} host={item.get('host')} uri={item.get('uri')} requests={item.get('requests')} bytes={item.get('bytes')} size_stability={float(item.get('size_stability', 0.0) or 0.0):.2f} linked_score={float(item.get('linked_beacon_score', 0.0) or 0.0):.2f} risk={int(item.get('risk_score', 0) or 0)} packets={item.get('packet_examples', '-')}"
+                    for item in http_post_beacons[:8]
+                ],
+            })
+
+        for item in candidates:
+            if item.score >= 0.80 and item.count >= max(12, min_events):
+                deterministic_category_checks["single_target_periodic_c2"].append(
+                    f"{item.src_ip}->{item.dst_ip} score={item.score:.2f} cadence≈{item.mean_interval:.1f}s"
+                )
+
+        benign_hits: list[str] = []
+        for item in candidates:
+            port_value = item.src_port or item.dst_port
+            if port_value in benign_service_ports and item.score < 0.90 and item.periodicity_score < 0.85:
+                benign_hits.append(
+                    f"{item.src_ip}->{item.dst_ip} {_proto_label(item)} appears service-like (score={item.score:.2f})"
+                )
+        if benign_hits:
+            detections.append({
+                "type": "beacon_benign_periodic",
+                "severity": "info",
+                "summary": "Likely benign periodic service traffic",
+                "details": "; ".join(benign_hits[:6]),
+            })
+            deterministic_category_checks["benign_periodic_likely"].extend(benign_hits[:12])
+
+        dns_nx = int(getattr(dns_summary, "rcode_counts", Counter()).get("NXDOMAIN", 0))
+        dns_queries = int(getattr(dns_summary, "query_packets", 0) or 0)
+        if dns_queries > 0 and dns_nx / dns_queries >= 0.25 and dns_nx >= 30:
+            detections.append({
+                "type": "beacon_dns_nxdomain",
+                "severity": "warning",
+                "summary": "DNS beacon semantics: elevated NXDOMAIN rate",
+                "details": f"NXDOMAIN ratio={dns_nx}/{dns_queries} ({(dns_nx / max(dns_queries, 1)) * 100.0:.1f}%)",
+            })
+
+        by_host: dict[str, list[BeaconCandidate]] = defaultdict(list)
+        for item in candidates:
+            by_host[item.src_ip].append(item)
+        for src, items in sorted(by_host.items(), key=lambda kv: len(kv[1]), reverse=True):
+            channels = sorted({item.proto for item in items})
+            destinations = sorted({item.dst_ip for item in items})
+            top = max(items, key=lambda cand: cand.score)
+            host_rollups.append({
+                "host": src,
+                "candidate_count": len(items),
+                "channels": channels,
+                "destinations": len(destinations),
+                "top_cadence_s": round(float(top.mean_interval), 2),
+                "max_score": round(float(top.score), 2),
+            })
+
+        campaign_map: dict[tuple[str, str], dict[str, object]] = {}
+        for item in candidates:
+            family = _cadence_family(float(item.mean_interval))
+            key = (item.src_ip, family)
+            camp = campaign_map.setdefault(
+                key,
+                {
+                    "host": item.src_ip,
+                    "cadence_family": family,
+                    "count": 0,
+                    "destinations": set(),
+                    "channels": set(),
+                    "max_score": 0.0,
+                },
+            )
+            camp["count"] = int(camp["count"]) + 1
+            cast_dests = camp.get("destinations")
+            if isinstance(cast_dests, set):
+                cast_dests.add(item.dst_ip)
+            cast_channels = camp.get("channels")
+            if isinstance(cast_channels, set):
+                cast_channels.add(item.proto)
+            camp["max_score"] = max(float(camp["max_score"]), float(item.score))
+
+        for idx, ((_host, _family), value) in enumerate(
+            sorted(campaign_map.items(), key=lambda row: (int(row[1].get("count", 0)), float(row[1].get("max_score", 0.0))), reverse=True),
+            start=1,
+        ):
+            destinations = value.get("destinations")
+            channels = value.get("channels")
+            campaign_id = f"BCN-{idx:03d}"
+            campaign_summaries.append({
+                "campaign_id": campaign_id,
+                "host": str(value.get("host", "-")),
+                "cadence_family": str(value.get("cadence_family", "unknown")),
+                "flows": int(value.get("count", 0)),
+                "destinations": len(destinations) if isinstance(destinations, set) else 0,
+                "channels": ",".join(sorted(channels)) if isinstance(channels, set) else "-",
+                "max_score": round(float(value.get("max_score", 0.0)), 2),
+            })
+
+        for item in candidates[:25]:
+            uri_template = "-"
+            for post in http_post_beacons:
+                if str(post.get("src")) == item.src_ip and str(post.get("dst")) == item.dst_ip:
+                    uri_template = str(post.get("uri", "-") or "-")
+                    break
+            template_hash = hashlib.sha1(uri_template.encode("utf-8", errors="ignore")).hexdigest()[:12] if uri_template != "-" else "-"
+            beacon_pivots.append({
+                "src": item.src_ip,
+                "dst": item.dst_ip,
+                "proto": _proto_label(item),
+                "interval": round(float(item.mean_interval), 2),
+                "score": round(float(item.score), 2),
+                "first_seen": item.first_seen,
+                "last_seen": item.last_seen,
+                "uri_template_hash": template_hash,
+            })
+
+        for item in candidates[:15]:
+            explainability.append(
+                f"{item.src_ip}->{item.dst_ip} flagged because interval MAD={item.mad_interval:.2f}s, "
+                f"size MAD={item.mad_bytes:.1f}, persistence={_format_duration(item.duration_seconds)}, score={item.score:.2f}"
+            )
     else:
         detections.append({
             "type": "no_beaconing",
@@ -709,6 +1184,13 @@ def analyze_beacons(path: Path, show_status: bool = True, min_events: int = 20) 
         total_packets=total_packets,
         candidate_count=len(candidates),
         candidates=candidates,
+        http_post_beacons=http_post_beacons,
+        protocol_beacon_checks=protocol_beacon_checks,
+        deterministic_category_checks=deterministic_category_checks,
+        campaign_summaries=campaign_summaries,
+        host_rollups=host_rollups,
+        beacon_pivots=beacon_pivots,
+        explainability=explainability,
         detections=detections,
-        errors=errors,
+        errors=errors + list(getattr(http_summary, "errors", []) or []) + list(getattr(dns_summary, "errors", []) or []),
     )
