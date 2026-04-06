@@ -79,8 +79,8 @@ python -m pcapper capture.pcap --timeline -ip 10.0.0.5 --protocols --services
 # 3) ATT&CK + IDS corroboration
 python -m pcapper capture.pcap --mitre --suricata
 
-# 4) Exfiltration and artifact hunt
-python -m pcapper capture.pcap --exfil --files --ftp --http
+# 4) Exfiltration, file transfer, and AIM artifact hunt
+python -m pcapper capture.pcap --exfil --files --ftp --http --aim
 
 # 5) OT/ICS deep-dive
 python -m pcapper capture.pcap --modbus --dnp3 --iec104 --s7 --ot-commands --safety
@@ -113,7 +113,7 @@ flowchart LR
 | Hunt C2 or beaconing behavior | `--beacon --dns --tls --quic` |
 | Map findings to ATT&CK | `--mitre` |
 | Corroborate with IDS alerts | `--suricata` |
-| Investigate data theft | `--exfil --files --ftp --http` |
+| Investigate data theft and transferred artifacts | `--exfil --files --ftp --http --aim` |
 | Investigate identity abuse | `--kerberos --ldap --ntlm --domain --creds` |
 | Track lateral movement | `--hosts --services --protocols --tcp --timeline -ip <host>` |
 | Run OT/ICS-specific triage | `--modbus --dnp3 --iec104 --s7 --ot-commands --safety` |
@@ -180,9 +180,12 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
-## Current Release: v1.6.0
+## Current Release: v1.6.5
 
 Latest additions in this release:
+- New AIM forensics workflow (`--aim`) to extract conversations, usernames, passwords/secrets, artifacts, and client/server activity stats.
+- AIM-over-nonstandard-port detection (including tunneled AIM content over TCP/443) for message/credential discovery.
+- `--files` now supports AIM/OFT transferred files (discover, `--view`, and `--extract`) and improved FTP transfer filename recovery.
 - MITRE ATT&CK mapping (`--mitre`) across Enterprise + ICS with technique heat, host chains, and attack-path visualization.
 - Suricata IDS integration (`--suricata`) with rule/config controls and deterministic coverage checks.
 - TCP stream carving (`--carve`) with signature-based extraction.
@@ -285,7 +288,7 @@ Client                   Server                   Start                     End 
 ```
 
 Secrets/credentials are displayed in reports by default.
-Exports (JSON/CSV/SQLite) are unredacted by default; use `--export-redact` to force export redaction when needed.
+Exports (JSON/CSV/SQLite) include full values by default.
 Use `-v/--verbose` to include additional evidence lines in summaries (for example file artifacts, LDAP anomalies, and OT/ICS command details).
 
 ## Summarize behavior
@@ -514,7 +517,6 @@ python -m pcapper --help
 - `--decrypt`
 - `--decrypt-limit N`
 - `--decrypt-out DIR`
-- `--export-redact`
 - `--extract FILENAME`
 - `--follow FLOW`
 - `--follow-id STREAM_ID`

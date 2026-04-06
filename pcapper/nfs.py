@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -10,12 +10,11 @@ try:
     from scapy.layers.inet import IP, TCP, UDP
     from scapy.layers.inet6 import IPv6
     from scapy.packet import Raw, Packet
-    from scapy.utils import PcapReader, PcapNgReader
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float, decode_payload, counter_inc, set_add_cap
+from .utils import safe_float, decode_payload, counter_inc, set_add_cap
 
 
 RPC_CALL = 0
@@ -459,7 +458,6 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
                 elif msg_type == RPC_REPLY and len(rpc_payload) >= 12:
                     reply_stat = struct.unpack(">I", rpc_payload[8:12])[0]
                     if reply_stat == RPC_MSG_ACCEPTED and len(rpc_payload) >= 24:
-                        verifier_flavor = struct.unpack(">I", rpc_payload[12:16])[0]
                         verifier_len = struct.unpack(">I", rpc_payload[16:20])[0]
                         offset = 20 + _rpc_align(verifier_len)
                         if offset + 4 <= len(rpc_payload):

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, detect_file_type
+from .utils import safe_float
 
 try:
     from scapy.layers.inet import IP, ICMP  # type: ignore

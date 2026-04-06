@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Optional
 import re
 import base64
-import hashlib
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -561,7 +560,6 @@ def _parse_rdp_client_core_data(payload: bytes) -> tuple[Optional[str], Optional
     offset2 += 2  # SAS
     if offset2 + 4 > len(data):
         return None, None, str(version)
-    keyboard_layout = int.from_bytes(data[offset2:offset2 + 4], "little")
     offset2 += 4
     if offset2 + 4 > len(data):
         return None, None, str(version)

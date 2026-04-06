@@ -6,7 +6,7 @@ import time
 import itertools
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional, TypeVar
+from typing import Callable, TypeVar
 
 
 @dataclass

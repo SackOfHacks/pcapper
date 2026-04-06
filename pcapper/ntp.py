@@ -109,7 +109,6 @@ def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
             if len(payload) < 2:
                 continue
             first_byte = payload[0]
-            li = (first_byte >> 6) & 0x3
             version = (first_byte >> 3) & 0x7
             mode = first_byte & 0x7
             mode_name = _mode_name(mode)

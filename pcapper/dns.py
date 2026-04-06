@@ -15,7 +15,7 @@ import re
 
 from .pcap_cache import PcapMeta, get_reader
 
-from .utils import safe_float, detect_file_type, decode_payload, counter_inc, set_add_cap, setdict_add
+from .utils import safe_float, decode_payload, counter_inc, set_add_cap, setdict_add
 
 try:
     from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore

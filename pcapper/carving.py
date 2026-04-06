@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 from collections import defaultdict, Counter
 import hashlib
 import os
 import re
 
 from .pcap_cache import get_reader
-from .utils import safe_float, detect_file_type_bytes
+from .utils import detect_file_type_bytes
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore

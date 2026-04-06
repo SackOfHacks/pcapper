@@ -627,6 +627,12 @@ def analyze_tcp(
     src_port_dsts: dict[tuple[str, int], set[str]] = defaultdict(set)
     syn_triplet_counts: Counter[tuple[str, str, int]] = Counter()
     syn_ack_triplet_counts: Counter[tuple[str, str, int]] = Counter()
+    syn_ack_service_counts: Counter[tuple[str, int]] = Counter()
+    null_scan_triplet_counts: Counter[tuple[str, str, int]] = Counter()
+    fin_scan_triplet_counts: Counter[tuple[str, str, int]] = Counter()
+    xmas_scan_triplet_counts: Counter[tuple[str, str, int]] = Counter()
+    ack_probe_triplet_counts: Counter[tuple[str, str, int]] = Counter()
+    land_attack_packets = 0
     retrans_counts: Counter[str] = Counter()
     zero_window_counts: Counter[str] = Counter()
     small_window_counts: Counter[str] = Counter()
@@ -687,6 +693,11 @@ def analyze_tcp(
             flags_val = int(flags)
             seq = int(getattr(tcp_layer, "seq", 0))
             window = int(getattr(tcp_layer, "window", 0))
+            payload_len = 0
+            try:
+                payload_len = len(bytes(tcp_layer.payload))
+            except Exception:
+                payload_len = 0
 
             client_key = src_ip or "-"
             server_key = dst_ip or "-"
@@ -737,6 +748,7 @@ def analyze_tcp(
                 convo["syn_ack"] = int(convo["syn_ack"]) + 1
                 if src_ip and dst_ip:
                     syn_ack_triplet_counts[(dst_ip, src_ip, sport)] += 1
+                    syn_ack_service_counts[(src_ip, sport)] += 1
             if flags_val & 0x04:
                 convo["rst"] = int(convo["rst"]) + 1
                 rst_counts[client_key] += 1
@@ -745,11 +757,20 @@ def analyze_tcp(
             if flags_val & 0x10:
                 convo["ack"] = int(convo["ack"]) + 1
 
-            payload_len = 0
-            try:
-                payload_len = len(bytes(tcp_layer.payload))
-            except Exception:
-                payload_len = 0
+            # Common TCP scan/flood indicators.
+            if src_ip and dst_ip:
+                triplet_key = (src_ip, dst_ip, dport)
+                if flags_val == 0:
+                    null_scan_triplet_counts[triplet_key] += 1
+                elif flags_val == 0x01 and payload_len == 0:
+                    fin_scan_triplet_counts[triplet_key] += 1
+                elif (flags_val & 0x29) == 0x29 and (flags_val & 0x16) == 0 and payload_len == 0:
+                    xmas_scan_triplet_counts[triplet_key] += 1
+                elif flags_val == 0x10 and payload_len == 0:
+                    ack_probe_triplet_counts[triplet_key] += 1
+                if src_ip == dst_ip and sport == dport and (flags_val & 0x02):
+                    land_attack_packets += 1
+
             tcp_payload_bytes += payload_len
             packet_size_hist[_bucketize(pkt_len)] += 1
             payload_size_hist[_bucketize(payload_len)] += 1
@@ -833,6 +854,29 @@ def analyze_tcp(
             "details": f"Potential scan or blocked services (SYN-only: {syn_only}).",
         })
 
+    # SYN flood indicator (including distributed sources) by target service.
+    syn_target_counts: Counter[tuple[str, int]] = Counter()
+    syn_ack_target_counts: Counter[tuple[str, int]] = Counter()
+    for (src_ip, dst_ip, dport), count in syn_triplet_counts.items():
+        syn_target_counts[(dst_ip, dport)] += int(count)
+    syn_ack_target_counts.update(syn_ack_service_counts)
+    syn_flood_hits: list[str] = []
+    for (dst_ip, dport), syn_total in syn_target_counts.items():
+        if syn_total < 200:
+            continue
+        syn_ack_total = syn_ack_target_counts.get((dst_ip, dport), 0)
+        ack_ratio = syn_ack_total / max(syn_total, 1)
+        if ack_ratio <= 0.2:
+            syn_flood_hits.append(
+                f"{dst_ip}:{dport} SYN={syn_total} SYN-ACK={syn_ack_total} ({ack_ratio:.1%})"
+            )
+    if syn_flood_hits:
+        detections.append({
+            "severity": "high",
+            "summary": "Potential TCP SYN flood",
+            "details": "; ".join(syn_flood_hits[:5]),
+        })
+
     total_retrans = sum(retrans_counts.values())
     if total_retrans > 100:
         top_retrans = ", ".join(f"{ip}({count})" for ip, count in retrans_counts.most_common(5))
@@ -906,6 +950,63 @@ def analyze_tcp(
             "severity": "high",
             "summary": "Potential TCP brute-force/credential probing",
             "details": ", ".join(brute_force[:5]),
+        })
+
+    def _scan_source_hits(
+        triplet_counts: Counter[tuple[str, str, int]],
+        *,
+        min_packets: int,
+        min_targets: int,
+    ) -> list[str]:
+        by_src_packets: Counter[str] = Counter()
+        by_src_targets: dict[str, set[tuple[str, int]]] = defaultdict(set)
+        for (src_ip, dst_ip, dport), count in triplet_counts.items():
+            by_src_packets[src_ip] += int(count)
+            by_src_targets[src_ip].add((dst_ip, dport))
+        hits: list[str] = []
+        for src_ip, pkt_count in by_src_packets.most_common():
+            targets = len(by_src_targets.get(src_ip, set()))
+            if pkt_count >= min_packets and targets >= min_targets:
+                hits.append(f"{src_ip} packets={pkt_count} targets={targets}")
+        return hits
+
+    null_scan_hits = _scan_source_hits(null_scan_triplet_counts, min_packets=40, min_targets=15)
+    if null_scan_hits:
+        detections.append({
+            "severity": "high",
+            "summary": "Potential TCP NULL scan activity",
+            "details": "; ".join(null_scan_hits[:5]),
+        })
+
+    fin_scan_hits = _scan_source_hits(fin_scan_triplet_counts, min_packets=40, min_targets=15)
+    if fin_scan_hits:
+        detections.append({
+            "severity": "high",
+            "summary": "Potential TCP FIN scan activity",
+            "details": "; ".join(fin_scan_hits[:5]),
+        })
+
+    xmas_scan_hits = _scan_source_hits(xmas_scan_triplet_counts, min_packets=30, min_targets=10)
+    if xmas_scan_hits:
+        detections.append({
+            "severity": "high",
+            "summary": "Potential TCP Xmas scan activity",
+            "details": "; ".join(xmas_scan_hits[:5]),
+        })
+
+    ack_probe_hits = _scan_source_hits(ack_probe_triplet_counts, min_packets=80, min_targets=20)
+    if ack_probe_hits:
+        detections.append({
+            "severity": "warning",
+            "summary": "Potential TCP ACK scan/probe activity",
+            "details": "; ".join(ack_probe_hits[:5]),
+        })
+
+    if land_attack_packets > 0:
+        detections.append({
+            "severity": "high",
+            "summary": "Potential TCP LAND attack pattern",
+            "details": f"Observed {land_attack_packets} packet(s) with identical src/dst IP and port.",
         })
 
     zero_ratio = zero_payload_packets / max(tcp_packets, 1)

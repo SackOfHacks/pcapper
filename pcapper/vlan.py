@@ -13,7 +13,7 @@ except Exception:  # pragma: no cover
     IP = None  # type: ignore
     IPv6 = None  # type: ignore
 
-from .utils import safe_float, detect_file_type
+from .utils import safe_float
 
 try:
     from scapy.layers.l2 import Dot1Q  # type: ignore

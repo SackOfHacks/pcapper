@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float, format_bytes_as_mb, sparkline
+from .utils import safe_float, sparkline
 
 
 @dataclass(frozen=True)

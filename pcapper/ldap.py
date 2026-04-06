@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .pcap_cache import PcapMeta, get_reader
 
-from .utils import detect_file_type, safe_float, decode_payload, counter_inc, set_add_cap
+from .utils import safe_float, decode_payload, counter_inc, set_add_cap
 from .dns import analyze_dns
 from .files import analyze_files
 from .progress import run_with_busy_status

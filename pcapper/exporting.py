@@ -7,7 +7,7 @@ import json
 import csv
 import sqlite3
 
-from .utils import to_serializable, safe_write_text, redact_data
+from .utils import to_serializable, safe_write_text
 
 
 @dataclass
@@ -20,14 +20,12 @@ def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def export_json(bundle: ExportBundle, output_path: Path, *, redact: bool = True) -> None:
+def export_json(bundle: ExportBundle, output_path: Path) -> None:
     _ensure_parent(output_path)
     payload = {
         "path": str(bundle.path),
         "summaries": {name: to_serializable(summary) for name, summary in bundle.summaries.items()},
     }
-    if redact:
-        payload = redact_data(payload)
     safe_write_text(output_path, json.dumps(payload, indent=2), encoding="utf-8", context="export_json")
 
 
@@ -74,7 +72,7 @@ def _csv_safe(value: Any) -> Any:
     return value
 
 
-def export_csv(bundle: ExportBundle, output_path: Path, *, redact: bool = True) -> None:
+def export_csv(bundle: ExportBundle, output_path: Path) -> None:
     _ensure_parent(output_path)
     rows: list[dict[str, Any]] = []
     host_rows: list[dict[str, Any]] = []
@@ -82,14 +80,10 @@ def export_csv(bundle: ExportBundle, output_path: Path, *, redact: bool = True) 
         for item in _iter_detections(summary):
             row = {"category": "detection", "module": name}
             row.update(to_serializable(item))
-            if redact:
-                row = redact_data(row)
             rows.append({key: _csv_safe(value) for key, value in row.items()})
         for item in _iter_artifacts(summary):
             row = {"category": "artifact", "module": name}
             row.update(to_serializable(item))
-            if redact:
-                row = redact_data(row)
             rows.append({key: _csv_safe(value) for key, value in row.items()})
         for host in _iter_hosts(summary):
             open_ports = []
@@ -117,8 +111,6 @@ def export_csv(bundle: ExportBundle, output_path: Path, *, redact: bool = True) 
                 "last_seen": getattr(host, "last_seen", None),
                 "open_ports": json.dumps(open_ports),
             }
-            if redact:
-                row = redact_data(row)
             host_rows.append({key: _csv_safe(value) for key, value in row.items()})
 
     if not rows:
@@ -142,7 +134,7 @@ def export_csv(bundle: ExportBundle, output_path: Path, *, redact: bool = True) 
                 writer.writerow(row)
 
 
-def export_sqlite(bundle: ExportBundle, output_path: Path, *, redact: bool = True) -> None:
+def export_sqlite(bundle: ExportBundle, output_path: Path) -> None:
     _ensure_parent(output_path)
     if output_path.exists():
         if output_path.is_dir():
@@ -165,13 +157,9 @@ def export_sqlite(bundle: ExportBundle, output_path: Path, *, redact: bool = Tru
     for name, summary in bundle.summaries.items():
         for item in _iter_detections(summary):
             payload = to_serializable(item)
-            if redact:
-                payload = redact_data(payload)
             cur.execute("INSERT INTO detections (module, data) VALUES (?, ?)", (name, json.dumps(payload)))
         for item in _iter_artifacts(summary):
             payload = to_serializable(item)
-            if redact:
-                payload = redact_data(payload)
             cur.execute("INSERT INTO artifacts (module, data) VALUES (?, ?)", (name, json.dumps(payload)))
         for host in _iter_hosts(summary):
             open_ports = []
@@ -198,7 +186,7 @@ def export_sqlite(bundle: ExportBundle, output_path: Path, *, redact: bool = Tru
                 "last_seen": getattr(host, "last_seen", None),
                 "open_ports": open_ports,
             }
-            payload = redact_data(row) if redact else row
+            payload = row
             cur.execute(
                 "INSERT INTO hosts (pcap_path, module, ip, macs, hostnames, operating_system, os_evidence, "
                 "packets_sent, packets_recv, bytes_sent, bytes_recv, first_seen, last_seen, open_ports) "

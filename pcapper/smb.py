@@ -12,12 +12,11 @@ try:
     from scapy.layers.inet import IP, TCP
     from scapy.layers.inet6 import IPv6
     from scapy.packet import Raw, Packet
-    from scapy.utils import PcapReader, PcapNgReader
 except ImportError:
     IP = TCP = Raw = None
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float, decode_payload, counter_inc, set_add_cap, setdict_add
+from .utils import safe_float, decode_payload, counter_inc, set_add_cap, setdict_add
 
 MAX_SMB_UNIQUE = int(os.getenv("PCAPPER_MAX_SMB_UNIQUE", "50000"))
 MAX_SMB_CONVERSATIONS = int(os.getenv("PCAPPER_MAX_SMB_CONVERSATIONS", "50000"))

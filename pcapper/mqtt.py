@@ -57,7 +57,6 @@ def _parse_mqtt_packets(payload: bytes) -> list[dict[str, object]]:
         remaining_len, next_idx = _decode_remaining_length(payload, idx + 1)
         if remaining_len is None:
             break
-        header_len = next_idx - idx
         msg_start = next_idx
         msg_end = msg_start + remaining_len
         if msg_end > len(payload):

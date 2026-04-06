@@ -15,7 +15,6 @@ except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float
 
 
 SUSPICIOUS_PATTERNS = [

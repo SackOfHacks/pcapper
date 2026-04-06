@@ -32,3 +32,6 @@ class PcapSummary:
     duration_seconds: Optional[float]
     interface_stats: list[InterfaceStat]
     protocol_counts: Counter[str]
+    tcp_packets: int = 0
+    retransmissions: int = 0
+    retransmission_rate: float = 0.0

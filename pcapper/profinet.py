@@ -4,7 +4,6 @@ from collections import Counter
 from pathlib import Path
 from typing import Optional
 import ipaddress
-import struct
 
 from .equipment import equipment_artifacts
 from .industrial_helpers import (
@@ -218,7 +217,6 @@ def _parse_dcp(payload: bytes) -> tuple[list[str], list[tuple[str, str]], list[I
     if len(payload) < 12:
         return commands, artifacts, anomalies
 
-    frame_id = int.from_bytes(payload[0:2], "big")
     service_id = payload[2]
     service_type = payload[3]
     service_name = DCP_SERVICE_IDS.get(service_id, f"Service 0x{service_id:02x}")

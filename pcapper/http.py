@@ -18,7 +18,7 @@ import urllib.request
 
 from .pcap_cache import PcapMeta, get_reader
 
-from .utils import safe_float, detect_file_type, detect_file_type_bytes, decode_payload, counter_inc, set_add_cap, setdict_add
+from .utils import safe_float, detect_file_type_bytes, decode_payload, counter_inc, set_add_cap
 from .device_detection import device_fingerprints_from_text, append_device_fingerprints
 
 try:

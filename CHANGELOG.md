@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 1.6.5 — 2026-04-06
+### Added
+- New AIM analyzer (`--aim`) with forensic extraction of conversations, usernames, passwords/secrets, server/client stats, and correlated artifact summaries.
+- AIM-aware file discovery in `--files`, including AIM/OFT transfer detection, carving, and view/extract support.
+- FTP file-transfer parsing improvements in `--files` to better recover transferred filenames/artifacts from control/data channels.
+
+### Changed
+- AIM detection logic now inspects tunneled/non-standard traffic (including TCP/443) for embedded AIM conversations and credential-like artifacts.
+- Release metadata/docs alignment updated for `v1.6.5`.
+
 ## 1.6.0 — 2026-03-22
 ### Added
 - MITRE ATT&CK mapping workflow (`--mitre`) with Enterprise + ICS tactic/technique correlation, attack-path visualization, host-centric chains, technique heat, pivots, and deterministic checks.

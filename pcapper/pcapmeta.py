@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_cached_packets, PcapMeta
+from .pcap_cache import load_capture_meta
 
 
 @dataclass(frozen=True)
@@ -24,7 +24,7 @@ class PcapMetaSummary:
 def analyze_pcapmeta(path: Path, show_status: bool = True) -> PcapMetaSummary:
     errors: list[str] = []
     try:
-        _packets, meta = get_cached_packets(path, show_status=show_status)
+        meta = load_capture_meta(path)
     except Exception as exc:
         return PcapMetaSummary(
             path=path,

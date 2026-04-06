@@ -3,20 +3,18 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Dict, List, Optional, Set, Tuple
+import re
 import struct
 
 try:
     from scapy.layers.inet import TCP, UDP
-    from scapy.layers.inet6 import IPv6
-    from scapy.layers.l2 import Ether
-    from scapy.packet import Raw, Packet
-    from scapy.utils import PcapReader, PcapNgReader
+    from scapy.packet import Raw
 except ImportError:
     TCP = UDP = Raw = None
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float
+from .utils import safe_float
 
 # --- Dataclasses ---
 
@@ -97,17 +95,48 @@ class NtlmAnalysis:
         # Returns (domain, username) tuples
         s = set()
         for session in self.sessions:
-            if session.username:
-                s.add((session.domain, session.username))
+            if session.username and session.username not in {"Unknown", "(Anonymous)"}:
+                if session.domain and session.domain != "Unknown":
+                    s.add((session.domain, session.username))
+                else:
+                    s.add(("<NO_DOMAIN>", session.username))
         return s
 
     @property
     def unique_domains(self) -> Set[str]:
-        return set(self.raw_domains.keys())
+        return {name for name in self.raw_domains.keys() if name and name != "Unknown"}
 
     @property
     def unique_workstations(self) -> Set[str]:
-        return set(s.workstation for s in self.sessions if s.workstation and s.workstation != "Unknown")
+        return {
+            s.workstation
+            for s in self.sessions
+            if s.workstation and s.workstation != "Unknown"
+        }
+
+
+def _append_ntlm_artifact(
+    artifacts: List[NtlmArtifact],
+    seen: Set[Tuple[str, str]],
+    *,
+    value: str,
+    description: str,
+) -> None:
+    normalized_value = _clean_ntlm_token(value)
+    if not normalized_value:
+        return
+    if description == "NTLM Target Name":
+        cleaned_target = _sanitize_ntlm_domain(normalized_value)
+        if cleaned_target == "Unknown":
+            cleaned_target = _sanitize_ntlm_workstation(normalized_value)
+        if cleaned_target == "Unknown":
+            return
+        normalized_value = cleaned_target
+    key = (description, normalized_value)
+    if key in seen:
+        return
+    seen.add(key)
+    artifacts.append(NtlmArtifact(value=normalized_value, description=description))
 
 
 # --- Constants ---
@@ -205,6 +234,73 @@ NTSTATUS_MAP = {
     0xC000A00D: "STATUS_BAD_NETWORK_NAME",
 }
 
+_NTLM_VISIBLE_RE = re.compile(r"^[\x20-\x7e]{1,128}$")
+_NTLM_USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._$-]{2,63}$")
+_NTLM_DOMAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{2,63}$")
+_NTLM_WORKSTATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
+
+
+def _clean_ntlm_token(value: str) -> str:
+    text = str(value or "").replace("\x00", "").strip()
+    text = text.strip(" \t\r\n\"'`[]{}()<>,;:!|&*?^%")
+    return text
+
+
+def _looks_like_hex_noise(value: str) -> bool:
+    text = str(value or "")
+    if len(text) < 8 or len(text) % 2 != 0:
+        return False
+    return bool(re.fullmatch(r"[0-9A-Fa-f]+", text))
+
+
+def _sanitize_ntlm_user(value: str) -> str:
+    user = _clean_ntlm_token(value)
+    if not user or user.lower() == "unknown":
+        return "Unknown"
+    if not _NTLM_VISIBLE_RE.fullmatch(user):
+        return "Unknown"
+    if not _NTLM_USER_RE.fullmatch(user):
+        return "Unknown"
+    if _looks_like_hex_noise(user):
+        return "Unknown"
+    if user.isdigit():
+        return "Unknown"
+    return user
+
+
+def _sanitize_ntlm_domain(value: str) -> str:
+    domain = _clean_ntlm_token(value).upper()
+    if not domain or domain == "UNKNOWN":
+        return "Unknown"
+    if not _NTLM_VISIBLE_RE.fullmatch(domain):
+        return "Unknown"
+    if not _NTLM_DOMAIN_RE.fullmatch(domain):
+        return "Unknown"
+    if domain.startswith(".") or domain.endswith(".") or ".." in domain:
+        return "Unknown"
+    if "." in domain:
+        labels = domain.split(".")
+        if len(labels) < 2 or any(len(label) < 2 for label in labels):
+            return "Unknown"
+    elif len(domain) < 5:
+        return "Unknown"
+    if _looks_like_hex_noise(domain):
+        return "Unknown"
+    return domain
+
+
+def _sanitize_ntlm_workstation(value: str) -> str:
+    workstation = _clean_ntlm_token(value)
+    if not workstation or workstation.lower() == "unknown":
+        return "Unknown"
+    if not _NTLM_VISIBLE_RE.fullmatch(workstation):
+        return "Unknown"
+    if not _NTLM_WORKSTATION_RE.fullmatch(workstation):
+        return "Unknown"
+    if _looks_like_hex_noise(workstation):
+        return "Unknown"
+    return workstation
+
 
 def _parse_smb2_status(payload: bytes) -> Optional[str]:
     idx = payload.find(b"\xfeSMB")
@@ -265,19 +361,21 @@ def _parse_http_status(payload: bytes) -> Optional[str]:
 
 def _read_sec_buffer(data: bytes, offset: int) -> Tuple[int, int, int]:
     # Length (2), Allocated (2), Offset (4)
-    if offset + 8 > len(data): return 0, 0, 0
+    if offset + 8 > len(data):
+        return 0, 0, 0
     length, alloc, val_offset = struct.unpack("<HHI", data[offset:offset+8])
     return length, alloc, val_offset
 
 def _extract_string(data: bytes, length: int, offset: int, unicode: bool) -> str:
-    if offset + length > len(data): return "Error"
+    if offset + length > len(data):
+        return "Error"
     raw = data[offset:offset+length]
     try:
         if unicode:
             return raw.decode("utf-16le")
         else:
             return raw.decode("ascii")
-    except:
+    except UnicodeDecodeError:
         return raw.hex()
 
 # --- Analysis Functions ---
@@ -312,6 +410,7 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
     })
     anomalies: List[NtlmAnomaly] = []
     artifacts: List[NtlmArtifact] = []
+    artifact_seen: Set[Tuple[str, str]] = set()
     errors: List[str] = []
     src_counts = Counter()
     dst_counts = Counter()
@@ -335,22 +434,26 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
 
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", 0))
-            if start_time is None: start_time = ts
+            if start_time is None:
+                start_time = ts
             last_time = ts
             
             # Look for NTLM Signature in Raw payload
             # Can be in TCP or UDP
-            if not pkt.haslayer(Raw): continue
+            if not pkt.haslayer(Raw):
+                continue
             
             payload = bytes(pkt[Raw])
             idx = payload.find(NTLM_SIG)
             
-            if idx == -1: continue
+            if idx == -1:
+                continue
             
             ntlm_packets += 1
             ntlm_data = payload[idx:]
             
-            if len(ntlm_data) < 12: continue
+            if len(ntlm_data) < 12:
+                continue
             
             # Header
             try:
@@ -401,7 +504,8 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                     # Message Type 3
                     # Sig(8), Type(4), LmResp(8), NtResp(8), Domain(8), User(8), Workstation(8), SessionKey(8), Flags(4)
                     
-                    if len(ntlm_data) < 64: continue
+                    if len(ntlm_data) < 64:
+                        continue
                     
                     # Offsets relative to start of ntlmssp header
                     lm_len, lm_alloc, lm_off = _read_sec_buffer(ntlm_data, 12)
@@ -414,13 +518,20 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                     
                     is_unicode = (flags & NTLMSSP_NEGOTIATE_UNICODE) != 0
                     
-                    domain = _extract_string(ntlm_data, dom_len, dom_off, is_unicode)
-                    user = _extract_string(ntlm_data, user_len, user_off, is_unicode)
-                    workstation = _extract_string(ntlm_data, ws_len, ws_off, is_unicode)
-                    
-                    users[user] += 1
-                    domains[domain] += 1
-                    workstations[workstation] += 1
+                    domain_raw = _extract_string(ntlm_data, dom_len, dom_off, is_unicode)
+                    user_raw = _extract_string(ntlm_data, user_len, user_off, is_unicode)
+                    workstation_raw = _extract_string(ntlm_data, ws_len, ws_off, is_unicode)
+
+                    domain = _sanitize_ntlm_domain(domain_raw)
+                    user = _sanitize_ntlm_user(user_raw)
+                    workstation = _sanitize_ntlm_workstation(workstation_raw)
+
+                    if user != "Unknown":
+                        users[user] += 1
+                    if domain != "Unknown":
+                        domains[domain] += 1
+                    if workstation != "Unknown":
+                        workstations[workstation] += 1
                     
                     # Version Check (Rough heuristic based on response lengths)
                     # NTLMv1: NT Resp is 24 bytes
@@ -429,7 +540,17 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                     if nt_len == 24:
                         ver = "NTLMv1"
                         versions["NTLMv1"] += 1
-                        anomalies.append(NtlmAnomaly("CRITICAL", "NTLMv1 Auth", f"Legacy NTLMv1 authentication used by {user}", total_packets, src, dst))
+                        user_label = user if user != "Unknown" else "<unknown user>"
+                        anomalies.append(
+                            NtlmAnomaly(
+                                "CRITICAL",
+                                "NTLMv1 Auth",
+                                f"Legacy NTLMv1 authentication used by {user_label}",
+                                total_packets,
+                                src,
+                                dst,
+                            )
+                        )
                     elif nt_len > 24:
                         ver = "NTLMv2"
                         versions["NTLMv2"] += 1
@@ -450,10 +571,12 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                     convo.messages["Authenticate"] += 1
                     handshake_state[convo_key]["authenticate"] = ts
                     if handshake_state[convo_key]["negotiate"] or handshake_state[convo_key]["challenge"]:
-                        artifacts.append(NtlmArtifact(
+                        _append_ntlm_artifact(
+                            artifacts,
+                            artifact_seen,
                             value=f"{src}->{dst}",
-                            description="NTLM handshake completed (Type1/2/3)"
-                        ))
+                            description="NTLM handshake completed (Type1/2/3)",
+                        )
                     status_code = _parse_smb2_status(payload) or _parse_smb1_status(payload) or _parse_http_status(payload)
                     if status_code:
                         status_codes[status_code] += 1
@@ -469,13 +592,23 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                          target_name_off = struct.unpack("<I", ntlm_data[16:20])[0]
                          if target_name_len and target_name_off + target_name_len <= len(ntlm_data):
                              target_name = ntlm_data[target_name_off:target_name_off + target_name_len].decode("utf-16le", errors="ignore")
-                             artifacts.append(NtlmArtifact(value=target_name, description="NTLM Target Name"))
+                             _append_ntlm_artifact(
+                                 artifacts,
+                                 artifact_seen,
+                                 value=target_name,
+                                 description="NTLM Target Name",
+                             )
                      if len(ntlm_data) >= 20:
                          flags = struct.unpack("<I", ntlm_data[20:24])[0]
                          if flags & NTLMSSP_NEGOTIATE_NTLM:
                              versions["NTLMv1"] += 1
                          if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                             artifacts.append(NtlmArtifact(value="Extended Session Security", description="NTLM Challenge Flag"))
+                             _append_ntlm_artifact(
+                                 artifacts,
+                                 artifact_seen,
+                                 value="Extended Session Security",
+                                 description="NTLM Challenge Flag",
+                             )
                      status_code = _parse_smb2_status(payload) or _parse_smb1_status(payload) or _parse_http_status(payload)
                      if status_code:
                          status_codes[status_code] += 1
@@ -491,7 +624,12 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                          if flags & NTLMSSP_NEGOTIATE_NTLM:
                              versions["NTLMv1"] += 1
                          if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                             artifacts.append(NtlmArtifact(value="Extended Session Security", description="NTLM Negotiate Flag"))
+                             _append_ntlm_artifact(
+                                 artifacts,
+                                 artifact_seen,
+                                 value="Extended Session Security",
+                                 description="NTLM Negotiate Flag",
+                             )
 
             except Exception:
                 pass
