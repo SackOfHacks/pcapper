@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import metadata
-from typing import Any, Callable, Iterable
+from typing import Callable, Iterable
 
 
 PluginAnalyze = Callable[..., object]

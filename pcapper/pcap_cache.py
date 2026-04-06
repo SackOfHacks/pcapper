@@ -5,9 +5,13 @@ from collections import OrderedDict
 import os
 import struct
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
-from scapy.utils import PcapReader, PcapNgReader
+try:
+    from scapy.utils import PcapReader, PcapNgReader  # type: ignore
+except Exception:  # pragma: no cover
+    PcapReader = None  # type: ignore
+    PcapNgReader = None  # type: ignore
 try:
     from scapy.all import sniff  # type: ignore
 except Exception:  # pragma: no cover
@@ -281,7 +285,33 @@ def get_cache_config() -> tuple[bool, int, int]:
     return _cache_config()
 
 
+def is_scapy_available() -> bool:
+    return PcapReader is not None and PcapNgReader is not None
+
+
+def _require_scapy() -> None:
+    if not is_scapy_available():
+        raise RuntimeError("Scapy is required for packet parsing (install scapy>=2.5.0).")
+
+
+def load_capture_meta(path: Path) -> PcapMeta:
+    file_type = detect_file_type(path)
+    try:
+        size_bytes = path.stat().st_size
+    except Exception:
+        size_bytes = 0
+    return _finalize_meta(
+        path=path,
+        file_type=file_type,
+        size_bytes=size_bytes,
+        linktype=None,
+        snaplen=None,
+        interfaces=None,
+    )
+
+
 def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], PcapMeta]:
+    _require_scapy()
     file_type = detect_file_type(path)
     size_bytes = 0
     try:
@@ -343,6 +373,8 @@ def get_cached_packets(path: Path, show_status: bool = True) -> tuple[list[objec
     enabled, max_cache, _max_file = _cache_config()
     if not enabled or max_cache == 0:
         return packets, meta
+    if size_bytes > max_cache:
+        return packets, meta
     while _PACKET_CACHE and _CACHE_BYTES + size_bytes > max_cache:
         _, evicted = _PACKET_CACHE.popitem(last=False)
         evicted_meta = evicted[1]
@@ -385,6 +417,7 @@ def load_filtered_packets(
     time_end: float | None = None,
     bpf_status: dict[str, object] | None = None,
 ) -> tuple[list[object], PcapMeta]:
+    _require_scapy()
     file_type = detect_file_type(path)
     try:
         size_bytes = path.stat().st_size
@@ -503,6 +536,7 @@ def get_reader(
         status = build_statusbar(path, enabled=show_status)
         return reader, status, reader, len(cached_packets), cached_meta.file_type
 
+    _require_scapy()
     reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
     status = build_statusbar(path, enabled=show_status)
     stream = _reader_stream(reader)

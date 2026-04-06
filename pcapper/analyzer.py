@@ -9,10 +9,13 @@ from .pcap_cache import PcapMeta, get_reader
 
 try:
     from scapy.layers.l2 import Dot1Q, Ether  # type: ignore
-    from scapy.layers.inet import TCP, UDP  # type: ignore
+    from scapy.layers.inet import IP, TCP, UDP  # type: ignore
+    from scapy.layers.inet6 import IPv6  # type: ignore
+    from scapy.packet import Raw  # type: ignore
 except Exception:  # pragma: no cover
     Dot1Q = None  # type: ignore
     TCP = UDP = None  # type: ignore
+    IP = IPv6 = Raw = None  # type: ignore
     Ether = None  # type: ignore
 
 from .models import InterfaceStat, PcapSummary
@@ -150,6 +153,9 @@ def analyze_pcap(
     protocol_counts: Counter[str] = Counter()
     iface_counts = defaultdict(int)
     iface_vlans = defaultdict(set)
+    tcp_packets = 0
+    retransmissions = 0
+    seen_seq: defaultdict[tuple[str, str, int, int], set[tuple[int, int]]] = defaultdict(set)
 
     reader, status, stream, _size_bytes, _file_type = get_reader(
         path, packets=packets, meta=meta, show_status=show_status
@@ -179,6 +185,17 @@ def analyze_pcap(
                 iface_key = "unknown"
             iface_counts[iface_key] += 1
 
+            src_ip = None
+            dst_ip = None
+            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
+                ip_layer = pkt[IP]  # type: ignore[index]
+                src_ip = str(getattr(ip_layer, "src", ""))
+                dst_ip = str(getattr(ip_layer, "dst", ""))
+            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
+                ip_layer = pkt[IPv6]  # type: ignore[index]
+                src_ip = str(getattr(ip_layer, "src", ""))
+                dst_ip = str(getattr(ip_layer, "dst", ""))
+
             if Dot1Q is not None:
                 try:
                     if pkt.haslayer(Dot1Q):  # type: ignore[truthy-bool]
@@ -204,6 +221,33 @@ def analyze_pcap(
             if ethertype_proto:
                 protocol_counts[ethertype_proto] += 1
 
+            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+                tcp_packets += 1
+                if src_ip and dst_ip:
+                    try:
+                        tcp_layer = pkt[TCP]  # type: ignore[index]
+                        seq = int(getattr(tcp_layer, "seq", 0) or 0)
+                        sport = int(getattr(tcp_layer, "sport", 0) or 0)
+                        dport = int(getattr(tcp_layer, "dport", 0) or 0)
+                        payload_len = 0
+                        if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
+                            payload_len = len(bytes(pkt[Raw]))  # type: ignore[index]
+                        else:
+                            try:
+                                payload_len = len(bytes(tcp_layer.payload))
+                            except Exception:
+                                payload_len = 0
+                        key = (src_ip, dst_ip, sport, dport)
+                        sig = (seq, payload_len)
+                        if sig in seen_seq[key]:
+                            retransmissions += 1
+                        else:
+                            seen_seq[key].add(sig)
+                        if len(seen_seq[key]) > 20000:
+                            seen_seq[key].clear()
+                    except Exception:
+                        pass
+
             if status.enabled and stream is not None and size_bytes:
                 try:
                     pos = stream.tell()
@@ -218,6 +262,7 @@ def analyze_pcap(
     duration_seconds = None
     if start_ts is not None and end_ts is not None:
         duration_seconds = max(0.0, end_ts - start_ts)
+    retransmission_rate = (retransmissions / tcp_packets) if tcp_packets else 0.0
 
     interface_stats: list[InterfaceStat] = []
 
@@ -319,6 +364,9 @@ def analyze_pcap(
         duration_seconds=duration_seconds,
         interface_stats=interface_stats,
         protocol_counts=protocol_counts,
+        tcp_packets=tcp_packets,
+        retransmissions=retransmissions,
+        retransmission_rate=retransmission_rate,
     )
 
 
@@ -334,6 +382,9 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
             duration_seconds=0.0,
             interface_stats=[],
             protocol_counts=Counter(),
+            tcp_packets=0,
+            retransmissions=0,
+            retransmission_rate=0.0,
         )
 
     file_types = {summary.file_type for summary in summaries if summary.file_type}
@@ -345,11 +396,17 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
     end_values = [summary.end_ts for summary in summaries if summary.end_ts is not None]
     merged_start = min(start_values) if start_values else None
     merged_end = max(end_values) if end_values else None
-    merged_duration = sum((summary.duration_seconds or 0.0) for summary in summaries)
+    if merged_start is not None and merged_end is not None:
+        merged_duration = max(0.0, merged_end - merged_start)
+    else:
+        merged_duration = sum((summary.duration_seconds or 0.0) for summary in summaries)
 
     merged_protocols: Counter[str] = Counter()
     for summary in summaries:
         merged_protocols.update(summary.protocol_counts)
+    merged_tcp_packets = sum(int(getattr(summary, "tcp_packets", 0) or 0) for summary in summaries)
+    merged_retransmissions = sum(int(getattr(summary, "retransmissions", 0) or 0) for summary in summaries)
+    merged_retransmission_rate = (merged_retransmissions / merged_tcp_packets) if merged_tcp_packets else 0.0
 
     iface_data: dict[str, dict[str, object]] = {}
     for summary in summaries:
@@ -430,4 +487,7 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
         duration_seconds=merged_duration,
         interface_stats=merged_interfaces,
         protocol_counts=merged_protocols,
+        tcp_packets=merged_tcp_packets,
+        retransmissions=merged_retransmissions,
+        retransmission_rate=merged_retransmission_rate,
     )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
 
 
 PCAP_EXTENSIONS = {".pcap", ".pcapng"}

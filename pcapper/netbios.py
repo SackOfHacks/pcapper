@@ -10,7 +10,7 @@ try:
     from scapy.layers.inet import TCP, UDP
     from scapy.layers.inet6 import IPv6
     from scapy.layers.l2 import Ether
-    from scapy.packet import Raw, Packet
+    from scapy.packet import Raw
     from scapy.layers.netbios import NBNSQueryRequest, NBNSQueryResponse, NBNSNodeStatusResponse
 except ImportError:
     # Use raw parsing if imports fail or layers missing

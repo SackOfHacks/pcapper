@@ -40,10 +40,12 @@ def correlate(
 
     host_list = list(host_summaries)
     svc_list = list(service_summaries)
-    total_pcaps = len({summary.path for summary in host_list}) or len({summary.path for summary in svc_list})
+    source_paths = {str(summary.path) for summary in host_list}
+    source_paths.update(str(summary.path) for summary in svc_list)
+    total_pcaps = len(source_paths)
 
     for summary in host_list:
-        pcap_name = summary.path.name
+        pcap_name = str(summary.path)
         for host in getattr(summary, "hosts", []) or []:
             ip = str(getattr(host, "ip", "") or "")
             if not ip:
@@ -54,7 +56,7 @@ def correlate(
                 errors.append(err)
 
     for summary in svc_list:
-        pcap_name = summary.path.name
+        pcap_name = str(summary.path)
         for asset in getattr(summary, "assets", []) or []:
             ip = str(getattr(asset, "ip", "") or "")
             port = int(getattr(asset, "port", 0) or 0)

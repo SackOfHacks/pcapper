@@ -8,7 +8,7 @@ import ipaddress
 import re
 
 from .pcap_cache import PcapMeta, get_reader
-from .utils import safe_float, decode_payload, counter_inc, setdict_add, set_add_cap
+from .utils import safe_float, decode_payload, counter_inc, setdict_add
 import os
 
 try:
@@ -1166,7 +1166,6 @@ def analyze_ftp(
             )
 
     for (client_ip, server_ip), stats in login_attempts.items():
-        attempts = int(stats["attempts"])
         fails = int(stats["fails"])
         success = int(stats["success"])
         user_count = len(stats["users"])

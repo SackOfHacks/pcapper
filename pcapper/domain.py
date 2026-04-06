@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .pcap_cache import PcapMeta, get_reader
-from .utils import detect_file_type, safe_float
+from .utils import safe_float
 from .dns import analyze_dns
 from .netbios import analyze_netbios
 from .ntlm import analyze_ntlm
@@ -97,6 +97,60 @@ _CRED_USER_PATTERNS = [
 _CRED_PASS_PATTERNS = [
     re.compile(r"(?i)\b(pass(word)?|passwd|pwd)\b\s*[:=]\s*([^\s'\";]{4,})"),
 ]
+_DOMAIN_USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._$@-]{2,63}$")
+_DOMAIN_COMPUTER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
+
+
+def _clean_identity_token(value: str) -> str:
+    text = str(value or "").replace("\x00", "").strip()
+    text = text.strip(" \t\r\n\"'`[]{}()<>,;:!|&*?^%")
+    return text
+
+
+def _looks_like_hex_noise(value: str) -> bool:
+    text = str(value or "")
+    if len(text) < 8 or len(text) % 2 != 0:
+        return False
+    return bool(re.fullmatch(r"[0-9A-Fa-f]+", text))
+
+
+def _is_plausible_domain_user(value: str) -> bool:
+    user = _clean_identity_token(value)
+    if not user or user.lower() == "unknown":
+        return False
+    if not _DOMAIN_USER_RE.fullmatch(user):
+        return False
+    if _looks_like_hex_noise(user):
+        return False
+    if user.isdigit():
+        return False
+    if sum(1 for ch in user if ch.isalpha()) < 2:
+        return False
+    return True
+
+
+def _is_plausible_computer_name(value: str) -> bool:
+    name = _clean_identity_token(value)
+    if not name or name.lower() == "unknown":
+        return False
+    if not _DOMAIN_COMPUTER_RE.fullmatch(name):
+        return False
+    if _looks_like_hex_noise(name):
+        return False
+    if sum(1 for ch in name if ch.isalpha()) < 2:
+        return False
+    return True
+
+
+def _is_plausible_credential_string(value: str) -> bool:
+    text = _clean_identity_token(value)
+    if len(text) < 8 or len(text) > 140:
+        return False
+    if not any(ch.isalpha() for ch in text):
+        return False
+    if "=" not in text and ":" not in text:
+        return False
+    return True
 
 
 def _base_domain(name: str) -> str:
@@ -209,12 +263,20 @@ def analyze_domain(
         if host.is_domain_controller:
             dc_hosts[ip] += 1
 
-    users = Counter(ntlm_summary.raw_users)
-    computer_names = Counter(ntlm_summary.raw_workstations)
+    users = Counter({
+        name: int(count)
+        for name, count in Counter(ntlm_summary.raw_users).items()
+        if _is_plausible_domain_user(name)
+    })
+    computer_names = Counter({
+        name: int(count)
+        for name, count in Counter(ntlm_summary.raw_workstations).items()
+        if _is_plausible_computer_name(name)
+    })
 
     for name in netbios_summary.unique_names:
-        if name:
-            computer_names[name] += 1
+        if _is_plausible_computer_name(name):
+            computer_names[_clean_identity_token(name)] += 1
 
     response_codes = Counter()
     response_codes.update(netbios_summary.response_codes)
@@ -315,9 +377,13 @@ def analyze_domain(
                         user_agents[ua] += 1
 
                 if payload:
-                    for value in _extract_ascii_strings(payload) + _extract_utf16le_strings(payload):
-                        if not value:
-                            continue
+                    extracted = _extract_ascii_strings(payload) + _extract_utf16le_strings(payload)
+                    values: set[str] = set()
+                    for value in extracted:
+                        cleaned = _clean_identity_token(value)
+                        if cleaned:
+                            values.add(cleaned)
+                    for value in values:
                         value_lower = value.lower()
                         if dport in LDAP_PORTS or sport in LDAP_PORTS:
                             pair_key = (src_ip, dst_ip) if dport in LDAP_PORTS else (dst_ip, src_ip)
@@ -328,12 +394,15 @@ def analyze_domain(
                         for pattern in _CRED_USER_PATTERNS:
                             match = pattern.search(value)
                             if match:
-                                user_val = match.group(3)
-                                users[user_val] += 1
+                                user_val = _clean_identity_token(match.group(3))
+                                if _is_plausible_domain_user(user_val):
+                                    users[user_val] += 1
                         for pattern in _CRED_PASS_PATTERNS:
                             match = pattern.search(value)
                             if match:
-                                credentials[match.group(0)] += 1
+                                credential_value = _clean_identity_token(match.group(0))
+                                if _is_plausible_credential_string(credential_value):
+                                    credentials[credential_value] += 1
 
             if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                 udp_layer = pkt[UDP]  # type: ignore[index]
@@ -550,7 +619,7 @@ def analyze_domain(
     for sess in getattr(ntlm_summary, "sessions", []):
         username = str(getattr(sess, "username", "") or "").strip()
         src_ip = str(getattr(sess, "src_ip", "") or "").strip()
-        if username and src_ip and username.lower() != "unknown":
+        if username and src_ip and _is_plausible_domain_user(username):
             user_to_hosts[username].add(src_ip)
     for username, hosts in user_to_hosts.items():
         if len(hosts) >= 3:

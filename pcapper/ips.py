@@ -14,7 +14,7 @@ import hashlib
 import math
 
 from .pcap_cache import get_reader
-from .utils import safe_float, detect_file_type, safe_read_text, counter_inc, setdict_add, set_add_cap
+from .utils import safe_float, safe_read_text, counter_inc, setdict_add, set_add_cap
 
 MAX_ENDPOINTS = int(os.getenv("PCAPPER_MAX_ENDPOINTS", "20000"))
 MAX_CONVERSATIONS = int(os.getenv("PCAPPER_MAX_CONVERSATIONS", "50000"))
@@ -189,7 +189,6 @@ def _build_ips_hunting_context(
 
     score_by_ip: defaultdict[str, int] = defaultdict(int)
     reasons_by_ip: defaultdict[str, list[str]] = defaultdict(list)
-    endpoint_map = {ep.ip: ep for ep in endpoints}
 
     intel_by_ip: defaultdict[str, list[dict[str, object]]] = defaultdict(list)
     for finding in intel_findings:
@@ -487,8 +486,6 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     duration_seconds = 0.0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
-    skipped_endpoints = 0
-    skipped_conversations = 0
 
     protocol_counts: Counter[str] = Counter()
     src_counts: Counter[str] = Counter()
@@ -1049,7 +1046,6 @@ def _tls_cert_risks_from_payload(cert_payload: object) -> list[dict[str, object]
         if subject == issuer:
             risks.append({"type": "self_signed", "details": subject})
 
-        now = getattr(cert, "not_valid_before", None)
         current = None
         try:
             from datetime import datetime, timezone

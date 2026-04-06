@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 import difflib
 import glob
+import inspect
 import json
 import os
 import re
@@ -78,6 +79,7 @@ from .reporting import (
     render_http_summary,
     render_sizes_summary,
     render_ftp_summary,
+    render_aim_summary,
     render_nfs_summary,
     render_strings_summary,
     render_search_summary,
@@ -112,7 +114,6 @@ from .reporting import (
     render_udp_rollup,
     render_exfil_summary,
     render_generic_rollup,
-    set_redact_secrets,
     set_verbose_output,
     render_pcapmeta_summary,
     render_quic_summary,
@@ -141,7 +142,13 @@ from .reporting import (
     render_iec101_103_summary,
     render_mitre_summary,
 )
-from .pcap_cache import load_packets_if_allowed, load_filtered_packets, get_reader, get_cache_config
+from .pcap_cache import (
+    load_packets_if_allowed,
+    load_filtered_packets,
+    get_reader,
+    get_cache_config,
+    is_scapy_available,
+)
 from .exporting import ExportBundle, export_json, export_csv, export_sqlite
 from .vlan import analyze_vlans
 from .icmp import analyze_icmp
@@ -189,6 +196,7 @@ from .ips import analyze_ips, merge_ips_summaries
 from .http import analyze_http
 from .sizes import analyze_sizes
 from .ftp import analyze_ftp, merge_ftp_summaries
+from .aim import analyze_aim, merge_aim_summaries
 from .nfs import analyze_nfs
 from .strings import analyze_strings
 from .search import analyze_search
@@ -264,6 +272,7 @@ def _builtin_flag_map() -> dict[str, str]:
         "--dns": "dns",
         "--http": "http",
         "--ftp": "ftp",
+        "--aim": "aim",
         "--tls": "tls",
         "--ssh": "ssh",
         "--rdp": "rdp",
@@ -394,6 +403,74 @@ def _ordered_steps(argv: list[str], plugins: list[PluginSpec] | None = None) -> 
     return ordered
 
 
+_FILTER_COMPATIBLE_STEPS = {
+    "search",
+    "packet",
+    "dns",
+    "http",
+    "ftp",
+    "aim",
+    "tls",
+    "ssh",
+    "rdp",
+    "telnet",
+    "vnc",
+    "teamviewer",
+    "winrm",
+    "wmic",
+    "powershell",
+    "syslog",
+    "snmp",
+    "smtp",
+    "rpc",
+    "tcp",
+    "udp",
+    "exfil",
+    "services",
+    "creds",
+    "secrets",
+    "kerberos",
+    "streams",
+}
+
+
+def _primary_flag_for_step(step: str) -> str:
+    for flag, mapped in _builtin_flag_map().items():
+        if mapped == step:
+            return flag
+    return step
+
+
+def _plugin_supports_packet_filters(spec: PluginSpec) -> bool:
+    if spec.analyze is None:
+        return True
+    try:
+        signature = inspect.signature(spec.analyze)
+    except Exception:
+        return False
+    params = signature.parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return True
+    return "packets" in params and "meta" in params
+
+
+def _collect_filter_incompatibilities(
+    ordered_steps: list[str],
+    plugins: list[PluginSpec],
+) -> list[str]:
+    plugin_lookup = plugin_map(plugins)
+    unsupported: list[str] = []
+    for step in ordered_steps:
+        spec = plugin_lookup.get(step)
+        if spec is not None:
+            if not _plugin_supports_packet_filters(spec):
+                unsupported.append(spec.flag)
+            continue
+        if step not in _FILTER_COMPATIBLE_STEPS:
+            unsupported.append(_primary_flag_for_step(step))
+    return list(dict.fromkeys(unsupported))
+
+
 def _build_banner() -> str:
     ot_ics_quotes = [
         "Safety before speed. Reliability before novelty.",
@@ -461,7 +538,7 @@ def _coerce_config_value(action: argparse.Action, value: Any) -> Any:
         return bool(value)
     if isinstance(action, argparse._StoreFalseAction):
         if isinstance(value, str):
-            return not (value.strip().lower() in {"1", "true", "yes", "on"})
+            return value.strip().lower() not in {"1", "true", "yes", "on"}
         return not bool(value)
     if action.dest == "timeline_categories" and isinstance(value, list):
         return ",".join(str(item) for item in value)
@@ -675,6 +752,10 @@ def _expand_target_wildcard(pattern: Path, recursive: bool) -> list[Path]:
 
 def _normalize_timeline_category(value: str) -> str:
     return " ".join(value.strip().lower().split())
+
+
+def _has_packet_filters(bpf: str | None, time_start: float | None, time_end: float | None) -> bool:
+    return bool(bpf) or time_start is not None or time_end is not None
 
 
 def _print_timeline_categories() -> None:
@@ -966,11 +1047,6 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Write SQLite export of results to PATH.",
     )
     general.add_argument(
-        "--export-redact",
-        action="store_true",
-        help="Force redaction of secrets in export outputs.",
-    )
-    general.add_argument(
         "--case-dir",
         metavar="DIR",
         help="Write exports/extracted files to a case directory.",
@@ -1066,7 +1142,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--arp", "Include ARP analysis (conversations, poisoning signals, anomalies, artifacts)."),
         ("--beacon", "Include beaconing analysis in the output."),
         ("--certificates", "Include TLS certificate extraction and analysis."),
-        ("--creds", "Scan for credential exposure (HTTP, FTP, SMTP, DNS, etc.)."),
+        ("--creds", "Scan for credential exposure (HTTP, FTP, SMTP, CIP/ENIP, etc.)."),
         ("--compromised", "Assess likely compromised hosts (multi-signal correlation)."),
         ("--secrets", "Discover reversible encoded/obfuscated secrets (base64, hex, url-encoded, JWT)."),
         ("--dhcp", "Include DHCP analysis (leases, options, clients/servers, attacks, anomalies)."),
@@ -1083,6 +1159,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--hostname", "Find hostnames for a target IP across DNS/HTTP/TLS/SMB/NetBIOS (use with -ip)."),
         ("--hosts", "Include host inventory analysis (MAC/IP/hostname/OS/ports/traffic)."),
         ("--http", "Include HTTP analysis in the output."),
+        ("--aim", "Include AIM (AOL Instant Messenger) forensic analysis (messages, creds, files, client/server stats)."),
         ("--icmp", "Include ICMP analysis in the output."),
         ("--ips", "Include IP address intelligence and conversation analysis."),
         ("--kerberos", "Include Kerberos analysis (requests, errors, principals, attacks)."),
@@ -1271,6 +1348,7 @@ def _analyze_paths(
     dns_vt: bool,
     show_http: bool,
     show_ftp: bool,
+    show_aim: bool,
     show_tls: bool,
     show_ssh: bool,
     show_rdp: bool,
@@ -1400,7 +1478,6 @@ def _analyze_paths(
     export_json_path: Path | None = None,
     export_csv_path: Path | None = None,
     export_sqlite_path: Path | None = None,
-    export_redact: bool = True,
     case_dir: Path | None = None,
     log_config: LogConfig | None = None,
     plugins: list[PluginSpec] | None = None,
@@ -1590,7 +1667,7 @@ def _analyze_paths(
         export_summaries: dict[str, object] = {}
         _log_event(log_config, "pcap_start", path=str(path), index=idx, total=len(paths))
 
-        if bpf or time_start or time_end:
+        if _has_packet_filters(bpf, time_start, time_end):
             packets, meta = load_filtered_packets(
                 path,
                 show_status=show_status,
@@ -1688,6 +1765,13 @@ def _analyze_paths(
                 else:
                     print(render_ftp_summary(ftp_summary, verbose=verbose))
                 export_summaries["ftp"] = ftp_summary
+            elif step == "aim" and show_aim:
+                aim_summary = analyze_aim(path, show_status=step_status, packets=packets, meta=meta)
+                if summarize_rollups:
+                    rollups.setdefault("aim", []).append(aim_summary)
+                else:
+                    print(render_aim_summary(aim_summary, verbose=verbose))
+                export_summaries["aim"] = aim_summary
             elif step == "tls" and show_tls:
                 quic_summary = None
                 if show_quic and "quic" in requested_steps:
@@ -1932,7 +2016,13 @@ def _analyze_paths(
                     print(render_routing_summary(routing_summary, verbose=verbose))
                 export_summaries["routing"] = routing_summary
             elif step == "services" and show_services:
-                svc_summary = analyze_services(path, show_status=step_status, filter_ip=timeline_ip)
+                svc_summary = analyze_services(
+                    path,
+                    show_status=step_status,
+                    filter_ip=timeline_ip,
+                    packets=packets,
+                    meta=meta,
+                )
                 if summarize_rollups:
                     rollups.setdefault("services", []).append(svc_summary)
                 else:
@@ -1983,14 +2073,14 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("creds", []).append(creds_summary)
                 else:
-                    print(render_creds_summary(creds_summary, show_secrets=True))
+                    print(render_creds_summary(creds_summary))
                 export_summaries["creds"] = creds_summary
             elif step == "secrets" and show_secrets_scan:
                 secrets_summary = analyze_secrets(path, show_status=step_status, packets=packets, meta=meta)
                 if summarize_rollups:
                     rollups.setdefault("secrets", []).append(secrets_summary)
                 else:
-                    print(render_secrets_summary(secrets_summary, show_secrets=True))
+                    print(render_secrets_summary(secrets_summary))
                 export_summaries["secrets"] = secrets_summary
             elif step == "certificates" and show_certificates:
                 cert_summary = analyze_certificates(path, show_status=step_status)
@@ -2470,11 +2560,11 @@ def _analyze_paths(
         if (export_json_path or export_csv_path or export_sqlite_path) and not summarize_rollups:
             bundle = ExportBundle(path=path, summaries=export_summaries)
             if export_json_path:
-                export_json(bundle, _resolve_export_path(export_json_path, path, "json"), redact=export_redact)
+                export_json(bundle, _resolve_export_path(export_json_path, path, "json"))
             if export_csv_path:
-                export_csv(bundle, _resolve_export_path(export_csv_path, path, "csv"), redact=export_redact)
+                export_csv(bundle, _resolve_export_path(export_csv_path, path, "csv"))
             if export_sqlite_path:
-                export_sqlite(bundle, _resolve_export_path(export_sqlite_path, path, "sqlite"), redact=export_redact)
+                export_sqlite(bundle, _resolve_export_path(export_sqlite_path, path, "sqlite"))
 
         _log_event(
             log_config,
@@ -2512,6 +2602,7 @@ def _analyze_paths(
             "hostname": (merge_hostname_summaries, lambda s: render_hostname_summary(s, verbose=verbose)),
             "hostdetails": (merge_hostdetails_summaries, lambda s: render_hostdetails_summary(s, verbose=verbose)),
             "ftp": (merge_ftp_summaries, lambda s: render_ftp_summary(s, verbose=verbose)),
+            "aim": (merge_aim_summaries, lambda s: render_aim_summary(s, verbose=verbose)),
             "ssh": (merge_ssh_summaries, lambda s: render_ssh_summary(s, verbose=verbose)),
             "protocols": (merge_protocols_summaries, lambda s: render_protocols_summary(s, verbose=verbose)),
             "routing": (merge_routing_summaries, lambda s: render_routing_summary(s, verbose=verbose)),
@@ -2545,6 +2636,7 @@ def _analyze_paths(
             "dns": "DNS ANALYSIS",
             "http": "HTTP ANALYSIS",
             "ftp": "FTP ANALYSIS",
+            "aim": "AIM ANALYSIS",
             "tls": "TLS/HTTPS ANALYSIS",
             "ssh": "SSH ANALYSIS",
             "rdp": "RDP ANALYSIS",
@@ -2686,11 +2778,11 @@ def _analyze_paths(
                 merged_summaries["correlation"] = correlation_summary
             bundle = ExportBundle(path=Path("ALL_PCAPS"), summaries=merged_summaries)
             if export_json_path:
-                export_json(bundle, export_json_path, redact=export_redact)
+                export_json(bundle, export_json_path)
             if export_csv_path:
-                export_csv(bundle, export_csv_path, redact=export_redact)
+                export_csv(bundle, export_csv_path)
             if export_sqlite_path:
-                export_sqlite(bundle, export_sqlite_path, redact=export_redact)
+                export_sqlite(bundle, export_sqlite_path)
         if rules_rollups:
             merged_rules = merge_rules_summaries(rules_rollups)
             print(render_rules_summary(merged_rules))
@@ -2841,7 +2933,6 @@ def main() -> int:
 
     if args.no_color:
         set_color_override(False)
-    set_redact_secrets(False)
     set_verbose_output(args.verbose)
     if getattr(args, "vt", False) and not args.dns:
         args.dns = True
@@ -2896,6 +2987,20 @@ def main() -> int:
     time_end = parse_time_arg(getattr(args, "time_end", None))
     if (args.time_start and time_start is None) or (args.time_end and time_end is None):
         print("Invalid --time-start or --time-end format. Use epoch seconds or ISO 8601 (e.g. 2025-01-01T00:00:00Z).")
+        return 2
+    filters_enabled = _has_packet_filters(getattr(args, "bpf", None), time_start, time_end)
+    if filters_enabled:
+        unsupported = _collect_filter_incompatibilities(ordered_steps, plugins)
+        if unsupported:
+            print("Packet filtering only supports filter-aware analyzers to avoid mixed-scope output.")
+            print("Run these flags without --bpf/--time-start/--time-end:")
+            for item in unsupported:
+                print(f"  - {item}")
+            return 2
+
+    if not is_scapy_available():
+        print("Scapy is required for packet analysis.")
+        print("Install scapy (e.g., `pip install scapy`) or run `--self-check` for diagnostics.")
         return 2
 
     ot_commands_config: OtControlConfig | None = None
@@ -2977,11 +3082,6 @@ def main() -> int:
     if case_dir and not (export_json_path or export_csv_path or export_sqlite_path):
         export_json_path = case_dir / "pcapper.json"
 
-    if args.export_redact:
-        export_redact = True
-    else:
-        export_redact = False
-
     def _run_analysis() -> int:
         return _analyze_paths(
             paths,
@@ -2996,6 +3096,7 @@ def main() -> int:
             dns_vt=args.vt,
             show_http=args.http,
             show_ftp=args.ftp,
+            show_aim=getattr(args, "aim", False),
             show_tls=args.tls,
             show_ssh=args.ssh,
             show_rdp=args.rdp,
@@ -3125,7 +3226,6 @@ def main() -> int:
             export_json_path=export_json_path,
             export_csv_path=export_csv_path,
             export_sqlite_path=export_sqlite_path,
-            export_redact=export_redact,
             case_dir=case_dir,
             log_config=log_config,
             plugins=plugins,

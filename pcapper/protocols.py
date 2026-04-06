@@ -13,12 +13,11 @@ try:
     from scapy.layers.l2 import Ether, ARP
     from scapy.layers.dns import DNS
     from scapy.packet import Raw, Packet
-    from scapy.utils import PcapReader, PcapNgReader
 except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float
+from .utils import safe_float
 # from .services import get_service_name - Removed
 
 # --- Dataclasses ---
@@ -649,7 +648,7 @@ def _get_proto_name(pkt: Packet) -> str:
         while layer.payload and layer.payload.name != "NoPayload":
             layer = layer.payload
         return layer.name
-    except:
+    except Exception:
         return "Unknown"
 
 def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
@@ -701,7 +700,8 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
 
             pkt_idx += 1
             ts = safe_float(getattr(pkt, "time", 0))
-            if start_ts is None: start_ts = ts
+            if start_ts is None:
+                start_ts = ts
             end_ts = ts
             
             pkt_len = len(pkt)

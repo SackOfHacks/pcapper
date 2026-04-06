@@ -17,7 +17,7 @@ except ImportError:
 from .pcap_cache import get_reader
 from .equipment import equipment_artifacts
 from .device_detection import device_fingerprint_from_fields
-from .utils import detect_file_type, safe_float
+from .utils import safe_float
 
 # --- Constants ---
 
@@ -164,7 +164,8 @@ class ModbusAnalysis:
         
     @property
     def error_rate(self) -> float:
-        if not self.messages: return 0.0
+        if not self.messages:
+            return 0.0
         errs = sum(1 for m in self.messages if m.is_exception)
         return (errs / len(self.messages)) * 100
 
@@ -492,7 +493,8 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                 pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
                 total_bytes += pkt_len
                 ts = safe_float(getattr(pkt, "time", 0))
-                if start_time is None: start_time = ts
+                if start_time is None:
+                    start_time = ts
                 last_time = ts
                 
                 has_tcp = False
@@ -559,7 +561,7 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                             remaining = len(payload) - 6
                             if length >= remaining: 
                                 is_modbus = True
-                    except:
+                    except (TypeError, ValueError, struct.error):
                         pass
                 
                 if not is_modbus:

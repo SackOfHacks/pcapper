@@ -578,12 +578,10 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
             if is_response:
                 client_ip = dst_ip
                 server_ip = src_ip
-                client_port = dport
                 server_port = sport
             else:
                 client_ip = src_ip
                 server_ip = dst_ip
-                client_port = sport
                 server_port = dport
             server_port = int(server_port or 0)
 

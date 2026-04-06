@@ -10,7 +10,6 @@ from typing import Optional
 import ipaddress
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore

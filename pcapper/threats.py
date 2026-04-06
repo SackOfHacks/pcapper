@@ -1572,6 +1572,13 @@ _NOISY_DETECTION_SUMMARIES = {
     "Suspicious file artifact",
     "OT protocol activity observed",
     "High TXT-query activity",
+    "OT protocol function operations observed",
+    "OT diagnostic/maintenance operations observed",
+    "OT reconnaissance error telemetry observed",
+    "ENIP session/discovery reconnaissance telemetry",
+    "Safety PLC/SIS traffic detected",
+    "Broad outbound external communication",
+    "High traffic concentration on a target",
 }
 
 
@@ -1588,6 +1595,14 @@ _HIGH_VALUE_SUMMARY_TOKENS = (
     "ot control",
     "internet-exposed",
     "threat-intel",
+)
+
+
+_LOW_CONFIDENCE_SUMMARY_TOKENS = (
+    "telemetry",
+    "activity observed",
+    "candidate",
+    "potential ",
 )
 
 
@@ -1656,6 +1671,13 @@ def _detection_signal_score(item: dict[str, object]) -> int:
 
     if summary in _NOISY_DETECTION_SUMMARIES:
         score -= 2
+    if (
+        severity == "warning"
+        and evidence_count <= 1
+        and max_peer_count <= 2
+        and any(token in lowered_summary for token in _LOW_CONFIDENCE_SUMMARY_TOKENS)
+    ):
+        score -= 1
     if severity == "warning" and not evidence_count and max_peer_count <= 1 and _parse_detail_count(details) < 5:
         score -= 1
 
@@ -1736,10 +1758,20 @@ def _curate_threat_detections(detections: list[dict[str, object]]) -> list[dict[
             item.pop("evidence", None)
 
         signal = _detection_signal_score(item)
+        lowered_summary = summary.lower()
+        has_context = bool(item.get("evidence")) or bool(item.get("top_sources")) or bool(item.get("top_destinations")) or bool(item.get("top_clients")) or bool(item.get("top_servers"))
+        high_value = any(token in lowered_summary for token in _HIGH_VALUE_SUMMARY_TOKENS)
+        noisy_summary = summary in _NOISY_DETECTION_SUMMARIES or any(token in lowered_summary for token in _LOW_CONFIDENCE_SUMMARY_TOKENS)
         if severity == "info":
             continue
-        if severity == "warning" and signal < 3:
-            continue
+        if severity == "warning":
+            min_signal = 3 if high_value else 4
+            if noisy_summary:
+                min_signal += 1
+            if not has_context:
+                min_signal += 1
+            if signal < min_signal:
+                continue
 
         key = (source, severity, summary, details)
         existing = merged_by_key.get(key)

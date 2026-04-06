@@ -514,10 +514,10 @@ def _analyze_ot_commands_fast(
             if cmd:
                 proto = "DNP3"
                 commands = [cmd]
-                command_gate = (
-                    lambda name, flag=is_control, extra=protocol_markers.get("DNP3", ()), base=base_markers:
-                    flag or _is_write_command(name, extra, base)
-                )
+                dnp3_markers = protocol_markers.get("DNP3", ())
+
+                def command_gate(name: str, flag: bool = is_control) -> bool:
+                    return flag or _is_write_command(name, dnp3_markers, base_markers)
         elif port == IEC104_PORT:
             proto = "IEC-104"
             commands = _parse_iec104_commands(payload)
@@ -557,10 +557,10 @@ def _analyze_ot_commands_fast(
             if cmd:
                 proto = "DNP3"
                 commands = [cmd]
-                command_gate = (
-                    lambda name, flag=is_control, extra=protocol_markers.get("DNP3", ()), base=base_markers:
-                    flag or _is_write_command(name, extra, base)
-                )
+                dnp3_markers = protocol_markers.get("DNP3", ())
+
+                def command_gate(name: str, flag: bool = is_control) -> bool:
+                    return flag or _is_write_command(name, dnp3_markers, base_markers)
             else:
                 commands = _fast_cip_commands(payload)
                 if commands:

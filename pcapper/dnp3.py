@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 import ipaddress
 import struct
 import math
@@ -15,7 +15,7 @@ except ImportError:
     TCP = UDP = Raw = None
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float
+from .utils import safe_float
 
 # --- Constants ---
 
@@ -636,7 +636,8 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
 
                 total_packets += 1
                 ts = safe_float(getattr(pkt, "time", 0))
-                if start_time is None: start_time = ts
+                if start_time is None:
+                    start_time = ts
                 last_time = ts
                 
                 # Check ports
@@ -752,7 +753,6 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                     if len(app_data) < 2:
                         continue
 
-                    app_control = app_data[0]
                     func_code = app_data[1]
                     func_name = FUNC_CODES.get(func_code, f"Unknown ({func_code})")
                     func_counts[func_name] += 1

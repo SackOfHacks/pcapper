@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import ipaddress
@@ -549,7 +549,6 @@ def _parse_bgp_update(body: bytes) -> dict[str, object]:
                 communities.append(f"{int.from_bytes(value[i:i+2],'big')}:{int.from_bytes(value[i+2:i+4],'big')}")
         elif code == 14 and len(value) >= 5:
             afi = int.from_bytes(value[0:2], "big")
-            safi = value[2]
             nh_len = value[3]
             pos = 4
             if pos + nh_len <= len(value):
@@ -784,7 +783,6 @@ def _parse_pim_group_prefix(data: bytes) -> tuple[str | None, int, int]:
     family = int.from_bytes(data[0:2], "big")
     if len(data) < 4:
         return None, family, 0
-    enc = data[2]
     mask_len = data[3]
     plen = (mask_len + 7) // 8
     if len(data) < 4 + plen:

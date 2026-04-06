@@ -11,14 +11,13 @@ try:
     from scapy.layers.inet import IP, TCP, UDP, ICMP
     from scapy.layers.inet6 import IPv6
     from scapy.layers.l2 import Ether, ARP
-    from scapy.layers.dns import DNS, DNSQR, DNSRR
-    from scapy.packet import Raw, Packet
-    from scapy.utils import PcapReader, PcapNgReader
+    from scapy.layers.dns import DNS
+    from scapy.packet import Raw
 except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
 
-from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float
+from .pcap_cache import PcapMeta, get_reader
+from .utils import safe_float
 
 # --- Dataclasses ---
 
@@ -402,8 +401,6 @@ def merge_services_summaries(
 
     assets_map: Dict[Tuple[str, int, str], ServiceAsset] = {}
     risks: List[ServiceRisk] = []
-    cleartext_hits: Dict[Tuple[str, str], Set[int]] = defaultdict(set)
-    nonstandard_hits: Dict[Tuple[str, str], Set[int]] = defaultdict(set)
     hierarchy: Counter[str] = Counter()
     errors: List[str] = []
 
@@ -496,28 +493,31 @@ COMMON_PORTS = {
 def _get_banner(payload: bytes, port: int) -> Optional[str]:
     # Try different decode
     try:
-        text = payload.decode('utf-8', errors='ignore')
-    except:
+        text = payload.decode("utf-8", errors="ignore")
+    except UnicodeDecodeError:
         return None
-        
-    if not text: return None
+
+    if not text:
+        return None
 
     # SSH
     if port == 22 or text.startswith("SSH-"):
         m = re.match(r"(SSH-[\d.]+-[\w_.]+)", text)
-        if m: return m.group(1)
-        
+        if m:
+            return m.group(1)
+
     # HTTP Server
     if port in (80, 8080, 8000) or "HTTP/" in text:
         # Response header?
         m = re.search(r"Server:\s*([^\r\n]+)", text, re.IGNORECASE)
-        if m: return m.group(1).strip()
-    
+        if m:
+            return m.group(1).strip()
+
     # FTP / SMTP
     if port in (21, 25) or text.startswith("220 "):
         if text.startswith("220 "):
             return text[4:].strip()
-            
+
     return None
 
 
@@ -546,13 +546,19 @@ def _guess_service(payload: bytes, port: int) -> tuple[Optional[str], Optional[s
 
     return None, None
 
-def analyze_services(path: Path, show_status: bool = True, filter_ip: Optional[str] = None) -> ServiceSummary:
+def analyze_services(
+    path: Path,
+    show_status: bool = True,
+    filter_ip: Optional[str] = None,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> ServiceSummary:
     if IP is None:
         return ServiceSummary(path, 0, [], [], {}, errors=["Scapy unavailable"])
 
     try:
         reader, status, stream, size_bytes, _file_type = get_reader(
-            path, show_status=show_status
+            path, packets=packets, meta=meta, show_status=show_status
         )
     except Exception as exc:
         return ServiceSummary(path, 0, [], [], {}, errors=[f"Error: {exc}"])

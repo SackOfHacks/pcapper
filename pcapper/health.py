@@ -8,7 +8,7 @@ import math
 import ipaddress
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float
+from .utils import safe_float
 from .certificates import analyze_certificates
 from .progress import run_with_busy_status
 

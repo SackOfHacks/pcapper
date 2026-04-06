@@ -209,7 +209,6 @@ def _burst_sleep_score(timeline: list[int]) -> float:
     avg = (sum(timeline) / len(timeline)) if timeline else 0.0
     if avg <= 0:
         return 0.0
-    density = active / len(timeline)
     burstiness = min(1.0, peak / max(avg, 1e-9) / 4.0)
     sleepiness = min(1.0, idle / len(timeline))
     return (0.6 * burstiness) + (0.4 * sleepiness)
