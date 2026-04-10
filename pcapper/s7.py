@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import ipaddress
+from pathlib import Path
 
 from .equipment import equipment_artifacts
 from .industrial_helpers import (
@@ -96,7 +96,7 @@ def _parse_commands(payload: bytes) -> list[str]:
             rosctr = payload[idx + 1]
             cmds.append(ROSCTR.get(rosctr, f"ROSCTR {rosctr}"))
         if idx + 10 <= len(payload):
-            param_len = int.from_bytes(payload[idx + 6:idx + 8], "big")
+            param_len = int.from_bytes(payload[idx + 6 : idx + 8], "big")
             param_start = idx + 10
             if param_len > 0 and param_start < len(payload):
                 func_code = payload[param_start]
@@ -118,28 +118,40 @@ def _parse_commands(payload: bytes) -> list[str]:
                         if spec_len < 0x0A:
                             break
                         transport = payload[item_offset + 3]
-                        length = int.from_bytes(payload[item_offset + 4:item_offset + 6], "big")
-                        db_num = int.from_bytes(payload[item_offset + 6:item_offset + 8], "big")
+                        length = int.from_bytes(
+                            payload[item_offset + 4 : item_offset + 6], "big"
+                        )
+                        db_num = int.from_bytes(
+                            payload[item_offset + 6 : item_offset + 8], "big"
+                        )
                         area = payload[item_offset + 8]
-                        addr = int.from_bytes(payload[item_offset + 9:item_offset + 12], "big")
+                        addr = int.from_bytes(
+                            payload[item_offset + 9 : item_offset + 12], "big"
+                        )
                         byte_offset = addr // 8
                         bit_offset = addr % 8
                         area_name = AREA_NAMES.get(area, f"AREA0x{area:02x}")
-                        transport_name = TRANSPORT_NAMES.get(transport, f"T0x{transport:02x}")
+                        transport_name = TRANSPORT_NAMES.get(
+                            transport, f"T0x{transport:02x}"
+                        )
                         if area_name == "DB":
                             addr_text = f"DB{db_num}.DBX{byte_offset}.{bit_offset}"
                         else:
                             addr_text = f"{area_name}{byte_offset}.{bit_offset}"
-                        cmds.append(f"{func_name} {addr_text} len={length} {transport_name}")
+                        cmds.append(
+                            f"{func_name} {addr_text} len={length} {transport_name}"
+                        )
                         item_offset += 12
 
                 if rosctr == 0x07 and param_len >= 8:
                     if param_start + 6 <= len(payload):
-                        param_bytes = payload[param_start:param_start + param_len]
+                        param_bytes = payload[param_start : param_start + param_len]
                         if len(param_bytes) >= 6 and param_bytes[2:4] == b"\x12\x04":
                             group = param_bytes[4]
                             subfunc = param_bytes[5]
-                            group_name = S7_USERDATA_GROUPS.get(group, f"Group 0x{group:02x}")
+                            group_name = S7_USERDATA_GROUPS.get(
+                                group, f"Group 0x{group:02x}"
+                            )
                             func_name = S7_USERDATA_FUNCTIONS.get((group, subfunc))
                             if func_name:
                                 cmds.append(f"UserData:{group_name}:{func_name}")
@@ -150,7 +162,9 @@ def _parse_commands(payload: bytes) -> list[str]:
     return cmds
 
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     text = payload[:200].decode("utf-8", errors="ignore").lower()
     if "stop" in text or "start" in text:
@@ -175,7 +189,10 @@ def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, comma
                 ts=ts,
             )
         )
-    if any(cmd in {"DownloadBlock", "RequestDownload", "StartUpload", "UploadBlock"} for cmd in commands):
+    if any(
+        cmd in {"DownloadBlock", "RequestDownload", "StartUpload", "UploadBlock"}
+        for cmd in commands
+    ):
         anomalies.append(
             IndustrialAnomaly(
                 severity="HIGH",
@@ -208,7 +225,10 @@ def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, comma
                 ts=ts,
             )
         )
-    if any(cmd in {"ReadVar", "BlockList", "GetBlockInfo", "GetDiagData"} for cmd in commands):
+    if any(
+        cmd in {"ReadVar", "BlockList", "GetBlockInfo", "GetDiagData"}
+        for cmd in commands
+    ):
         anomalies.append(
             IndustrialAnomaly(
                 severity="LOW",

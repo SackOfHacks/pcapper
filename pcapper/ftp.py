@@ -1,20 +1,20 @@
 from __future__ import annotations
 
+import ipaddress
+import os
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import ipaddress
-import re
 
 from .pcap_cache import PcapMeta, get_reader
-from .utils import safe_float, decode_payload, counter_inc, setdict_add
-import os
+from .utils import counter_inc, decode_payload, safe_float, setdict_add
 
 try:
-    from scapy.layers.l2 import Ether  # type: ignore
     from scapy.layers.inet import IP, TCP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
+    from scapy.layers.l2 import Ether  # type: ignore
     from scapy.packet import Raw  # type: ignore
 except Exception:  # pragma: no cover
     Ether = None  # type: ignore
@@ -243,9 +243,17 @@ def merge_ftp_summaries(
         ftp_bytes += summary.ftp_bytes
 
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         client_counts.update(summary.client_counts)
         server_counts.update(summary.server_counts)
@@ -271,14 +279,22 @@ def merge_ftp_summaries(
         for key, values in checks.items():
             for value in values or []:
                 deterministic_checks[str(key)].append(str(value))
-        sequence_violations.extend(list(getattr(summary, "sequence_violations", []) or []))
-        control_data_integrity.extend(list(getattr(summary, "control_data_integrity", []) or []))
-        auth_abuse_profiles.extend(list(getattr(summary, "auth_abuse_profiles", []) or []))
+        sequence_violations.extend(
+            list(getattr(summary, "sequence_violations", []) or [])
+        )
+        control_data_integrity.extend(
+            list(getattr(summary, "control_data_integrity", []) or [])
+        )
+        auth_abuse_profiles.extend(
+            list(getattr(summary, "auth_abuse_profiles", []) or [])
+        )
         exfil_profiles.extend(list(getattr(summary, "exfil_profiles", []) or []))
         lateral_clusters.extend(list(getattr(summary, "lateral_clusters", []) or []))
         host_attack_paths.extend(list(getattr(summary, "host_attack_paths", []) or []))
         incident_clusters.extend(list(getattr(summary, "incident_clusters", []) or []))
-        campaign_indicators.extend(list(getattr(summary, "campaign_indicators", []) or []))
+        campaign_indicators.extend(
+            list(getattr(summary, "campaign_indicators", []) or [])
+        )
         benign_context.extend(list(getattr(summary, "benign_context", []) or []))
 
     duration_seconds = None
@@ -314,7 +330,9 @@ def merge_ftp_summaries(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
-        deterministic_checks={k: list(dict.fromkeys(v)) for k, v in deterministic_checks.items()},
+        deterministic_checks={
+            k: list(dict.fromkeys(v)) for k, v in deterministic_checks.items()
+        },
         sequence_violations=sequence_violations,
         control_data_integrity=control_data_integrity,
         auth_abuse_profiles=auth_abuse_profiles,
@@ -372,7 +390,9 @@ def _build_ftp_hunting_context(
         if "bounce/fxp" in summary_text:
             deterministic_checks["active_passive_mode_abuse"].append(details_text)
         if "tls upgrade requested" in summary_text:
-            deterministic_checks["ftps_downgrade_or_weak_protection"].append(details_text)
+            deterministic_checks["ftps_downgrade_or_weak_protection"].append(
+                details_text
+            )
 
     for (client_ip, server_ip), stats in login_attempts.items():
         attempts = int(stats.get("attempts", 0) or 0)
@@ -413,12 +433,26 @@ def _build_ftp_hunting_context(
                 f"{client_ip}->{server_ip} {cmd} without filename context"
             )
 
-    high_risk_exts = {".exe", ".dll", ".ps1", ".bat", ".cmd", ".vbs", ".js", ".hta", ".zip", ".rar", ".7z"}
+    high_risk_exts = {
+        ".exe",
+        ".dll",
+        ".ps1",
+        ".bat",
+        ".cmd",
+        ".vbs",
+        ".js",
+        ".hta",
+        ".zip",
+        ".rar",
+        ".7z",
+    }
     transfer_by_filename: dict[str, list[FtpTransfer]] = defaultdict(list)
     for transfer in transfers:
         if transfer.filename:
             transfer_by_filename[str(transfer.filename).lower()].append(transfer)
-            filename_by_client[str(transfer.client_ip)][str(transfer.filename).lower()] += 1
+            filename_by_client[str(transfer.client_ip)][
+                str(transfer.filename).lower()
+            ] += 1
 
         ext = Path(transfer.filename or "").suffix.lower()
         if ext in high_risk_exts:
@@ -426,7 +460,11 @@ def _build_ftp_hunting_context(
                 f"{transfer.client_ip}->{transfer.server_ip} {transfer.direction} {transfer.filename} {transfer.bytes} bytes"
             )
 
-        if transfer.direction == "upload" and transfer.bytes >= 1_000_000 and _is_public_ip(str(transfer.server_ip)):
+        if (
+            transfer.direction == "upload"
+            and transfer.bytes >= 1_000_000
+            and _is_public_ip(str(transfer.server_ip))
+        ):
             exfil_profiles.append(
                 {
                     "client": transfer.client_ip,
@@ -440,8 +478,12 @@ def _build_ftp_hunting_context(
             )
 
     for name, entries in transfer_by_filename.items():
-        unique_servers = sorted({entry.server_ip for entry in entries if entry.server_ip})
-        unique_clients = sorted({entry.client_ip for entry in entries if entry.client_ip})
+        unique_servers = sorted(
+            {entry.server_ip for entry in entries if entry.server_ip}
+        )
+        unique_clients = sorted(
+            {entry.client_ip for entry in entries if entry.client_ip}
+        )
         if len(unique_servers) >= 3 and len(unique_clients) >= 1:
             cluster = {
                 "filename": name,
@@ -498,7 +540,9 @@ def _build_ftp_hunting_context(
             )
 
     if not deterministic_checks["ftp_exfiltration_signal"]:
-        benign_context.append("No strong FTP public-destination exfiltration pattern detected")
+        benign_context.append(
+            "No strong FTP public-destination exfiltration pattern detected"
+        )
     if not deterministic_checks["data_channel_integrity"]:
         benign_context.append("No major FTP control/data integrity anomalies detected")
 
@@ -729,7 +773,9 @@ def analyze_ftp(
     errors: list[str] = []
 
     flow_states: dict[tuple[str, str, int, int], _FlowState] = {}
-    login_attempts: dict[tuple[str, str], dict[str, object]] = defaultdict(lambda: {"attempts": 0, "fails": 0, "users": set(), "success": 0})
+    login_attempts: dict[tuple[str, str], dict[str, object]] = defaultdict(
+        lambda: {"attempts": 0, "fails": 0, "users": set(), "success": 0}
+    )
     client_server_commands: dict[tuple[str, str], int] = Counter()
     client_server_failures: dict[tuple[str, str], int] = Counter()
     client_servers_seen: dict[str, set[str]] = defaultdict(set)
@@ -743,7 +789,12 @@ def analyze_ftp(
         if key in flow_states:
             return flow_states[key]
         client_ip, server_ip, client_port, server_port = key
-        state = _FlowState(client_ip=client_ip, server_ip=server_ip, client_port=client_port, server_port=server_port)
+        state = _FlowState(
+            client_ip=client_ip,
+            server_ip=server_ip,
+            client_port=client_port,
+            server_port=server_port,
+        )
         flow_states[key] = state
         return state
 
@@ -758,7 +809,11 @@ def analyze_ftp(
                 token = token.strip()
                 if not token:
                     continue
-                if re.search(r"ftp|ftpd|proftpd|vsftpd|filezilla|serv-u|pure-ftpd", token, re.IGNORECASE):
+                if re.search(
+                    r"ftp|ftpd|proftpd|vsftpd|filezilla|serv-u|pure-ftpd",
+                    token,
+                    re.IGNORECASE,
+                ):
                     counter_inc(server_software, token)
 
     def _record_mac(pkt) -> None:
@@ -769,9 +824,19 @@ def analyze_ftp(
                 src_mac = getattr(pkt[Ether], "src", None)
                 dst_mac = getattr(pkt[Ether], "dst", None)
                 if src_mac and IP is not None and IP in pkt:
-                    setdict_add(mac_addresses, str(pkt[IP].src), str(src_mac), max_values=MAX_FTP_UNIQUE)
+                    setdict_add(
+                        mac_addresses,
+                        str(pkt[IP].src),
+                        str(src_mac),
+                        max_values=MAX_FTP_UNIQUE,
+                    )
                 if dst_mac and IP is not None and IP in pkt:
-                    setdict_add(mac_addresses, str(pkt[IP].dst), str(dst_mac), max_values=MAX_FTP_UNIQUE)
+                    setdict_add(
+                        mac_addresses,
+                        str(pkt[IP].dst),
+                        str(dst_mac),
+                        max_values=MAX_FTP_UNIQUE,
+                    )
         except Exception:
             return
 
@@ -868,8 +933,15 @@ def analyze_ftp(
                     counter_inc(response_counts, code)
                     counter_inc(server_counts, state.server_ip)
                     counter_inc(server_ports, state.server_port)
-                    setdict_add(client_servers_seen, state.client_ip, state.server_ip, max_values=MAX_FTP_UNIQUE)
-                    counter_inc(client_server_commands, (state.client_ip, state.server_ip), 0)
+                    setdict_add(
+                        client_servers_seen,
+                        state.client_ip,
+                        state.server_ip,
+                        max_values=MAX_FTP_UNIQUE,
+                    )
+                    counter_inc(
+                        client_server_commands, (state.client_ip, state.server_ip), 0
+                    )
 
                     if code == "220":
                         if sep == "-":
@@ -907,15 +979,29 @@ def analyze_ftp(
                                 counter_inc(feature_counts, msg.strip())
 
                     if code in {"530", "430", "421"}:
-                        counter_inc(client_server_failures, (state.client_ip, state.server_ip))
-                        login_attempts[(state.client_ip, state.server_ip)]["fails"] = int(
-                            login_attempts[(state.client_ip, state.server_ip)]["fails"]
-                        ) + 1
+                        counter_inc(
+                            client_server_failures, (state.client_ip, state.server_ip)
+                        )
+                        login_attempts[(state.client_ip, state.server_ip)]["fails"] = (
+                            int(
+                                login_attempts[(state.client_ip, state.server_ip)][
+                                    "fails"
+                                ]
+                            )
+                            + 1
+                        )
 
                     if code in {"230"}:
-                        login_attempts[(state.client_ip, state.server_ip)]["success"] = int(
-                            login_attempts[(state.client_ip, state.server_ip)]["success"]
-                        ) + 1
+                        login_attempts[(state.client_ip, state.server_ip)][
+                            "success"
+                        ] = (
+                            int(
+                                login_attempts[(state.client_ip, state.server_ip)][
+                                    "success"
+                                ]
+                            )
+                            + 1
+                        )
 
                     if state.pending_pasv and code == "227":
                         parsed = _parse_pasv_response(msg)
@@ -948,7 +1034,9 @@ def analyze_ftp(
                                 "server_ip": state.server_ip,
                                 "data_host": state.last_data_host,
                                 "data_port": state.last_data_port,
-                                "direction": "upload" if state.pending_data_cmd in {"STOR", "APPE"} else "download",
+                                "direction": "upload"
+                                if state.pending_data_cmd in {"STOR", "APPE"}
+                                else "download",
                                 "filename": state.pending_filename,
                                 "command": state.pending_data_cmd,
                                 "ts": ts,
@@ -960,10 +1048,15 @@ def analyze_ftp(
                     continue
 
                 command = line.split(" ", 1)[0].upper()
-                arg = line[len(command):].strip() if len(line) > len(command) else ""
+                arg = line[len(command) :].strip() if len(line) > len(command) else ""
                 counter_inc(command_counts, command)
                 counter_inc(client_counts, state.client_ip)
-                setdict_add(client_servers_seen, state.client_ip, state.server_ip, max_values=MAX_FTP_UNIQUE)
+                setdict_add(
+                    client_servers_seen,
+                    state.client_ip,
+                    state.server_ip,
+                    max_values=MAX_FTP_UNIQUE,
+                )
                 counter_inc(client_server_commands, (state.client_ip, state.server_ip))
 
                 if command == "NOOP" and ts is not None:
@@ -976,11 +1069,25 @@ def analyze_ftp(
                     if user:
                         state.last_user = user
                         counter_inc(user_counts, user)
-                        login_attempts[(state.client_ip, state.server_ip)]["attempts"] = int(
-                            login_attempts[(state.client_ip, state.server_ip)]["attempts"]
-                        ) + 1
-                        login_attempts[(state.client_ip, state.server_ip)]["users"].add(user)
-                        setdict_add(username_servers, user, state.server_ip, max_values=MAX_FTP_UNIQUE)
+                        login_attempts[(state.client_ip, state.server_ip)][
+                            "attempts"
+                        ] = (
+                            int(
+                                login_attempts[(state.client_ip, state.server_ip)][
+                                    "attempts"
+                                ]
+                            )
+                            + 1
+                        )
+                        login_attempts[(state.client_ip, state.server_ip)]["users"].add(
+                            user
+                        )
+                        setdict_add(
+                            username_servers,
+                            user,
+                            state.server_ip,
+                            max_values=MAX_FTP_UNIQUE,
+                        )
                         if user.lower() in {"anonymous", "ftp"}:
                             detections.append(
                                 {
@@ -1069,7 +1176,10 @@ def analyze_ftp(
                 if command in FTP_DATA_COMMANDS:
                     state.pending_data_cmd = command
                     state.pending_filename = _extract_filename(arg)
-                    if state.pending_filename and ("../" in state.pending_filename or "..\\" in state.pending_filename):
+                    if state.pending_filename and (
+                        "../" in state.pending_filename
+                        or "..\\" in state.pending_filename
+                    ):
                         detections.append(
                             {
                                 "severity": "high",
@@ -1218,7 +1328,7 @@ def analyze_ftp(
                 mean = sum(intervals) / len(intervals)
                 if mean > 0:
                     variance = sum((i - mean) ** 2 for i in intervals) / len(intervals)
-                    std = variance ** 0.5
+                    std = variance**0.5
                     if mean > 5 and (std / mean) < 0.2:
                         detections.append(
                             {
@@ -1230,7 +1340,11 @@ def analyze_ftp(
                         )
 
     for transfer in transfers:
-        if transfer.direction == "upload" and transfer.bytes >= 10_000_000 and _is_public_ip(transfer.server_ip):
+        if (
+            transfer.direction == "upload"
+            and transfer.bytes >= 10_000_000
+            and _is_public_ip(transfer.server_ip)
+        ):
             detections.append(
                 {
                     "severity": "high",

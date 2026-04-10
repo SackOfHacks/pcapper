@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
 import ipaddress
+from pathlib import Path
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_port_protocol,
+)
 
 MELSEC_TCP_PORT = 5007
 MELSEC_UDP_PORT = 5006
@@ -46,10 +50,19 @@ def _parse_commands(payload: bytes) -> list[str]:
         if len(payload) >= 30:
             try:
                 cmd_hex = payload[22:26].decode("ascii", errors="ignore")
-                sub_hex = payload[26:30].decode("ascii", errors="ignore") if len(payload) >= 30 else ""
+                sub_hex = (
+                    payload[26:30].decode("ascii", errors="ignore")
+                    if len(payload) >= 30
+                    else ""
+                )
                 if all(ch in "0123456789ABCDEFabcdef" for ch in cmd_hex):
                     cmd = int(cmd_hex, 16)
-                    subcmd = int(sub_hex, 16) if sub_hex and all(ch in "0123456789ABCDEFabcdef" for ch in sub_hex) else None
+                    subcmd = (
+                        int(sub_hex, 16)
+                        if sub_hex
+                        and all(ch in "0123456789ABCDEFabcdef" for ch in sub_hex)
+                        else None
+                    )
                     return [f"MC ASCII {_format_cmd(cmd, subcmd)}"]
             except Exception:
                 pass
@@ -57,12 +70,17 @@ def _parse_commands(payload: bytes) -> list[str]:
     if len(payload) >= 2 and payload[0] == 0x50 and payload[1] == 0x00:
         if len(payload) >= 13:
             cmd = int.from_bytes(payload[11:13], "little")
-            subcmd = int.from_bytes(payload[13:15], "little") if len(payload) >= 15 else None
+            subcmd = (
+                int.from_bytes(payload[13:15], "little") if len(payload) >= 15 else None
+            )
             return [f"MC Binary {_format_cmd(cmd, subcmd)}"]
         return ["MC Binary"]
     return []
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     write_detected = False
     for cmd in commands:

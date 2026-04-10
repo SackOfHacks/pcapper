@@ -1,23 +1,23 @@
 from __future__ import annotations
 
+import ipaddress
+import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-import ipaddress
-import math
 
-from .pcap_cache import get_reader
-from .utils import safe_float
-from .http import analyze_http
 from .files import analyze_files
-from .services import analyze_services
+from .http import analyze_http
+from .pcap_cache import get_reader
 from .progress import run_with_busy_status
+from .services import analyze_services
+from .utils import safe_float
 
 try:
+    from scapy.layers.dns import DNS  # type: ignore
     from scapy.layers.inet import IP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
-    from scapy.layers.dns import DNS  # type: ignore
 except Exception:  # pragma: no cover
     IP = None  # type: ignore
     UDP = None  # type: ignore
@@ -162,6 +162,23 @@ def _shannon_entropy(value: str) -> float:
     return -sum((count / total) * math.log2(count / total) for count in freq.values())
 
 
+def _is_likely_udp_initiator_packet(sport: int, dport: int) -> bool:
+    # Prefer request/initiator direction to avoid attributing responder traffic as scanner behavior.
+    if dport in AMPLIFICATION_PORTS and sport not in AMPLIFICATION_PORTS:
+        return True
+    if sport in AMPLIFICATION_PORTS and dport not in AMPLIFICATION_PORTS:
+        return False
+    if dport <= 1024 and sport > 1024:
+        return True
+    if sport <= 1024 and dport > 1024:
+        return False
+    if dport <= 49151 and sport > 49151:
+        return True
+    if sport <= 49151 and dport > 49151:
+        return False
+    return dport != sport
+
+
 def _build_udp_hunting_context(
     *,
     udp_packets: int,
@@ -214,13 +231,19 @@ def _build_udp_hunting_context(
         if convo.first_seen is not None and convo.last_seen is not None:
             duration = max(0.0, float(convo.last_seen) - float(convo.first_seen))
         pps = (float(convo.packets) / duration) if duration and duration > 0 else 0.0
-        avg_pkt = (float(convo.bytes) / float(convo.packets)) if convo.packets > 0 else 0.0
+        avg_pkt = (
+            (float(convo.bytes) / float(convo.packets)) if convo.packets > 0 else 0.0
+        )
 
         checks["evidence_provenance"].append(
             f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port} packets={convo.packets} bytes={convo.bytes}"
         )
 
-        if convo.packets >= 20 and avg_pkt <= 120 and convo.dst_port in AMPLIFICATION_PORTS:
+        if (
+            convo.packets >= 20
+            and avg_pkt <= 120
+            and convo.dst_port in AMPLIFICATION_PORTS
+        ):
             checks["udp_request_response_asymmetry"].append(
                 f"{convo.src_ip}->{convo.dst_ip}:{convo.dst_port} packets={convo.packets} avg_pkt={avg_pkt:.1f}"
             )
@@ -233,7 +256,13 @@ def _build_udp_hunting_context(
                 }
             )
 
-        if duration and duration >= 900 and convo.packets >= 30 and pps <= 0.2 and avg_pkt <= 512:
+        if (
+            duration
+            and duration >= 900
+            and convo.packets >= 30
+            and pps <= 0.2
+            and avg_pkt <= 512
+        ):
             checks["udp_periodic_cadence"].append(
                 f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port} packets={convo.packets} duration={duration:.1f}s pps={pps:.3f}"
             )
@@ -279,7 +308,9 @@ def _build_udp_hunting_context(
                     "port": convo.dst_port,
                     "zone": "internal->public",
                     "packets": convo.packets,
-                    "confidence": "high" if convo.dst_port in admin_udp_ports else "medium",
+                    "confidence": "high"
+                    if convo.dst_port in admin_udp_ports
+                    else "medium",
                 }
             )
 
@@ -299,7 +330,11 @@ def _build_udp_hunting_context(
             host_scores[convo.src_ip] += 2
             host_reasons[convo.src_ip].append("OT UDP boundary crossing")
 
-        if src_private and _is_public_ip(convo.dst_ip) and convo.dst_port in admin_udp_ports:
+        if (
+            src_private
+            and _is_public_ip(convo.dst_ip)
+            and convo.dst_port in admin_udp_ports
+        ):
             checks["udp_role_drift"].append(
                 f"{convo.src_ip} sends admin-like UDP to public {convo.dst_ip}:{convo.dst_port}"
             )
@@ -318,7 +353,11 @@ def _build_udp_hunting_context(
     for (client, server, port), volumes in amp_flows.items():
         client_bytes = int(volumes.get("client", 0))
         server_bytes = int(volumes.get("server", 0))
-        ratio = (float(server_bytes) / float(client_bytes)) if client_bytes > 0 else float(server_bytes)
+        ratio = (
+            (float(server_bytes) / float(client_bytes))
+            if client_bytes > 0
+            else float(server_bytes)
+        )
         if server_bytes >= 10000 and (client_bytes == 0 or ratio >= 5.0):
             checks["reflection_amplification_risk"].append(
                 f"{client}->{server}:{port} server/client_bytes={server_bytes}/{client_bytes} ratio={ratio:.2f}"
@@ -374,7 +413,11 @@ def _build_udp_hunting_context(
         for src_ip, total in dns_query_counts.items():
             unique = len(dns_unique_queries.get(src_ip, set()))
             long_q = int(dns_long_queries.get(src_ip, 0))
-            if total >= 20 and (unique / max(total, 1) >= 0.8) and (avg_dns_len >= 30 or avg_dns_entropy >= 3.5 or long_q >= 10):
+            if (
+                total >= 20
+                and (unique / max(total, 1) >= 0.8)
+                and (avg_dns_len >= 30 or avg_dns_entropy >= 3.5 or long_q >= 10)
+            ):
                 checks["udp_tunneling_signal"].append(
                     f"{src_ip} dns_unique={unique}/{total} long_queries={long_q} avg_len={avg_dns_len:.1f} avg_entropy={avg_dns_entropy:.2f}"
                 )
@@ -408,19 +451,29 @@ def _build_udp_hunting_context(
             host_scores[src_ip] += 1
             host_reasons[src_ip].append("Large outbound UDP transfer")
 
-    high_det = sum(1 for item in detections if str(item.get("severity", "")).lower() in {"high", "critical"})
+    high_det = sum(
+        1
+        for item in detections
+        if str(item.get("severity", "")).lower() in {"high", "critical"}
+    )
     if high_det >= 2:
         checks["cross_signal_corroboration"].append(
             f"multiple high-severity UDP detections observed={high_det}"
         )
 
-    for host, score in sorted(host_scores.items(), key=lambda item: item[1], reverse=True):
+    for host, score in sorted(
+        host_scores.items(), key=lambda item: item[1], reverse=True
+    ):
         reasons = list(dict.fromkeys(host_reasons.get(host, [])))
         corroborated_findings.append(
             {
                 "host": host,
                 "score": score,
-                "confidence": "high" if score >= 6 else "medium" if score >= 3 else "low",
+                "confidence": "high"
+                if score >= 6
+                else "medium"
+                if score >= 3
+                else "low",
                 "reasons": reasons[:4],
             }
         )
@@ -476,49 +529,69 @@ def _build_udp_hunting_context(
         {
             "category": "UDP Asymmetry",
             "risk": "Medium" if checks["udp_request_response_asymmetry"] else "None",
-            "confidence": "Medium" if checks["udp_request_response_asymmetry"] else "Low",
-            "evidence": str(len(checks["udp_request_response_asymmetry"])) if checks["udp_request_response_asymmetry"] else "No matching detections",
+            "confidence": "Medium"
+            if checks["udp_request_response_asymmetry"]
+            else "Low",
+            "evidence": str(len(checks["udp_request_response_asymmetry"]))
+            if checks["udp_request_response_asymmetry"]
+            else "No matching detections",
         },
         {
             "category": "Reflection/Amplification",
             "risk": "High" if checks["reflection_amplification_risk"] else "None",
             "confidence": "High" if checks["reflection_amplification_risk"] else "Low",
-            "evidence": str(len(checks["reflection_amplification_risk"])) if checks["reflection_amplification_risk"] else "No matching detections",
+            "evidence": str(len(checks["reflection_amplification_risk"]))
+            if checks["reflection_amplification_risk"]
+            else "No matching detections",
         },
         {
             "category": "Recon/Sweep",
             "risk": "High" if checks["udp_recon_scan_behavior"] else "None",
             "confidence": "High" if checks["udp_recon_scan_behavior"] else "Low",
-            "evidence": str(len(checks["udp_recon_scan_behavior"])) if checks["udp_recon_scan_behavior"] else "No matching detections",
+            "evidence": str(len(checks["udp_recon_scan_behavior"]))
+            if checks["udp_recon_scan_behavior"]
+            else "No matching detections",
         },
         {
             "category": "Tunneling/Covert Channel",
             "risk": "High" if checks["udp_tunneling_signal"] else "None",
             "confidence": "Medium" if checks["udp_tunneling_signal"] else "Low",
-            "evidence": str(len(checks["udp_tunneling_signal"])) if checks["udp_tunneling_signal"] else "No matching detections",
+            "evidence": str(len(checks["udp_tunneling_signal"]))
+            if checks["udp_tunneling_signal"]
+            else "No matching detections",
         },
         {
             "category": "OT Boundary Crossing",
             "risk": "High" if checks["ot_udp_boundary_crossing"] else "None",
             "confidence": "High" if checks["ot_udp_boundary_crossing"] else "Low",
-            "evidence": str(len(checks["ot_udp_boundary_crossing"])) if checks["ot_udp_boundary_crossing"] else "No matching detections",
+            "evidence": str(len(checks["ot_udp_boundary_crossing"]))
+            if checks["ot_udp_boundary_crossing"]
+            else "No matching detections",
         },
     ]
 
     fp_context: list[str] = []
     if checks["udp_recon_scan_behavior"]:
-        fp_context.append("UDP scan-like fan-out may reflect approved discovery/scanner windows")
+        fp_context.append(
+            "UDP scan-like fan-out may reflect approved discovery/scanner windows"
+        )
     if checks["reflection_amplification_risk"]:
-        fp_context.append("Amplification-like ratios can occur with legitimate recursive or broadcast services")
+        fp_context.append(
+            "Amplification-like ratios can occur with legitimate recursive or broadcast services"
+        )
     if checks["udp_periodic_cadence"]:
-        fp_context.append("Periodic UDP cadence can be from telemetry, keepalives, or service discovery")
+        fp_context.append(
+            "Periodic UDP cadence can be from telemetry, keepalives, or service discovery"
+        )
     if not checks["udp_tunneling_signal"]:
         fp_context.append("No strong DNS/UDP tunneling threshold was crossed")
 
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
-        "analyst_reasons": analyst_reasons if analyst_reasons else ["No high-confidence UDP threat heuristic crossed threshold"],
+        "analyst_reasons": analyst_reasons
+        if analyst_reasons
+        else ["No high-confidence UDP threat heuristic crossed threshold"],
         "deterministic_checks": checks,
         "asymmetry_profiles": asymmetry_profiles[:40],
         "amplification_profiles": amplification_profiles[:40],
@@ -592,12 +665,14 @@ def analyze_udp(
     udp_packets = 0
     udp_bytes = 0
     udp_payload_bytes = 0
-    conversations: dict[tuple[str, str, int, int], dict[str, object]] = defaultdict(lambda: {
-        "packets": 0,
-        "bytes": 0,
-        "first_seen": None,
-        "last_seen": None,
-    })
+    conversations: dict[tuple[str, str, int, int], dict[str, object]] = defaultdict(
+        lambda: {
+            "packets": 0,
+            "bytes": 0,
+            "first_seen": None,
+            "last_seen": None,
+        }
+    )
 
     client_counts: Counter[str] = Counter()
     client_bytes: Counter[str] = Counter()
@@ -618,19 +693,27 @@ def analyze_udp(
     dst_to_srcs: dict[str, set[str]] = defaultdict(set)
     src_dst_ports: dict[tuple[str, str], set[int]] = defaultdict(set)
     src_port_dsts: dict[tuple[str, int], set[str]] = defaultdict(set)
-    amp_flows: dict[tuple[str, str, int], dict[str, int]] = defaultdict(lambda: {"client": 0, "server": 0})
+    req_src_to_ports: dict[str, set[int]] = defaultdict(set)
+    req_src_to_dsts: dict[str, set[str]] = defaultdict(set)
+    req_src_dst_ports: dict[tuple[str, str], set[int]] = defaultdict(set)
+    req_src_port_dsts: dict[tuple[str, int], set[str]] = defaultdict(set)
+    amp_flows: dict[tuple[str, str, int], dict[str, int]] = defaultdict(
+        lambda: {"client": 0, "server": 0}
+    )
     dns_query_lengths: list[int] = []
     dns_long_queries = Counter()
     dns_entropy_scores: list[float] = []
     dns_unique_queries: dict[str, set[str]] = defaultdict(set)
     dns_query_counts: Counter[str] = Counter()
     outbound_flow_bytes: Counter[tuple[str, str]] = Counter()
-    beacon_trackers: dict[tuple[str, str, int, int], dict[str, object]] = defaultdict(lambda: {
-        "last_ts": None,
-        "intervals": [],
-        "payloads": [],
-        "count": 0,
-    })
+    beacon_trackers: dict[tuple[str, str, int, int], dict[str, object]] = defaultdict(
+        lambda: {
+            "last_ts": None,
+            "intervals": [],
+            "payloads": [],
+            "count": 0,
+        }
+    )
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -696,6 +779,11 @@ def analyze_udp(
             dst_to_srcs[server_key].add(client_key)
             src_dst_ports[(client_key, server_key)].add(dport)
             src_port_dsts[(client_key, dport)].add(server_key)
+            if _is_likely_udp_initiator_packet(sport, dport):
+                req_src_to_ports[client_key].add(dport)
+                req_src_to_dsts[client_key].add(server_key)
+                req_src_dst_ports[(client_key, server_key)].add(dport)
+                req_src_port_dsts[(client_key, dport)].add(server_key)
 
             convo_key = (src_ip or "-", dst_ip or "-", sport, dport)
             convo = conversations[convo_key]
@@ -780,21 +868,27 @@ def analyze_udp(
 
     conversation_rows: list[UdpConversation] = []
     for (src_ip, dst_ip, sport, dport), data in conversations.items():
-        conversation_rows.append(UdpConversation(
-            src_ip=src_ip,
-            dst_ip=dst_ip,
-            src_port=sport,
-            dst_port=dport,
-            packets=int(data["packets"]),
-            bytes=int(data["bytes"]),
-            first_seen=data["first_seen"],
-            last_seen=data["last_seen"],
-        ))
+        conversation_rows.append(
+            UdpConversation(
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                src_port=sport,
+                dst_port=dport,
+                packets=int(data["packets"]),
+                bytes=int(data["bytes"]),
+                first_seen=data["first_seen"],
+                last_seen=data["last_seen"],
+            )
+        )
 
     def _busy(desc: str, func, *args, **kwargs):
-        return run_with_busy_status(path, show_status, f"UDP: {desc}", func, *args, **kwargs)
+        return run_with_busy_status(
+            path, show_status, f"UDP: {desc}", func, *args, **kwargs
+        )
 
-    http_summary = _busy("HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta)
+    http_summary = _busy(
+        "HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta
+    )
     file_summary = _busy("Files", analyze_files, path, show_status=False)
     services_summary = _busy("Services", analyze_services, path, show_status=False)
 
@@ -809,73 +903,89 @@ def analyze_udp(
         if asset.protocol.upper() != "UDP":
             continue
         clients_preview = ", ".join(sorted(asset.clients)[:5]) if asset.clients else "-"
-        service_rows.append({
-            "service": asset.service_name,
-            "port": asset.port,
-            "count": asset.packets,
-            "proto": asset.protocol,
-            "endpoint": asset.ip,
-            "clients": clients_preview,
-            "client_count": len(asset.clients),
-        })
+        service_rows.append(
+            {
+                "service": asset.service_name,
+                "port": asset.port,
+                "count": asset.packets,
+                "proto": asset.protocol,
+                "endpoint": asset.ip,
+                "clients": clients_preview,
+                "client_count": len(asset.clients),
+            }
+        )
 
     detections: list[dict[str, object]] = []
     broad_scans = []
-    for src_ip, ports in src_to_ports.items():
-        if len(ports) >= 50 and len(src_to_dsts.get(src_ip, set())) >= 5:
+    for src_ip, ports in req_src_to_ports.items():
+        if len(ports) >= 50 and len(req_src_to_dsts.get(src_ip, set())) >= 5:
             broad_scans.append(src_ip)
     if broad_scans:
-        detections.append({
-            "severity": "high",
-            "summary": "Potential UDP port scan activity",
-            "details": ", ".join(broad_scans[:5]),
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Potential UDP port scan activity",
+                "details": ", ".join(broad_scans[:5]),
+            }
+        )
 
     high_fanout = []
-    for src_ip, dsts in src_to_dsts.items():
+    for src_ip, dsts in req_src_to_dsts.items():
         if len(dsts) >= 50:
             high_fanout.append(src_ip)
     if high_fanout:
-        detections.append({
-            "severity": "warning",
-            "summary": "High UDP fan-out",
-            "details": ", ".join(high_fanout[:5]),
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "High UDP fan-out",
+                "details": ", ".join(high_fanout[:5]),
+            }
+        )
 
     port_sweeps = []
-    for (src_ip, dst_ip), ports in src_dst_ports.items():
+    for (src_ip, dst_ip), ports in req_src_dst_ports.items():
         if len(ports) >= 50:
             port_sweeps.append(f"{src_ip} -> {dst_ip} ({len(ports)} ports)")
     if port_sweeps:
-        detections.append({
-            "severity": "high",
-            "summary": "Potential UDP port sweep",
-            "details": ", ".join(port_sweeps[:5]),
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Potential UDP port sweep",
+                "details": ", ".join(port_sweeps[:5]),
+            }
+        )
 
     host_sweeps = []
-    for (src_ip, dport), dsts in src_port_dsts.items():
+    for (src_ip, dport), dsts in req_src_port_dsts.items():
         if len(dsts) >= 50:
             host_sweeps.append(f"{src_ip} -> *:{dport} ({len(dsts)} hosts)")
     if host_sweeps:
-        detections.append({
-            "severity": "warning",
-            "summary": "Potential UDP host sweep",
-            "details": ", ".join(host_sweeps[:5]),
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Potential UDP host sweep",
+                "details": ", ".join(host_sweeps[:5]),
+            }
+        )
 
     amp_hits = []
     for (client, server, port), volumes in amp_flows.items():
         client_bytes = volumes.get("client", 0)
         server_bytes = volumes.get("server", 0)
-        if server_bytes >= 10000 and (client_bytes == 0 or server_bytes / max(client_bytes, 1) >= 5):
-            amp_hits.append(f"{client} -> {server}:{port} ({server_bytes}/{client_bytes} bytes)")
+        if server_bytes >= 10000 and (
+            client_bytes == 0 or server_bytes / max(client_bytes, 1) >= 5
+        ):
+            amp_hits.append(
+                f"{client} -> {server}:{port} ({server_bytes}/{client_bytes} bytes)"
+            )
     if amp_hits:
-        detections.append({
-            "severity": "high",
-            "summary": "Potential UDP amplification patterns",
-            "details": ", ".join(amp_hits[:5]),
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Potential UDP amplification patterns",
+                "details": ", ".join(amp_hits[:5]),
+            }
+        )
 
     avg_len = 0.0
     avg_entropy = 0.0
@@ -886,22 +996,30 @@ def analyze_udp(
         for src_ip, total in dns_query_counts.items():
             unique = len(dns_unique_queries.get(src_ip, set()))
             long_q = dns_long_queries.get(src_ip, 0)
-            if total >= 20 and (unique / max(total, 1) >= 0.8) and (avg_len >= 30 or avg_entropy >= 3.5 or long_q >= 10):
+            if (
+                total >= 20
+                and (unique / max(total, 1) >= 0.8)
+                and (avg_len >= 30 or avg_entropy >= 3.5 or long_q >= 10)
+            ):
                 suspicious_clients.append(f"{src_ip} (unique {unique}/{total})")
         if suspicious_clients:
-            detections.append({
-                "severity": "high",
-                "summary": "Possible DNS tunneling behavior",
-                "details": ", ".join(suspicious_clients[:5]),
-            })
+            detections.append(
+                {
+                    "severity": "high",
+                    "summary": "Possible DNS tunneling behavior",
+                    "details": ", ".join(suspicious_clients[:5]),
+                }
+            )
 
     zero_ratio = zero_payload_packets / max(udp_packets, 1)
     if udp_packets >= 200 and zero_ratio >= 0.6:
-        detections.append({
-            "severity": "warning",
-            "summary": "High rate of empty UDP payloads",
-            "details": f"{zero_payload_packets}/{udp_packets} UDP packets have zero-length payloads.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "High rate of empty UDP payloads",
+                "details": f"{zero_payload_packets}/{udp_packets} UDP packets have zero-length payloads.",
+            }
+        )
 
     beacon_hits = []
     for (src_ip, dst_ip, sport, dport), tracker in beacon_trackers.items():
@@ -912,7 +1030,9 @@ def analyze_udp(
         mean_interval = sum(intervals) / max(len(intervals), 1)
         if mean_interval <= 1.0:
             continue
-        variance = sum((val - mean_interval) ** 2 for val in intervals) / max(len(intervals), 1)
+        variance = sum((val - mean_interval) ** 2 for val in intervals) / max(
+            len(intervals), 1
+        )
         std_dev = math.sqrt(variance)
         cv = std_dev / mean_interval if mean_interval > 0 else 1.0
         if cv >= 0.2:
@@ -920,22 +1040,28 @@ def analyze_udp(
         payload_mean = sum(payloads) / max(len(payloads), 1) if payloads else 0
         if payload_mean > 512:
             continue
-        beacon_hits.append(f"{src_ip}:{sport} -> {dst_ip}:{dport} ({mean_interval:.2f}s avg)")
+        beacon_hits.append(
+            f"{src_ip}:{sport} -> {dst_ip}:{dport} ({mean_interval:.2f}s avg)"
+        )
     if beacon_hits:
-        detections.append({
-            "severity": "high",
-            "summary": "Possible UDP beaconing",
-            "details": ", ".join(beacon_hits[:5]),
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Possible UDP beaconing",
+                "details": ", ".join(beacon_hits[:5]),
+            }
+        )
 
     if outbound_flow_bytes:
         top_outbound = outbound_flow_bytes.most_common(1)[0]
         if top_outbound[1] >= 5_000_000:
-            detections.append({
-                "severity": "high",
-                "summary": "Large outbound UDP transfer",
-                "details": f"{top_outbound[0][0]} -> {top_outbound[0][1]} sent {top_outbound[1]} bytes.",
-            })
+            detections.append(
+                {
+                    "severity": "high",
+                    "summary": "Large outbound UDP transfer",
+                    "details": f"{top_outbound[0][0]} -> {top_outbound[0][1]} sent {top_outbound[1]} bytes.",
+                }
+            )
 
     artifacts: list[str] = []
     for ip, count in client_counts.most_common(5):
@@ -945,14 +1071,16 @@ def analyze_udp(
     for port, count in port_counts.most_common(5):
         artifacts.append(f"Port: {port} ({count})")
 
-    conversations_sorted = sorted(conversation_rows, key=lambda c: c.packets, reverse=True)
+    conversations_sorted = sorted(
+        conversation_rows, key=lambda c: c.packets, reverse=True
+    )
     context = _build_udp_hunting_context(
         udp_packets=udp_packets,
         conversations=conversations_sorted,
         detections=detections,
-        src_to_ports=src_to_ports,
-        src_to_dsts=src_to_dsts,
-        src_port_dsts=src_port_dsts,
+        src_to_ports=req_src_to_ports,
+        src_to_dsts=req_src_to_dsts,
+        src_port_dsts=req_src_port_dsts,
         amp_flows=amp_flows,
         outbound_flow_bytes=outbound_flow_bytes,
         dns_query_counts=dns_query_counts,
@@ -994,16 +1122,23 @@ def analyze_udp(
         services=service_rows,
         detections=detections,
         artifacts=artifacts,
-        errors=errors + http_summary.errors + file_summary.errors + services_summary.errors,
+        errors=errors
+        + http_summary.errors
+        + file_summary.errors
+        + services_summary.errors,
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
         analyst_verdict=str(context.get("analyst_verdict", "")),
         analyst_confidence=str(context.get("analyst_confidence", "low")),
-        analyst_reasons=[str(v) for v in list(context.get("analyst_reasons", []) or [])],
+        analyst_reasons=[
+            str(v) for v in list(context.get("analyst_reasons", []) or [])
+        ],
         deterministic_checks={
             str(key): [str(v) for v in list(values or [])]
-            for key, values in dict(context.get("deterministic_checks", {}) or {}).items()
+            for key, values in dict(
+                context.get("deterministic_checks", {}) or {}
+            ).items()
         },
         asymmetry_profiles=list(context.get("asymmetry_profiles", []) or []),
         amplification_profiles=list(context.get("amplification_profiles", []) or []),
@@ -1016,6 +1151,12 @@ def analyze_udp(
         transport_profiles=list(context.get("transport_profiles", []) or []),
         corroborated_findings=list(context.get("corroborated_findings", []) or []),
         investigation_pivots=list(context.get("investigation_pivots", []) or []),
-        risk_matrix=[dict(item) for item in list(context.get("risk_matrix", []) or []) if isinstance(item, dict)],
-        false_positive_context=[str(v) for v in list(context.get("false_positive_context", []) or [])],
+        risk_matrix=[
+            dict(item)
+            for item in list(context.get("risk_matrix", []) or [])
+            if isinstance(item, dict)
+        ],
+        false_positive_context=[
+            str(v) for v in list(context.get("false_positive_context", []) or [])
+        ],
     )

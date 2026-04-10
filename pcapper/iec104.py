@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
 import ipaddress
 import struct
+from pathlib import Path
 
 from .industrial_helpers import (
     IndustrialAnalysis,
@@ -148,13 +148,17 @@ def _parse_asdu(payload: bytes) -> tuple[list[str], list[tuple[str, str]]]:
                 artifacts.append(("iec104_command", f"SC {mode} {state} IOA {ioa}"))
             elif type_id == 46:
                 state_code = cmd_byte & 0x03
-                state = {0: "OFF", 1: "ON", 2: "OFF", 3: "ON"}.get(state_code, f"STATE {state_code}")
+                state = {0: "OFF", 1: "ON", 2: "OFF", 3: "ON"}.get(
+                    state_code, f"STATE {state_code}"
+                )
                 commands.append(f"DC {mode} {state}")
                 artifacts.append(("iec104_command", f"DC {mode} {state} IOA {ioa}"))
             elif type_id == 47:
                 state_code = cmd_byte & 0x03
                 commands.append(f"RC {mode} {state_code}")
-                artifacts.append(("iec104_command", f"RC {mode} code={state_code} IOA {ioa}"))
+                artifacts.append(
+                    ("iec104_command", f"RC {mode} code={state_code} IOA {ioa}")
+                )
             elif type_id in {48, 49, 50}:
                 value_text = None
                 if type_id in {48, 49} and len(asdu) >= 12:
@@ -166,7 +170,9 @@ def _parse_asdu(payload: bytes) -> tuple[list[str], list[tuple[str, str]]]:
                         value_text = None
                 if value_text is not None:
                     commands.append(f"Setpoint {value_text}")
-                    artifacts.append(("iec104_setpoint", f"IOA {ioa} value={value_text}"))
+                    artifacts.append(
+                        ("iec104_setpoint", f"IOA {ioa} value={value_text}")
+                    )
     return commands, artifacts
 
 

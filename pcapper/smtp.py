@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import base64
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Iterable
-import base64
-import re
+from typing import Iterable, Optional
 
+from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
 from .utils import safe_float
-from .device_detection import device_fingerprints_from_text
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -23,8 +23,20 @@ except Exception:  # pragma: no cover
 SMTP_PORTS = {25, 465, 587, 2525}
 
 SMTP_COMMANDS = (
-    "HELO", "EHLO", "MAIL FROM", "RCPT TO", "DATA", "RSET", "NOOP", "QUIT",
-    "VRFY", "EXPN", "STARTTLS", "AUTH", "HELP", "BDAT",
+    "HELO",
+    "EHLO",
+    "MAIL FROM",
+    "RCPT TO",
+    "DATA",
+    "RSET",
+    "NOOP",
+    "QUIT",
+    "VRFY",
+    "EXPN",
+    "STARTTLS",
+    "AUTH",
+    "HELP",
+    "BDAT",
 )
 
 EMAIL_RE = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
@@ -36,13 +48,22 @@ FILE_NAME_RE = re.compile(
     r"[\w\-.()\[\]/ ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|tgz|txt|csv|log|ps1|sh|bat|py|js|jar|apk|iso|img)",
     re.IGNORECASE,
 )
-ATTACHMENT_RE = re.compile(r'filename=\"?([^\";]+)\"?', re.IGNORECASE)
-NAME_RE = re.compile(r'name=\"?([^\";]+)\"?', re.IGNORECASE)
+ATTACHMENT_RE = re.compile(r"filename=\"?([^\";]+)\"?", re.IGNORECASE)
+NAME_RE = re.compile(r"name=\"?([^\";]+)\"?", re.IGNORECASE)
 
 SUSPICIOUS_PATTERNS = [
-    (re.compile(r"powershell|cmd\.exe|wmic|winrs", re.IGNORECASE), "Command execution tooling"),
-    (re.compile(r"mimikatz|cobalt|beacon|meterpreter", re.IGNORECASE), "Malware tooling"),
-    (re.compile(r"rundll32|regsvr32|schtasks|at\s+", re.IGNORECASE), "Execution/persistence tooling"),
+    (
+        re.compile(r"powershell|cmd\.exe|wmic|winrs", re.IGNORECASE),
+        "Command execution tooling",
+    ),
+    (
+        re.compile(r"mimikatz|cobalt|beacon|meterpreter", re.IGNORECASE),
+        "Malware tooling",
+    ),
+    (
+        re.compile(r"rundll32|regsvr32|schtasks|at\s+", re.IGNORECASE),
+        "Execution/persistence tooling",
+    ),
     (re.compile(r"nmap|masscan|sqlmap", re.IGNORECASE), "Recon tooling"),
 ]
 
@@ -138,7 +159,12 @@ class SmtpSummary:
             "detections": list(self.detections),
             "anomalies": list(self.anomalies),
             "artifacts": [
-                {"kind": item.kind, "detail": item.detail, "src": item.src, "dst": item.dst}
+                {
+                    "kind": item.kind,
+                    "detail": item.detail,
+                    "src": item.src,
+                    "dst": item.dst,
+                }
                 for item in self.artifacts
             ],
             "errors": list(self.errors),
@@ -166,7 +192,7 @@ def _beacon_score(times: list[float]) -> Optional[dict[str, float]]:
     if avg <= 0:
         return None
     variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
+    stddev = variance**0.5
     if avg < 1 or avg > 3600:
         return None
     if stddev / avg > 0.15:
@@ -174,7 +200,12 @@ def _beacon_score(times: list[float]) -> Optional[dict[str, float]]:
     return {"avg": avg, "stddev": stddev}
 
 
-def analyze_smtp(path: Path, show_status: bool = True, packets: list[object] | None = None, meta: object | None = None) -> SmtpSummary:
+def analyze_smtp(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: object | None = None,
+) -> SmtpSummary:
     errors: list[str] = []
     if TCP is None:
         errors.append("Scapy TCP layers unavailable; install scapy for SMTP analysis.")
@@ -257,7 +288,9 @@ def analyze_smtp(path: Path, show_status: bool = True, packets: list[object] | N
             stream_buffers[key] = state
         return state
 
-    def _process_smtp_lines(src: str, dst: str, dport: int, lines: list[str], state: dict[str, object]) -> None:
+    def _process_smtp_lines(
+        src: str, dst: str, dport: int, lines: list[str], state: dict[str, object]
+    ) -> None:
         nonlocal total_messages
         in_data = bool(state.get("in_data"))
         data_lines: list[str] = list(state.get("data_lines") or [])
@@ -268,12 +301,16 @@ def analyze_smtp(path: Path, show_status: bool = True, packets: list[object] | N
             if line.startswith("220"):
                 banner = line[3:].lstrip("- ").strip()
                 if banner:
-                    for detail in device_fingerprints_from_text(banner, source="SMTP banner"):
+                    for detail in device_fingerprints_from_text(
+                        banner, source="SMTP banner"
+                    ):
                         key = f"device:{detail}"
                         if key in seen_device_artifacts:
                             continue
                         seen_device_artifacts.add(key)
-                        artifacts.append(SmtpArtifact(kind="device", detail=detail, src=src, dst=dst))
+                        artifacts.append(
+                            SmtpArtifact(kind="device", detail=detail, src=src, dst=dst)
+                        )
             upper = line.upper()
             if in_data:
                 if line == ".":
@@ -283,7 +320,11 @@ def analyze_smtp(path: Path, show_status: bool = True, packets: list[object] | N
                     mime_text = "\n".join(data_lines)
                     for match in ATTACHMENT_RE.findall(mime_text):
                         file_artifacts[match] += 1
-                        artifacts.append(SmtpArtifact(kind="attachment", detail=match, src=src, dst=dst))
+                        artifacts.append(
+                            SmtpArtifact(
+                                kind="attachment", detail=match, src=src, dst=dst
+                            )
+                        )
                     for match in NAME_RE.findall(mime_text):
                         file_artifacts[match] += 1
                     data_lines = []
@@ -309,13 +350,19 @@ def analyze_smtp(path: Path, show_status: bool = True, packets: list[object] | N
                             auth_methods[method] += 1
                             if match.group(2):
                                 try:
-                                    decoded = base64.b64decode(match.group(2).encode(), validate=False)
-                                    artifacts.append(SmtpArtifact(
-                                        kind="auth",
-                                        detail=decoded.decode("utf-8", errors="ignore"),
-                                        src=src,
-                                        dst=dst,
-                                    ))
+                                    decoded = base64.b64decode(
+                                        match.group(2).encode(), validate=False
+                                    )
+                                    artifacts.append(
+                                        SmtpArtifact(
+                                            kind="auth",
+                                            detail=decoded.decode(
+                                                "utf-8", errors="ignore"
+                                            ),
+                                            src=src,
+                                            dst=dst,
+                                        )
+                                    )
                                 except Exception:
                                     pass
                     if cmd == "DATA":
@@ -331,12 +378,14 @@ def analyze_smtp(path: Path, show_status: bool = True, packets: list[object] | N
                 domain_counts[dom] += 1
             for pattern, reason in SUSPICIOUS_PATTERNS:
                 if pattern.search(line):
-                    detections.append({
-                        "severity": "warning",
-                        "summary": f"Suspicious SMTP content: {reason}",
-                        "details": f"{src}->{dst} {line[:120]}",
-                        "source": "SMTP",
-                    })
+                    detections.append(
+                        {
+                            "severity": "warning",
+                            "summary": f"Suspicious SMTP content: {reason}",
+                            "details": f"{src}->{dst} {line[:120]}",
+                            "source": "SMTP",
+                        }
+                    )
             for match in FILE_NAME_RE.findall(line):
                 file_artifacts[match] += 1
         state["in_data"] = in_data
@@ -477,53 +526,63 @@ def analyze_smtp(path: Path, show_status: bool = True, packets: list[object] | N
 
     for src, dsts in dst_by_src.items():
         if len(dsts) >= 20:
-            detections.append({
-                "severity": "warning",
-                "summary": "SMTP scanning/probing detected",
-                "details": f"{src} contacted {len(dsts)} SMTP endpoints.",
-                "source": "SMTP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SMTP scanning/probing detected",
+                    "details": f"{src} contacted {len(dsts)} SMTP endpoints.",
+                    "source": "SMTP",
+                }
+            )
 
     for src, count in auth_fail_by_src.items():
         if count >= 10:
-            detections.append({
-                "severity": "warning",
-                "summary": "SMTP auth brute-force suspected",
-                "details": f"{src} saw {count} auth failures.",
-                "source": "SMTP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SMTP auth brute-force suspected",
+                    "details": f"{src} saw {count} auth failures.",
+                    "source": "SMTP",
+                }
+            )
 
     for flow, times in request_times.items():
         score = _beacon_score(times)
         if score:
-            detections.append({
-                "severity": "warning",
-                "summary": "SMTP beaconing suspected",
-                "details": f"{flow[0]}->{flow[1]} avg {score['avg']:.1f}s interval.",
-                "source": "SMTP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SMTP beaconing suspected",
+                    "details": f"{flow[0]}->{flow[1]} avg {score['avg']:.1f}s interval.",
+                    "source": "SMTP",
+                }
+            )
 
     for flow, bytes_sent in data_bytes_by_flow.items():
         if bytes_sent > 1_000_000:
-            detections.append({
-                "severity": "warning",
-                "summary": "SMTP data exfiltration suspected",
-                "details": f"{flow[0]}->{flow[1]} sent {bytes_sent} bytes.",
-                "source": "SMTP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SMTP data exfiltration suspected",
+                    "details": f"{flow[0]}->{flow[1]} sent {bytes_sent} bytes.",
+                    "source": "SMTP",
+                }
+            )
 
     conversations: list[SmtpConversation] = []
     for (src, dst, proto, port), data in conv_map.items():
-        conversations.append(SmtpConversation(
-            client_ip=src,
-            server_ip=dst,
-            protocol=proto,
-            server_port=port,
-            packets=int(data["packets"]),
-            bytes=int(data["bytes"]),
-            first_seen=data.get("first_seen"),
-            last_seen=data.get("last_seen"),
-        ))
+        conversations.append(
+            SmtpConversation(
+                client_ip=src,
+                server_ip=dst,
+                protocol=proto,
+                server_port=port,
+                packets=int(data["packets"]),
+                bytes=int(data["bytes"]),
+                first_seen=data.get("first_seen"),
+                last_seen=data.get("last_seen"),
+            )
+        )
     conversations.sort(key=lambda c: c.packets, reverse=True)
 
     duration_seconds = None
@@ -659,7 +718,11 @@ def merge_smtp_summaries(summaries: Iterable[SmtpSummary]) -> SmtpSummary:
         file_artifacts.update(summary.file_artifacts)
 
         for item in summary.detections:
-            key = (str(item.get("severity", "")), str(item.get("summary", "")), str(item.get("details", "")))
+            key = (
+                str(item.get("severity", "")),
+                str(item.get("summary", "")),
+                str(item.get("details", "")),
+            )
             if key in det_seen:
                 continue
             det_seen.add(key)
@@ -685,9 +748,13 @@ def merge_smtp_summaries(summaries: Iterable[SmtpSummary]) -> SmtpSummary:
                 continue
             current["packets"] = int(current["packets"]) + conv.packets
             current["bytes"] = int(current["bytes"]) + conv.bytes
-            if conv.first_seen is not None and (current["first_seen"] is None or conv.first_seen < current["first_seen"]):
+            if conv.first_seen is not None and (
+                current["first_seen"] is None or conv.first_seen < current["first_seen"]
+            ):
                 current["first_seen"] = conv.first_seen
-            if conv.last_seen is not None and (current["last_seen"] is None or conv.last_seen > current["last_seen"]):
+            if conv.last_seen is not None and (
+                current["last_seen"] is None or conv.last_seen > current["last_seen"]
+            ):
                 current["last_seen"] = conv.last_seen
 
     conversations = [

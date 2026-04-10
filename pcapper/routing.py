@@ -1,18 +1,18 @@
 from __future__ import annotations
 
+import ipaddress
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import ipaddress
 
 from .pcap_cache import get_reader
 from .utils import safe_float
 
 try:
-    from scapy.layers.inet import IP, TCP, UDP, ICMP  # type: ignore
+    from scapy.layers.inet import ICMP, IP, TCP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
-    from scapy.layers.l2 import Ether, LLC  # type: ignore
+    from scapy.layers.l2 import LLC, Ether  # type: ignore
     from scapy.packet import Raw  # type: ignore
 except Exception:  # pragma: no cover
     IP = None  # type: ignore
@@ -149,6 +149,7 @@ PIM_OPT_TYPES = {
     28: "State Refresh Capable",
 }
 
+
 @dataclass(frozen=True)
 class RoutingArtifact:
     kind: str
@@ -258,17 +259,17 @@ def _parse_ospf_lsas(payload: bytes) -> list[dict[str, object]]:
     for _ in range(max_lsas):
         if offset + 20 > len(payload):
             break
-        age = int.from_bytes(payload[offset:offset + 2], "big")
+        age = int.from_bytes(payload[offset : offset + 2], "big")
         options = payload[offset + 2]
         lsa_type = payload[offset + 3]
-        ls_id_raw = payload[offset + 4:offset + 8]
-        adv_raw = payload[offset + 8:offset + 12]
-        seq = int.from_bytes(payload[offset + 12:offset + 16], "big")
-        checksum = int.from_bytes(payload[offset + 16:offset + 18], "big")
-        length = int.from_bytes(payload[offset + 18:offset + 20], "big")
+        ls_id_raw = payload[offset + 4 : offset + 8]
+        adv_raw = payload[offset + 8 : offset + 12]
+        seq = int.from_bytes(payload[offset + 12 : offset + 16], "big")
+        checksum = int.from_bytes(payload[offset + 16 : offset + 18], "big")
+        length = int.from_bytes(payload[offset + 18 : offset + 20], "big")
         if length < 20 or offset + length > len(payload):
             break
-        body = payload[offset + 20:offset + length]
+        body = payload[offset + 20 : offset + length]
         details: dict[str, object] = {}
         lsid_int = int.from_bytes(ls_id_raw, "big")
 
@@ -282,16 +283,20 @@ def _parse_ospf_lsas(payload: bytes) -> list[dict[str, object]]:
             for _link in range(min(link_count, 6)):
                 if link_offset + 12 > len(body):
                     break
-                link_id = _ip_text(body[link_offset:link_offset + 4])
-                link_data = _ip_text(body[link_offset + 4:link_offset + 8])
+                link_id = _ip_text(body[link_offset : link_offset + 4])
+                link_data = _ip_text(body[link_offset + 4 : link_offset + 8])
                 link_type = body[link_offset + 8]
-                metric = int.from_bytes(body[link_offset + 10:link_offset + 12], "big")
-                links.append({
-                    "id": link_id,
-                    "data": link_data,
-                    "type": link_type,
-                    "metric": metric,
-                })
+                metric = int.from_bytes(
+                    body[link_offset + 10 : link_offset + 12], "big"
+                )
+                links.append(
+                    {
+                        "id": link_id,
+                        "data": link_data,
+                        "type": link_type,
+                        "metric": metric,
+                    }
+                )
                 link_offset += 12
             if links:
                 details["links"] = links
@@ -300,7 +305,7 @@ def _parse_ospf_lsas(payload: bytes) -> list[dict[str, object]]:
             routers: list[str] = []
             offset2 = 4
             while offset2 + 4 <= len(body) and len(routers) < 8:
-                routers.append(_ip_text(body[offset2:offset2 + 4]))
+                routers.append(_ip_text(body[offset2 : offset2 + 4]))
                 offset2 += 4
             details["netmask"] = netmask
             if routers:
@@ -329,17 +334,19 @@ def _parse_ospf_lsas(payload: bytes) -> list[dict[str, object]]:
             details["opaque_type"] = opaque_type
             details["opaque_id"] = opaque_id
 
-        lsas.append({
-            "age": age,
-            "options": options,
-            "type": lsa_type,
-            "ls_id": _ip_text(ls_id_raw),
-            "adv_router": _ip_text(adv_raw),
-            "seq": seq,
-            "checksum": checksum,
-            "length": length,
-            "details": details,
-        })
+        lsas.append(
+            {
+                "age": age,
+                "options": options,
+                "type": lsa_type,
+                "ls_id": _ip_text(ls_id_raw),
+                "adv_router": _ip_text(adv_raw),
+                "seq": seq,
+                "checksum": checksum,
+                "length": length,
+                "details": details,
+            }
+        )
         offset += length
     return lsas
 
@@ -393,8 +400,8 @@ def _parse_rip(payload: bytes) -> dict[str, object]:
         if afi == 0xFFFF:
             entry_offset = 24
     if len(payload) >= entry_offset + 20:
-        metric = int.from_bytes(payload[entry_offset + 16:entry_offset + 20], "big")
-        metric16 = (metric == 16)
+        metric = int.from_bytes(payload[entry_offset + 16 : entry_offset + 20], "big")
+        metric16 = metric == 16
     return {
         "cmd": cmd,
         "version": version,
@@ -409,34 +416,38 @@ def _parse_bgp_messages(payload: bytes) -> list[dict[str, object]]:
     idx = 0
     marker = b"\xff" * 16
     while idx + 19 <= len(payload):
-        if payload[idx:idx + 16] != marker:
+        if payload[idx : idx + 16] != marker:
             next_idx = payload.find(marker, idx + 1)
             if next_idx == -1:
                 break
             idx = next_idx
             continue
-        length = int.from_bytes(payload[idx + 16:idx + 18], "big")
+        length = int.from_bytes(payload[idx + 16 : idx + 18], "big")
         if length < 19 or idx + length > len(payload):
             break
         msg_type = payload[idx + 18]
-        body = payload[idx + 19:idx + length]
+        body = payload[idx + 19 : idx + length]
         entry: dict[str, object] = {"type": msg_type}
         if msg_type == 1 and len(body) >= 10:
-            entry.update({
-                "version": body[0],
-                "asn": int.from_bytes(body[1:3], "big"),
-                "hold_time": int.from_bytes(body[3:5], "big"),
-                "bgp_id": _ip_text(body[5:9]),
-                "opt_len": body[9],
-            })
+            entry.update(
+                {
+                    "version": body[0],
+                    "asn": int.from_bytes(body[1:3], "big"),
+                    "hold_time": int.from_bytes(body[3:5], "big"),
+                    "bgp_id": _ip_text(body[5:9]),
+                    "opt_len": body[9],
+                }
+            )
         elif msg_type == 2:
             update = _parse_bgp_update(body)
             entry.update(update)
         elif msg_type == 3 and len(body) >= 2:
-            entry.update({
-                "error_code": body[0],
-                "error_subcode": body[1],
-            })
+            entry.update(
+                {
+                    "error_code": body[0],
+                    "error_subcode": body[1],
+                }
+            )
         messages.append(entry)
         idx += length
     return messages
@@ -451,7 +462,7 @@ def _parse_bgp_prefixes(prefix_bytes: bytes) -> list[str]:
         octets = (plen + 7) // 8
         if idx + octets > len(prefix_bytes):
             break
-        raw = prefix_bytes[idx:idx + octets]
+        raw = prefix_bytes[idx : idx + octets]
         idx += octets
         if octets == 0:
             prefixes.append("0.0.0.0/0")
@@ -479,10 +490,16 @@ def _parse_bgp_as_path(attr_bytes: bytes) -> list[str]:
         for _ in range(seg_len):
             if idx + 2 > len(attr_bytes):
                 break
-            asn = int.from_bytes(attr_bytes[idx:idx + 2], "big")
+            asn = int.from_bytes(attr_bytes[idx : idx + 2], "big")
             idx += 2
             seg_asns.append(str(asn))
-        seg_label = "AS_SEQUENCE" if seg_type == 2 else "AS_SET" if seg_type == 1 else f"TYPE{seg_type}"
+        seg_label = (
+            "AS_SEQUENCE"
+            if seg_type == 2
+            else "AS_SET"
+            if seg_type == 1
+            else f"TYPE{seg_type}"
+        )
         if seg_asns:
             segments.append(f"{seg_label}({','.join(seg_asns)})")
     return segments
@@ -492,15 +509,15 @@ def _parse_bgp_update(body: bytes) -> dict[str, object]:
     if len(body) < 4:
         return {}
     idx = 0
-    withdrawn_len = int.from_bytes(body[idx:idx + 2], "big")
+    withdrawn_len = int.from_bytes(body[idx : idx + 2], "big")
     idx += 2
-    withdrawn_bytes = body[idx:idx + withdrawn_len]
+    withdrawn_bytes = body[idx : idx + withdrawn_len]
     idx += withdrawn_len
     if idx + 2 > len(body):
         return {"withdrawn": _parse_bgp_prefixes(withdrawn_bytes)}
-    attr_len = int.from_bytes(body[idx:idx + 2], "big")
+    attr_len = int.from_bytes(body[idx : idx + 2], "big")
     idx += 2
-    attr_bytes = body[idx:idx + attr_len]
+    attr_bytes = body[idx : idx + attr_len]
     idx += attr_len
     nlri_bytes = body[idx:]
 
@@ -523,7 +540,7 @@ def _parse_bgp_update(body: bytes) -> dict[str, object]:
         if extended_len:
             if attr_idx + 2 > len(attr_bytes):
                 break
-            length = int.from_bytes(attr_bytes[attr_idx:attr_idx + 2], "big")
+            length = int.from_bytes(attr_bytes[attr_idx : attr_idx + 2], "big")
             attr_idx += 2
         else:
             if attr_idx + 1 > len(attr_bytes):
@@ -532,7 +549,7 @@ def _parse_bgp_update(body: bytes) -> dict[str, object]:
             attr_idx += 1
         if attr_idx + length > len(attr_bytes):
             break
-        value = attr_bytes[attr_idx:attr_idx + length]
+        value = attr_bytes[attr_idx : attr_idx + length]
         attr_idx += length
         name = BGP_PATH_ATTR.get(code, f"ATTR_{code}")
         attrs.append({"code": code, "name": name})
@@ -546,13 +563,15 @@ def _parse_bgp_update(body: bytes) -> dict[str, object]:
             for i in range(0, len(value), 4):
                 if i + 4 > len(value):
                     break
-                communities.append(f"{int.from_bytes(value[i:i+2],'big')}:{int.from_bytes(value[i+2:i+4],'big')}")
+                communities.append(
+                    f"{int.from_bytes(value[i : i + 2], 'big')}:{int.from_bytes(value[i + 2 : i + 4], 'big')}"
+                )
         elif code == 14 and len(value) >= 5:
             afi = int.from_bytes(value[0:2], "big")
             nh_len = value[3]
             pos = 4
             if pos + nh_len <= len(value):
-                nh_raw = value[pos:pos + nh_len]
+                nh_raw = value[pos : pos + nh_len]
                 pos += nh_len
                 try:
                     if afi == 1 and nh_len >= 4:
@@ -614,7 +633,7 @@ def _parse_isis_tlvs(payload: bytes) -> dict[str, object]:
         idx += 2
         if idx + tlv_len > len(payload):
             break
-        value = payload[idx:idx + tlv_len]
+        value = payload[idx : idx + tlv_len]
         idx += tlv_len
         tlv_name = ISIS_TLV_NAMES.get(tlv_type, f"TLV {tlv_type}")
         tlv_counts[tlv_name] += 1
@@ -626,13 +645,13 @@ def _parse_isis_tlvs(payload: bytes) -> dict[str, object]:
                 pos += 1
                 if pos + alen > len(value):
                     break
-                area = value[pos:pos + alen].hex()
+                area = value[pos : pos + alen].hex()
                 areas.append(area)
                 pos += alen
         elif tlv_type == 6:  # IS Neighbors (LAN)
             pos = 0
             while pos + 6 <= len(value):
-                neighbors.append(_isis_system_id(value[pos:pos + 6]))
+                neighbors.append(_isis_system_id(value[pos : pos + 6]))
                 pos += 6
         elif tlv_type == 10 or tlv_type == 9:  # Authentication
             if value:
@@ -647,13 +666,13 @@ def _parse_isis_tlvs(payload: bytes) -> dict[str, object]:
         elif tlv_type == 132:  # IPv4 Interface Address
             pos = 0
             while pos + 4 <= len(value):
-                ipv4_addrs.append(_ip_text(value[pos:pos + 4]))
+                ipv4_addrs.append(_ip_text(value[pos : pos + 4]))
                 pos += 4
         elif tlv_type == 232:  # IPv6 Interface Address
             pos = 0
             while pos + 16 <= len(value):
                 try:
-                    ipv6_addrs.append(str(ipaddress.IPv6Address(value[pos:pos + 16])))
+                    ipv6_addrs.append(str(ipaddress.IPv6Address(value[pos : pos + 16])))
                 except Exception:
                     pass
                 pos += 16
@@ -667,13 +686,13 @@ def _parse_isis_tlvs(payload: bytes) -> dict[str, object]:
         elif tlv_type == 135:  # Extended IP Reachability
             pos = 0
             while pos + 5 <= len(value):
-                metric = int.from_bytes(value[pos:pos + 4], "big")
+                metric = int.from_bytes(value[pos : pos + 4], "big")
                 plen = value[pos + 4]
                 pos += 5
                 octets = (plen + 7) // 8
                 if pos + octets > len(value):
                     break
-                prefix_raw = value[pos:pos + octets]
+                prefix_raw = value[pos : pos + octets]
                 pos += octets
                 if octets <= 4:
                     prefix = _ip_text(prefix_raw + b"\x00" * (4 - octets))
@@ -681,16 +700,18 @@ def _parse_isis_tlvs(payload: bytes) -> dict[str, object]:
         elif tlv_type == 236:  # IPv6 Reachability
             pos = 0
             while pos + 6 <= len(value):
-                metric = int.from_bytes(value[pos:pos + 4], "big")
+                metric = int.from_bytes(value[pos : pos + 4], "big")
                 plen = value[pos + 4]
                 pos += 6  # skip metric + plen + flags
                 octets = (plen + 7) // 8
                 if pos + octets > len(value):
                     break
-                prefix_raw = value[pos:pos + octets]
+                prefix_raw = value[pos : pos + octets]
                 pos += octets
                 try:
-                    prefix = str(ipaddress.IPv6Address(prefix_raw + b"\x00" * (16 - octets)))
+                    prefix = str(
+                        ipaddress.IPv6Address(prefix_raw + b"\x00" * (16 - octets))
+                    )
                     reachability.append((f"{prefix}/{plen}", metric))
                 except Exception:
                     continue
@@ -754,12 +775,12 @@ def _parse_pim_hello_options(data: bytes) -> dict[str, object]:
     dr_priority = None
     gen_id = None
     while idx + 4 <= len(data):
-        opt_type = int.from_bytes(data[idx:idx + 2], "big")
-        opt_len = int.from_bytes(data[idx + 2:idx + 4], "big")
+        opt_type = int.from_bytes(data[idx : idx + 2], "big")
+        opt_len = int.from_bytes(data[idx + 2 : idx + 4], "big")
         idx += 4
         if idx + opt_len > len(data):
             break
-        value = data[idx:idx + opt_len]
+        value = data[idx : idx + opt_len]
         idx += opt_len
         name = PIM_OPT_TYPES.get(opt_type, f"Opt {opt_type}")
         opts[name] += 1
@@ -787,7 +808,7 @@ def _parse_pim_group_prefix(data: bytes) -> tuple[str | None, int, int]:
     plen = (mask_len + 7) // 8
     if len(data) < 4 + plen:
         return None, family, 0
-    addr_raw = data[4:4 + plen]
+    addr_raw = data[4 : 4 + plen]
     addr = None
     try:
         if family == 1:
@@ -811,7 +832,7 @@ def _parse_pim_source_prefix(data: bytes) -> tuple[str | None, int, int, int]:
     plen = (mask_len + 7) // 8
     if len(data) < 4 + plen:
         return None, family, flags, 0
-    addr_raw = data[4:4 + plen]
+    addr_raw = data[4 : 4 + plen]
     addr = None
     try:
         if family == 1:
@@ -828,10 +849,10 @@ def _parse_pim_join_prune(body: bytes) -> dict[str, object]:
     if len(body) < 8:
         return {}
     idx = 0
-    upstream = _ip_text(body[idx:idx + 4])
+    upstream = _ip_text(body[idx : idx + 4])
     idx += 4
     idx += 2  # reserved
-    group_count = int.from_bytes(body[idx:idx + 2], "big")
+    group_count = int.from_bytes(body[idx : idx + 2], "big")
     idx += 2
     groups: list[dict[str, object]] = []
     for _ in range(min(group_count, 64)):
@@ -841,8 +862,8 @@ def _parse_pim_join_prune(body: bytes) -> dict[str, object]:
         idx += glen
         if idx + 4 > len(body):
             break
-        joined = int.from_bytes(body[idx:idx + 2], "big")
-        pruned = int.from_bytes(body[idx + 2:idx + 4], "big")
+        joined = int.from_bytes(body[idx : idx + 2], "big")
+        pruned = int.from_bytes(body[idx + 2 : idx + 4], "big")
         idx += 4
         sources: list[dict[str, object]] = []
         total_src = joined + pruned
@@ -851,18 +872,22 @@ def _parse_pim_join_prune(body: bytes) -> dict[str, object]:
             if slen == 0:
                 break
             idx += slen
-            sources.append({
-                "source": src_prefix,
-                "family": sfamily,
-                "flags": flags,
-            })
-        groups.append({
-            "group": group_prefix,
-            "family": family,
-            "join_count": joined,
-            "prune_count": pruned,
-            "sources": sources,
-        })
+            sources.append(
+                {
+                    "source": src_prefix,
+                    "family": sfamily,
+                    "flags": flags,
+                }
+            )
+        groups.append(
+            {
+                "group": group_prefix,
+                "family": family,
+                "join_count": joined,
+                "prune_count": pruned,
+                "sources": sources,
+            }
+        )
     return {
         "upstream": upstream,
         "groups": groups,
@@ -949,13 +974,13 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
             isis_reachability_counts=Counter(),
             isis_tlv_counts=Counter(),
             isis_lsp_id_counts=Counter(),
-        isis_lsp_seq_high_count=0,
-        pim_type_counts=Counter(),
-        pim_group_counts=Counter(),
-        pim_source_counts=Counter(),
-        pim_options_counts=Counter(),
-        pim_dr_priority_counts=Counter(),
-        auth_counts=Counter(),
+            isis_lsp_seq_high_count=0,
+            pim_type_counts=Counter(),
+            pim_group_counts=Counter(),
+            pim_source_counts=Counter(),
+            pim_options_counts=Counter(),
+            pim_dr_priority_counts=Counter(),
+            auth_counts=Counter(),
             vrid_counts=Counter(),
             hsrp_group_counts=Counter(),
             sessions=[],
@@ -968,7 +993,9 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
 
     total_packets = 0
     routing_packets = 0
@@ -1022,7 +1049,15 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    def _update_session(protocol: str, src: str, dst: str, sport: int, dport: int, ts: Optional[float], detail: str | None = None) -> None:
+    def _update_session(
+        protocol: str,
+        src: str,
+        dst: str,
+        sport: int,
+        dport: int,
+        ts: Optional[float],
+        detail: str | None = None,
+    ) -> None:
         key = (protocol, src, dst, sport, dport)
         session = sessions_map.get(key)
         if session is None:
@@ -1042,7 +1077,9 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
         if ts is not None:
             first_ts = session.get("first_seen")
             last_ts = session.get("last_seen")
-            session["first_seen"] = ts if first_ts is None or ts < first_ts else first_ts
+            session["first_seen"] = (
+                ts if first_ts is None or ts < first_ts else first_ts
+            )
             session["last_seen"] = ts if last_ts is None or ts > last_ts else last_ts
         if detail and not session.get("details"):
             session["details"] = detail
@@ -1079,7 +1116,11 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                 proto_val = int(getattr(ip_layer, "nh", 0) or 0)
             src_label = src_ip
             dst_label = dst_ip
-            if (not src_label or not dst_label) and Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+            if (
+                (not src_label or not dst_label)
+                and Ether is not None
+                and pkt.haslayer(Ether)
+            ):  # type: ignore[truthy-bool]
                 eth = pkt[Ether]  # type: ignore[index]
                 src_label = str(getattr(eth, "src", ""))
                 dst_label = str(getattr(eth, "dst", ""))
@@ -1104,7 +1145,9 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                         message_counts["ICMP Redirect"] += 1
                         endpoint_counts[src_label] += 1
                         endpoint_counts[dst_label] += 1
-                        _update_session("ICMP Redirect", src_label, dst_label, 0, 0, ts, None)
+                        _update_session(
+                            "ICMP Redirect", src_label, dst_label, 0, 0, ts, None
+                        )
                 except Exception:
                     pass
 
@@ -1127,21 +1170,29 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                 if proto_name == "OSPF":
                     info = _parse_ospf(payload)
                     msg_type = info.get("type")
-                    msg_name = OSPF_TYPES.get(msg_type, f"Type {msg_type}") if msg_type is not None else "OSPF"
+                    msg_name = (
+                        OSPF_TYPES.get(msg_type, f"Type {msg_type}")
+                        if msg_type is not None
+                        else "OSPF"
+                    )
                     message_counts[f"OSPF {msg_name}"] += 1
                     if msg_name == "LSUpd":
                         ospf_lsa_updates += 1
                         lsas = _parse_ospf_lsas(payload)
                         for lsa in lsas:
                             lsa_type = int(lsa.get("type", 0) or 0)
-                            lsa_type_name = OSPF_LSA_TYPES.get(lsa_type, f"Type {lsa_type}")
+                            lsa_type_name = OSPF_LSA_TYPES.get(
+                                lsa_type, f"Type {lsa_type}"
+                            )
                             lsa_type_counts[lsa_type_name] += 1
                             adv_router = str(lsa.get("adv_router", ""))
                             ls_id = str(lsa.get("ls_id", ""))
                             if adv_router:
                                 lsa_adv_router_counts[adv_router] += 1
                                 if ls_id:
-                                    lsa_id_sources.setdefault((lsa_type_name, ls_id), set()).add(adv_router)
+                                    lsa_id_sources.setdefault(
+                                        (lsa_type_name, ls_id), set()
+                                    ).add(adv_router)
                             if ls_id:
                                 lsa_id_counts[ls_id] += 1
                             age_val = int(lsa.get("age", 0) or 0)
@@ -1161,17 +1212,33 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                                 ]
                                 if isinstance(details, dict):
                                     if details.get("link_count") is not None:
-                                        detail_bits.append(f"links={details.get('link_count')}")
+                                        detail_bits.append(
+                                            f"links={details.get('link_count')}"
+                                        )
                                     if details.get("netmask"):
-                                        detail_bits.append(f"mask={details.get('netmask')}")
+                                        detail_bits.append(
+                                            f"mask={details.get('netmask')}"
+                                        )
                                     if details.get("metric") is not None:
-                                        detail_bits.append(f"metric={details.get('metric')}")
+                                        detail_bits.append(
+                                            f"metric={details.get('metric')}"
+                                        )
                                     if details.get("external_type"):
-                                        detail_bits.append(f"ext={details.get('external_type')}")
+                                        detail_bits.append(
+                                            f"ext={details.get('external_type')}"
+                                        )
                                     if details.get("opaque_type") is not None:
-                                        detail_bits.append(f"opaque_type={details.get('opaque_type')}")
-                                detail_text = " ".join(bit for bit in detail_bits if bit)
-                                artifacts.append(RoutingArtifact("ospf_lsa", detail_text, src_ip, dst_ip))
+                                        detail_bits.append(
+                                            f"opaque_type={details.get('opaque_type')}"
+                                        )
+                                detail_text = " ".join(
+                                    bit for bit in detail_bits if bit
+                                )
+                                artifacts.append(
+                                    RoutingArtifact(
+                                        "ospf_lsa", detail_text, src_ip, dst_ip
+                                    )
+                                )
                     router_id = info.get("router_id")
                     area_id = info.get("area_id")
                     auth_type = info.get("auth_type")
@@ -1180,34 +1247,63 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                     if router_id:
                         router_id_counts[str(router_id)] += 1
                     router_id_sources.setdefault(str(router_id), set()).add(src_label)
-                    artifacts.append(RoutingArtifact("ospf_router_id", f"{router_id}", src_label, dst_label))
+                    artifacts.append(
+                        RoutingArtifact(
+                            "ospf_router_id", f"{router_id}", src_label, dst_label
+                        )
+                    )
                 if area_id:
-                    artifacts.append(RoutingArtifact("ospf_area", f"{area_id}", src_label, dst_label))
+                    artifacts.append(
+                        RoutingArtifact("ospf_area", f"{area_id}", src_label, dst_label)
+                    )
                 if lsa_count is not None:
-                    artifacts.append(RoutingArtifact("ospf_lsa_count", f"{lsa_count}", src_label, dst_label))
+                    artifacts.append(
+                        RoutingArtifact(
+                            "ospf_lsa_count", f"{lsa_count}", src_label, dst_label
+                        )
+                    )
                     if auth_type is not None:
-                        auth_label = {0: "None", 1: "Simple", 2: "Cryptographic"}.get(auth_type, f"Type {auth_type}")
+                        auth_label = {0: "None", 1: "Simple", 2: "Cryptographic"}.get(
+                            auth_type, f"Type {auth_type}"
+                        )
                         auth_counts[f"OSPF {auth_label}"] += 1
                         if auth_type == 1 and auth_data:
-                            pwd = auth_data.decode("latin-1", errors="ignore").strip("\x00")
-                            artifacts.append(RoutingArtifact("ospf_auth", f"OSPF simple auth password: {pwd}", src_label, dst_label))
+                            pwd = auth_data.decode("latin-1", errors="ignore").strip(
+                                "\x00"
+                            )
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "ospf_auth",
+                                    f"OSPF simple auth password: {pwd}",
+                                    src_label,
+                                    dst_label,
+                                )
+                            )
                         elif auth_type == 0:
-                            detections.append({
-                                "severity": "warning",
-                                "summary": "OSPF without authentication",
-                                "details": f"{src_label} -> {dst_label} area {area_id or '-'}",
-                            })
+                            detections.append(
+                                {
+                                    "severity": "warning",
+                                    "summary": "OSPF without authentication",
+                                    "details": f"{src_label} -> {dst_label} area {area_id or '-'}",
+                                }
+                            )
                     _update_session("OSPF", src_label, dst_label, 0, 0, ts, msg_name)
 
                 elif proto_name == "EIGRP":
                     info = _parse_eigrp(payload)
                     opcode = info.get("opcode")
-                    message_counts[f"EIGRP opcode {opcode if opcode is not None else '?'}"] += 1
+                    message_counts[
+                        f"EIGRP opcode {opcode if opcode is not None else '?'}"
+                    ] += 1
                     asn = info.get("asn")
                     if asn is not None:
                         asn_counts[str(asn)] += 1
-                        artifacts.append(RoutingArtifact("eigrp_asn", f"{asn}", src_label, dst_label))
-                    _update_session("EIGRP", src_label, dst_label, 0, 0, ts, f"opcode {opcode}")
+                        artifacts.append(
+                            RoutingArtifact("eigrp_asn", f"{asn}", src_label, dst_label)
+                        )
+                    _update_session(
+                        "EIGRP", src_label, dst_label, 0, 0, ts, f"opcode {opcode}"
+                    )
 
                 elif proto_name == "VRRP":
                     info = _parse_vrrp(payload)
@@ -1217,66 +1313,119 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                     if vrid is not None:
                         vrid_counts[str(vrid)] += 1
                         vrid_sources.setdefault(int(vrid), set()).add(src_label)
-                        artifacts.append(RoutingArtifact("vrrp_vrid", f"{vrid}", src_label, dst_label))
+                        artifacts.append(
+                            RoutingArtifact(
+                                "vrrp_vrid", f"{vrid}", src_label, dst_label
+                            )
+                        )
                     if priority is not None:
-                        artifacts.append(RoutingArtifact("vrrp_priority", f"{priority}", src_label, dst_label))
+                        artifacts.append(
+                            RoutingArtifact(
+                                "vrrp_priority", f"{priority}", src_label, dst_label
+                            )
+                        )
                     auth_type = info.get("auth_type")
                     if auth_type:
                         auth_counts[f"VRRP Auth {auth_type}"] += 1
-                    _update_session("VRRP", src_label, dst_label, 0, 0, ts, f"vrid {vrid}")
+                    _update_session(
+                        "VRRP", src_label, dst_label, 0, 0, ts, f"vrid {vrid}"
+                    )
 
                 elif proto_name == "IS-IS":
                     info = _parse_isis_pdu(payload)
                     pdu_type = info.get("pdu_type")
-                    pdu_name = ISIS_PDU_TYPES.get(pdu_type, f"PDU {pdu_type}") if pdu_type is not None else "IS-IS"
+                    pdu_name = (
+                        ISIS_PDU_TYPES.get(pdu_type, f"PDU {pdu_type}")
+                        if pdu_type is not None
+                        else "IS-IS"
+                    )
                     message_counts[f"IS-IS {pdu_name}"] += 1
                     tlvs = info.get("tlvs") or {}
                     if info.get("source_id"):
                         sysid = str(info.get("source_id"))
                         isis_system_id_counts[sysid] += 1
-                        artifacts.append(RoutingArtifact("isis_system_id", sysid, src_label, dst_label))
+                        artifacts.append(
+                            RoutingArtifact(
+                                "isis_system_id", sysid, src_label, dst_label
+                            )
+                        )
                     if info.get("lsp_id"):
                         lsp_id = str(info.get("lsp_id"))
                         isis_lsp_id_counts[lsp_id] += 1
-                        artifacts.append(RoutingArtifact("isis_lsp_id", lsp_id, src_label, dst_label))
+                        artifacts.append(
+                            RoutingArtifact("isis_lsp_id", lsp_id, src_label, dst_label)
+                        )
                     if info.get("lsp_seq") is not None:
                         seq_val = int(info.get("lsp_seq") or 0)
                         if seq_val >= 0xFFFFFF00:
                             isis_lsp_seq_high_count += 1
                     if isinstance(tlvs, dict):
-                        for name, count in (tlvs.get("tlv_counts") or Counter()).items():
+                        for name, count in (
+                            tlvs.get("tlv_counts") or Counter()
+                        ).items():
                             isis_tlv_counts[str(name)] += int(count)
                         for area in tlvs.get("areas", []):
                             isis_area_counts[str(area)] += 1
                         for host in tlvs.get("hostnames", []):
                             isis_hostname_counts[str(host)] += 1
-                            artifacts.append(RoutingArtifact("isis_hostname", str(host), src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "isis_hostname", str(host), src_label, dst_label
+                                )
+                            )
                         for addr in tlvs.get("ipv4_addrs", []):
-                            artifacts.append(RoutingArtifact("isis_ipv4", str(addr), src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "isis_ipv4", str(addr), src_label, dst_label
+                                )
+                            )
                         for addr in tlvs.get("ipv6_addrs", []):
-                            artifacts.append(RoutingArtifact("isis_ipv6", str(addr), src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "isis_ipv6", str(addr), src_label, dst_label
+                                )
+                            )
                         for nbr in tlvs.get("neighbors", []):
                             isis_neighbor_counts[str(nbr)] += 1
                         for prefix, metric in tlvs.get("reachability", []):
                             isis_reachability_counts[f"{prefix} (m{metric})"] += 1
                         for rid in tlvs.get("router_caps", []):
-                            artifacts.append(RoutingArtifact("isis_router_cap_id", str(rid), src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "isis_router_cap_id", str(rid), src_label, dst_label
+                                )
+                            )
                         auth_vals = tlvs.get("auth_values", [])
                         if auth_vals:
                             auth_counts["ISIS Auth"] += 1
                             for auth_val in auth_vals:
-                                artifacts.append(RoutingArtifact("isis_auth", f"ISIS auth: {auth_val}", src_label, dst_label))
-                                if isinstance(auth_val, str) and all(32 <= ord(ch) <= 126 for ch in auth_val):
-                                    detections.append({
-                                        "severity": "warning",
-                                        "summary": "ISIS plaintext authentication",
-                                        "details": f"{src_label} -> {dst_label} value '{auth_val}'",
-                                    })
+                                artifacts.append(
+                                    RoutingArtifact(
+                                        "isis_auth",
+                                        f"ISIS auth: {auth_val}",
+                                        src_label,
+                                        dst_label,
+                                    )
+                                )
+                                if isinstance(auth_val, str) and all(
+                                    32 <= ord(ch) <= 126 for ch in auth_val
+                                ):
+                                    detections.append(
+                                        {
+                                            "severity": "warning",
+                                            "summary": "ISIS plaintext authentication",
+                                            "details": f"{src_label} -> {dst_label} value '{auth_val}'",
+                                        }
+                                    )
                     _update_session("IS-IS", src_label, dst_label, 0, 0, ts, pdu_name)
                 elif proto_name == "PIM":
                     info = _parse_pim(payload)
                     msg_type = info.get("type")
-                    msg_name = PIM_TYPES.get(msg_type, f"Type {msg_type}") if msg_type is not None else "PIM"
+                    msg_name = (
+                        PIM_TYPES.get(msg_type, f"Type {msg_type}")
+                        if msg_type is not None
+                        else "PIM"
+                    )
                     pim_type_counts[msg_name] += 1
                     message_counts[f"PIM {msg_name}"] += 1
                     if info.get("hello"):
@@ -1288,33 +1437,62 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                         dr_pri = hello.get("dr_priority")
                         gen_id = hello.get("gen_id")
                         if hold is not None:
-                            artifacts.append(RoutingArtifact("pim_holdtime", f"{hold}", src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "pim_holdtime", f"{hold}", src_label, dst_label
+                                )
+                            )
                         if dr_pri is not None:
                             pim_dr_priority_counts[str(dr_pri)] += 1
-                            artifacts.append(RoutingArtifact("pim_dr_priority", f"{dr_pri}", src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "pim_dr_priority", f"{dr_pri}", src_label, dst_label
+                                )
+                            )
                         if gen_id is not None:
-                            artifacts.append(RoutingArtifact("pim_gen_id", f"{gen_id}", src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "pim_gen_id", f"{gen_id}", src_label, dst_label
+                                )
+                            )
                     if info.get("join_prune"):
                         jp = info.get("join_prune") or {}
                         upstream = jp.get("upstream")
                         if upstream:
-                            artifacts.append(RoutingArtifact("pim_upstream", f"{upstream}", src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "pim_upstream", f"{upstream}", src_label, dst_label
+                                )
+                            )
                         for grp in jp.get("groups", []):
                             group = grp.get("group")
                             if group:
                                 pim_group_counts[str(group)] += 1
-                                artifacts.append(RoutingArtifact("pim_group", str(group), src_label, dst_label))
+                                artifacts.append(
+                                    RoutingArtifact(
+                                        "pim_group", str(group), src_label, dst_label
+                                    )
+                                )
                             for src in grp.get("sources", []):
                                 src_prefix = src.get("source")
                                 if src_prefix:
                                     pim_source_counts[str(src_prefix)] += 1
-                                    artifacts.append(RoutingArtifact("pim_source", str(src_prefix), src_label, dst_label))
+                                    artifacts.append(
+                                        RoutingArtifact(
+                                            "pim_source",
+                                            str(src_prefix),
+                                            src_label,
+                                            dst_label,
+                                        )
+                                    )
                             if int(grp.get("prune_count") or 0) > 0:
-                                detections.append({
-                                    "severity": "info",
-                                    "summary": "PIM prune activity observed",
-                                    "details": f"{src_label} -> {dst_label} group {group or '-'} prunes {grp.get('prune_count')}",
-                                })
+                                detections.append(
+                                    {
+                                        "severity": "info",
+                                        "summary": "PIM prune activity observed",
+                                        "details": f"{src_label} -> {dst_label} group {group or '-'} prunes {grp.get('prune_count')}",
+                                    }
+                                )
                     _update_session("PIM", src_label, dst_label, 0, 0, ts, msg_name)
                 else:
                     message_counts[proto_name] += 1
@@ -1359,50 +1537,89 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                     endpoint_counts[src_label] += 1
                     endpoint_counts[dst_label] += 1
                     pdu_type = info.get("pdu_type")
-                    pdu_name = ISIS_PDU_TYPES.get(pdu_type, f"PDU {pdu_type}") if pdu_type is not None else "IS-IS"
+                    pdu_name = (
+                        ISIS_PDU_TYPES.get(pdu_type, f"PDU {pdu_type}")
+                        if pdu_type is not None
+                        else "IS-IS"
+                    )
                     message_counts[f"IS-IS {pdu_name}"] += 1
                     tlvs = info.get("tlvs") or {}
                     if info.get("source_id"):
                         sysid = str(info.get("source_id"))
                         isis_system_id_counts[sysid] += 1
-                        artifacts.append(RoutingArtifact("isis_system_id", sysid, src_label, dst_label))
+                        artifacts.append(
+                            RoutingArtifact(
+                                "isis_system_id", sysid, src_label, dst_label
+                            )
+                        )
                     if info.get("lsp_id"):
                         lsp_id = str(info.get("lsp_id"))
                         isis_lsp_id_counts[lsp_id] += 1
-                        artifacts.append(RoutingArtifact("isis_lsp_id", lsp_id, src_label, dst_label))
+                        artifacts.append(
+                            RoutingArtifact("isis_lsp_id", lsp_id, src_label, dst_label)
+                        )
                     if info.get("lsp_seq") is not None:
                         seq_val = int(info.get("lsp_seq") or 0)
                         if seq_val >= 0xFFFFFF00:
                             isis_lsp_seq_high_count += 1
                     if isinstance(tlvs, dict):
-                        for name, count in (tlvs.get("tlv_counts") or Counter()).items():
+                        for name, count in (
+                            tlvs.get("tlv_counts") or Counter()
+                        ).items():
                             isis_tlv_counts[str(name)] += int(count)
                         for area in tlvs.get("areas", []):
                             isis_area_counts[str(area)] += 1
                         for host in tlvs.get("hostnames", []):
                             isis_hostname_counts[str(host)] += 1
-                            artifacts.append(RoutingArtifact("isis_hostname", str(host), src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "isis_hostname", str(host), src_label, dst_label
+                                )
+                            )
                         for addr in tlvs.get("ipv4_addrs", []):
-                            artifacts.append(RoutingArtifact("isis_ipv4", str(addr), src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "isis_ipv4", str(addr), src_label, dst_label
+                                )
+                            )
                         for addr in tlvs.get("ipv6_addrs", []):
-                            artifacts.append(RoutingArtifact("isis_ipv6", str(addr), src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "isis_ipv6", str(addr), src_label, dst_label
+                                )
+                            )
                         for nbr in tlvs.get("neighbors", []):
                             isis_neighbor_counts[str(nbr)] += 1
                         for prefix, metric in tlvs.get("reachability", []):
                             isis_reachability_counts[f"{prefix} (m{metric})"] += 1
                         for rid in tlvs.get("router_caps", []):
-                            artifacts.append(RoutingArtifact("isis_router_cap_id", str(rid), src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "isis_router_cap_id", str(rid), src_label, dst_label
+                                )
+                            )
                         auth_vals = tlvs.get("auth_values", [])
                         if auth_vals:
                             auth_counts["ISIS Auth"] += 1
                             for auth_val in auth_vals:
-                                artifacts.append(RoutingArtifact("isis_auth", f"ISIS auth: {auth_val}", src_label, dst_label))
-                                if isinstance(auth_val, str) and all(32 <= ord(ch) <= 126 for ch in auth_val):
-                                    detections.append({
-                                        "severity": "warning",
-                                        "summary": "ISIS plaintext authentication",
-                                        "details": f"{src_label} -> {dst_label} value '{auth_val}'",
-                                    })
+                                artifacts.append(
+                                    RoutingArtifact(
+                                        "isis_auth",
+                                        f"ISIS auth: {auth_val}",
+                                        src_label,
+                                        dst_label,
+                                    )
+                                )
+                                if isinstance(auth_val, str) and all(
+                                    32 <= ord(ch) <= 126 for ch in auth_val
+                                ):
+                                    detections.append(
+                                        {
+                                            "severity": "warning",
+                                            "summary": "ISIS plaintext authentication",
+                                            "details": f"{src_label} -> {dst_label} value '{auth_val}'",
+                                        }
+                                    )
                     _update_session("IS-IS", src_label, dst_label, 0, 0, ts, pdu_name)
 
             # Port-based routing protocols (BGP/RIP/HSRP/GLBP)
@@ -1434,13 +1651,33 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                                 hold_time = msg.get("hold_time")
                                 if asn is not None:
                                     asn_counts[str(asn)] += 1
-                                    artifacts.append(RoutingArtifact("bgp_asn", f"{asn}", src_label, dst_label))
+                                    artifacts.append(
+                                        RoutingArtifact(
+                                            "bgp_asn", f"{asn}", src_label, dst_label
+                                        )
+                                    )
                                 if bgp_id:
                                     router_id_counts[str(bgp_id)] += 1
-                                    bgp_id_sources.setdefault(str(bgp_id), set()).add(src_label)
-                                    artifacts.append(RoutingArtifact("bgp_router_id", f"{bgp_id}", src_label, dst_label))
+                                    bgp_id_sources.setdefault(str(bgp_id), set()).add(
+                                        src_label
+                                    )
+                                    artifacts.append(
+                                        RoutingArtifact(
+                                            "bgp_router_id",
+                                            f"{bgp_id}",
+                                            src_label,
+                                            dst_label,
+                                        )
+                                    )
                                 if hold_time is not None:
-                                    artifacts.append(RoutingArtifact("bgp_hold_time", f"{hold_time}", src_label, dst_label))
+                                    artifacts.append(
+                                        RoutingArtifact(
+                                            "bgp_hold_time",
+                                            f"{hold_time}",
+                                            src_label,
+                                            dst_label,
+                                        )
+                                    )
                             if msg_name == "UPDATE":
                                 withdrawn = msg.get("withdrawn") or []
                                 nlri = msg.get("nlri") or []
@@ -1467,14 +1704,44 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                                 if as_path:
                                     bgp_as_path_counts[" ".join(as_path)] += 1
                                 if origin:
-                                    artifacts.append(RoutingArtifact("bgp_origin", f"{origin}", src_label, dst_label))
+                                    artifacts.append(
+                                        RoutingArtifact(
+                                            "bgp_origin",
+                                            f"{origin}",
+                                            src_label,
+                                            dst_label,
+                                        )
+                                    )
                                 if next_hop:
-                                    artifacts.append(RoutingArtifact("bgp_next_hop", f"{next_hop}", src_label, dst_label))
+                                    artifacts.append(
+                                        RoutingArtifact(
+                                            "bgp_next_hop",
+                                            f"{next_hop}",
+                                            src_label,
+                                            dst_label,
+                                        )
+                                    )
                                 for prefix in nlri[:5]:
-                                    artifacts.append(RoutingArtifact("bgp_nlri", str(prefix), src_label, dst_label))
+                                    artifacts.append(
+                                        RoutingArtifact(
+                                            "bgp_nlri",
+                                            str(prefix),
+                                            src_label,
+                                            dst_label,
+                                        )
+                                    )
                                 for prefix in withdrawn[:5]:
-                                    artifacts.append(RoutingArtifact("bgp_withdraw", str(prefix), src_label, dst_label))
-                        _update_session("BGP", src_label, dst_label, sport, dport, ts, None)
+                                    artifacts.append(
+                                        RoutingArtifact(
+                                            "bgp_withdraw",
+                                            str(prefix),
+                                            src_label,
+                                            dst_label,
+                                        )
+                                    )
+                        _update_session(
+                            "BGP", src_label, dst_label, sport, dport, ts, None
+                        )
                     continue
 
             if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
@@ -1495,28 +1762,47 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                     if proto_name in {"RIP", "RIPng"}:
                         info = _parse_rip(payload)
                         cmd = info.get("cmd")
-                        cmd_name = RIP_COMMANDS.get(cmd, f"Cmd {cmd}") if cmd is not None else "RIP"
+                        cmd_name = (
+                            RIP_COMMANDS.get(cmd, f"Cmd {cmd}")
+                            if cmd is not None
+                            else "RIP"
+                        )
                         message_counts[f"{proto_name} {cmd_name}"] += 1
                         if info.get("metric16"):
-                            detections.append({
-                                "severity": "warning",
-                                "summary": f"{proto_name} route withdrawal observed",
-                                "details": f"{src_label} -> {dst_label} metric 16 (unreachable) entry",
-                            })
+                            detections.append(
+                                {
+                                    "severity": "warning",
+                                    "summary": f"{proto_name} route withdrawal observed",
+                                    "details": f"{src_label} -> {dst_label} metric 16 (unreachable) entry",
+                                }
+                            )
                         auth_type = info.get("auth_type")
                         auth_data = info.get("auth_data", b"")
                         if auth_type is not None:
                             auth_counts[f"{proto_name} auth {auth_type}"] += 1
                             if auth_type == 2 and auth_data:
-                                pwd = auth_data.decode("latin-1", errors="ignore").strip("\x00")
-                                artifacts.append(RoutingArtifact("rip_auth", f"{proto_name} simple auth password: {pwd}", src_label, dst_label))
+                                pwd = auth_data.decode(
+                                    "latin-1", errors="ignore"
+                                ).strip("\x00")
+                                artifacts.append(
+                                    RoutingArtifact(
+                                        "rip_auth",
+                                        f"{proto_name} simple auth password: {pwd}",
+                                        src_label,
+                                        dst_label,
+                                    )
+                                )
                             elif auth_type == 0:
-                                detections.append({
-                                    "severity": "warning",
-                                    "summary": f"{proto_name} without authentication",
-                                    "details": f"{src_label} -> {dst_label}",
-                                })
-                        _update_session(proto_name, src_label, dst_label, sport, dport, ts, cmd_name)
+                                detections.append(
+                                    {
+                                        "severity": "warning",
+                                        "summary": f"{proto_name} without authentication",
+                                        "details": f"{src_label} -> {dst_label}",
+                                    }
+                                )
+                        _update_session(
+                            proto_name, src_label, dst_label, sport, dport, ts, cmd_name
+                        )
                     elif proto_name == "HSRP":
                         info = _parse_hsrp(payload)
                         group = info.get("group")
@@ -1526,17 +1812,44 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                         if group is not None:
                             hsrp_group_counts[str(group)] += 1
                             hsrp_sources.setdefault(int(group), set()).add(src_label)
-                            artifacts.append(RoutingArtifact("hsrp_group", f"{group}", src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "hsrp_group", f"{group}", src_label, dst_label
+                                )
+                            )
                         if state is not None:
-                            artifacts.append(RoutingArtifact("hsrp_state", f"{state}", src_label, dst_label))
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "hsrp_state", f"{state}", src_label, dst_label
+                                )
+                            )
                         if auth_data:
                             auth_counts["HSRP Auth"] += 1
-                            auth_text = auth_data.decode("latin-1", errors="ignore").strip("\x00")
-                            artifacts.append(RoutingArtifact("hsrp_auth", f"HSRP auth password: {auth_text}", src_label, dst_label))
-                        _update_session("HSRP", src_label, dst_label, sport, dport, ts, f"group {group}")
+                            auth_text = auth_data.decode(
+                                "latin-1", errors="ignore"
+                            ).strip("\x00")
+                            artifacts.append(
+                                RoutingArtifact(
+                                    "hsrp_auth",
+                                    f"HSRP auth password: {auth_text}",
+                                    src_label,
+                                    dst_label,
+                                )
+                            )
+                        _update_session(
+                            "HSRP",
+                            src_label,
+                            dst_label,
+                            sport,
+                            dport,
+                            ts,
+                            f"group {group}",
+                        )
                     else:
                         message_counts[proto_name] += 1
-                        _update_session(proto_name, src_label, dst_label, sport, dport, ts, None)
+                        _update_session(
+                            proto_name, src_label, dst_label, sport, dport, ts, None
+                        )
 
     except Exception as exc:
         errors.append(str(exc))
@@ -1544,132 +1857,172 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
         status.finish()
         reader.close()
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
 
     # Post-analysis detections/insights
     if routing_packets:
         ratio = routing_packets / max(1, total_packets)
         if ratio >= 0.25:
-            insights.append(f"Routing-control traffic is {ratio:.1%} of total packets (control-plane heavy capture).")
+            insights.append(
+                f"Routing-control traffic is {ratio:.1%} of total packets (control-plane heavy capture)."
+            )
     if public_endpoints:
-        detections.append({
-            "severity": "high",
-            "summary": "Routing protocol traffic with public IPs",
-            "details": f"Public endpoints observed: {', '.join(sorted(public_endpoints)[:6])}",
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Routing protocol traffic with public IPs",
+                "details": f"Public endpoints observed: {', '.join(sorted(public_endpoints)[:6])}",
+            }
+        )
     if bgp_withdraw_counts:
         top_withdrawn = ", ".join([p for p, _ in bgp_withdraw_counts.most_common(5)])
-        detections.append({
-            "severity": "info",
-            "summary": "BGP withdrawals observed",
-            "details": f"Top withdrawn prefixes: {top_withdrawn}",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "BGP withdrawals observed",
+                "details": f"Top withdrawn prefixes: {top_withdrawn}",
+            }
+        )
     if bgp_prefix_counts:
         top_announced = ", ".join([p for p, _ in bgp_prefix_counts.most_common(5)])
-        detections.append({
-            "severity": "info",
-            "summary": "BGP announcements observed",
-            "details": f"Top announced prefixes: {top_announced}",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "BGP announcements observed",
+                "details": f"Top announced prefixes: {top_announced}",
+            }
+        )
     if bgp_notifications >= 3:
-        detections.append({
-            "severity": "high",
-            "summary": "BGP instability detected",
-            "details": f"{bgp_notifications} BGP NOTIFICATION messages observed.",
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "BGP instability detected",
+                "details": f"{bgp_notifications} BGP NOTIFICATION messages observed.",
+            }
+        )
     if ospf_lsa_updates >= 200:
-        detections.append({
-            "severity": "warning",
-            "summary": "Elevated OSPF LSA updates",
-            "details": f"{ospf_lsa_updates} OSPF LS Update messages observed.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Elevated OSPF LSA updates",
+                "details": f"{ospf_lsa_updates} OSPF LS Update messages observed.",
+            }
+        )
     if icmp_redirects >= 5:
-        detections.append({
-            "severity": "warning",
-            "summary": "ICMP redirect activity",
-            "details": f"{icmp_redirects} ICMP redirect messages observed.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "ICMP redirect activity",
+                "details": f"{icmp_redirects} ICMP redirect messages observed.",
+            }
+        )
     if isis_lsp_seq_high_count:
-        detections.append({
-            "severity": "warning",
-            "summary": "IS-IS LSP sequence nearing max",
-            "details": f"{isis_lsp_seq_high_count} IS-IS LSPs with high sequence values observed.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "IS-IS LSP sequence nearing max",
+                "details": f"{isis_lsp_seq_high_count} IS-IS LSPs with high sequence values observed.",
+            }
+        )
     if protocol_counts.get("IS-IS") and not auth_counts.get("ISIS Auth"):
-        detections.append({
-            "severity": "warning",
-            "summary": "IS-IS without authentication",
-            "details": "IS-IS traffic observed without authentication TLVs.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "IS-IS without authentication",
+                "details": "IS-IS traffic observed without authentication TLVs.",
+            }
+        )
     if protocol_counts.get("PIM") and not pim_type_counts:
-        detections.append({
-            "severity": "warning",
-            "summary": "PIM traffic observed but no messages decoded",
-            "details": "PIM packets detected but parsing failed (check capture integrity).",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "PIM traffic observed but no messages decoded",
+                "details": "PIM packets detected but parsing failed (check capture integrity).",
+            }
+        )
     if lsa_maxage_count:
-        detections.append({
-            "severity": "warning",
-            "summary": "OSPF MaxAge LSAs observed",
-            "details": f"{lsa_maxage_count} LSAs with age >= 3600 (MaxAge) detected.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "OSPF MaxAge LSAs observed",
+                "details": f"{lsa_maxage_count} LSAs with age >= 3600 (MaxAge) detected.",
+            }
+        )
     if lsa_seq_high_count:
-        detections.append({
-            "severity": "warning",
-            "summary": "OSPF LSA sequence nearing max",
-            "details": f"{lsa_seq_high_count} LSAs with high sequence values observed.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "OSPF LSA sequence nearing max",
+                "details": f"{lsa_seq_high_count} LSAs with high sequence values observed.",
+            }
+        )
 
     for router_id, sources in router_id_sources.items():
         if len(sources) > 1:
-            detections.append({
-                "severity": "warning",
-                "summary": "Duplicate OSPF router ID observed",
-                "details": f"Router ID {router_id} seen from {', '.join(sorted(sources))}",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Duplicate OSPF router ID observed",
+                    "details": f"Router ID {router_id} seen from {', '.join(sorted(sources))}",
+                }
+            )
     for router_id, sources in bgp_id_sources.items():
         if len(sources) > 1:
-            detections.append({
-                "severity": "warning",
-                "summary": "Duplicate BGP router ID observed",
-                "details": f"BGP ID {router_id} seen from {', '.join(sorted(sources))}",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Duplicate BGP router ID observed",
+                    "details": f"BGP ID {router_id} seen from {', '.join(sorted(sources))}",
+                }
+            )
     for vrid, sources in vrid_sources.items():
         if len(sources) > 1:
-            detections.append({
-                "severity": "info",
-                "summary": "VRRP redundancy group seen from multiple routers",
-                "details": f"VRID {vrid} advertised by {', '.join(sorted(sources))}",
-            })
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "VRRP redundancy group seen from multiple routers",
+                    "details": f"VRID {vrid} advertised by {', '.join(sorted(sources))}",
+                }
+            )
     for group, sources in hsrp_sources.items():
         if len(sources) > 1:
-            detections.append({
-                "severity": "info",
-                "summary": "HSRP group seen from multiple routers",
-                "details": f"Group {group} advertised by {', '.join(sorted(sources))}",
-            })
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "HSRP group seen from multiple routers",
+                    "details": f"Group {group} advertised by {', '.join(sorted(sources))}",
+                }
+            )
     for key, sources in lsa_id_sources.items():
         if len(sources) > 1:
             lsa_type, ls_id = key
-            detections.append({
-                "severity": "warning",
-                "summary": "OSPF LSA ID advertised by multiple routers",
-                "details": f"{lsa_type} LSA {ls_id} seen from {', '.join(sorted(sources))}",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "OSPF LSA ID advertised by multiple routers",
+                    "details": f"{lsa_type} LSA {ls_id} seen from {', '.join(sorted(sources))}",
+                }
+            )
 
     sessions: list[RoutingSession] = []
     for session in sessions_map.values():
-        sessions.append(RoutingSession(
-            protocol=str(session.get("protocol", "-")),
-            src_ip=str(session.get("src_ip", "-")),
-            dst_ip=str(session.get("dst_ip", "-")),
-            src_port=int(session.get("src_port", 0) or 0),
-            dst_port=int(session.get("dst_port", 0) or 0),
-            packets=int(session.get("packets", 0) or 0),
-            first_seen=session.get("first_seen"),
-            last_seen=session.get("last_seen"),
-            details=session.get("details"),
-        ))
+        sessions.append(
+            RoutingSession(
+                protocol=str(session.get("protocol", "-")),
+                src_ip=str(session.get("src_ip", "-")),
+                dst_ip=str(session.get("dst_ip", "-")),
+                src_port=int(session.get("src_port", 0) or 0),
+                dst_port=int(session.get("dst_port", 0) or 0),
+                packets=int(session.get("packets", 0) or 0),
+                first_seen=session.get("first_seen"),
+                last_seen=session.get("last_seen"),
+                details=session.get("details"),
+            )
+        )
 
     return RoutingSummary(
         path=path,
@@ -1745,13 +2098,13 @@ def merge_routing_summaries(summaries: list[RoutingSummary]) -> RoutingSummary:
             isis_reachability_counts=Counter(),
             isis_tlv_counts=Counter(),
             isis_lsp_id_counts=Counter(),
-        isis_lsp_seq_high_count=0,
-        pim_type_counts=Counter(),
-        pim_group_counts=Counter(),
-        pim_source_counts=Counter(),
-        pim_options_counts=Counter(),
-        pim_dr_priority_counts=Counter(),
-        auth_counts=Counter(),
+            isis_lsp_seq_high_count=0,
+            pim_type_counts=Counter(),
+            pim_group_counts=Counter(),
+            pim_source_counts=Counter(),
+            pim_options_counts=Counter(),
+            pim_dr_priority_counts=Counter(),
+            auth_counts=Counter(),
             vrid_counts=Counter(),
             hsrp_group_counts=Counter(),
             sessions=[],
@@ -1843,11 +2196,21 @@ def merge_routing_summaries(summaries: list[RoutingSummary]) -> RoutingSummary:
         artifacts.extend(item.artifacts)
         errors.extend(item.errors)
         if item.first_seen is not None:
-            first_seen = item.first_seen if first_seen is None else min(first_seen, item.first_seen)
+            first_seen = (
+                item.first_seen
+                if first_seen is None
+                else min(first_seen, item.first_seen)
+            )
         if item.last_seen is not None:
-            last_seen = item.last_seen if last_seen is None else max(last_seen, item.last_seen)
+            last_seen = (
+                item.last_seen if last_seen is None else max(last_seen, item.last_seen)
+            )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return RoutingSummary(
         path=Path(f"ALL_PCAPS_{len(summaries)}"),
         total_packets=total_packets,

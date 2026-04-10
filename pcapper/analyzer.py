@@ -8,9 +8,9 @@ from typing import Iterable, Optional
 from .pcap_cache import PcapMeta, get_reader
 
 try:
-    from scapy.layers.l2 import Dot1Q, Ether  # type: ignore
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
+    from scapy.layers.l2 import Dot1Q, Ether  # type: ignore
     from scapy.packet import Raw  # type: ignore
 except Exception:  # pragma: no cover
     Dot1Q = None  # type: ignore
@@ -19,9 +19,8 @@ except Exception:  # pragma: no cover
     Ether = None  # type: ignore
 
 from .models import InterfaceStat, PcapSummary
-from .utils import detect_file_type
 from .services import COMMON_PORTS
-
+from .utils import detect_file_type
 
 IGNORE_LAYERS = {"Raw", "Padding", "NoPayload"}
 
@@ -94,14 +93,32 @@ def _get_iface_key(pkt) -> Optional[object]:
     if iface:
         return iface
 
-    for attr in ("interface", "iface", "ifname", "if_name", "ifindex", "if_index", "if_id", "ifid"):
+    for attr in (
+        "interface",
+        "iface",
+        "ifname",
+        "if_name",
+        "ifindex",
+        "if_index",
+        "if_id",
+        "ifid",
+    ):
         value = getattr(pkt, attr, None)
         if value is not None:
             return value
 
     metadata = getattr(pkt, "metadata", None)
     if isinstance(metadata, dict):
-        for key in ("ifname", "interface", "iface", "if_name", "ifindex", "if_index", "if_id", "ifid"):
+        for key in (
+            "ifname",
+            "interface",
+            "iface",
+            "if_name",
+            "ifindex",
+            "if_index",
+            "if_id",
+            "ifid",
+        ):
             if key in metadata and metadata[key] is not None:
                 return metadata[key]
     return None
@@ -155,7 +172,9 @@ def analyze_pcap(
     iface_vlans = defaultdict(set)
     tcp_packets = 0
     retransmissions = 0
-    seen_seq: defaultdict[tuple[str, str, int, int], set[tuple[int, int]]] = defaultdict(set)
+    seen_seq: defaultdict[tuple[str, str, int, int], set[tuple[int, int]]] = (
+        defaultdict(set)
+    )
 
     reader, status, stream, _size_bytes, _file_type = get_reader(
         path, packets=packets, meta=meta, show_status=show_status
@@ -292,7 +311,9 @@ def analyze_pcap(
             speed = _iface_get(iface, "speed", "if_speed")
             mac = _iface_get(iface, "mac", "if_macaddr", "if_mac")
             os = _iface_get(iface, "os", "if_os")
-            dropcount = _iface_get(iface, "dropcount", "if_dropcount", "if_drops", "if_drop")
+            dropcount = _iface_get(
+                iface, "dropcount", "if_dropcount", "if_drops", "if_drop"
+            )
             capture_filter = _iface_get(iface, "filter", "if_filter")
 
             iface_id = _iface_get(iface, "id", "if_id", "ifid", "if_index", "ifindex")
@@ -320,8 +341,11 @@ def analyze_pcap(
             interface_stats.append(
                 InterfaceStat(
                     name=_normalize_iface_name(name),
-                    linktype=_as_text(linktype) or _as_text(meta.linktype if meta else None),
-                    snaplen=snaplen if snaplen is not None else (meta.snaplen if meta else None),
+                    linktype=_as_text(linktype)
+                    or _as_text(meta.linktype if meta else None),
+                    snaplen=snaplen
+                    if snaplen is not None
+                    else (meta.snaplen if meta else None),
                     packet_count=iface_count,
                     dropped_packets=_as_int(dropcount),
                     capture_filter=_as_text(capture_filter),
@@ -343,7 +367,8 @@ def analyze_pcap(
                     name=_normalize_iface_name(iface_key),
                     linktype=str(linktype) if linktype is not None else None,
                     snaplen=snaplen,
-                    packet_count=iface_count or (packet_count if packet_count else None),
+                    packet_count=iface_count
+                    or (packet_count if packet_count else None),
                     dropped_packets=None,
                     capture_filter=None,
                     description=None,
@@ -392,21 +417,31 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
     merged_size = sum(summary.size_bytes for summary in summaries)
     merged_packets = sum(summary.packet_count for summary in summaries)
 
-    start_values = [summary.start_ts for summary in summaries if summary.start_ts is not None]
+    start_values = [
+        summary.start_ts for summary in summaries if summary.start_ts is not None
+    ]
     end_values = [summary.end_ts for summary in summaries if summary.end_ts is not None]
     merged_start = min(start_values) if start_values else None
     merged_end = max(end_values) if end_values else None
     if merged_start is not None and merged_end is not None:
         merged_duration = max(0.0, merged_end - merged_start)
     else:
-        merged_duration = sum((summary.duration_seconds or 0.0) for summary in summaries)
+        merged_duration = sum(
+            (summary.duration_seconds or 0.0) for summary in summaries
+        )
 
     merged_protocols: Counter[str] = Counter()
     for summary in summaries:
         merged_protocols.update(summary.protocol_counts)
-    merged_tcp_packets = sum(int(getattr(summary, "tcp_packets", 0) or 0) for summary in summaries)
-    merged_retransmissions = sum(int(getattr(summary, "retransmissions", 0) or 0) for summary in summaries)
-    merged_retransmission_rate = (merged_retransmissions / merged_tcp_packets) if merged_tcp_packets else 0.0
+    merged_tcp_packets = sum(
+        int(getattr(summary, "tcp_packets", 0) or 0) for summary in summaries
+    )
+    merged_retransmissions = sum(
+        int(getattr(summary, "retransmissions", 0) or 0) for summary in summaries
+    )
+    merged_retransmission_rate = (
+        (merged_retransmissions / merged_tcp_packets) if merged_tcp_packets else 0.0
+    )
 
     iface_data: dict[str, dict[str, object]] = {}
     for summary in summaries:
@@ -436,7 +471,9 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
                 data["packet_count"] = int(data["packet_count"]) + iface.packet_count
             if iface.dropped_packets is not None:
                 data["has_dropped"] = True
-                data["dropped_packets"] = int(data["dropped_packets"]) + iface.dropped_packets
+                data["dropped_packets"] = (
+                    int(data["dropped_packets"]) + iface.dropped_packets
+                )
             if iface.capture_filter:
                 data["capture_filters"].add(iface.capture_filter)
             if iface.description:
@@ -464,12 +501,28 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
         merged_interfaces.append(
             InterfaceStat(
                 name=name,
-                linktype=linktypes[0] if len(linktypes) == 1 else ("mixed" if linktypes else None),
-                snaplen=snaplens[0] if len(snaplens) == 1 else (max(snaplens) if snaplens else None),
-                packet_count=int(data["packet_count"]) if int(data["packet_count"]) > 0 else None,
-                dropped_packets=int(data["dropped_packets"]) if bool(data["has_dropped"]) else None,
-                capture_filter=(capture_filters[0] if len(capture_filters) == 1 else ("multiple" if capture_filters else None)),
-                description=(descriptions[0] if len(descriptions) == 1 else ("multiple" if descriptions else None)),
+                linktype=linktypes[0]
+                if len(linktypes) == 1
+                else ("mixed" if linktypes else None),
+                snaplen=snaplens[0]
+                if len(snaplens) == 1
+                else (max(snaplens) if snaplens else None),
+                packet_count=int(data["packet_count"])
+                if int(data["packet_count"]) > 0
+                else None,
+                dropped_packets=int(data["dropped_packets"])
+                if bool(data["has_dropped"])
+                else None,
+                capture_filter=(
+                    capture_filters[0]
+                    if len(capture_filters) == 1
+                    else ("multiple" if capture_filters else None)
+                ),
+                description=(
+                    descriptions[0]
+                    if len(descriptions) == 1
+                    else ("multiple" if descriptions else None)
+                ),
                 speed_bps=speeds[0] if len(speeds) == 1 else None,
                 mac=macs[0] if len(macs) == 1 else None,
                 os=oses[0] if len(oses) == 1 else None,

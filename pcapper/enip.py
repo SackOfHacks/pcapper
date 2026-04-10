@@ -1,46 +1,48 @@
 from __future__ import annotations
 
+import ipaddress
 from collections import Counter, defaultdict
-from functools import lru_cache
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
-import ipaddress
 
 try:
-    from scapy.layers.inet import TCP, UDP, IP
+    from scapy.layers.inet import IP, TCP, UDP
     from scapy.packet import Raw
 except ImportError:  # pragma: no cover - scapy optional at runtime
     TCP = UDP = IP = Raw = None
 
 from .cip import (
-    CIP_GENERAL_STATUS,
-    CIP_CLASS_NAMES,
     CIP_ATTRIBUTE_NAMES,
-    CIP_SERVICE_NAMES,
-    ENIP_ENUMERATION_COMMANDS,
-    CPF_ITEM_TYPES,
+    CIP_CLASS_NAMES,
+    CIP_GENERAL_STATUS,
     CIP_RECON_STATUS_CODES,
-    CONTROL_SERVICE_CODES,
-    PROGRAM_SERVICE_CODES,
-    WRITE_SERVICE_CODES,
-    ENUMERATION_SERVICE_CODES,
-    HIGH_RISK_SERVICE_CODES,
-    CIP_SECURITY_PORT,
     CIP_SAFETY_CLASS_IDS,
     CIP_SECURITY_CLASS_IDS,
+    CIP_SECURITY_PORT,
+    CIP_SERVICE_NAMES,
+    CONTROL_SERVICE_CODES,
+    CPF_ITEM_TYPES,
+    ENIP_ENUMERATION_COMMANDS,
+    ENUMERATION_SERVICE_CODES,
+    HIGH_RISK_SERVICE_CODES,
+    PROGRAM_SERVICE_CODES,
     WRITE_BASELINE_MIN,
-    _parse_cip_message,
-    _extract_symbol,
-    _parse_tag_payload,
+    WRITE_SERVICE_CODES,
     _decode_cip_data_type,
-    _parse_multiple_service_packet,
+    _extract_symbol,
     _match_sensitive_tag,
+    _parse_cip_message,
+    _parse_multiple_service_packet,
+    _parse_tag_payload,
+)
+from .cip import (
     _parse_enip_details as _parse_enip_details_base,
 )
-from .equipment import equipment_artifacts
 from .device_detection import device_fingerprint_from_fields
-from .industrial_helpers import IndustrialArtifact, IndustrialAnomaly
+from .equipment import equipment_artifacts
+from .industrial_helpers import IndustrialAnomaly, IndustrialArtifact
 from .pcap_cache import get_reader
 from .utils import safe_float, safe_read_text
 
@@ -185,7 +187,9 @@ def merge_enip_summaries(summaries: list[ENIPAnalysis]) -> ENIPAnalysis:
             _ = low, high
             entry = by_label.get(label)
             if not entry or entry["count"] <= 0:
-                merged_buckets.append(SizeBucket(label=label, count=0, avg=0.0, min=0, max=0, pct=0.0))
+                merged_buckets.append(
+                    SizeBucket(label=label, count=0, avg=0.0, min=0, max=0, pct=0.0)
+                )
                 continue
             count = int(entry["count"])
             avg = entry["sum"] / entry["count"] if entry["count"] else 0.0
@@ -333,10 +337,15 @@ def _parse_cpf(data: bytes) -> tuple[Optional[bytes], bool]:
         b"\x6f\x00" + len(data).to_bytes(2, "little") + b"\x00" * 20 + data
     )
     payload = info.get("cip_payload")
-    return (payload if isinstance(payload, (bytes, bytearray)) else None, bool(info.get("is_connected", False)))
+    return (
+        payload if isinstance(payload, (bytes, bytearray)) else None,
+        bool(info.get("is_connected", False)),
+    )
 
 
-def _parse_enip(payload: bytes) -> tuple[Optional[int], Optional[str], Optional[int], Optional[bytes], bool]:
+def _parse_enip(
+    payload: bytes,
+) -> tuple[Optional[int], Optional[str], Optional[int], Optional[bytes], bool]:
     info = _parse_enip_details_base(payload)
     return (
         info.get("command"),  # type: ignore[return-value]
@@ -353,18 +362,18 @@ def _parse_list_identity_response(data: bytes, src_ip: str) -> list[IdentityInfo
     ptr = 0
     ptr += 2
     ptr += 2
-    item_count = int.from_bytes(data[ptr:ptr + 2], "little")
+    item_count = int.from_bytes(data[ptr : ptr + 2], "little")
     ptr += 2
     identities: list[IdentityInfo] = []
     for _ in range(item_count):
         if ptr + 4 > len(data):
             break
-        item_type = int.from_bytes(data[ptr:ptr + 2], "little")
-        item_len = int.from_bytes(data[ptr + 2:ptr + 4], "little")
+        item_type = int.from_bytes(data[ptr : ptr + 2], "little")
+        item_len = int.from_bytes(data[ptr + 2 : ptr + 4], "little")
         ptr += 4
         if ptr + item_len > len(data):
             break
-        item_data = data[ptr:ptr + item_len]
+        item_data = data[ptr : ptr + item_len]
         ptr += item_len
         if item_type != 0x000C:
             continue
@@ -380,7 +389,9 @@ def _parse_list_identity_response(data: bytes, src_ip: str) -> list[IdentityInfo
         name_start = 15
         name_end = min(len(item_data), name_start + product_name_len)
         try:
-            product_name = item_data[name_start:name_end].decode("utf-8", errors="ignore")
+            product_name = item_data[name_start:name_end].decode(
+                "utf-8", errors="ignore"
+            )
         except Exception:
             product_name = None
         if product_name:
@@ -422,6 +433,7 @@ def _load_identity_mappings() -> dict[str, dict[str, object]]:
         return {}
     try:
         import json
+
         raw_text = safe_read_text(path, encoding="utf-8", errors="ignore")
         if not raw_text:
             return {}
@@ -441,20 +453,38 @@ def _resolve_identity_names(
     device_type_name = None
     product_code_name = None
 
-    vendors = mappings.get("vendors") if isinstance(mappings.get("vendors"), dict) else {}
-    device_types = mappings.get("device_types") if isinstance(mappings.get("device_types"), dict) else {}
-    product_codes = mappings.get("product_codes") if isinstance(mappings.get("product_codes"), dict) else {}
+    vendors = (
+        mappings.get("vendors") if isinstance(mappings.get("vendors"), dict) else {}
+    )
+    device_types = (
+        mappings.get("device_types")
+        if isinstance(mappings.get("device_types"), dict)
+        else {}
+    )
+    product_codes = (
+        mappings.get("product_codes")
+        if isinstance(mappings.get("product_codes"), dict)
+        else {}
+    )
 
     matched_vendor_id = None
     if vendor_id is not None:
         vendor_name = vendors.get(str(vendor_id))
         if vendor_name:
             matched_vendor_id = str(vendor_id)
-        vendor_bucket = product_codes.get(str(vendor_id)) if isinstance(product_codes, dict) else None
+        vendor_bucket = (
+            product_codes.get(str(vendor_id))
+            if isinstance(product_codes, dict)
+            else None
+        )
         if isinstance(vendor_bucket, dict) and product_code is not None:
             product_code_name = vendor_bucket.get(str(product_code))
 
-    if product_code_name is None and product_code is not None and isinstance(product_codes, dict):
+    if (
+        product_code_name is None
+        and product_code is not None
+        and isinstance(product_codes, dict)
+    ):
         for vendor_key, vendor_bucket in product_codes.items():
             if not isinstance(vendor_bucket, dict):
                 continue
@@ -484,21 +514,28 @@ def _scan_identity_items(payload: bytes, src_ip: str) -> list[IdentityInfo]:
     idx = 0
     max_len = len(payload)
     while idx + 4 <= max_len:
-        item_type = int.from_bytes(payload[idx:idx + 2], "little")
-        item_len = int.from_bytes(payload[idx + 2:idx + 4], "little")
+        item_type = int.from_bytes(payload[idx : idx + 2], "little")
+        item_len = int.from_bytes(payload[idx + 2 : idx + 4], "little")
         if item_type == 0x000C and item_len >= 28 and idx + 4 + item_len <= max_len:
-            item_data = payload[idx + 4:idx + 4 + item_len]
-            identities.extend(_parse_list_identity_response(
-                b"\x00\x00\x00\x00\x01\x00" + b"\x0c\x00" + item_len.to_bytes(2, "little") + item_data,
-                src_ip,
-            ))
+            item_data = payload[idx + 4 : idx + 4 + item_len]
+            identities.extend(
+                _parse_list_identity_response(
+                    b"\x00\x00\x00\x00\x01\x00"
+                    + b"\x0c\x00"
+                    + item_len.to_bytes(2, "little")
+                    + item_data,
+                    src_ip,
+                )
+            )
             idx += 4 + item_len
             continue
         idx += 1
     return identities
 
 
-def _parse_cip_service(payload: bytes) -> tuple[Optional[int], Optional[str], bool, Optional[int], Optional[str]]:
+def _parse_cip_service(
+    payload: bytes,
+) -> tuple[Optional[int], Optional[str], bool, Optional[int], Optional[str]]:
     if not payload:
         return None, None, True, None, None
     service = payload[0]
@@ -525,7 +562,11 @@ def _bucketize(values: list[int]) -> list[SizeBucket]:
         min_val = min(entries) if entries else 0
         max_val = max(entries) if entries else 0
         pct = (count / total) * 100 if total else 0.0
-        buckets.append(SizeBucket(label=label, count=count, avg=avg, min=min_val, max=max_val, pct=pct))
+        buckets.append(
+            SizeBucket(
+                label=label, count=count, avg=avg, min=min_val, max=max_val, pct=pct
+            )
+        )
     return buckets
 
 
@@ -564,7 +605,9 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
     src_enum_commands: Counter[str] = Counter()
     src_high_risk_commands: Counter[str] = Counter()
     src_recon_errors: Counter[str] = Counter()
-    identity_keys: set[tuple[str, int | None, int | None, int | None, str | None]] = set()
+    identity_keys: set[tuple[str, int | None, int | None, int | None, str | None]] = (
+        set()
+    )
     asset_write_targets: dict[str, set[str]] = defaultdict(set)
     asset_write_counts: Counter[str] = Counter()
     write_target_anoms_seen: set[str] = set()
@@ -592,11 +635,17 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                     start_time = ts
                 last_time = ts
 
-                has_transport, src_ip, dst_ip, sport, dport, payload = _extract_transport(pkt)
+                has_transport, src_ip, dst_ip, sport, dport, payload = (
+                    _extract_transport(pkt)
+                )
                 if not has_transport:
                     continue
 
-                matches_port = sport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT} or dport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
+                matches_port = sport in {
+                    ENIP_TCP_PORT,
+                    ENIP_UDP_PORT,
+                    ENIP_SECURITY_PORT,
+                } or dport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
                 matches_signature = False
                 if payload and len(payload) >= 2:
                     cmd_guess = int.from_bytes(payload[0:2], "little")
@@ -630,7 +679,10 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                 ts=ts or 0.0,
                             )
                         )
-                    if sec_key not in security_sessions_seen and len(analysis.anomalies) < max_anomalies:
+                    if (
+                        sec_key not in security_sessions_seen
+                        and len(analysis.anomalies) < max_anomalies
+                    ):
                         security_sessions_seen.add(sec_key)
                         analysis.anomalies.append(
                             IndustrialAnomaly(
@@ -654,12 +706,12 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                 if ts is not None:
                     session_last_ts[session_key] = ts
 
-                request_like = (dport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}) and (
-                    sport not in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
-                )
-                response_like = (sport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}) and (
-                    dport not in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
-                )
+                request_like = (
+                    dport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
+                ) and (sport not in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT})
+                response_like = (
+                    sport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
+                ) and (dport not in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT})
 
                 enip = _parse_enip_details_base(payload)
                 encap_command = enip.get("command")
@@ -676,12 +728,17 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
 
                 if encap_command is not None:
                     cmd_label = str(encap_name or f"Encap 0x{int(encap_command):04x}")
-                    actor_ip = src_ip if request_like else dst_ip if response_like else src_ip
+                    actor_ip = (
+                        src_ip if request_like else dst_ip if response_like else src_ip
+                    )
                     analysis.enip_commands[cmd_label] += 1
                     src_commands[actor_ip][cmd_label] += 1
                     src_enip_commands[actor_ip][cmd_label] += 1
 
-                    if cmd_label in SUSPICIOUS_ENIP_COMMANDS and len(analysis.anomalies) < max_anomalies:
+                    if (
+                        cmd_label in SUSPICIOUS_ENIP_COMMANDS
+                        and len(analysis.anomalies) < max_anomalies
+                    ):
                         analysis.anomalies.append(
                             IndustrialAnomaly(
                                 severity="LOW",
@@ -701,7 +758,9 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         src_unregister_commands[actor_ip] += 1
 
                     if session_handle and len(analysis.artifacts) < 200:
-                        session_key = f"enip_session:{actor_ip}:{session_handle}:{cmd_label}"
+                        session_key = (
+                            f"enip_session:{actor_ip}:{session_handle}:{cmd_label}"
+                        )
                         if session_key not in seen_artifacts:
                             seen_artifacts.add(session_key)
                             analysis.artifacts.append(
@@ -715,9 +774,14 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                             )
 
                 if encap_status is not None:
-                    status_text = str(enip.get("status_text") or f"0x{int(encap_status):08x}")
+                    status_text = str(
+                        enip.get("status_text") or f"0x{int(encap_status):08x}"
+                    )
                     analysis.status_codes[f"ENIP:{status_text}"] += 1
-                    if int(encap_status) != 0 and len(analysis.anomalies) < max_anomalies:
+                    if (
+                        int(encap_status) != 0
+                        and len(analysis.anomalies) < max_anomalies
+                    ):
                         analysis.anomalies.append(
                             IndustrialAnomaly(
                                 severity="LOW",
@@ -741,7 +805,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         )
                     )
 
-                if is_cip_carrier and cpf_malformed and len(analysis.anomalies) < max_anomalies:
+                if (
+                    is_cip_carrier
+                    and cpf_malformed
+                    and len(analysis.anomalies) < max_anomalies
+                ):
                     analysis.anomalies.append(
                         IndustrialAnomaly(
                             severity="MEDIUM",
@@ -753,8 +821,16 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         )
                     )
 
-                if is_cip_carrier and isinstance(cpf_item_types, list) and cpf_item_types and len(analysis.artifacts) < 200:
-                    item_names = [CPF_ITEM_TYPES.get(int(code), f"0x{int(code):04x}") for code in cpf_item_types[:4]]
+                if (
+                    is_cip_carrier
+                    and isinstance(cpf_item_types, list)
+                    and cpf_item_types
+                    and len(analysis.artifacts) < 200
+                ):
+                    item_names = [
+                        CPF_ITEM_TYPES.get(int(code), f"0x{int(code):04x}")
+                        for code in cpf_item_types[:4]
+                    ]
                     cpf_key = f"cpf_items:{','.join(str(int(code)) for code in cpf_item_types[:6])}"
                     if cpf_key not in seen_artifacts:
                         seen_artifacts.add(cpf_key)
@@ -776,13 +852,17 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                 parse_payload = b""
                 if is_cip_carrier and isinstance(cip_payload, (bytes, bytearray)):
                     parse_payload = bytes(cip_payload)
-                elif encap_command is None and isinstance(cip_payload, (bytes, bytearray)):
+                elif encap_command is None and isinstance(
+                    cip_payload, (bytes, bytearray)
+                ):
                     parse_payload = bytes(cip_payload)
 
                 if encap_data:
                     identities = []
                     if encap_command == 0x0063:
-                        identities.extend(_parse_list_identity_response(bytes(encap_data), src_ip))
+                        identities.extend(
+                            _parse_list_identity_response(bytes(encap_data), src_ip)
+                        )
                     identities.extend(_scan_identity_items(bytes(encap_data), src_ip))
                     for ident in identities:
                         key = (
@@ -798,17 +878,37 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         if len(analysis.identities) < 200:
                             analysis.identities.append(ident)
                         device_fields = {
-                            "vendor": ident.vendor_name or (f"Vendor {ident.vendor_id}" if ident.vendor_id is not None else None),
-                            "device_type": ident.device_type_name or (f"DeviceType {ident.device_type}" if ident.device_type is not None else None),
-                            "model": ident.product_code_name or (f"Product {ident.product_code}" if ident.product_code is not None else None),
+                            "vendor": ident.vendor_name
+                            or (
+                                f"Vendor {ident.vendor_id}"
+                                if ident.vendor_id is not None
+                                else None
+                            ),
+                            "device_type": ident.device_type_name
+                            or (
+                                f"DeviceType {ident.device_type}"
+                                if ident.device_type is not None
+                                else None
+                            ),
+                            "model": ident.product_code_name
+                            or (
+                                f"Product {ident.product_code}"
+                                if ident.product_code is not None
+                                else None
+                            ),
                             "product": ident.product_name,
                             "revision": ident.revision,
                             "serial": ident.serial_number,
                         }
-                        detail = device_fingerprint_from_fields(device_fields, source="ENIP ListIdentity")
+                        detail = device_fingerprint_from_fields(
+                            device_fields, source="ENIP ListIdentity"
+                        )
                         if detail:
                             key = f"device:{detail}"
-                            if key not in seen_artifacts and len(analysis.artifacts) < 200:
+                            if (
+                                key not in seen_artifacts
+                                and len(analysis.artifacts) < 200
+                            ):
                                 seen_artifacts.add(key)
                                 analysis.artifacts.append(
                                     IndustrialArtifact(
@@ -837,8 +937,14 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
 
                 service_code = (service & 0x7F) if service is not None else None
                 tag_name = _extract_symbol(path_str)
-                is_request = bool(cip_is_request) if service is not None else (request_like or not response_like)
-                data_type_code, element_count, tag_offset = _parse_tag_payload(service_code, is_request, cip_payload)
+                is_request = (
+                    bool(cip_is_request)
+                    if service is not None
+                    else (request_like or not response_like)
+                )
+                data_type_code, element_count, tag_offset = _parse_tag_payload(
+                    service_code, is_request, cip_payload
+                )
                 data_type_name = _decode_cip_data_type(data_type_code)
                 if is_request:
                     analysis.requests += 1
@@ -855,10 +961,15 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                     analysis.cip_services[service_name] += 1
                     actor_ip = src_ip if is_request else dst_ip
                     src_commands[actor_ip][service_name] += 1
-                    endpoints = analysis.service_endpoints.setdefault(service_name, Counter())
+                    endpoints = analysis.service_endpoints.setdefault(
+                        service_name, Counter()
+                    )
                     endpoints[f"{src_ip} -> {dst_ip}"] += 1
                     if is_request and service_code is not None:
-                        is_write_service = service_code in WRITE_SERVICE_CODES or service_code in HIGH_RISK_SERVICE_CODES
+                        is_write_service = (
+                            service_code in WRITE_SERVICE_CODES
+                            or service_code in HIGH_RISK_SERVICE_CODES
+                        )
                         if service_code in HIGH_RISK_SERVICE_CODES:
                             analysis.high_risk_services[service_name] += 1
                             analysis.source_risky_commands[src_ip] += 1
@@ -879,12 +990,18 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         if service_code == 0x0A:
                             sub_codes = _parse_multiple_service_packet(cip_payload)
                             if sub_codes:
-                                sub_names = [CIP_SERVICE_NAMES.get(code, f"Service 0x{code:02x}") for code in sub_codes]
+                                sub_names = [
+                                    CIP_SERVICE_NAMES.get(code, f"Service 0x{code:02x}")
+                                    for code in sub_codes
+                                ]
                                 msp_detail = ", ".join(sub_names[:6])
                                 if len(sub_names) > 6:
                                     msp_detail = f"{msp_detail} (+{len(sub_names) - 6})"
                                 msp_key = f"msp:{src_ip}:{dst_ip}:{msp_detail}"
-                                if msp_key not in seen_artifacts and len(analysis.artifacts) < 200:
+                                if (
+                                    msp_key not in seen_artifacts
+                                    and len(analysis.artifacts) < 200
+                                ):
                                     seen_artifacts.add(msp_key)
                                     analysis.artifacts.append(
                                         IndustrialArtifact(
@@ -898,22 +1015,37 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                 for sub_code, sub_name in zip(sub_codes, sub_names):
                                     msp_service_name = f"MSP/{sub_name}"
                                     analysis.cip_services[msp_service_name] += 1
-                                    msp_eps = analysis.service_endpoints.setdefault(msp_service_name, Counter())
+                                    msp_eps = analysis.service_endpoints.setdefault(
+                                        msp_service_name, Counter()
+                                    )
                                     msp_eps[f"{src_ip} -> {dst_ip}"] += 1
                                     if sub_code in HIGH_RISK_SERVICE_CODES:
-                                        analysis.high_risk_services[msp_service_name] += 1
+                                        analysis.high_risk_services[
+                                            msp_service_name
+                                        ] += 1
                                         analysis.source_risky_commands[src_ip] += 1
                                     if sub_code in ENUMERATION_SERVICE_CODES:
-                                        analysis.suspicious_services[msp_service_name] += 1
+                                        analysis.suspicious_services[
+                                            msp_service_name
+                                        ] += 1
                                         analysis.source_enum_commands[src_ip] += 1
                                     if sub_code in CONTROL_SERVICE_CODES:
                                         src_control_commands[src_ip] += 1
                                     if sub_code in PROGRAM_SERVICE_CODES:
                                         src_program_commands[src_ip] += 1
-                                    if sub_code in WRITE_SERVICE_CODES or sub_code in HIGH_RISK_SERVICE_CODES:
+                                    if (
+                                        sub_code in WRITE_SERVICE_CODES
+                                        or sub_code in HIGH_RISK_SERVICE_CODES
+                                    ):
                                         src_write_commands[src_ip] += 1
 
-                                if any(code in HIGH_RISK_SERVICE_CODES for code in sub_codes) and len(analysis.anomalies) < max_anomalies:
+                                if (
+                                    any(
+                                        code in HIGH_RISK_SERVICE_CODES
+                                        for code in sub_codes
+                                    )
+                                    and len(analysis.anomalies) < max_anomalies
+                                ):
                                     analysis.anomalies.append(
                                         IndustrialAnomaly(
                                             severity="HIGH",
@@ -943,9 +1075,15 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                 target_key = "|".join(target_parts)
                                 if target_key not in asset_write_targets[asset_key]:
                                     asset_write_targets[asset_key].add(target_key)
-                                    if asset_write_counts[asset_key] >= WRITE_BASELINE_MIN:
+                                    if (
+                                        asset_write_counts[asset_key]
+                                        >= WRITE_BASELINE_MIN
+                                    ):
                                         anomaly_key = f"{asset_key}:{target_key}"
-                                        if anomaly_key not in write_target_anoms_seen and len(analysis.anomalies) < max_anomalies:
+                                        if (
+                                            anomaly_key not in write_target_anoms_seen
+                                            and len(analysis.anomalies) < max_anomalies
+                                        ):
                                             write_target_anoms_seen.add(anomaly_key)
                                             analysis.anomalies.append(
                                                 IndustrialAnomaly(
@@ -958,12 +1096,22 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                                 )
                                             )
 
-                        sensitive_token = _match_sensitive_tag(tag_name if is_write_service else None)
+                        sensitive_token = _match_sensitive_tag(
+                            tag_name if is_write_service else None
+                        )
                         if sensitive_token:
                             sensitive_key = f"{src_ip}:{dst_ip}:{tag_name}:{service_name}:{sensitive_token}"
-                            if sensitive_key not in sensitive_write_seen and len(analysis.anomalies) < max_anomalies:
+                            if (
+                                sensitive_key not in sensitive_write_seen
+                                and len(analysis.anomalies) < max_anomalies
+                            ):
                                 sensitive_write_seen.add(sensitive_key)
-                                severity = "HIGH" if sensitive_token in {"safety", "sif", "estop", "trip", "interlock"} else "MEDIUM"
+                                severity = (
+                                    "HIGH"
+                                    if sensitive_token
+                                    in {"safety", "sif", "estop", "trip", "interlock"}
+                                    else "MEDIUM"
+                                )
                                 analysis.anomalies.append(
                                     IndustrialAnomaly(
                                         severity=severity,
@@ -975,7 +1123,10 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                     )
                                 )
                             artifact_key = f"sensitive_tag_write:{tag_name}:{sensitive_token}:{service_name}"
-                            if artifact_key not in seen_artifacts and len(analysis.artifacts) < 200:
+                            if (
+                                artifact_key not in seen_artifacts
+                                and len(analysis.artifacts) < 200
+                            ):
                                 seen_artifacts.add(artifact_key)
                                 analysis.artifacts.append(
                                     IndustrialArtifact(
@@ -996,7 +1147,9 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                     if instance_id is not None:
                         detail = f"{detail} Instance {instance_id}"
                     if attribute_id is not None:
-                        attr_name = CIP_ATTRIBUTE_NAMES.get(class_id, {}).get(attribute_id)
+                        attr_name = CIP_ATTRIBUTE_NAMES.get(class_id, {}).get(
+                            attribute_id
+                        )
                         if attr_name:
                             detail = f"{detail} Attribute {attribute_id} ({attr_name})"
                         else:
@@ -1015,7 +1168,10 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         )
                     if class_id in CIP_SAFETY_CLASS_IDS:
                         safety_key = f"cip_safety:{class_id}"
-                        if safety_key not in seen_artifacts and len(analysis.artifacts) < 200:
+                        if (
+                            safety_key not in seen_artifacts
+                            and len(analysis.artifacts) < 200
+                        ):
                             seen_artifacts.add(safety_key)
                             analysis.artifacts.append(
                                 IndustrialArtifact(
@@ -1026,7 +1182,13 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                     ts=ts or 0.0,
                                 )
                             )
-                        if is_request and service_code in WRITE_SERVICE_CODES | CONTROL_SERVICE_CODES | HIGH_RISK_SERVICE_CODES:
+                        if (
+                            is_request
+                            and service_code
+                            in WRITE_SERVICE_CODES
+                            | CONTROL_SERVICE_CODES
+                            | HIGH_RISK_SERVICE_CODES
+                        ):
                             if len(analysis.anomalies) < max_anomalies:
                                 analysis.anomalies.append(
                                     IndustrialAnomaly(
@@ -1040,7 +1202,10 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                 )
                     if class_id in CIP_SECURITY_CLASS_IDS:
                         security_key = f"cip_security:{class_id}"
-                        if security_key not in seen_artifacts and len(analysis.artifacts) < 200:
+                        if (
+                            security_key not in seen_artifacts
+                            and len(analysis.artifacts) < 200
+                        ):
                             seen_artifacts.add(security_key)
                             analysis.artifacts.append(
                                 IndustrialArtifact(
@@ -1051,7 +1216,13 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                     ts=ts or 0.0,
                                 )
                             )
-                        if is_request and service_code in WRITE_SERVICE_CODES | CONTROL_SERVICE_CODES | HIGH_RISK_SERVICE_CODES:
+                        if (
+                            is_request
+                            and service_code
+                            in WRITE_SERVICE_CODES
+                            | CONTROL_SERVICE_CODES
+                            | HIGH_RISK_SERVICE_CODES
+                        ):
                             if len(analysis.anomalies) < max_anomalies:
                                 analysis.anomalies.append(
                                     IndustrialAnomaly(
@@ -1069,9 +1240,16 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                     analysis.attribute_ids[attribute_id] += 1
 
                 if general_status is not None:
-                    cip_status_text = status_text or CIP_GENERAL_STATUS.get(general_status) or f"0x{general_status:02x}"
+                    cip_status_text = (
+                        status_text
+                        or CIP_GENERAL_STATUS.get(general_status)
+                        or f"0x{general_status:02x}"
+                    )
                     analysis.status_codes[f"CIP:{cip_status_text}"] += 1
-                    if general_status != 0x00 and len(analysis.anomalies) < max_anomalies:
+                    if (
+                        general_status != 0x00
+                        and len(analysis.anomalies) < max_anomalies
+                    ):
                         analysis.anomalies.append(
                             IndustrialAnomaly(
                                 severity="LOW",
@@ -1104,7 +1282,10 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                 ts=ts or 0.0,
                             )
                         )
-                    if service_code in {0x4B, 0x4C, 0x4D, 0x4E, 0x4F} and len(analysis.artifacts) < 200:
+                    if (
+                        service_code in {0x4B, 0x4C, 0x4D, 0x4E, 0x4F}
+                        and len(analysis.artifacts) < 200
+                    ):
                         op_parts = [f"tag={tag_name}"]
                         if data_type_name:
                             op_parts.append(f"type={data_type_name}")
@@ -1112,7 +1293,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                             op_parts.append(f"elements={element_count}")
                         if tag_offset is not None:
                             op_parts.append(f"offset={tag_offset}")
-                        op_kind = "tag_write" if is_request and service_code in {0x4C, 0x4E, 0x4F} else "tag_read"
+                        op_kind = (
+                            "tag_write"
+                            if is_request and service_code in {0x4C, 0x4E, 0x4F}
+                            else "tag_read"
+                        )
                         if not is_request:
                             op_kind = "tag_response"
                         detail = " ".join(op_parts)
@@ -1130,8 +1315,16 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                             )
 
                 if encap_command in {0x0004, 0x0063}:
-                    identity_payload = encap_data if isinstance(encap_data, (bytes, bytearray)) else cip_payload
-                    ascii_text = _format_ascii(bytes(identity_payload), limit=180) if identity_payload else ""
+                    identity_payload = (
+                        encap_data
+                        if isinstance(encap_data, (bytes, bytearray))
+                        else cip_payload
+                    )
+                    ascii_text = (
+                        _format_ascii(bytes(identity_payload), limit=180)
+                        if identity_payload
+                        else ""
+                    )
                     if ascii_text:
                         key = f"identity:{ascii_text}"
                         if key not in seen_artifacts and len(analysis.artifacts) < 200:
@@ -1208,7 +1401,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
         unique_dsts = len(dsts)
         req_count = src_requests.get(src, 0)
         resp_count = src_responses.get(src, 0)
-        if unique_dsts >= 20 and req_count > resp_count * 2 and len(analysis.anomalies) < max_anomalies:
+        if (
+            unique_dsts >= 20
+            and req_count > resp_count * 2
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="MEDIUM",
@@ -1220,7 +1417,9 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                 )
             )
 
-        if req_count >= 50 and any(cmd in SUSPICIOUS_ENIP_COMMANDS for cmd in src_enip_commands.get(src, {})):
+        if req_count >= 50 and any(
+            cmd in SUSPICIOUS_ENIP_COMMANDS for cmd in src_enip_commands.get(src, {})
+        ):
             if len(analysis.anomalies) < max_anomalies:
                 analysis.anomalies.append(
                     IndustrialAnomaly(
@@ -1235,7 +1434,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
 
     for src, enum_count in analysis.source_enip_enum_commands.items():
         unique_dsts = len(src_dst_counts.get(src, {}))
-        if enum_count >= 20 and unique_dsts >= 4 and len(analysis.anomalies) < max_anomalies:
+        if (
+            enum_count >= 20
+            and unique_dsts >= 4
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="MEDIUM",
@@ -1265,7 +1468,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
     for server, error_count in analysis.server_error_responses.items():
         resp_count = src_responses.get(server, 0)
         error_ratio = (error_count / resp_count) if resp_count else 0.0
-        if error_count >= 20 and error_ratio >= 0.4 and len(analysis.anomalies) < max_anomalies:
+        if (
+            error_count >= 20
+            and error_ratio >= 0.4
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="MEDIUM",
@@ -1308,7 +1515,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
 
     for src, recon_count in src_recon_errors.items():
         unique_dsts = len(src_dst_counts.get(src, {}))
-        if recon_count >= 10 and unique_dsts >= 3 and len(analysis.anomalies) < max_anomalies:
+        if (
+            recon_count >= 10
+            and unique_dsts >= 3
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="MEDIUM",
@@ -1327,7 +1538,7 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
         if avg <= 0:
             continue
         variance = sum((x - avg) ** 2 for x in intervals) / len(intervals)
-        cv = (variance ** 0.5) / avg
+        cv = (variance**0.5) / avg
         if cv <= 0.2 and 1.0 <= avg <= 300.0:
             src_part, dst_part = session_key.split(" -> ", 1)
             src_ip = src_part.split(":", 1)[0]
@@ -1361,7 +1572,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
     for src, control_count in src_control_commands.items():
         req_count = src_requests.get(src, 0)
         ratio = (control_count / req_count) if req_count else 0.0
-        if control_count >= 5 and ratio >= 0.1 and len(analysis.anomalies) < max_anomalies:
+        if (
+            control_count >= 5
+            and ratio >= 0.1
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="HIGH",
@@ -1389,7 +1604,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
     for src, write_count in src_write_commands.items():
         req_count = src_requests.get(src, 0)
         ratio = (write_count / req_count) if req_count else 0.0
-        if write_count >= 20 and ratio >= 0.3 and len(analysis.anomalies) < max_anomalies:
+        if (
+            write_count >= 20
+            and ratio >= 0.3
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="HIGH",
@@ -1404,7 +1623,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
     for src, risky_count in src_high_risk_commands.items():
         req_count = src_requests.get(src, 0)
         ratio = (risky_count / req_count) if req_count else 0.0
-        if risky_count >= 10 and ratio >= 0.2 and len(analysis.anomalies) < max_anomalies:
+        if (
+            risky_count >= 10
+            and ratio >= 0.2
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="HIGH",

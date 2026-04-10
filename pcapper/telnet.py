@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import re
 
+from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
 from .utils import safe_float
-from .device_detection import device_fingerprints_from_text
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -25,7 +25,9 @@ except Exception:  # pragma: no cover
 
 TELNET_PORTS = {23, 2323, 9923}
 
-USERNAME_RE = re.compile(r"(?:login|user(name)?|username)\s*[:=]\s*(\S+)", re.IGNORECASE)
+USERNAME_RE = re.compile(
+    r"(?:login|user(name)?|username)\s*[:=]\s*(\S+)", re.IGNORECASE
+)
 PASSWORD_RE = re.compile(r"(?:password|passwd|pass)\s*[:=]\s*(\S+)", re.IGNORECASE)
 
 SUSPICIOUS_PLAINTEXT = [
@@ -181,7 +183,9 @@ class _SessionState:
             self.passwords = Counter()
 
 
-def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
+def _extract_ascii_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
     results: list[str] = []
     if not data:
         return results
@@ -255,7 +259,9 @@ def _scan_plaintext(
             artifacts.append(item)
 
 
-def _direction(src_ip: str, dst_ip: str, sport: int, dport: int) -> tuple[str, str, int, int]:
+def _direction(
+    src_ip: str, dst_ip: str, sport: int, dport: int
+) -> tuple[str, str, int, int]:
     if dport in TELNET_PORTS:
         return src_ip, dst_ip, sport, dport
     if sport in TELNET_PORTS:
@@ -278,7 +284,7 @@ def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
     if avg <= 0:
         return None
     variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
+    stddev = variance**0.5
     if avg < 5 or avg > 86400:
         return None
     if stddev > max(5.0, avg * 0.25):
@@ -294,7 +300,9 @@ def analyze_telnet(
 ) -> TelnetSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
-        errors.append("Scapy IP/TCP layers unavailable; install scapy for Telnet analysis.")
+        errors.append(
+            "Scapy IP/TCP layers unavailable; install scapy for Telnet analysis."
+        )
         return TelnetSummary(
             path=path,
             total_packets=0,
@@ -514,7 +522,14 @@ def analyze_telnet(
                     value = pass_match.group(1)
                     session.passwords[value] += 1
                     passwords[value] += 1
-                _scan_plaintext(clean_payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts, commands)
+                _scan_plaintext(
+                    clean_payload,
+                    plaintext_strings,
+                    suspicious_plaintext,
+                    file_artifacts,
+                    artifacts,
+                    commands,
+                )
 
     except Exception as exc:
         errors.append(str(exc))
@@ -557,74 +572,95 @@ def analyze_telnet(
             short_session_by_client[session.client_ip] += 1
             short_session_targets[session.client_ip].add(session.server_ip)
         if session.first_seen is not None:
-            pair_first_seen[(session.client_ip, session.server_ip)].append(session.first_seen)
+            pair_first_seen[(session.client_ip, session.server_ip)].append(
+                session.first_seen
+            )
 
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
     non_standard_ports = [port for port in server_ports if port not in {23, 2323}]
     if non_standard_ports:
-        detections.append({
-            "severity": "info",
-            "summary": "Telnet observed on non-standard ports",
-            "details": ", ".join(str(port) for port in sorted(non_standard_ports)),
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "Telnet observed on non-standard ports",
+                "details": ", ".join(str(port) for port in sorted(non_standard_ports)),
+            }
+        )
 
     if usernames or passwords:
-        detections.append({
-            "severity": "warning",
-            "summary": "Cleartext Telnet credentials observed",
-            "details": "Usernames and/or passwords were extracted from Telnet sessions.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Cleartext Telnet credentials observed",
+                "details": "Usernames and/or passwords were extracted from Telnet sessions.",
+            }
+        )
 
     if suspicious_plaintext:
-        detections.append({
-            "severity": "warning",
-            "summary": "Suspicious plaintext strings observed in Telnet payloads",
-            "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Suspicious plaintext strings observed in Telnet payloads",
+                "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
+            }
+        )
 
     for (client_ip, server_ip), count in short_session_counts.items():
         if count >= 20:
-            anomalies.append({
-                "title": "Potential brute force or probing",
-                "details": f"{client_ip} -> {server_ip} short sessions: {count}",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential brute force or probing",
+                    "details": f"{client_ip} -> {server_ip} short sessions: {count}",
+                }
+            )
 
     for client_ip, count in short_session_by_client.items():
         targets = short_session_targets.get(client_ip, set())
         if count >= 30 and len(targets) >= 10:
-            anomalies.append({
-                "title": "Potential Telnet scanning",
-                "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential Telnet scanning",
+                    "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
+                }
+            )
 
     for (client_ip, server_ip), times in pair_first_seen.items():
         score = _beaconing_score(times)
         if score:
-            detections.append({
-                "severity": "info",
-                "summary": "Potential Telnet beaconing",
-                "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
-            })
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "Potential Telnet beaconing",
+                    "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
+                }
+            )
 
     for session in sessions.values():
-        if session.client_bytes >= 50 * 1024 * 1024 and session.client_bytes > session.server_bytes * 3:
-            detections.append({
-                "severity": "warning",
-                "summary": "Potential Telnet data upload/exfiltration",
-                "details": (
-                    f"{session.client_ip} -> {session.server_ip} "
-                    f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
-                ),
-            })
+        if (
+            session.client_bytes >= 50 * 1024 * 1024
+            and session.client_bytes > session.server_bytes * 3
+        ):
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Potential Telnet data upload/exfiltration",
+                    "details": (
+                        f"{session.client_ip} -> {session.server_ip} "
+                        f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
+                    ),
+                }
+            )
         if session.last_seen is not None and session.first_seen is not None:
             duration = session.last_seen - session.first_seen
             if duration >= 4 * 3600:
-                anomalies.append({
-                    "title": "Long-lived Telnet session",
-                    "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
-                })
+                anomalies.append(
+                    {
+                        "title": "Long-lived Telnet session",
+                        "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
+                    }
+                )
 
     total_sessions = len(conversations)
 
@@ -746,9 +782,17 @@ def merge_telnet_summaries(
         total_sessions += summary.total_sessions
 
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         client_counts.update(summary.client_counts)
         server_counts.update(summary.server_counts)

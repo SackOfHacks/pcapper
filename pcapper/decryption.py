@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -41,12 +41,16 @@ def _run_tshark(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
-def _collect_streams(path: Path, display_filter: str, pref: str | None) -> tuple[list[int], list[str]]:
+def _collect_streams(
+    path: Path, display_filter: str, pref: str | None
+) -> tuple[list[int], list[str]]:
     errors: list[str] = []
     cmd = ["tshark"]
     if pref:
         cmd.extend(["-o", pref])
-    cmd.extend(["-r", str(path), "-T", "fields", "-e", "tcp.stream", "-Y", display_filter])
+    cmd.extend(
+        ["-r", str(path), "-T", "fields", "-e", "tcp.stream", "-Y", display_filter]
+    )
     proc = _run_tshark(cmd)
     if proc.returncode != 0:
         errors.append(proc.stderr.strip() or "tshark stream listing failed.")
@@ -101,16 +105,22 @@ def _stream_label(path: Path, stream_id: int) -> str:
     return f"stream_{stream_id}"
 
 
-def _follow_stream(path: Path, stream_id: int, pref: str | None, follow_proto: str) -> tuple[str, str]:
+def _follow_stream(
+    path: Path, stream_id: int, pref: str | None, follow_proto: str
+) -> tuple[str, str]:
     cmd = ["tshark"]
     if pref:
         cmd.extend(["-o", pref])
-    cmd.extend(["-r", str(path), "-q", "-z", f"follow,{follow_proto},ascii,{stream_id}"])
+    cmd.extend(
+        ["-r", str(path), "-q", "-z", f"follow,{follow_proto},ascii,{stream_id}"]
+    )
     proc = _run_tshark(cmd)
     return proc.stdout, proc.stderr
 
 
-def decrypt_tls(path: Path, keylog: Path, output_dir: Path, limit: int) -> DecryptSummary:
+def decrypt_tls(
+    path: Path, keylog: Path, output_dir: Path, limit: int
+) -> DecryptSummary:
     errors: list[str] = []
     notes: list[str] = []
     outputs: list[Path] = []
@@ -164,7 +174,9 @@ def decrypt_tls(path: Path, keylog: Path, output_dir: Path, limit: int) -> Decry
     )
 
 
-def decrypt_ssh(path: Path, keylog: Path, output_dir: Path, limit: int) -> DecryptSummary:
+def decrypt_ssh(
+    path: Path, keylog: Path, output_dir: Path, limit: int
+) -> DecryptSummary:
     errors: list[str] = []
     notes: list[str] = []
     outputs: list[Path] = []

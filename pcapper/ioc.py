@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import json
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from collections import Counter
-import re
-import json
 
+from .files import analyze_files
 from .pcap_cache import get_reader
 from .utils import safe_float, safe_read_text
-from .files import analyze_files
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -42,7 +42,9 @@ class IocSummary:
     avg_confidence: Optional[float] = None
 
 
-def _load_iocs(path: Path, errors: list[str] | None = None) -> tuple[set[str], set[str], set[str], dict[str, dict[str, object]]]:
+def _load_iocs(
+    path: Path, errors: list[str] | None = None
+) -> tuple[set[str], set[str], set[str], dict[str, dict[str, object]]]:
     ips: set[str] = set()
     domains: set[str] = set()
     hashes: set[str] = set()
@@ -78,7 +80,9 @@ def _load_iocs(path: Path, errors: list[str] | None = None) -> tuple[set[str], s
                     value = str(item.get("value") or "").strip()
                     if not value:
                         continue
-                    kind = str(item.get("type") or item.get("kind") or "").strip().lower()
+                    kind = (
+                        str(item.get("type") or item.get("kind") or "").strip().lower()
+                    )
                     if not kind:
                         if re.fullmatch(r"[0-9a-fA-F]{32,64}", value):
                             kind = "hash"
@@ -160,7 +164,9 @@ def analyze_iocs(path: Path, ioc_path: Path, show_status: bool = True) -> IocSum
         if md5 and md5.lower() in hashes:
             hash_hits[md5.lower()] += 1
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -209,73 +215,95 @@ def analyze_iocs(path: Path, ioc_path: Path, show_status: bool = True) -> IocSum
         reader.close()
 
     if ip_hits:
-        def _format_hit(value: str, count: int) -> str:
-            entry = meta.get(value)
-            if not entry:
-                return f"{value} ({count})"
-            parts = []
-            if entry.get("source"):
-                parts.append(f"src={entry.get('source')}")
-            if entry.get("confidence") is not None:
-                parts.append(f"conf={int(entry.get('confidence') or 0)}")
-            mitre = entry.get("mitre") or []
-            if mitre:
-                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
-            suffix = f" ({count})"
-            if parts:
-                suffix = f" ({count}, {', '.join(parts)})"
-            return f"{value}{suffix}"
-        detections.append({
-            "severity": "high",
-            "summary": "IOC IP match",
-            "details": "; ".join(_format_hit(ip, count) for ip, count in ip_hits.most_common(5)),
-        })
-    if domain_hits:
-        def _format_hit(value: str, count: int) -> str:
-            entry = meta.get(value)
-            if not entry:
-                return f"{value} ({count})"
-            parts = []
-            if entry.get("source"):
-                parts.append(f"src={entry.get('source')}")
-            if entry.get("confidence") is not None:
-                parts.append(f"conf={int(entry.get('confidence') or 0)}")
-            mitre = entry.get("mitre") or []
-            if mitre:
-                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
-            suffix = f" ({count})"
-            if parts:
-                suffix = f" ({count}, {', '.join(parts)})"
-            return f"{value}{suffix}"
-        detections.append({
-            "severity": "high",
-            "summary": "IOC domain match",
-            "details": "; ".join(_format_hit(dom, count) for dom, count in domain_hits.most_common(5)),
-        })
-    if hash_hits:
-        def _format_hit(value: str, count: int) -> str:
-            entry = meta.get(value)
-            if not entry:
-                return f"{value} ({count})"
-            parts = []
-            if entry.get("source"):
-                parts.append(f"src={entry.get('source')}")
-            if entry.get("confidence") is not None:
-                parts.append(f"conf={int(entry.get('confidence') or 0)}")
-            mitre = entry.get("mitre") or []
-            if mitre:
-                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
-            suffix = f" ({count})"
-            if parts:
-                suffix = f" ({count}, {', '.join(parts)})"
-            return f"{value}{suffix}"
-        detections.append({
-            "severity": "critical",
-            "summary": "IOC hash match",
-            "details": "; ".join(_format_hit(h, count) for h, count in hash_hits.most_common(5)),
-        })
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+        def _format_hit(value: str, count: int) -> str:
+            entry = meta.get(value)
+            if not entry:
+                return f"{value} ({count})"
+            parts = []
+            if entry.get("source"):
+                parts.append(f"src={entry.get('source')}")
+            if entry.get("confidence") is not None:
+                parts.append(f"conf={int(entry.get('confidence') or 0)}")
+            mitre = entry.get("mitre") or []
+            if mitre:
+                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
+            suffix = f" ({count})"
+            if parts:
+                suffix = f" ({count}, {', '.join(parts)})"
+            return f"{value}{suffix}"
+
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "IOC IP match",
+                "details": "; ".join(
+                    _format_hit(ip, count) for ip, count in ip_hits.most_common(5)
+                ),
+            }
+        )
+    if domain_hits:
+
+        def _format_hit(value: str, count: int) -> str:
+            entry = meta.get(value)
+            if not entry:
+                return f"{value} ({count})"
+            parts = []
+            if entry.get("source"):
+                parts.append(f"src={entry.get('source')}")
+            if entry.get("confidence") is not None:
+                parts.append(f"conf={int(entry.get('confidence') or 0)}")
+            mitre = entry.get("mitre") or []
+            if mitre:
+                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
+            suffix = f" ({count})"
+            if parts:
+                suffix = f" ({count}, {', '.join(parts)})"
+            return f"{value}{suffix}"
+
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "IOC domain match",
+                "details": "; ".join(
+                    _format_hit(dom, count) for dom, count in domain_hits.most_common(5)
+                ),
+            }
+        )
+    if hash_hits:
+
+        def _format_hit(value: str, count: int) -> str:
+            entry = meta.get(value)
+            if not entry:
+                return f"{value} ({count})"
+            parts = []
+            if entry.get("source"):
+                parts.append(f"src={entry.get('source')}")
+            if entry.get("confidence") is not None:
+                parts.append(f"conf={int(entry.get('confidence') or 0)}")
+            mitre = entry.get("mitre") or []
+            if mitre:
+                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
+            suffix = f" ({count})"
+            if parts:
+                suffix = f" ({count}, {', '.join(parts)})"
+            return f"{value}{suffix}"
+
+        detections.append(
+            {
+                "severity": "critical",
+                "summary": "IOC hash match",
+                "details": "; ".join(
+                    _format_hit(h, count) for h, count in hash_hits.most_common(5)
+                ),
+            }
+        )
+
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     source_counts: Counter[str] = Counter()
     tag_counts: Counter[str] = Counter()
     mitre_counts: Counter[str] = Counter()

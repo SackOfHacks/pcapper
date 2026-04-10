@@ -109,7 +109,11 @@ def analyze_sizes(path: Path, show_status: bool = True) -> SizeSummary:
         min_size = min(sizes) if sizes else 0
         max_size = max(sizes) if sizes else 0
         pct = (count / total_packets) * 100 if total_packets else 0.0
-        rate = (count / duration_seconds) if duration_seconds and duration_seconds > 0 else 0.0
+        rate = (
+            (count / duration_seconds)
+            if duration_seconds and duration_seconds > 0
+            else 0.0
+        )
 
         burst_rate = 0.0
         burst_start = None
@@ -124,40 +128,50 @@ def analyze_sizes(path: Path, show_status: bool = True) -> SizeSummary:
                     burst_rate = float(window_count)
                     burst_start = times[left]
 
-        buckets.append(SizeBucketStat(
-            label=label,
-            count=count,
-            avg=avg_size,
-            min=min_size,
-            max=max_size,
-            rate=rate,
-            pct=pct,
-            burst_rate=burst_rate,
-            burst_start=burst_start,
-        ))
+        buckets.append(
+            SizeBucketStat(
+                label=label,
+                count=count,
+                avg=avg_size,
+                min=min_size,
+                max=max_size,
+                rate=rate,
+                pct=pct,
+                burst_rate=burst_rate,
+                burst_start=burst_start,
+            )
+        )
 
     detections: list[dict[str, object]] = []
     if total_packets == 0:
-        detections.append({
-            "severity": "info",
-            "summary": "No packets observed",
-            "details": "No packet sizes to analyze.",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "No packets observed",
+                "details": "No packet sizes to analyze.",
+            }
+        )
     else:
-        jumbo = next((b for b in buckets if b.label == "1501-9000" or b.label == "9001+"), None)
+        jumbo = next(
+            (b for b in buckets if b.label == "1501-9000" or b.label == "9001+"), None
+        )
         if jumbo and jumbo.pct > 5:
-            detections.append({
-                "severity": "warning",
-                "summary": "High volume of jumbo packets",
-                "details": f"{jumbo.pct:.1f}% of traffic exceeds 1500 bytes; check for tunneling or exfil.",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "High volume of jumbo packets",
+                    "details": f"{jumbo.pct:.1f}% of traffic exceeds 1500 bytes; check for tunneling or exfil.",
+                }
+            )
         tiny = next((b for b in buckets if b.label in {"0-64", "65-128"}), None)
         if tiny and tiny.pct > 40:
-            detections.append({
-                "severity": "warning",
-                "summary": "Tiny-packet heavy profile",
-                "details": f"{tiny.pct:.1f}% of packets are <=128 bytes; possible scanning or keepalive chatter.",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Tiny-packet heavy profile",
+                    "details": f"{tiny.pct:.1f}% of packets are <=128 bytes; possible scanning or keepalive chatter.",
+                }
+            )
 
     return SizeSummary(
         path=path,

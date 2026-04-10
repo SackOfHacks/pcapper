@@ -42,7 +42,9 @@ class EncryptedDnsSummary:
 
 
 def analyze_encrypted_dns(path: Path, show_status: bool = True) -> EncryptedDnsSummary:
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     dot_packets = 0
     doh_packets = 0
@@ -117,13 +119,35 @@ def analyze_encrypted_dns(path: Path, show_status: bool = True) -> EncryptedDnsS
         reader.close()
 
     if dot_packets:
-        detections.append({"severity": "info", "summary": "DNS over TLS observed", "details": f"{dot_packets} packets on TCP/853"})
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "DNS over TLS observed",
+                "details": f"{dot_packets} packets on TCP/853",
+            }
+        )
     if doh_packets:
-        detections.append({"severity": "info", "summary": "DNS over HTTPS indicators observed", "details": f"{doh_packets} HTTP requests with /dns-query paths"})
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "DNS over HTTPS indicators observed",
+                "details": f"{doh_packets} HTTP requests with /dns-query paths",
+            }
+        )
     if doq_packets:
-        detections.append({"severity": "info", "summary": "DNS over QUIC observed", "details": f"{doq_packets} packets on UDP/853"})
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "DNS over QUIC observed",
+                "details": f"{doq_packets} packets on UDP/853",
+            }
+        )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return EncryptedDnsSummary(
         path=path,
         total_packets=total_packets,

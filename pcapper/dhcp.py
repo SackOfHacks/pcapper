@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
-from pathlib import Path
 import ipaddress
 import math
 import re
-from typing import Optional
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Optional
 
+from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
 from .utils import safe_float
-from .device_detection import device_fingerprints_from_text
 
 try:
+    from scapy.layers.dhcp import BOOTP, DHCP  # type: ignore
     from scapy.layers.inet import IP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
     from scapy.layers.l2 import Ether  # type: ignore
-    from scapy.layers.dhcp import DHCP, BOOTP  # type: ignore
     from scapy.packet import Raw  # type: ignore
 except Exception:
     IP = UDP = IPv6 = Ether = DHCP = BOOTP = Raw = None
@@ -25,6 +25,23 @@ except Exception:
 _FILENAME_RE = re.compile(
     r"[\w\-.()\[\] ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|txt|bat|ps1|jpg|jpeg|png|gif|iso|img|tar|gz|7z|rar)",
     re.IGNORECASE,
+)
+
+_BENIGN_DHCP_IDENTITY_TOKENS = (
+    "msft",
+    "android",
+    "iphone",
+    "ios",
+    "linux",
+    "ubuntu",
+    "debian",
+    "fedora",
+    "windows",
+    "apple",
+    "chromebook",
+    "vmware",
+    "virtualbox",
+    "pxeclient",
 )
 
 _DHCP_MESSAGE_TYPES = {
@@ -38,8 +55,39 @@ _DHCP_MESSAGE_TYPES = {
     8: "INFORM",
 }
 
+_DHCP6_MESSAGE_TYPES = {
+    1: "SOLICITv6",
+    2: "ADVERTISEv6",
+    3: "REQUESTv6",
+    4: "CONFIRMv6",
+    5: "RENEWv6",
+    6: "REBINDv6",
+    7: "REPLYv6",
+    8: "RELEASEv6",
+    9: "DECLINEv6",
+    10: "RECONFIGUREv6",
+    11: "INFO-REQUESTv6",
+    12: "RELAY-FORWv6",
+    13: "RELAY-REPLv6",
+}
+
 _SERVER_MSG_TYPES = {"OFFER", "ACK", "NAK"}
 _CLIENT_MSG_TYPES = {"DISCOVER", "REQUEST", "DECLINE", "RELEASE", "INFORM"}
+
+_SERVER_MSG_TYPES.update({"ADVERTISEv6", "REPLYv6", "RECONFIGUREv6", "RELAY-REPLv6"})
+_CLIENT_MSG_TYPES.update(
+    {
+        "SOLICITv6",
+        "REQUESTv6",
+        "CONFIRMv6",
+        "RENEWv6",
+        "REBINDv6",
+        "RELEASEv6",
+        "DECLINEv6",
+        "INFO-REQUESTv6",
+        "RELAY-FORWv6",
+    }
+)
 
 
 @dataclass
@@ -70,6 +118,20 @@ class DhcpSession:
 
 
 @dataclass
+class DhcpHostLease:
+    client_mac: str
+    client_ip: str
+    hostname: str = "-"
+    server: str = "-"
+    lease_seconds: Optional[int] = None
+    lease_start: Optional[float] = None
+    lease_end_estimate: Optional[float] = None
+    first_seen: Optional[float] = None
+    last_seen: Optional[float] = None
+    message_count: int = 0
+
+
+@dataclass
 class DhcpArtifact:
     kind: str
     detail: str
@@ -96,6 +158,7 @@ class DhcpSummary:
     dhcp_packets: int = 0
     conversations: list[DhcpConversation] = field(default_factory=list)
     sessions: list[DhcpSession] = field(default_factory=list)
+    host_leases: list[DhcpHostLease] = field(default_factory=list)
     message_types: Counter[str] = field(default_factory=Counter)
     src_ips: Counter[str] = field(default_factory=Counter)
     dst_ips: Counter[str] = field(default_factory=Counter)
@@ -107,6 +170,7 @@ class DhcpSummary:
     requested_ips: Counter[str] = field(default_factory=Counter)
     offered_ips: Counter[str] = field(default_factory=Counter)
     hostnames: Counter[str] = field(default_factory=Counter)
+    client_hostnames_by_mac: dict[str, list[str]] = field(default_factory=dict)
     domains: Counter[str] = field(default_factory=Counter)
     vendor_classes: Counter[str] = field(default_factory=Counter)
     vendor_classes_by_mac: dict[str, Counter[str]] = field(default_factory=dict)
@@ -114,6 +178,8 @@ class DhcpSummary:
     client_ids: Counter[str] = field(default_factory=Counter)
     lease_servers: Counter[str] = field(default_factory=Counter)
     lease_time_buckets: Counter[str] = field(default_factory=Counter)
+    dhcp_option_counts: Counter[str] = field(default_factory=Counter)
+    dhcp_option_values: dict[str, Counter[str]] = field(default_factory=dict)
     plaintext_observed: Counter[str] = field(default_factory=Counter)
     files_discovered: list[str] = field(default_factory=list)
     attacks: Counter[str] = field(default_factory=Counter)
@@ -287,12 +353,89 @@ def _first_option(option_map: dict[str, object], keys: tuple[str, ...]) -> str:
     return ""
 
 
+def _parse_dhcp6_options(payload: bytes) -> tuple[str, dict[str, object], int]:
+    if not payload:
+        return "UNKNOWNv6", {}, 0
+
+    msg_type_code = int(payload[0])
+    msg_type = _DHCP6_MESSAGE_TYPES.get(msg_type_code, f"TYPE{msg_type_code}v6")
+    options: dict[str, object] = {}
+
+    xid = 0
+    offset = 4
+    if msg_type_code in {12, 13}:  # relay-forward / relay-reply
+        offset = 34 if len(payload) >= 34 else len(payload)
+    elif len(payload) >= 4:
+        xid = int.from_bytes(payload[1:4], "big", signed=False)
+
+    while offset + 4 <= len(payload):
+        code = int.from_bytes(payload[offset : offset + 2], "big", signed=False)
+        length = int.from_bytes(payload[offset + 2 : offset + 4], "big", signed=False)
+        offset += 4
+        if offset + length > len(payload):
+            break
+        value = payload[offset : offset + length]
+        offset += length
+
+        if code == 1:  # ClientID (DUID)
+            options["client_id"] = value.hex()
+        elif code == 2:  # ServerID (DUID)
+            options["server_id"] = value.hex()
+        elif code == 23:  # DNS Recursive Name Server
+            addrs: list[str] = []
+            idx = 0
+            while idx + 16 <= len(value):
+                raw = value[idx : idx + 16]
+                try:
+                    addrs.append(str(ipaddress.IPv6Address(raw)))
+                except Exception:
+                    pass
+                idx += 16
+            if addrs:
+                options["name_server"] = addrs
+        elif code == 24:  # Domain Search List
+            decoded = _decode_name(value)
+            if decoded:
+                options["domain_name"] = decoded
+        elif code == 59:  # Bootfile URL
+            decoded = _decode_name(value)
+            if decoded:
+                options["bootfile_name"] = decoded
+        elif code == 60:  # Bootfile params
+            decoded = _decode_name(value)
+            if decoded:
+                options["bootfile_params"] = decoded
+        elif code == 18:  # Interface-Id (relay)
+            decoded = _decode_name(value)
+            if decoded:
+                options["relay_agent_information"] = decoded
+        elif code == 5 and len(value) >= 16:  # IAADDR
+            try:
+                options["requested_addr"] = str(ipaddress.IPv6Address(value[0:16]))
+            except Exception:
+                pass
+        elif code == 16:  # Vendor Class
+            decoded = _decode_name(value)
+            if decoded:
+                options["vendor_class"] = decoded
+        elif code == 15:  # User Class
+            decoded = _decode_name(value)
+            if decoded:
+                options["hostname"] = decoded
+
+    return msg_type, options, xid
+
+
 def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
     if DHCP is None or BOOTP is None or UDP is None:
-        return DhcpSummary(path=path, errors=["Scapy unavailable (DHCP/BOOTP/UDP layer missing)"])
+        return DhcpSummary(
+            path=path, errors=["Scapy unavailable (DHCP/BOOTP/UDP layer missing)"]
+        )
 
     try:
-        reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+        reader, status, stream, size_bytes, _file_type = get_reader(
+            path, show_status=show_status
+        )
     except Exception as exc:
         return DhcpSummary(path=path, errors=[f"Error opening pcap: {exc}"])
 
@@ -302,14 +445,20 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
 
     conversations: dict[tuple[str, str, str, str, int, int, str], DhcpConversation] = {}
     sessions: dict[tuple[str, str, str], DhcpSession] = {}
+    host_leases: dict[tuple[str, str, str], DhcpHostLease] = {}
     vendor_classes_by_mac: dict[str, Counter[str]] = defaultdict(Counter)
     vendor_classes_by_ip: dict[str, Counter[str]] = defaultdict(Counter)
+    dhcp_option_values: dict[str, Counter[str]] = defaultdict(Counter)
 
     discover_intervals: dict[str, list[float]] = defaultdict(list)
     last_discover_ts: dict[str, float] = {}
     client_xids: dict[str, set[int]] = defaultdict(set)
     client_requested_ips: dict[str, set[str]] = defaultdict(set)
     src_unique_client_macs: dict[str, set[str]] = defaultdict(set)
+    client_src_ips: Counter[str] = Counter()
+    server_src_ips: Counter[str] = Counter()
+    source_first_seen: dict[str, float] = {}
+    client_first_seen: dict[str, float] = {}
     offer_servers_by_client: dict[str, set[str]] = defaultdict(set)
     nak_by_server: Counter[str] = Counter()
     xid_client_requests: dict[str, set[int]] = defaultdict(set)
@@ -320,7 +469,9 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
     client_hostname_set: dict[str, set[str]] = defaultdict(set)
     client_id_set: dict[str, set[str]] = defaultdict(set)
     client_vendor_set: dict[str, set[str]] = defaultdict(set)
-    server_policy_values: dict[str, dict[str, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
+    server_policy_values: dict[str, dict[str, Counter[str]]] = defaultdict(
+        lambda: defaultdict(Counter)
+    )
 
     exfil_signals: Counter[str] = Counter()
     strings_counter: Counter[str] = Counter()
@@ -339,7 +490,9 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
         "likely_benign_failover_context": [],
     }
 
-    def _append_anomaly(severity: str, title: str, description: str, src: str, dst: str, ts: float) -> None:
+    def _append_anomaly(
+        severity: str, title: str, description: str, src: str, dst: str, ts: float
+    ) -> None:
         if len(summary.anomalies) >= max_anomalies:
             return
         summary.anomalies.append(
@@ -368,10 +521,25 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             udp_layer = pkt[UDP]
             sport = int(getattr(udp_layer, "sport", 0) or 0)
             dport = int(getattr(udp_layer, "dport", 0) or 0)
-            if {sport, dport}.isdisjoint({67, 68}):
-                continue
+            is_dhcpv4 = (
+                (not {sport, dport}.isdisjoint({67, 68}))
+                and pkt.haslayer(DHCP)
+                and pkt.haslayer(BOOTP)
+            )
+            is_dhcpv6 = False
+            if (
+                not is_dhcpv4
+                and not {sport, dport}.isdisjoint({546, 547})
+                and IPv6 is not None
+                and pkt.haslayer(IPv6)
+            ):
+                payload_probe = _extract_payload(pkt)
+                if payload_probe:
+                    msg_code = int(payload_probe[0])
+                    if msg_code in _DHCP6_MESSAGE_TYPES:
+                        is_dhcpv6 = True
 
-            if not (pkt.haslayer(DHCP) and pkt.haslayer(BOOTP)):
+            if not (is_dhcpv4 or is_dhcpv6):
                 continue
 
             summary.dhcp_packets += 1
@@ -384,36 +552,79 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             src_ip, dst_ip = _extract_ip_pair(pkt)
             src_mac, dst_mac = _extract_mac_pair(pkt)
             payload = _extract_payload(pkt)
+            if src_ip and src_ip not in source_first_seen:
+                source_first_seen[src_ip] = ts
 
             summary.src_ips[src_ip] += 1
             summary.dst_ips[dst_ip] += 1
             summary.src_macs[src_mac] += 1
             summary.dst_macs[dst_mac] += 1
 
-            dhcp_layer = pkt[DHCP]
-            bootp_layer = pkt[BOOTP]
+            chaddr = src_mac if src_mac and src_mac != "00:00:00:00:00:00" else src_ip
+            ciaddr = src_ip
+            yiaddr = "0.0.0.0"
+            siaddr = dst_ip
+            xid = 0
+            option_map: dict[str, object] = {}
+            msg_type = "UNKNOWN"
 
-            chaddr = _format_mac(getattr(bootp_layer, "chaddr", b""))
-            ciaddr = str(getattr(bootp_layer, "ciaddr", "0.0.0.0") or "0.0.0.0")
-            yiaddr = str(getattr(bootp_layer, "yiaddr", "0.0.0.0") or "0.0.0.0")
-            siaddr = str(getattr(bootp_layer, "siaddr", "0.0.0.0") or "0.0.0.0")
-            xid = int(getattr(bootp_layer, "xid", 0) or 0)
-
-            options = _iter_dhcp_options(dhcp_layer)
-            option_map: dict[str, object] = {key: value for key, value in options}
-            msg_type = _message_type_name(option_map.get("message-type", "UNKNOWN"))
+            if is_dhcpv4:
+                dhcp_layer = pkt[DHCP]
+                bootp_layer = pkt[BOOTP]
+                chaddr = _format_mac(getattr(bootp_layer, "chaddr", b""))
+                ciaddr = str(getattr(bootp_layer, "ciaddr", "0.0.0.0") or "0.0.0.0")
+                yiaddr = str(getattr(bootp_layer, "yiaddr", "0.0.0.0") or "0.0.0.0")
+                siaddr = str(getattr(bootp_layer, "siaddr", "0.0.0.0") or "0.0.0.0")
+                xid = int(getattr(bootp_layer, "xid", 0) or 0)
+                options = _iter_dhcp_options(dhcp_layer)
+                option_map = {key: value for key, value in options}
+                msg_type = _message_type_name(option_map.get("message-type", "UNKNOWN"))
+            elif is_dhcpv6:
+                msg_type, option_map, xid = _parse_dhcp6_options(payload)
+                chaddr = _decode_name(option_map.get("client_id", ""))[:64] or chaddr
+                ciaddr = src_ip
+                yiaddr = _decode_name(option_map.get("requested_addr", "")) or "0.0.0.0"
+                siaddr = dst_ip
             summary.message_types[msg_type] += 1
 
-            server_id = _decode_name(option_map.get("server_id", option_map.get("server-id", "")))
-            requested_ip = _decode_name(option_map.get("requested_addr", option_map.get("requested-address", "")))
-            hostname = _decode_name(option_map.get("hostname", option_map.get("host_name", ""))).lower()
-            domain = _decode_name(option_map.get("domain", option_map.get("domain_name", ""))).lower()
-            vendor_class = _decode_name(option_map.get("vendor_class_id", option_map.get("vendor_class", "")))
+            for opt_key, opt_value in option_map.items():
+                option_name = str(opt_key or "").strip().lower()
+                if not option_name:
+                    continue
+                summary.dhcp_option_counts[option_name] += 1
+                for item in _option_value_list(opt_value):
+                    cleaned = str(item).strip()
+                    if not cleaned:
+                        continue
+                    dhcp_option_values[option_name][cleaned[:120]] += 1
+
+            server_id = _decode_name(
+                option_map.get("server_id", option_map.get("server-id", ""))
+            )
+            requested_ip = _decode_name(
+                option_map.get(
+                    "requested_addr", option_map.get("requested-address", "")
+                )
+            )
+            hostname = _decode_name(
+                option_map.get("hostname", option_map.get("host_name", ""))
+            ).lower()
+            domain = _decode_name(
+                option_map.get("domain", option_map.get("domain_name", ""))
+            ).lower()
+            vendor_class = _decode_name(
+                option_map.get("vendor_class_id", option_map.get("vendor_class", ""))
+            )
             client_id = _decode_name(option_map.get("client_id", ""))
 
             session_client_ip = ciaddr if ciaddr != "0.0.0.0" else src_ip
 
-            relay_ip = _decode_name(option_map.get("relay_agent_Information", option_map.get("relay_agent_information", "")))
+            relay_ip = _decode_name(
+                option_map.get(
+                    "relay_agent_Information",
+                    option_map.get("relay_agent_information", ""),
+                )
+            )
             if relay_ip:
                 summary.relay_agents[relay_ip] += 1
 
@@ -462,8 +673,17 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             router_opt = _first_option(option_map, ("router",))
             dns_opt = _first_option(option_map, ("name_server", "domain_name_server"))
             domain_opt = _first_option(option_map, ("domain", "domain_name"))
-            wpad_opt = _first_option(option_map, ("wpad", "option_252", "proxy_autodiscovery"))
-            routes_opt = _first_option(option_map, ("classless_static_routes", "static_route", "ms_classless_static_routes"))
+            wpad_opt = _first_option(
+                option_map, ("wpad", "option_252", "proxy_autodiscovery")
+            )
+            routes_opt = _first_option(
+                option_map,
+                (
+                    "classless_static_routes",
+                    "static_route",
+                    "ms_classless_static_routes",
+                ),
+            )
             tftp_opt = _first_option(option_map, ("tftp_server_name",))
             bootfile_opt = _first_option(option_map, ("bootfile_name", "file"))
 
@@ -486,7 +706,9 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             ):
                 if not value:
                     continue
-                for detail in device_fingerprints_from_text(str(value), source=source_label):
+                for detail in device_fingerprints_from_text(
+                    str(value), source=source_label
+                ):
                     key = f"device:{detail}"
                     if key in seen_device_artifacts:
                         continue
@@ -503,9 +725,13 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
 
             if msg_type in _CLIENT_MSG_TYPES:
                 summary.client_details[chaddr] += 1
+                client_src_ips[src_ip] += 1
+                if chaddr not in client_first_seen:
+                    client_first_seen[chaddr] = ts
             if msg_type in _SERVER_MSG_TYPES:
                 server_key = server_id or src_ip
                 summary.server_details[server_key] += 1
+                server_src_ips[src_ip] += 1
 
             convo_key = (src_ip, dst_ip, src_mac, dst_mac, sport, dport, msg_type)
             convo = conversations.get(convo_key)
@@ -531,19 +757,31 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             sess_key = (chaddr, session_client_ip, session_server)
             session = sessions.get(sess_key)
             if session is None:
-                session = DhcpSession(client_mac=chaddr, client_ip=session_client_ip, server_ip=session_server)
+                session = DhcpSession(
+                    client_mac=chaddr,
+                    client_ip=session_client_ip,
+                    server_ip=session_server,
+                )
                 sessions[sess_key] = session
 
-            if msg_type == "REQUEST":
+            if msg_type in {
+                "REQUEST",
+                "REQUESTv6",
+                "SOLICITv6",
+                "RENEWv6",
+                "REBINDv6",
+                "CONFIRMv6",
+                "INFO-REQUESTv6",
+            }:
                 session.requests += 1
                 if xid:
                     xid_client_requests[chaddr].add(xid)
-            elif msg_type == "OFFER":
+            elif msg_type in {"OFFER", "ADVERTISEv6"}:
                 session.offers += 1
                 offer_servers_by_client[chaddr].add(server_id or src_ip)
                 if xid:
                     xid_server_seen[chaddr].add(xid)
-            elif msg_type == "ACK":
+            elif msg_type in {"ACK", "REPLYv6"}:
                 session.acks += 1
                 if xid:
                     xid_server_seen[chaddr].add(xid)
@@ -558,7 +796,52 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             if session.last_seen is None or ts > session.last_seen:
                 session.last_seen = ts
 
-            if msg_type == "DISCOVER":
+            # Build per-host lease records from DHCP assignment lifecycle evidence.
+            assigned_ip = yiaddr if yiaddr and yiaddr != "0.0.0.0" else ""
+            if not assigned_ip and requested_ip and requested_ip != "0.0.0.0":
+                assigned_ip = requested_ip
+            if not assigned_ip and session_client_ip and session_client_ip != "0.0.0.0":
+                assigned_ip = session_client_ip
+
+            if assigned_ip and msg_type in {"OFFER", "ACK", "ADVERTISEv6", "REPLYv6"}:
+                lease_server = server_id or siaddr or src_ip or "-"
+                lease_key = (chaddr or "-", assigned_ip, lease_server)
+                lease = host_leases.get(lease_key)
+                if lease is None:
+                    lease = DhcpHostLease(
+                        client_mac=chaddr or "-",
+                        client_ip=assigned_ip,
+                        server=lease_server,
+                    )
+                    host_leases[lease_key] = lease
+
+                if hostname:
+                    lease.hostname = hostname
+
+                if lease.first_seen is None or ts < lease.first_seen:
+                    lease.first_seen = ts
+                if lease.last_seen is None or ts > lease.last_seen:
+                    lease.last_seen = ts
+
+                if msg_type in {"ACK", "REPLYv6"}:
+                    if lease.lease_start is None or ts < lease.lease_start:
+                        lease.lease_start = ts
+
+                if lease_time_val is not None:
+                    try:
+                        lease_seconds = int(lease_time_val)
+                    except Exception:
+                        lease_seconds = None
+                    if lease_seconds is not None and lease_seconds > 0:
+                        lease.lease_seconds = lease_seconds
+                        lease_base = (
+                            lease.lease_start if lease.lease_start is not None else ts
+                        )
+                        lease.lease_end_estimate = lease_base + float(lease_seconds)
+
+                lease.message_count += 1
+
+            if msg_type in {"DISCOVER", "SOLICITv6"}:
                 prev = last_discover_ts.get(chaddr)
                 if prev is not None and ts > prev:
                     discover_intervals[chaddr].append(ts - prev)
@@ -573,7 +856,13 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             if yiaddr and yiaddr != "0.0.0.0" and msg_type in {"OFFER", "ACK"}:
                 yiaddr_clients[yiaddr].add(chaddr)
 
-            if msg_type in _SERVER_MSG_TYPES and xid and xid not in xid_client_requests.get(chaddr, set()):
+            has_client_identity = bool(chaddr and chaddr != "00:00:00:00:00:00")
+            if (
+                msg_type in _SERVER_MSG_TYPES
+                and xid
+                and has_client_identity
+                and xid not in xid_client_requests.get(chaddr, set())
+            ):
                 summary.transaction_violations.append(
                     {
                         "server": server_key,
@@ -592,6 +881,9 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             # Exfil/abuse heuristics for option values
             for value in (hostname, domain, vendor_class, client_id):
                 if not value:
+                    continue
+                low_value = value.lower()
+                if any(token in low_value for token in _BENIGN_DHCP_IDENTITY_TOKENS):
                     continue
                 entropy = _shannon_entropy(value)
                 if len(value) >= 80 or entropy >= 3.8:
@@ -624,35 +916,59 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
     if start_ts is not None and end_ts is not None:
         summary.duration = max(0.0, end_ts - start_ts)
 
-    summary.plaintext_observed = Counter({item: count for item, count in strings_counter.most_common(30)})
+    summary.plaintext_observed = Counter(
+        {item: count for item, count in strings_counter.most_common(30)}
+    )
     summary.files_discovered = sorted(files)[:80]
     summary.vendor_classes_by_mac = dict(vendor_classes_by_mac)
     summary.vendor_classes_by_ip = dict(vendor_classes_by_ip)
-    summary.conversations = sorted(conversations.values(), key=lambda item: item.packets, reverse=True)
-    summary.sessions = sorted(sessions.values(), key=lambda item: (item.requests + item.offers + item.acks + item.naks), reverse=True)
+    summary.dhcp_option_values = dict(dhcp_option_values)
+    summary.client_hostnames_by_mac = {
+        str(mac): sorted(str(host) for host in hosts if str(host).strip())[:8]
+        for mac, hosts in client_hostname_set.items()
+        if hosts
+    }
+    summary.host_leases = sorted(
+        host_leases.values(),
+        key=lambda item: (
+            safe_float(item.lease_start) if item.lease_start is not None else -1.0,
+            safe_float(item.last_seen) if item.last_seen is not None else -1.0,
+            item.message_count,
+        ),
+        reverse=True,
+    )
+    summary.conversations = sorted(
+        conversations.values(), key=lambda item: item.packets, reverse=True
+    )
+    summary.sessions = sorted(
+        sessions.values(),
+        key=lambda item: (item.requests + item.offers + item.acks + item.naks),
+        reverse=True,
+    )
 
     # Threat hunting detections
-    if summary.duration > 0 and summary.dhcp_packets >= 400:
-        overall_pps = summary.dhcp_packets / summary.duration
+    total_client_msgs = sum(client_src_ips.values())
+    if summary.duration > 0 and total_client_msgs >= 300:
+        overall_pps = total_client_msgs / summary.duration
         if overall_pps >= 80.0:
             summary.attacks["DHCP Flood Attack"] += 1
             summary.threat_summary["DHCP Flood Attack"] += 1
             summary.risk_factors["Elevated DHCP packets-per-second"] += 1
             deterministic_checks["starvation_exhaustion_behavior"].append(
-                f"overall_dhcp_rate={overall_pps:.2f}pps packets={summary.dhcp_packets} duration={summary.duration:.2f}s"
+                f"overall_client_dhcp_rate={overall_pps:.2f}pps packets={total_client_msgs} duration={summary.duration:.2f}s"
             )
             _append_anomaly(
                 "HIGH",
                 "High DHCP Packet Rate",
-                f"Capture shows elevated DHCP packet rate ({overall_pps:.2f} pkt/s, total={summary.dhcp_packets}).",
+                f"Capture shows elevated client DHCP packet rate ({overall_pps:.2f} pkt/s, client-total={total_client_msgs}).",
                 "-",
                 "-",
-                0.0,
+                start_ts or 0.0,
             )
 
     if summary.duration > 0:
         flood_sources: list[tuple[str, int, float]] = []
-        for src_ip, count in summary.src_ips.items():
+        for src_ip, count in client_src_ips.items():
             if count < 150:
                 continue
             pps = count / summary.duration
@@ -676,7 +992,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 f"Top source {top_src} sent {top_count} DHCP packets at {top_pps:.2f} pkt/s; suspicious sources={len(flood_sources)}.",
                 top_src,
                 "-",
-                0.0,
+                source_first_seen.get(top_src, start_ts or 0.0),
             )
 
     for client_mac, req_ips in client_requested_ips.items():
@@ -697,7 +1013,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 f"Client {client_mac} issued {req_count} client messages with {unique_xid_count} XIDs and {unique_ip_count} requested addresses.",
                 client_mac,
                 "-",
-                0.0,
+                client_first_seen.get(client_mac, start_ts or 0.0),
             )
 
         if unique_ip_count >= 30:
@@ -711,10 +1027,12 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 f"Client {client_mac} requested {unique_ip_count} distinct IP addresses.",
                 client_mac,
                 "-",
-                0.0,
+                client_first_seen.get(client_mac, start_ts or 0.0),
             )
 
-    offer_servers = [server for server, count in summary.server_details.items() if count >= 3]
+    offer_servers = [
+        server for server, count in summary.server_details.items() if count >= 3
+    ]
     if len(offer_servers) >= 2:
         summary.attacks["Rogue DHCP Server"] += 1
         summary.threat_summary["Rogue DHCP Server"] += 1
@@ -728,7 +1046,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             f"Potential rogue/competing DHCP servers observed: {', '.join(offer_servers[:8])}",
             ", ".join(offer_servers[:4]),
             "-",
-            0.0,
+            start_ts or 0.0,
         )
 
     for server, count in nak_by_server.items():
@@ -742,7 +1060,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 f"Server {server} sent {count} DHCP NAK responses.",
                 server,
                 "-",
-                0.0,
+                source_first_seen.get(server, start_ts or 0.0),
             )
 
     for src_ip, macs in src_unique_client_macs.items():
@@ -757,7 +1075,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 f"Source {src_ip} carried DHCP traffic for {len(macs)} unique client MACs.",
                 src_ip,
                 "-",
-                0.0,
+                source_first_seen.get(src_ip, start_ts or 0.0),
             )
 
     for client_mac, intervals in discover_intervals.items():
@@ -780,7 +1098,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 f"Client {client_mac} shows periodic DHCP discover cadence (avg={avg:.2f}s, cv={cv:.2f}, n={len(intervals)}).",
                 client_mac,
                 "-",
-                0.0,
+                client_first_seen.get(client_mac, start_ts or 0.0),
             )
 
     for client_mac, signal_count in exfil_signals.items():
@@ -795,7 +1113,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             f"Client {client_mac} produced {signal_count} suspicious high-entropy/long DHCP option values.",
             client_mac,
             "-",
-            0.0,
+            client_first_seen.get(client_mac, start_ts or 0.0),
         )
 
     for attack_name, count in summary.attacks.items():
@@ -805,7 +1123,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 detail=f"{attack_name}: {count}",
                 src="-",
                 dst="-",
-                ts=0.0,
+                ts=end_ts or start_ts or 0.0,
             )
         )
 
@@ -816,7 +1134,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 detail=file_name,
                 src="-",
                 dst="-",
-                ts=0.0,
+                ts=end_ts or start_ts or 0.0,
             )
         )
 
@@ -832,7 +1150,9 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
         if yiaddr == "0.0.0.0" or len(clients) < 2:
             continue
         clients_sorted = sorted(clients)
-        summary.lease_conflicts.append({"ip": yiaddr, "clients": clients_sorted, "count": len(clients_sorted)})
+        summary.lease_conflicts.append(
+            {"ip": yiaddr, "clients": clients_sorted, "count": len(clients_sorted)}
+        )
         deterministic_checks["lease_conflict_duplicate_assignment"].append(
             f"{yiaddr} assigned to multiple clients: {', '.join(clients_sorted[:6])}"
         )
@@ -913,11 +1233,39 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 f"{client_mac} identity churn hostnames={hostname_count} client_ids={client_id_count} vendors={vendor_count}"
             )
 
-    if len(summary.server_details) == 2 and not summary.policy_tampering and not summary.lease_conflicts:
+    potential_failover = (
+        len(offer_servers) == 2
+        and not summary.policy_tampering
+        and not summary.lease_conflicts
+        and len(summary.transaction_violations) < 5
+    )
+    if potential_failover:
+        summary.attacks["Rogue DHCP Server"] = max(
+            0, int(summary.attacks.get("Rogue DHCP Server", 0)) - 1
+        )
+        summary.threat_summary["Rogue DHCP Server"] = max(
+            0, int(summary.threat_summary.get("Rogue DHCP Server", 0)) - 1
+        )
+        summary.risk_factors["Multiple active DHCP servers"] = max(
+            0,
+            int(summary.risk_factors.get("Multiple active DHCP servers", 0)) - 1,
+        )
+        deterministic_checks["rogue_competing_server_evidence"] = [
+            item
+            for item in deterministic_checks.get("rogue_competing_server_evidence", [])
+            if "Competing servers observed" not in str(item)
+        ]
+        summary.anomalies = [
+            item
+            for item in summary.anomalies
+            if getattr(item, "title", "") != "Multiple DHCP Servers Detected"
+        ]
         deterministic_checks["likely_benign_failover_context"].append(
             "Dual DHCP servers with no policy drift or duplicate lease conflicts"
         )
-        summary.benign_context.append("Dual-server DHCP may reflect HA/failover behavior")
+        summary.benign_context.append(
+            "Dual-server DHCP may reflect HA/failover behavior"
+        )
 
     for violation in summary.transaction_violations[:120]:
         summary.timeline.append(
@@ -951,7 +1299,9 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
         ),
         reverse=True,
     )
-    summary.deterministic_checks = {key: values[:50] for key, values in deterministic_checks.items()}
+    summary.deterministic_checks = {
+        key: values[:50] for key, values in deterministic_checks.items()
+    }
     summary.policy_tampering = summary.policy_tampering[:50]
     summary.transaction_violations = summary.transaction_violations[:120]
     summary.lease_conflicts = summary.lease_conflicts[:60]
@@ -959,3 +1309,98 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
     summary.benign_context = summary.benign_context[:25]
 
     return summary
+
+
+def merge_dhcp_summaries(summaries: Iterable[DhcpSummary]) -> DhcpSummary:
+    summary_list = list(summaries)
+    if not summary_list:
+        return DhcpSummary(path=Path("ALL_PCAPS"))
+
+    merged = DhcpSummary(path=Path("ALL_PCAPS"))
+
+    deterministic_checks: dict[str, list[str]] = defaultdict(list)
+    seen_check_values: dict[str, set[str]] = defaultdict(set)
+
+    for item in summary_list:
+        merged.duration += float(item.duration or 0.0)
+        merged.total_packets += int(item.total_packets or 0)
+        merged.dhcp_packets += int(item.dhcp_packets or 0)
+
+        merged.message_types.update(item.message_types)
+        merged.src_ips.update(item.src_ips)
+        merged.dst_ips.update(item.dst_ips)
+        merged.src_macs.update(item.src_macs)
+        merged.dst_macs.update(item.dst_macs)
+        merged.client_details.update(item.client_details)
+        merged.server_details.update(item.server_details)
+        merged.relay_agents.update(item.relay_agents)
+        merged.requested_ips.update(item.requested_ips)
+        merged.offered_ips.update(item.offered_ips)
+        merged.hostnames.update(item.hostnames)
+        merged.domains.update(item.domains)
+        merged.vendor_classes.update(item.vendor_classes)
+        merged.client_ids.update(item.client_ids)
+        merged.lease_servers.update(item.lease_servers)
+        merged.lease_time_buckets.update(item.lease_time_buckets)
+        merged.plaintext_observed.update(item.plaintext_observed)
+        merged.attacks.update(item.attacks)
+        merged.threat_summary.update(item.threat_summary)
+        merged.beacon_candidates.update(item.beacon_candidates)
+        merged.exfil_candidates.update(item.exfil_candidates)
+        merged.probe_sources.update(item.probe_sources)
+        merged.brute_force_sources.update(item.brute_force_sources)
+        merged.risk_factors.update(item.risk_factors)
+
+        for key, values in (item.vendor_classes_by_mac or {}).items():
+            merged.vendor_classes_by_mac.setdefault(key, Counter()).update(values)
+        for key, values in (item.vendor_classes_by_ip or {}).items():
+            merged.vendor_classes_by_ip.setdefault(key, Counter()).update(values)
+
+        merged.conversations.extend(item.conversations)
+        merged.sessions.extend(item.sessions)
+        merged.policy_tampering.extend(item.policy_tampering)
+        merged.transaction_violations.extend(item.transaction_violations)
+        merged.lease_conflicts.extend(item.lease_conflicts)
+        merged.relay_anomalies.extend(item.relay_anomalies)
+        merged.server_policy_profiles.extend(item.server_policy_profiles)
+        merged.client_abuse_profiles.extend(item.client_abuse_profiles)
+        merged.timeline.extend(item.timeline)
+        merged.artifacts.extend(item.artifacts)
+        merged.anomalies.extend(item.anomalies)
+        merged.errors.extend(item.errors)
+        merged.files_discovered.extend(item.files_discovered)
+        merged.benign_context.extend(item.benign_context)
+
+        for check_key, values in (item.deterministic_checks or {}).items():
+            for value in values or []:
+                text = str(value).strip()
+                if not text or text in seen_check_values[check_key]:
+                    continue
+                seen_check_values[check_key].add(text)
+                deterministic_checks[check_key].append(text)
+
+    merged.conversations = sorted(
+        merged.conversations, key=lambda row: row.packets, reverse=True
+    )[:500]
+    merged.sessions = sorted(
+        merged.sessions,
+        key=lambda row: (row.requests + row.offers + row.acks + row.naks),
+        reverse=True,
+    )[:500]
+    merged.timeline.sort(key=lambda row: float(row.get("ts", 0.0) or 0.0))
+    merged.timeline = merged.timeline[:500]
+    merged.policy_tampering = merged.policy_tampering[:200]
+    merged.transaction_violations = merged.transaction_violations[:300]
+    merged.lease_conflicts = merged.lease_conflicts[:200]
+    merged.relay_anomalies = merged.relay_anomalies[:200]
+    merged.server_policy_profiles = merged.server_policy_profiles[:300]
+    merged.client_abuse_profiles = merged.client_abuse_profiles[:300]
+    merged.artifacts = merged.artifacts[:400]
+    merged.anomalies = merged.anomalies[:300]
+    merged.files_discovered = sorted(set(merged.files_discovered))[:200]
+    merged.benign_context = sorted(set(merged.benign_context))[:40]
+    merged.deterministic_checks = {
+        key: values[:120] for key, values in deterministic_checks.items()
+    }
+
+    return merged

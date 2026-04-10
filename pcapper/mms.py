@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
 import ipaddress
+from pathlib import Path
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_port_protocol,
+)
 
 MMS_PORT = 102
 
@@ -89,7 +93,7 @@ def _read_ber_length(data: bytes, idx: int) -> tuple[int | None, int]:
     count = first & 0x7F
     if count == 0 or idx + count > len(data):
         return None, idx
-    length = int.from_bytes(data[idx:idx + count], "big")
+    length = int.from_bytes(data[idx : idx + count], "big")
     idx += count
     return length, idx
 
@@ -102,7 +106,7 @@ def _read_ber_tlv(data: bytes, idx: int) -> tuple[int | None, bytes, int]:
     length, idx = _read_ber_length(data, idx)
     if length is None or idx + length > len(data):
         return None, b"", idx
-    value = data[idx:idx + length]
+    value = data[idx : idx + length]
     return tag, value, idx + length
 
 

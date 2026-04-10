@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
+import math
+import struct
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set
-import ipaddress
-import struct
-import math
 
 try:
     from scapy.layers.inet import TCP, UDP
@@ -58,7 +58,7 @@ FUNC_CODES = {
     31: "Activate Config",
     32: "Authenticate Req",
     33: "Authenticate Err",
-    129: "Response"
+    129: "Response",
 }
 
 CONTROL_FUNCTIONS = {2, 4, 5, 6}
@@ -237,8 +237,8 @@ def _strip_crc_blocks(frame: bytes) -> tuple[bytes, bool]:
         if remaining < 3:
             break
         data_len = min(16, remaining - 2)
-        data = data_with_crc[idx:idx + data_len]
-        crc_bytes = data_with_crc[idx + data_len:idx + data_len + 2]
+        data = data_with_crc[idx : idx + data_len]
+        crc_bytes = data_with_crc[idx + data_len : idx + data_len + 2]
         if not _check_crc(data, crc_bytes):
             all_ok = False
         out.extend(data)
@@ -293,7 +293,10 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
     objects: list[dict[str, object]] = []
     details: list[str] = []
     idx = 0
-    def _decode_values(group: int, variation: int, raw: bytes, count: int | None) -> tuple[Optional[str], list[object]]:
+
+    def _decode_values(
+        group: int, variation: int, raw: bytes, count: int | None
+    ) -> tuple[Optional[str], list[object]]:
         values_out: list[object] = []
         if count is None or count <= 0:
             return None, values_out
@@ -390,15 +393,19 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
                 if flags is not None:
                     val = (flags >> 0) & 0x03
             elif value_type == "int" and value_size:
-                val = int.from_bytes(raw[offset:offset + value_size], "little", signed=True)
+                val = int.from_bytes(
+                    raw[offset : offset + value_size], "little", signed=True
+                )
             elif value_type == "uint" and value_size:
-                val = int.from_bytes(raw[offset:offset + value_size], "little", signed=False)
+                val = int.from_bytes(
+                    raw[offset : offset + value_size], "little", signed=False
+                )
             elif value_type == "float" and value_size:
                 try:
                     if value_size == 4:
-                        val = struct.unpack("<f", raw[offset:offset + value_size])[0]
+                        val = struct.unpack("<f", raw[offset : offset + value_size])[0]
                     elif value_size == 8:
-                        val = struct.unpack("<d", raw[offset:offset + value_size])[0]
+                        val = struct.unpack("<d", raw[offset : offset + value_size])[0]
                 except Exception:
                     val = None
             if val is not None:
@@ -410,6 +417,7 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
         if count > len(values):
             suffix = f" (+{count - len(values)} more)"
         return f"[{', '.join(values)}]{suffix}", values_out
+
     while idx + 3 <= len(data):
         group = data[idx]
         variation = data[idx + 1]
@@ -422,15 +430,15 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
             size = QUALIFIER_RANGE_SIZES[qualifier]
             if idx + (2 * size) > len(data):
                 break
-            start = int.from_bytes(data[idx:idx + size], "little")
-            stop = int.from_bytes(data[idx + size:idx + 2 * size], "little")
+            start = int.from_bytes(data[idx : idx + size], "little")
+            stop = int.from_bytes(data[idx + size : idx + 2 * size], "little")
             count = max((stop - start + 1), 0)
             idx += 2 * size
         elif qualifier in QUALIFIER_COUNT_SIZES:
             size = QUALIFIER_COUNT_SIZES[qualifier]
             if idx + size > len(data):
                 break
-            count = int.from_bytes(data[idx:idx + size], "little")
+            count = int.from_bytes(data[idx : idx + size], "little")
             idx += size
         else:
             break
@@ -459,7 +467,9 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
             break
         if idx + data_len > len(data):
             break
-        value_preview, values_out = _decode_values(group, variation, data[idx:idx + data_len], count)
+        value_preview, values_out = _decode_values(
+            group, variation, data[idx : idx + data_len], count
+        )
         if value_preview:
             summary = f"{summary} values={value_preview}"
             objects[-1]["summary"] = summary
@@ -468,29 +478,33 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
         idx += data_len
     return objects, details
 
+
 # --- Dataclasses ---
+
 
 @dataclass
 class Dnp3Message:
     ts: float
     src_ip: str
     dst_ip: str
-    src_addr: int # Data Link Source
-    dst_addr: int # Data Link Dest
+    src_addr: int  # Data Link Source
+    dst_addr: int  # Data Link Dest
     len: int
     func_code: Optional[int]
     func_name: str
-    is_master: bool # True if sending requests typically (heuristically)
+    is_master: bool  # True if sending requests typically (heuristically)
     object_summary: Optional[str] = None
+
 
 @dataclass
 class Dnp3Anomaly:
-    severity: str # CRITICAL, HIGH, MEDIUM, LOW
+    severity: str  # CRITICAL, HIGH, MEDIUM, LOW
     title: str
     description: str
     src: str
     dst: str
     ts: float
+
 
 @dataclass
 class Dnp3Analysis:
@@ -498,13 +512,15 @@ class Dnp3Analysis:
     duration: float = 0.0
     total_packets: int = 0
     dnp3_packets: int = 0
-    
+
     # Statistics
     func_counts: Counter[str] = field(default_factory=Counter)
-    src_addrs: Counter[int] = field(default_factory=Counter) # DNP3 Addresses
+    src_addrs: Counter[int] = field(default_factory=Counter)  # DNP3 Addresses
     dst_addrs: Counter[int] = field(default_factory=Counter)
-    ip_endpoints: Counter[str] = field(default_factory=Counter) # IP addresses participating
-    
+    ip_endpoints: Counter[str] = field(
+        default_factory=Counter
+    )  # IP addresses participating
+
     # Activity
     messages: List[Dnp3Message] = field(default_factory=list)
     object_counts: Counter[str] = field(default_factory=Counter)
@@ -512,7 +528,7 @@ class Dnp3Analysis:
     anomalies: List[Dnp3Anomaly] = field(default_factory=list)
     value_changes: List[dict[str, object]] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
-    
+
     @property
     def unique_dnp3_addresses(self) -> int:
         return len(set(list(self.src_addrs.keys()) + list(self.dst_addrs.keys())))
@@ -565,12 +581,12 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
 
     total_packets = 0
     dnp3_packets = 0
-    
+
     func_counts = Counter()
     src_addrs = Counter()
     dst_addrs = Counter()
     ip_endpoints = Counter()
-    
+
     messages: List[Dnp3Message] = []
     anomalies: List[Dnp3Anomaly] = []
     object_counts: Counter[str] = Counter()
@@ -596,7 +612,16 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
     start_time = None
     last_time = None
 
-    def _parse_object_header(data: bytes) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
+    def _parse_object_header(
+        data: bytes,
+    ) -> tuple[
+        Optional[int],
+        Optional[int],
+        Optional[int],
+        Optional[int],
+        Optional[int],
+        Optional[int],
+    ]:
         if len(data) < 3:
             return None, None, None, None, None, None
         group = data[0]
@@ -610,17 +635,17 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
             size = QUALIFIER_RANGE_SIZES[qualifier]
             if idx + (2 * size) > len(data):
                 return group, variation, qualifier, None, None, None
-            start = int.from_bytes(data[idx:idx + size], "little")
-            stop = int.from_bytes(data[idx + size:idx + 2 * size], "little")
+            start = int.from_bytes(data[idx : idx + size], "little")
+            stop = int.from_bytes(data[idx + size : idx + 2 * size], "little")
             if stop is not None and start is not None:
                 count = max((stop - start + 1), 0)
         elif qualifier in QUALIFIER_COUNT_SIZES:
             size = QUALIFIER_COUNT_SIZES[qualifier]
             if idx + size > len(data):
                 return group, variation, qualifier, None, None, None
-            count = int.from_bytes(data[idx:idx + size], "little")
+            count = int.from_bytes(data[idx : idx + size], "little")
         return group, variation, qualifier, count, start, stop
-    
+
     try:
         with status as pbar:
             try:
@@ -639,12 +664,12 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                 if start_time is None:
                     start_time = ts
                 last_time = ts
-                
+
                 # Check ports
                 has_transport = False
                 sport, dport = 0, 0
                 payload = b""
-                
+
                 if pkt.haslayer(TCP):
                     has_transport = True
                     sport = int(pkt[TCP].sport)
@@ -672,7 +697,9 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                     # Fallback: parse TCP/UDP from raw bytes if scapy didn't dissect layers
                     try:
                         raw = bytes(pkt)
-                        if len(raw) >= 34 and raw[12:14] == b"\x08\x00":  # Ethernet + IPv4
+                        if (
+                            len(raw) >= 34 and raw[12:14] == b"\x08\x00"
+                        ):  # Ethernet + IPv4
                             ihl = (raw[14] & 0x0F) * 4
                             proto = raw[23]
                             ip_start = 14
@@ -680,25 +707,43 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                             transport_start = ip_start + ihl
                             if proto == 6 and len(raw) >= transport_start + 20:
                                 data_offset = (raw[transport_start + 12] >> 4) * 4
-                                sport = int.from_bytes(raw[transport_start:transport_start + 2], "big")
-                                dport = int.from_bytes(raw[transport_start + 2:transport_start + 4], "big")
+                                sport = int.from_bytes(
+                                    raw[transport_start : transport_start + 2], "big"
+                                )
+                                dport = int.from_bytes(
+                                    raw[transport_start + 2 : transport_start + 4],
+                                    "big",
+                                )
                                 payload_start = transport_start + data_offset
                                 ip_end = ip_start + total_len
-                                payload = raw[payload_start:ip_end] if ip_end <= len(raw) else raw[payload_start:]
+                                payload = (
+                                    raw[payload_start:ip_end]
+                                    if ip_end <= len(raw)
+                                    else raw[payload_start:]
+                                )
                                 has_transport = True
                             elif proto == 17 and len(raw) >= transport_start + 8:
-                                sport = int.from_bytes(raw[transport_start:transport_start + 2], "big")
-                                dport = int.from_bytes(raw[transport_start + 2:transport_start + 4], "big")
+                                sport = int.from_bytes(
+                                    raw[transport_start : transport_start + 2], "big"
+                                )
+                                dport = int.from_bytes(
+                                    raw[transport_start + 2 : transport_start + 4],
+                                    "big",
+                                )
                                 payload_start = transport_start + 8
                                 ip_end = ip_start + total_len
-                                payload = raw[payload_start:ip_end] if ip_end <= len(raw) else raw[payload_start:]
+                                payload = (
+                                    raw[payload_start:ip_end]
+                                    if ip_end <= len(raw)
+                                    else raw[payload_start:]
+                                )
                                 has_transport = True
                     except Exception:
                         pass
 
                 if not has_transport:
                     continue
-                
+
                 frames = _parse_dnp3_frames(payload) if payload else []
 
                 is_dnp3 = bool(frames)
@@ -714,8 +759,8 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                 dnp3_packets += 1
 
                 for dl_src, dl_dst, dl_ctrl, user_data, crc_ok in frames:
-                    src_ip = pkt[0].src if hasattr(pkt[0], 'src') else "?"
-                    dst_ip = pkt[0].dst if hasattr(pkt[0], 'dst') else "?"
+                    src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
+                    dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "?"
 
                     ip_endpoints[src_ip] += 1
                     ip_endpoints[dst_ip] += 1
@@ -724,14 +769,16 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                     dst_addrs[dl_dst] += 1
 
                     if not crc_ok and len(anomalies) < max_anomalies:
-                        anomalies.append(Dnp3Anomaly(
-                            "LOW",
-                            "DNP3 CRC Mismatch",
-                            "DNP3 frame CRC mismatch detected (possible corruption or tampering).",
-                            src_ip,
-                            dst_ip,
-                            ts,
-                        ))
+                        anomalies.append(
+                            Dnp3Anomaly(
+                                "LOW",
+                                "DNP3 CRC Mismatch",
+                                "DNP3 frame CRC mismatch detected (possible corruption or tampering).",
+                                src_ip,
+                                dst_ip,
+                                ts,
+                            )
+                        )
 
                     if not user_data or len(user_data) < 2:
                         continue
@@ -778,42 +825,77 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                     if func_code in TIME_FUNCTIONS:
                         src_time_counts[src_ip] += 1
 
-                    if func_code in RESTART_FUNCTIONS and len(anomalies) < max_anomalies:
-                        anomalies.append(Dnp3Anomaly(
-                            "HIGH", "DNP3 Restart", f"System restart command ({func_name}) detected",
-                            src_ip, dst_ip, ts
-                        ))
+                    if (
+                        func_code in RESTART_FUNCTIONS
+                        and len(anomalies) < max_anomalies
+                    ):
+                        anomalies.append(
+                            Dnp3Anomaly(
+                                "HIGH",
+                                "DNP3 Restart",
+                                f"System restart command ({func_name}) detected",
+                                src_ip,
+                                dst_ip,
+                                ts,
+                            )
+                        )
 
                     if func_code == 2 and len(anomalies) < max_anomalies:
-                        anomalies.append(Dnp3Anomaly(
-                            "MEDIUM", "DNP3 Write", f"Write command detected to {dst_ip} (Addr {dl_dst})",
-                            src_ip, dst_ip, ts
-                        ))
+                        anomalies.append(
+                            Dnp3Anomaly(
+                                "MEDIUM",
+                                "DNP3 Write",
+                                f"Write command detected to {dst_ip} (Addr {dl_dst})",
+                                src_ip,
+                                dst_ip,
+                                ts,
+                            )
+                        )
 
                     if func_code in FILE_FUNCTIONS and len(anomalies) < max_anomalies:
-                        anomalies.append(Dnp3Anomaly(
-                            "HIGH", "DNP3 File Op", f"File operation ({func_name}) detected",
-                            src_ip, dst_ip, ts
-                        ))
+                        anomalies.append(
+                            Dnp3Anomaly(
+                                "HIGH",
+                                "DNP3 File Op",
+                                f"File operation ({func_name}) detected",
+                                src_ip,
+                                dst_ip,
+                                ts,
+                            )
+                        )
 
                     app_payload_start = 2
                     if is_response and len(app_data) >= 4:
                         iin = int.from_bytes(app_data[2:4], "little")
                         if iin & 0x0080 and len(anomalies) < max_anomalies:
-                            anomalies.append(Dnp3Anomaly(
-                                "MEDIUM", "IIN Device Restart", "Internal Indication: Device Restart detected",
-                                src_ip, dst_ip, ts
-                            ))
+                            anomalies.append(
+                                Dnp3Anomaly(
+                                    "MEDIUM",
+                                    "IIN Device Restart",
+                                    "Internal Indication: Device Restart detected",
+                                    src_ip,
+                                    dst_ip,
+                                    ts,
+                                )
+                            )
                         if iin & 0x0040 and len(anomalies) < max_anomalies:
-                            anomalies.append(Dnp3Anomaly(
-                                "MEDIUM", "IIN Device Trouble", "Internal Indication: Device Trouble/Error",
-                                src_ip, dst_ip, ts
-                            ))
+                            anomalies.append(
+                                Dnp3Anomaly(
+                                    "MEDIUM",
+                                    "IIN Device Trouble",
+                                    "Internal Indication: Device Trouble/Error",
+                                    src_ip,
+                                    dst_ip,
+                                    ts,
+                                )
+                            )
                         app_payload_start = 4
 
                     object_summary = None
                     if app_payload_start < len(app_data):
-                        obj_items, obj_keys = _parse_objects(app_data[app_payload_start:])
+                        obj_items, obj_keys = _parse_objects(
+                            app_data[app_payload_start:]
+                        )
                         if obj_items:
                             object_summary = str(obj_items[0].get("summary") or "")
                         for key in obj_keys:
@@ -823,7 +905,9 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                             except Exception:
                                 group_id = None
                             if group_id is not None:
-                                group_name = OBJECT_GROUPS.get(group_id, f"Group {group_id}")
+                                group_name = OBJECT_GROUPS.get(
+                                    group_id, f"Group {group_id}"
+                                )
                                 object_group_counts[group_name] += 1
                         for item in obj_items:
                             values = item.get("values")
@@ -832,7 +916,9 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                             group_id = item.get("group")
                             variation = item.get("variation")
                             start_index = item.get("start") or 0
-                            if not isinstance(group_id, int) or not isinstance(variation, int):
+                            if not isinstance(group_id, int) or not isinstance(
+                                variation, int
+                            ):
                                 continue
                             for offset, value in enumerate(values):
                                 if len(value_changes) >= 200:
@@ -857,41 +943,53 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                         if obj_items and func_code in {2, 3, 4, 5, 6}:
                             for item in obj_items:
                                 group_id = item.get("group")
-                                if isinstance(group_id, int) and group_id in CONTROL_OBJECT_GROUPS:
+                                if (
+                                    isinstance(group_id, int)
+                                    and group_id in CONTROL_OBJECT_GROUPS
+                                ):
                                     if len(anomalies) < max_anomalies:
-                                        anomalies.append(Dnp3Anomaly(
-                                            "HIGH",
-                                            "DNP3 Control Object Operation",
-                                            f"{func_name} on {item.get('summary')}",
-                                            src_ip,
-                                            dst_ip,
-                                            ts,
-                                        ))
+                                        anomalies.append(
+                                            Dnp3Anomaly(
+                                                "HIGH",
+                                                "DNP3 Control Object Operation",
+                                                f"{func_name} on {item.get('summary')}",
+                                                src_ip,
+                                                dst_ip,
+                                                ts,
+                                            )
+                                        )
                                         break
-                                if isinstance(group_id, int) and group_id in FILE_OBJECT_GROUPS:
+                                if (
+                                    isinstance(group_id, int)
+                                    and group_id in FILE_OBJECT_GROUPS
+                                ):
                                     if len(anomalies) < max_anomalies:
-                                        anomalies.append(Dnp3Anomaly(
-                                            "HIGH",
-                                            "DNP3 File Object Operation",
-                                            f"{func_name} on {item.get('summary')}",
-                                            src_ip,
-                                            dst_ip,
-                                            ts,
-                                        ))
+                                        anomalies.append(
+                                            Dnp3Anomaly(
+                                                "HIGH",
+                                                "DNP3 File Object Operation",
+                                                f"{func_name} on {item.get('summary')}",
+                                                src_ip,
+                                                dst_ip,
+                                                ts,
+                                            )
+                                        )
                                         break
 
-                    messages.append(Dnp3Message(
-                        ts=ts,
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        src_addr=dl_src,
-                        dst_addr=dl_dst,
-                        len=len(app_data),
-                        func_code=func_code,
-                        func_name=func_name,
-                        is_master=(dl_src < 65500),
-                        object_summary=object_summary,
-                    ))
+                    messages.append(
+                        Dnp3Message(
+                            ts=ts,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            src_addr=dl_src,
+                            dst_addr=dl_dst,
+                            len=len(app_data),
+                            func_code=func_code,
+                            func_name=func_name,
+                            is_master=(dl_src < 65500),
+                            object_summary=object_summary,
+                        )
+                    )
 
                 continue
 
@@ -902,7 +1000,7 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
             reader.close()
         except Exception:
             pass
-    
+
     duration = 0.0
     if start_time and last_time:
         duration = last_time - start_time
@@ -910,14 +1008,16 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
     if nonstandard_port_counts:
         for session, count in nonstandard_port_counts.most_common(6):
             if len(anomalies) < max_anomalies:
-                anomalies.append(Dnp3Anomaly(
-                    "MEDIUM",
-                    "DNP3 on Non-Standard Port",
-                    f"Observed DNP3 signature on {session} ({count} packets)",
-                    "*",
-                    "*",
-                    0.0,
-                ))
+                anomalies.append(
+                    Dnp3Anomaly(
+                        "MEDIUM",
+                        "DNP3 on Non-Standard Port",
+                        f"Observed DNP3 signature on {session} ({count} packets)",
+                        "*",
+                        "*",
+                        0.0,
+                    )
+                )
 
     for src_ip, dsts in src_dst_counts.items():
         unique_dsts = len(dsts)
@@ -925,93 +1025,109 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
         resp_count = src_responses.get(src_ip, 0)
         if unique_dsts >= 20 and req_count > resp_count * 2:
             if len(anomalies) < max_anomalies:
-                anomalies.append(Dnp3Anomaly(
-                    "MEDIUM",
-                    "DNP3 Scanning/Probing",
-                    f"Source contacted {unique_dsts} endpoints with low response rate.",
-                    src_ip,
-                    "*",
-                    0.0,
-                ))
+                anomalies.append(
+                    Dnp3Anomaly(
+                        "MEDIUM",
+                        "DNP3 Scanning/Probing",
+                        f"Source contacted {unique_dsts} endpoints with low response rate.",
+                        src_ip,
+                        "*",
+                        0.0,
+                    )
+                )
 
         addr_count = len(src_dst_addrs.get(src_ip, set()))
         if addr_count >= 20 and len(anomalies) < max_anomalies:
-            anomalies.append(Dnp3Anomaly(
-                "MEDIUM",
-                "DNP3 Address Scan",
-                f"Source probed {addr_count} DNP3 destination addresses.",
-                src_ip,
-                "*",
-                0.0,
-            ))
+            anomalies.append(
+                Dnp3Anomaly(
+                    "MEDIUM",
+                    "DNP3 Address Scan",
+                    f"Source probed {addr_count} DNP3 destination addresses.",
+                    src_ip,
+                    "*",
+                    0.0,
+                )
+            )
 
     for src_ip, count in src_control_counts.items():
         req_count = src_requests.get(src_ip, 0)
         ratio = (count / req_count) if req_count else 0.0
         if count >= 10 and ratio >= 0.2 and len(anomalies) < max_anomalies:
-            anomalies.append(Dnp3Anomaly(
-                "HIGH",
-                "DNP3 Control Command Burst",
-                f"{count} control/operate commands ({ratio:.0%} of requests).",
-                src_ip,
-                "*",
-                0.0,
-            ))
+            anomalies.append(
+                Dnp3Anomaly(
+                    "HIGH",
+                    "DNP3 Control Command Burst",
+                    f"{count} control/operate commands ({ratio:.0%} of requests).",
+                    src_ip,
+                    "*",
+                    0.0,
+                )
+            )
 
     for src_ip, count in src_unsolicited_counts.items():
         if count >= 5 and len(anomalies) < max_anomalies:
-            anomalies.append(Dnp3Anomaly(
-                "MEDIUM",
-                "DNP3 Unsolicited Control",
-                f"{count} enable/disable unsolicited operations observed.",
-                src_ip,
-                "*",
-                0.0,
-            ))
+            anomalies.append(
+                Dnp3Anomaly(
+                    "MEDIUM",
+                    "DNP3 Unsolicited Control",
+                    f"{count} enable/disable unsolicited operations observed.",
+                    src_ip,
+                    "*",
+                    0.0,
+                )
+            )
 
     for src_ip, count in src_restart_counts.items():
         if count and len(anomalies) < max_anomalies:
-            anomalies.append(Dnp3Anomaly(
-                "HIGH",
-                "DNP3 Restart Activity",
-                f"{count} restart commands observed.",
-                src_ip,
-                "*",
-                0.0,
-            ))
+            anomalies.append(
+                Dnp3Anomaly(
+                    "HIGH",
+                    "DNP3 Restart Activity",
+                    f"{count} restart commands observed.",
+                    src_ip,
+                    "*",
+                    0.0,
+                )
+            )
 
     for src_ip, count in src_app_control_counts.items():
         if count >= 5 and len(anomalies) < max_anomalies:
-            anomalies.append(Dnp3Anomaly(
-                "HIGH",
-                "DNP3 Application Control",
-                f"{count} application control/config operations observed.",
-                src_ip,
-                "*",
-                0.0,
-            ))
+            anomalies.append(
+                Dnp3Anomaly(
+                    "HIGH",
+                    "DNP3 Application Control",
+                    f"{count} application control/config operations observed.",
+                    src_ip,
+                    "*",
+                    0.0,
+                )
+            )
 
     for src_ip, count in src_file_counts.items():
         if count and len(anomalies) < max_anomalies:
-            anomalies.append(Dnp3Anomaly(
-                "HIGH",
-                "DNP3 File Operations",
-                f"{count} file transfer/control operations observed.",
-                src_ip,
-                "*",
-                0.0,
-            ))
+            anomalies.append(
+                Dnp3Anomaly(
+                    "HIGH",
+                    "DNP3 File Operations",
+                    f"{count} file transfer/control operations observed.",
+                    src_ip,
+                    "*",
+                    0.0,
+                )
+            )
 
     for src_ip, count in src_time_counts.items():
         if count >= 5 and len(anomalies) < max_anomalies:
-            anomalies.append(Dnp3Anomaly(
-                "LOW",
-                "DNP3 Time Sync Activity",
-                f"{count} time sync/delay operations observed.",
-                src_ip,
-                "*",
-                0.0,
-            ))
+            anomalies.append(
+                Dnp3Anomaly(
+                    "LOW",
+                    "DNP3 Time Sync Activity",
+                    f"{count} time sync/delay operations observed.",
+                    src_ip,
+                    "*",
+                    0.0,
+                )
+            )
 
     public_endpoints = []
     for ip_value in ip_endpoints:
@@ -1021,14 +1137,16 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
         except Exception:
             continue
     if public_endpoints and len(anomalies) < max_anomalies:
-        anomalies.append(Dnp3Anomaly(
-            "HIGH",
-            "DNP3 Exposure to Public IP",
-            f"DNP3 traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-            "*",
-            "*",
-            0.0,
-        ))
+        anomalies.append(
+            Dnp3Anomaly(
+                "HIGH",
+                "DNP3 Exposure to Public IP",
+                f"DNP3 traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
+                "*",
+                "*",
+                0.0,
+            )
+        )
 
     return Dnp3Analysis(
         path=path,
@@ -1044,5 +1162,5 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
         object_group_counts=object_group_counts,
         anomalies=anomalies,
         value_changes=value_changes,
-        errors=errors
+        errors=errors,
     )

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from collections import defaultdict, Counter
 import hashlib
 import os
 import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
 
 from .pcap_cache import get_reader
 from .utils import detect_file_type_bytes
@@ -21,7 +21,9 @@ except Exception:  # pragma: no cover
     Raw = None  # type: ignore
 
 
-DEFAULT_STREAM_MAX = int(os.environ.get("PCAPPER_CARVE_STREAM_MAX_BYTES", str(8 * 1024 * 1024)))
+DEFAULT_STREAM_MAX = int(
+    os.environ.get("PCAPPER_CARVE_STREAM_MAX_BYTES", str(8 * 1024 * 1024))
+)
 DEFAULT_CARVE_MAX = int(os.environ.get("PCAPPER_CARVE_MAX_BYTES", str(2 * 1024 * 1024)))
 DEFAULT_CARVE_LIMIT = int(os.environ.get("PCAPPER_CARVE_LIMIT", "100"))
 
@@ -97,7 +99,9 @@ def merge_carve_summaries(summaries: list[CarveSummary]) -> CarveSummary:
     )
 
 
-def _canonical_key(src: str, dst: str, sport: int, dport: int) -> tuple[str, int, str, int]:
+def _canonical_key(
+    src: str, dst: str, sport: int, dport: int
+) -> tuple[str, int, str, int]:
     left = (src, sport)
     right = (dst, dport)
     if left <= right:
@@ -181,9 +185,15 @@ def analyze_carving(
             errors=["Scapy TCP unavailable"],
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
-    segments_ab: dict[tuple[str, int, str, int], list[tuple[int, bytes]]] = defaultdict(list)
-    segments_ba: dict[tuple[str, int, str, int], list[tuple[int, bytes]]] = defaultdict(list)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
+    segments_ab: dict[tuple[str, int, str, int], list[tuple[int, bytes]]] = defaultdict(
+        list
+    )
+    segments_ba: dict[tuple[str, int, str, int], list[tuple[int, bytes]]] = defaultdict(
+        list
+    )
     segments_ab_bytes: dict[tuple[str, int, str, int], int] = defaultdict(int)
     segments_ba_bytes: dict[tuple[str, int, str, int], int] = defaultdict(int)
     stream_stats: Counter[tuple[str, int, str, int]] = Counter()
@@ -272,8 +282,10 @@ def analyze_carving(
     for stream_key in stream_stats.keys():
         src, sport, dst, dport = stream_key
         sid = _stream_id(src, sport, dst, dport)
-        for direction, data in (("client", _reassemble(segments_ab.get(stream_key, []), stream_max_bytes)),
-                                ("server", _reassemble(segments_ba.get(stream_key, []), stream_max_bytes))):
+        for direction, data in (
+            ("client", _reassemble(segments_ab.get(stream_key, []), stream_max_bytes)),
+            ("server", _reassemble(segments_ba.get(stream_key, []), stream_max_bytes)),
+        ):
             if not data:
                 continue
             sig_hits = _find_signatures(data)

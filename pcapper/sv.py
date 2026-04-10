@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import struct
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import struct
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -73,7 +73,7 @@ def _read_ber_length(data: bytes, idx: int) -> tuple[Optional[int], int]:
     count = first & 0x7F
     if count == 0 or idx + count > len(data):
         return None, idx
-    length = int.from_bytes(data[idx:idx + count], "big")
+    length = int.from_bytes(data[idx : idx + count], "big")
     idx += count
     return length, idx
 
@@ -88,7 +88,7 @@ def _parse_sv_tlvs(data: bytes, result: dict[str, object], depth: int = 0) -> No
         length, idx = _read_ber_length(data, idx)
         if length is None or idx + length > len(data):
             break
-        value = data[idx:idx + length]
+        value = data[idx : idx + length]
         idx += length
         tag_name = SV_TAGS.get(tag)
         if tag_name:
@@ -113,14 +113,14 @@ def _decode_seq_of_data(value: bytes) -> tuple[str, list[str]]:
     if len(value) % 4 == 0:
         for idx in range(0, min(len(value), 4 * 8), 4):
             try:
-                val = struct.unpack(">i", value[idx:idx + 4])[0]
+                val = struct.unpack(">i", value[idx : idx + 4])[0]
             except Exception:
-                val = int.from_bytes(value[idx:idx + 4], "big", signed=True)
+                val = int.from_bytes(value[idx : idx + 4], "big", signed=True)
             values.append(str(val))
         return "int32", values
     if len(value) % 2 == 0:
         for idx in range(0, min(len(value), 2 * 8), 2):
-            val = int.from_bytes(value[idx:idx + 2], "big", signed=True)
+            val = int.from_bytes(value[idx : idx + 2], "big", signed=True)
             values.append(str(val))
         return "int16", values
     return "bytes", [value[:16].hex()]
@@ -158,7 +158,9 @@ def analyze_sv(path: Path, show_status: bool = True) -> SvSummary:
             None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     sv_packets = 0
     src_macs: Counter[str] = Counter()
@@ -239,11 +241,13 @@ def analyze_sv(path: Path, show_status: bool = True) -> SvSummary:
                     key = (src_mac, f"0x{appid:04x}")
                     prev = smp_state.get(key)
                     if prev is not None and smp_cnt < prev:
-                        detections.append({
-                            "severity": "warning",
-                            "summary": "SV Sample Counter Decrease",
-                            "details": f"{key[0]} appid {key[1]} smpCnt decreased {prev}->{smp_cnt}.",
-                        })
+                        detections.append(
+                            {
+                                "severity": "warning",
+                                "summary": "SV Sample Counter Decrease",
+                                "details": f"{key[0]} appid {key[1]} smpCnt decreased {prev}->{smp_cnt}.",
+                            }
+                        )
                     smp_state[key] = smp_cnt
             if isinstance(conf_rev, int):
                 conf_revs[conf_rev] += 1
@@ -262,26 +266,36 @@ def analyze_sv(path: Path, show_status: bool = True) -> SvSummary:
         reader.close()
 
     if sv_packets:
-        detections.append({
-            "severity": "info",
-            "summary": "IEC 61850 Sampled Values traffic observed",
-            "details": f"{sv_packets} SV frames detected at L2.",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "IEC 61850 Sampled Values traffic observed",
+                "details": f"{sv_packets} SV frames detected at L2.",
+            }
+        )
     for src_mac, appid_set in src_appids.items():
         if len(appid_set) >= 5:
-            detections.append({
-                "severity": "warning",
-                "summary": "SV Source Uses Many AppIDs",
-                "details": f"{src_mac} advertised {len(appid_set)} AppIDs (possible spoofing or misconfiguration).",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SV Source Uses Many AppIDs",
+                    "details": f"{src_mac} advertised {len(appid_set)} AppIDs (possible spoofing or misconfiguration).",
+                }
+            )
     if unicast_dsts:
-        detections.append({
-            "severity": "warning",
-            "summary": "SV Unicast Destinations",
-            "details": f"Unicast MAC destinations observed: {', '.join(sorted(unicast_dsts)[:5])}.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "SV Unicast Destinations",
+                "details": f"Unicast MAC destinations observed: {', '.join(sorted(unicast_dsts)[:5])}.",
+            }
+        )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return SvSummary(
         path=path,
         total_packets=total_packets,

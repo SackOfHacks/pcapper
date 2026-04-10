@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import ipaddress
 from collections import Counter, defaultdict
 from pathlib import Path
-import ipaddress
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_port_protocol,
+)
 
 BACNET_PORT = 47808
 
@@ -253,12 +257,12 @@ def _parse_context_tag(data: bytes, idx: int) -> tuple[dict[str, object] | None,
         if ext == 254:
             if idx + 2 > len(data):
                 return None, len(data)
-            length = int.from_bytes(data[idx:idx + 2], "big")
+            length = int.from_bytes(data[idx : idx + 2], "big")
             idx += 2
         elif ext == 255:
             if idx + 4 > len(data):
                 return None, len(data)
-            length = int.from_bytes(data[idx:idx + 4], "big")
+            length = int.from_bytes(data[idx : idx + 4], "big")
             idx += 4
         else:
             length = ext
@@ -268,7 +272,7 @@ def _parse_context_tag(data: bytes, idx: int) -> tuple[dict[str, object] | None,
 
     if idx + length > len(data):
         return None, len(data)
-    value = data[idx:idx + length]
+    value = data[idx : idx + length]
     idx += length
     return {
         "tag_number": tag_number,
@@ -279,7 +283,9 @@ def _parse_context_tag(data: bytes, idx: int) -> tuple[dict[str, object] | None,
     }, idx
 
 
-def _context_primitive_value(data: bytes, tag_number: int, max_tags: int = 24) -> bytes | None:
+def _context_primitive_value(
+    data: bytes, tag_number: int, max_tags: int = 24
+) -> bytes | None:
     idx = 0
     seen = 0
     while idx < len(data) and seen < max_tags:
@@ -391,14 +397,18 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
     if bvlc_len < 4:
         issues.append(f"Invalid BVLC length {bvlc_len}.")
     if bvlc_len != len(payload):
-        issues.append(f"BVLC length {bvlc_len} does not match UDP payload length {len(payload)}.")
+        issues.append(
+            f"BVLC length {bvlc_len} does not match UDP payload length {len(payload)}."
+        )
     body_end = min(len(payload), bvlc_len) if bvlc_len >= 4 else len(payload)
     body = payload[4:body_end]
 
     if bvlc_func == 0x00 and len(body) >= 2:
         result_code = int.from_bytes(body[:2], "big")
         info["bvlc_result_code"] = result_code
-        info["bvlc_result_name"] = BVLC_RESULT_CODES.get(result_code, f"Result-0x{result_code:04x}")
+        info["bvlc_result_name"] = BVLC_RESULT_CODES.get(
+            result_code, f"Result-0x{result_code:04x}"
+        )
     elif bvlc_func == 0x05 and len(body) >= 2:
         info["foreign_ttl"] = int.from_bytes(body[:2], "big")
     elif bvlc_func == 0x07 and len(body) >= 6:
@@ -410,14 +420,16 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
         for idx in range(0, len(body), 10):
             if idx + 10 > len(body):
                 break
-            ip_raw = body[idx:idx + 4]
-            port = int.from_bytes(body[idx + 4:idx + 6], "big")
-            mask_raw = body[idx + 6:idx + 10]
+            ip_raw = body[idx : idx + 4]
+            port = int.from_bytes(body[idx + 4 : idx + 6], "big")
+            mask_raw = body[idx + 6 : idx + 10]
             ip_text = ".".join(str(part) for part in ip_raw)
             mask_text = ".".join(str(part) for part in mask_raw)
             entries.append(f"{ip_text}:{port} mask={mask_text}")
         if len(body) % 10 != 0:
-            issues.append("BDT payload has trailing bytes not aligned to 10-byte entries.")
+            issues.append(
+                "BDT payload has trailing bytes not aligned to 10-byte entries."
+            )
         info["bdt_entries"] = entries
 
     npdu_start = 4
@@ -454,7 +466,7 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
         if idx + 3 > len(payload):
             issues.append("Truncated NPDU destination specifier.")
             return info
-        dnet = int.from_bytes(payload[idx:idx + 2], "big")
+        dnet = int.from_bytes(payload[idx : idx + 2], "big")
         dlen = payload[idx + 2]
         idx += 3
         info["dnet"] = dnet
@@ -471,7 +483,7 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
         if idx + 3 > len(payload):
             issues.append("Truncated NPDU source specifier.")
             return info
-        snet = int.from_bytes(payload[idx:idx + 2], "big")
+        snet = int.from_bytes(payload[idx : idx + 2], "big")
         slen = payload[idx + 2]
         idx += 3
         info["snet"] = snet
@@ -486,7 +498,9 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
             return info
         msg_type = payload[idx]
         info["npdu_message_type"] = msg_type
-        info["npdu_message_name"] = NPDU_NETWORK_MESSAGES.get(msg_type, f"NPDU-Message-0x{msg_type:02x}")
+        info["npdu_message_name"] = NPDU_NETWORK_MESSAGES.get(
+            msg_type, f"NPDU-Message-0x{msg_type:02x}"
+        )
         return info
 
     if idx >= len(payload):
@@ -506,19 +520,25 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
         offset = 5 if segmented else 3
         if offset < len(apdu):
             service_choice = apdu[offset]
-            info["service_name"] = CONFIRMED_SERVICE_CHOICES.get(service_choice, f"Confirmed Service 0x{service_choice:02x}")
-            service_data = apdu[offset + 1:]
+            info["service_name"] = CONFIRMED_SERVICE_CHOICES.get(
+                service_choice, f"Confirmed Service 0x{service_choice:02x}"
+            )
+            service_data = apdu[offset + 1 :]
     elif pdu_type == 0x01:
         if len(apdu) >= 2:
             service_choice = apdu[1]
-            info["service_name"] = UNCONFIRMED_SERVICE_CHOICES.get(service_choice, f"Unconfirmed Service 0x{service_choice:02x}")
+            info["service_name"] = UNCONFIRMED_SERVICE_CHOICES.get(
+                service_choice, f"Unconfirmed Service 0x{service_choice:02x}"
+            )
             service_data = apdu[2:]
     elif pdu_type == 0x02:
         if len(apdu) >= 2:
             info["invoke_id"] = apdu[1]
         if len(apdu) >= 3:
             service_choice = apdu[2]
-            info["service_name"] = CONFIRMED_SERVICE_CHOICES.get(service_choice, f"Confirmed Service 0x{service_choice:02x}")
+            info["service_name"] = CONFIRMED_SERVICE_CHOICES.get(
+                service_choice, f"Confirmed Service 0x{service_choice:02x}"
+            )
             service_data = apdu[3:]
     elif pdu_type == 0x03:
         segmented = bool(apdu[0] & 0x08)
@@ -527,14 +547,18 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
         offset = 5 if segmented else 3
         if offset < len(apdu):
             service_choice = apdu[offset]
-            info["service_name"] = CONFIRMED_SERVICE_CHOICES.get(service_choice, f"Confirmed Service 0x{service_choice:02x}")
-            service_data = apdu[offset + 1:]
+            info["service_name"] = CONFIRMED_SERVICE_CHOICES.get(
+                service_choice, f"Confirmed Service 0x{service_choice:02x}"
+            )
+            service_data = apdu[offset + 1 :]
     elif pdu_type == 0x05:
         if len(apdu) >= 2:
             info["invoke_id"] = apdu[1]
         if len(apdu) >= 3:
             service_choice = apdu[2]
-            info["service_name"] = CONFIRMED_SERVICE_CHOICES.get(service_choice, f"Confirmed Service 0x{service_choice:02x}")
+            info["service_name"] = CONFIRMED_SERVICE_CHOICES.get(
+                service_choice, f"Confirmed Service 0x{service_choice:02x}"
+            )
             service_data = apdu[3:]
     elif pdu_type == 0x06:
         if len(apdu) >= 2:
@@ -562,7 +586,9 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
             property_id = _context_unsigned(service_data, 1)
             if isinstance(property_id, int):
                 info["property_id"] = property_id
-                info["property_name"] = BACNET_PROPERTY_IDS.get(property_id, f"Property-{property_id}")
+                info["property_name"] = BACNET_PROPERTY_IDS.get(
+                    property_id, f"Property-{property_id}"
+                )
         elif service_choice == 0x08:
             info["who_is_low_limit"] = _context_unsigned(service_data, 0)
             info["who_is_high_limit"] = _context_unsigned(service_data, 1)
@@ -607,7 +633,9 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
     artifacts: list[tuple[str, str]] = []
     bvlc_name = str(info.get("bvlc_name") or "")
     if bvlc_name:
-        artifacts.append(("bacnet_bvlc", f"{bvlc_name} len={info.get('bvlc_length', 0)}"))
+        artifacts.append(
+            ("bacnet_bvlc", f"{bvlc_name} len={info.get('bvlc_length', 0)}")
+        )
 
     result_name = str(info.get("bvlc_result_name") or "")
     result_code = info.get("bvlc_result_code")
@@ -650,14 +678,18 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
     who_is_low = info.get("who_is_low_limit")
     who_is_high = info.get("who_is_high_limit")
     if isinstance(who_is_low, int) and isinstance(who_is_high, int):
-        artifacts.append(("bacnet_discovery_scope", f"Who-Is range {who_is_low}-{who_is_high}"))
+        artifacts.append(
+            ("bacnet_discovery_scope", f"Who-Is range {who_is_low}-{who_is_high}")
+        )
 
     for issue in (info.get("issues") or [])[:3]:
         artifacts.append(("bacnet_parser_issue", str(issue)))
     return artifacts
 
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     info = _parse_bacnet_payload(payload)
     command_set = set(commands)
@@ -803,7 +835,10 @@ def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, comma
                 ts=ts,
             )
         )
-    if "ConfirmedPrivateTransfer" in command_set or "UnconfirmedPrivateTransfer" in command_set:
+    if (
+        "ConfirmedPrivateTransfer" in command_set
+        or "UnconfirmedPrivateTransfer" in command_set
+    ):
         anomalies.append(
             IndustrialAnomaly(
                 severity="MEDIUM",
@@ -867,7 +902,11 @@ def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, comma
 
     who_is_low = info.get("who_is_low_limit")
     who_is_high = info.get("who_is_high_limit")
-    if "Who-Is" in command_set and isinstance(who_is_low, int) and isinstance(who_is_high, int):
+    if (
+        "Who-Is" in command_set
+        and isinstance(who_is_low, int)
+        and isinstance(who_is_high, int)
+    ):
         if who_is_low == 0 and who_is_high >= 4_194_303:
             anomalies.append(
                 IndustrialAnomaly(
@@ -934,7 +973,12 @@ def _append_behavioral_anomalies(analysis: IndustrialAnalysis) -> None:
             )
 
     read_src_to_dst: dict[str, set[str]] = defaultdict(set)
-    for command_name in ("ReadProperty", "ReadPropertyMultiple", "Read-Broadcast-Distribution-Table", "Read-Foreign-Device-Table"):
+    for command_name in (
+        "ReadProperty",
+        "ReadPropertyMultiple",
+        "Read-Broadcast-Distribution-Table",
+        "Read-Foreign-Device-Table",
+    ):
         for endpoint, count in endpoint_map.get(command_name, Counter()).items():
             pair = _split_endpoint_pair(str(endpoint))
             if pair and count:
@@ -963,7 +1007,11 @@ def _append_behavioral_anomalies(analysis: IndustrialAnalysis) -> None:
             control_counts[src] += int(count)
             control_dsts[src].add(dst)
     for src, total in control_counts.items():
-        if total >= 20 and len(control_dsts[src]) >= 4 and len(analysis.anomalies) < max_anomalies:
+        if (
+            total >= 20
+            and len(control_dsts[src]) >= 4
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="HIGH",
@@ -974,7 +1022,12 @@ def _append_behavioral_anomalies(analysis: IndustrialAnalysis) -> None:
                     ts=0.0,
                 )
             )
-        if src in who_is_src_to_dst and total >= 5 and len(control_dsts[src]) >= 2 and len(analysis.anomalies) < max_anomalies:
+        if (
+            src in who_is_src_to_dst
+            and total >= 5
+            and len(control_dsts[src]) >= 2
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="HIGH",
@@ -986,7 +1039,9 @@ def _append_behavioral_anomalies(analysis: IndustrialAnalysis) -> None:
                 )
             )
 
-    bvlc_admin_ops = int(commands.get("Write-Broadcast-Distribution-Table", 0)) + int(commands.get("Delete-Foreign-Device-Table", 0))
+    bvlc_admin_ops = int(commands.get("Write-Broadcast-Distribution-Table", 0)) + int(
+        commands.get("Delete-Foreign-Device-Table", 0)
+    )
     if bvlc_admin_ops >= 3 and len(analysis.anomalies) < max_anomalies:
         analysis.anomalies.append(
             IndustrialAnomaly(
@@ -999,9 +1054,20 @@ def _append_behavioral_anomalies(analysis: IndustrialAnalysis) -> None:
             )
         )
 
-    apdu_total = sum(int(count) for cmd, count in commands.items() if str(cmd).startswith("APDU "))
-    error_total = int(commands.get("APDU Error", 0)) + int(commands.get("APDU Reject", 0)) + int(commands.get("APDU Abort", 0))
-    if apdu_total >= 20 and error_total >= 6 and error_total / max(apdu_total, 1) >= 0.25 and len(analysis.anomalies) < max_anomalies:
+    apdu_total = sum(
+        int(count) for cmd, count in commands.items() if str(cmd).startswith("APDU ")
+    )
+    error_total = (
+        int(commands.get("APDU Error", 0))
+        + int(commands.get("APDU Reject", 0))
+        + int(commands.get("APDU Abort", 0))
+    )
+    if (
+        apdu_total >= 20
+        and error_total >= 6
+        and error_total / max(apdu_total, 1) >= 0.25
+        and len(analysis.anomalies) < max_anomalies
+    ):
         analysis.anomalies.append(
             IndustrialAnomaly(
                 severity="MEDIUM",

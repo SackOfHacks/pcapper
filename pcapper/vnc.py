@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import re
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -169,7 +169,9 @@ class _SessionState:
     server_banner: Optional[str] = None
 
 
-def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
+def _extract_ascii_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
     results: list[str] = []
     if not data:
         return results
@@ -214,7 +216,9 @@ def _scan_plaintext(
             artifacts.append(item)
 
 
-def _direction(src_ip: str, dst_ip: str, sport: int, dport: int) -> tuple[str, str, int, int]:
+def _direction(
+    src_ip: str, dst_ip: str, sport: int, dport: int
+) -> tuple[str, str, int, int]:
     if dport in VNC_PORTS:
         return src_ip, dst_ip, sport, dport
     if sport in VNC_PORTS:
@@ -237,7 +241,7 @@ def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
     if avg <= 0:
         return None
     variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
+    stddev = variance**0.5
     if avg < 5 or avg > 86400:
         return None
     if stddev > max(5.0, avg * 0.25):
@@ -253,7 +257,9 @@ def analyze_vnc(
 ) -> VncSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
-        errors.append("Scapy IP/TCP layers unavailable; install scapy for VNC analysis.")
+        errors.append(
+            "Scapy IP/TCP layers unavailable; install scapy for VNC analysis."
+        )
         return VncSummary(
             path=path,
             total_packets=0,
@@ -468,7 +474,14 @@ def analyze_vnc(
                     else:
                         session.server_banner = session.server_banner or value
                         server_banners[value] += 1
-                _scan_plaintext(payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts, auth_types)
+                _scan_plaintext(
+                    payload,
+                    plaintext_strings,
+                    suspicious_plaintext,
+                    file_artifacts,
+                    artifacts,
+                    auth_types,
+                )
 
     except Exception as exc:
         errors.append(str(exc))
@@ -507,75 +520,98 @@ def analyze_vnc(
             short_session_by_client[session.client_ip] += 1
             short_session_targets[session.client_ip].add(session.server_ip)
         if session.first_seen is not None:
-            pair_first_seen[(session.client_ip, session.server_ip)].append(session.first_seen)
+            pair_first_seen[(session.client_ip, session.server_ip)].append(
+                session.first_seen
+            )
 
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
-    non_standard_ports = [port for port in server_ports if port not in {5900, 5901, 5800}]
+    non_standard_ports = [
+        port for port in server_ports if port not in {5900, 5901, 5800}
+    ]
     if non_standard_ports:
-        detections.append({
-            "severity": "info",
-            "summary": "VNC observed on non-standard ports",
-            "details": ", ".join(str(port) for port in sorted(non_standard_ports)),
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "VNC observed on non-standard ports",
+                "details": ", ".join(str(port) for port in sorted(non_standard_ports)),
+            }
+        )
 
     if auth_types:
         if any(name.lower() == "none" for name in auth_types):
-            detections.append({
-                "severity": "warning",
-                "summary": "VNC sessions with no authentication detected",
-                "details": "RFB authentication scheme indicates 'None'.",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "VNC sessions with no authentication detected",
+                    "details": "RFB authentication scheme indicates 'None'.",
+                }
+            )
 
     if suspicious_plaintext:
-        detections.append({
-            "severity": "warning",
-            "summary": "Suspicious plaintext strings observed in VNC payloads",
-            "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Suspicious plaintext strings observed in VNC payloads",
+                "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
+            }
+        )
 
     for (client_ip, server_ip), count in short_session_counts.items():
         if count >= 20:
-            anomalies.append({
-                "title": "Potential brute force or probing",
-                "details": f"{client_ip} -> {server_ip} short sessions: {count}",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential brute force or probing",
+                    "details": f"{client_ip} -> {server_ip} short sessions: {count}",
+                }
+            )
 
     for client_ip, count in short_session_by_client.items():
         targets = short_session_targets.get(client_ip, set())
         if count >= 30 and len(targets) >= 10:
-            anomalies.append({
-                "title": "Potential VNC scanning",
-                "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential VNC scanning",
+                    "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
+                }
+            )
 
     for (client_ip, server_ip), times in pair_first_seen.items():
         score = _beaconing_score(times)
         if score:
-            detections.append({
-                "severity": "info",
-                "summary": "Potential VNC beaconing",
-                "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
-            })
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "Potential VNC beaconing",
+                    "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
+                }
+            )
 
     for session in sessions.values():
-        if session.client_bytes >= 50 * 1024 * 1024 and session.client_bytes > session.server_bytes * 3:
-            detections.append({
-                "severity": "warning",
-                "summary": "Potential VNC data upload/exfiltration",
-                "details": (
-                    f"{session.client_ip} -> {session.server_ip} "
-                    f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
-                ),
-            })
+        if (
+            session.client_bytes >= 50 * 1024 * 1024
+            and session.client_bytes > session.server_bytes * 3
+        ):
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Potential VNC data upload/exfiltration",
+                    "details": (
+                        f"{session.client_ip} -> {session.server_ip} "
+                        f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
+                    ),
+                }
+            )
         if session.last_seen is not None and session.first_seen is not None:
             duration = session.last_seen - session.first_seen
             if duration >= 4 * 3600:
-                anomalies.append({
-                    "title": "Long-lived VNC session",
-                    "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
-                })
+                anomalies.append(
+                    {
+                        "title": "Long-lived VNC session",
+                        "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
+                    }
+                )
 
     total_sessions = len(conversations)
 
@@ -694,9 +730,17 @@ def merge_vnc_summaries(
         total_sessions += summary.total_sessions
 
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         client_counts.update(summary.client_counts)
         server_counts.update(summary.server_counts)

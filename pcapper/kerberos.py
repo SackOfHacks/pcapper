@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
 import ipaddress
 import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -23,9 +23,14 @@ except Exception:  # pragma: no cover
 KERBEROS_PORTS = {88, 464}
 
 UPN_RE = re.compile(r"\b([A-Za-z0-9._$-]{3,})@([A-Za-z0-9.-]{3,})\b")
-SPN_RE = re.compile(r"\b([A-Za-z0-9._-]{3,}/[A-Za-z0-9._:-]{3,})(?:@([A-Za-z0-9.-]{3,}))?\b")
+SPN_RE = re.compile(
+    r"\b([A-Za-z0-9._-]{3,}/[A-Za-z0-9._:-]{3,})(?:@([A-Za-z0-9.-]{3,}))?\b"
+)
 ERR_RE = re.compile(r"\bKDC_ERR_[A-Z0-9_]+\b")
-REQ_RE = re.compile(r"\b(AS-REQ|AS-REP|TGS-REQ|TGS-REP|KRB_ERROR|S4U2SELF|S4U2PROXY|PA-ENC-TIMESTAMP)\b", re.IGNORECASE)
+REQ_RE = re.compile(
+    r"\b(AS-REQ|AS-REP|TGS-REQ|TGS-REP|KRB_ERROR|S4U2SELF|S4U2PROXY|PA-ENC-TIMESTAMP)\b",
+    re.IGNORECASE,
+)
 
 CNAME_SUFFIXES = (
     ".local",
@@ -165,7 +170,11 @@ def _is_plausible_spn(value: str) -> bool:
     if sum(1 for ch in host_only if ch.isalpha()) < 2:
         return False
     service_upper = service.upper()
-    if "." not in host_only and "-" not in host_only and service_upper not in _KNOWN_SPN_SERVICES:
+    if (
+        "." not in host_only
+        and "-" not in host_only
+        and service_upper not in _KNOWN_SPN_SERVICES
+    ):
         if len(host_only) < 8:
             return False
     return True
@@ -240,7 +249,11 @@ def _split_cname_concat(value: str) -> Optional[tuple[str, str]]:
                 score += 2
             if any(ch.isdigit() for ch in user):
                 score -= 1
-            if best is None or score > best[0] or (score == best[0] and len(realm) > len(best[1])):
+            if (
+                best is None
+                or score > best[0]
+                or (score == best[0] and len(realm) > len(best[1]))
+            ):
                 best = (score, realm, user)
             start = idx + 1
     if not best:
@@ -309,16 +322,19 @@ def _build_kerberos_attack_overview(
         "user_enumeration": [],
         "public_kdc_exposure": [],
         "cross_realm_or_realm_spray": [],
+        "kdc_error_saturation": [],
     }
     matrix: List[Dict[str, str]] = []
 
     def _status_row(attack: str, status: str, severity: str, evidence: str) -> None:
-        matrix.append({
-            "attack": attack,
-            "status": status,
-            "severity": severity,
-            "evidence": evidence,
-        })
+        matrix.append(
+            {
+                "attack": attack,
+                "status": status,
+                "severity": severity,
+                "evidence": evidence,
+            }
+        )
 
     tgs_req = int(request_types.get("TGS-REQ", 0))
     unique_spn = len(spns)
@@ -327,16 +343,21 @@ def _build_kerberos_attack_overview(
         client_tgs = int(reqs.get("TGS-REQ", 0))
         client_spns = len(spns_by_client.get(client_ip, set()))
         if client_tgs >= 20 and client_spns >= 8:
-            kerberoast_clients.append(f"{client_ip}(tgs={client_tgs},spn={client_spns})")
+            kerberoast_clients.append(
+                f"{client_ip}(tgs={client_tgs},spn={client_spns})"
+            )
     if (tgs_req >= 50 and unique_spn >= 15) or kerberoast_clients:
         checks["kerberoasting"].append(f"TGS-REQ={tgs_req}, unique SPNs={unique_spn}")
         if kerberoast_clients:
-            checks["kerberoasting"].append(f"Top clients: {', '.join(kerberoast_clients[:5])}")
+            checks["kerberoasting"].append(
+                f"Top clients: {', '.join(kerberoast_clients[:5])}"
+            )
         _status_row(
             "Kerberoasting (TGS ticket harvesting)",
             "suspicious",
             "high",
-            "; ".join(checks["kerberoasting"]) or f"TGS-REQ={tgs_req}, unique SPNs={unique_spn}",
+            "; ".join(checks["kerberoasting"])
+            or f"TGS-REQ={tgs_req}, unique SPNs={unique_spn}",
         )
     elif tgs_req >= 15 and unique_spn >= 8:
         checks["kerberoasting"].append(f"TGS-REQ={tgs_req}, unique SPNs={unique_spn}")
@@ -357,8 +378,12 @@ def _build_kerberos_attack_overview(
     as_rep = int(request_types.get("AS-REP", 0))
     preauth_required = int(error_codes.get("KDC_ERR_PREAUTH_REQUIRED", 0))
     if as_rep >= 5 and preauth_required == 0:
-        checks["asrep_roasting"].append(f"AS-REP={as_rep} with no KDC_ERR_PREAUTH_REQUIRED")
-        _status_row("AS-REP roasting", "suspicious", "high", checks["asrep_roasting"][0])
+        checks["asrep_roasting"].append(
+            f"AS-REP={as_rep} with no KDC_ERR_PREAUTH_REQUIRED"
+        )
+        _status_row(
+            "AS-REP roasting", "suspicious", "high", checks["asrep_roasting"][0]
+        )
     elif as_rep >= 10 and as_rep > preauth_required:
         checks["asrep_roasting"].append(
             f"AS-REP={as_rep} exceeds preauth-required errors={preauth_required}"
@@ -384,7 +409,9 @@ def _build_kerberos_attack_overview(
             f"Preauth failures={preauth_failed}, peak AS/TGS req/min={peak_burst}"
         )
         if spray_clients:
-            checks["password_spray_bruteforce"].append(f"Top clients: {', '.join(spray_clients[:5])}")
+            checks["password_spray_bruteforce"].append(
+                f"Top clients: {', '.join(spray_clients[:5])}"
+            )
         _status_row(
             "Password spray / brute-force",
             "suspicious",
@@ -414,10 +441,17 @@ def _build_kerberos_attack_overview(
     s4u_total = s4u2self + s4u2proxy
     if s4u_total >= 10:
         checks["delegation_abuse"].append(f"S4U2SELF={s4u2self}, S4U2PROXY={s4u2proxy}")
-        _status_row("Delegation abuse (S4U)", "suspicious", "high", checks["delegation_abuse"][0])
+        _status_row(
+            "Delegation abuse (S4U)",
+            "suspicious",
+            "high",
+            checks["delegation_abuse"][0],
+        )
     elif s4u_total > 0:
         checks["delegation_abuse"].append(f"S4U2SELF={s4u2self}, S4U2PROXY={s4u2proxy}")
-        _status_row("Delegation abuse (S4U)", "watch", "warning", checks["delegation_abuse"][0])
+        _status_row(
+            "Delegation abuse (S4U)", "watch", "warning", checks["delegation_abuse"][0]
+        )
     else:
         _status_row(
             "Delegation abuse (S4U)",
@@ -436,9 +470,13 @@ def _build_kerberos_attack_overview(
         if client_tgs >= 20 and client_as <= 2:
             ptt_like_clients.append(f"{client_ip}(tgs={client_tgs},as={client_as})")
     if krbtgt_hits > 0 and tgs_rep >= 20 and as_req <= max(2, tgs_rep // 20):
-        checks["ticket_forgery_ptt"].append(f"krbtgt={krbtgt_hits}, TGS-REP={tgs_rep}, AS-REQ={as_req}")
+        checks["ticket_forgery_ptt"].append(
+            f"krbtgt={krbtgt_hits}, TGS-REP={tgs_rep}, AS-REQ={as_req}"
+        )
     if ptt_like_clients:
-        checks["ticket_forgery_ptt"].append(f"TGS-heavy clients: {', '.join(ptt_like_clients[:5])}")
+        checks["ticket_forgery_ptt"].append(
+            f"TGS-heavy clients: {', '.join(ptt_like_clients[:5])}"
+        )
     if checks["ticket_forgery_ptt"]:
         severity = "high" if krbtgt_hits > 0 else "warning"
         _status_row(
@@ -461,14 +499,20 @@ def _build_kerberos_attack_overview(
     enum_clients = [
         f"{client_ip}({int(codes.get('KDC_ERR_C_PRINCIPAL_UNKNOWN', 0) + codes.get('KDC_ERR_S_PRINCIPAL_UNKNOWN', 0))})"
         for client_ip, codes in error_by_client.items()
-        if int(codes.get("KDC_ERR_C_PRINCIPAL_UNKNOWN", 0) + codes.get("KDC_ERR_S_PRINCIPAL_UNKNOWN", 0)) >= 10
+        if int(
+            codes.get("KDC_ERR_C_PRINCIPAL_UNKNOWN", 0)
+            + codes.get("KDC_ERR_S_PRINCIPAL_UNKNOWN", 0)
+        )
+        >= 10
     ]
     if enum_total >= 20:
         checks["user_enumeration"].append(
             f"Unknown principal errors user={unknown_user_errors}, service={unknown_service_errors}"
         )
         if enum_clients:
-            checks["user_enumeration"].append(f"Top clients: {', '.join(enum_clients[:5])}")
+            checks["user_enumeration"].append(
+                f"Top clients: {', '.join(enum_clients[:5])}"
+            )
         _status_row(
             "User/service enumeration via KDC errors",
             "suspicious",
@@ -503,11 +547,17 @@ def _build_kerberos_attack_overview(
 
     realm_spray_clients: list[str] = []
     for client_ip, realms_seen in realms_by_client.items():
-        as_req_client = int(request_types_by_client.get(client_ip, Counter()).get("AS-REQ", 0))
+        as_req_client = int(
+            request_types_by_client.get(client_ip, Counter()).get("AS-REQ", 0)
+        )
         if as_req_client >= 20 and len(realms_seen) >= 4:
-            realm_spray_clients.append(f"{client_ip}(as-req={as_req_client},realms={len(realms_seen)})")
+            realm_spray_clients.append(
+                f"{client_ip}(as-req={as_req_client},realms={len(realms_seen)})"
+            )
     if realm_spray_clients:
-        checks["cross_realm_or_realm_spray"].append(f"Clients spanning many realms: {', '.join(realm_spray_clients[:5])}")
+        checks["cross_realm_or_realm_spray"].append(
+            f"Clients spanning many realms: {', '.join(realm_spray_clients[:5])}"
+        )
         _status_row(
             "Cross-realm spray/anomalous realm targeting",
             "watch",
@@ -522,10 +572,47 @@ def _build_kerberos_attack_overview(
             "No high-volume multi-realm spray pattern observed",
         )
 
+    kdc_error_total = sum(int(v) for v in error_codes.values())
+    auth_req_total = int(request_types.get("AS-REQ", 0)) + int(
+        request_types.get("TGS-REQ", 0)
+    )
+    ratio = (
+        (float(kdc_error_total) / float(auth_req_total)) if auth_req_total > 0 else 0.0
+    )
+    if kdc_error_total >= 40 and ratio >= 0.35:
+        checks["kdc_error_saturation"].append(
+            f"KDC error saturation errors={kdc_error_total} auth_requests={auth_req_total} ratio={ratio:.2f}"
+        )
+        _status_row(
+            "KDC error saturation",
+            "suspicious",
+            "warning",
+            checks["kdc_error_saturation"][0],
+        )
+    elif kdc_error_total >= 20 and ratio >= 0.20:
+        checks["kdc_error_saturation"].append(
+            f"Elevated KDC error ratio errors={kdc_error_total} auth_requests={auth_req_total} ratio={ratio:.2f}"
+        )
+        _status_row(
+            "KDC error saturation",
+            "watch",
+            "warning",
+            checks["kdc_error_saturation"][0],
+        )
+    else:
+        _status_row(
+            "KDC error saturation",
+            "not observed",
+            "info",
+            f"errors={kdc_error_total}, auth_requests={auth_req_total}, ratio={ratio:.2f}",
+        )
+
     return checks, matrix
 
 
-def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> List[str]:
+def _extract_ascii_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> List[str]:
     results: List[str] = []
     current = bytearray()
     for b in data:
@@ -542,7 +629,9 @@ def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) ->
     return results
 
 
-def _extract_utf16le_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> List[str]:
+def _extract_utf16le_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> List[str]:
     results: List[str] = []
     current = bytearray()
     i = 0
@@ -679,7 +768,9 @@ def analyze_kerberos(
             if not payload:
                 continue
 
-            extracted = _extract_ascii_strings(payload) + _extract_utf16le_strings(payload)
+            extracted = _extract_ascii_strings(payload) + _extract_utf16le_strings(
+                payload
+            )
             candidate_strings: set[str] = set()
             for text in extracted:
                 normalized = _clean_identity_token(text)
@@ -698,7 +789,9 @@ def analyze_kerberos(
                 for match in UPN_RE.finditer(value):
                     user = _normalize_principal_local(match.group(1))
                     realm = _normalize_realm(match.group(2))
-                    if not _is_plausible_principal_local(user) or not _is_plausible_realm(realm):
+                    if not _is_plausible_principal_local(
+                        user
+                    ) or not _is_plausible_realm(realm):
                         continue
                     principal = f"{user}@{realm}"
                     principals[principal] += 1
@@ -707,21 +800,25 @@ def analyze_kerberos(
                     key = (src_ip, dst_ip, dport or sport, proto, principal)
                     if key not in principal_seen:
                         principal_seen.add(key)
-                        principal_evidence.append({
-                            "src_ip": src_ip,
-                            "dst_ip": dst_ip,
-                            "dst_port": dport or sport,
-                            "protocol": proto,
-                            "principal": principal,
-                            "kind": "UPN",
-                        })
+                        principal_evidence.append(
+                            {
+                                "src_ip": src_ip,
+                                "dst_ip": dst_ip,
+                                "dst_port": dport or sport,
+                                "protocol": proto,
+                                "principal": principal,
+                                "kind": "UPN",
+                            }
+                        )
 
                 cname = _split_cname_concat(value)
                 if cname:
                     user, realm = cname
                     user = _normalize_principal_local(user)
                     realm = _normalize_realm(realm)
-                    if _is_plausible_principal_local(user) and _is_plausible_realm(realm):
+                    if _is_plausible_principal_local(user) and _is_plausible_realm(
+                        realm
+                    ):
                         principal = f"{user}@{realm}"
                         principals[principal] += 1
                         realms[realm] += 1
@@ -729,14 +826,16 @@ def analyze_kerberos(
                         key = (src_ip, dst_ip, dport or sport, proto, principal)
                         if key not in principal_seen:
                             principal_seen.add(key)
-                            principal_evidence.append({
-                                "src_ip": src_ip,
-                                "dst_ip": dst_ip,
-                                "dst_port": dport or sport,
-                                "protocol": proto,
-                                "principal": principal,
-                                "kind": "CNameString",
-                            })
+                            principal_evidence.append(
+                                {
+                                    "src_ip": src_ip,
+                                    "dst_ip": dst_ip,
+                                    "dst_port": dport or sport,
+                                    "protocol": proto,
+                                    "principal": principal,
+                                    "kind": "CNameString",
+                                }
+                            )
 
                 for match in SPN_RE.finditer(value):
                     spn = _normalize_spn(match.group(1))
@@ -806,62 +905,78 @@ def analyze_kerberos(
 
     if public_endpoints:
         anomalies.append("Kerberos traffic to public IPs detected.")
-        detections.append({
-            "severity": "warning",
-            "summary": "Kerberos traffic to public IPs",
-            "details": ", ".join([ip for ip, _ in public_endpoints.most_common(10)]),
-            "source": "Kerberos",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Kerberos traffic to public IPs",
+                "details": ", ".join(
+                    [ip for ip, _ in public_endpoints.most_common(10)]
+                ),
+                "source": "Kerberos",
+            }
+        )
 
     tgs_req = request_types.get("TGS-REQ", 0)
     if tgs_req and len(spns) >= 10:
-        detections.append({
-            "severity": "warning",
-            "summary": "Possible Kerberoasting indicators",
-            "details": f"TGS-REQ observed ({tgs_req}) with {len(spns)} unique SPNs.",
-            "source": "Kerberos",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Possible Kerberoasting indicators",
+                "details": f"TGS-REQ observed ({tgs_req}) with {len(spns)} unique SPNs.",
+                "source": "Kerberos",
+            }
+        )
 
     as_rep = request_types.get("AS-REP", 0)
     if as_rep and "KDC_ERR_PREAUTH_REQUIRED" not in error_codes:
-        detections.append({
-            "severity": "warning",
-            "summary": "Possible AS-REP roasting indicators",
-            "details": f"AS-REP observed ({as_rep}) without preauth requirement errors.",
-            "source": "Kerberos",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Possible AS-REP roasting indicators",
+                "details": f"AS-REP observed ({as_rep}) without preauth requirement errors.",
+                "source": "Kerberos",
+            }
+        )
 
     if spns.get("krbtgt"):
-        detections.append({
-            "severity": "info",
-            "summary": "krbtgt service activity observed",
-            "details": "TGT-related service principal observed (heuristic for ticket activity).",
-            "source": "Kerberos",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "krbtgt service activity observed",
+                "details": "TGT-related service principal observed (heuristic for ticket activity).",
+                "source": "Kerberos",
+            }
+        )
 
     if spns.get("krbtgt") and request_types.get("TGS-REP", 0) > 0 and tgs_req > 0:
-        detections.append({
-            "severity": "warning",
-            "summary": "Potential golden/silver ticket indicators (heuristic)",
-            "details": "krbtgt SPN activity observed alongside TGS traffic.",
-            "source": "Kerberos",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Potential golden/silver ticket indicators (heuristic)",
+                "details": "krbtgt SPN activity observed alongside TGS traffic.",
+                "source": "Kerberos",
+            }
+        )
 
     if request_types.get("S4U2SELF", 0) or request_types.get("S4U2PROXY", 0):
-        detections.append({
-            "severity": "warning",
-            "summary": "Kerberos delegation activity observed",
-            "details": "S4U2Self/S4U2Proxy usage can indicate delegation abuse.",
-            "source": "Kerberos",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Kerberos delegation activity observed",
+                "details": "S4U2Self/S4U2Proxy usage can indicate delegation abuse.",
+                "source": "Kerberos",
+            }
+        )
 
     if error_codes.get("KDC_ERR_PREAUTH_FAILED"):
-        detections.append({
-            "severity": "warning",
-            "summary": "Kerberos pre-authentication failures",
-            "details": f"KDC_ERR_PREAUTH_FAILED seen {error_codes['KDC_ERR_PREAUTH_FAILED']} times.",
-            "source": "Kerberos",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Kerberos pre-authentication failures",
+                "details": f"KDC_ERR_PREAUTH_FAILED seen {error_codes['KDC_ERR_PREAUTH_FAILED']} times.",
+                "source": "Kerberos",
+            }
+        )
 
     bind_bursts = Counter()
     for (client_ip, _minute), count in bind_buckets.items():
@@ -870,12 +985,14 @@ def analyze_kerberos(
     if bind_bursts:
         top_burst = max(bind_bursts.values())
         if top_burst >= 20:
-            detections.append({
-                "severity": "warning",
-                "summary": "Potential Kerberos brute-force (high AS/TGS request rate)",
-                "details": f"Peak AS/TGS requests per minute: {top_burst}",
-                "source": "Kerberos",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Potential Kerberos brute-force (high AS/TGS request rate)",
+                    "details": f"Peak AS/TGS requests per minute: {top_burst}",
+                    "source": "Kerberos",
+                }
+            )
 
     deterministic_checks, attack_matrix = _build_kerberos_attack_overview(
         request_types=request_types,
@@ -903,17 +1020,22 @@ def analyze_kerberos(
         status = str(item.get("status", ""))
         if status not in {"suspicious", "watch"}:
             continue
-        summary_text = attack_detection_map.get(str(item.get("attack", "")), str(item.get("attack", "Kerberos attack indicator")))
+        summary_text = attack_detection_map.get(
+            str(item.get("attack", "")),
+            str(item.get("attack", "Kerberos attack indicator")),
+        )
         details = str(item.get("evidence", ""))
         severity = str(item.get("severity", "warning"))
         if status == "watch" and severity == "high":
             severity = "warning"
-        detections.append({
-            "severity": severity,
-            "summary": summary_text,
-            "details": details,
-            "source": "Kerberos",
-        })
+        detections.append(
+            {
+                "severity": severity,
+                "summary": summary_text,
+                "details": details,
+                "source": "Kerberos",
+            }
+        )
 
     return KerberosAnalysis(
         path=path,

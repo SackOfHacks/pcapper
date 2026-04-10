@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import ipaddress
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Iterable
-import ipaddress
-import re
+from typing import Iterable, Optional
 
+from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
 from .utils import safe_float
-from .device_detection import device_fingerprints_from_text
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -50,9 +50,18 @@ OID_LABELS = {
 }
 
 SUSPICIOUS_PATTERNS = [
-    (re.compile(r"powershell|cmd\.exe|wmic|winrs", re.IGNORECASE), "Command execution tooling"),
-    (re.compile(r"mimikatz|cobalt|beacon|meterpreter", re.IGNORECASE), "Malware tooling"),
-    (re.compile(r"rundll32|regsvr32|schtasks|at\s+", re.IGNORECASE), "Execution/persistence tooling"),
+    (
+        re.compile(r"powershell|cmd\.exe|wmic|winrs", re.IGNORECASE),
+        "Command execution tooling",
+    ),
+    (
+        re.compile(r"mimikatz|cobalt|beacon|meterpreter", re.IGNORECASE),
+        "Malware tooling",
+    ),
+    (
+        re.compile(r"rundll32|regsvr32|schtasks|at\s+", re.IGNORECASE),
+        "Execution/persistence tooling",
+    ),
     (re.compile(r"nmap|masscan|sqlmap", re.IGNORECASE), "Recon tooling"),
 ]
 
@@ -178,19 +187,21 @@ def _read_ber_length(payload: bytes, offset: int) -> tuple[Optional[int], int]:
     num_bytes = first & 0x7F
     if num_bytes == 0 or offset + num_bytes > len(payload):
         return None, offset
-    length = int.from_bytes(payload[offset:offset + num_bytes], "big")
+    length = int.from_bytes(payload[offset : offset + num_bytes], "big")
     offset += num_bytes
     return length, offset
 
 
-def _read_tlv(payload: bytes, offset: int) -> tuple[Optional[int], Optional[bytes], int]:
+def _read_tlv(
+    payload: bytes, offset: int
+) -> tuple[Optional[int], Optional[bytes], int]:
     if offset >= len(payload):
         return None, None, offset
     tag = payload[offset]
     length, idx = _read_ber_length(payload, offset + 1)
     if length is None or idx + length > len(payload):
         return None, None, offset
-    value = payload[idx:idx + length]
+    value = payload[idx : idx + length]
     return tag, value, idx + length
 
 
@@ -250,7 +261,7 @@ def _parse_snmp_message(payload: bytes) -> Optional[dict[str, object]]:
     pdu_len, pdu_idx = _read_ber_length(value, idx + 1)
     if pdu_len is None or pdu_idx + pdu_len > len(value):
         return None
-    pdu_value = value[pdu_idx:pdu_idx + pdu_len]
+    pdu_value = value[pdu_idx : pdu_idx + pdu_len]
     pidx = 0
     _req_tag, _req_val, pidx = _read_tlv(pdu_value, pidx)
     _err_tag, _err_val, pidx = _read_tlv(pdu_value, pidx)
@@ -303,7 +314,7 @@ def _beacon_score(times: list[float]) -> Optional[dict[str, float]]:
     if avg <= 0:
         return None
     variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
+    stddev = variance**0.5
     if avg < 1 or avg > 3600:
         return None
     if stddev / avg > 0.15:
@@ -311,7 +322,12 @@ def _beacon_score(times: list[float]) -> Optional[dict[str, float]]:
     return {"avg": avg, "stddev": stddev}
 
 
-def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | None = None, meta: object | None = None) -> SnmpSummary:
+def analyze_snmp(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: object | None = None,
+) -> SnmpSummary:
     errors: list[str] = []
     if UDP is None and TCP is None:
         errors.append("Scapy IP layers unavailable; install scapy for SNMP analysis.")
@@ -473,7 +489,13 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
             dst_by_src[src_ip].add(dst_ip)
             community_by_flow[(src_ip, dst_ip)].add(community)
 
-            if ts is not None and pdu in {"GetRequest", "GetNextRequest", "GetBulkRequest", "SetRequest", "InformRequest"}:
+            if ts is not None and pdu in {
+                "GetRequest",
+                "GetNextRequest",
+                "GetBulkRequest",
+                "SetRequest",
+                "InformRequest",
+            }:
                 request_times[(src_ip, dst_ip)].append(ts)
 
             if pdu in {"GetResponse", "SNMPv2-Trap", "Trap", "Report"}:
@@ -506,47 +528,70 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
                     label = OID_LABELS.get(oid)
                     oid_counts[oid] += 1
                     if label:
-                        artifacts.append(SnmpArtifact(kind=label, detail=value, src=src_ip, dst=dst_ip))
+                        artifacts.append(
+                            SnmpArtifact(
+                                kind=label, detail=value, src=src_ip, dst=dst_ip
+                            )
+                        )
                     if label == "sysName" and value:
                         hostnames[value] += 1
                     if label == "sysDescr" and value:
                         plaintext_strings[_truncate(value, 120)] += 1
                         if "windows" in value.lower():
-                            detections.append({
-                                "severity": "info",
-                                "summary": "Windows SNMP device observed",
-                                "details": f"{src_ip}->{dst_ip} {value[:80]}",
-                                "source": "SNMP",
-                            })
-                        for detail in device_fingerprints_from_text(value, source="SNMP sysDescr"):
+                            detections.append(
+                                {
+                                    "severity": "info",
+                                    "summary": "Windows SNMP device observed",
+                                    "details": f"{src_ip}->{dst_ip} {value[:80]}",
+                                    "source": "SNMP",
+                                }
+                            )
+                        for detail in device_fingerprints_from_text(
+                            value, source="SNMP sysDescr"
+                        ):
                             key = f"device:{detail}"
                             if key in seen_device_artifacts:
                                 continue
                             seen_device_artifacts.add(key)
-                            artifacts.append(SnmpArtifact(kind="device", detail=detail, src=src_ip, dst=dst_ip))
+                            artifacts.append(
+                                SnmpArtifact(
+                                    kind="device", detail=detail, src=src_ip, dst=dst_ip
+                                )
+                            )
                     if label == "ipAdEntAddr" and value:
                         ip_addresses[value] += 1
                     if label == "ifPhysAddress":
                         mac = _format_mac(value)
                         if mac:
                             mac_addresses[mac] += 1
-                    if label in {"hrSWRunName", "hrSWInstalledName", "hrDeviceDescr"} and value:
+                    if (
+                        label in {"hrSWRunName", "hrSWInstalledName", "hrDeviceDescr"}
+                        and value
+                    ):
                         services[_truncate(value, 80)] += 1
-                        for detail in device_fingerprints_from_text(value, source=f"SNMP {label}"):
+                        for detail in device_fingerprints_from_text(
+                            value, source=f"SNMP {label}"
+                        ):
                             key = f"device:{detail}"
                             if key in seen_device_artifacts:
                                 continue
                             seen_device_artifacts.add(key)
-                            artifacts.append(SnmpArtifact(kind="device", detail=detail, src=src_ip, dst=dst_ip))
+                            artifacts.append(
+                                SnmpArtifact(
+                                    kind="device", detail=detail, src=src_ip, dst=dst_ip
+                                )
+                            )
                     if value:
                         for pattern, reason in SUSPICIOUS_PATTERNS:
                             if pattern.search(value):
-                                detections.append({
-                                    "severity": "warning",
-                                    "summary": f"Suspicious SNMP value: {reason}",
-                                    "details": f"{src_ip}->{dst_ip} {value[:120]}",
-                                    "source": "SNMP",
-                                })
+                                detections.append(
+                                    {
+                                        "severity": "warning",
+                                        "summary": f"Suspicious SNMP value: {reason}",
+                                        "details": f"{src_ip}->{dst_ip} {value[:120]}",
+                                        "source": "SNMP",
+                                    }
+                                )
     except Exception as exc:
         errors.append(str(exc))
     finally:
@@ -558,79 +603,95 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
 
     for community in list(community_counts.keys()):
         if community.lower() in {"public", "private"}:
-            detections.append({
-                "severity": "high",
-                "summary": "Default SNMP community string detected",
-                "details": f"Community '{community}' observed; review access controls.",
-                "source": "SNMP",
-            })
+            detections.append(
+                {
+                    "severity": "high",
+                    "summary": "Default SNMP community string detected",
+                    "details": f"Community '{community}' observed; review access controls.",
+                    "source": "SNMP",
+                }
+            )
 
     if pdu_counts.get("SetRequest"):
-        detections.append({
-            "severity": "high",
-            "summary": "SNMP SET operations observed",
-            "details": f"{pdu_counts.get('SetRequest')} SetRequest PDU(s) detected.",
-            "source": "SNMP",
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "SNMP SET operations observed",
+                "details": f"{pdu_counts.get('SetRequest')} SetRequest PDU(s) detected.",
+                "source": "SNMP",
+            }
+        )
 
     if version_counts.get("v1"):
-        detections.append({
-            "severity": "warning",
-            "summary": "Legacy SNMPv1 observed",
-            "details": f"{version_counts.get('v1')} SNMPv1 message(s) detected.",
-            "source": "SNMP",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Legacy SNMPv1 observed",
+                "details": f"{version_counts.get('v1')} SNMPv1 message(s) detected.",
+                "source": "SNMP",
+            }
+        )
 
     for src, dsts in dst_by_src.items():
         if len(dsts) >= 20:
-            detections.append({
-                "severity": "warning",
-                "summary": "SNMP scanning/probing detected",
-                "details": f"{src} contacted {len(dsts)} SNMP endpoints.",
-                "source": "SNMP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SNMP scanning/probing detected",
+                    "details": f"{src} contacted {len(dsts)} SNMP endpoints.",
+                    "source": "SNMP",
+                }
+            )
 
     for (src, dst), comms in community_by_flow.items():
         if len(comms) >= 6:
-            detections.append({
-                "severity": "warning",
-                "summary": "SNMP community brute-force suspected",
-                "details": f"{src} tried {len(comms)} community strings against {dst}.",
-                "source": "SNMP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SNMP community brute-force suspected",
+                    "details": f"{src} tried {len(comms)} community strings against {dst}.",
+                    "source": "SNMP",
+                }
+            )
 
     for flow, times in request_times.items():
         score = _beacon_score(times)
         if score:
-            detections.append({
-                "severity": "warning",
-                "summary": "SNMP beaconing suspected",
-                "details": f"{flow[0]}->{flow[1]} avg {score['avg']:.1f}s interval.",
-                "source": "SNMP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SNMP beaconing suspected",
+                    "details": f"{flow[0]}->{flow[1]} avg {score['avg']:.1f}s interval.",
+                    "source": "SNMP",
+                }
+            )
 
     for flow, resp_bytes in response_bytes.items():
         req_bytes = request_bytes.get(flow, 1)
         if resp_bytes > 50_000 and resp_bytes > req_bytes * 5:
-            detections.append({
-                "severity": "warning",
-                "summary": "SNMP data exfiltration suspected",
-                "details": f"{flow[0]}->{flow[1]} response bytes {resp_bytes}.",
-                "source": "SNMP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SNMP data exfiltration suspected",
+                    "details": f"{flow[0]}->{flow[1]} response bytes {resp_bytes}.",
+                    "source": "SNMP",
+                }
+            )
 
     conversations: list[SnmpConversation] = []
     for (src, dst, proto, port), data in conv_map.items():
-        conversations.append(SnmpConversation(
-            client_ip=src,
-            server_ip=dst,
-            protocol=proto,
-            server_port=port,
-            packets=int(data["packets"]),
-            bytes=int(data["bytes"]),
-            first_seen=data.get("first_seen"),
-            last_seen=data.get("last_seen"),
-        ))
+        conversations.append(
+            SnmpConversation(
+                client_ip=src,
+                server_ip=dst,
+                protocol=proto,
+                server_port=port,
+                packets=int(data["packets"]),
+                bytes=int(data["bytes"]),
+                first_seen=data.get("first_seen"),
+                last_seen=data.get("last_seen"),
+            )
+        )
     conversations.sort(key=lambda c: c.packets, reverse=True)
 
     duration_seconds = None
@@ -768,7 +829,11 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
         plaintext_strings.update(summary.plaintext_strings)
 
         for item in summary.detections:
-            key = (str(item.get("severity", "")), str(item.get("summary", "")), str(item.get("details", "")))
+            key = (
+                str(item.get("severity", "")),
+                str(item.get("summary", "")),
+                str(item.get("details", "")),
+            )
             if key in det_seen:
                 continue
             det_seen.add(key)
@@ -796,9 +861,13 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
                 continue
             current["packets"] = int(current["packets"]) + conv.packets
             current["bytes"] = int(current["bytes"]) + conv.bytes
-            if conv.first_seen is not None and (current["first_seen"] is None or conv.first_seen < current["first_seen"]):
+            if conv.first_seen is not None and (
+                current["first_seen"] is None or conv.first_seen < current["first_seen"]
+            ):
                 current["first_seen"] = conv.first_seen
-            if conv.last_seen is not None and (current["last_seen"] is None or conv.last_seen > current["last_seen"]):
+            if conv.last_seen is not None and (
+                current["last_seen"] is None or conv.last_seen > current["last_seen"]
+            ):
                 current["last_seen"] = conv.last_seen
 
     conversations = [

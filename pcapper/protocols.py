@@ -1,34 +1,37 @@
 from __future__ import annotations
 
-from collections import defaultdict, Counter
 import ipaddress
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
-    from scapy.layers.inet import IP, TCP, UDP, ICMP
-    from scapy.layers.inet6 import IPv6
-    from scapy.layers.l2 import Ether, ARP
     from scapy.layers.dns import DNS
-    from scapy.packet import Raw, Packet
+    from scapy.layers.inet import ICMP, IP, TCP, UDP
+    from scapy.layers.inet6 import IPv6
+    from scapy.layers.l2 import ARP, Ether
+    from scapy.packet import Packet, Raw
 except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
 
 from .pcap_cache import get_reader
 from .utils import safe_float
+
 # from .services import get_service_name - Removed
 
 # --- Dataclasses ---
+
 
 @dataclass
 class ProtocolStat:
     name: str
     packets: int = 0
     bytes: int = 0
-    sub_protocols: Dict[str, 'ProtocolStat'] = field(default_factory=dict)
-    
+    sub_protocols: Dict[str, "ProtocolStat"] = field(default_factory=dict)
+
+
 @dataclass
 class Conversation:
     src: str
@@ -40,6 +43,7 @@ class Conversation:
     end_ts: float
     ports: Set[int]
 
+
 @dataclass
 class Endpoint:
     address: str
@@ -49,6 +53,7 @@ class Endpoint:
     bytes_recv: int = 0
     protocols: Set[str] = field(default_factory=set)
 
+
 @dataclass
 class Anomaly:
     severity: str  # LOW, MEDIUM, HIGH, CRITICAL
@@ -57,6 +62,7 @@ class Anomaly:
     packet_index: int
     src: Optional[str] = None
     dst: Optional[str] = None
+
 
 @dataclass
 class ProtocolSummary:
@@ -134,12 +140,44 @@ def _build_protocol_hunting_context(
     role_inversion_profiles: List[Dict[str, object]] = []
     pivots: List[Dict[str, object]] = []
 
-    suspicious_proto_names = {"DNS", "ICMP", "QUIC", "HTTPS", "HTTP", "SMB", "RDP", "WinRM", "SSH", "Telnet"}
+    suspicious_proto_names = {
+        "DNS",
+        "ICMP",
+        "QUIC",
+        "HTTPS",
+        "HTTP",
+        "SMB",
+        "RDP",
+        "WinRM",
+        "SSH",
+        "Telnet",
+    }
     admin_protos = {"SMB", "RDP", "WinRM", "SSH", "Telnet", "RPC", "LDAP", "Kerberos"}
-    ot_markers = {"Modbus", "DNP3", "IEC", "CIP", "ENIP", "BACnet", "OPC", "S7", "PROFINET", "EtherCAT", "GOOSE", "SV", "MMS", "ICCP", "PTP", "MQTT", "CoAP", "HART"}
+    ot_markers = {
+        "Modbus",
+        "DNP3",
+        "IEC",
+        "CIP",
+        "ENIP",
+        "BACnet",
+        "OPC",
+        "S7",
+        "PROFINET",
+        "EtherCAT",
+        "GOOSE",
+        "SV",
+        "MMS",
+        "ICCP",
+        "PTP",
+        "MQTT",
+        "CoAP",
+        "HART",
+    }
 
     for name, count in top_protocols:
-        pct = (float(count) / float(total_packets) * 100.0) if total_packets > 0 else 0.0
+        pct = (
+            (float(count) / float(total_packets) * 100.0) if total_packets > 0 else 0.0
+        )
         if count <= 5 or pct <= 0.2:
             checks["rare_or_low_prevalence_protocol"].append(
                 f"{name} packets={count} prevalence={pct:.2f}%"
@@ -162,7 +200,11 @@ def _build_protocol_hunting_context(
         event_types = {str(event.type) for event in events}
         event_severities = {str(event.severity).upper() for event in events}
         scan_signal = any("Scan" in t for t in event_types)
-        cred_signal = any(t in {"Cleartext Creds", "Credential Leakage", "Basic Auth", "Cleartext Auth"} for t in event_types)
+        cred_signal = any(
+            t
+            in {"Cleartext Creds", "Credential Leakage", "Basic Auth", "Cleartext Auth"}
+            for t in event_types
+        )
         frag_signal = any(t == "IP Fragmentation" for t in event_types)
         if scan_signal and cred_signal:
             checks["anomalous_protocol_sequence"].append(
@@ -188,7 +230,9 @@ def _build_protocol_hunting_context(
                     "evidence_count": len(events),
                 }
             )
-        if len(event_types) >= 3 and ("HIGH" in event_severities or "CRITICAL" in event_severities):
+        if len(event_types) >= 3 and (
+            "HIGH" in event_severities or "CRITICAL" in event_severities
+        ):
             checks["cross_protocol_corroboration"].append(
                 f"{src} has multi-signal anomaly stack types={','.join(sorted(event_types))}"
             )
@@ -204,7 +248,9 @@ def _build_protocol_hunting_context(
         proto_name = str(conv.protocol)
         duration_s = max(0.0, float(conv.end_ts or 0.0) - float(conv.start_ts or 0.0))
         pps = (float(conv.packets) / duration_s) if duration_s > 0 else 0.0
-        avg_payload = (float(conv.bytes) / float(conv.packets)) if conv.packets > 0 else 0.0
+        avg_payload = (
+            (float(conv.bytes) / float(conv.packets)) if conv.packets > 0 else 0.0
+        )
         ports = sorted(int(p) for p in list(conv.ports))
 
         checks["evidence_provenance"].append(
@@ -275,7 +321,11 @@ def _build_protocol_hunting_context(
         src_ep = endpoint_map.get(str(conv.src))
         if src_ep is not None:
             src_protocols = {str(p) for p in src_ep.protocols}
-            if proto_name in admin_protos and src_zone == "internal" and len(src_protocols) <= 2:
+            if (
+                proto_name in admin_protos
+                and src_zone == "internal"
+                and len(src_protocols) <= 2
+            ):
                 checks["role_inversion_signal"].append(
                     f"{conv.src} appears narrowly exposed on admin protocol {proto_name}"
                 )
@@ -296,9 +346,13 @@ def _build_protocol_hunting_context(
                     f"{conv.src} speaks broad risky protocol mix: {','.join(sorted(src_protocols.intersection(suspicious_proto_names)))}"
                 )
                 host_scores[str(conv.src)] += 1
-                host_reasons[str(conv.src)].append("Broad risky cross-protocol service mix")
+                host_reasons[str(conv.src)].append(
+                    "Broad risky cross-protocol service mix"
+                )
 
-    for host, score in sorted(host_scores.items(), key=lambda item: item[1], reverse=True):
+    for host, score in sorted(
+        host_scores.items(), key=lambda item: item[1], reverse=True
+    ):
         reasons = list(dict.fromkeys(host_reasons.get(host, [])))
         confidence = "high" if score >= 5 else "medium" if score >= 3 else "low"
         corroborated_findings.append(
@@ -311,7 +365,9 @@ def _build_protocol_hunting_context(
         )
 
     for conv in sorted(conversations, key=lambda c: c.bytes, reverse=True):
-        reasons = host_reasons.get(str(conv.src), []) + host_reasons.get(str(conv.dst), [])
+        reasons = host_reasons.get(str(conv.src), []) + host_reasons.get(
+            str(conv.dst), []
+        )
         if not reasons:
             continue
         pivots.append(
@@ -320,7 +376,9 @@ def _build_protocol_hunting_context(
                 "protocol": conv.protocol,
                 "packets": conv.packets,
                 "bytes": conv.bytes,
-                "duration_s": max(0.0, float(conv.end_ts or 0.0) - float(conv.start_ts or 0.0)),
+                "duration_s": max(
+                    0.0, float(conv.end_ts or 0.0) - float(conv.start_ts or 0.0)
+                ),
                 "reasons": list(dict.fromkeys(reasons))[:4],
             }
         )
@@ -333,22 +391,39 @@ def _build_protocol_hunting_context(
     verdict_score += 1 if checks["tunneling_or_encapsulation_signal"] else 0
     verdict_score += 1 if checks["periodic_beacon_profile"] else 0
     verdict_score += 1 if checks["role_inversion_signal"] else 0
-    verdict_score += 1 if len([a for a in anomalies if str(a.severity).upper() in {"HIGH", "CRITICAL"}]) >= 3 else 0
+    verdict_score += (
+        1
+        if len(
+            [a for a in anomalies if str(a.severity).upper() in {"HIGH", "CRITICAL"}]
+        )
+        >= 3
+        else 0
+    )
 
     analyst_reasons: List[str] = []
     if checks["boundary_cross_zone_protocol"]:
-        analyst_reasons.append("Administrative protocols crossed internal/public boundaries")
+        analyst_reasons.append(
+            "Administrative protocols crossed internal/public boundaries"
+        )
     if checks["ot_protocol_boundary_crossing"]:
         analyst_reasons.append("OT protocols crossed expected network boundaries")
     if checks["cross_protocol_corroboration"]:
-        analyst_reasons.append("Multiple independent protocol anomaly signals corroborate")
+        analyst_reasons.append(
+            "Multiple independent protocol anomaly signals corroborate"
+        )
     if checks["anomalous_protocol_sequence"]:
-        analyst_reasons.append("Suspicious sequence pattern observed in protocol events")
+        analyst_reasons.append(
+            "Suspicious sequence pattern observed in protocol events"
+        )
     if checks["tunneling_or_encapsulation_signal"]:
-        analyst_reasons.append("Potential protocol tunneling/encapsulation signals observed")
+        analyst_reasons.append(
+            "Potential protocol tunneling/encapsulation signals observed"
+        )
 
     if verdict_score >= 8:
-        verdict = "YES - HIGH-CONFIDENCE PROTOCOL ABUSE OR LATERAL-MOVEMENT PATTERN DETECTED"
+        verdict = (
+            "YES - HIGH-CONFIDENCE PROTOCOL ABUSE OR LATERAL-MOVEMENT PATTERN DETECTED"
+        )
         confidence = "high"
     elif verdict_score >= 5:
         verdict = "LIKELY - MULTIPLE CORROBORATING PROTOCOL RISK INDICATORS DETECTED"
@@ -357,7 +432,9 @@ def _build_protocol_hunting_context(
         verdict = "POSSIBLE - PROTOCOL RISK SIGNALS REQUIRE VALIDATION"
         confidence = "medium"
     else:
-        verdict = "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE PROTOCOL ABUSE PATTERN"
+        verdict = (
+            "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE PROTOCOL ABUSE PATTERN"
+        )
         confidence = "low"
 
     risk_matrix: List[Dict[str, str]] = [
@@ -365,53 +442,80 @@ def _build_protocol_hunting_context(
             "category": "Anomalous Sequence",
             "risk": "High" if checks["anomalous_protocol_sequence"] else "None",
             "confidence": "High" if checks["anomalous_protocol_sequence"] else "Low",
-            "evidence": str(len(checks["anomalous_protocol_sequence"])) if checks["anomalous_protocol_sequence"] else "No matching detections",
+            "evidence": str(len(checks["anomalous_protocol_sequence"]))
+            if checks["anomalous_protocol_sequence"]
+            else "No matching detections",
         },
         {
             "category": "Cross-Zone Protocol Exposure",
             "risk": "High" if checks["boundary_cross_zone_protocol"] else "None",
             "confidence": "High" if checks["boundary_cross_zone_protocol"] else "Low",
-            "evidence": str(len(checks["boundary_cross_zone_protocol"])) if checks["boundary_cross_zone_protocol"] else "No matching detections",
+            "evidence": str(len(checks["boundary_cross_zone_protocol"]))
+            if checks["boundary_cross_zone_protocol"]
+            else "No matching detections",
         },
         {
             "category": "Tunneling/Encapsulation",
             "risk": "Medium" if checks["tunneling_or_encapsulation_signal"] else "None",
-            "confidence": "Medium" if checks["tunneling_or_encapsulation_signal"] else "Low",
-            "evidence": str(len(checks["tunneling_or_encapsulation_signal"])) if checks["tunneling_or_encapsulation_signal"] else "No matching detections",
+            "confidence": "Medium"
+            if checks["tunneling_or_encapsulation_signal"]
+            else "Low",
+            "evidence": str(len(checks["tunneling_or_encapsulation_signal"]))
+            if checks["tunneling_or_encapsulation_signal"]
+            else "No matching detections",
         },
         {
             "category": "Periodic Beaconing",
             "risk": "Medium" if checks["periodic_beacon_profile"] else "None",
             "confidence": "Medium" if checks["periodic_beacon_profile"] else "Low",
-            "evidence": str(len(checks["periodic_beacon_profile"])) if checks["periodic_beacon_profile"] else "No matching detections",
+            "evidence": str(len(checks["periodic_beacon_profile"]))
+            if checks["periodic_beacon_profile"]
+            else "No matching detections",
         },
         {
             "category": "Role Inversion",
             "risk": "Medium" if checks["role_inversion_signal"] else "None",
             "confidence": "Medium" if checks["role_inversion_signal"] else "Low",
-            "evidence": str(len(checks["role_inversion_signal"])) if checks["role_inversion_signal"] else "No matching detections",
+            "evidence": str(len(checks["role_inversion_signal"]))
+            if checks["role_inversion_signal"]
+            else "No matching detections",
         },
         {
             "category": "OT Boundary Crossing",
             "risk": "High" if checks["ot_protocol_boundary_crossing"] else "None",
             "confidence": "High" if checks["ot_protocol_boundary_crossing"] else "Low",
-            "evidence": str(len(checks["ot_protocol_boundary_crossing"])) if checks["ot_protocol_boundary_crossing"] else "No matching detections",
+            "evidence": str(len(checks["ot_protocol_boundary_crossing"]))
+            if checks["ot_protocol_boundary_crossing"]
+            else "No matching detections",
         },
     ]
 
     false_positive_context: List[str] = []
-    if checks["boundary_cross_zone_protocol"] and not checks["cross_protocol_corroboration"]:
-        false_positive_context.append("Boundary crossings may be expected for approved remote administration or managed gateways")
+    if (
+        checks["boundary_cross_zone_protocol"]
+        and not checks["cross_protocol_corroboration"]
+    ):
+        false_positive_context.append(
+            "Boundary crossings may be expected for approved remote administration or managed gateways"
+        )
     if checks["periodic_beacon_profile"]:
-        false_positive_context.append("Periodic behavior can be caused by health checks, backup agents, or telemetry polling")
+        false_positive_context.append(
+            "Periodic behavior can be caused by health checks, backup agents, or telemetry polling"
+        )
     if not checks["anomalous_protocol_sequence"]:
-        false_positive_context.append("No strong deterministic protocol-event sequence crossed high-confidence thresholds")
-    false_positive_context.append("Baseline drift is estimated from this capture only unless historical baselines are provided")
+        false_positive_context.append(
+            "No strong deterministic protocol-event sequence crossed high-confidence thresholds"
+        )
+    false_positive_context.append(
+        "Baseline drift is estimated from this capture only unless historical baselines are provided"
+    )
 
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
-        "analyst_reasons": analyst_reasons if analyst_reasons else ["No high-confidence protocol threat heuristic crossed threshold"],
+        "analyst_reasons": analyst_reasons
+        if analyst_reasons
+        else ["No high-confidence protocol threat heuristic crossed threshold"],
         "deterministic_checks": checks,
         "corroborated_findings": corroborated_findings[:40],
         "sequence_profiles": sequence_profiles[:40],
@@ -427,7 +531,9 @@ def _build_protocol_hunting_context(
 
 
 def merge_protocols_summaries(
-    summaries: List[ProtocolSummary] | Tuple[ProtocolSummary, ...] | Set[ProtocolSummary]
+    summaries: List[ProtocolSummary]
+    | Tuple[ProtocolSummary, ...]
+    | Set[ProtocolSummary],
 ) -> ProtocolSummary:
     summary_list = list(summaries)
     if not summary_list:
@@ -540,10 +646,14 @@ def merge_protocols_summaries(
         errors=errors,
         analyst_verdict=str(context.get("analyst_verdict", "")),
         analyst_confidence=str(context.get("analyst_confidence", "low")),
-        analyst_reasons=[str(v) for v in list(context.get("analyst_reasons", []) or [])],
+        analyst_reasons=[
+            str(v) for v in list(context.get("analyst_reasons", []) or [])
+        ],
         deterministic_checks={
             str(key): [str(v) for v in list(values or [])]
-            for key, values in dict(context.get("deterministic_checks", {}) or {}).items()
+            for key, values in dict(
+                context.get("deterministic_checks", {}) or {}
+            ).items()
         },
         corroborated_findings=list(context.get("corroborated_findings", []) or []),
         sequence_profiles=list(context.get("sequence_profiles", []) or []),
@@ -553,9 +663,16 @@ def merge_protocols_summaries(
         beacon_profiles=list(context.get("beacon_profiles", []) or []),
         role_inversion_profiles=list(context.get("role_inversion_profiles", []) or []),
         investigation_pivots=list(context.get("investigation_pivots", []) or []),
-        risk_matrix=[dict(item) for item in list(context.get("risk_matrix", []) or []) if isinstance(item, dict)],
-        false_positive_context=[str(v) for v in list(context.get("false_positive_context", []) or [])],
+        risk_matrix=[
+            dict(item)
+            for item in list(context.get("risk_matrix", []) or [])
+            if isinstance(item, dict)
+        ],
+        false_positive_context=[
+            str(v) for v in list(context.get("false_positive_context", []) or [])
+        ],
     )
+
 
 # --- Analysis ---
 
@@ -606,20 +723,51 @@ ETHERTYPE_PROTOCOLS = {
 }
 
 KNOWN_PORTS = {
-    20: "FTP-Data", 21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP",
-    53: "DNS", 67: "DHCP", 68: "DHCP", 69: "TFTP", 80: "HTTP",
-    88: "Kerberos", 110: "POP3", 123: "NTP", 135: "RPC",
-    137: "NetBIOS", 138: "NetBIOS", 139: "NetBIOS", 143: "IMAP",
-    161: "SNMP", 162: "SNMP", 389: "LDAP", 443: "HTTPS",
-    445: "SMB", 514: "Syslog", 636: "LDAPS", 993: "IMAPS", 995: "POP3S",
-    1433: "MSSQL", 1521: "Oracle", 3306: "MySQL", 3389: "RDP",
-    5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 8000: "HTTP-Alt",
-    8080: "HTTP-Proxy", 8443: "HTTPS-Alt", 9200: "Elasticsearch", 27017: "MongoDB",
+    20: "FTP-Data",
+    21: "FTP",
+    22: "SSH",
+    23: "Telnet",
+    25: "SMTP",
+    53: "DNS",
+    67: "DHCP",
+    68: "DHCP",
+    69: "TFTP",
+    80: "HTTP",
+    88: "Kerberos",
+    110: "POP3",
+    123: "NTP",
+    135: "RPC",
+    137: "NetBIOS",
+    138: "NetBIOS",
+    139: "NetBIOS",
+    143: "IMAP",
+    161: "SNMP",
+    162: "SNMP",
+    389: "LDAP",
+    443: "HTTPS",
+    445: "SMB",
+    514: "Syslog",
+    636: "LDAPS",
+    993: "IMAPS",
+    995: "POP3S",
+    1433: "MSSQL",
+    1521: "Oracle",
+    3306: "MySQL",
+    3389: "RDP",
+    5432: "PostgreSQL",
+    5900: "VNC",
+    6379: "Redis",
+    8000: "HTTP-Alt",
+    8080: "HTTP-Proxy",
+    8443: "HTTPS-Alt",
+    9200: "Elasticsearch",
+    27017: "MongoDB",
     5353: "mDNS",
 }
 KNOWN_PORTS.update(INDUSTRIAL_PORTS)
 
 OSCILLATION_REPEAT_CAP = 3
+
 
 def _get_proto_name(pkt: Packet) -> str:
     # Heuristic based on layers
@@ -640,7 +788,7 @@ def _get_proto_name(pkt: Packet) -> str:
         return "IPv6"
     elif ARP in pkt:
         return "ARP"
-    
+
     # Fallback to layer name
     try:
         # Try to find the highest layer
@@ -651,16 +799,41 @@ def _get_proto_name(pkt: Packet) -> str:
     except Exception:
         return "Unknown"
 
+
 def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
     if IP is None:
-         return ProtocolSummary(path, 0, 0, ProtocolStat("Root"), [], [], [], [], [], [], ["Scapy not available"])
+        return ProtocolSummary(
+            path,
+            0,
+            0,
+            ProtocolStat("Root"),
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            ["Scapy not available"],
+        )
 
     try:
         reader, status, stream, size_bytes, _file_type = get_reader(
             path, show_status=show_status
         )
     except Exception as e:
-        return ProtocolSummary(path, 0, 0, ProtocolStat("Root"), [], [], [], [], [], [], [f"Error opening pcap: {e}"])
+        return ProtocolSummary(
+            path,
+            0,
+            0,
+            ProtocolStat("Root"),
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [f"Error opening pcap: {e}"],
+        )
     size_bytes = size_bytes
 
     # Stats containers
@@ -679,13 +852,13 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
     tcp_xmas_scan: Counter[str] = Counter()
     ip_fragments = 0
     icmp_large_payloads: List[Tuple[str, str, int]] = []
-    
+
     start_ts = None
     end_ts = None
     pkt_idx = 0
     port_protocol_counts: Counter[str] = Counter()
     ethertype_protocol_counts: Counter[str] = Counter()
-    
+
     errors = []
 
     try:
@@ -703,7 +876,7 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
             if start_ts is None:
                 start_ts = ts
             end_ts = ts
-            
+
             pkt_len = len(pkt)
             port_protocol_counts[_get_proto_name(pkt)] += 1
             if Ether in pkt:
@@ -715,7 +888,7 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                     label = ETHERTYPE_PROTOCOLS.get(ethertype)
                     if label:
                         ethertype_protocol_counts[label] += 1
-            
+
             # 1. Hierarchy Update
             # Traverse layers while avoiding double-counting VLAN-tagged traffic.
             current_node = hierarchy
@@ -749,7 +922,9 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                         # Count VLAN tags, but do not make them the parent of L3/L4.
                         vlan_parent = current_node
                         if vlan_parent.name != "Ethernet":
-                            vlan_parent = hierarchy.sub_protocols.get("Ethernet", vlan_parent)
+                            vlan_parent = hierarchy.sub_protocols.get(
+                                "Ethernet", vlan_parent
+                            )
                         if lname not in vlan_parent.sub_protocols:
                             vlan_parent.sub_protocols[lname] = ProtocolStat(lname)
                         vlan_node = vlan_parent.sub_protocols[lname]
@@ -785,15 +960,23 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
             port_label = None
             if TCP in pkt:
                 try:
-                    port_label = KNOWN_PORTS.get(int(pkt[TCP].sport)) or KNOWN_PORTS.get(int(pkt[TCP].dport))
+                    port_label = KNOWN_PORTS.get(
+                        int(pkt[TCP].sport)
+                    ) or KNOWN_PORTS.get(int(pkt[TCP].dport))
                 except Exception:
                     port_label = None
             elif UDP in pkt:
                 try:
-                    port_label = KNOWN_PORTS.get(int(pkt[UDP].sport)) or KNOWN_PORTS.get(int(pkt[UDP].dport))
+                    port_label = KNOWN_PORTS.get(
+                        int(pkt[UDP].sport)
+                    ) or KNOWN_PORTS.get(int(pkt[UDP].dport))
                 except Exception:
                     port_label = None
-            if l4_node is not None and port_label and port_label not in effective_path_layers:
+            if (
+                l4_node is not None
+                and port_label
+                and port_label not in effective_path_layers
+            ):
                 child = l4_node.sub_protocols.get(port_label)
                 if child is None:
                     child = ProtocolStat(port_label)
@@ -806,17 +989,25 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
             dst = None
             proto = "Ethernet"
             ports = set()
-            
+
             if IP in pkt:
                 src = pkt[IP].src
                 dst = pkt[IP].dst
                 proto = "IP"
                 if TCP in pkt:
-                    proto = KNOWN_PORTS.get(pkt[TCP].sport) or KNOWN_PORTS.get(pkt[TCP].dport) or "TCP"
+                    proto = (
+                        KNOWN_PORTS.get(pkt[TCP].sport)
+                        or KNOWN_PORTS.get(pkt[TCP].dport)
+                        or "TCP"
+                    )
                     ports.add(pkt[TCP].sport)
                     ports.add(pkt[TCP].dport)
                 elif UDP in pkt:
-                    proto = KNOWN_PORTS.get(pkt[UDP].sport) or KNOWN_PORTS.get(pkt[UDP].dport) or "UDP"
+                    proto = (
+                        KNOWN_PORTS.get(pkt[UDP].sport)
+                        or KNOWN_PORTS.get(pkt[UDP].dport)
+                        or "UDP"
+                    )
                     ports.add(pkt[UDP].sport)
                     ports.add(pkt[UDP].dport)
                 elif ICMP in pkt:
@@ -851,7 +1042,7 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                         broadcast_frames += 1
                 except Exception:
                     pass
-            
+
             if src and dst:
                 # Endpoints
                 e_src = eps[src]
@@ -859,19 +1050,25 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                 e_src.packets_sent += 1
                 e_src.bytes_sent += pkt_len
                 e_src.protocols.add(proto)
-                
+
                 e_dst = eps[dst]
                 e_dst.address = dst
                 e_dst.packets_recv += 1
                 e_dst.bytes_recv += pkt_len
                 e_dst.protocols.add(proto)
-                
+
                 # Conversations (Order insensitive Key)
                 key = tuple(sorted([src, dst])) + (proto,)
                 if key not in convs:
                     convs[key] = Conversation(
-                        src=src, dst=dst, protocol=proto, packets=0, bytes=0,
-                        start_ts=ts, end_ts=ts, ports=set()
+                        src=src,
+                        dst=dst,
+                        protocol=proto,
+                        packets=0,
+                        bytes=0,
+                        start_ts=ts,
+                        end_ts=ts,
+                        ports=set(),
                     )
                 c = convs[key]
                 c.packets += 1
@@ -884,7 +1081,11 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                 try:
                     ip_layer = pkt[IP]
                     if getattr(ip_layer, "frag", 0) or getattr(ip_layer, "flags", 0):
-                        if getattr(ip_layer, "frag", 0) > 0 or str(getattr(ip_layer, "flags", "")).lower().find("mf") >= 0:
+                        if (
+                            getattr(ip_layer, "frag", 0) > 0
+                            or str(getattr(ip_layer, "flags", "")).lower().find("mf")
+                            >= 0
+                        ):
                             ip_fragments += 1
                 except Exception:
                     pass
@@ -893,13 +1094,32 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
             if TCP in pkt and Raw in pkt:
                 payload = bytes(pkt[Raw])
                 # FTP/Telnet/HTTP Basic Auth check (very basic)
-                if (pkt[TCP].dport == 21 or pkt[TCP].sport == 21) or \
-                   (pkt[TCP].dport == 23 or pkt[TCP].sport == 23):
-                     if b"USER" in payload or b"PASS" in payload:
-                         anomalies.append(Anomaly("HIGH", "Cleartext Creds", f"Potential {proto} cleartext credentials", pkt_idx, src, dst))
-                
+                if (pkt[TCP].dport == 21 or pkt[TCP].sport == 21) or (
+                    pkt[TCP].dport == 23 or pkt[TCP].sport == 23
+                ):
+                    if b"USER" in payload or b"PASS" in payload:
+                        anomalies.append(
+                            Anomaly(
+                                "HIGH",
+                                "Cleartext Creds",
+                                f"Potential {proto} cleartext credentials",
+                                pkt_idx,
+                                src,
+                                dst,
+                            )
+                        )
+
                 if b"Authorization: Basic" in payload:
-                     anomalies.append(Anomaly("MEDIUM", "Basic Auth", "HTTP Basic Auth used (Base64 cleartext)", pkt_idx, src, dst))
+                    anomalies.append(
+                        Anomaly(
+                            "MEDIUM",
+                            "Basic Auth",
+                            "HTTP Basic Auth used (Base64 cleartext)",
+                            pkt_idx,
+                            src,
+                            dst,
+                        )
+                    )
 
                 try:
                     text = payload.decode("utf-8", errors="ignore")
@@ -917,16 +1137,47 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                         match = re.search(pattern, text)
                         if match:
                             key = match.group(1)
-                            anomalies.append(Anomaly("MEDIUM", "Credential Leakage", f"Potential {key} disclosure in cleartext payload", pkt_idx, src, dst))
+                            anomalies.append(
+                                Anomaly(
+                                    "MEDIUM",
+                                    "Credential Leakage",
+                                    f"Potential {key} disclosure in cleartext payload",
+                                    pkt_idx,
+                                    src,
+                                    dst,
+                                )
+                            )
                             break
 
                     # SMTP/IMAP/POP3 auth indicators
-                    if re.search(r"(?i)AUTH\s+LOGIN", text) or re.search(r"(?i)AUTH\s+PLAIN", text):
-                        anomalies.append(Anomaly("MEDIUM", "Cleartext Auth", "SMTP/IMAP auth sequence observed", pkt_idx, src, dst))
+                    if re.search(r"(?i)AUTH\s+LOGIN", text) or re.search(
+                        r"(?i)AUTH\s+PLAIN", text
+                    ):
+                        anomalies.append(
+                            Anomaly(
+                                "MEDIUM",
+                                "Cleartext Auth",
+                                "SMTP/IMAP auth sequence observed",
+                                pkt_idx,
+                                src,
+                                dst,
+                            )
+                        )
 
                     # FTP explicit USER/PASS lines
-                    if re.search(r"(?i)^USER\s+\S+", text) and re.search(r"(?i)^PASS\s+\S+", text):
-                        anomalies.append(Anomaly("HIGH", "Cleartext Creds", "FTP USER/PASS observed", pkt_idx, src, dst))
+                    if re.search(r"(?i)^USER\s+\S+", text) and re.search(
+                        r"(?i)^PASS\s+\S+", text
+                    ):
+                        anomalies.append(
+                            Anomaly(
+                                "HIGH",
+                                "Cleartext Creds",
+                                "FTP USER/PASS observed",
+                                pkt_idx,
+                                src,
+                                dst,
+                            )
+                        )
 
             if TCP in pkt:
                 try:
@@ -974,9 +1225,9 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                 if len(payload) >= 512:
                     icmp_large_payloads.append((src or "-", dst or "-", len(payload)))
 
-            # Non-Standard Ports for known protocols? 
+            # Non-Standard Ports for known protocols?
             # (Hard without deep inspection, skipping for now to keep it safe)
-            
+
             # Syn Scan? (Lots of SYNs from one source) - post process
 
     except Exception as e:
@@ -990,119 +1241,141 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
     # Post-process anomalies
     for ip_addr, macs in arp_ip_macs.items():
         if len(macs) >= 2:
-            anomalies.append(Anomaly(
-                "HIGH",
-                "ARP Spoofing",
-                f"Multiple MACs for {ip_addr}: {', '.join(sorted(macs))}",
-                0,
-                ip_addr,
-                None,
-            ))
+            anomalies.append(
+                Anomaly(
+                    "HIGH",
+                    "ARP Spoofing",
+                    f"Multiple MACs for {ip_addr}: {', '.join(sorted(macs))}",
+                    0,
+                    ip_addr,
+                    None,
+                )
+            )
 
     if gratuitous_arp > 50:
-        anomalies.append(Anomaly(
-            "MEDIUM",
-            "Gratuitous ARP",
-            f"High gratuitous ARP volume: {gratuitous_arp} packets",
-            0,
-        ))
+        anomalies.append(
+            Anomaly(
+                "MEDIUM",
+                "Gratuitous ARP",
+                f"High gratuitous ARP volume: {gratuitous_arp} packets",
+                0,
+            )
+        )
 
     if pkt_idx and broadcast_frames / pkt_idx > 0.3:
-        anomalies.append(Anomaly(
-            "MEDIUM",
-            "Broadcast Storm",
-            f"Broadcast frames are {broadcast_frames}/{pkt_idx} packets.",
-            0,
-        ))
+        anomalies.append(
+            Anomaly(
+                "MEDIUM",
+                "Broadcast Storm",
+                f"Broadcast frames are {broadcast_frames}/{pkt_idx} packets.",
+                0,
+            )
+        )
 
     # TCP scan heuristics
     for ip, count in tcp_syn_sources.items():
         unique_ports = len(tcp_syn_ports.get(ip, set()))
         if count > 200 or unique_ports > 100:
-            anomalies.append(Anomaly(
-                "MEDIUM",
-                "Port Scan",
-                f"Potential SYN scan activity ({count} SYNs, {unique_ports} ports) from {ip}",
-                0,
-                ip,
-                None,
-            ))
+            anomalies.append(
+                Anomaly(
+                    "MEDIUM",
+                    "Port Scan",
+                    f"Potential SYN scan activity ({count} SYNs, {unique_ports} ports) from {ip}",
+                    0,
+                    ip,
+                    None,
+                )
+            )
 
     for ip, count in tcp_null_scan.items():
         if count >= 10:
-            anomalies.append(Anomaly(
-                "MEDIUM",
-                "TCP Null Scan",
-                f"Null scan pattern observed ({count} packets) from {ip}",
-                0,
-                ip,
-                None,
-            ))
+            anomalies.append(
+                Anomaly(
+                    "MEDIUM",
+                    "TCP Null Scan",
+                    f"Null scan pattern observed ({count} packets) from {ip}",
+                    0,
+                    ip,
+                    None,
+                )
+            )
 
     for ip, count in tcp_fin_scan.items():
         if count >= 10:
-            anomalies.append(Anomaly(
-                "MEDIUM",
-                "TCP FIN Scan",
-                f"FIN scan pattern observed ({count} packets) from {ip}",
-                0,
-                ip,
-                None,
-            ))
+            anomalies.append(
+                Anomaly(
+                    "MEDIUM",
+                    "TCP FIN Scan",
+                    f"FIN scan pattern observed ({count} packets) from {ip}",
+                    0,
+                    ip,
+                    None,
+                )
+            )
 
     for ip, count in tcp_xmas_scan.items():
         if count >= 10:
-            anomalies.append(Anomaly(
-                "MEDIUM",
-                "TCP Xmas Scan",
-                f"Xmas scan pattern observed ({count} packets) from {ip}",
-                0,
-                ip,
-                None,
-            ))
+            anomalies.append(
+                Anomaly(
+                    "MEDIUM",
+                    "TCP Xmas Scan",
+                    f"Xmas scan pattern observed ({count} packets) from {ip}",
+                    0,
+                    ip,
+                    None,
+                )
+            )
 
     for ip, count in tcp_rst_sources.items():
         if count > 500:
-            anomalies.append(Anomaly(
-                "LOW",
-                "TCP Reset Flood",
-                f"High TCP RST volume ({count} packets) from {ip}",
-                0,
-                ip,
-                None,
-            ))
+            anomalies.append(
+                Anomaly(
+                    "LOW",
+                    "TCP Reset Flood",
+                    f"High TCP RST volume ({count} packets) from {ip}",
+                    0,
+                    ip,
+                    None,
+                )
+            )
 
     if ip_fragments > 50:
-        anomalies.append(Anomaly(
-            "MEDIUM",
-            "IP Fragmentation",
-            f"Elevated IP fragmentation observed ({ip_fragments} fragments)",
-            0,
-        ))
+        anomalies.append(
+            Anomaly(
+                "MEDIUM",
+                "IP Fragmentation",
+                f"Elevated IP fragmentation observed ({ip_fragments} fragments)",
+                0,
+            )
+        )
 
     if len(icmp_large_payloads) > 10:
         src, dst, size = max(icmp_large_payloads, key=lambda item: item[2])
-        anomalies.append(Anomaly(
-            "MEDIUM",
-            "Large ICMP Payloads",
-            f"Large ICMP payloads observed ({len(icmp_large_payloads)} packets, max {size} bytes)",
-            0,
-            src,
-            dst,
-        ))
+        anomalies.append(
+            Anomaly(
+                "MEDIUM",
+                "Large ICMP Payloads",
+                f"Large ICMP payloads observed ({len(icmp_large_payloads)} packets, max {size} bytes)",
+                0,
+                src,
+                dst,
+            )
+        )
 
     # Calculate Top Protocols
     # Flatten hierarchy counts? Or just use root children?
     # Let's use layer occurrences
     layer_counts = Counter()
+
     def traverse(node):
         layer_counts[node.name] += node.packets
         for child in node.sub_protocols.values():
             traverse(child)
+
     traverse(hierarchy)
     # Remove Root
     del layer_counts["Root"]
-    
+
     conversations = list(convs.values())
     endpoints = list(eps.values())
     top_protocols = layer_counts.most_common(10)
@@ -1133,10 +1406,14 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
         errors=errors,
         analyst_verdict=str(context.get("analyst_verdict", "")),
         analyst_confidence=str(context.get("analyst_confidence", "low")),
-        analyst_reasons=[str(v) for v in list(context.get("analyst_reasons", []) or [])],
+        analyst_reasons=[
+            str(v) for v in list(context.get("analyst_reasons", []) or [])
+        ],
         deterministic_checks={
             str(key): [str(v) for v in list(values or [])]
-            for key, values in dict(context.get("deterministic_checks", {}) or {}).items()
+            for key, values in dict(
+                context.get("deterministic_checks", {}) or {}
+            ).items()
         },
         corroborated_findings=list(context.get("corroborated_findings", []) or []),
         sequence_profiles=list(context.get("sequence_profiles", []) or []),
@@ -1146,6 +1423,12 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
         beacon_profiles=list(context.get("beacon_profiles", []) or []),
         role_inversion_profiles=list(context.get("role_inversion_profiles", []) or []),
         investigation_pivots=list(context.get("investigation_pivots", []) or []),
-        risk_matrix=[dict(item) for item in list(context.get("risk_matrix", []) or []) if isinstance(item, dict)],
-        false_positive_context=[str(v) for v in list(context.get("false_positive_context", []) or [])],
+        risk_matrix=[
+            dict(item)
+            for item in list(context.get("risk_matrix", []) or [])
+            if isinstance(item, dict)
+        ],
+        false_positive_context=[
+            str(v) for v in list(context.get("false_positive_context", []) or [])
+        ],
     )

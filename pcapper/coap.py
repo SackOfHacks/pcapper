@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
 import ipaddress
+from pathlib import Path
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_port_protocol,
+)
 
 COAP_PORTS = {5683, 5684}
 
@@ -46,7 +50,9 @@ def _decode_option_value(opt_number: int, opt_value: bytes) -> str:
     return opt_value.hex()
 
 
-def _parse_coap_options(payload: bytes) -> tuple[list[str], list[tuple[str, str]], dict[str, object]]:
+def _parse_coap_options(
+    payload: bytes,
+) -> tuple[list[str], list[tuple[str, str]], dict[str, object]]:
     commands: list[str] = []
     artifacts: list[tuple[str, str]] = []
     info: dict[str, object] = {"uri": "", "observe": None}
@@ -82,7 +88,7 @@ def _parse_coap_options(payload: bytes) -> tuple[list[str], list[tuple[str, str]
         elif delta == 14:
             if idx + 1 >= len(payload):
                 break
-            delta = 269 + int.from_bytes(payload[idx:idx + 2], "big")
+            delta = 269 + int.from_bytes(payload[idx : idx + 2], "big")
             idx += 2
         if length == 13:
             if idx >= len(payload):
@@ -92,12 +98,12 @@ def _parse_coap_options(payload: bytes) -> tuple[list[str], list[tuple[str, str]
         elif length == 14:
             if idx + 1 >= len(payload):
                 break
-            length = 269 + int.from_bytes(payload[idx:idx + 2], "big")
+            length = 269 + int.from_bytes(payload[idx : idx + 2], "big")
             idx += 2
         if idx + length > len(payload):
             break
         current_opt += delta
-        value = payload[idx:idx + length]
+        value = payload[idx : idx + length]
         idx += length
         decoded = _decode_option_value(current_opt, value)
         opt_name = COAP_OPTIONS.get(current_opt, f"Option {current_opt}")
@@ -151,7 +157,7 @@ def _parse_commands(payload: bytes) -> list[str]:
         commands.extend(opt_cmds)
         return commands
     if code >= 64:
-        commands = [f"{prefix} RESP {code//32}.{code%32:02d}"]
+        commands = [f"{prefix} RESP {code // 32}.{code % 32:02d}"]
         opt_cmds, _artifacts, _info = _parse_coap_options(payload)
         commands.extend(opt_cmds)
         return commands
@@ -165,9 +171,17 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
     _ = opt_cmds
     return artifacts
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
-    if any(cmd.endswith("REQ PUT") or cmd.endswith("REQ POST") or cmd.endswith("REQ DELETE") for cmd in commands):
+    if any(
+        cmd.endswith("REQ PUT")
+        or cmd.endswith("REQ POST")
+        or cmd.endswith("REQ DELETE")
+        for cmd in commands
+    ):
         anomalies.append(
             IndustrialAnomaly(
                 severity="MEDIUM",

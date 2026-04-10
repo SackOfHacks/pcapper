@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
+
 try:
     from scapy.layers.inet import IP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
@@ -56,23 +57,32 @@ def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
     errors: list[str] = []
     if Dot1Q is None:
         errors.append("Scapy Dot1Q layer unavailable; install scapy for VLAN analysis.")
-        return VlanSummary(path=path, total_tagged_packets=0, total_tagged_bytes=0, vlan_stats=[], detections=[], errors=errors)
+        return VlanSummary(
+            path=path,
+            total_tagged_packets=0,
+            total_tagged_bytes=0,
+            vlan_stats=[],
+            detections=[],
+            errors=errors,
+        )
 
     reader, status, stream, size_bytes, _file_type = get_reader(
         path, show_status=show_status
     )
 
-    vlan_stats: dict[int, dict[str, object]] = defaultdict(lambda: {
-        "packets": 0,
-        "bytes": 0,
-        "src_macs": set(),
-        "dst_macs": set(),
-        "src_ips": set(),
-        "dst_ips": set(),
-        "protocols": Counter(),
-        "first_seen": None,
-        "last_seen": None,
-    })
+    vlan_stats: dict[int, dict[str, object]] = defaultdict(
+        lambda: {
+            "packets": 0,
+            "bytes": 0,
+            "src_macs": set(),
+            "dst_macs": set(),
+            "src_ips": set(),
+            "dst_ips": set(),
+            "protocols": Counter(),
+            "first_seen": None,
+            "last_seen": None,
+        }
+    )
 
     total_tagged_packets = 0
     total_tagged_bytes = 0
@@ -160,31 +170,37 @@ def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
     if stats_list:
         vlan_ids = sorted(v.vlan_id for v in stats_list)
         if 1 in vlan_ids:
-            detections.append({
-                "type": "vlan_default_used",
-                "severity": "warning",
-                "summary": "VLAN 1 (default) observed",
-                "details": "Default VLAN is in use; consider verifying network segmentation policy.",
-            })
+            detections.append(
+                {
+                    "type": "vlan_default_used",
+                    "severity": "warning",
+                    "summary": "VLAN 1 (default) observed",
+                    "details": "Default VLAN is in use; consider verifying network segmentation policy.",
+                }
+            )
 
         total_packets = sum(v.packets for v in stats_list)
         for stat in stats_list:
             if total_packets > 0:
                 ratio = stat.packets / total_packets
                 if ratio > 0.8 and stat.packets > 1000:
-                    detections.append({
-                        "type": "vlan_traffic_concentration",
-                        "severity": "warning",
-                        "summary": f"VLAN {stat.vlan_id} carries {ratio:.1%} of tagged traffic",
-                        "details": "Check for misconfiguration or single-VLAN dependency.",
-                    })
+                    detections.append(
+                        {
+                            "type": "vlan_traffic_concentration",
+                            "severity": "warning",
+                            "summary": f"VLAN {stat.vlan_id} carries {ratio:.1%} of tagged traffic",
+                            "details": "Check for misconfiguration or single-VLAN dependency.",
+                        }
+                    )
                 if stat.packets < 10:
-                    detections.append({
-                        "type": "vlan_low_activity",
-                        "severity": "info",
-                        "summary": f"VLAN {stat.vlan_id} has low activity ({stat.packets} packets)",
-                        "details": "Low activity VLANs can be normal; validate against expectations.",
-                    })
+                    detections.append(
+                        {
+                            "type": "vlan_low_activity",
+                            "severity": "info",
+                            "summary": f"VLAN {stat.vlan_id} has low activity ({stat.packets} packets)",
+                            "details": "Low activity VLANs can be normal; validate against expectations.",
+                        }
+                    )
 
     return VlanSummary(
         path=path,

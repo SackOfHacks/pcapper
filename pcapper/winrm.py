@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import ipaddress
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import re
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -36,7 +37,10 @@ SUSPICIOUS_PLAINTEXT = [
     (re.compile(r"powershell", re.IGNORECASE), "PowerShell usage"),
     (re.compile(r"wmi|wmic|winrs", re.IGNORECASE), "Remote exec tooling"),
     (re.compile(r"whoami|hostname|ipconfig", re.IGNORECASE), "Recon command"),
-    (re.compile(r"invoke-|downloadstring|base64", re.IGNORECASE), "Suspicious script patterns"),
+    (
+        re.compile(r"invoke-|downloadstring|base64", re.IGNORECASE),
+        "Suspicious script patterns",
+    ),
 ]
 
 FILE_NAME_RE = re.compile(
@@ -99,6 +103,10 @@ class WinrmSummary:
     anomalies: list[dict[str, object]]
     artifacts: list[str]
     errors: list[str]
+    deterministic_checks: dict[str, list[str]]
+    threat_hypotheses: list[dict[str, object]]
+    hunting_pivots: list[dict[str, object]]
+    benign_context: list[str]
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
@@ -157,6 +165,12 @@ class WinrmSummary:
             "anomalies": list(self.anomalies),
             "artifacts": list(self.artifacts),
             "errors": list(self.errors),
+            "deterministic_checks": {
+                key: list(value) for key, value in self.deterministic_checks.items()
+            },
+            "threat_hypotheses": list(self.threat_hypotheses),
+            "hunting_pivots": list(self.hunting_pivots),
+            "benign_context": list(self.benign_context),
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "duration_seconds": self.duration_seconds,
@@ -188,7 +202,9 @@ class _SessionState:
             self.hosts = Counter()
 
 
-def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
+def _extract_ascii_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
     results: list[str] = []
     if not data:
         return results
@@ -248,7 +264,9 @@ def _scan_plaintext(
             artifacts.append(item)
 
 
-def _direction(src_ip: str, dst_ip: str, sport: int, dport: int) -> tuple[str, str, int, int]:
+def _direction(
+    src_ip: str, dst_ip: str, sport: int, dport: int
+) -> tuple[str, str, int, int]:
     if dport in WINRM_PORTS:
         return src_ip, dst_ip, sport, dport
     if sport in WINRM_PORTS:
@@ -271,7 +289,7 @@ def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
     if avg <= 0:
         return None
     variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
+    stddev = variance**0.5
     if avg < 5 or avg > 86400:
         return None
     if stddev > max(5.0, avg * 0.25):
@@ -287,7 +305,9 @@ def analyze_winrm(
 ) -> WinrmSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
-        errors.append("Scapy IP/TCP layers unavailable; install scapy for WinRM analysis.")
+        errors.append(
+            "Scapy IP/TCP layers unavailable; install scapy for WinRM analysis."
+        )
         return WinrmSummary(
             path=path,
             total_packets=0,
@@ -320,6 +340,10 @@ def analyze_winrm(
             anomalies=[],
             artifacts=[],
             errors=errors,
+            deterministic_checks={},
+            threat_hypotheses=[],
+            hunting_pivots=[],
+            benign_context=[],
             first_seen=None,
             last_seen=None,
             duration_seconds=None,
@@ -408,7 +432,11 @@ def analyze_winrm(
                     payload = b""
 
             payload_prefix = payload[:64] if payload else b""
-            text_hint = payload_prefix.decode("latin-1", errors="ignore") if payload_prefix else ""
+            text_hint = (
+                payload_prefix.decode("latin-1", errors="ignore")
+                if payload_prefix
+                else ""
+            )
             is_winrm = (
                 sport in WINRM_PORTS
                 or dport in WINRM_PORTS
@@ -492,7 +520,11 @@ def analyze_winrm(
 
             if server_port in HTTP_PORTS or dport in HTTP_PORTS or sport in HTTP_PORTS:
                 session.http_detected = True
-            if server_port in HTTPS_PORTS or dport in HTTPS_PORTS or sport in HTTPS_PORTS:
+            if (
+                server_port in HTTPS_PORTS
+                or dport in HTTPS_PORTS
+                or sport in HTTPS_PORTS
+            ):
                 session.https_detected = True
 
             if payload:
@@ -556,76 +588,240 @@ def analyze_winrm(
             short_session_by_client[session.client_ip] += 1
             short_session_targets[session.client_ip].add(session.server_ip)
         if session.first_seen is not None:
-            pair_first_seen[(session.client_ip, session.server_ip)].append(session.first_seen)
+            pair_first_seen[(session.client_ip, session.server_ip)].append(
+                session.first_seen
+            )
 
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
     non_standard_ports = [port for port in server_ports if port not in WINRM_PORTS]
     if non_standard_ports:
-        detections.append({
-            "severity": "info",
-            "summary": "WinRM observed on non-standard ports",
-            "details": ", ".join(str(port) for port in sorted(non_standard_ports)),
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "WinRM observed on non-standard ports",
+                "details": ", ".join(str(port) for port in sorted(non_standard_ports)),
+            }
+        )
 
     if auth_schemes:
-        weak_schemes = {scheme for scheme in auth_schemes if scheme.lower() in {"basic"}}
+        weak_schemes = {
+            scheme for scheme in auth_schemes if scheme.lower() in {"basic"}
+        }
         if weak_schemes:
-            detections.append({
-                "severity": "warning",
-                "summary": "Weak WinRM authentication schemes observed",
-                "details": ", ".join(sorted(weak_schemes)),
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Weak WinRM authentication schemes observed",
+                    "details": ", ".join(sorted(weak_schemes)),
+                }
+            )
 
     if suspicious_plaintext:
-        detections.append({
-            "severity": "warning",
-            "summary": "Suspicious plaintext strings observed in WinRM payloads",
-            "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Suspicious plaintext strings observed in WinRM payloads",
+                "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
+            }
+        )
 
     for (client_ip, server_ip), count in short_session_counts.items():
         if count >= 20:
-            anomalies.append({
-                "title": "Potential brute force or probing",
-                "details": f"{client_ip} -> {server_ip} short sessions: {count}",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential brute force or probing",
+                    "details": f"{client_ip} -> {server_ip} short sessions: {count}",
+                }
+            )
 
     for client_ip, count in short_session_by_client.items():
         targets = short_session_targets.get(client_ip, set())
         if count >= 30 and len(targets) >= 10:
-            anomalies.append({
-                "title": "Potential WinRM scanning",
-                "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential WinRM scanning",
+                    "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
+                }
+            )
 
     for (client_ip, server_ip), times in pair_first_seen.items():
         score = _beaconing_score(times)
         if score:
-            detections.append({
-                "severity": "info",
-                "summary": "Potential WinRM beaconing",
-                "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
-            })
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "Potential WinRM beaconing",
+                    "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
+                }
+            )
 
     for session in sessions.values():
-        if session.client_bytes >= 50 * 1024 * 1024 and session.client_bytes > session.server_bytes * 3:
-            detections.append({
-                "severity": "warning",
-                "summary": "Potential WinRM data upload/exfiltration",
-                "details": (
-                    f"{session.client_ip} -> {session.server_ip} "
-                    f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
-                ),
-            })
+        if (
+            session.client_bytes >= 50 * 1024 * 1024
+            and session.client_bytes > session.server_bytes * 3
+        ):
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Potential WinRM data upload/exfiltration",
+                    "details": (
+                        f"{session.client_ip} -> {session.server_ip} "
+                        f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
+                    ),
+                }
+            )
         if session.last_seen is not None and session.first_seen is not None:
             duration = session.last_seen - session.first_seen
             if duration >= 4 * 3600:
-                anomalies.append({
-                    "title": "Long-lived WinRM session",
-                    "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
-                })
+                anomalies.append(
+                    {
+                        "title": "Long-lived WinRM session",
+                        "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
+                    }
+                )
+
+    deterministic_checks: dict[str, list[str]] = {
+        "winrm_plaintext_exposure": [],
+        "winrm_weak_auth_scheme": [],
+        "winrm_nonstandard_port_usage": [],
+        "winrm_command_exec_telemetry": [],
+        "winrm_scanning_or_bruteforce": [],
+        "winrm_periodic_beaconing": [],
+        "winrm_data_staging_asymmetry": [],
+        "winrm_public_endpoint_exposure": [],
+    }
+    threat_hypotheses: list[dict[str, object]] = []
+    hunting_pivots: list[dict[str, object]] = []
+    benign_context: list[str] = []
+
+    def _is_public_ip(value: str) -> bool:
+        try:
+            return ipaddress.ip_address(str(value)).is_global
+        except Exception:
+            return False
+
+    if http_sessions > 0:
+        deterministic_checks["winrm_plaintext_exposure"].append(
+            f"WinRM over HTTP sessions={http_sessions} on ports {', '.join(str(p) for p in sorted(HTTP_PORTS))}"
+        )
+    for scheme, count in auth_schemes.most_common(6):
+        if str(scheme).lower() in {"basic"}:
+            deterministic_checks["winrm_weak_auth_scheme"].append(
+                f"Weak authentication scheme observed {scheme} count={int(count)}"
+            )
+    for port, count in server_ports.items():
+        if int(port) not in WINRM_PORTS:
+            deterministic_checks["winrm_nonstandard_port_usage"].append(
+                f"WinRM on non-standard port={int(port)} count={int(count)}"
+            )
+    for signal, count in suspicious_plaintext.most_common(20):
+        deterministic_checks["winrm_command_exec_telemetry"].append(
+            f"{signal[:120]} hits={int(count)}"
+        )
+
+    for (client_ip, server_ip), count in short_session_counts.items():
+        if count >= 20:
+            deterministic_checks["winrm_scanning_or_bruteforce"].append(
+                f"{client_ip}->{server_ip} short-session burst count={int(count)}"
+            )
+            hunting_pivots.append(
+                {
+                    "pivot": "short_session_pair",
+                    "pair": f"{client_ip}->{server_ip}",
+                    "count": int(count),
+                }
+            )
+    for client_ip, count in short_session_by_client.items():
+        targets = short_session_targets.get(client_ip, set())
+        if count >= 30 and len(targets) >= 10:
+            deterministic_checks["winrm_scanning_or_bruteforce"].append(
+                f"{client_ip} short-session fan-out count={int(count)} targets={len(targets)}"
+            )
+            hunting_pivots.append(
+                {
+                    "pivot": "scanner_client",
+                    "client": client_ip,
+                    "short_sessions": int(count),
+                    "targets": len(targets),
+                }
+            )
+    for (client_ip, server_ip), times in pair_first_seen.items():
+        score = _beaconing_score(times)
+        if score:
+            deterministic_checks["winrm_periodic_beaconing"].append(
+                f"{client_ip}->{server_ip} periodic interval avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s"
+            )
+    for session in sessions.values():
+        if (
+            session.client_bytes >= 50 * 1024 * 1024
+            and session.client_bytes > session.server_bytes * 3
+        ):
+            deterministic_checks["winrm_data_staging_asymmetry"].append(
+                f"{session.client_ip}->{session.server_ip} c2s_bytes={int(session.client_bytes)} s2c_bytes={int(session.server_bytes)}"
+            )
+            hunting_pivots.append(
+                {
+                    "pivot": "high_upload_session",
+                    "flow": f"{session.client_ip}->{session.server_ip}",
+                    "client_bytes": int(session.client_bytes),
+                    "server_bytes": int(session.server_bytes),
+                }
+            )
+
+    for ip_value, count in server_counts.items():
+        if _is_public_ip(ip_value):
+            deterministic_checks["winrm_public_endpoint_exposure"].append(
+                f"WinRM server endpoint on public IP {ip_value} count={int(count)}"
+            )
+    for ip_value, count in client_counts.items():
+        if _is_public_ip(ip_value):
+            deterministic_checks["winrm_public_endpoint_exposure"].append(
+                f"WinRM client endpoint on public IP {ip_value} count={int(count)}"
+            )
+
+    if (
+        deterministic_checks["winrm_plaintext_exposure"]
+        and deterministic_checks["winrm_weak_auth_scheme"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Credential exposure risk from HTTP WinRM with weak auth scheme",
+                "confidence": "high",
+                "evidence": len(deterministic_checks["winrm_plaintext_exposure"])
+                + len(deterministic_checks["winrm_weak_auth_scheme"]),
+            }
+        )
+    if (
+        deterministic_checks["winrm_command_exec_telemetry"]
+        and deterministic_checks["winrm_scanning_or_bruteforce"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "WinRM remote execution activity with brute-force or scan-like access pattern",
+                "confidence": "high",
+                "evidence": len(deterministic_checks["winrm_command_exec_telemetry"])
+                + len(deterministic_checks["winrm_scanning_or_bruteforce"]),
+            }
+        )
+    if deterministic_checks["winrm_data_staging_asymmetry"]:
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Potential WinRM-based payload staging or exfiltration over management channel",
+                "confidence": "medium",
+                "evidence": len(deterministic_checks["winrm_data_staging_asymmetry"]),
+            }
+        )
+
+    if not deterministic_checks["winrm_scanning_or_bruteforce"]:
+        benign_context.append(
+            "No substantial WinRM short-session scan/bruteforce burst observed"
+        )
+    if not deterministic_checks["winrm_periodic_beaconing"]:
+        benign_context.append("No strong periodic WinRM beacon cadence identified")
+    if not deterministic_checks["winrm_public_endpoint_exposure"]:
+        benign_context.append("No WinRM public Internet endpoint exposure observed")
 
     total_sessions = len(conversations)
 
@@ -661,6 +857,10 @@ def analyze_winrm(
         anomalies=anomalies,
         artifacts=artifacts,
         errors=errors,
+        deterministic_checks={k: v[:80] for k, v in deterministic_checks.items()},
+        threat_hypotheses=threat_hypotheses[:24],
+        hunting_pivots=hunting_pivots[:150],
+        benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
@@ -704,6 +904,10 @@ def merge_winrm_summaries(
             anomalies=[],
             artifacts=[],
             errors=[],
+            deterministic_checks={},
+            threat_hypotheses=[],
+            hunting_pivots=[],
+            benign_context=[],
             first_seen=None,
             last_seen=None,
             duration_seconds=None,
@@ -741,6 +945,10 @@ def merge_winrm_summaries(
     anomalies: list[dict[str, object]] = []
     artifacts: list[str] = []
     errors: list[str] = []
+    deterministic_checks: dict[str, list[str]] = defaultdict(list)
+    threat_hypotheses: list[dict[str, object]] = []
+    hunting_pivots: list[dict[str, object]] = []
+    benign_context: list[str] = []
 
     for summary in summary_list:
         total_packets += summary.total_packets
@@ -755,9 +963,17 @@ def merge_winrm_summaries(
         https_sessions += summary.https_sessions
 
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         client_counts.update(summary.client_counts)
         server_counts.update(summary.server_counts)
@@ -778,6 +994,23 @@ def merge_winrm_summaries(
         anomalies.extend(summary.anomalies)
         artifacts.extend(summary.artifacts)
         errors.extend(summary.errors)
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+        if isinstance(checks, dict):
+            for key, values in checks.items():
+                for value in list(values or []):
+                    text = str(value).strip()
+                    if text and text not in deterministic_checks[key]:
+                        deterministic_checks[key].append(text)
+        for item in list(getattr(summary, "threat_hypotheses", []) or []):
+            if item not in threat_hypotheses:
+                threat_hypotheses.append(item)
+        for item in list(getattr(summary, "hunting_pivots", []) or []):
+            if item not in hunting_pivots:
+                hunting_pivots.append(item)
+        for item in list(getattr(summary, "benign_context", []) or []):
+            text = str(item).strip()
+            if text and text not in benign_context:
+                benign_context.append(text)
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -815,6 +1048,12 @@ def merge_winrm_summaries(
         anomalies=anomalies,
         artifacts=artifacts,
         errors=errors,
+        deterministic_checks={
+            key: values[:80] for key, values in deterministic_checks.items()
+        },
+        threat_hypotheses=threat_hypotheses[:24],
+        hunting_pivots=hunting_pivots[:150],
+        benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,

@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 try:
-    from scapy.layers.inet import TCP, UDP, IP
-    from scapy.packet import Raw
+    from scapy.layers.inet import IP, TCP, UDP
     from scapy.layers.l2 import Ether
+    from scapy.packet import Raw
 except ImportError:  # pragma: no cover - scapy optional at runtime
     TCP = UDP = IP = Raw = Ether = None
 
@@ -105,7 +105,9 @@ class SizeBucket:
 
 CommandParser = Callable[[bytes], Iterable[str]]
 ArtifactParser = Callable[[bytes], Iterable[tuple[str, str]]]
-AnomalyDetector = Callable[[bytes, str, str, float, Iterable[str]], Iterable[IndustrialAnomaly]]
+AnomalyDetector = Callable[
+    [bytes, str, str, float, Iterable[str]], Iterable[IndustrialAnomaly]
+]
 SignatureMatcher = Callable[[bytes], bool]
 
 
@@ -170,7 +172,11 @@ def _bucketize(values: list[int]) -> list[SizeBucket]:
         min_val = min(entries) if entries else 0
         max_val = max(entries) if entries else 0
         pct = (count / total) * 100 if total else 0.0
-        buckets.append(SizeBucket(label=label, count=count, avg=avg, min=min_val, max=max_val, pct=pct))
+        buckets.append(
+            SizeBucket(
+                label=label, count=count, avg=avg, min=min_val, max=max_val, pct=pct
+            )
+        )
     return buckets
 
 
@@ -183,7 +189,10 @@ def _default_anomalies(
 ) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     lowered = _format_ascii(payload).lower()
-    if any(token in lowered for token in ("password", "passwd", "token", "apikey", "secret")):
+    if any(
+        token in lowered
+        for token in ("password", "passwd", "token", "apikey", "secret")
+    ):
         anomalies.append(
             IndustrialAnomaly(
                 severity="MEDIUM",
@@ -194,7 +203,9 @@ def _default_anomalies(
                 ts=ts,
             )
         )
-    if any(cmd.lower().startswith("write") or "write" in cmd.lower() for cmd in commands):
+    if any(
+        cmd.lower().startswith("write") or "write" in cmd.lower() for cmd in commands
+    ):
         anomalies.append(
             IndustrialAnomaly(
                 severity="MEDIUM",
@@ -324,12 +335,23 @@ def analyze_port_protocol(
                     start_time = ts
                 last_time = ts
 
-                has_transport, src_ip, dst_ip, sport, dport, payload = _extract_transport(pkt)
+                has_transport, src_ip, dst_ip, sport, dport, payload = (
+                    _extract_transport(pkt)
+                )
                 if not has_transport:
                     continue
 
-                matches_port = sport in tcp_ports or dport in tcp_ports or sport in udp_ports or dport in udp_ports
-                matches_sig = signature_matcher(payload) if signature_matcher and payload else False
+                matches_port = (
+                    sport in tcp_ports
+                    or dport in tcp_ports
+                    or sport in udp_ports
+                    or dport in udp_ports
+                )
+                matches_sig = (
+                    signature_matcher(payload)
+                    if signature_matcher and payload
+                    else False
+                )
                 if not matches_port and not matches_sig:
                     continue
 
@@ -374,7 +396,9 @@ def analyze_port_protocol(
                     analysis.commands.update(commands)
                     if enable_enrichment:
                         for cmd in commands:
-                            endpoints = analysis.service_endpoints.setdefault(str(cmd), Counter())
+                            endpoints = analysis.service_endpoints.setdefault(
+                                str(cmd), Counter()
+                            )
                             endpoints[f"{src_ip} -> {dst_ip}"] += 1
                     if ts is not None and len(analysis.command_events) < 5000:
                         for cmd in commands:
@@ -432,7 +456,11 @@ def analyze_port_protocol(
             unique_dsts = len(dsts)
             req_count = src_requests.get(src, 0)
             resp_count = src_responses.get(src, 0)
-            if unique_dsts >= 20 and req_count > resp_count * 2 and len(analysis.anomalies) < max_anomalies:
+            if (
+                unique_dsts >= 20
+                and req_count > resp_count * 2
+                and len(analysis.anomalies) < max_anomalies
+            ):
                 analysis.anomalies.append(
                     IndustrialAnomaly(
                         severity="MEDIUM",
@@ -451,7 +479,7 @@ def analyze_port_protocol(
             if avg <= 0:
                 continue
             variance = sum((x - avg) ** 2 for x in intervals) / len(intervals)
-            cv = (variance ** 0.5) / avg
+            cv = (variance**0.5) / avg
             if cv <= 0.2 and 1.0 <= avg <= 300.0:
                 src_part, dst_part = session_key.split(" -> ", 1)
                 src_ip = src_part.split(":", 1)[0]
@@ -470,7 +498,11 @@ def analyze_port_protocol(
 
         for src, dsts in src_dst_bytes.items():
             for dst, byte_count in dsts.items():
-                if byte_count >= 5_000_000 and _is_public_ip(dst) and len(analysis.anomalies) < max_anomalies:
+                if (
+                    byte_count >= 5_000_000
+                    and _is_public_ip(dst)
+                    and len(analysis.anomalies) < max_anomalies
+                ):
                     analysis.anomalies.append(
                         IndustrialAnomaly(
                             severity="MEDIUM",
@@ -552,7 +584,11 @@ def analyze_ethertype_protocol(
                 analysis.sessions[f"{src_ip} -> {dst_ip}"] += 1
 
                 if enable_enrichment:
-                    payload = bytes(pkt[Ether].payload) if Ether is not None and pkt.haslayer(Ether) else b""
+                    payload = (
+                        bytes(pkt[Ether].payload)
+                        if Ether is not None and pkt.haslayer(Ether)
+                        else b""
+                    )
                     payload_sizes.append(len(payload))
                     packet_sizes.append(pkt_len)
                     analysis.requests += 1
@@ -568,14 +604,20 @@ def analyze_ethertype_protocol(
                     if payload:
                         src_dst_bytes[src_ip][dst_ip] += len(payload)
 
-                payload = bytes(pkt[Ether].payload) if Ether is not None and pkt.haslayer(Ether) else b""
+                payload = (
+                    bytes(pkt[Ether].payload)
+                    if Ether is not None and pkt.haslayer(Ether)
+                    else b""
+                )
 
                 commands = list(command_parser(payload)) if command_parser else []
                 if commands:
                     analysis.commands.update(commands)
                     if enable_enrichment:
                         for cmd in commands:
-                            endpoints = analysis.service_endpoints.setdefault(str(cmd), Counter())
+                            endpoints = analysis.service_endpoints.setdefault(
+                                str(cmd), Counter()
+                            )
                             endpoints[f"{src_ip} -> {dst_ip}"] += 1
 
                 if artifact_parser is None:
@@ -626,7 +668,7 @@ def analyze_ethertype_protocol(
             if avg <= 0:
                 continue
             variance = sum((x - avg) ** 2 for x in intervals) / len(intervals)
-            cv = (variance ** 0.5) / avg
+            cv = (variance**0.5) / avg
             if cv <= 0.2 and 1.0 <= avg <= 300.0:
                 src_ip, dst_ip = session_key.split(" -> ", 1)
                 if len(analysis.anomalies) < max_anomalies:
@@ -643,7 +685,11 @@ def analyze_ethertype_protocol(
 
         for src, dsts in src_dst_bytes.items():
             for dst, byte_count in dsts.items():
-                if byte_count >= 5_000_000 and _is_public_ip(dst) and len(analysis.anomalies) < max_anomalies:
+                if (
+                    byte_count >= 5_000_000
+                    and _is_public_ip(dst)
+                    and len(analysis.anomalies) < max_anomalies
+                ):
                     analysis.anomalies.append(
                         IndustrialAnomaly(
                             severity="MEDIUM",

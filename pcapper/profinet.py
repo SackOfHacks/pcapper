@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
 from collections import Counter
 from pathlib import Path
 from typing import Optional
-import ipaddress
 
 from .equipment import equipment_artifacts
 from .industrial_helpers import (
@@ -92,11 +92,11 @@ def _decode_dcp_blocks(payload: bytes, offset: int) -> list[tuple[int, int, byte
     while ptr + 4 <= len(payload):
         option = payload[ptr]
         suboption = payload[ptr + 1]
-        block_len = int.from_bytes(payload[ptr + 2:ptr + 4], "big")
+        block_len = int.from_bytes(payload[ptr + 2 : ptr + 4], "big")
         ptr += 4
         if block_len <= 0 or ptr + block_len > len(payload):
             break
-        block = payload[ptr:ptr + block_len]
+        block = payload[ptr : ptr + block_len]
         ptr += block_len
         blocks.append((option, suboption, block))
     return blocks
@@ -205,12 +205,16 @@ def _parse_dcp_block(
         )
 
     if block_info is not None:
-        artifacts.append(("dcp_block", f"{option_name}/{sub_name} info=0x{block_info:04x}"))
+        artifacts.append(
+            ("dcp_block", f"{option_name}/{sub_name} info=0x{block_info:04x}")
+        )
 
     return commands, artifacts, anomalies
 
 
-def _parse_dcp(payload: bytes) -> tuple[list[str], list[tuple[str, str]], list[IndustrialAnomaly]]:
+def _parse_dcp(
+    payload: bytes,
+) -> tuple[list[str], list[tuple[str, str]], list[IndustrialAnomaly]]:
     commands: list[str] = []
     artifacts: list[tuple[str, str]] = []
     anomalies: list[IndustrialAnomaly] = []
@@ -220,7 +224,9 @@ def _parse_dcp(payload: bytes) -> tuple[list[str], list[tuple[str, str]], list[I
     service_id = payload[2]
     service_type = payload[3]
     service_name = DCP_SERVICE_IDS.get(service_id, f"Service 0x{service_id:02x}")
-    service_type_name = DCP_SERVICE_TYPES.get(service_type, f"Type 0x{service_type:02x}")
+    service_type_name = DCP_SERVICE_TYPES.get(
+        service_type, f"Type 0x{service_type:02x}"
+    )
     commands.append(f"DCP {service_name} {service_type_name}")
     if service_name in {"Identify", "Get"}:
         anomalies.append(
@@ -274,12 +280,12 @@ def _parse_pnio_blocks(payload: bytes) -> tuple[list[str], list[tuple[str, str]]
         return commands, artifacts
     ptr = 0
     while ptr + 4 <= len(payload):
-        block_type = int.from_bytes(payload[ptr:ptr + 2], "big")
-        block_len = int.from_bytes(payload[ptr + 2:ptr + 4], "big")
+        block_type = int.from_bytes(payload[ptr : ptr + 2], "big")
+        block_len = int.from_bytes(payload[ptr + 2 : ptr + 4], "big")
         ptr += 4
         if block_len <= 0 or ptr + block_len > len(payload):
             break
-        block = payload[ptr:ptr + block_len]
+        block = payload[ptr : ptr + block_len]
         ptr += block_len
 
         name = PNIO_BLOCK_TYPES.get(block_type)
@@ -294,7 +300,9 @@ def _parse_pnio_blocks(payload: bytes) -> tuple[list[str], list[tuple[str, str]]
             version_hi = block[0]
             version_lo = block[1]
             block_payload = block[2:]
-            artifacts.append(("pnio_block", f"{name} v{version_hi}.{version_lo} len={block_len}"))
+            artifacts.append(
+                ("pnio_block", f"{name} v{version_hi}.{version_lo} len={block_len}")
+            )
         else:
             artifacts.append(("pnio_block", f"{name} len={block_len}"))
 
@@ -407,13 +415,19 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
     return artifacts
 
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     if len(payload) >= 2:
         frame_id = int.from_bytes(payload[:2], "big")
         if 0xFC00 <= frame_id <= 0xFDFF:
             alarm_cmds, _ = _parse_alarm(payload)
-            alarm_detail = alarm_cmds[0] if alarm_cmds else f"Alarm frame (FrameID 0x{frame_id:04x})"
+            alarm_detail = (
+                alarm_cmds[0]
+                if alarm_cmds
+                else f"Alarm frame (FrameID 0x{frame_id:04x})"
+            )
             anomalies.append(
                 IndustrialAnomaly(
                     severity="MEDIUM",
@@ -449,8 +463,6 @@ def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, comma
             )
         )
     return anomalies
-
-
 
 
 def _merge(left: IndustrialAnalysis, right: IndustrialAnalysis) -> IndustrialAnalysis:
@@ -491,9 +503,15 @@ def _merge_size_buckets(left: list, right: list) -> list:
     for l_bucket, r_bucket in zip(left, right):
         count = l_bucket.count + r_bucket.count
         if count:
-            avg = ((l_bucket.avg * l_bucket.count) + (r_bucket.avg * r_bucket.count)) / count
-            min_val = min(val for val in (l_bucket.min, r_bucket.min) if val is not None)
-            max_val = max(val for val in (l_bucket.max, r_bucket.max) if val is not None)
+            avg = (
+                (l_bucket.avg * l_bucket.count) + (r_bucket.avg * r_bucket.count)
+            ) / count
+            min_val = min(
+                val for val in (l_bucket.min, r_bucket.min) if val is not None
+            )
+            max_val = max(
+                val for val in (l_bucket.max, r_bucket.max) if val is not None
+            )
         else:
             avg = 0.0
             min_val = 0

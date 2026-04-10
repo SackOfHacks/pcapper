@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import ipaddress
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-import re
 
 try:
     from scapy.layers.inet import TCP, UDP
     from scapy.layers.inet6 import IPv6
     from scapy.layers.l2 import Ether
+    from scapy.layers.netbios import (
+        NBNSNodeStatusResponse,
+        NBNSQueryRequest,
+        NBNSQueryResponse,
+    )
     from scapy.packet import Raw
-    from scapy.layers.netbios import NBNSQueryRequest, NBNSQueryResponse, NBNSNodeStatusResponse
 except ImportError:
     # Use raw parsing if imports fail or layers missing
     TCP = UDP = Raw = None
@@ -46,12 +51,25 @@ NBNS_RCODE_MAP = {
 }
 
 SMB2_CMD_MAP = {
-    0x00: "Negotiate", 0x01: "Session Setup", 0x02: "Logoff",
-    0x03: "Tree Connect", 0x04: "Tree Disconnect", 0x05: "Create",
-    0x06: "Close", 0x07: "Flush", 0x08: "Read", 0x09: "Write",
-    0x0A: "Lock", 0x0B: "Ioctl", 0x0C: "Cancel", 0x0D: "Echo",
-    0x0E: "Query Dir", 0x0F: "Change Notify", 0x10: "Query Info",
-    0x11: "Set Info", 0x12: "Oplock Break",
+    0x00: "Negotiate",
+    0x01: "Session Setup",
+    0x02: "Logoff",
+    0x03: "Tree Connect",
+    0x04: "Tree Disconnect",
+    0x05: "Create",
+    0x06: "Close",
+    0x07: "Flush",
+    0x08: "Read",
+    0x09: "Write",
+    0x0A: "Lock",
+    0x0B: "Ioctl",
+    0x0C: "Cancel",
+    0x0D: "Echo",
+    0x0E: "Query Dir",
+    0x0F: "Change Notify",
+    0x10: "Query Info",
+    0x11: "Set Info",
+    0x12: "Oplock Break",
 }
 
 SMB1_CMD_MAP = {
@@ -76,25 +94,47 @@ SUSPICIOUS_SMB_TOKENS = {
 HIGH_RISK_NBNS_CODES = {"Refused", "ServFail", "FormErr"}
 
 
-def _parse_ntlm_type3(payload: bytes) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def _parse_ntlm_type3(
+    payload: bytes,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     signature = b"NTLMSSP\x00"
     idx = payload.find(signature)
     if idx == -1 or len(payload) < idx + 64:
         return None, None, None
     try:
-        msg_type = int.from_bytes(payload[idx + 8:idx + 12], "little")
+        msg_type = int.from_bytes(payload[idx + 8 : idx + 12], "little")
         if msg_type != 3:
             return None, None, None
+
         def _read_field(offset: int) -> Tuple[int, int]:
-            length = int.from_bytes(payload[offset:offset + 2], "little")
-            field_offset = int.from_bytes(payload[offset + 4:offset + 8], "little")
+            length = int.from_bytes(payload[offset : offset + 2], "little")
+            field_offset = int.from_bytes(payload[offset + 4 : offset + 8], "little")
             return length, field_offset
+
         domain_len, domain_off = _read_field(idx + 28)
         user_len, user_off = _read_field(idx + 36)
         workstation_len, workstation_off = _read_field(idx + 44)
-        domain = payload[idx + domain_off:idx + domain_off + domain_len].decode("utf-16le", errors="ignore") if domain_len else None
-        user = payload[idx + user_off:idx + user_off + user_len].decode("utf-16le", errors="ignore") if user_len else None
-        workstation = payload[idx + workstation_off:idx + workstation_off + workstation_len].decode("utf-16le", errors="ignore") if workstation_len else None
+        domain = (
+            payload[idx + domain_off : idx + domain_off + domain_len].decode(
+                "utf-16le", errors="ignore"
+            )
+            if domain_len
+            else None
+        )
+        user = (
+            payload[idx + user_off : idx + user_off + user_len].decode(
+                "utf-16le", errors="ignore"
+            )
+            if user_len
+            else None
+        )
+        workstation = (
+            payload[
+                idx + workstation_off : idx + workstation_off + workstation_len
+            ].decode("utf-16le", errors="ignore")
+            if workstation_len
+            else None
+        )
         return user or None, domain or None, workstation or None
     except Exception:
         return None, None, None
@@ -103,17 +143,22 @@ def _parse_ntlm_type3(payload: bytes) -> Tuple[Optional[str], Optional[str], Opt
 def _parse_smb_command(payload: bytes) -> Optional[str]:
     if payload.startswith(b"\xfeSMB") and len(payload) >= 16:
         cmd = int.from_bytes(payload[12:14], "little")
-        return f"SMB2:{SMB2_CMD_MAP.get(cmd, f'0x{cmd:02X}') }"
+        return f"SMB2:{SMB2_CMD_MAP.get(cmd, f'0x{cmd:02X}')}"
     if payload.startswith(b"\xffSMB") and len(payload) >= 5:
         cmd = payload[4]
-        return f"SMB1:{SMB1_CMD_MAP.get(cmd, f'0x{cmd:02X}') }"
+        return f"SMB1:{SMB1_CMD_MAP.get(cmd, f'0x{cmd:02X}')}"
     return None
+
 
 @dataclass
 class NetbiosName:
     name: str
     suffix: int
     type_str: str
+    scope: str = "UNKNOWN"  # UNIQUE/GROUP/UNKNOWN
+    status: str = "Registered"
+    source: str = "NBNS"
+
 
 @dataclass
 class NetbiosHost:
@@ -124,12 +169,13 @@ class NetbiosHost:
     is_domain_controller: bool = False
     group_name: Optional[str] = None
 
+
 @dataclass
 class NetbiosAnomaly:
     timestamp: float
     src_ip: str
     dst_ip: str
-    type: str # Conflict, Spoof, Malformed, BroadcastStorm
+    type: str  # Conflict, Spoof, Malformed, BroadcastStorm
     details: str
     severity: str = "LOW"
 
@@ -159,13 +205,14 @@ class NetbiosSession:
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
+
 @dataclass
 class NetbiosAnalysis:
     path: Path
     duration: float = 0.0
     total_bytes: int = 0
     total_packets: int = 0
-    hosts: Dict[str, NetbiosHost] = field(default_factory=dict) # Keyed by IP
+    hosts: Dict[str, NetbiosHost] = field(default_factory=dict)  # Keyed by IP
     conversations: List[NetbiosConversation] = field(default_factory=list)
     sessions: List[NetbiosSession] = field(default_factory=list)
     endpoint_bytes_sent: Counter[str] = field(default_factory=Counter)
@@ -203,7 +250,12 @@ class NetbiosAnalysis:
     name_conflicts: int = 0
     browser_elections: int = 0
     unique_names: Set[str] = field(default_factory=set)
+    deterministic_checks: Dict[str, List[str]] = field(default_factory=dict)
+    threat_hypotheses: List[Dict[str, object]] = field(default_factory=list)
+    hunting_pivots: List[Dict[str, object]] = field(default_factory=list)
+    benign_context: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+
 
 def decode_netbios_name(encoded_name: bytes) -> str:
     """
@@ -211,19 +263,105 @@ def decode_netbios_name(encoded_name: bytes) -> str:
     """
     if len(encoded_name) < 32:
         return "<BAD_ENCODING>"
-    
+
     try:
-        # NetBIOS Name Encoding: 2 characters for each byte
-        # Simplistic decoding for now or use scapy's if available.
-        # usually stored as 16 chars (padded spaces)
-        # Actually scapy usually handles this, so we might extract from layer
-        pass
+        raw = encoded_name[:32]
+        out = bytearray()
+        for idx in range(0, 32, 2):
+            c1 = raw[idx]
+            c2 = raw[idx + 1]
+            if not (65 <= c1 <= 80 and 65 <= c2 <= 80):  # "A".."P"
+                return encoded_name.decode("utf-8", errors="replace").strip()
+            high = c1 - 65
+            low = c2 - 65
+            out.append((high << 4) | low)
+        return out.decode("latin-1", errors="ignore").strip()
     except Exception:
-        pass
-    return encoded_name.decode('utf-8', errors='replace').strip()
+        return encoded_name.decode("utf-8", errors="replace").strip()
+
 
 def get_netbios_suffix_desc(suffix: int) -> str:
     return SUFFIX_MAP.get(suffix, f"Unknown (0x{suffix:02X})")
+
+
+def _scope_from_suffix(suffix: int) -> str:
+    if suffix in {0x1C, 0x1D, 0x1E}:
+        return "GROUP"
+    return "UNIQUE"
+
+
+def _parse_name_text(raw_name: object) -> Tuple[str, Optional[int]]:
+    if raw_name is None:
+        return "", None
+    if isinstance(raw_name, bytes):
+        text = raw_name.decode("latin-1", errors="ignore").strip()
+    else:
+        text = str(raw_name).strip()
+    if not text:
+        return "", None
+
+    candidate = "".join(
+        ch for ch in text.rstrip(".") if ch.isprintable() or ch in {"\x01", "\x02"}
+    )
+    if "__MSBROWSE__" in candidate.upper():
+        return "__MSBROWSE__", 0x01
+    match = re.match(r"^(.*)<([0-9A-Fa-f]{2})>$", candidate)
+    if match:
+        name = match.group(1).strip()
+        suffix = int(match.group(2), 16)
+        return name[:15], suffix
+
+    if len(candidate) >= 32 and all(("A" <= ch <= "P") for ch in candidate[:32]):
+        decoded = decode_netbios_name(candidate[:32].encode("latin-1", errors="ignore"))
+        if decoded and decoded != "<BAD_ENCODING>":
+            if len(decoded) >= 16:
+                return decoded[:15].strip(), ord(decoded[15])
+            return decoded[:15].strip(), None
+
+    return candidate[:15].strip(), None
+
+
+def _infer_suffix_from_name(name: str) -> Optional[int]:
+    upper = str(name or "").upper().strip()
+    if not upper:
+        return None
+    if upper == "__MSBROWSE__":
+        return 0x01
+    if upper in {"WORKGROUP", "MSHOME", "DOMAIN"}:
+        return 0x00
+    return None
+
+
+def _nb_name_status(flags: int) -> str:
+    if flags & 0x2000:
+        return "Conflict"
+    if flags & 0x4000:
+        return "Deregistered"
+    if flags & 0x1000:
+        return "Registered"
+    if flags & 0x0800:
+        return "Permanent"
+    return "Registered"
+
+
+def _extract_node_status_entries(layer_obj: object) -> List[Tuple[str, int, str, str]]:
+    entries: List[Tuple[str, int, str, str]] = []
+    blob = getattr(layer_obj, "NODE_NAME", b"")
+    if not isinstance(blob, (bytes, bytearray)):
+        return entries
+    data = bytes(blob)
+    for idx in range(0, len(data), 18):
+        chunk = data[idx : idx + 18]
+        if len(chunk) < 18:
+            break
+        name = chunk[:15].decode("latin-1", errors="ignore").strip()
+        suffix = int(chunk[15])
+        flags = int.from_bytes(chunk[16:18], "big")
+        scope = "GROUP" if (flags & 0x8000) else "UNIQUE"
+        status = _nb_name_status(flags)
+        if name:
+            entries.append((name[:15], suffix, scope, status))
+    return entries
 
 
 def _scan_filenames(data: bytes) -> List[str]:
@@ -253,6 +391,7 @@ def _extract_plaintext(data: bytes, max_items: int = 8) -> List[str]:
         if len(tokens) >= max_items:
             break
     return tokens
+
 
 def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysis:
     analysis = NetbiosAnalysis(path=pcap_path)
@@ -286,6 +425,7 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
 
     keepalive_last_ts: Dict[str, float] = {}
     keepalive_intervals: Dict[str, List[float]] = defaultdict(list)
+    host_name_seen: Dict[str, Set[Tuple[str, int, str, str]]] = defaultdict(set)
 
     max_anomalies = 250
 
@@ -295,7 +435,9 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
         if obj.last_seen is None or ts_val > obj.last_seen:
             obj.last_seen = ts_val
 
-    def _append_anomaly(severity: str, kind: str, details: str, src: str, dst: str, ts: float) -> None:
+    def _append_anomaly(
+        severity: str, kind: str, details: str, src: str, dst: str, ts: float
+    ) -> None:
         if len(analysis.anomalies) >= max_anomalies:
             return
         analysis.anomalies.append(
@@ -308,6 +450,37 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                 severity=severity,
             )
         )
+
+    def _add_host_name(
+        host_ip: str, name: str, suffix: int, scope: str, status: str, source: str
+    ) -> None:
+        if not name:
+            return
+        if host_ip not in analysis.hosts:
+            analysis.hosts[host_ip] = NetbiosHost(ip=host_ip)
+        norm_name = name[:15].strip()
+        norm_scope = scope.upper() if scope else _scope_from_suffix(suffix)
+        norm_status = status or "Registered"
+        key = (norm_name.lower(), int(suffix), norm_scope, norm_status)
+        if key in host_name_seen[host_ip]:
+            return
+        host_name_seen[host_ip].add(key)
+        analysis.hosts[host_ip].names.append(
+            NetbiosName(
+                name=norm_name,
+                suffix=int(suffix),
+                type_str=get_netbios_suffix_desc(int(suffix)),
+                scope=norm_scope,
+                status=norm_status,
+                source=source,
+            )
+        )
+        if int(suffix) in {0x1B, 0x1C, 0xDC}:
+            analysis.hosts[host_ip].is_domain_controller = True
+        if int(suffix) in {0x1D, 0x1E, 0xE0}:
+            analysis.hosts[host_ip].is_master_browser = True
+        if norm_scope == "GROUP" and analysis.hosts[host_ip].group_name is None:
+            analysis.hosts[host_ip].group_name = norm_name
 
     try:
         reader, status_bar, stream, size_bytes, _file_type = get_reader(
@@ -380,7 +553,11 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
 
                 if src_ip not in analysis.hosts:
                     analysis.hosts[src_ip] = NetbiosHost(ip=src_ip)
-                if Ether is not None and pkt.haslayer(Ether) and analysis.hosts[src_ip].mac is None:
+                if (
+                    Ether is not None
+                    and pkt.haslayer(Ether)
+                    and analysis.hosts[src_ip].mac is None
+                ):
                     try:
                         analysis.hosts[src_ip].mac = str(pkt[Ether].src)
                     except Exception:
@@ -438,18 +615,26 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                         else:
                             qname_str = str(qname).strip() if qname is not None else ""
                         if qname_str:
-                            src_nbns_names[src_ip].add(qname_str)
+                            parsed_name, parsed_suffix = _parse_name_text(qname_str)
+                            display_name = qname_str
+                            if parsed_name:
+                                display_name = (
+                                    f"{parsed_name}<{parsed_suffix:02X}>"
+                                    if parsed_suffix is not None
+                                    else parsed_name
+                                )
+                            src_nbns_names[src_ip].add(display_name)
                             src_nbns_targets[src_ip].add(dst_ip)
-                            analysis.observed_users[qname_str] += 1
-                            analysis.unique_names.add(qname_str)
-                            artifacts.add(qname_str)
-                            name_registry[qname_str].add(src_ip)
-                            if len(name_registry[qname_str]) > 1:
+                            analysis.observed_users[display_name] += 1
+                            analysis.unique_names.add(display_name)
+                            artifacts.add(display_name)
+                            name_registry[display_name].add(src_ip)
+                            if len(name_registry[display_name]) > 1:
                                 analysis.name_conflicts += 1
                                 _append_anomaly(
                                     "HIGH",
                                     "NameConflict",
-                                    f"Multiple hosts claimed query name {qname_str}: {', '.join(sorted(name_registry[qname_str]))}",
+                                    f"Multiple hosts claimed query name {display_name}: {', '.join(sorted(name_registry[display_name]))}",
                                     src_ip,
                                     dst_ip,
                                     ts,
@@ -486,23 +671,75 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                                 )
 
                         rr_name = getattr(nbns, "RR_NAME", None)
-                        if isinstance(rr_name, bytes):
-                            rr_name = rr_name.decode("latin-1", errors="ignore").strip()
-                        rr_name = str(rr_name).strip() if rr_name else ""
-                        if rr_name:
-                            response_name_registry[rr_name].add(src_ip)
-                            if len(response_name_registry[rr_name]) > 1:
+                        parsed_name, parsed_suffix = _parse_name_text(rr_name)
+                        if parsed_name and parsed_suffix is None:
+                            parsed_suffix = _infer_suffix_from_name(parsed_name)
+                        rr_name_text = (
+                            f"{parsed_name}<{parsed_suffix:02X}>"
+                            if (parsed_name and parsed_suffix is not None)
+                            else parsed_name
+                        )
+                        if rr_name_text:
+                            response_name_registry[rr_name_text].add(src_ip)
+                            if len(response_name_registry[rr_name_text]) > 1:
                                 analysis.threat_summary["NBNS Response Spoofing"] += 1
                                 _append_anomaly(
                                     "HIGH",
                                     "NBNS Spoofing",
-                                    f"Name {rr_name} resolved by multiple IPs: {', '.join(sorted(response_name_registry[rr_name]))}",
+                                    f"Name {rr_name_text} resolved by multiple IPs: {', '.join(sorted(response_name_registry[rr_name_text]))}",
                                     src_ip,
                                     dst_ip,
                                     ts,
                                 )
+                        if parsed_name:
+                            addr_entries = getattr(nbns, "ADDR_ENTRY", []) or []
+                            entry_scope = _scope_from_suffix(
+                                parsed_suffix if parsed_suffix is not None else 0x00
+                            )
+                            if isinstance(addr_entries, list) and addr_entries:
+                                try:
+                                    g_raw = getattr(addr_entries[0], "G", None)
+                                    if isinstance(g_raw, int):
+                                        if int(g_raw) == 1:
+                                            entry_scope = "GROUP"
+                                        elif int(g_raw) == 0:
+                                            entry_scope = "UNIQUE"
+                                    else:
+                                        g_value = str(g_raw or "").lower()
+                                        if "group" in g_value:
+                                            entry_scope = "GROUP"
+                                        elif "unique" in g_value:
+                                            entry_scope = "UNIQUE"
+                                except Exception:
+                                    pass
+                            if parsed_name.upper() == "__MSBROWSE__":
+                                entry_scope = "GROUP"
+                            _add_host_name(
+                                src_ip,
+                                parsed_name,
+                                int(
+                                    parsed_suffix if parsed_suffix is not None else 0x00
+                                ),
+                                entry_scope,
+                                "Registered",
+                                "NBNS Response",
+                            )
                     except Exception as exc:
                         analysis.errors.append(f"NBNS response parse: {exc}")
+
+                if NBNSNodeStatusResponse is not None and pkt.haslayer(
+                    NBNSNodeStatusResponse
+                ):
+                    try:
+                        node_status = pkt[NBNSNodeStatusResponse]
+                        entries = _extract_node_status_entries(node_status)
+                        for name, suffix, scope, status in entries:
+                            _add_host_name(
+                                src_ip, name, suffix, scope, status, "NBSTAT"
+                            )
+                            analysis.unique_names.add(f"{name}<{suffix:02X}>")
+                    except Exception as exc:
+                        analysis.errors.append(f"NBNS node status parse: {exc}")
 
                 # Browser datagram heuristics (UDP/138)
                 if proto_label == "UDP" and (sport == 138 or dport == 138) and payload:
@@ -517,7 +754,9 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                     sess_key = (src_ip, dst_ip, sport, dport)
                     sess = sessions.get(sess_key)
                     if sess is None:
-                        sess = NetbiosSession(src_ip=src_ip, dst_ip=dst_ip, src_port=sport, dst_port=dport)
+                        sess = NetbiosSession(
+                            src_ip=src_ip, dst_ip=dst_ip, src_port=sport, dst_port=dport
+                        )
                         sessions[sess_key] = sess
                     sess.packets += 1
                     _update_time(sess, ts)
@@ -560,7 +799,9 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                             cmd_name = _parse_smb_command(nbss_payload)
                             if cmd_name:
                                 analysis.smb_commands[cmd_name] += 1
-                                if any(token in cmd_name for token in SUSPICIOUS_SMB_TOKENS):
+                                if any(
+                                    token in cmd_name for token in SUSPICIOUS_SMB_TOKENS
+                                ):
                                     analysis.suspicious_smb_commands[cmd_name] += 1
                                 if "Session Setup" in cmd_name and is_client_to_server:
                                     smb_session_setup_attempts[src_ip] += 1
@@ -576,17 +817,19 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                                 key = (src_ip, dst_ip, user, domain or "", sport, dport)
                                 if key not in user_evidence_seen:
                                     user_evidence_seen.add(key)
-                                    analysis.user_evidence.append({
-                                        "src_ip": src_ip,
-                                        "dst_ip": dst_ip,
-                                        "src_port": sport,
-                                        "dst_port": dport,
-                                        "username": user,
-                                        "domain": domain,
-                                        "workstation": workstation,
-                                        "method": "NetBIOS SMB Session Setup",
-                                        "details": cmd_name or "SMB over NetBIOS",
-                                    })
+                                    analysis.user_evidence.append(
+                                        {
+                                            "src_ip": src_ip,
+                                            "dst_ip": dst_ip,
+                                            "src_port": sport,
+                                            "dst_port": dport,
+                                            "username": user,
+                                            "domain": domain,
+                                            "workstation": workstation,
+                                            "method": "NetBIOS SMB Session Setup",
+                                            "details": cmd_name or "SMB over NetBIOS",
+                                        }
+                                    )
                             if domain:
                                 analysis.smb_domains[domain] += 1
                             if workstation:
@@ -598,7 +841,10 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                 # Broadcast storm heuristic
                 ts_sec = int(ts)
                 packet_rate_tracker[ts_sec][src_ip] += 1
-                if packet_rate_tracker[ts_sec][src_ip] > 200 and src_ip not in storm_flagged:
+                if (
+                    packet_rate_tracker[ts_sec][src_ip] > 200
+                    and src_ip not in storm_flagged
+                ):
                     storm_flagged.add(src_ip)
                     analysis.threat_summary["Broadcast/Name Storm"] += 1
                     _append_anomaly(
@@ -682,7 +928,7 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
         if avg <= 0:
             continue
         variance = sum((x - avg) ** 2 for x in intervals) / len(intervals)
-        cv = (variance ** 0.5) / avg
+        cv = (variance**0.5) / avg
         if cv <= 0.20 and 1.0 <= avg <= 120.0:
             analysis.beacon_candidates[flow_key] += len(intervals)
             analysis.threat_summary["Beaconing Pattern"] += 1
@@ -695,10 +941,177 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                 0.0,
             )
 
-    analysis.conversations = sorted(conversations.values(), key=lambda item: item.packets, reverse=True)
-    analysis.sessions = sorted(sessions.values(), key=lambda item: item.packets, reverse=True)
+    analysis.conversations = sorted(
+        conversations.values(), key=lambda item: item.packets, reverse=True
+    )
+    analysis.sessions = sorted(
+        sessions.values(), key=lambda item: item.packets, reverse=True
+    )
     analysis.service_endpoints = dict(service_endpoints)
     analysis.files_discovered = sorted(file_set)[:200]
     analysis.artifacts = sorted(artifacts)[:300]
+
+    def _is_public_ip(value: str) -> bool:
+        try:
+            return ipaddress.ip_address(str(value)).is_global
+        except Exception:
+            return False
+
+    deterministic_checks: Dict[str, List[str]] = {
+        "nbns_spoofing_or_conflict": [],
+        "nbns_scan_or_probe_fanout": [],
+        "nbns_broadcast_storm": [],
+        "smb_auth_abuse_over_netbios": [],
+        "smb_write_exfil_over_netbios": [],
+        "netbios_beaconing_pattern": [],
+        "role_claim_anomaly": [],
+        "public_netbios_exposure": [],
+    }
+    threat_hypotheses: List[Dict[str, object]] = []
+    hunting_pivots: List[Dict[str, object]] = []
+    benign_context: List[str] = []
+
+    spoof_hits = int(analysis.threat_summary.get("NBNS Response Spoofing", 0) or 0)
+    if spoof_hits > 0:
+        deterministic_checks["nbns_spoofing_or_conflict"].append(
+            f"NBNS response spoofing indicators count={spoof_hits}"
+        )
+    if int(analysis.name_conflicts or 0) > 0:
+        deterministic_checks["nbns_spoofing_or_conflict"].append(
+            f"NetBIOS name conflicts observed count={int(analysis.name_conflicts or 0)}"
+        )
+
+    for src_ip, count in analysis.scanning_sources.most_common(15):
+        deterministic_checks["nbns_scan_or_probe_fanout"].append(
+            f"NBNS scan-like source {src_ip} queried names={int(count)}"
+        )
+        hunting_pivots.append(
+            {
+                "pivot": "nbns_scan_source",
+                "source": src_ip,
+                "count": int(count),
+            }
+        )
+    for src_ip, count in analysis.probe_sources.most_common(15):
+        deterministic_checks["nbns_scan_or_probe_fanout"].append(
+            f"NetBIOS probe sweep source {src_ip} target_count={int(count)}"
+        )
+        hunting_pivots.append(
+            {
+                "pivot": "nbns_probe_source",
+                "source": src_ip,
+                "count": int(count),
+            }
+        )
+
+    storm_hits = int(analysis.threat_summary.get("Broadcast/Name Storm", 0) or 0)
+    if storm_hits > 0:
+        deterministic_checks["nbns_broadcast_storm"].append(
+            f"Broadcast/name storm indicators count={storm_hits}"
+        )
+
+    for src_ip, count in analysis.brute_force_sources.most_common(15):
+        deterministic_checks["smb_auth_abuse_over_netbios"].append(
+            f"SMB SessionSetup brute-force indicator source {src_ip} attempts={int(count)}"
+        )
+        hunting_pivots.append(
+            {
+                "pivot": "smb_bruteforce_source",
+                "source": src_ip,
+                "attempts": int(count),
+            }
+        )
+
+    for src_ip, total_bytes in analysis.exfil_candidates.most_common(15):
+        deterministic_checks["smb_write_exfil_over_netbios"].append(
+            f"SMB write-heavy flow source {src_ip} bytes={int(total_bytes)}"
+        )
+        hunting_pivots.append(
+            {
+                "pivot": "smb_write_source",
+                "source": src_ip,
+                "bytes": int(total_bytes),
+            }
+        )
+
+    for flow_key, count in analysis.beacon_candidates.most_common(15):
+        deterministic_checks["netbios_beaconing_pattern"].append(
+            f"Periodic keepalive cadence flow={flow_key} intervals={int(count)}"
+        )
+
+    dc_hosts = [
+        ip
+        for ip, host in analysis.hosts.items()
+        if getattr(host, "is_domain_controller", False)
+    ]
+    browser_hosts = [
+        ip
+        for ip, host in analysis.hosts.items()
+        if getattr(host, "is_master_browser", False)
+    ]
+    if dc_hosts:
+        deterministic_checks["role_claim_anomaly"].append(
+            f"Domain-controller role suffixes observed on hosts={', '.join(sorted(dc_hosts)[:8])}"
+        )
+    if browser_hosts:
+        deterministic_checks["role_claim_anomaly"].append(
+            f"Master-browser role suffixes observed on hosts={', '.join(sorted(browser_hosts)[:8])}"
+        )
+
+    for ip_value, count in analysis.src_counts.items():
+        if _is_public_ip(ip_value):
+            deterministic_checks["public_netbios_exposure"].append(
+                f"NetBIOS source on public IP {ip_value} packets={int(count)}"
+            )
+    for ip_value, count in analysis.dst_counts.items():
+        if _is_public_ip(ip_value):
+            deterministic_checks["public_netbios_exposure"].append(
+                f"NetBIOS destination on public IP {ip_value} packets={int(count)}"
+            )
+
+    if (
+        deterministic_checks["nbns_spoofing_or_conflict"]
+        and deterministic_checks["nbns_scan_or_probe_fanout"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Possible NBNS poisoning campaign coupled with active name reconnaissance",
+                "confidence": "high",
+                "evidence": len(deterministic_checks["nbns_spoofing_or_conflict"])
+                + len(deterministic_checks["nbns_scan_or_probe_fanout"]),
+            }
+        )
+    if (
+        deterministic_checks["smb_auth_abuse_over_netbios"]
+        and deterministic_checks["smb_write_exfil_over_netbios"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Credential abuse followed by SMB write-heavy activity over NetBIOS",
+                "confidence": "high",
+                "evidence": len(deterministic_checks["smb_auth_abuse_over_netbios"])
+                + len(deterministic_checks["smb_write_exfil_over_netbios"]),
+            }
+        )
+    if deterministic_checks["public_netbios_exposure"]:
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Legacy NetBIOS service surface exposed on public network path",
+                "confidence": "high",
+                "evidence": len(deterministic_checks["public_netbios_exposure"]),
+            }
+        )
+
+    if not deterministic_checks["nbns_spoofing_or_conflict"]:
+        benign_context.append("No strong NBNS spoofing/name-conflict cluster observed")
+    if not deterministic_checks["smb_auth_abuse_over_netbios"]:
+        benign_context.append("No substantial SMB auth abuse over NetBIOS observed")
+    if not deterministic_checks["public_netbios_exposure"]:
+        benign_context.append("No public Internet NetBIOS endpoint exposure observed")
+
+    analysis.deterministic_checks = {k: v[:80] for k, v in deterministic_checks.items()}
+    analysis.threat_hypotheses = threat_hypotheses[:24]
+    analysis.hunting_pivots = hunting_pivots[:150]
+    analysis.benign_context = benign_context[:24]
 
     return analysis

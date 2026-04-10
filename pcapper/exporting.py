@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import csv
+import json
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
-import json
-import csv
-import sqlite3
 
-from .utils import to_serializable, safe_write_text
+from .utils import safe_write_text, to_serializable
 
 
 @dataclass
@@ -24,9 +24,16 @@ def export_json(bundle: ExportBundle, output_path: Path) -> None:
     _ensure_parent(output_path)
     payload = {
         "path": str(bundle.path),
-        "summaries": {name: to_serializable(summary) for name, summary in bundle.summaries.items()},
+        "summaries": {
+            name: to_serializable(summary) for name, summary in bundle.summaries.items()
+        },
     }
-    safe_write_text(output_path, json.dumps(payload, indent=2), encoding="utf-8", context="export_json")
+    safe_write_text(
+        output_path,
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+        context="export_json",
+    )
 
 
 def _iter_detections(summary: Any) -> Iterable[dict[str, Any]]:
@@ -88,12 +95,14 @@ def export_csv(bundle: ExportBundle, output_path: Path) -> None:
         for host in _iter_hosts(summary):
             open_ports = []
             for port in getattr(host, "open_ports", []) or []:
-                open_ports.append({
-                    "port": int(getattr(port, "port", 0) or 0),
-                    "protocol": str(getattr(port, "protocol", "") or ""),
-                    "service": str(getattr(port, "service", "") or ""),
-                    "software": str(getattr(port, "software", "") or ""),
-                })
+                open_ports.append(
+                    {
+                        "port": int(getattr(port, "port", 0) or 0),
+                        "protocol": str(getattr(port, "protocol", "") or ""),
+                        "service": str(getattr(port, "service", "") or ""),
+                        "software": str(getattr(port, "software", "") or ""),
+                    }
+                )
             row = {
                 "category": "host",
                 "module": name,
@@ -124,7 +133,9 @@ def export_csv(bundle: ExportBundle, output_path: Path) -> None:
                 writer.writerow(row)
 
     if host_rows:
-        host_path = output_path.with_name(f"{output_path.stem}_hosts{output_path.suffix or '.csv'}")
+        host_path = output_path.with_name(
+            f"{output_path.stem}_hosts{output_path.suffix or '.csv'}"
+        )
         _ensure_parent(host_path)
         host_fields = sorted({key for row in host_rows for key in row.keys()})
         with host_path.open("w", newline="", encoding="utf-8") as handle:
@@ -142,12 +153,8 @@ def export_sqlite(bundle: ExportBundle, output_path: Path) -> None:
         output_path.unlink()
     conn = sqlite3.connect(str(output_path))
     cur = conn.cursor()
-    cur.execute(
-        "CREATE TABLE detections (module TEXT, data TEXT)"
-    )
-    cur.execute(
-        "CREATE TABLE artifacts (module TEXT, data TEXT)"
-    )
+    cur.execute("CREATE TABLE detections (module TEXT, data TEXT)")
+    cur.execute("CREATE TABLE artifacts (module TEXT, data TEXT)")
     cur.execute(
         "CREATE TABLE hosts (pcap_path TEXT, module TEXT, ip TEXT, macs TEXT, hostnames TEXT, "
         "operating_system TEXT, os_evidence TEXT, packets_sent INTEGER, packets_recv INTEGER, "
@@ -157,19 +164,27 @@ def export_sqlite(bundle: ExportBundle, output_path: Path) -> None:
     for name, summary in bundle.summaries.items():
         for item in _iter_detections(summary):
             payload = to_serializable(item)
-            cur.execute("INSERT INTO detections (module, data) VALUES (?, ?)", (name, json.dumps(payload)))
+            cur.execute(
+                "INSERT INTO detections (module, data) VALUES (?, ?)",
+                (name, json.dumps(payload)),
+            )
         for item in _iter_artifacts(summary):
             payload = to_serializable(item)
-            cur.execute("INSERT INTO artifacts (module, data) VALUES (?, ?)", (name, json.dumps(payload)))
+            cur.execute(
+                "INSERT INTO artifacts (module, data) VALUES (?, ?)",
+                (name, json.dumps(payload)),
+            )
         for host in _iter_hosts(summary):
             open_ports = []
             for port in getattr(host, "open_ports", []) or []:
-                open_ports.append({
-                    "port": int(getattr(port, "port", 0) or 0),
-                    "protocol": str(getattr(port, "protocol", "") or ""),
-                    "service": str(getattr(port, "service", "") or ""),
-                    "software": str(getattr(port, "software", "") or ""),
-                })
+                open_ports.append(
+                    {
+                        "port": int(getattr(port, "port", 0) or 0),
+                        "protocol": str(getattr(port, "protocol", "") or ""),
+                        "service": str(getattr(port, "service", "") or ""),
+                        "software": str(getattr(port, "software", "") or ""),
+                    }
+                )
             row = {
                 "pcap_path": str(bundle.path),
                 "module": name,

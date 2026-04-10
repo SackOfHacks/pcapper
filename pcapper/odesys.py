@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from pathlib import Path
 import ipaddress
 import re
+from pathlib import Path
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
-from .opcode_models import load_opcode_model, format_opcode
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_port_protocol,
+)
+from .opcode_models import format_opcode, load_opcode_model
 
 ODESYS_PORTS = {2455, 1217}
 ODESYS_MODEL_PATH = Path(__file__).with_name("odesys_opcodes.json")
@@ -24,7 +28,9 @@ ODESYS_KEYWORDS = {
     "codesys": "CODESYS",
 }
 
-ODESYS_OPCODE_PATTERN = re.compile(r"(?:opcode|op|cmd)\\s*[:=]\\s*(0x[0-9a-fA-F]+|\\d+)", re.IGNORECASE)
+ODESYS_OPCODE_PATTERN = re.compile(
+    r"(?:opcode|op|cmd)\\s*[:=]\\s*(0x[0-9a-fA-F]+|\\d+)", re.IGNORECASE
+)
 
 
 def _load_model() -> object | None:
@@ -44,7 +50,11 @@ def _parse_commands(payload: bytes) -> list[str]:
         commands.append(f"ODESYS Opcode {match}")
         if model is not None:
             try:
-                opcode = int(match, 16) if str(match).lower().startswith("0x") else int(match)
+                opcode = (
+                    int(match, 16)
+                    if str(match).lower().startswith("0x")
+                    else int(match)
+                )
                 label = getattr(model, "opcodes", {}).get(opcode)
                 if label:
                     commands.append(f"ODESYS {label}")
@@ -70,7 +80,9 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
     return artifacts
 
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     if any(cmd in {"ODESYS Download", "ODESYS Upload"} for cmd in commands):
         anomalies.append(

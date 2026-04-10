@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import re
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -30,7 +30,10 @@ SUSPICIOUS_PLAINTEXT = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential indicator"),
     (re.compile(r"user(name)?\s*[:=]", re.IGNORECASE), "User indicator"),
     (re.compile(r"unattended|easy access", re.IGNORECASE), "Unattended access marker"),
-    (re.compile(r"remote control|file transfer", re.IGNORECASE), "Remote control feature"),
+    (
+        re.compile(r"remote control|file transfer", re.IGNORECASE),
+        "Remote control feature",
+    ),
 ]
 
 FILE_NAME_RE = re.compile(
@@ -175,7 +178,9 @@ class _SessionState:
             self.hints = Counter()
 
 
-def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
+def _extract_ascii_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
     results: list[str] = []
     if not data:
         return results
@@ -248,7 +253,7 @@ def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
     if avg <= 0:
         return None
     variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
+    stddev = variance**0.5
     if avg < 5 or avg > 86400:
         return None
     if stddev > max(5.0, avg * 0.25):
@@ -264,7 +269,9 @@ def analyze_teamviewer(
 ) -> TeamviewerSummary:
     errors: list[str] = []
     if (TCP is None and UDP is None) or (IP is None and IPv6 is None):
-        errors.append("Scapy IP/TCP/UDP layers unavailable; install scapy for TeamViewer analysis.")
+        errors.append(
+            "Scapy IP/TCP/UDP layers unavailable; install scapy for TeamViewer analysis."
+        )
         return TeamviewerSummary(
             path=path,
             total_packets=0,
@@ -391,9 +398,11 @@ def analyze_teamviewer(
                     payload = b""
 
             payload_prefix = payload[:64] if payload else b""
-            is_tv = (
-                (sport in TEAMVIEWER_PORTS or dport in TEAMVIEWER_PORTS)
-                or (payload_prefix and TEAMVIEWER_HINT_RE.search(payload_prefix.decode("latin-1", errors="ignore")))
+            is_tv = (sport in TEAMVIEWER_PORTS or dport in TEAMVIEWER_PORTS) or (
+                payload_prefix
+                and TEAMVIEWER_HINT_RE.search(
+                    payload_prefix.decode("latin-1", errors="ignore")
+                )
             )
             if not is_tv:
                 continue
@@ -475,7 +484,14 @@ def analyze_teamviewer(
                     session.last_seen = ts
 
             if payload:
-                _scan_plaintext(payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts, hints)
+                _scan_plaintext(
+                    payload,
+                    plaintext_strings,
+                    suspicious_plaintext,
+                    file_artifacts,
+                    artifacts,
+                    hints,
+                )
                 for hint in _extract_ascii_strings(payload):
                     if TEAMVIEWER_HINT_RE.search(hint):
                         session.hints[hint] += 1
@@ -523,68 +539,93 @@ def analyze_teamviewer(
             short_session_by_client[session.client_ip] += 1
             short_session_targets[session.client_ip].add(session.server_ip)
         if session.first_seen is not None:
-            pair_first_seen[(session.client_ip, session.server_ip)].append(session.first_seen)
+            pair_first_seen[(session.client_ip, session.server_ip)].append(
+                session.first_seen
+            )
 
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
-    non_standard_ports = [port for port in server_tcp_ports if port not in TEAMVIEWER_PORTS]
-    non_standard_ports += [port for port in server_udp_ports if port not in TEAMVIEWER_PORTS]
+    non_standard_ports = [
+        port for port in server_tcp_ports if port not in TEAMVIEWER_PORTS
+    ]
+    non_standard_ports += [
+        port for port in server_udp_ports if port not in TEAMVIEWER_PORTS
+    ]
     if non_standard_ports:
-        detections.append({
-            "severity": "info",
-            "summary": "TeamViewer observed on non-standard ports",
-            "details": ", ".join(str(port) for port in sorted(set(non_standard_ports))),
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "TeamViewer observed on non-standard ports",
+                "details": ", ".join(
+                    str(port) for port in sorted(set(non_standard_ports))
+                ),
+            }
+        )
 
     if suspicious_plaintext:
-        detections.append({
-            "severity": "warning",
-            "summary": "Suspicious plaintext strings observed in TeamViewer payloads",
-            "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Suspicious plaintext strings observed in TeamViewer payloads",
+                "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
+            }
+        )
 
     for (client_ip, server_ip), count in short_session_counts.items():
         if count >= 20:
-            anomalies.append({
-                "title": "Potential brute force or probing",
-                "details": f"{client_ip} -> {server_ip} short sessions: {count}",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential brute force or probing",
+                    "details": f"{client_ip} -> {server_ip} short sessions: {count}",
+                }
+            )
 
     for client_ip, count in short_session_by_client.items():
         targets = short_session_targets.get(client_ip, set())
         if count >= 30 and len(targets) >= 10:
-            anomalies.append({
-                "title": "Potential TeamViewer scanning",
-                "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential TeamViewer scanning",
+                    "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
+                }
+            )
 
     for (client_ip, server_ip), times in pair_first_seen.items():
         score = _beaconing_score(times)
         if score:
-            detections.append({
-                "severity": "info",
-                "summary": "Potential TeamViewer beaconing",
-                "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
-            })
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "Potential TeamViewer beaconing",
+                    "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
+                }
+            )
 
     for session in sessions.values():
-        if session.client_bytes >= 50 * 1024 * 1024 and session.client_bytes > session.server_bytes * 3:
-            detections.append({
-                "severity": "warning",
-                "summary": "Potential TeamViewer data upload/exfiltration",
-                "details": (
-                    f"{session.client_ip} -> {session.server_ip} "
-                    f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
-                ),
-            })
+        if (
+            session.client_bytes >= 50 * 1024 * 1024
+            and session.client_bytes > session.server_bytes * 3
+        ):
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Potential TeamViewer data upload/exfiltration",
+                    "details": (
+                        f"{session.client_ip} -> {session.server_ip} "
+                        f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
+                    ),
+                }
+            )
         if session.last_seen is not None and session.first_seen is not None:
             duration = session.last_seen - session.first_seen
             if duration >= 4 * 3600:
-                anomalies.append({
-                    "title": "Long-lived TeamViewer session",
-                    "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
-                })
+                anomalies.append(
+                    {
+                        "title": "Long-lived TeamViewer session",
+                        "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
+                    }
+                )
 
     total_sessions = len(conversations)
 
@@ -625,7 +666,9 @@ def analyze_teamviewer(
 
 
 def merge_teamviewer_summaries(
-    summaries: list[TeamviewerSummary] | tuple[TeamviewerSummary, ...] | set[TeamviewerSummary],
+    summaries: list[TeamviewerSummary]
+    | tuple[TeamviewerSummary, ...]
+    | set[TeamviewerSummary],
 ) -> TeamviewerSummary:
     summary_list = list(summaries)
     if not summary_list:
@@ -708,9 +751,17 @@ def merge_teamviewer_summaries(
         udp_sessions += summary.udp_sessions
 
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         client_counts.update(summary.client_counts)
         server_counts.update(summary.server_counts)

@@ -3,8 +3,9 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from .utils import safe_read_text, decode_payload
 from .device_detection import device_fingerprints_from_text
+from .utils import decode_payload, safe_read_text
+
 
 @lru_cache(maxsize=4)
 def _load_json(path: Path) -> dict[str, object]:

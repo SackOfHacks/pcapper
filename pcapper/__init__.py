@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import os
-from collections import Counter
 import heapq
 import numbers
+import os
+from collections import Counter
 from typing import Any
 
 __all__ = ["__version__"]
-__version__ = "1.6.5"
+__version__ = "1.7.0"
 
 
 def _stable_key(value: Any) -> tuple[int, Any]:

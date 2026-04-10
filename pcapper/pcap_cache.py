@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from collections import OrderedDict
+import ipaddress
 import os
+import re
 import struct
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 try:
-    from scapy.utils import PcapReader, PcapNgReader  # type: ignore
+    from scapy.utils import PcapNgReader, PcapReader  # type: ignore
 except Exception:  # pragma: no cover
     PcapReader = None  # type: ignore
     PcapNgReader = None  # type: ignore
@@ -16,13 +18,20 @@ try:
     from scapy.all import sniff  # type: ignore
 except Exception:  # pragma: no cover
     sniff = None  # type: ignore
+try:
+    from scapy.layers.inet import IP  # type: ignore
+    from scapy.layers.inet6 import IPv6  # type: ignore
+except Exception:  # pragma: no cover
+    IP = None  # type: ignore
+    IPv6 = None  # type: ignore
 
-from .progress import build_statusbar, build_busy_statusbar
+from .progress import build_busy_statusbar, build_statusbar
 from .utils import detect_file_type
-
 
 _PACKET_CACHE: "OrderedDict[Path, tuple[list[object], 'PcapMeta']]" = OrderedDict()
 _CACHE_BYTES = 0
+_FORCED_PACKET_VIEWS: dict[Path, tuple[list[object], "PcapMeta | None"]] = {}
+_HOST_ONLY_BPF_RE = re.compile(r"^\s*\(?\s*host\s+([0-9A-Fa-f:.]+)\s*\)?\s*$")
 
 
 @dataclass(frozen=True)
@@ -106,33 +115,49 @@ def _read_pcapng_interfaces(path: Path) -> list[dict[str, object]]:
                     if len(body) < body_len:
                         break
                     if len(body) >= 8:
-                        linktype, _reserved, snaplen = struct.unpack(f"{endian}HHI", body[:8])
+                        linktype, _reserved, snaplen = struct.unpack(
+                            f"{endian}HHI", body[:8]
+                        )
                         iface: dict[str, object] = {
                             "linktype": linktype,
                             "snaplen": snaplen,
                         }
                         opt_offset = 8
                         while opt_offset + 4 <= len(body):
-                            code, length = struct.unpack(f"{endian}HH", body[opt_offset:opt_offset + 4])
+                            code, length = struct.unpack(
+                                f"{endian}HH", body[opt_offset : opt_offset + 4]
+                            )
                             opt_offset += 4
                             if code == 0:
                                 break
-                            value = body[opt_offset:opt_offset + length]
+                            value = body[opt_offset : opt_offset + length]
                             opt_offset += (length + 3) & ~3
 
                             if code == 2:  # if_name
-                                iface["if_name"] = value.rstrip(b"\x00").decode(errors="ignore")
+                                iface["if_name"] = value.rstrip(b"\x00").decode(
+                                    errors="ignore"
+                                )
                             elif code == 3:  # if_description
-                                iface["if_description"] = value.rstrip(b"\x00").decode(errors="ignore")
+                                iface["if_description"] = value.rstrip(b"\x00").decode(
+                                    errors="ignore"
+                                )
                             elif code == 6:  # if_MACaddr
-                                iface["if_macaddr"] = ":".join(f"{b:02x}" for b in value[:6])
+                                iface["if_macaddr"] = ":".join(
+                                    f"{b:02x}" for b in value[:6]
+                                )
                             elif code == 8 and len(value) >= 8:  # if_speed
-                                iface["if_speed"] = struct.unpack(f"{endian}Q", value[:8])[0]
+                                iface["if_speed"] = struct.unpack(
+                                    f"{endian}Q", value[:8]
+                                )[0]
                             elif code == 11 and len(value) >= 1:  # if_filter
                                 filter_val = value[1:]
-                                iface["if_filter"] = filter_val.rstrip(b"\x00").decode(errors="ignore")
+                                iface["if_filter"] = filter_val.rstrip(b"\x00").decode(
+                                    errors="ignore"
+                                )
                             elif code == 12:  # if_os
-                                iface["if_os"] = value.rstrip(b"\x00").decode(errors="ignore")
+                                iface["if_os"] = value.rstrip(b"\x00").decode(
+                                    errors="ignore"
+                                )
 
                         iface["id"] = len(interfaces)
                         interfaces.append(iface)
@@ -150,14 +175,18 @@ def _read_pcapng_interfaces(path: Path) -> list[dict[str, object]]:
                         opt_offset = 12
                         stats = if_stats.setdefault(iface_id, {})
                         while opt_offset + 4 <= len(body):
-                            code, length = struct.unpack(f"{endian}HH", body[opt_offset:opt_offset + 4])
+                            code, length = struct.unpack(
+                                f"{endian}HH", body[opt_offset : opt_offset + 4]
+                            )
                             opt_offset += 4
                             if code == 0:
                                 break
-                            value = body[opt_offset:opt_offset + length]
+                            value = body[opt_offset : opt_offset + length]
                             opt_offset += (length + 3) & ~3
                             if code == 5 and len(value) >= 8:  # isb_ifdrop
-                                stats["dropcount"] = struct.unpack(f"{endian}Q", value[:8])[0]
+                                stats["dropcount"] = struct.unpack(
+                                    f"{endian}Q", value[:8]
+                                )[0]
                     handle.seek(4, 1)
                     continue
 
@@ -264,14 +293,61 @@ def _reader_stream(reader: object) -> Optional[object]:
     return None
 
 
+def _extract_host_only_bpf_ip(bpf: str | None) -> str | None:
+    if not bpf:
+        return None
+    match = _HOST_ONLY_BPF_RE.match(str(bpf).strip())
+    if not match:
+        return None
+    candidate = match.group(1).strip()
+    try:
+        ipaddress.ip_address(candidate)
+    except Exception:
+        return None
+    return candidate
+
+
+def _packet_matches_host(pkt: object, host_ip: str) -> bool:
+    try:
+        host_addr = ipaddress.ip_address(host_ip)
+    except Exception:
+        return False
+
+    if IP is not None and getattr(pkt, "haslayer", None) and pkt.haslayer(IP):  # type: ignore[truthy-bool]
+        try:
+            src = ipaddress.ip_address(str(pkt[IP].src))  # type: ignore[index]
+            dst = ipaddress.ip_address(str(pkt[IP].dst))  # type: ignore[index]
+            if src == host_addr or dst == host_addr:
+                return True
+        except Exception:
+            pass
+
+    if (
+        IPv6 is not None and getattr(pkt, "haslayer", None) and pkt.haslayer(IPv6)  # type: ignore[truthy-bool]
+    ):
+        try:
+            src = ipaddress.ip_address(str(pkt[IPv6].src))  # type: ignore[index]
+            dst = ipaddress.ip_address(str(pkt[IPv6].dst))  # type: ignore[index]
+            if src == host_addr or dst == host_addr:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
 def _cache_config() -> tuple[bool, int, int]:
     enabled = os.environ.get("PCAPPER_CACHE_ENABLED", "1") != "0"
     try:
-        max_cache = int(os.environ.get("PCAPPER_CACHE_MAX_BYTES", str(256 * 1024 * 1024)))
+        max_cache = int(
+            os.environ.get("PCAPPER_CACHE_MAX_BYTES", str(256 * 1024 * 1024))
+        )
     except Exception:
         max_cache = 256 * 1024 * 1024
     try:
-        max_file = int(os.environ.get("PCAPPER_CACHE_FILE_MAX_BYTES", str(64 * 1024 * 1024)))
+        max_file = int(
+            os.environ.get("PCAPPER_CACHE_FILE_MAX_BYTES", str(64 * 1024 * 1024))
+        )
     except Exception:
         max_file = 64 * 1024 * 1024
     if max_cache < 0:
@@ -291,7 +367,9 @@ def is_scapy_available() -> bool:
 
 def _require_scapy() -> None:
     if not is_scapy_available():
-        raise RuntimeError("Scapy is required for packet parsing (install scapy>=2.5.0).")
+        raise RuntimeError(
+            "Scapy is required for packet parsing (install scapy>=2.5.0)."
+        )
 
 
 def load_capture_meta(path: Path) -> PcapMeta:
@@ -362,7 +440,9 @@ def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], Pc
     return packets, meta
 
 
-def get_cached_packets(path: Path, show_status: bool = True) -> tuple[list[object], PcapMeta]:
+def get_cached_packets(
+    path: Path, show_status: bool = True
+) -> tuple[list[object], PcapMeta]:
     global _CACHE_BYTES
     cached = _PACKET_CACHE.get(path)
     if cached:
@@ -419,12 +499,13 @@ def load_filtered_packets(
 ) -> tuple[list[object], PcapMeta]:
     _require_scapy()
     file_type = detect_file_type(path)
+    host_only_ip = _extract_host_only_bpf_ip(bpf)
     try:
         size_bytes = path.stat().st_size
     except Exception:
         size_bytes = 0
 
-    if bpf and sniff is not None:
+    if bpf and sniff is not None and host_only_ip is None:
         try:
             status = build_busy_statusbar(path, enabled=show_status, desc="Filtering")
             with status:
@@ -485,6 +566,8 @@ def load_filtered_packets(
                     continue
                 if time_end is not None and ts > time_end:
                     continue
+            if host_only_ip and not _packet_matches_host(pkt, host_only_ip):
+                continue
             packets.append(pkt)
     finally:
         status.finish()
@@ -509,6 +592,16 @@ def has_cached_packets(path: Path) -> bool:
     return path in _PACKET_CACHE
 
 
+def set_forced_packet_view(
+    path: Path, packets: list[object], meta: PcapMeta | None = None
+) -> None:
+    _FORCED_PACKET_VIEWS[Path(path)] = (packets, meta)
+
+
+def clear_forced_packet_view(path: Path) -> None:
+    _FORCED_PACKET_VIEWS.pop(Path(path), None)
+
+
 def get_reader(
     path: Path,
     *,
@@ -516,11 +609,26 @@ def get_reader(
     meta: PcapMeta | None = None,
     show_status: bool = True,
 ) -> tuple[object, object, Optional[object], int, str]:
+    forced = _FORCED_PACKET_VIEWS.get(Path(path))
+    if forced is not None:
+        forced_packets, forced_meta = forced
+        size_bytes = len(forced_packets)
+        reader = PacketListReader(forced_packets, forced_meta)
+        status = build_statusbar(path, enabled=show_status)
+        file_type = forced_meta.file_type if forced_meta else detect_file_type(path)
+        return reader, status, reader, size_bytes, file_type
+
     if packets is not None:
         size_bytes = len(packets)
         reader = PacketListReader(packets, meta)
         status = build_statusbar(path, enabled=show_status)
-        return reader, status, reader, size_bytes, (meta.file_type if meta else detect_file_type(path))
+        return (
+            reader,
+            status,
+            reader,
+            size_bytes,
+            (meta.file_type if meta else detect_file_type(path)),
+        )
 
     enabled, max_cache, max_file = _cache_config()
     file_type = meta.file_type if meta else detect_file_type(path)
@@ -529,7 +637,12 @@ def get_reader(
     except Exception:
         size_bytes = 0
 
-    cache_allowed = enabled and max_cache > 0 and max_file > 0 and (size_bytes == 0 or size_bytes <= max_file)
+    cache_allowed = (
+        enabled
+        and max_cache > 0
+        and max_file > 0
+        and (size_bytes == 0 or size_bytes <= max_file)
+    )
     if cache_allowed:
         cached_packets, cached_meta = get_cached_packets(path, show_status=show_status)
         reader = PacketListReader(cached_packets, cached_meta)

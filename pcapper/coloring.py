@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import sys
 
-
 ANSI_RESET = "\x1b[0m"
 ANSI_BOLD = "\x1b[1m"
 ANSI_DIM = "\x1b[2m"
@@ -35,7 +34,13 @@ def use_color(enabled: bool | None = None) -> bool:
         return False
 
 
-def colorize(text: str, color: str | None, enabled: bool | None = None, bold: bool = False, dim: bool = False) -> str:
+def colorize(
+    text: str,
+    color: str | None,
+    enabled: bool | None = None,
+    bold: bool = False,
+    dim: bool = False,
+) -> str:
     if not use_color(enabled) or color is None:
         return text
     parts = []
@@ -103,4 +108,10 @@ def danger_bg(text: str, enabled: bool | None = None) -> str:
 def warn_bg(text: str, enabled: bool | None = None) -> str:
     if not use_color(enabled):
         return text
-    return f"{ANSI_RED_BG}{ANSI_BLACK}{ANSI_BOLD}{text}{ANSI_RESET}"
+    return f"{ANSI_YELLOW_BG}{ANSI_BLACK}{ANSI_BOLD}{text}{ANSI_RESET}"
+
+
+def suspicious_bg(text: str, enabled: bool | None = None) -> str:
+    if not use_color(enabled):
+        return text
+    return f"{ANSI_YELLOW_BG}{ANSI_BLACK}{ANSI_BOLD}{text}{ANSI_RESET}"

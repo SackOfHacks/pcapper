@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Iterable
-import re
+from typing import Iterable, Optional
 from urllib.parse import parse_qsl
 
 from .pcap_cache import get_reader
@@ -21,10 +21,20 @@ except Exception:  # pragma: no cover
 
 AIM_PORTS = {5190}
 TLS_TUNNEL_PORTS = {443}
-USER_RE = re.compile(r"\b(?:sn|screenname|screen_name|username|user|login)\b\s*[:=]\s*([A-Za-z0-9._@-]{2,64})", re.IGNORECASE)
-PASS_RE = re.compile(r"\b(?:pass|password|pwd)\b\s*[:=]\s*([^\s&;,]{1,128})", re.IGNORECASE)
-SECRET_RE = re.compile(r"\b(?:secret|token|apikey|api_key|api-key|session|sessionid|auth|authorization)\b\s*[:=]\s*([^\s&;,]{3,256})", re.IGNORECASE)
-MSG_RE = re.compile(r"\b(?:message|msg|im|text|body)\b\s*[:=]\s*([^&\r\n]{1,512})", re.IGNORECASE)
+USER_RE = re.compile(
+    r"\b(?:sn|screenname|screen_name|username|user|login)\b\s*[:=]\s*([A-Za-z0-9._@-]{2,64})",
+    re.IGNORECASE,
+)
+PASS_RE = re.compile(
+    r"\b(?:pass|password|pwd)\b\s*[:=]\s*([^\s&;,]{1,128})", re.IGNORECASE
+)
+SECRET_RE = re.compile(
+    r"\b(?:secret|token|apikey|api_key|api-key|session|sessionid|auth|authorization)\b\s*[:=]\s*([^\s&;,]{3,256})",
+    re.IGNORECASE,
+)
+MSG_RE = re.compile(
+    r"\b(?:message|msg|im|text|body)\b\s*[:=]\s*([^&\r\n]{1,512})", re.IGNORECASE
+)
 KV_RE = re.compile(
     r"[\"']?(sn|screenname|screen_name|username|user|login|pass|password|pwd|secret|token|apikey|api_key|api-key|session|sessionid|auth|authorization|message|msg|im|text|body)[\"']?\s*[:=]\s*[\"']([^\"'\r\n]{1,512})[\"']",
     re.IGNORECASE,
@@ -140,7 +150,17 @@ def _add_from_query_like(
         elif lk in {"pass", "password", "pwd"}:
             passwords[val] += 1
             secrets[val] += 1
-        elif lk in {"secret", "token", "apikey", "api_key", "api-key", "session", "sessionid", "auth", "authorization"}:
+        elif lk in {
+            "secret",
+            "token",
+            "apikey",
+            "api_key",
+            "api-key",
+            "session",
+            "sessionid",
+            "auth",
+            "authorization",
+        }:
             secrets[val] += 1
         elif lk in {"message", "msg", "im", "text", "body"}:
             messages[val] += 1
@@ -182,7 +202,9 @@ def analyze_aim(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, packets=packets, meta=meta, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, packets=packets, meta=meta, show_status=show_status
+    )
 
     total_packets = 0
     aim_packets = 0
@@ -301,19 +323,43 @@ def analyze_aim(
             if not payload or not text:
                 continue
 
-            _add_from_query_like(text, username_counts, password_counts, secret_counts, message_counts, file_counts)
+            _add_from_query_like(
+                text,
+                username_counts,
+                password_counts,
+                secret_counts,
+                message_counts,
+                file_counts,
+            )
 
             for key, value in KV_RE.findall(text):
                 lk = key.lower().strip()
                 val = value.strip()
                 if not val:
                     continue
-                if lk in {"sn", "screenname", "screen_name", "username", "user", "login"}:
+                if lk in {
+                    "sn",
+                    "screenname",
+                    "screen_name",
+                    "username",
+                    "user",
+                    "login",
+                }:
                     username_counts[val] += 1
                 elif lk in {"pass", "password", "pwd"}:
                     password_counts[val] += 1
                     secret_counts[val] += 1
-                elif lk in {"secret", "token", "apikey", "api_key", "api-key", "session", "sessionid", "auth", "authorization"}:
+                elif lk in {
+                    "secret",
+                    "token",
+                    "apikey",
+                    "api_key",
+                    "api-key",
+                    "session",
+                    "sessionid",
+                    "auth",
+                    "authorization",
+                }:
                     secret_counts[val] += 1
                 elif lk in {"message", "msg", "im", "text", "body"}:
                     message_counts[val] += 1
@@ -340,7 +386,9 @@ def analyze_aim(
                 line = line.strip()
                 if not line or len(line) < 10:
                     continue
-                if TEXT_LINE_RE.fullmatch(line) and not line.lower().startswith(("host:", "user-agent:", "cookie:", "accept:", "connection:")):
+                if TEXT_LINE_RE.fullmatch(line) and not line.lower().startswith(
+                    ("host:", "user-agent:", "cookie:", "accept:", "connection:")
+                ):
                     if len(line.split()) >= 3:
                         message_counts[line] += 1
                 chat_match = CHAT_LINE_RE.match(line)
@@ -363,7 +411,9 @@ def analyze_aim(
             for msg in MSG_RE.findall(text):
                 cleaned = msg.strip()
                 if cleaned:
-                    artifacts.append(AimArtifact("message", cleaned, src_ip, dst_ip, idx))
+                    artifacts.append(
+                        AimArtifact("message", cleaned, src_ip, dst_ip, idx)
+                    )
             for fname in FILE_RE.findall(text):
                 artifacts.append(AimArtifact("file", fname, src_ip, dst_ip, idx))
 
@@ -377,61 +427,77 @@ def analyze_aim(
             pass
 
     if password_counts:
-        detections.append({
-            "severity": "high",
-            "summary": "AIM credential exposure detected",
-            "details": f"Observed {sum(password_counts.values())} password artifact(s) in AIM traffic.",
-            "source": "AIM",
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "AIM credential exposure detected",
+                "details": f"Observed {sum(password_counts.values())} password artifact(s) in AIM traffic.",
+                "source": "AIM",
+            }
+        )
     if secret_counts:
-        detections.append({
-            "severity": "high",
-            "summary": "AIM secrets exposure detected",
-            "details": f"Observed {sum(secret_counts.values())} secret/token artifact(s) in AIM traffic.",
-            "source": "AIM",
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "AIM secrets exposure detected",
+                "details": f"Observed {sum(secret_counts.values())} secret/token artifact(s) in AIM traffic.",
+                "source": "AIM",
+            }
+        )
     if file_counts:
-        detections.append({
-            "severity": "warning",
-            "summary": "AIM file transfer artifacts observed",
-            "details": f"Observed {sum(file_counts.values())} AIM file artifact(s).",
-            "source": "AIM",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "AIM file transfer artifacts observed",
+                "details": f"Observed {sum(file_counts.values())} AIM file artifact(s).",
+                "source": "AIM",
+            }
+        )
     if message_counts:
-        detections.append({
-            "severity": "info",
-            "summary": "AIM message content recovered",
-            "details": f"Recovered {sum(message_counts.values())} AIM message artifact(s).",
-            "source": "AIM",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "AIM message content recovered",
+                "details": f"Recovered {sum(message_counts.values())} AIM message artifact(s).",
+                "source": "AIM",
+            }
+        )
 
     conversations: list[AimConversation] = []
     for (client_ip, server_ip, server_port), data in conv_map.items():
-        conversations.append(AimConversation(
-            client_ip=client_ip,
-            server_ip=server_ip,
-            server_port=server_port,
-            packets=int(data.get("packets", 0) or 0),
-            bytes=int(data.get("bytes", 0) or 0),
-            first_seen=safe_float(data.get("first_seen")),
-            last_seen=safe_float(data.get("last_seen")),
-        ))
+        conversations.append(
+            AimConversation(
+                client_ip=client_ip,
+                server_ip=server_ip,
+                server_port=server_port,
+                packets=int(data.get("packets", 0) or 0),
+                bytes=int(data.get("bytes", 0) or 0),
+                first_seen=safe_float(data.get("first_seen")),
+                last_seen=safe_float(data.get("last_seen")),
+            )
+        )
 
     if conversations:
-        detections.append({
-            "severity": "info",
-            "summary": "AIM conversation activity observed",
-            "details": f"Observed {len(conversations)} AIM conversation(s).",
-            "source": "AIM",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "AIM conversation activity observed",
+                "details": f"Observed {len(conversations)} AIM conversation(s).",
+                "source": "AIM",
+            }
+        )
     if non_standard_ports:
-        details = ", ".join(f"{port}({count})" for port, count in non_standard_ports.most_common(8))
-        detections.append({
-            "severity": "warning",
-            "summary": "AIM traffic observed on non-standard/tunneled ports",
-            "details": f"Observed AIM-like traffic on: {details}",
-            "source": "AIM",
-        })
+        details = ", ".join(
+            f"{port}({count})" for port, count in non_standard_ports.most_common(8)
+        )
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "AIM traffic observed on non-standard/tunneled ports",
+                "details": f"Observed AIM-like traffic on: {details}",
+                "source": "AIM",
+            }
+        )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:

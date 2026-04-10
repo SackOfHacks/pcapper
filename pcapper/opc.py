@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 from typing import Optional
-import ipaddress
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_port_protocol,
+)
 
 OPC_UA_PORT = 4840
 
@@ -90,13 +94,13 @@ def _parse_nodeid(payload: bytes, idx: int) -> tuple[tuple[int, int] | None, int
         idx += 1
         return (0, node_id), idx
     if encoding == 0x01 and idx + 2 < len(payload):
-        node_id = int.from_bytes(payload[idx:idx + 2], "little")
+        node_id = int.from_bytes(payload[idx : idx + 2], "little")
         ns = payload[idx + 2]
         idx += 3
         return (ns, node_id), idx
     if encoding == 0x02 and idx + 5 < len(payload):
-        ns = int.from_bytes(payload[idx:idx + 2], "little")
-        node_id = int.from_bytes(payload[idx + 2:idx + 6], "little")
+        ns = int.from_bytes(payload[idx : idx + 2], "little")
+        node_id = int.from_bytes(payload[idx + 2 : idx + 6], "little")
         idx += 6
         return (ns, node_id), idx
     return None, idx
@@ -105,14 +109,14 @@ def _parse_nodeid(payload: bytes, idx: int) -> tuple[tuple[int, int] | None, int
 def _read_int32(payload: bytes, idx: int) -> tuple[int | None, int]:
     if idx + 4 > len(payload):
         return None, idx
-    value = int.from_bytes(payload[idx:idx + 4], "little", signed=True)
+    value = int.from_bytes(payload[idx : idx + 4], "little", signed=True)
     return value, idx + 4
 
 
 def _read_uint32(payload: bytes, idx: int) -> tuple[int | None, int]:
     if idx + 4 > len(payload):
         return None, idx
-    value = int.from_bytes(payload[idx:idx + 4], "little")
+    value = int.from_bytes(payload[idx : idx + 4], "little")
     return value, idx + 4
 
 
@@ -125,7 +129,7 @@ def _read_uint8(payload: bytes, idx: int) -> tuple[int | None, int]:
 def _read_uint16(payload: bytes, idx: int) -> tuple[int | None, int]:
     if idx + 2 > len(payload):
         return None, idx
-    return int.from_bytes(payload[idx:idx + 2], "little"), idx + 2
+    return int.from_bytes(payload[idx : idx + 2], "little"), idx + 2
 
 
 def _read_double(payload: bytes, idx: int) -> tuple[float | None, int]:
@@ -133,7 +137,8 @@ def _read_double(payload: bytes, idx: int) -> tuple[float | None, int]:
         return None, idx
     try:
         import struct
-        value = struct.unpack("<d", payload[idx:idx + 8])[0]
+
+        value = struct.unpack("<d", payload[idx : idx + 8])[0]
     except Exception:
         value = None
     return value, idx + 8
@@ -147,7 +152,7 @@ def _read_string(payload: bytes, idx: int) -> tuple[str | None, int]:
         return None, idx
     if length < 0 or idx + length > len(payload):
         return None, idx
-    value = payload[idx:idx + length].decode("utf-8", errors="ignore")
+    value = payload[idx : idx + length].decode("utf-8", errors="ignore")
     return value, idx + length
 
 
@@ -159,7 +164,7 @@ def _read_bytestring(payload: bytes, idx: int) -> tuple[bytes | None, int]:
         return None, idx
     if length < 0 or idx + length > len(payload):
         return None, idx
-    return payload[idx:idx + length], idx + length
+    return payload[idx : idx + length], idx + length
 
 
 def _skip_localized_text(payload: bytes, idx: int) -> int:
@@ -296,7 +301,9 @@ def _skip_variant(payload: bytes, idx: int) -> int:
     return idx
 
 
-def _decode_service_payload(payload: bytes, idx: int, service_name: str) -> list[tuple[str, str]]:
+def _decode_service_payload(
+    payload: bytes, idx: int, service_name: str
+) -> list[tuple[str, str]]:
     artifacts: list[tuple[str, str]] = []
     if service_name.endswith("Request"):
         idx = _skip_request_header(payload, idx)
@@ -444,11 +451,11 @@ def _parse_hello(payload: bytes) -> Optional[str]:
     idx = 8 + 20
     if idx + 4 > len(payload):
         return None
-    url_len = int.from_bytes(payload[idx:idx + 4], "little")
+    url_len = int.from_bytes(payload[idx : idx + 4], "little")
     idx += 4
     if idx + url_len > len(payload):
         return None
-    url = payload[idx:idx + url_len].decode("utf-8", errors="ignore")
+    url = payload[idx : idx + url_len].decode("utf-8", errors="ignore")
     return url.strip() if url else None
 
 
@@ -502,7 +509,10 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
     _cmds, artifacts = _parse_opcua(payload)
     return artifacts
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     if any(cmd == "OpenSecureChannel" for cmd in commands):
         anomalies.append(
@@ -548,7 +558,9 @@ def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, comma
                 ts=ts,
             )
         )
-    if any(cmd in {"CreateSessionRequest", "ActivateSessionRequest"} for cmd in commands):
+    if any(
+        cmd in {"CreateSessionRequest", "ActivateSessionRequest"} for cmd in commands
+    ):
         anomalies.append(
             IndustrialAnomaly(
                 severity="LOW",

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
-import json
-import re
 
 from .utils import safe_read_text
 
@@ -119,8 +119,12 @@ def collect_detections(summaries: dict[str, Any]) -> list[dict[str, Any]]:
                 {
                     "source": source,
                     "severity": str(entry.get("severity", "info")).lower(),
-                    "summary": str(entry.get("summary", "") or entry.get("title", "") or ""),
-                    "details": str(entry.get("details", "") or entry.get("description", "") or ""),
+                    "summary": str(
+                        entry.get("summary", "") or entry.get("title", "") or ""
+                    ),
+                    "details": str(
+                        entry.get("details", "") or entry.get("description", "") or ""
+                    ),
                     "category": str(entry.get("category", "") or ""),
                     "raw": entry,
                 }
@@ -196,13 +200,20 @@ def _match_rule(rule: Rule, record: dict[str, Any]) -> bool:
         # convenience match keys
         summary_contains = match.get("summary_contains")
         if summary_contains:
-            return _match_condition({"field": "summary", "op": "contains", "value": summary_contains}, record)
+            return _match_condition(
+                {"field": "summary", "op": "contains", "value": summary_contains},
+                record,
+            )
         details_regex = match.get("details_regex")
         if details_regex:
-            return _match_condition({"field": "details", "op": "regex", "value": details_regex}, record)
+            return _match_condition(
+                {"field": "details", "op": "regex", "value": details_regex}, record
+            )
         sources = match.get("sources")
         if sources:
-            return _match_condition({"field": "source", "op": "in", "value": sources}, record)
+            return _match_condition(
+                {"field": "source", "op": "in", "value": sources}, record
+            )
         return False
 
     for condition in all_conditions:
@@ -216,7 +227,9 @@ def _match_rule(rule: Rule, record: dict[str, Any]) -> bool:
     return False
 
 
-def apply_rules(path: Path, rules: list[Rule], detections: list[dict[str, Any]]) -> RulesSummary:
+def apply_rules(
+    path: Path, rules: list[Rule], detections: list[dict[str, Any]]
+) -> RulesSummary:
     hits: list[RuleHit] = []
     total_matches = 0
 
@@ -232,7 +245,9 @@ def apply_rules(path: Path, rules: list[Rule], detections: list[dict[str, Any]])
                 summary = record.get("summary", "")
                 details = record.get("details", "")
                 if details:
-                    examples.append(f"{record.get('source', '-')}: {summary} :: {details}")
+                    examples.append(
+                        f"{record.get('source', '-')}: {summary} :: {details}"
+                    )
                 else:
                     examples.append(f"{record.get('source', '-')}: {summary}")
             src = str(record.get("source", "") or "")
@@ -261,7 +276,9 @@ def apply_rules(path: Path, rules: list[Rule], detections: list[dict[str, Any]])
 def merge_rules_summaries(summaries: Iterable[RulesSummary]) -> RulesSummary:
     items = list(summaries)
     if not items:
-        return RulesSummary(path=Path("ALL_PCAPS"), total_rules=0, total_matches=0, hits=[], errors=[])
+        return RulesSummary(
+            path=Path("ALL_PCAPS"), total_rules=0, total_matches=0, hits=[], errors=[]
+        )
 
     total_rules = max((item.total_rules for item in items), default=0)
     total_matches = 0

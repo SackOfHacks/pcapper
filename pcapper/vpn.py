@@ -45,7 +45,9 @@ class VpnSummary:
 
 
 def analyze_vpn(path: Path, show_status: bool = True) -> VpnSummary:
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     vpn_packets = 0
     service_counts: Counter[str] = Counter()
@@ -119,13 +121,19 @@ def analyze_vpn(path: Path, show_status: bool = True) -> VpnSummary:
         reader.close()
 
     if vpn_packets:
-        detections.append({
-            "severity": "info",
-            "summary": "VPN/Tunnel indicators observed",
-            "details": f"{vpn_packets} packets mapped to VPN/Tunnel ports or GRE.",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "VPN/Tunnel indicators observed",
+                "details": f"{vpn_packets} packets mapped to VPN/Tunnel ports or GRE.",
+            }
+        )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return VpnSummary(
         path=path,
         total_packets=total_packets,

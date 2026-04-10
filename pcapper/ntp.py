@@ -52,9 +52,25 @@ def _mode_name(value: int) -> str:
 
 def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
     if UDP is None:
-        return NtpSummary(path, 0, 0, Counter(), Counter(), Counter(), Counter(), Counter(), [], ["Scapy UDP unavailable"], None, None, None)
+        return NtpSummary(
+            path,
+            0,
+            0,
+            Counter(),
+            Counter(),
+            Counter(),
+            Counter(),
+            Counter(),
+            [],
+            ["Scapy UDP unavailable"],
+            None,
+            None,
+            None,
+        )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
 
     total_packets = 0
     ntp_packets = 0
@@ -130,20 +146,28 @@ def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
         reader.close()
 
     if ntp_packets and mode_counts.get("control", 0) > 0:
-        detections.append({
-            "severity": "warning",
-            "summary": "NTP control mode traffic detected",
-            "details": "Control mode traffic can indicate management or misuse on NTP services.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "NTP control mode traffic detected",
+                "details": "Control mode traffic can indicate management or misuse on NTP services.",
+            }
+        )
     if ntp_packets and stratum_counts:
         if any(stratum >= 16 for stratum in stratum_counts.keys()):
-            detections.append({
-                "severity": "warning",
-                "summary": "NTP stratum 16/unsynchronized observed",
-                "details": "Stratum 16 indicates unsynchronized sources; investigate NTP health.",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "NTP stratum 16/unsynchronized observed",
+                    "details": "Stratum 16 indicates unsynchronized sources; investigate NTP health.",
+                }
+            )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return NtpSummary(
         path=path,
         total_packets=total_packets,

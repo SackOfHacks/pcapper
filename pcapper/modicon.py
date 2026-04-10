@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
 import ipaddress
 import struct
+from pathlib import Path
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_port_protocol,
+)
 
 MODICON_PORT = 502
 
@@ -26,8 +30,7 @@ def _parse_commands(payload: bytes) -> list[str]:
     if len(payload) < 8:
         return []
     try:
-        _trans_id, proto_id, _length, _unit_id = struct.unpack(">HHHB", payload[:7]
-        )
+        _trans_id, proto_id, _length, _unit_id = struct.unpack(">HHHB", payload[:7])
         if proto_id != 0:
             return []
         func = payload[7]
@@ -35,7 +38,10 @@ def _parse_commands(payload: bytes) -> list[str]:
     except Exception:
         return []
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     if any(cmd.startswith("Write") for cmd in commands):
         anomalies.append(

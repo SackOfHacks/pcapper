@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import is_dataclass, asdict
+import base64
+import os
+from collections import OrderedDict
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Any
-import base64
-from collections import OrderedDict
-import os
-
+from typing import Any, Optional
 
 PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
 
@@ -17,6 +16,7 @@ _DECODE_CACHE_MAX_BYTES = 4096
 _MAX_COUNTER_KEYS = int(os.getenv("PCAPPER_MAX_COUNTER_KEYS", "50000"))
 _MAX_SET_ITEMS = int(os.getenv("PCAPPER_MAX_SET_ITEMS", "50000"))
 _MAX_SET_VALUES = int(os.getenv("PCAPPER_MAX_SET_VALUES", "2000"))
+
 
 def decode_payload(
     payload: bytes | None,
@@ -51,7 +51,9 @@ def decode_payload(
     return text
 
 
-def decode_payload_lower(payload: bytes | None, *, encoding: str = "latin-1", limit: int | None = None) -> str:
+def decode_payload_lower(
+    payload: bytes | None, *, encoding: str = "latin-1", limit: int | None = None
+) -> str:
     return decode_payload(payload, encoding=encoding, lower=True, limit=limit)
 
 
@@ -92,7 +94,9 @@ def safe_write_text(
             raise IOError(f"{context}: {type(exc).__name__}: {exc}") from exc
 
 
-def counter_inc(counter: dict[object, int], key: object, inc: int = 1, max_keys: int | None = None) -> None:
+def counter_inc(
+    counter: dict[object, int], key: object, inc: int = 1, max_keys: int | None = None
+) -> None:
     limit = _MAX_COUNTER_KEYS if max_keys is None else max_keys
     if key in counter or len(counter) < limit:
         counter[key] = int(counter.get(key, 0)) + inc
@@ -120,7 +124,9 @@ def setdict_add(
     bucket.add(value)
 
 
-def set_add_cap(target: set[object], value: object, *, max_size: int | None = None) -> None:
+def set_add_cap(
+    target: set[object], value: object, *, max_size: int | None = None
+) -> None:
     limit = _MAX_SET_ITEMS if max_size is None else max_size
     if len(target) >= limit:
         return
@@ -216,13 +222,16 @@ def sparkline(values: list[int]) -> str:
     max_val = max(values) if values else 0
     if max_val == 0:
         return "".join(levels[0] for _ in values)
-    return "".join(levels[min(len(levels) - 1, int((val / max_val) * (len(levels) - 1)))] for val in values)
+    return "".join(
+        levels[min(len(levels) - 1, int((val / max_val) * (len(levels) - 1)))]
+        for val in values
+    )
 
 
 def hexdump(data: bytes, width: int = 16) -> str:
     lines: list[str] = []
     for offset in range(0, len(data), width):
-        chunk = data[offset:offset + width]
+        chunk = data[offset : offset + width]
         hex_part = " ".join(f"{b:02x}" for b in chunk)
         ascii_part = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
         lines.append(f"{offset:08x}  {hex_part:<{width * 3}}  {ascii_part}")
@@ -279,4 +288,3 @@ def parse_time_arg(value: Optional[str]) -> Optional[float]:
         return dt.timestamp()
     except Exception:
         return None
-

@@ -1,252 +1,282 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import difflib
 import glob
 import inspect
+import ipaddress
 import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .analyzer import analyze_pcap, merge_pcap_summaries
-from .coloring import set_color_override
-from .discovery import find_pcaps, is_supported_pcap
-from .config import find_config, load_config
-from .baseline import build_baseline, compare_baseline, load_baseline
-from .carving import analyze_carving, merge_carve_summaries
-from .control_loop import analyze_control_loop, merge_control_loop_summaries
-from .decryption import DecryptConfig, DecryptSummary, decrypt_tls, decrypt_ssh
-from .correlation import correlate
-from .obfuscation import analyze_obfuscation, merge_obfuscation_summaries
-from .plugins import load_plugins, plugin_map, PluginSpec
-from .rules import Rule, load_rules, collect_detections, apply_rules, merge_rules_summaries
-from .safety import analyze_safety, merge_safety_summaries
-from .provenance import build_case_metadata
-from .reporting import (
-    render_summary,
-    render_vlan_summary,
-    render_vlan_rollup,
-    render_icmp_summary,
-    render_dns_summary,
-    render_beacon_summary,
-    render_threats_summary,
-    render_files_summary,
-    render_protocols_summary,
-    render_services_summary,
-    render_smb_summary,
-    render_ntlm_summary,
-    render_netbios_summary,
-    render_arp_summary,
-    render_dhcp_summary,
-    render_modbus_summary,
-    render_modbus_rollup,
-    render_dnp3_summary,
-    render_dnp3_rollup,
-    render_iec104_summary,
-    render_bacnet_summary,
-    render_enip_summary,
-    render_profinet_summary,
-    render_s7_summary,
-    render_opc_summary,
-    render_ethercat_summary,
-    render_fins_summary,
-    render_crimson_summary,
-    render_pcworx_summary,
-    render_melsec_summary,
-    render_cip_summary,
-    render_odesys_summary,
-    render_niagara_summary,
-    render_mms_summary,
-    render_srtp_summary,
-    render_df1_summary,
-    render_pccc_summary,
-    render_csp_summary,
-    render_modicon_summary,
-    render_yokogawa_summary,
-    render_honeywell_summary,
-    render_mqtt_summary,
-    render_coap_summary,
-    render_hart_summary,
-    render_prconos_summary,
-    render_iccp_summary,
-    render_ips_summary,
-    render_http_summary,
-    render_sizes_summary,
-    render_ftp_summary,
-    render_aim_summary,
-    render_nfs_summary,
-    render_strings_summary,
-    render_search_summary,
-    render_search_rollup,
-    render_creds_summary,
-    render_secrets_summary,
-    render_certificates_summary,
-    render_health_summary,
-    render_compromised_summary,
-    render_hosts_summary,
-    render_hostname_summary,
-    render_hostdetails_summary,
-    render_timeline_summary,
-    render_domain_summary,
-    render_ldap_summary,
-    render_kerberos_summary,
-    render_tls_summary,
-    render_ssh_summary,
-    render_rdp_summary,
-    render_telnet_summary,
-    render_vnc_summary,
-    render_teamviewer_summary,
-    render_winrm_summary,
-    render_wmic_summary,
-    render_powershell_summary,
-    render_syslog_summary,
-    render_snmp_summary,
-    render_smtp_summary,
-    render_rpc_summary,
-    render_tcp_summary,
-    render_udp_summary,
-    render_udp_rollup,
-    render_exfil_summary,
-    render_generic_rollup,
-    set_verbose_output,
-    render_pcapmeta_summary,
-    render_quic_summary,
-    render_http2_summary,
-    render_encrypted_dns_summary,
-    render_ntp_summary,
-    render_vpn_summary,
-    render_routing_summary,
-    render_goose_summary,
-    render_sv_summary,
-    render_lldp_dcp_summary,
-    render_ptp_summary,
-    render_opc_classic_summary,
-    render_streams_summary,
-    render_rules_summary,
-    render_baseline_delta,
-    render_decrypt_summary,
-    render_carve_summary,
-    render_obfuscation_summary,
-    render_control_loop_summary,
-    render_safety_summary,
-    render_correlation_summary,
-    render_ctf_summary,
-    render_ioc_summary,
-    render_ot_commands_summary,
-    render_iec101_103_summary,
-    render_mitre_summary,
-)
-from .pcap_cache import (
-    load_packets_if_allowed,
-    load_filtered_packets,
-    get_reader,
-    get_cache_config,
-    is_scapy_available,
-)
-from .exporting import ExportBundle, export_json, export_csv, export_sqlite
-from .vlan import analyze_vlans
-from .icmp import analyze_icmp
-from .dns import analyze_dns
-from .beacon import analyze_beacons
-from .threats import analyze_suricata, analyze_threats, merge_threats_summaries
-from .files import analyze_files, merge_files_summaries
-from .protocols import analyze_protocols, merge_protocols_summaries
-from .services import analyze_services, merge_services_summaries
-from .smb import analyze_smb
-from .ntlm import analyze_ntlm
-from .netbios import analyze_netbios
-from .arp import analyze_arp
-from .dhcp import analyze_dhcp
-from .modbus import analyze_modbus
-from .dnp3 import analyze_dnp3
-from .iec104 import analyze_iec104
-from .bacnet import analyze_bacnet
-from .enip import analyze_enip, merge_enip_summaries
-from .profinet import analyze_profinet
-from .s7 import analyze_s7
-from .opc import analyze_opc
-from .ethercat import analyze_ethercat
-from .fins import analyze_fins
-from .crimson import analyze_crimson
-from .pcworx import analyze_pcworx
-from .melsec import analyze_melsec
-from .cip import analyze_cip, merge_cip_summaries
-from .odesys import analyze_odesys
-from .niagara import analyze_niagara
-from .mms import analyze_mms
-from .srtp import analyze_srtp
-from .df1 import analyze_df1
-from .pccc import analyze_pccc
-from .csp import analyze_csp
-from .modicon import analyze_modicon
-from .yokogawa import analyze_yokogawa
-from .honeywell import analyze_honeywell
-from .mqtt import analyze_mqtt
-from .coap import analyze_coap
-from .hart import analyze_hart
-from .prconos import analyze_prconos
-from .iccp import analyze_iccp
-from .ips import analyze_ips, merge_ips_summaries
-from .http import analyze_http
-from .sizes import analyze_sizes
-from .ftp import analyze_ftp, merge_ftp_summaries
 from .aim import analyze_aim, merge_aim_summaries
-from .nfs import analyze_nfs
-from .strings import analyze_strings
-from .search import analyze_search
-from .creds import analyze_creds
-from .secrets import analyze_secrets
+from .analyzer import analyze_pcap, merge_pcap_summaries
+from .arp import analyze_arp, merge_arp_summaries
+from .bacnet import analyze_bacnet
+from .baseline import build_baseline, compare_baseline, load_baseline
+from .beacon import analyze_beacons
+from .carving import analyze_carving, merge_carve_summaries
 from .certificates import analyze_certificates
-from .health import analyze_health, merge_health_summaries
+from .cip import analyze_cip, merge_cip_summaries
+from .coap import analyze_coap
+from .coloring import set_color_override
 from .compromised import analyze_compromised, merge_compromised_summaries
-from .hosts import analyze_hosts, merge_hosts_summaries
-from .hostname import analyze_hostname, merge_hostname_summaries
-from .hostdetails import analyze_hostdetails, merge_hostdetails_summaries
-from .timeline import analyze_timeline, merge_timeline_summaries, OT_CATEGORIES, NON_OT_CATEGORIES, TIMELINE_CATEGORIES
-from .domain import analyze_domain
-from .ldap import analyze_ldap
-from .kerberos import analyze_kerberos
-from .tls import analyze_tls
-from .ssh import analyze_ssh, merge_ssh_summaries
-from .rdp import analyze_rdp, merge_rdp_summaries
-from .telnet import analyze_telnet, merge_telnet_summaries
-from .vnc import analyze_vnc, merge_vnc_summaries
-from .teamviewer import analyze_teamviewer, merge_teamviewer_summaries
-from .winrm import analyze_winrm, merge_winrm_summaries
-from .wmic import analyze_wmic, merge_wmic_summaries
-from .powershell import analyze_powershell, merge_powershell_summaries
-from .syslog import analyze_syslog
-from .snmp import analyze_snmp, merge_snmp_summaries
-from .smtp import analyze_smtp, merge_smtp_summaries
-from .rpc import analyze_rpc, merge_rpc_summaries
-from .tcp import analyze_tcp
-from .udp import analyze_udp
-from .exfil import analyze_exfil
-from .pcapmeta import analyze_pcapmeta
-from .quic import analyze_quic
-from .http2 import analyze_http2
-from .encrypted_dns import analyze_encrypted_dns
-from .ntp import analyze_ntp
-from .vpn import analyze_vpn
-from .routing import analyze_routing, merge_routing_summaries
-from .goose import analyze_goose
-from .sv import analyze_sv
-from .lldp_dcp import analyze_lldp_dcp
-from .ptp import analyze_ptp
-from .opc_classic import analyze_opc_classic
-from .streams import analyze_streams
+from .config import find_config, load_config
+from .control_loop import analyze_control_loop, merge_control_loop_summaries
+from .correlation import correlate
+from .creds import analyze_creds, merge_creds_summaries
+from .crimson import analyze_crimson
+from .csp import analyze_csp
 from .ctf import analyze_ctf
-from .ioc import analyze_iocs
-from .ot_commands import analyze_ot_commands, load_ot_control_config, OtControlConfig
+from .decryption import DecryptConfig, DecryptSummary, decrypt_ssh, decrypt_tls
+from .df1 import analyze_df1
+from .dhcp import analyze_dhcp, merge_dhcp_summaries
+from .discovery import find_pcaps, is_supported_pcap
+from .dnp3 import analyze_dnp3
+from .dns import analyze_dns
+from .domain import analyze_domain
+from .email import analyze_email, merge_email_summaries
+from .encrypted_dns import analyze_encrypted_dns
+from .enip import analyze_enip, merge_enip_summaries
+from .ethercat import analyze_ethercat
+from .exfil import analyze_exfil
+from .exporting import ExportBundle, export_csv, export_json, export_sqlite
+from .files import analyze_files, merge_files_summaries
+from .fins import analyze_fins
+from .ftp import analyze_ftp, merge_ftp_summaries
+from .goose import analyze_goose
+from .hart import analyze_hart
+from .health import analyze_health, merge_health_summaries
+from .honeywell import analyze_honeywell
+from .hostdetails import analyze_hostdetails, merge_hostdetails_summaries
+from .hostname import analyze_hostname, merge_hostname_summaries
+from .http import analyze_http
+from .http2 import analyze_http2
+from .iccp import analyze_iccp
+from .icmp import analyze_icmp
 from .iec101_103 import analyze_iec101_103
+from .iec104 import analyze_iec104
+from .ioc import analyze_iocs
+from .ipmac import analyze_ip_lookup, analyze_mac_lookup
+from .ips import analyze_ips, merge_ips_summaries
+from .kerberos import analyze_kerberos
+from .ldap import analyze_ldap
+from .lldp_dcp import analyze_lldp_dcp
+from .malware import analyze_malware, merge_malware_summaries
+from .melsec import analyze_melsec
 from .mitre import analyze_mitre, merge_mitre_summaries
-from .utils import parse_time_arg, hexdump, safe_write_text
+from .mms import analyze_mms
+from .modbus import analyze_modbus
+from .modicon import analyze_modicon
+from .mqtt import analyze_mqtt
+from .netbios import analyze_netbios
+from .nfs import analyze_nfs
+from .niagara import analyze_niagara
+from .ntlm import analyze_ntlm
+from .ntp import analyze_ntp
+from .obfuscation import analyze_obfuscation, merge_obfuscation_summaries
+from .odesys import analyze_odesys
+from .opc import analyze_opc
+from .opc_classic import analyze_opc_classic
+from .ot_commands import OtControlConfig, analyze_ot_commands, load_ot_control_config
+from .pcap_cache import (
+    clear_forced_packet_view,
+    get_cache_config,
+    get_reader,
+    is_scapy_available,
+    load_filtered_packets,
+    load_packets_if_allowed,
+    set_forced_packet_view,
+)
+from .pcapmeta import analyze_pcapmeta
+from .pccc import analyze_pccc
+from .pcworx import analyze_pcworx
+from .plugins import PluginSpec, load_plugins, plugin_map
+from .powershell import analyze_powershell, merge_powershell_summaries
+from .prconos import analyze_prconos
+from .profinet import analyze_profinet
+from .protocols import analyze_protocols, merge_protocols_summaries
+from .provenance import build_case_metadata
+from .ptp import analyze_ptp
+from .qos import analyze_qos, merge_qos_summaries
+from .quic import analyze_quic
+from .rdp import analyze_rdp, merge_rdp_summaries
+from .reporting import (
+    render_aim_summary,
+    render_arp_summary,
+    render_bacnet_summary,
+    render_baseline_delta,
+    render_beacon_summary,
+    render_carve_summary,
+    render_certificates_summary,
+    render_cip_summary,
+    render_coap_summary,
+    render_compromised_summary,
+    render_control_loop_summary,
+    render_correlation_summary,
+    render_creds_summary,
+    render_crimson_summary,
+    render_csp_summary,
+    render_ctf_summary,
+    render_decrypt_summary,
+    render_df1_summary,
+    render_dhcp_summary,
+    render_dnp3_rollup,
+    render_dnp3_summary,
+    render_dns_summary,
+    render_domain_summary,
+    render_email_summary,
+    render_encrypted_dns_summary,
+    render_enip_summary,
+    render_ethercat_summary,
+    render_exfil_summary,
+    render_files_summary,
+    render_fins_summary,
+    render_ftp_summary,
+    render_generic_rollup,
+    render_goose_summary,
+    render_hart_summary,
+    render_health_summary,
+    render_honeywell_summary,
+    render_hostdetails_summary,
+    render_hostname_summary,
+    render_http2_summary,
+    render_http_summary,
+    render_iccp_summary,
+    render_icmp_summary,
+    render_iec101_103_summary,
+    render_iec104_summary,
+    render_ioc_summary,
+    render_ip_lookup_summary,
+    render_ips_summary,
+    render_kerberos_summary,
+    render_ldap_summary,
+    render_lldp_dcp_summary,
+    render_malware_summary,
+    render_melsec_summary,
+    render_mitre_summary,
+    render_mac_lookup_summary,
+    render_mms_summary,
+    render_modbus_rollup,
+    render_modbus_summary,
+    render_modicon_summary,
+    render_mqtt_summary,
+    render_netbios_summary,
+    render_nfs_summary,
+    render_niagara_summary,
+    render_ntlm_summary,
+    render_ntp_summary,
+    render_obfuscation_summary,
+    render_odesys_summary,
+    render_opc_classic_summary,
+    render_opc_summary,
+    render_ot_commands_summary,
+    render_pcapmeta_summary,
+    render_pccc_summary,
+    render_pcworx_summary,
+    render_powershell_summary,
+    render_prconos_summary,
+    render_profinet_summary,
+    render_protocols_summary,
+    render_ptp_summary,
+    render_qos_summary,
+    render_quic_summary,
+    render_rdp_summary,
+    render_routing_summary,
+    render_rpc_summary,
+    render_rules_summary,
+    render_s7_summary,
+    render_safety_summary,
+    render_scan_summary,
+    render_search_rollup,
+    render_search_summary,
+    render_secrets_summary,
+    render_services_summary,
+    render_sizes_summary,
+    render_smb_summary,
+    render_smtp_summary,
+    render_snmp_summary,
+    render_srtp_summary,
+    render_ssdp_summary,
+    render_ssh_summary,
+    render_streams_summary,
+    render_strings_summary,
+    render_summary,
+    render_sv_summary,
+    render_syslog_summary,
+    render_tcp_summary,
+    render_teamviewer_summary,
+    render_telnet_summary,
+    render_threats_summary,
+    render_timeline_summary,
+    render_tls_summary,
+    render_udp_rollup,
+    render_udp_summary,
+    render_vlan_rollup,
+    render_vlan_summary,
+    render_vnc_summary,
+    render_vpn_summary,
+    render_webrequests_summary,
+    render_winrm_summary,
+    render_wlan_summary,
+    render_wmic_summary,
+    render_yokogawa_summary,
+    set_verbose_output,
+)
+from .routing import analyze_routing, merge_routing_summaries
+from .rpc import analyze_rpc, merge_rpc_summaries
+from .rules import (
+    Rule,
+    apply_rules,
+    collect_detections,
+    load_rules,
+    merge_rules_summaries,
+)
+from .s7 import analyze_s7
+from .safety import analyze_safety, merge_safety_summaries
+from .scan import analyze_scan, merge_scan_summaries
+from .search import analyze_search
+from .secrets import analyze_secrets
+from .services import analyze_services, merge_services_summaries
+from .sizes import analyze_sizes
+from .smb import analyze_smb
+from .smtp import analyze_smtp, merge_smtp_summaries
+from .snmp import analyze_snmp, merge_snmp_summaries
+from .srtp import analyze_srtp
+from .ssdp import analyze_ssdp
+from .ssh import analyze_ssh, merge_ssh_summaries
+from .streams import analyze_streams
+from .strings import analyze_strings
+from .sv import analyze_sv
+from .syslog import analyze_syslog
+from .tcp import analyze_tcp
+from .teamviewer import analyze_teamviewer, merge_teamviewer_summaries
+from .telnet import analyze_telnet, merge_telnet_summaries
+from .threats import analyze_suricata, analyze_threats, merge_threats_summaries
+from .timeline import (
+    NON_OT_CATEGORIES,
+    OT_CATEGORIES,
+    TIMELINE_CATEGORIES,
+    analyze_timeline,
+    merge_timeline_summaries,
+)
+from .tls import analyze_tls
+from .udp import analyze_udp
+from .utils import hexdump, parse_time_arg, safe_write_text
+from .vlan import analyze_vlans
+from .vnc import analyze_vnc, merge_vnc_summaries
+from .vpn import analyze_vpn
+from .webrequests import analyze_webrequests, merge_webrequests_summaries
+from .winrm import analyze_winrm, merge_winrm_summaries
+from .wlan import analyze_wlan, merge_wlan_summaries
+from .wmic import analyze_wmic, merge_wmic_summaries
+from .yokogawa import analyze_yokogawa
 
 _PLUGIN_SPECS: list[PluginSpec] | None = None
 _PLUGIN_ERRORS: list[str] = []
@@ -271,9 +301,11 @@ def _builtin_flag_map() -> dict[str, str]:
         "--icmp": "icmp",
         "--dns": "dns",
         "--http": "http",
+        "--webrequests": "webrequests",
         "--ftp": "ftp",
         "--aim": "aim",
         "--tls": "tls",
+        "--tlsm": "tls",
         "--ssh": "ssh",
         "--rdp": "rdp",
         "--telnet": "telnet",
@@ -282,23 +314,31 @@ def _builtin_flag_map() -> dict[str, str]:
         "--winrm": "winrm",
         "--wmic": "wmic",
         "--powershell": "powershell",
+        "--malware": "malware",
         "--syslog": "syslog",
         "--snmp": "snmp",
         "--smtp": "smtp",
+        "--email": "email",
+        "--scan": "scan",
         "--rpc": "rpc",
         "--tcp": "tcp",
         "--udp": "udp",
         "--exfil": "exfil",
         "--sizes": "sizes",
         "--ips": "ips",
+        "--ip": "ip_lookup",
+        "--mac": "mac_lookup",
         "--beacon": "beacon",
         "--threats": "threats",
         "--mitre": "mitre",
         "--suricata": "suricata",
         "--quic": "quic",
+        "--qos": "qos",
+        "--wlan": "wlan",
         "--http2": "http2",
         "--encrypted-dns": "encrypted_dns",
         "--ntp": "ntp",
+        "--ssdp": "ssdp",
         "--vpn": "vpn",
         "--opc-classic": "opc_classic",
         "--streams": "streams",
@@ -319,9 +359,8 @@ def _builtin_flag_map() -> dict[str, str]:
         "--ldap": "ldap",
         "--kerberos": "kerberos",
         "--health": "health",
-        "--hostname": "hostname",
+        "--hostnames": "hostnames",
         "--hostdetails": "hostdetails",
-        "--hosts": "hosts",
         "--compromised": "compromised",
         "--ntlm": "ntlm",
         "--netbios": "netbios",
@@ -387,7 +426,9 @@ def _filtered_plugins(flag_map: dict[str, str]) -> tuple[list[PluginSpec], list[
     return filtered, errors
 
 
-def _ordered_steps(argv: list[str], plugins: list[PluginSpec] | None = None) -> list[str]:
+def _ordered_steps(
+    argv: list[str], plugins: list[PluginSpec] | None = None
+) -> list[str]:
     flag_map = _builtin_flag_map()
     if plugins is None:
         plugins, _errors = _filtered_plugins(flag_map)
@@ -408,6 +449,7 @@ _FILTER_COMPATIBLE_STEPS = {
     "packet",
     "dns",
     "http",
+    "webrequests",
     "ftp",
     "aim",
     "tls",
@@ -419,18 +461,78 @@ _FILTER_COMPATIBLE_STEPS = {
     "winrm",
     "wmic",
     "powershell",
+    "malware",
+    "arp",
     "syslog",
     "snmp",
     "smtp",
+    "email",
     "rpc",
     "tcp",
     "udp",
     "exfil",
+    "ip_lookup",
+    "mac_lookup",
     "services",
     "creds",
     "secrets",
     "kerberos",
     "streams",
+    "scan",
+    "qos",
+    "wlan",
+    "ssdp",
+}
+
+
+_IP_TARGET_FILTER_STEPS = {
+    "aim",
+    "beacon",
+    "compromised",
+    "creds",
+    "ctf",
+    "domain",
+    "email",
+    "exfil",
+    "files",
+    "ftp",
+    "http",
+    "webrequests",
+    "http2",
+    "ioc",
+    "ips",
+    "kerberos",
+    "ldap",
+    "netbios",
+    "nfs",
+    "ntlm",
+    "ntp",
+    "obfuscation",
+    "protocols",
+    "quic",
+    "qos",
+    "rdp",
+    "routing",
+    "rpc",
+    "secrets",
+    "services",
+    "scan",
+    "smb",
+    "smtp",
+    "ssh",
+    "streams",
+    "strings",
+    "syslog",
+    "tcp",
+    "udp",
+    "teamviewer",
+    "telnet",
+    "threats",
+    "tls",
+    "vlan",
+    "vnc",
+    "winrm",
+    "wmic",
 }
 
 
@@ -508,7 +610,7 @@ def _build_banner() -> str:
         "   ██║     ╚██████╗ ██║  ██║██║     ██║     ███████╗██║  ██║    ",
         "   ╚═╝      ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝     ╚══════╝╚═╝  ╚═╝ ICS/OT",
         "=====================================================================================",
-        f"  PCAPPER v{__version__}  ::  Quote of the Day: \"{quote}\"",
+        f'  PCAPPER v{__version__}  ::  Quote of the Day: "{quote}"',
         "=====================================================================================",
     ]
     return "\n".join(banner)
@@ -592,8 +694,12 @@ def _log_event(log_config: LogConfig | None, event: str, **fields: Any) -> None:
         return
     payload = {"ts": datetime.now(timezone.utc).isoformat(), "event": event}
     payload.update(fields)
-    line = json.dumps(payload, separators=(",", ":")) if log_config.json else " ".join(
-        [payload["ts"], event] + [f"{key}={value}" for key, value in fields.items()]
+    line = (
+        json.dumps(payload, separators=(",", ":"))
+        if log_config.json
+        else " ".join(
+            [payload["ts"], event] + [f"{key}={value}" for key, value in fields.items()]
+        )
     )
     try:
         if log_config.path:
@@ -605,6 +711,10 @@ def _log_event(log_config: LogConfig | None, event: str, **fields: Any) -> None:
             log_config.stream.flush()
     except Exception:
         return
+
+
+def _print_error(message: str) -> None:
+    print(message, file=sys.stderr)
 
 
 def _run_self_check(
@@ -685,7 +795,9 @@ def _build_log_config(args: argparse.Namespace) -> LogConfig | None:
     return LogConfig(path=path, json=log_json, stream=stream)
 
 
-def _render_plugin_summary(spec: PluginSpec, summary: object, verbose: bool = False) -> str:
+def _render_plugin_summary(
+    spec: PluginSpec, summary: object, verbose: bool = False
+) -> str:
     if spec.render:
         try:
             return spec.render(summary, verbose=verbose)  # type: ignore[arg-type]
@@ -701,7 +813,10 @@ def _has_glob_wildcards(value: str) -> bool:
 
 _CASE_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9_.()\\[\\]-]")
 _WINDOWS_RESERVED_NAMES = {
-    "CON", "PRN", "AUX", "NUL",
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
@@ -730,7 +845,9 @@ def _sanitize_case_name(value: str) -> str:
 
 def _expand_target_wildcard(pattern: Path, recursive: bool) -> list[Path]:
     expanded_pattern = str(pattern.expanduser())
-    matches = [Path(value) for value in glob.glob(expanded_pattern, recursive=recursive)]
+    matches = [
+        Path(value) for value in glob.glob(expanded_pattern, recursive=recursive)
+    ]
 
     paths: list[Path] = []
     seen: set[Path] = set()
@@ -754,7 +871,9 @@ def _normalize_timeline_category(value: str) -> str:
     return " ".join(value.strip().lower().split())
 
 
-def _has_packet_filters(bpf: str | None, time_start: float | None, time_end: float | None) -> bool:
+def _has_packet_filters(
+    bpf: str | None, time_start: float | None, time_end: float | None
+) -> bool:
     return bool(bpf) or time_start is not None or time_end is not None
 
 
@@ -768,7 +887,9 @@ def _print_timeline_categories() -> None:
         print(f"  - {name}")
 
 
-def _parse_timeline_categories(raw: str | None) -> tuple[set[str] | None, bool, list[str]]:
+def _parse_timeline_categories(
+    raw: str | None,
+) -> tuple[set[str] | None, bool, list[str]]:
     if raw is None:
         return None, False, []
 
@@ -828,7 +949,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     parser.add_argument(
         "target",
         type=Path,
-        nargs="+",
+        nargs="*",
         help="Path(s) to pcap/pcapng file(s), wildcard pattern(s), or director(ies) of captures.",
     )
     general = parser.add_argument_group("GENERAL FLAGS")
@@ -863,14 +984,67 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Include the standard base capture summary even when other analysis flags are used.",
     )
     general.add_argument(
-        "--extract",
+        "-extract",
         metavar="FILENAME",
         help="Extract a discovered file by name into ./files (use with --files).",
     )
     general.add_argument(
         "-ip",
         dest="timeline_ip",
-        help="Target IP for host-centric analysis (use with --timeline, --hostdetails, or --services; optional for --hostname).",
+        help="Target IP scope for supported analyzers (e.g., --services/--ips/--http/--threats/--streams); required for --timeline and optional for --hostdetails. Also used as query input for --mac.",
+    )
+    general.add_argument(
+        "-mac",
+        dest="lookup_mac",
+        help="Target MAC query used with --ip (example: -mac aa:bb:cc:dd:ee:ff).",
+    )
+    general.add_argument(
+        "-post",
+        dest="webrequests_post_only",
+        action="store_true",
+        help="Optional filter for --webrequests: include only HTTP POST requests and print full request details.",
+    )
+    general.add_argument(
+        "-high",
+        dest="webrequests_high_only",
+        action="store_true",
+        help="Optional filter for --webrequests: include only non-low risk requests.",
+    )
+    general.add_argument(
+        "-host",
+        dest="webrequests_host_view",
+        action="store_true",
+        help="Optional output mode for --webrequests: show full request details (Request Line, headers, body).",
+    )
+    general.add_argument(
+        "-port",
+        dest="stream_port",
+        type=int,
+        help="Optional port filter for --streams, --hostnames, --hostdetails, --http, --tls/--tlsm, and --files (matches src or dst port; service port where available). Can be combined with -ip.",
+    )
+    general.add_argument(
+        "-established",
+        dest="streams_established",
+        action="store_true",
+        help="Optional filter for --streams: only include TCP streams with a completed 3-way handshake.",
+    )
+    general.add_argument(
+        "-search",
+        dest="stream_search",
+        metavar="TERM",
+        help="Optional filter for --streams, --webrequests, --hostnames, --hostdetails, --http, --tls/--tlsm, and --files. For --webrequests, search runs across all HTTP requests (ignores -ip/-post/-high scope filters).",
+    )
+    general.add_argument(
+        "-name",
+        dest="hostname_name",
+        metavar="HOSTNAME",
+        help="Optional hostname selector/filter for --hostnames, --hostdetails, --http, --tls/--tlsm, and --files.",
+    )
+    general.add_argument(
+        "-exe",
+        dest="files_executable_only",
+        action="store_true",
+        help="Optional filter for --files: show only executable-like file artifacts and force full output detail.",
     )
     general.add_argument(
         "-l",
@@ -939,10 +1113,10 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         "--vt",
         dest="vt",
         action="store_true",
-        help="Enable VirusTotal lookups for DNS queries/domains and HTTP URLs/domains (requires VT_API_KEY).",
+        help="Enable VirusTotal lookups/enrichment for --dns, --http, --tls/--tlsm, --threats, --webrequests, --timeline, and --compromised (requires VT_API_KEY).",
     )
     general.add_argument(
-        "--view",
+        "-view",
         metavar="FILENAME",
         help="View extracted file content in ASCII/HEX (use with --files).",
     )
@@ -950,7 +1124,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         "-raw",
         dest="view_raw",
         action="store_true",
-        help="Show --view output as raw text (no ASCII/HEX).",
+        help="Show -view output as raw text (no ASCII/HEX).",
     )
     general.add_argument(
         "--bpf",
@@ -988,7 +1162,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     general.add_argument(
         "--baseline-save",
         metavar="PATH",
-        help="Write baseline snapshot (hosts/services/OT commands) to PATH (JSON).",
+        help="Write baseline snapshot (services/OT commands) to PATH (JSON).",
     )
     general.add_argument(
         "--baseline-compare",
@@ -1072,19 +1246,10 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Freeform notes stored in case metadata.",
     )
     general.add_argument(
-        "--follow",
-        metavar="FLOW",
-        help="Follow a TCP stream (use with --streams). Format: src_ip:src_port->dst_ip:dst_port",
-    )
-    general.add_argument(
-        "--follow-id",
+        "-id",
+        dest="stream_id",
         metavar="STREAM_ID",
-        help="Follow a TCP stream by stream ID (use with --streams).",
-    )
-    general.add_argument(
-        "--lookup-stream-id",
-        metavar="STREAM_ID",
-        help="Lookup a TCP stream ID and print its 5-tuple (use with --streams).",
+        help="Select a TCP stream by stream ID and display full stream packet details (use with --streams).",
     )
     general.add_argument(
         "--streams-full",
@@ -1127,7 +1292,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     general.add_argument(
         "--correlate",
         action="store_true",
-        help="Correlate hosts/services across multiple pcaps (auto-enables --hosts/--services).",
+        help="Correlate hosts/services across multiple pcaps (auto-enables --services).",
     )
     general.add_argument(
         "--correlate-min",
@@ -1138,74 +1303,203 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
 
     it_group = parser.add_argument_group("IT/ENTERPRISE FUNCTIONS")
     it_flags = [
-        ("--obfuscation", "Detect high-entropy or encoded payloads (tunneling/obfuscation heuristics)."),
-        ("--arp", "Include ARP analysis (conversations, poisoning signals, anomalies, artifacts)."),
+        (
+            "--obfuscation",
+            "Detect high-entropy or encoded payloads (tunneling/obfuscation heuristics).",
+        ),
+        (
+            "--arp",
+            "Include ARP analysis (conversations, poisoning signals, anomalies, artifacts).",
+        ),
         ("--beacon", "Include beaconing analysis in the output."),
         ("--certificates", "Include TLS certificate extraction and analysis."),
         ("--creds", "Scan for credential exposure (HTTP, FTP, SMTP, CIP/ENIP, etc.)."),
-        ("--compromised", "Assess likely compromised hosts (multi-signal correlation)."),
-        ("--secrets", "Discover reversible encoded/obfuscated secrets (base64, hex, url-encoded, JWT)."),
-        ("--dhcp", "Include DHCP analysis (leases, options, clients/servers, attacks, anomalies)."),
+        (
+            "--compromised",
+            "Assess likely compromised hosts (multi-signal correlation).",
+        ),
+        (
+            "--secrets",
+            "Discover reversible encoded/obfuscated secrets (base64, hex, url-encoded, JWT).",
+        ),
+        (
+            "--dhcp",
+            "Include DHCP analysis (leases, options, clients/servers, attacks, anomalies).",
+        ),
         ("--dns", "Include DNS analysis in the output."),
-        ("--domain", "Include MS AD and domain analysis (services, users, DCs, artifacts)."),
+        (
+            "--domain",
+            "Include MS AD and domain analysis (services, users, DCs, artifacts).",
+        ),
         ("--exfil", "Include exfiltration heuristics and anomaly analysis."),
-        ("--files", "Include file transfer discovery in the output."),
+        (
+            "--files",
+            "Include file transfer discovery in the output (supports filters: -ip, -name, -port, -search, -exe).",
+        ),
         ("--ftp", "Include FTP analysis (credentials, transfers, threats, anomalies)."),
-        ("--health", "Include overall traffic health assessment (retransmissions, TTL, QoS, SNMP, certs)."),
+        (
+            "--health",
+            "Include overall traffic health assessment (retransmissions, TTL, QoS, SNMP, certs).",
+        ),
         (
             "--hostdetails",
-            "Deep host-centric threat hunting/forensics for a target IP (services, peers, attacks, beaconing, exfil, artifacts; use with -ip).",
+            "Deep host-centric threat hunting/forensics (services, peers, attacks, beaconing, exfil, artifacts) filtered by -ip, -name, -port, and/or -search.",
         ),
-        ("--hostname", "Find hostnames for a target IP across DNS/HTTP/TLS/SMB/NetBIOS (use with -ip)."),
-        ("--hosts", "Include host inventory analysis (MAC/IP/hostname/OS/ports/traffic)."),
-        ("--http", "Include HTTP analysis in the output."),
-        ("--aim", "Include AIM (AOL Instant Messenger) forensic analysis (messages, creds, files, client/server stats)."),
+        (
+            "--hostnames",
+            "Find hostnames across DNS/DHCP/DHCPv6/LLMNR/mDNS/HTTP/HTTP2/TLS/SMB/FTP/SMTP/SSH/SNMP/SSDP/LLDP/CDP/OT protocol clues (optional -ip target scope and optional -name/-port/-search filters).",
+        ),
+        (
+            "--http",
+            "Include HTTP analysis in the output (supports filters: -ip, -name, -port, -search).",
+        ),
+        (
+            "--webrequests",
+            "Show web requests. Modes: default quick overview, -ip full request details for scoped traffic, -host full request details (Request Line/Headers/Body). Optional filters: -post, -high, -search.",
+        ),
+        (
+            "--aim",
+            "Include AIM (AOL Instant Messenger) forensic analysis (messages, creds, files, client/server stats).",
+        ),
         ("--icmp", "Include ICMP analysis in the output."),
+        (
+            "--ip",
+            "Lookup IP addresses associated with a MAC address (optional -mac filter; without it, list all MAC->IP pairs).",
+        ),
         ("--ips", "Include IP address intelligence and conversation analysis."),
-        ("--kerberos", "Include Kerberos analysis (requests, errors, principals, attacks)."),
-        ("--ldap", "Include LDAP analysis (queries, users, servers, anomalies, secrets)."),
+        (
+            "--mac",
+            "Lookup MAC addresses associated with an IP address (optional -ip filter; without it, list all IP->MAC pairs).",
+        ),
+        (
+            "--kerberos",
+            "Include Kerberos analysis (requests, errors, principals, attacks).",
+        ),
+        (
+            "--ldap",
+            "Include LDAP analysis (queries, users, servers, anomalies, secrets).",
+        ),
         ("--netbios", "Include NetBIOS name service analysis (Names, Groups, Roles)."),
-        ("--nfs", "Include NFS protocol analysis (RPC, Clients, Servers, Files, Anomalies)."),
+        (
+            "--nfs",
+            "Include NFS protocol analysis (RPC, Clients, Servers, Files, Anomalies).",
+        ),
         ("--ntlm", "Include NTLM authentication analysis (Users, Domains, Versions)."),
         ("--protocols", "Include detailed protocol hierarchy and anomaly analysis."),
-        ("--routing", "Include routing protocol analysis (OSPF, IS-IS, BGP, RIP, EIGRP, VRRP, HSRP)."),
+        (
+            "--routing",
+            "Include routing protocol analysis (OSPF, IS-IS, BGP, RIP, EIGRP, VRRP, HSRP).",
+        ),
         ("--rdp", "Include RDP analysis (sessions, hostnames, anomalies, threats)."),
         ("--services", "Include service discovery and cybersecurity risk analysis."),
         ("--sizes", "Include packet size distribution analysis."),
         ("--smb", "Include SMB protocol analysis (Versioning, Shares, Anomalies)."),
         ("--ssh", "Include SSH analysis (sessions, versions, plaintext, anomalies)."),
         ("--strings", "Include cleartext strings extraction and anomaly analysis."),
-        ("--syslog", "Include syslog analysis (messages, clients, severity, anomalies)."),
-        ("--snmp", "Include SNMP analysis (versions, communities, OIDs, host details, threats)."),
-        ("--smtp", "Include SMTP analysis (commands, auth, recipients, threats, exfil)."),
+        (
+            "--syslog",
+            "Include syslog analysis (messages, clients, severity, anomalies).",
+        ),
+        (
+            "--snmp",
+            "Include SNMP analysis (versions, communities, OIDs, host details, threats).",
+        ),
+        (
+            "--smtp",
+            "Include SMTP analysis (commands, auth, recipients, threats, exfil).",
+        ),
+        (
+            "--email",
+            "Include email forensics across SMTP/POP3/IMAP (addresses, usernames/passwords, attachments, detections, deterministic checks). Add --timeline for email interaction timeline view.",
+        ),
+        (
+            "--scan",
+            "Review network scanning activity (offenders, discovered hosts/ports, banners, brute-force hints).",
+        ),
         ("--rpc", "Include RPC analysis (binds, interfaces, commands, threats)."),
         ("--tcp", "Include TCP analysis in the output."),
-        ("--teamviewer", "Include TeamViewer analysis (sessions, hints, anomalies, threats)."),
-        ("--telnet", "Include Telnet analysis (sessions, credentials, anomalies, threats)."),
+        (
+            "--teamviewer",
+            "Include TeamViewer analysis (sessions, hints, anomalies, threats).",
+        ),
+        (
+            "--telnet",
+            "Include Telnet analysis (sessions, credentials, anomalies, threats).",
+        ),
         ("--threats", "Include consolidated threat detections in the output."),
-        ("--mitre", "Map detections to MITRE ATT&CK (Enterprise + ICS) with TTP attack-path visualization."),
-        ("--suricata", "Run local Suricata IDS against the capture and include Suricata detections."),
+        (
+            "--mitre",
+            "Map detections to MITRE ATT&CK (Enterprise + ICS) with TTP attack-path visualization.",
+        ),
+        (
+            "--suricata",
+            "Run local Suricata IDS against the capture and include Suricata detections.",
+        ),
         ("--quic", "Include QUIC (HTTP/3) analysis in the output."),
+        (
+            "--qos",
+            "Include QoS analysis (DSCP/ECN/PCP/WMM stats, deterministic checks, threats, plaintext/secrets).",
+        ),
+        (
+            "--wlan",
+            "Include WLAN/802.11 analysis (WEP/WPA1/2/3 artifacts, handshakes, deauth floods, evil twin clues).",
+        ),
         ("--http2", "Include HTTP/2 analysis (cleartext/upgrade indicators)."),
         ("--encrypted-dns", "Include encrypted DNS analysis (DoH/DoT/DoQ)."),
         ("--ntp", "Include NTP analysis (versions, modes, anomalies)."),
-        ("--vpn", "Include VPN/tunnel detection (IKE, IPsec, OpenVPN, WireGuard, etc)."),
-        ("--timeline", "Include a threat-hunting timeline for a specific IP (use with -ip)."),
-        ("--tls", "Include TLS/HTTPS analysis in the output."),
+        (
+            "--ssdp",
+            "Include SSDP/UPnP analysis (discovery artifacts, deterministic checks, threats, anomalies).",
+        ),
+        (
+            "--vpn",
+            "Include VPN/tunnel detection (IKE, IPsec, OpenVPN, WireGuard, etc).",
+        ),
+        (
+            "--timeline",
+            "Include a threat-hunting timeline for a specific IP (use with -ip).",
+        ),
+        (
+            "--tls",
+            "Include TLS/HTTPS analysis in the output (alias: --tlsm; supports filters: -ip, -name, -port, -search).",
+        ),
         ("--udp", "Include UDP analysis in the output."),
         ("--vlan", "Include VLAN analysis in the output."),
         ("--vnc", "Include VNC analysis (sessions, banners, anomalies, threats)."),
         ("--winrm", "Include WinRM analysis (HTTP/HTTPS, anomalies, threats)."),
         ("--wmic", "Include WMIC/WMI analysis (commands, hosts, anomalies, threats)."),
         ("--powershell", "Include PowerShell analysis (commands, artifacts, threats)."),
+        (
+            "--malware",
+            "Include malware hunting analysis (deterministic checks, discoveries, beacon/exfil/download/c2 findings).",
+        ),
         ("--opc-classic", "Include OPC Classic (DCOM) analysis."),
-        ("--streams", "Include TCP stream summary (use --follow for details)."),
+        (
+            "--streams",
+            "Include TCP stream summary (use -id STREAM_ID for full packet metadata/details; add -established to only show completed handshakes).",
+        ),
         ("--ctf", "Include CTF flag finder and decoder analysis."),
         ("--ioc", "Include IOC matching analysis (use with --ioc-file)."),
-        ("--pcapmeta", "Include pcap metadata analysis (linktype, snaplen, interfaces)."),
+        (
+            "--pcapmeta",
+            "Include pcap metadata analysis (linktype, snaplen, interfaces).",
+        ),
     ]
     it_entries: list[tuple[str, dict[str, object]]] = [
-        (flag, {"action": "store_true", "help": help_text})
+        (
+            flag,
+            {
+                "action": "store_true",
+                "help": help_text,
+                **(
+                    {"dest": "ip_lookup"}
+                    if flag == "--ip"
+                    else {"dest": "mac_lookup"}
+                    if flag == "--mac"
+                    else {}
+                ),
+            },
+        )
         for flag, help_text in it_flags
     ]
     it_entries.extend(
@@ -1256,13 +1550,22 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     )
     for flag, kwargs in sorted(it_entries, key=lambda item: item[0]):
         it_group.add_argument(flag, **kwargs)
+    it_group.add_argument(
+        "--tlsm",
+        dest="tls",
+        action="store_true",
+        help="Alias for --tls.",
+    )
 
     ics_group = parser.add_argument_group("OT/ICS/INDUSTRIAL FUNCTIONS")
     ics_flags = [
         ("--bacnet", "Include BACnet analysis (BVLC functions, endpoints, anomalies)."),
         ("--cip", "Include CIP analysis (object operations)."),
         ("--coap", "Include CoAP analysis (RESTful IoT/ICS)."),
-        ("--control-loop", "Analyze control-loop value changes (rate-of-change, oscillation, outliers)."),
+        (
+            "--control-loop",
+            "Analyze control-loop value changes (rate-of-change, oscillation, outliers).",
+        ),
         ("--crimson", "Include Crimson V3 analysis (HMI/tag traffic)."),
         ("--csp", "Include CSP analysis (ControlNet service protocol)."),
         ("--df1", "Include Allen-Bradley DF1 analysis (serial framing)."),
@@ -1273,10 +1576,16 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--hart", "Include HART-IP analysis (field device communications)."),
         ("--honeywell", "Include Honeywell CDA analysis (DCS traffic)."),
         ("--iccp", "Include ICCP/TASE.2 analysis (inter-control center)."),
-        ("--iec104", "Include IEC-104 analysis (APCI/ASDU, control events, anomalies)."),
+        (
+            "--iec104",
+            "Include IEC-104 analysis (APCI/ASDU, control events, anomalies).",
+        ),
         ("--melsec", "Include MELSEC-Q analysis (MC protocol)."),
         ("--mms", "Include IEC 61850 MMS analysis (substation automation)."),
-        ("--modbus", "Include Modbus/TCP status and security analysis (Functions, Units, Anomalies)."),
+        (
+            "--modbus",
+            "Include Modbus/TCP status and security analysis (Functions, Units, Anomalies).",
+        ),
         ("--modicon", "Include Modicon/Unity analysis (Modbus family)."),
         ("--mqtt", "Include MQTT analysis (publish/subscribe IoT/ICS)."),
         ("--niagara", "Include Niagara Fox analysis (building automation)."),
@@ -1287,14 +1596,20 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--prconos", "Include ProConOS analysis (ProSoft protocol)."),
         ("--profinet", "Include Profinet analysis (RT/PNIO, endpoints, anomalies)."),
         ("--s7", "Include Siemens S7 analysis (TPKT/COTP, jobs, anomalies)."),
-        ("--safety", "Include safety PLC/SIS protocol detection (Triconex/TriStation)."),
+        (
+            "--safety",
+            "Include safety PLC/SIS protocol detection (Triconex/TriStation).",
+        ),
         ("--srtp", "Include GE SRTP analysis (PLC communications)."),
         ("--goose", "Include IEC 61850 GOOSE analysis (L2 events)."),
         ("--sv", "Include IEC 61850 Sampled Values analysis (L2)."),
         ("--lldp", "Include LLDP/Profinet DCP asset discovery analysis."),
         ("--ptp", "Include IEEE 1588 PTP time-sync analysis."),
         ("--ot-commands", "Include normalized OT control/write command analysis."),
-        ("--ot-commands-fast", "Fast OT command scan (port heuristics + cached packets)."),
+        (
+            "--ot-commands-fast",
+            "Fast OT command scan (port heuristics + cached packets).",
+        ),
         ("--iec101-103", "Include IEC 60870-5-101/103 heuristic analysis."),
         ("--yokogawa", "Include Yokogawa Vnet/IP analysis."),
     ]
@@ -1335,6 +1650,138 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     return parser
 
 
+_HELP_BAR = "=" * 72
+
+
+def _normalize_cli_option_token(token: str) -> str | None:
+    if not token.startswith("-"):
+        return None
+    if token.startswith("--"):
+        return token.split("=", 1)[0]
+    return token
+
+
+def _action_takes_value(action: argparse.Action) -> bool:
+    if isinstance(
+        action,
+        (
+            argparse._StoreTrueAction,  # type: ignore[attr-defined]
+            argparse._StoreFalseAction,  # type: ignore[attr-defined]
+            argparse._HelpAction,  # type: ignore[attr-defined]
+            argparse._CountAction,  # type: ignore[attr-defined]
+        ),
+    ):
+        return False
+    return action.nargs != 0
+
+
+def _format_action_usage(action: argparse.Action) -> str:
+    option_text = (
+        ", ".join(action.option_strings) if action.option_strings else action.dest
+    )
+    if not _action_takes_value(action):
+        return option_text
+    metavar = action.metavar
+    if isinstance(metavar, tuple):
+        metavar_text = " ".join(str(v) for v in metavar)
+    elif metavar:
+        metavar_text = str(metavar)
+    else:
+        metavar_text = str(action.dest).upper()
+    return f"{option_text} {metavar_text}"
+
+
+def _collect_related_help_actions(
+    parser: argparse.ArgumentParser,
+    target_flag: str,
+    target_action: argparse.Action,
+) -> list[argparse.Action]:
+    related: list[argparse.Action] = []
+    seen: set[tuple[str, ...]] = set()
+    target_text = target_flag.lower()
+    for action in getattr(parser, "_actions", []):
+        if not action.option_strings or action is target_action:
+            continue
+        help_text = str(getattr(action, "help", "") or "").lower()
+        if target_text not in help_text:
+            continue
+        key = tuple(action.option_strings)
+        if key in seen:
+            continue
+        seen.add(key)
+        related.append(action)
+    related.sort(key=lambda item: item.option_strings[0] if item.option_strings else "")
+    return related
+
+
+def _print_contextual_function_help(
+    parser: argparse.ArgumentParser,
+    target_flags: list[str],
+) -> None:
+    option_actions = dict(getattr(parser, "_option_string_actions", {}))
+    print(_HELP_BAR)
+    print("PCAPPER FUNCTION HELP MODE")
+    print(_HELP_BAR)
+    print("Showing focused help for requested function flag(s).")
+    print("Use `pcapper -h` for full global help.")
+    for idx, flag in enumerate(target_flags, start=1):
+        action = option_actions.get(flag)
+        if action is None:
+            continue
+        if idx > 1:
+            print(_HELP_BAR)
+        print(f"Function: {flag}")
+        description = str(getattr(action, "help", "") or "").strip()
+        if description:
+            print(f"Description: {description}")
+        print(f"Usage: pcapper <target> {flag} [function options]")
+        related = _collect_related_help_actions(parser, flag, action)
+        if related:
+            print("Related options:")
+            for rel_action in related:
+                usage = _format_action_usage(rel_action)
+                rel_help = str(getattr(rel_action, "help", "") or "").strip()
+                if rel_help:
+                    print(f"  {usage:<30} {rel_help}")
+                else:
+                    print(f"  {usage}")
+        else:
+            print("Related options: (none)")
+    print(_HELP_BAR)
+
+
+def _handle_help_request(
+    parser: argparse.ArgumentParser,
+    plugins: list[PluginSpec],
+    argv: list[str],
+) -> bool:
+    help_requested = any(token in {"-h", "--help"} for token in argv)
+    if not help_requested:
+        return False
+
+    flag_map = _builtin_flag_map()
+    function_flags = set(flag_map.keys())
+    function_flags.update(spec.flag for spec in plugins)
+    seen_targets: set[str] = set()
+    target_flags: list[str] = []
+    for token in argv:
+        normalized = _normalize_cli_option_token(token)
+        if not normalized or normalized in {"-h", "--help"}:
+            continue
+        if normalized not in function_flags:
+            continue
+        if normalized in seen_targets:
+            continue
+        seen_targets.add(normalized)
+        target_flags.append(normalized)
+
+    if target_flags:
+        _print_contextual_function_help(parser, target_flags)
+    else:
+        parser.print_help()
+    return True
+
+
 def _analyze_paths(
     paths: list[Path],
     protocol_limit: int,
@@ -1347,6 +1794,10 @@ def _analyze_paths(
     show_dns: bool,
     dns_vt: bool,
     show_http: bool,
+    show_webrequests: bool,
+    webrequests_post_only: bool,
+    webrequests_high_only: bool,
+    webrequests_host_view: bool,
     show_ftp: bool,
     show_aim: bool,
     show_tls: bool,
@@ -1358,16 +1809,21 @@ def _analyze_paths(
     show_winrm: bool,
     show_wmic: bool,
     show_powershell: bool,
+    show_malware: bool,
     show_syslog: bool,
     show_snmp: bool,
     show_smtp: bool,
+    show_email: bool,
     show_rpc: bool,
     show_tcp: bool,
     show_udp: bool,
     show_exfil: bool,
     show_sizes: bool,
     show_ips: bool,
+    show_ip_lookup: bool,
+    show_mac_lookup: bool,
     show_beacon: bool,
+    show_scan: bool,
     show_threats: bool,
     show_mitre: bool,
     show_suricata: bool,
@@ -1378,6 +1834,7 @@ def _analyze_paths(
     suricata_only_sid: set[str] | None,
     suricata_strict: bool,
     show_files: bool,
+    files_executable_only: bool,
     show_protocols: bool,
     show_routing: bool,
     show_services: bool,
@@ -1389,11 +1846,12 @@ def _analyze_paths(
     show_certificates: bool,
     show_health: bool,
     show_compromised: bool,
-    show_hosts: bool,
-    show_hostname: bool,
+    show_hostnames: bool,
+    hostname_name: str | None,
     show_hostdetails: bool,
     show_timeline: bool,
     timeline_ip: str | None,
+    lookup_mac: str | None,
     timeline_bins: int,
     timeline_storyline_off: bool,
     timeline_categories: set[str] | None,
@@ -1443,9 +1901,12 @@ def _analyze_paths(
     summarize: bool,
     show_dhcp: bool = False,
     show_quic: bool = False,
+    show_qos: bool = False,
+    show_wlan: bool = False,
     show_http2: bool = False,
     show_encrypted_dns: bool = False,
     show_ntp: bool = False,
+    show_ssdp: bool = False,
     show_vpn: bool = False,
     show_goose: bool = False,
     show_sv: bool = False,
@@ -1453,9 +1914,10 @@ def _analyze_paths(
     show_ptp: bool = False,
     show_opc_classic: bool = False,
     show_streams: bool = False,
-    follow_stream: str | None = None,
-    follow_stream_id: str | None = None,
-    lookup_stream_id: str | None = None,
+    stream_id: str | None = None,
+    stream_search: str | None = None,
+    stream_port: int | None = None,
+    streams_established: bool = False,
     streams_full: bool = False,
     show_carve: bool = False,
     carve_out: Path | None = None,
@@ -1491,31 +1953,34 @@ def _analyze_paths(
     if not paths:
         return 1
 
-    summarize_rollups = summarize and len(paths) > 0
+    # Keep single-pcap behavior identical with/without --summarize.
+    # Rollup rendering is only meaningful when multiple pcaps are supplied.
+    summarize_rollups = summarize and len(paths) > 1
     render_base_summary = show_base or len(ordered_steps) == 0
     base_rollups = []
     modbus_rollups = []
     dnp3_rollups = []
     rollups: dict[str, list[object]] = {}
     baseline_requested = bool(baseline_save or baseline_compare)
-    baseline_host_summaries: list[object] = []
     baseline_service_summaries: list[object] = []
     baseline_ot_summaries: list[object] = []
-    correlate_host_summaries: list[object] = []
     correlate_service_summaries: list[object] = []
     rules_rollups: list[object] = []
     decrypt_rollups: list[object] = []
-    use_packets = len(ordered_steps) > 1 or (render_base_summary and len(ordered_steps) > 0)
+    use_packets = len(ordered_steps) > 1 or (
+        render_base_summary and len(ordered_steps) > 0
+    )
     multi_export = len(paths) > 1 and not summarize
     plugin_lookup = plugin_map(plugins or [])
     suricata_strict_failures = 0
+    suricata_scans = 0
 
     if case_dir:
         case_dir.mkdir(parents=True, exist_ok=True)
 
     def _render_packet(path: Path, index: int, packets: list[object] | None) -> None:
         if index <= 0:
-            print("--packet must be a positive integer.")
+            _print_error("--packet must be a positive integer.")
             return
 
         pkt = None
@@ -1523,7 +1988,7 @@ def _analyze_paths(
             if index - 1 < len(packets):
                 pkt = packets[index - 1]
             else:
-                print(f"Packet {index} not found in loaded packet list.")
+                _print_error(f"Packet {index} not found in loaded packet list.")
                 return
         else:
             reader, status, _stream, _size_bytes, _file_type = get_reader(
@@ -1544,7 +2009,7 @@ def _analyze_paths(
                 except Exception:
                     pass
             if pkt is None:
-                print(f"Packet {index} not found in capture.")
+                _print_error(f"Packet {index} not found in capture.")
                 return
 
         raw = None
@@ -1588,16 +2053,91 @@ def _analyze_paths(
             return case_dir / path
         return path
 
+    def _valid_ip_text(value: str | None) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return str(ipaddress.ip_address(text))
+        except ValueError:
+            return None
+
+    def _discover_hostdetails_targets(
+        pcap_path: Path,
+        *,
+        target_ip_value: str | None,
+        hostname_value: str | None,
+        port_value: int | None,
+        search_value: str | None,
+        step_status: bool,
+    ) -> list[str]:
+        explicit_ip = _valid_ip_text(target_ip_value)
+        if explicit_ip:
+            return [explicit_ip]
+
+        candidates: set[str] = set()
+        has_name = bool(str(hostname_value or "").strip())
+        has_search = bool(str(search_value or "").strip())
+        has_port = isinstance(port_value, int) and port_value > 0
+
+        if has_name or has_search:
+            hostname_summary = analyze_hostname(
+                pcap_path,
+                None,
+                show_status=False,
+                include_related=False,
+                hostname_query=hostname_value,
+                port_filter=port_value,
+                search_query=search_value,
+            )
+            for finding in getattr(hostname_summary, "findings", []) or []:
+                mapped = _valid_ip_text(getattr(finding, "mapped_ip", None))
+                if mapped:
+                    candidates.add(mapped)
+
+        if has_port:
+            ips_summary = analyze_ips(
+                pcap_path,
+                show_status=False,
+                include_threat_hunting=False,
+            )
+            for conv in getattr(ips_summary, "conversations", []) or []:
+                ports = set(getattr(conv, "ports", []) or [])
+                if port_value in ports:
+                    src_ip = _valid_ip_text(getattr(conv, "src", None))
+                    dst_ip = _valid_ip_text(getattr(conv, "dst", None))
+                    if src_ip:
+                        candidates.add(src_ip)
+                    if dst_ip:
+                        candidates.add(dst_ip)
+
+        # Keep deterministic ordering for stable output.
+        return sorted(candidates)
+
     requested_steps = set(ordered_steps)
+    ip_scope_requested = bool(
+        timeline_ip and any(step in _IP_TARGET_FILTER_STEPS for step in ordered_steps)
+    )
 
     def _annotate_smb_with_quic(smb_summary, quic_summary) -> None:
         if not quic_summary or not getattr(quic_summary, "quic_packets", 0):
             return
-        if not hasattr(smb_summary, "analysis_notes") or smb_summary.analysis_notes is None:
+        if (
+            not hasattr(smb_summary, "analysis_notes")
+            or smb_summary.analysis_notes is None
+        ):
             smb_summary.analysis_notes = []
         notes: list[str] = smb_summary.analysis_notes
-        smb_servers = {srv.ip for srv in getattr(smb_summary, "servers", []) if getattr(srv, "ip", None)}
-        smb_clients = {cli.ip for cli in getattr(smb_summary, "clients", []) if getattr(cli, "ip", None)}
+        smb_servers = {
+            srv.ip
+            for srv in getattr(smb_summary, "servers", [])
+            if getattr(srv, "ip", None)
+        }
+        smb_clients = {
+            cli.ip
+            for cli in getattr(smb_summary, "clients", [])
+            if getattr(cli, "ip", None)
+        }
         quic_servers = set(getattr(quic_summary, "servers", {}).keys())
         quic_clients = set(getattr(quic_summary, "clients", {}).keys())
         overlap_servers = smb_servers & quic_servers
@@ -1628,7 +2168,10 @@ def _analyze_paths(
     def _annotate_tls_with_quic(tls_summary, quic_summary) -> None:
         if not quic_summary or not getattr(quic_summary, "quic_packets", 0):
             return
-        if not hasattr(tls_summary, "analysis_notes") or tls_summary.analysis_notes is None:
+        if (
+            not hasattr(tls_summary, "analysis_notes")
+            or tls_summary.analysis_notes is None
+        ):
             tls_summary.analysis_notes = []
         notes: list[str] = tls_summary.analysis_notes
         tls_servers = set(getattr(tls_summary, "server_counts", {}).keys())
@@ -1665,16 +2208,28 @@ def _analyze_paths(
         meta = None
         step_status = show_status
         export_summaries: dict[str, object] = {}
-        _log_event(log_config, "pcap_start", path=str(path), index=idx, total=len(paths))
+        _log_event(
+            log_config, "pcap_start", path=str(path), index=idx, total=len(paths)
+        )
+        ip_scope_enabled_for_path = False
+        effective_bpf = bpf
+        if ip_scope_requested and timeline_ip:
+            ip_bpf = f"host {timeline_ip}"
+            if effective_bpf:
+                effective_bpf = f"({effective_bpf}) and ({ip_bpf})"
+            else:
+                effective_bpf = ip_bpf
 
-        if _has_packet_filters(bpf, time_start, time_end):
+        if _has_packet_filters(effective_bpf, time_start, time_end):
             packets, meta = load_filtered_packets(
                 path,
                 show_status=show_status,
-                bpf=bpf,
+                bpf=effective_bpf,
                 time_start=time_start,
                 time_end=time_end,
             )
+            if ip_scope_requested and timeline_ip:
+                ip_scope_enabled_for_path = True
         elif use_packets:
             max_file_override = None
             enabled, max_cache, _max_file = get_cache_config()
@@ -1693,8 +2248,13 @@ def _analyze_paths(
             if packets is not None:
                 step_status = show_status
 
+        if ip_scope_enabled_for_path and packets is not None:
+            set_forced_packet_view(path, packets, meta)
+
         if render_base_summary:
-            summary = analyze_pcap(path, show_status=step_status, packets=packets, meta=meta)
+            summary = analyze_pcap(
+                path, show_status=step_status, packets=packets, meta=meta
+            )
             if summarize_rollups:
                 base_rollups.append(summary)
             else:
@@ -1752,21 +2312,62 @@ def _analyze_paths(
                     packets=packets,
                     meta=meta,
                     vt_lookup=dns_vt,
+                    target_ip=timeline_ip,
+                    hostname_query=hostname_name,
+                    port_filter=stream_port,
+                    search_query=stream_search,
                 )
                 if summarize_rollups:
                     rollups.setdefault("http", []).append(http_summary)
                 else:
                     print(render_http_summary(http_summary, verbose=verbose))
                 export_summaries["http"] = http_summary
+            elif step == "webrequests" and show_webrequests:
+                webreq_summary = analyze_webrequests(
+                    path,
+                    timeline_ip if timeline_ip else None,
+                    post_only=webrequests_post_only,
+                    high_only=webrequests_high_only,
+                    search_query=stream_search,
+                    vt_lookup=dns_vt,
+                    show_status=step_status,
+                    packets=packets,
+                    meta=meta,
+                )
+                if summarize_rollups:
+                    rollups.setdefault("webrequests", []).append(webreq_summary)
+                else:
+                    webreq_verbose = bool(verbose or webrequests_high_only)
+                    webreq_view = (
+                        "full"
+                        if (
+                            webrequests_host_view
+                            or webrequests_post_only
+                            or webrequests_high_only
+                            or bool(stream_search)
+                            or bool(timeline_ip)
+                        )
+                        else "minimal"
+                    )
+                    print(
+                        render_webrequests_summary(
+                            webreq_summary, verbose=webreq_verbose, view=webreq_view
+                        )
+                    )
+                export_summaries["webrequests"] = webreq_summary
             elif step == "ftp" and show_ftp:
-                ftp_summary = analyze_ftp(path, show_status=step_status, packets=packets, meta=meta)
+                ftp_summary = analyze_ftp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("ftp", []).append(ftp_summary)
                 else:
                     print(render_ftp_summary(ftp_summary, verbose=verbose))
                 export_summaries["ftp"] = ftp_summary
             elif step == "aim" and show_aim:
-                aim_summary = analyze_aim(path, show_status=step_status, packets=packets, meta=meta)
+                aim_summary = analyze_aim(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("aim", []).append(aim_summary)
                 else:
@@ -1779,7 +2380,17 @@ def _analyze_paths(
                     if quic_summary is None:
                         quic_summary = analyze_quic(path, show_status=step_status)
                         export_summaries["quic"] = quic_summary
-                tls_summary = analyze_tls(path, show_status=step_status, packets=packets, meta=meta)
+                tls_summary = analyze_tls(
+                    path,
+                    show_status=step_status,
+                    packets=packets,
+                    meta=meta,
+                    vt_lookup=dns_vt,
+                    target_ip=timeline_ip,
+                    hostname_query=hostname_name,
+                    port_filter=stream_port,
+                    search_query=stream_search,
+                )
                 if quic_summary is not None:
                     _annotate_tls_with_quic(tls_summary, quic_summary)
                 if summarize_rollups:
@@ -1788,105 +2399,157 @@ def _analyze_paths(
                     print(render_tls_summary(tls_summary, verbose=verbose))
                 export_summaries["tls"] = tls_summary
             elif step == "ssh" and show_ssh:
-                ssh_summary = analyze_ssh(path, show_status=step_status, packets=packets, meta=meta)
+                ssh_summary = analyze_ssh(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("ssh", []).append(ssh_summary)
                 else:
                     print(render_ssh_summary(ssh_summary, verbose=verbose))
                 export_summaries["ssh"] = ssh_summary
             elif step == "rdp" and show_rdp:
-                rdp_summary = analyze_rdp(path, show_status=step_status, packets=packets, meta=meta)
+                rdp_summary = analyze_rdp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("rdp", []).append(rdp_summary)
                 else:
                     print(render_rdp_summary(rdp_summary, verbose=verbose))
                 export_summaries["rdp"] = rdp_summary
             elif step == "telnet" and show_telnet:
-                telnet_summary = analyze_telnet(path, show_status=step_status, packets=packets, meta=meta)
+                telnet_summary = analyze_telnet(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("telnet", []).append(telnet_summary)
                 else:
                     print(render_telnet_summary(telnet_summary, verbose=verbose))
                 export_summaries["telnet"] = telnet_summary
             elif step == "vnc" and show_vnc:
-                vnc_summary = analyze_vnc(path, show_status=step_status, packets=packets, meta=meta)
+                vnc_summary = analyze_vnc(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("vnc", []).append(vnc_summary)
                 else:
                     print(render_vnc_summary(vnc_summary, verbose=verbose))
                 export_summaries["vnc"] = vnc_summary
             elif step == "teamviewer" and show_teamviewer:
-                tv_summary = analyze_teamviewer(path, show_status=step_status, packets=packets, meta=meta)
+                tv_summary = analyze_teamviewer(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("teamviewer", []).append(tv_summary)
                 else:
                     print(render_teamviewer_summary(tv_summary, verbose=verbose))
                 export_summaries["teamviewer"] = tv_summary
             elif step == "winrm" and show_winrm:
-                winrm_summary = analyze_winrm(path, show_status=step_status, packets=packets, meta=meta)
+                winrm_summary = analyze_winrm(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("winrm", []).append(winrm_summary)
                 else:
                     print(render_winrm_summary(winrm_summary, verbose=verbose))
                 export_summaries["winrm"] = winrm_summary
             elif step == "wmic" and show_wmic:
-                wmic_summary = analyze_wmic(path, show_status=step_status, packets=packets, meta=meta)
+                wmic_summary = analyze_wmic(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("wmic", []).append(wmic_summary)
                 else:
                     print(render_wmic_summary(wmic_summary, verbose=verbose))
                 export_summaries["wmic"] = wmic_summary
             elif step == "powershell" and show_powershell:
-                ps_summary = analyze_powershell(path, show_status=step_status, packets=packets, meta=meta)
+                ps_summary = analyze_powershell(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("powershell", []).append(ps_summary)
                 else:
                     print(render_powershell_summary(ps_summary, verbose=verbose))
                 export_summaries["powershell"] = ps_summary
+            elif step == "malware" and show_malware:
+                malware_summary = analyze_malware(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
+                if summarize_rollups:
+                    rollups.setdefault("malware", []).append(malware_summary)
+                else:
+                    print(render_malware_summary(malware_summary, verbose=verbose))
+                export_summaries["malware"] = malware_summary
             elif step == "syslog" and show_syslog:
-                syslog_summary = analyze_syslog(path, show_status=step_status, packets=packets, meta=meta)
+                syslog_summary = analyze_syslog(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("syslog", []).append(syslog_summary)
                 else:
                     print(render_syslog_summary(syslog_summary, verbose=verbose))
                 export_summaries["syslog"] = syslog_summary
             elif step == "snmp" and show_snmp:
-                snmp_summary = analyze_snmp(path, show_status=step_status, packets=packets, meta=meta)
+                snmp_summary = analyze_snmp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("snmp", []).append(snmp_summary)
                 else:
                     print(render_snmp_summary(snmp_summary, verbose=verbose))
                 export_summaries["snmp"] = snmp_summary
             elif step == "smtp" and show_smtp:
-                smtp_summary = analyze_smtp(path, show_status=step_status, packets=packets, meta=meta)
+                smtp_summary = analyze_smtp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("smtp", []).append(smtp_summary)
                 else:
                     print(render_smtp_summary(smtp_summary, verbose=verbose))
                 export_summaries["smtp"] = smtp_summary
+            elif step == "email" and show_email:
+                email_summary = analyze_email(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
+                if summarize_rollups:
+                    rollups.setdefault("email", []).append(email_summary)
+                else:
+                    print(
+                        render_email_summary(
+                            email_summary, verbose=verbose, show_timeline=show_timeline
+                        )
+                    )
+                export_summaries["email"] = email_summary
             elif step == "rpc" and show_rpc:
-                rpc_summary = analyze_rpc(path, show_status=step_status, packets=packets, meta=meta)
+                rpc_summary = analyze_rpc(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("rpc", []).append(rpc_summary)
                 else:
                     print(render_rpc_summary(rpc_summary, verbose=verbose))
                 export_summaries["rpc"] = rpc_summary
             elif step == "tcp" and show_tcp:
-                tcp_summary = analyze_tcp(path, show_status=step_status, packets=packets, meta=meta)
+                tcp_summary = analyze_tcp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("tcp", []).append(tcp_summary)
                 else:
                     print(render_tcp_summary(tcp_summary, verbose=verbose))
                 export_summaries["tcp"] = tcp_summary
             elif step == "udp" and show_udp:
-                udp_summary = analyze_udp(path, show_status=step_status, packets=packets, meta=meta)
+                udp_summary = analyze_udp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("udp", []).append(udp_summary)
                 else:
                     print(render_udp_summary(udp_summary, verbose=verbose))
                 export_summaries["udp"] = udp_summary
             elif step == "exfil" and show_exfil:
-                exfil_summary = analyze_exfil(path, show_status=step_status, packets=packets, meta=meta)
+                exfil_summary = analyze_exfil(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("exfil", []).append(exfil_summary)
                 else:
@@ -1906,6 +2569,32 @@ def _analyze_paths(
                 else:
                     print(render_ips_summary(ips_summary, verbose=verbose))
                 export_summaries["ips"] = ips_summary
+            elif step == "ip_lookup" and show_ip_lookup:
+                ip_lookup_summary = analyze_ip_lookup(
+                    path,
+                    lookup_mac or "",
+                    show_status=step_status,
+                    packets=packets,
+                    meta=meta,
+                )
+                if summarize_rollups:
+                    rollups.setdefault("ip_lookup", []).append(ip_lookup_summary)
+                else:
+                    print(render_ip_lookup_summary(ip_lookup_summary))
+                export_summaries["ip_lookup"] = ip_lookup_summary
+            elif step == "mac_lookup" and show_mac_lookup:
+                mac_lookup_summary = analyze_mac_lookup(
+                    path,
+                    timeline_ip or "",
+                    show_status=step_status,
+                    packets=packets,
+                    meta=meta,
+                )
+                if summarize_rollups:
+                    rollups.setdefault("mac_lookup", []).append(mac_lookup_summary)
+                else:
+                    print(render_mac_lookup_summary(mac_lookup_summary))
+                export_summaries["mac_lookup"] = mac_lookup_summary
             elif step == "beacon" and show_beacon:
                 beacon_summary = analyze_beacons(path, show_status=step_status)
                 if summarize_rollups:
@@ -1913,18 +2602,31 @@ def _analyze_paths(
                 else:
                     print(render_beacon_summary(beacon_summary, verbose=verbose))
                 export_summaries["beacon"] = beacon_summary
+            elif step == "scan" and show_scan:
+                scan_summary = analyze_scan(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
+                if summarize_rollups:
+                    rollups.setdefault("scan", []).append(scan_summary)
+                else:
+                    print(render_scan_summary(scan_summary, verbose=verbose))
+                export_summaries["scan"] = scan_summary
             elif step == "threats" and show_threats:
-                threat_summary = analyze_threats(path, show_status=step_status)
+                threat_summary = analyze_threats(
+                    path, show_status=step_status, vt_lookup=dns_vt
+                )
                 if summarize_rollups:
                     rollups.setdefault("threats", []).append(threat_summary)
                 else:
                     print(render_threats_summary(threat_summary, verbose=verbose))
                 export_summaries["threats"] = threat_summary
             elif step == "mitre" and show_mitre:
+                existing_threat_summary = export_summaries.get("threats")
                 mitre_summary = analyze_mitre(
                     path,
                     show_status=step_status,
                     ioc_file=Path(ioc_file).expanduser() if ioc_file else None,
+                    threat_summary=existing_threat_summary,
                 )
                 if summarize_rollups:
                     rollups.setdefault("mitre", []).append(mitre_summary)
@@ -1942,6 +2644,7 @@ def _analyze_paths(
                     only_sid=suricata_only_sid,
                     strict=suricata_strict,
                 )
+                suricata_scans += 1
                 if summarize_rollups:
                     rollups.setdefault("suricata", []).append(suricata_summary)
                 else:
@@ -1958,6 +2661,28 @@ def _analyze_paths(
                 else:
                     print(render_quic_summary(quic_summary))
                 export_summaries["quic"] = quic_summary
+            elif step == "qos" and show_qos:
+                qos_summary = analyze_qos(
+                    path,
+                    show_status=step_status,
+                    packets=packets,
+                    meta=meta,
+                    filter_ip=timeline_ip,
+                )
+                if summarize_rollups:
+                    rollups.setdefault("qos", []).append(qos_summary)
+                else:
+                    print(render_qos_summary(qos_summary, verbose=verbose))
+                export_summaries["qos"] = qos_summary
+            elif step == "wlan" and show_wlan:
+                wlan_summary = analyze_wlan(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
+                if summarize_rollups:
+                    rollups.setdefault("wlan", []).append(wlan_summary)
+                else:
+                    print(render_wlan_summary(wlan_summary))
+                export_summaries["wlan"] = wlan_summary
             elif step == "http2" and show_http2:
                 http2_summary = analyze_http2(path, show_status=step_status)
                 if summarize_rollups:
@@ -1979,6 +2704,15 @@ def _analyze_paths(
                 else:
                     print(render_ntp_summary(ntp_summary))
                 export_summaries["ntp"] = ntp_summary
+            elif step == "ssdp" and show_ssdp:
+                ssdp_summary = analyze_ssdp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
+                if summarize_rollups:
+                    rollups.setdefault("ssdp", []).append(ssdp_summary)
+                else:
+                    print(render_ssdp_summary(ssdp_summary, verbose=verbose))
+                export_summaries["ssdp"] = ssdp_summary
             elif step == "vpn" and show_vpn:
                 vpn_summary = analyze_vpn(path, show_status=step_status)
                 if summarize_rollups:
@@ -1994,12 +2728,23 @@ def _analyze_paths(
                     view_name=view_name,
                     view_raw=view_raw,
                     show_status=step_status,
-                    include_x509=verbose,
+                    include_x509=bool(verbose or files_executable_only),
+                    filter_ip=timeline_ip,
+                    hostname_query=hostname_name,
+                    port_filter=stream_port,
+                    search_query=stream_search,
+                    executable_only=files_executable_only,
+                    packets=packets,
                 )
                 if summarize_rollups:
                     rollups.setdefault("files", []).append(files_summary)
                 else:
-                    print(render_files_summary(files_summary, verbose=verbose))
+                    print(
+                        render_files_summary(
+                            files_summary,
+                            verbose=bool(verbose or files_executable_only),
+                        )
+                    )
                 export_summaries["files"] = files_summary
             elif step == "protocols" and show_protocols:
                 proto_summary = analyze_protocols(path, show_status=step_status)
@@ -2026,7 +2771,7 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("services", []).append(svc_summary)
                 else:
-                    print(render_services_summary(svc_summary))
+                    print(render_services_summary(svc_summary, verbose=verbose))
                 export_summaries["services"] = svc_summary
                 if baseline_requested:
                     baseline_service_summaries.append(svc_summary)
@@ -2069,14 +2814,18 @@ def _analyze_paths(
                     print(render_obfuscation_summary(ob_summary))
                 export_summaries["obfuscation"] = ob_summary
             elif step == "creds" and show_creds:
-                creds_summary = analyze_creds(path, show_status=step_status, packets=packets, meta=meta)
+                creds_summary = analyze_creds(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("creds", []).append(creds_summary)
                 else:
                     print(render_creds_summary(creds_summary))
                 export_summaries["creds"] = creds_summary
             elif step == "secrets" and show_secrets_scan:
-                secrets_summary = analyze_secrets(path, show_status=step_status, packets=packets, meta=meta)
+                secrets_summary = analyze_secrets(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("secrets", []).append(secrets_summary)
                 else:
@@ -2097,11 +2846,15 @@ def _analyze_paths(
                     print(render_health_summary(health_summary))
                 export_summaries["health"] = health_summary
             elif step == "compromised" and show_compromised:
-                compromised_summary = analyze_compromised(path, show_status=step_status)
+                compromised_summary = analyze_compromised(
+                    path, show_status=step_status, vt_lookup=dns_vt
+                )
                 if summarize_rollups:
                     rollups.setdefault("compromised", []).append(compromised_summary)
                 else:
-                    print(render_compromised_summary(compromised_summary, verbose=verbose))
+                    print(
+                        render_compromised_summary(compromised_summary, verbose=verbose)
+                    )
                 export_summaries["compromised"] = compromised_summary
             elif step == "pcapmeta" and show_pcapmeta:
                 meta_summary = analyze_pcapmeta(path, show_status=step_status)
@@ -2116,18 +2869,24 @@ def _analyze_paths(
                     show_status=step_status,
                     packets=packets,
                     meta=meta,
-                    follow=follow_stream,
-                    follow_id=follow_stream_id,
-                    lookup_id=lookup_stream_id,
+                    stream_id=stream_id,
+                    stream_search=stream_search,
                     streams_full=streams_full,
+                    filter_ip=timeline_ip,
+                    filter_port=stream_port,
+                    established_only=streams_established,
                 )
                 if summarize_rollups:
                     rollups.setdefault("streams", []).append(stream_summary)
                 else:
-                    print(render_streams_summary(stream_summary))
+                    print(render_streams_summary(stream_summary, verbose=verbose))
                 export_summaries["streams"] = stream_summary
             elif step == "carve" and show_carve:
-                base_dir = _resolve_misc_path(carve_out) if carve_out else ((case_dir / "carved") if case_dir else Path("carved"))
+                base_dir = (
+                    _resolve_misc_path(carve_out)
+                    if carve_out
+                    else ((case_dir / "carved") if case_dir else Path("carved"))
+                )
                 out_dir = base_dir / (path.stem if len(paths) > 1 else "")
                 carve_summary = analyze_carving(
                     path,
@@ -2150,7 +2909,9 @@ def _analyze_paths(
                     print(render_ctf_summary(ctf_summary))
                 export_summaries["ctf"] = ctf_summary
             elif step == "ioc" and show_ioc and ioc_file:
-                ioc_summary = analyze_iocs(path, Path(ioc_file), show_status=step_status)
+                ioc_summary = analyze_iocs(
+                    path, Path(ioc_file), show_status=step_status
+                )
                 if summarize_rollups:
                     rollups.setdefault("ioc", []).append(ioc_summary)
                 else:
@@ -2163,31 +2924,67 @@ def _analyze_paths(
                 else:
                     print(render_opc_classic_summary(opc_summary))
                 export_summaries["opc_classic"] = opc_summary
-            elif step == "hosts" and show_hosts:
-                hosts_summary = analyze_hosts(path, show_status=step_status)
+            elif step == "hostnames" and show_hostnames:
+                hostname_summary = analyze_hostname(
+                    path,
+                    timeline_ip,
+                    show_status=step_status,
+                    include_related=bool(timeline_ip),
+                    hostname_query=hostname_name,
+                    port_filter=stream_port,
+                    search_query=stream_search,
+                    apply_filters=False,
+                )
                 if summarize_rollups:
-                    rollups.setdefault("hosts", []).append(hosts_summary)
+                    rollups.setdefault("hostnames", []).append(hostname_summary)
                 else:
-                    print(render_hosts_summary(hosts_summary, verbose=verbose))
-                export_summaries["hosts"] = hosts_summary
-                if baseline_requested:
-                    baseline_host_summaries.append(hosts_summary)
-                if correlate_requested:
-                    correlate_host_summaries.append(hosts_summary)
-            elif step == "hostname" and show_hostname:
-                hostname_summary = analyze_hostname(path, timeline_ip, show_status=step_status)
-                if summarize_rollups:
-                    rollups.setdefault("hostname", []).append(hostname_summary)
-                else:
-                    print(render_hostname_summary(hostname_summary, verbose=verbose))
-                export_summaries["hostname"] = hostname_summary
-            elif step == "hostdetails" and show_hostdetails and timeline_ip:
-                hostdetails_summary = analyze_hostdetails(path, timeline_ip, show_status=step_status)
-                if summarize_rollups:
-                    rollups.setdefault("hostdetails", []).append(hostdetails_summary)
-                else:
-                    print(render_hostdetails_summary(hostdetails_summary, verbose=verbose))
-                export_summaries["hostdetails"] = hostdetails_summary
+                    print(
+                        render_hostname_summary(
+                            hostname_summary, limit=10_000, verbose=True
+                        )
+                    )
+                export_summaries["hostnames"] = hostname_summary
+            elif step == "hostdetails" and show_hostdetails:
+                target_ips = _discover_hostdetails_targets(
+                    path,
+                    target_ip_value=timeline_ip,
+                    hostname_value=hostname_name,
+                    port_value=stream_port,
+                    search_value=stream_search,
+                    step_status=step_status,
+                )
+                if not target_ips:
+                    _print_error(
+                        "No host targets matched --hostdetails filters (-ip/-name/-port/-search)."
+                    )
+                    continue
+
+                hostdetails_results: list[object] = []
+                for target_ip in target_ips:
+                    hostdetails_summary = analyze_hostdetails(
+                        path,
+                        target_ip,
+                        show_status=step_status,
+                        hostname_query=hostname_name,
+                        port_filter=stream_port,
+                        search_query=stream_search,
+                        services_summary=export_summaries.get("services"),
+                        smb_summary=export_summaries.get("smb"),
+                        file_summary=export_summaries.get("files"),
+                        threats_summary=export_summaries.get("threats"),
+                        timeline_summary=export_summaries.get("timeline"),
+                    )
+                    hostdetails_results.append(hostdetails_summary)
+                    if summarize_rollups:
+                        rollups.setdefault("hostdetails", []).append(hostdetails_summary)
+                    else:
+                        print(
+                            render_hostdetails_summary(
+                                hostdetails_summary, verbose=True
+                            )
+                        )
+                if hostdetails_results:
+                    export_summaries["hostdetails"] = hostdetails_results[-1]
             elif step == "timeline" and show_timeline and timeline_ip:
                 timeline_summary = analyze_timeline(
                     path,
@@ -2196,6 +2993,7 @@ def _analyze_paths(
                     timeline_bins=timeline_bins,
                     timeline_storyline_off=timeline_storyline_off,
                     categories=timeline_categories,
+                    vt_lookup=dns_vt,
                 )
                 if summarize_rollups:
                     rollups.setdefault("timeline", []).append(timeline_summary)
@@ -2203,21 +3001,27 @@ def _analyze_paths(
                     print(render_timeline_summary(timeline_summary, verbose=verbose))
                 export_summaries["timeline"] = timeline_summary
             elif step == "domain" and show_domain:
-                domain_summary = analyze_domain(path, show_status=step_status, packets=packets, meta=meta)
+                domain_summary = analyze_domain(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("domain", []).append(domain_summary)
                 else:
                     print(render_domain_summary(domain_summary, verbose=verbose))
                 export_summaries["domain"] = domain_summary
             elif step == "ldap" and show_ldap:
-                ldap_summary = analyze_ldap(path, show_status=step_status, packets=packets, meta=meta)
+                ldap_summary = analyze_ldap(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("ldap", []).append(ldap_summary)
                 else:
                     print(render_ldap_summary(ldap_summary, verbose=verbose))
                 export_summaries["ldap"] = ldap_summary
             elif step == "kerberos" and show_kerberos:
-                kerberos_summary = analyze_kerberos(path, show_status=step_status, packets=packets, meta=meta)
+                kerberos_summary = analyze_kerberos(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("kerberos", []).append(kerberos_summary)
                 else:
@@ -2238,7 +3042,9 @@ def _analyze_paths(
                     print(render_netbios_summary(nb_summary))
                 export_summaries["netbios"] = nb_summary
             elif step == "arp" and show_arp:
-                arp_summary = analyze_arp(path, show_status=step_status)
+                arp_summary = analyze_arp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("arp", []).append(arp_summary)
                 else:
@@ -2506,7 +3312,13 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("ot_commands", []).append(summary)
                 else:
-                    print(render_ot_commands_summary(summary, session_limit=ot_commands_sessions_limit, verbose=verbose))
+                    print(
+                        render_ot_commands_summary(
+                            summary,
+                            session_limit=ot_commands_sessions_limit,
+                            verbose=verbose,
+                        )
+                    )
                 export_summaries["ot_commands"] = summary
                 if baseline_requested:
                     baseline_ot_summaries.append(summary)
@@ -2521,14 +3333,18 @@ def _analyze_paths(
                 spec = plugin_lookup[step]
                 if spec.analyze is None:
                     continue
-                summary = spec.analyze(path, show_status=step_status, packets=packets, meta=meta)
+                summary = spec.analyze(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault(step, []).append(summary)
                 else:
                     print(_render_plugin_summary(spec, summary, verbose=verbose))
                 export_summaries[spec.export_key or spec.name] = summary
         if ruleset:
-            rules_summary = apply_rules(path, ruleset, collect_detections(export_summaries))
+            rules_summary = apply_rules(
+                path, ruleset, collect_detections(export_summaries)
+            )
             if summarize_rollups:
                 rules_rollups.append(rules_summary)
             else:
@@ -2538,16 +3354,30 @@ def _analyze_paths(
         if decrypt_config and decrypt_config.enabled:
             decrypt_summaries = []
             if decrypt_config.tls_keylog:
-                tls_out_dir = decrypt_config.output_dir / (path.stem if len(paths) > 1 else "")
+                tls_out_dir = decrypt_config.output_dir / (
+                    path.stem if len(paths) > 1 else ""
+                )
                 tls_out_dir = tls_out_dir / "tls"
                 decrypt_summaries.append(
-                    decrypt_tls(path, decrypt_config.tls_keylog, tls_out_dir, decrypt_config.limit)
+                    decrypt_tls(
+                        path,
+                        decrypt_config.tls_keylog,
+                        tls_out_dir,
+                        decrypt_config.limit,
+                    )
                 )
             if decrypt_config.ssh_keylog:
-                ssh_out_dir = decrypt_config.output_dir / (path.stem if len(paths) > 1 else "")
+                ssh_out_dir = decrypt_config.output_dir / (
+                    path.stem if len(paths) > 1 else ""
+                )
                 ssh_out_dir = ssh_out_dir / "ssh"
                 decrypt_summaries.append(
-                    decrypt_ssh(path, decrypt_config.ssh_keylog, ssh_out_dir, decrypt_config.limit)
+                    decrypt_ssh(
+                        path,
+                        decrypt_config.ssh_keylog,
+                        ssh_out_dir,
+                        decrypt_config.limit,
+                    )
                 )
             if decrypt_summaries:
                 if summarize_rollups:
@@ -2557,14 +3387,20 @@ def _analyze_paths(
                         print(render_decrypt_summary(summary))
                 export_summaries["decrypt"] = decrypt_summaries
 
-        if (export_json_path or export_csv_path or export_sqlite_path) and not summarize_rollups:
+        if (
+            export_json_path or export_csv_path or export_sqlite_path
+        ) and not summarize_rollups:
             bundle = ExportBundle(path=path, summaries=export_summaries)
             if export_json_path:
-                export_json(bundle, _resolve_export_path(export_json_path, path, "json"))
+                export_json(
+                    bundle, _resolve_export_path(export_json_path, path, "json")
+                )
             if export_csv_path:
                 export_csv(bundle, _resolve_export_path(export_csv_path, path, "csv"))
             if export_sqlite_path:
-                export_sqlite(bundle, _resolve_export_path(export_sqlite_path, path, "sqlite"))
+                export_sqlite(
+                    bundle, _resolve_export_path(export_sqlite_path, path, "sqlite")
+                )
 
         _log_event(
             log_config,
@@ -2574,6 +3410,8 @@ def _analyze_paths(
             total=len(paths),
             summaries=sorted(export_summaries.keys()),
         )
+        if ip_scope_enabled_for_path:
+            clear_forced_packet_view(path)
         if idx < len(paths):
             print()
 
@@ -2581,12 +3419,12 @@ def _analyze_paths(
     if correlate_requested:
         if len(paths) > 1:
             correlation_summary = correlate(
-                correlate_host_summaries,
+                [],
                 correlate_service_summaries,
                 min_count=max(2, int(correlate_min or 2)),
             )
         else:
-            print("Correlation requires multiple pcaps.")
+            _print_error("Correlation requires multiple pcaps.")
 
     if summarize_rollups:
         if base_rollups:
@@ -2595,35 +3433,157 @@ def _analyze_paths(
             if rollups or modbus_rollups or dnp3_rollups:
                 print()
         merge_handlers: dict[str, tuple[callable, callable]] = {
-            "ips": (merge_ips_summaries, lambda s: render_ips_summary(s, verbose=verbose)),
-            "timeline": (merge_timeline_summaries, lambda s: render_timeline_summary(s, verbose=verbose)),
-            "compromised": (merge_compromised_summaries, lambda s: render_compromised_summary(s, verbose=verbose)),
-            "hosts": (merge_hosts_summaries, lambda s: render_hosts_summary(s, verbose=verbose)),
-            "hostname": (merge_hostname_summaries, lambda s: render_hostname_summary(s, verbose=verbose)),
-            "hostdetails": (merge_hostdetails_summaries, lambda s: render_hostdetails_summary(s, verbose=verbose)),
-            "ftp": (merge_ftp_summaries, lambda s: render_ftp_summary(s, verbose=verbose)),
-            "aim": (merge_aim_summaries, lambda s: render_aim_summary(s, verbose=verbose)),
-            "ssh": (merge_ssh_summaries, lambda s: render_ssh_summary(s, verbose=verbose)),
-            "protocols": (merge_protocols_summaries, lambda s: render_protocols_summary(s, verbose=verbose)),
-            "routing": (merge_routing_summaries, lambda s: render_routing_summary(s, verbose=verbose)),
-            "services": (merge_services_summaries, render_services_summary),
+            "ips": (
+                merge_ips_summaries,
+                lambda s: render_ips_summary(s, verbose=verbose),
+            ),
+            "timeline": (
+                merge_timeline_summaries,
+                lambda s: render_timeline_summary(s, verbose=verbose),
+            ),
+            "compromised": (
+                merge_compromised_summaries,
+                lambda s: render_compromised_summary(s, verbose=verbose),
+            ),
+            "hostnames": (
+                merge_hostname_summaries,
+                lambda s: render_hostname_summary(s, limit=10_000, verbose=True),
+            ),
+            "hostdetails": (
+                merge_hostdetails_summaries,
+                lambda s: render_hostdetails_summary(s, verbose=True),
+            ),
+            "webrequests": (
+                merge_webrequests_summaries,
+                lambda s: render_webrequests_summary(
+                    s,
+                    verbose=bool(verbose or webrequests_high_only),
+                    view=(
+                        "full"
+                        if (
+                            webrequests_host_view
+                            or webrequests_post_only
+                            or webrequests_high_only
+                            or bool(stream_search)
+                            or bool(timeline_ip)
+                        )
+                        else "minimal"
+                    ),
+                ),
+            ),
+            "ftp": (
+                merge_ftp_summaries,
+                lambda s: render_ftp_summary(s, verbose=verbose),
+            ),
+            "aim": (
+                merge_aim_summaries,
+                lambda s: render_aim_summary(s, verbose=verbose),
+            ),
+            "ssh": (
+                merge_ssh_summaries,
+                lambda s: render_ssh_summary(s, verbose=verbose),
+            ),
+            "protocols": (
+                merge_protocols_summaries,
+                lambda s: render_protocols_summary(s, verbose=verbose),
+            ),
+            "routing": (
+                merge_routing_summaries,
+                lambda s: render_routing_summary(s, verbose=verbose),
+            ),
+            "services": (
+                merge_services_summaries,
+                lambda s: render_services_summary(s, verbose=verbose),
+            ),
             "health": (merge_health_summaries, render_health_summary),
-            "rdp": (merge_rdp_summaries, lambda s: render_rdp_summary(s, verbose=verbose)),
-            "telnet": (merge_telnet_summaries, lambda s: render_telnet_summary(s, verbose=verbose)),
-            "vnc": (merge_vnc_summaries, lambda s: render_vnc_summary(s, verbose=verbose)),
-            "teamviewer": (merge_teamviewer_summaries, lambda s: render_teamviewer_summary(s, verbose=verbose)),
-            "winrm": (merge_winrm_summaries, lambda s: render_winrm_summary(s, verbose=verbose)),
-            "wmic": (merge_wmic_summaries, lambda s: render_wmic_summary(s, verbose=verbose)),
-            "powershell": (merge_powershell_summaries, lambda s: render_powershell_summary(s, verbose=verbose)),
-            "threats": (merge_threats_summaries, lambda s: render_threats_summary(s, verbose=verbose)),
-            "suricata": (merge_threats_summaries, lambda s: render_threats_summary(s, verbose=verbose)),
-            "mitre": (merge_mitre_summaries, lambda s: render_mitre_summary(s, verbose=verbose)),
-            "snmp": (merge_snmp_summaries, lambda s: render_snmp_summary(s, verbose=verbose)),
-            "smtp": (merge_smtp_summaries, lambda s: render_smtp_summary(s, verbose=verbose)),
-            "rpc": (merge_rpc_summaries, lambda s: render_rpc_summary(s, verbose=verbose)),
+            "rdp": (
+                merge_rdp_summaries,
+                lambda s: render_rdp_summary(s, verbose=verbose),
+            ),
+            "telnet": (
+                merge_telnet_summaries,
+                lambda s: render_telnet_summary(s, verbose=verbose),
+            ),
+            "vnc": (
+                merge_vnc_summaries,
+                lambda s: render_vnc_summary(s, verbose=verbose),
+            ),
+            "teamviewer": (
+                merge_teamviewer_summaries,
+                lambda s: render_teamviewer_summary(s, verbose=verbose),
+            ),
+            "winrm": (
+                merge_winrm_summaries,
+                lambda s: render_winrm_summary(s, verbose=verbose),
+            ),
+            "wmic": (
+                merge_wmic_summaries,
+                lambda s: render_wmic_summary(s, verbose=verbose),
+            ),
+            "powershell": (
+                merge_powershell_summaries,
+                lambda s: render_powershell_summary(s, verbose=verbose),
+            ),
+            "malware": (
+                merge_malware_summaries,
+                lambda s: render_malware_summary(s, verbose=verbose),
+            ),
+            "dhcp": (
+                merge_dhcp_summaries,
+                lambda s: render_dhcp_summary(s, verbose=verbose),
+            ),
+            "arp": (
+                merge_arp_summaries,
+                lambda s: render_arp_summary(s, verbose=verbose),
+            ),
+            "threats": (
+                merge_threats_summaries,
+                lambda s: render_threats_summary(s, verbose=verbose),
+            ),
+            "suricata": (
+                merge_threats_summaries,
+                lambda s: render_threats_summary(s, verbose=verbose),
+            ),
+            "mitre": (
+                merge_mitre_summaries,
+                lambda s: render_mitre_summary(s, verbose=verbose),
+            ),
+            "qos": (
+                merge_qos_summaries,
+                lambda s: render_qos_summary(s, verbose=verbose),
+            ),
+            "wlan": (merge_wlan_summaries, render_wlan_summary),
+            "snmp": (
+                merge_snmp_summaries,
+                lambda s: render_snmp_summary(s, verbose=verbose),
+            ),
+            "smtp": (
+                merge_smtp_summaries,
+                lambda s: render_smtp_summary(s, verbose=verbose),
+            ),
+            "email": (
+                merge_email_summaries,
+                lambda s: render_email_summary(
+                    s, verbose=verbose, show_timeline=show_timeline
+                ),
+            ),
+            "scan": (
+                merge_scan_summaries,
+                lambda s: render_scan_summary(s, verbose=verbose),
+            ),
+            "rpc": (
+                merge_rpc_summaries,
+                lambda s: render_rpc_summary(s, verbose=verbose),
+            ),
             "enip": (merge_enip_summaries, render_enip_summary),
             "cip": (merge_cip_summaries, render_cip_summary),
-            "files": (merge_files_summaries, lambda s: render_files_summary(s, verbose=verbose)),
+            "creds": (merge_creds_summaries, render_creds_summary),
+            "files": (
+                merge_files_summaries,
+                lambda s: render_files_summary(
+                    s, verbose=bool(verbose or files_executable_only)
+                ),
+            ),
             "obfuscation": (merge_obfuscation_summaries, render_obfuscation_summary),
             "carve": (merge_carve_summaries, render_carve_summary),
             "control_loop": (merge_control_loop_summaries, render_control_loop_summary),
@@ -2635,6 +3595,7 @@ def _analyze_paths(
             "icmp": "ICMP ANALYSIS",
             "dns": "DNS ANALYSIS",
             "http": "HTTP ANALYSIS",
+            "webrequests": "WEB REQUESTS ANALYSIS",
             "ftp": "FTP ANALYSIS",
             "aim": "AIM ANALYSIS",
             "tls": "TLS/HTTPS ANALYSIS",
@@ -2646,23 +3607,31 @@ def _analyze_paths(
             "winrm": "WINRM ANALYSIS",
             "wmic": "WMIC/WMI ANALYSIS",
             "powershell": "POWERSHELL ANALYSIS",
+            "malware": "MALWARE HUNTING ANALYSIS",
             "syslog": "SYSLOG ANALYSIS",
             "snmp": "SNMP ANALYSIS",
             "smtp": "SMTP ANALYSIS",
+            "email": "EMAIL ANALYSIS",
             "rpc": "RPC ANALYSIS",
             "tcp": "TCP ANALYSIS",
             "udp": "UDP ANALYSIS",
             "exfil": "EXFILTRATION ANALYSIS",
             "sizes": "PACKET SIZE ANALYSIS",
             "ips": "IP INTELLIGENCE ANALYSIS",
+            "ip_lookup": "MAC -> IP LOOKUP",
+            "mac_lookup": "IP -> MAC LOOKUP",
             "beacon": "BEACON ANALYSIS",
+            "scan": "SCAN REPORT",
             "threats": "THREAT DETECTIONS",
             "suricata": "SURICATA IDS",
             "mitre": "MITRE ATT&CK MAPPING",
             "quic": "QUIC ANALYSIS",
+            "qos": "QOS ANALYSIS",
+            "wlan": "WLAN ANALYSIS",
             "http2": "HTTP/2 ANALYSIS",
             "encrypted_dns": "ENCRYPTED DNS ANALYSIS",
             "ntp": "NTP ANALYSIS",
+            "ssdp": "SSDP ANALYSIS",
             "vpn": "VPN/TUNNEL ANALYSIS",
             "files": "FILE TRANSFER ANALYSIS",
             "protocols": "PROTOCOL ANALYSIS",
@@ -2676,8 +3645,7 @@ def _analyze_paths(
             "certificates": "CERTIFICATE ANALYSIS",
             "health": "TRAFFIC HEALTH ANALYSIS",
             "compromised": "COMPROMISE ASSESSMENT",
-            "hosts": "HOST INVENTORY",
-            "hostname": "HOSTNAME DISCOVERY",
+            "hostnames": "HOSTNAME DISCOVERY",
             "hostdetails": "HOST DETAILS",
             "timeline": "TIMELINE ANALYSIS",
             "domain": "DOMAIN ANALYSIS",
@@ -2735,7 +3703,9 @@ def _analyze_paths(
             if spec.merge and spec.render:
                 merge_handlers[spec.name] = (
                     spec.merge,
-                    lambda s, _spec=spec: _render_plugin_summary(_spec, s, verbose=verbose),
+                    lambda s, _spec=spec: _render_plugin_summary(
+                        _spec, s, verbose=verbose
+                    ),
                 )
         ordered_rollups = [step for step in ordered_steps if rollups.get(step)]
         for step in ordered_rollups:
@@ -2751,7 +3721,11 @@ def _analyze_paths(
                     merged = merge_fn(rollups[step])
                     print(render_fn(merged))
                 else:
-                    print(render_generic_rollup(title_map.get(step, step.upper()), rollups[step]))
+                    print(
+                        render_generic_rollup(
+                            title_map.get(step, step.upper()), rollups[step]
+                        )
+                    )
                 print()
         if rollups.get("vlan"):
             print(render_vlan_rollup(rollups["vlan"], verbose=verbose))
@@ -2762,7 +3736,7 @@ def _analyze_paths(
                 print()
         if show_dnp3 and dnp3_rollups:
             print(render_dnp3_rollup(dnp3_rollups))
-        if (export_json_path or export_csv_path or export_sqlite_path):
+        if export_json_path or export_csv_path or export_sqlite_path:
             merged_summaries: dict[str, object] = {}
             if base_rollups:
                 merged_summaries["base"] = merge_pcap_summaries(base_rollups)
@@ -2808,28 +3782,41 @@ def _analyze_paths(
                         protocol=proto,
                         keylog_path=existing.keylog_path,
                         output_dir=existing.output_dir,
-                        stream_count=existing.stream_count + getattr(item, "stream_count", 0),
-                        outputs=list(existing.outputs) + list(getattr(item, "outputs", []) or []),
-                        errors=list(existing.errors) + list(getattr(item, "errors", []) or []),
-                        notes=list(existing.notes) + list(getattr(item, "notes", []) or []),
+                        stream_count=existing.stream_count
+                        + getattr(item, "stream_count", 0),
+                        outputs=list(existing.outputs)
+                        + list(getattr(item, "outputs", []) or []),
+                        errors=list(existing.errors)
+                        + list(getattr(item, "errors", []) or []),
+                        notes=list(existing.notes)
+                        + list(getattr(item, "notes", []) or []),
                     )
             for summary in merged_by_proto.values():
                 print(render_decrypt_summary(summary))
 
     if correlation_summary:
-        print(render_correlation_summary(correlation_summary, min_count=correlate_min, verbose=verbose))
+        print(
+            render_correlation_summary(
+                correlation_summary, min_count=correlate_min, verbose=verbose
+            )
+        )
 
     if baseline_requested:
         current_baseline = build_baseline(
             __version__,
             [str(item) for item in paths],
-            baseline_host_summaries,
+            [],
             baseline_service_summaries,
             baseline_ot_summaries,
         )
         if baseline_save:
             out_path = _resolve_misc_path(Path(baseline_save).expanduser())
-            safe_write_text(out_path, json.dumps(current_baseline.to_dict(), indent=2), encoding="utf-8", context="baseline save")
+            safe_write_text(
+                out_path,
+                json.dumps(current_baseline.to_dict(), indent=2),
+                encoding="utf-8",
+                context="baseline save",
+            )
             print(f"Baseline saved to {out_path}")
         if baseline_compare:
             compare_path = _resolve_misc_path(Path(baseline_compare).expanduser())
@@ -2838,7 +3825,12 @@ def _analyze_paths(
                 delta = compare_baseline(current_baseline, baseline_loaded)
                 print(render_baseline_delta(delta))
             except Exception as exc:
-                print(f"Baseline compare error: {exc}")
+                _print_error(f"Baseline compare error: {exc}")
+    if suricata_strict and suricata_scans:
+        print(
+            "Suricata strict mode summary: "
+            f"{suricata_strict_failures} failure(s) across {suricata_scans} scan(s)."
+        )
     if suricata_strict and suricata_strict_failures:
         return 2
     return 0
@@ -2847,20 +3839,23 @@ def _analyze_paths(
 def main() -> int:
     plugins, plugin_errors = _filtered_plugins(_builtin_flag_map())
     parser = build_parser(plugins)
+    if _handle_help_request(parser, plugins, sys.argv[1:]):
+        return 0
     if len(sys.argv) == 1:
         print(_build_banner())
         print("Usage: pcapper <target> [options]")
         print("Run with -h for full help and options.")
         return 0
     args = parser.parse_args()
-    config_path = find_config(getattr(args, "config", None) or os.environ.get("PCAPPER_CONFIG"))
+    config_path = find_config(
+        getattr(args, "config", None) or os.environ.get("PCAPPER_CONFIG")
+    )
     config_result = load_config(config_path)
     _apply_config_defaults(parser, args, config_result.data, sys.argv[1:])
     baseline_save = getattr(args, "baseline_save", None)
     baseline_compare = getattr(args, "baseline_compare", None)
     baseline_requested = bool(baseline_save or baseline_compare)
     if baseline_requested:
-        args.hosts = True
         args.services = True
         args.ot_commands = True
         if getattr(args, "baseline_fast", False):
@@ -2868,7 +3863,6 @@ def main() -> int:
 
     correlate_requested = bool(getattr(args, "correlate", False))
     if correlate_requested:
-        args.hosts = True
         args.services = True
 
     ruleset: list[Rule] | None = None
@@ -2876,7 +3870,23 @@ def main() -> int:
     if getattr(args, "rules", None):
         ruleset, rules_errors = load_rules(Path(args.rules).expanduser())
     log_config = _build_log_config(args)
-    _log_event(log_config, "start", version=__version__, config=str(config_result.path) if config_result.path else "")
+    _log_event(
+        log_config,
+        "start",
+        version=__version__,
+        config=str(config_result.path) if config_result.path else "",
+    )
+    raw_targets = args.target if isinstance(args.target, list) else [args.target]
+    if (
+        not raw_targets
+        and not getattr(args, "list_plugins", False)
+        and not getattr(args, "self_check", False)
+    ):
+        _print_error(
+            "At least one target is required unless using --self-check or --list-plugins."
+        )
+        parser.print_usage(sys.stderr)
+        return 2
     print(_build_banner())
     if rules_errors:
         print("Rule load warnings:")
@@ -2918,100 +3928,209 @@ def main() -> int:
     if getattr(args, "ot_commands_fast", False):
         args.ot_commands = True
 
-    timeline_categories, show_category_list, invalid_categories = _parse_timeline_categories(
-        getattr(args, "timeline_categories", None)
+    timeline_categories, show_category_list, invalid_categories = (
+        _parse_timeline_categories(getattr(args, "timeline_categories", None))
     )
     if show_category_list:
         _print_timeline_categories()
         return 0
     if invalid_categories:
-        invalid_text = ", ".join(item.strip() for item in invalid_categories if item.strip())
+        invalid_text = ", ".join(
+            item.strip() for item in invalid_categories if item.strip()
+        )
         if invalid_text:
-            print(f"Unknown timeline categories: {invalid_text}")
+            _print_error(f"Unknown timeline categories: {invalid_text}")
         _print_timeline_categories()
         return 2
 
     if args.no_color:
         set_color_override(False)
     set_verbose_output(args.verbose)
-    if getattr(args, "vt", False) and not args.dns:
-        args.dns = True
-    if getattr(args, "vt", False) and "dns" not in ordered_steps:
+    if (
+        getattr(args, "vt", False)
+        and getattr(args, "dns", False)
+        and "dns" not in ordered_steps
+    ):
         ordered_steps.append("dns")
 
     if args.limit_protocols <= 0:
-        print("--limit-protocols must be a positive integer.")
+        _print_error("--limit-protocols must be a positive integer.")
         return 2
     if getattr(args, "packet", None) is not None and args.packet <= 0:
-        print("--packet must be a positive integer.")
+        _print_error("--packet must be a positive integer.")
         return 2
     if getattr(args, "ot_commands_sessions", 10) <= 0:
-        print("--ot-commands-sessions must be a positive integer.")
+        _print_error("--ot-commands-sessions must be a positive integer.")
         return 2
+    if getattr(args, "stream_port", None) is not None:
+        if args.stream_port <= 0 or args.stream_port > 65535:
+            _print_error("-port must be in the range 1-65535.")
+            return 2
     if args.timeline_bins <= 0:
-        print("--timeline-bins must be a positive integer.")
+        _print_error("--timeline-bins must be a positive integer.")
         return 2
     if getattr(args, "carve_limit", 1) <= 0:
-        print("--carve-limit must be a positive integer.")
+        _print_error("--carve-limit must be a positive integer.")
         return 2
     if getattr(args, "carve_max_bytes", 1) <= 0:
-        print("--carve-max-bytes must be a positive integer.")
+        _print_error("--carve-max-bytes must be a positive integer.")
         return 2
     if getattr(args, "carve_stream_bytes", 1) <= 0:
-        print("--carve-stream-bytes must be a positive integer.")
+        _print_error("--carve-stream-bytes must be a positive integer.")
         return 2
     if getattr(args, "correlate_min", 1) <= 0:
-        print("--correlate-min must be a positive integer.")
+        _print_error("--correlate-min must be a positive integer.")
         return 2
     if args.profile_out and not args.profile:
-        print("--profile-out requires --profile.")
+        _print_error("--profile-out requires --profile.")
         return 2
 
-    if args.timeline and not args.timeline_ip:
-        print("Timeline analysis requires a target IP. Use -ip <address> with --timeline.")
+    if args.timeline and not args.timeline_ip and not getattr(args, "email", False):
+        _print_error(
+            "Timeline analysis requires a target IP. Use -ip <address> with --timeline."
+        )
         return 2
-    if args.hostdetails and not args.timeline_ip:
-        print("Host details analysis requires a target IP. Use -ip <address> with --hostdetails.")
+    if getattr(args, "webrequests_post_only", False) and not getattr(
+        args, "webrequests", False
+    ):
+        _print_error("-post requires --webrequests.")
         return 2
+    if getattr(args, "webrequests_high_only", False) and not getattr(
+        args, "webrequests", False
+    ):
+        _print_error("-high requires --webrequests.")
+        return 2
+    if getattr(args, "webrequests_host_view", False) and not getattr(
+        args, "webrequests", False
+    ):
+        _print_error("-host requires --webrequests.")
+        return 2
+    if getattr(args, "files_executable_only", False) and not getattr(
+        args, "files", False
+    ):
+        _print_error("-exe requires --files.")
+        return 2
+    if getattr(args, "hostname_name", None) and not (
+        getattr(args, "hostnames", False)
+        or getattr(args, "hostdetails", False)
+        or getattr(args, "http", False)
+        or getattr(args, "tls", False)
+        or getattr(args, "tlsm", False)
+        or getattr(args, "files", False)
+    ):
+        _print_error("-name requires --hostnames, --hostdetails, --http, --tls/--tlsm, or --files.")
+        return 2
+    if args.hostdetails and not (
+        args.timeline_ip
+        or getattr(args, "hostname_name", None)
+        or getattr(args, "stream_port", None) is not None
+        or getattr(args, "stream_search", None)
+    ):
+        _print_error(
+            "--hostdetails requires at least one filter: -ip, -name, -port, or -search."
+        )
+        return 2
+    ip_target_scope_requested = bool(
+        args.timeline_ip
+        and (
+            args.timeline
+            or args.hostdetails
+            or getattr(args, "mac_lookup", False)
+            or any(step in _IP_TARGET_FILTER_STEPS for step in ordered_steps)
+        )
+    )
+    if ip_target_scope_requested:
+        try:
+            ipaddress.ip_address(str(args.timeline_ip))
+        except ValueError:
+            _print_error("Invalid -ip value. Provide a valid IPv4/IPv6 address.")
+            return 2
     if args.ioc and not args.ioc_file:
-        print("IOC analysis requires --ioc-file <path>.")
+        _print_error("IOC analysis requires --ioc-file <path>.")
         return 2
-    if getattr(args, "follow", None) and getattr(args, "follow_id", None):
-        print("Use only one of --follow or --follow-id.")
+    if getattr(args, "stream_id", None) and not getattr(args, "streams", False):
+        _print_error("-id requires --streams.")
         return 2
-    if getattr(args, "lookup_stream_id", None) and not getattr(args, "streams", False):
-        print("--lookup-stream-id requires --streams.")
+    if getattr(args, "stream_search", None) and not (
+        getattr(args, "streams", False)
+        or getattr(args, "webrequests", False)
+        or getattr(args, "hostnames", False)
+        or getattr(args, "hostdetails", False)
+        or getattr(args, "http", False)
+        or getattr(args, "tls", False)
+        or getattr(args, "tlsm", False)
+        or getattr(args, "files", False)
+    ):
+        _print_error(
+            "-search requires --streams, --webrequests, --hostnames, --hostdetails, --http, --tls/--tlsm, or --files."
+        )
         return 2
+    if getattr(args, "stream_port", None) is not None and not (
+        getattr(args, "streams", False)
+        or getattr(args, "hostnames", False)
+        or getattr(args, "hostdetails", False)
+        or getattr(args, "http", False)
+        or getattr(args, "tls", False)
+        or getattr(args, "tlsm", False)
+        or getattr(args, "files", False)
+    ):
+        _print_error("-port requires --streams, --hostnames, --hostdetails, --http, --tls/--tlsm, or --files.")
+        return 2
+    if getattr(args, "streams_established", False) and not getattr(
+        args, "streams", False
+    ):
+        _print_error("-established requires --streams.")
+        return 2
+    if getattr(args, "ip_lookup", False) and getattr(args, "lookup_mac", None):
+        mac_value = str(getattr(args, "lookup_mac", "") or "").strip()
+        canonical = re.sub(r"[^0-9a-fA-F]", "", mac_value)
+        if len(canonical) != 12:
+            _print_error(
+                "Invalid -mac value. Use 12 hex characters (formats like aa:bb:cc:dd:ee:ff are supported)."
+            )
+            return 2
 
     time_start = parse_time_arg(getattr(args, "time_start", None))
     time_end = parse_time_arg(getattr(args, "time_end", None))
     if (args.time_start and time_start is None) or (args.time_end and time_end is None):
-        print("Invalid --time-start or --time-end format. Use epoch seconds or ISO 8601 (e.g. 2025-01-01T00:00:00Z).")
+        _print_error(
+            "Invalid --time-start or --time-end format. Use epoch seconds or ISO 8601 (e.g. 2025-01-01T00:00:00Z)."
+        )
         return 2
-    filters_enabled = _has_packet_filters(getattr(args, "bpf", None), time_start, time_end)
+    filters_enabled = _has_packet_filters(
+        getattr(args, "bpf", None), time_start, time_end
+    )
     if filters_enabled:
         unsupported = _collect_filter_incompatibilities(ordered_steps, plugins)
         if unsupported:
-            print("Packet filtering only supports filter-aware analyzers to avoid mixed-scope output.")
-            print("Run these flags without --bpf/--time-start/--time-end:")
+            _print_error(
+                "Packet filtering only supports filter-aware analyzers to avoid mixed-scope output."
+            )
+            _print_error("Run these flags without --bpf/--time-start/--time-end:")
             for item in unsupported:
-                print(f"  - {item}")
+                _print_error(f"  - {item}")
             return 2
 
     if not is_scapy_available():
-        print("Scapy is required for packet analysis.")
-        print("Install scapy (e.g., `pip install scapy`) or run `--self-check` for diagnostics.")
+        _print_error("Scapy is required for packet analysis.")
+        _print_error(
+            "Install scapy (e.g., `pip install scapy`) or run `--self-check` for diagnostics."
+        )
         return 2
 
     ot_commands_config: OtControlConfig | None = None
     if getattr(args, "ot_commands_config", None):
         try:
-            ot_commands_config = load_ot_control_config(Path(args.ot_commands_config).expanduser())
+            ot_commands_config = load_ot_control_config(
+                Path(args.ot_commands_config).expanduser()
+            )
         except Exception as exc:
-            print(f"Invalid --ot-commands-config: {exc}")
+            _print_error(f"Invalid --ot-commands-config: {exc}")
             return 2
 
-    case_dir = Path(args.case_dir).expanduser() if getattr(args, "case_dir", None) else None
+    case_dir = (
+        Path(args.case_dir).expanduser() if getattr(args, "case_dir", None) else None
+    )
     if case_dir:
         if args.case_name:
             safe_name = _sanitize_case_name(args.case_name)
@@ -3019,9 +4138,21 @@ def main() -> int:
 
     decrypt_config: DecryptConfig | None = None
     if getattr(args, "decrypt", False):
-        tls_keylog = Path(args.tls_keylog).expanduser() if getattr(args, "tls_keylog", None) else None
-        ssh_keylog = Path(args.ssh_keylog).expanduser() if getattr(args, "ssh_keylog", None) else None
-        output_dir = Path(args.decrypt_out).expanduser() if getattr(args, "decrypt_out", None) else None
+        tls_keylog = (
+            Path(args.tls_keylog).expanduser()
+            if getattr(args, "tls_keylog", None)
+            else None
+        )
+        ssh_keylog = (
+            Path(args.ssh_keylog).expanduser()
+            if getattr(args, "ssh_keylog", None)
+            else None
+        )
+        output_dir = (
+            Path(args.decrypt_out).expanduser()
+            if getattr(args, "decrypt_out", None)
+            else None
+        )
         if output_dir is None:
             output_dir = (case_dir / "decrypted") if case_dir else Path("decrypted")
         decrypt_config = DecryptConfig(
@@ -3032,9 +4163,10 @@ def main() -> int:
             limit=int(getattr(args, "decrypt_limit", 50) or 50),
         )
         if not tls_keylog and not ssh_keylog:
-            print("Decrypt requested but no keylog file provided (--tls-keylog/--ssh-keylog).")
+            _print_error(
+                "Decrypt requested but no keylog file provided (--tls-keylog/--ssh-keylog)."
+            )
 
-    raw_targets = args.target if isinstance(args.target, list) else [args.target]
     paths: list[Path] = []
     seen_paths: set[Path] = set()
 
@@ -3042,9 +4174,13 @@ def main() -> int:
         target = Path(raw_target).expanduser()
 
         if _has_glob_wildcards(str(raw_target)):
-            wildcard_paths = _expand_target_wildcard(Path(raw_target), recursive=args.recursive)
+            wildcard_paths = _expand_target_wildcard(
+                Path(raw_target), recursive=args.recursive
+            )
             if not wildcard_paths:
-                print(f"No pcap/pcapng files found matching pattern: {raw_target}")
+                _print_error(
+                    f"No pcap/pcapng files found matching pattern: {raw_target}"
+                )
                 return 2
             for path in wildcard_paths:
                 if path not in seen_paths:
@@ -3053,12 +4189,12 @@ def main() -> int:
             continue
 
         if not target.exists():
-            print(f"Target not found: {raw_target}")
+            _print_error(f"Target not found: {raw_target}")
             return 2
 
         if target.is_file():
             if not is_supported_pcap(target):
-                print("Target is not a supported pcap/pcapng file.")
+                _print_error("Target is not a supported pcap/pcapng file.")
                 return 2
             resolved = target
             if resolved not in seen_paths:
@@ -3073,16 +4209,48 @@ def main() -> int:
                 paths.append(path)
 
     if not paths:
-        print("No pcap/pcapng files found.")
+        _print_error("No pcap/pcapng files found.")
         return 2
 
-    export_json_path = Path(args.json).expanduser() if getattr(args, "json", None) else None
-    export_csv_path = Path(args.csv).expanduser() if getattr(args, "csv", None) else None
-    export_sqlite_path = Path(args.sqlite).expanduser() if getattr(args, "sqlite", None) else None
+    export_json_path = (
+        Path(args.json).expanduser() if getattr(args, "json", None) else None
+    )
+    export_csv_path = (
+        Path(args.csv).expanduser() if getattr(args, "csv", None) else None
+    )
+    export_sqlite_path = (
+        Path(args.sqlite).expanduser() if getattr(args, "sqlite", None) else None
+    )
     if case_dir and not (export_json_path or export_csv_path or export_sqlite_path):
         export_json_path = case_dir / "pcapper.json"
 
     def _run_analysis() -> int:
+        suricata_rules_path = (
+            Path(args.suricata_rules).expanduser()
+            if getattr(args, "suricata_rules", None)
+            else None
+        )
+        suricata_config_path = (
+            Path(args.suricata_config).expanduser()
+            if getattr(args, "suricata_config", None)
+            else None
+        )
+        if getattr(args, "suricata", False):
+            for label_text, candidate in (
+                ("Suricata rules", suricata_rules_path),
+                ("Suricata config", suricata_config_path),
+            ):
+                if candidate is None:
+                    continue
+                if not candidate.exists():
+                    _print_error(f"{label_text} file not found: {candidate}")
+                    return 2
+                if not candidate.is_file():
+                    _print_error(f"{label_text} path is not a file: {candidate}")
+                    return 2
+                if not os.access(candidate, os.R_OK):
+                    _print_error(f"{label_text} file is not readable: {candidate}")
+                    return 2
         return _analyze_paths(
             paths,
             args.limit_protocols,
@@ -3095,6 +4263,10 @@ def main() -> int:
             show_dns=args.dns,
             dns_vt=args.vt,
             show_http=args.http,
+            show_webrequests=getattr(args, "webrequests", False),
+            webrequests_post_only=bool(getattr(args, "webrequests_post_only", False)),
+            webrequests_high_only=bool(getattr(args, "webrequests_high_only", False)),
+            webrequests_host_view=bool(getattr(args, "webrequests_host_view", False)),
             show_ftp=args.ftp,
             show_aim=getattr(args, "aim", False),
             show_tls=args.tls,
@@ -3106,26 +4278,51 @@ def main() -> int:
             show_winrm=args.winrm,
             show_wmic=args.wmic,
             show_powershell=args.powershell,
+            show_malware=getattr(args, "malware", False),
             show_syslog=args.syslog,
             show_snmp=args.snmp,
             show_smtp=args.smtp,
+            show_email=getattr(args, "email", False),
             show_rpc=args.rpc,
             show_tcp=args.tcp,
             show_udp=args.udp,
             show_exfil=args.exfil,
             show_sizes=args.sizes,
             show_ips=args.ips,
+            show_ip_lookup=getattr(args, "ip_lookup", False),
+            show_mac_lookup=getattr(args, "mac_lookup", False),
             show_beacon=args.beacon,
+            show_scan=getattr(args, "scan", False),
             show_threats=args.threats,
             show_mitre=getattr(args, "mitre", False),
             show_suricata=getattr(args, "suricata", False),
-            suricata_rules=Path(args.suricata_rules).expanduser() if getattr(args, "suricata_rules", None) else None,
-            suricata_config=Path(args.suricata_config).expanduser() if getattr(args, "suricata_config", None) else None,
-            suricata_eve_types={item.strip().lower() for item in str(getattr(args, "suricata_eve_types", "") or "").split(",") if item.strip()} or None,
-            suricata_suppress_sid={item.strip() for item in str(getattr(args, "suricata_suppress_sid", "") or "").split(",") if item.strip()} or None,
-            suricata_only_sid={item.strip() for item in str(getattr(args, "suricata_only_sid", "") or "").split(",") if item.strip()} or None,
+            suricata_rules=suricata_rules_path,
+            suricata_config=suricata_config_path,
+            suricata_eve_types={
+                item.strip().lower()
+                for item in str(getattr(args, "suricata_eve_types", "") or "").split(
+                    ","
+                )
+                if item.strip()
+            }
+            or None,
+            suricata_suppress_sid={
+                item.strip()
+                for item in str(getattr(args, "suricata_suppress_sid", "") or "").split(
+                    ","
+                )
+                if item.strip()
+            }
+            or None,
+            suricata_only_sid={
+                item.strip()
+                for item in str(getattr(args, "suricata_only_sid", "") or "").split(",")
+                if item.strip()
+            }
+            or None,
             suricata_strict=bool(getattr(args, "suricata_strict", False)),
             show_files=args.files,
+            files_executable_only=bool(getattr(args, "files_executable_only", False)),
             show_protocols=args.protocols,
             show_routing=args.routing,
             show_services=args.services,
@@ -3137,11 +4334,12 @@ def main() -> int:
             show_certificates=args.certificates,
             show_health=args.health,
             show_compromised=getattr(args, "compromised", False),
-            show_hosts=getattr(args, "hosts", False),
-            show_hostname=args.hostname,
+            show_hostnames=args.hostnames,
+            hostname_name=getattr(args, "hostname_name", None),
             show_hostdetails=args.hostdetails,
             show_timeline=args.timeline,
             timeline_ip=args.timeline_ip,
+            lookup_mac=getattr(args, "lookup_mac", None),
             timeline_bins=args.timeline_bins,
             timeline_storyline_off=args.timeline_storyline_off,
             timeline_categories=timeline_categories,
@@ -3191,9 +4389,12 @@ def main() -> int:
             ordered_steps=ordered_steps,
             summarize=args.summarize,
             show_quic=getattr(args, "quic", False),
+            show_qos=getattr(args, "qos", False),
+            show_wlan=getattr(args, "wlan", False),
             show_http2=getattr(args, "http2", False),
             show_encrypted_dns=getattr(args, "encrypted_dns", False),
             show_ntp=getattr(args, "ntp", False),
+            show_ssdp=getattr(args, "ssdp", False),
             show_vpn=getattr(args, "vpn", False),
             show_goose=getattr(args, "goose", False),
             show_sv=getattr(args, "sv", False),
@@ -3201,12 +4402,15 @@ def main() -> int:
             show_ptp=getattr(args, "ptp", False),
             show_opc_classic=getattr(args, "opc_classic", False),
             show_streams=getattr(args, "streams", False),
-            follow_stream=getattr(args, "follow", None),
-            follow_stream_id=getattr(args, "follow_id", None),
-            lookup_stream_id=getattr(args, "lookup_stream_id", None),
+            stream_id=getattr(args, "stream_id", None),
+            stream_search=getattr(args, "stream_search", None),
+            stream_port=getattr(args, "stream_port", None),
+            streams_established=getattr(args, "streams_established", False),
             streams_full=getattr(args, "streams_full", False),
             show_carve=getattr(args, "carve", False),
-            carve_out=Path(args.carve_out).expanduser() if getattr(args, "carve_out", None) else None,
+            carve_out=Path(args.carve_out).expanduser()
+            if getattr(args, "carve_out", None)
+            else None,
             carve_limit=getattr(args, "carve_limit", 100),
             carve_max_bytes=getattr(args, "carve_max_bytes", 2 * 1024 * 1024),
             carve_stream_bytes=getattr(args, "carve_stream_bytes", 8 * 1024 * 1024),
@@ -3247,7 +4451,9 @@ def main() -> int:
         case_id = getattr(args, "case_id", None) or getattr(args, "case_name", None)
         if not case_id:
             case_id = end_time.strftime("case-%Y%m%d-%H%M%S")
-        analyst = getattr(args, "case_analyst", None) or os.environ.get("PCAPPER_ANALYST", "")
+        analyst = getattr(args, "case_analyst", None) or os.environ.get(
+            "PCAPPER_ANALYST", ""
+        )
         notes = getattr(args, "case_notes", None) or ""
         metadata = build_case_metadata(
             case_id=str(case_id),
@@ -3260,7 +4466,12 @@ def main() -> int:
             start_time=run_start,
             end_time=end_time,
         )
-        safe_write_text(case_dir / "case.json", json.dumps(metadata.to_dict(), indent=2), encoding="utf-8", context="case metadata")
+        safe_write_text(
+            case_dir / "case.json",
+            json.dumps(metadata.to_dict(), indent=2),
+            encoding="utf-8",
+            context="case metadata",
+        )
 
     run_start = datetime.now(timezone.utc)
     if not args.profile:
