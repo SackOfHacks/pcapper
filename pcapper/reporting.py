@@ -1,79 +1,106 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from pathlib import Path
+import hashlib
 import ipaddress
 import re
-import hashlib
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Protocol
 
-from .models import PcapSummary
-from .utils import format_bytes_as_mb, format_duration, format_speed_bps, format_ts, sparkline, hexdump, decode_payload
-from .coloring import danger, header, label, muted, ok, warn, highlight, orange, danger_bg, warn_bg
-from .vlan import VlanSummary, VlanStat
-from .icmp import IcmpSummary
-from .dns import DnsSummary, PUBLIC_DNS_RESOLVERS
-from .beacon import BeaconSummary
-from .threats import ThreatSummary
-from .files import FileTransferSummary
-from .protocols import ProtocolSummary
-from .services import ServiceSummary, COMMON_PORTS
-from .smb import SmbSummary
-from .nfs import NfsSummary
-from .strings import StringsSummary
-from .creds import CredentialSummary
-from .secrets import SecretsSummary
-from .search import SearchSummary
-from .certificates import CertificateSummary
-from .tls import TlsSummary
-from .ssh import SshSummary
-from .syslog import SyslogSummary
-from .snmp import SnmpSummary
-from .smtp import SmtpSummary
-from .rpc import RpcSummary
-from .tcp import TcpSummary
-from .udp import UdpSummary, UdpConversation
-from .exfil import ExfilSummary
-from .http import HttpSummary
-from .ftp import FtpSummary
 from .aim import AimSummary
-from .sizes import SizeSummary, render_size_sparkline
-from .ips import IpSummary
-from .timeline import TimelineSummary
-from .health import HealthSummary
-from .rdp import RdpSummary
-from .telnet import TelnetSummary
-from .vnc import VncSummary
-from .teamviewer import TeamviewerSummary
-from .winrm import WinrmSummary
-from .wmic import WmicSummary
-from .powershell import PowershellSummary
+from .arp import ArpSummary
+from .beacon import BeaconSummary
+from .certificates import CertificateSummary
+from .coloring import (
+    danger,
+    danger_bg,
+    header,
+    highlight,
+    label,
+    muted,
+    ok,
+    orange,
+    suspicious_bg,
+    warn,
+)
 from .compromised import CompromiseSummary
+from .creds import CredentialSummary
+from .ctf import CtfSummary
+from .dhcp import DhcpSummary
+from .dns import PUBLIC_DNS_RESOLVERS, DnsSummary
+from .email import EmailSummary
+from .encrypted_dns import EncryptedDnsSummary
+from .exfil import ExfilSummary
+from .files import FileTransferSummary
+from .ftp import FtpSummary
+from .goose import GooseSummary
+from .health import HealthSummary
+from .hostdetails import HostDetailsSummary
 from .hostname import HostnameSummary
 from .hosts import HostSummary
-from .hostdetails import HostDetailsSummary
-from .arp import ArpSummary
-from .dhcp import DhcpSummary
-from .pcapmeta import PcapMetaSummary
-from .quic import QuicSummary
+from .http import HttpSummary
 from .http2 import Http2Summary
-from .encrypted_dns import EncryptedDnsSummary
-from .ntp import NtpSummary
-from .vpn import VpnSummary
-from .routing import RoutingSummary
-from .goose import GooseSummary
-from .sv import SvSummary
-from .lldp_dcp import LldpDcpSummary
-from .ptp import PtpSummary
-from .opc_classic import OpcClassicSummary
-from .streams import StreamSummary
-from .ctf import CtfSummary
-from .ioc import IocSummary
-from .ot_commands import OtCommandSummary
+from .icmp import IcmpSummary
 from .iec101_103 import Iec101103Summary
+from .ioc import IocSummary
+from .ipmac import IpLookupSummary, MacLookupSummary, mac_manufacturer
+from .ips import IpSummary
+from .lldp_dcp import LldpDcpSummary
+from .malware import MalwareSummary
 from .mitre import MitreSummary
+from .models import PcapSummary
+from .nfs import NfsSummary
+from .ntp import NtpSummary
+from .opc_classic import OpcClassicSummary
+from .ot_commands import OtCommandSummary
+from .pcapmeta import PcapMetaSummary
+from .powershell import PowershellSummary
+from .protocols import ProtocolSummary
+from .ptp import PtpSummary
+from .qos import QosSummary
+from .quic import QuicSummary
+from .rdp import RdpSummary
 from .reporting_format import format_table
-
+from .routing import RoutingSummary
+from .rpc import RpcSummary
+from .scan import ScanSummary
+from .search import SearchSummary
+from .secrets import SecretsSummary
+from .services import COMMON_PORTS, ServiceSummary
+from .sizes import SizeSummary, render_size_sparkline
+from .smb import SmbSummary
+from .smtp import SmtpSummary
+from .snmp import SnmpSummary
+from .ssdp import SsdpSummary
+from .ssh import SshSummary
+from .streams import StreamSummary
+from .strings import StringsSummary
+from .sv import SvSummary
+from .syslog import SyslogSummary
+from .tcp import TcpSummary
+from .teamviewer import TeamviewerSummary
+from .telnet import TelnetSummary
+from .threats import ThreatSummary
+from .timeline import TimelineSummary
+from .tls import TlsSummary
+from .udp import UdpConversation, UdpSummary
+from .utils import (
+    decode_payload,
+    format_bytes_as_mb,
+    format_duration,
+    format_speed_bps,
+    format_ts,
+    hexdump,
+    sparkline,
+)
+from .vlan import VlanStat, VlanSummary
+from .vnc import VncSummary
+from .vpn import VpnSummary
+from .webrequests import WebRequestSummary
+from .winrm import WinrmSummary
+from .wlan import WlanSummary
+from .wmic import WmicSummary
 
 if TYPE_CHECKING:
     from .cip import CIPAnalysis
@@ -122,18 +149,24 @@ def _limit_value(value: int) -> int:
 
 def _secret_fingerprint(value: str) -> str:
     digest = hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
-    return f"redacted:{digest[:_limit_value(8)]}"
+    return f"redacted:{digest[: _limit_value(8)]}"
 
 
 def _redact_secret(value: str | None) -> str:
     if value is None:
         return "-"
-    return value
+    text = str(value).strip()
+    if not text or text == "-":
+        return "-"
+    return _secret_fingerprint(text)
 
 
 _SECRET_PATTERNS = [
-    re.compile(r"(?i)\b(pass(word)?|passwd|pwd|secret|token|apikey|api_key|api-key|bearer)\b\s*[:=]\s*([^\s,;]+)"),
+    re.compile(
+        r"(?i)\b(pass(word)?|passwd|pwd|secret|token|apikey|api_key|api-key|bearer)\b\s*[:=]\s*([^\s,;]+)"
+    ),
     re.compile(r"(?i)\bPASS\s+(\S+)"),
+    re.compile(r"(?i)\bAuthorization\b\s*:\s*Bearer\s+([^\s,;]+)"),
 ]
 
 _HTTP_STATUS_TEXT = {
@@ -203,7 +236,25 @@ _HTTP_STATUS_TEXT = {
 
 
 def _redact_in_text(text: str) -> str:
-    return text
+    if not text:
+        return text
+
+    redacted = text
+
+    def _replace_secret(match: re.Match[str]) -> str:
+        matched = match.group(0)
+        secret_value: str | None = None
+        if match.lastindex and match.lastindex >= 3 and match.group(3) is not None:
+            secret_value = match.group(3)
+        elif match.lastindex and match.group(1) is not None:
+            secret_value = match.group(1)
+        if not secret_value:
+            return matched
+        return matched.replace(secret_value, _secret_fingerprint(secret_value), 1)
+
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub(_replace_secret, redacted)
+    return redacted
 
 
 def _http_status_text(value: object) -> str:
@@ -248,7 +299,9 @@ def _format_linktype(value: object | None) -> str:
         return str(value)
 
 
-def _format_kv(label_text: str, value: str, width: int = 24, color: bool | None = None) -> str:
+def _format_kv(
+    label_text: str, value: str, width: int = 24, color: bool | None = None
+) -> str:
     return f"{label(label_text, color):<{width}}: {value}"
 
 
@@ -262,7 +315,9 @@ def _format_counter(counter: object, limit: int = 5, key_max: int = 40) -> str:
     if hasattr(counter, "most_common"):
         items = list(counter.most_common(_limit_value(limit)))
     elif isinstance(counter, dict):
-        items = sorted(counter.items(), key=lambda kv: kv[1], reverse=True)[:_limit_value(limit)]
+        items = sorted(counter.items(), key=lambda kv: kv[1], reverse=True)[
+            : _limit_value(limit)
+        ]
     else:
         return "-"
     parts: list[str] = []
@@ -279,6 +334,7 @@ def _format_counter(counter: object, limit: int = 5, key_max: int = 40) -> str:
 def _format_table(rows: Iterable[list[str]]) -> str:
     return format_table(rows)
 
+
 def _filtered_detections(summary, verbose: bool) -> list[dict[str, object]]:
     detections = list(getattr(summary, "detections", []) or [])
     if not detections:
@@ -294,7 +350,11 @@ def _filtered_detections(summary, verbose: bool) -> list[dict[str, object]]:
     if not detections:
         return []
     ot_counts_raw = getattr(summary, "ot_protocol_counts", None)
-    ot_counts = {str(k).upper(): int(v) for k, v in (ot_counts_raw or {}).items()} if ot_counts_raw else {}
+    ot_counts = (
+        {str(k).upper(): int(v) for k, v in (ot_counts_raw or {}).items()}
+        if ot_counts_raw
+        else {}
+    )
     ot_aliases = {
         "DF1": ["DF1"],
         "PCCC": ["PCCC"],
@@ -376,7 +436,6 @@ def _filtered_detections(summary, verbose: bool) -> list[dict[str, object]]:
     return detections
 
 
-
 def _highlight_search_text(text: str, query: str) -> str:
     if not text or not query:
         return text
@@ -404,14 +463,18 @@ def _format_client_server_table(
         rows.append(["-", "-"])
     else:
         for idx in range(max_len):
-            rows.append([
-                client_items[idx] if idx < len(client_items) else "-",
-                server_items[idx] if idx < len(server_items) else "-",
-            ])
+            rows.append(
+                [
+                    client_items[idx] if idx < len(client_items) else "-",
+                    server_items[idx] if idx < len(server_items) else "-",
+                ]
+            )
     return _format_table(rows)
 
 
-def _conv_value(conv: object, name: str, default: object | None = None) -> object | None:
+def _conv_value(
+    conv: object, name: str, default: object | None = None
+) -> object | None:
     if isinstance(conv, dict):
         return conv.get(name, default)
     return getattr(conv, name, default)
@@ -426,7 +489,10 @@ def _format_sessions_table(
     extra_cols: list[tuple[str, Callable[[object], object]]] | None = None,
 ) -> str:
     extra_cols = extra_cols or []
-    rows = [["Client", "Server", "Start", "End", "Duration", packet_label, "Size"] + [label for label, _fn in extra_cols]]
+    rows = [
+        ["Client", "Server", "Start", "End", "Duration", packet_label, "Size"]
+        + [label for label, _fn in extra_cols]
+    ]
 
     def _to_float(value: object | None) -> float | None:
         if value is None:
@@ -460,8 +526,12 @@ def _format_sessions_table(
         )
         client_port = _conv_value(conv, "client_port") or _conv_value(conv, "src_port")
         server_port = _conv_value(conv, "server_port") or _conv_value(conv, "dst_port")
-        client = f"{client_ip}:{client_port}" if client_port is not None else str(client_ip)
-        server = f"{server_ip}:{server_port}" if server_port is not None else str(server_ip)
+        client = (
+            f"{client_ip}:{client_port}" if client_port is not None else str(client_ip)
+        )
+        server = (
+            f"{server_ip}:{server_port}" if server_port is not None else str(server_ip)
+        )
 
         first_seen = _conv_value(conv, "first_seen")
         last_seen = _conv_value(conv, "last_seen")
@@ -483,12 +553,18 @@ def _format_sessions_table(
         packet_text = str(packet_val) if packet_val is not None else "-"
 
         bytes_val = _conv_value(conv, "bytes")
-        size_text = format_bytes_as_mb(int(bytes_val)) if isinstance(bytes_val, (int, float)) else "-"
+        size_text = (
+            format_bytes_as_mb(int(bytes_val))
+            if isinstance(bytes_val, (int, float))
+            else "-"
+        )
 
         row = [
             client,
             server,
-            format_ts(first_seen if isinstance(first_seen, (int, float)) else first_val),
+            format_ts(
+                first_seen if isinstance(first_seen, (int, float)) else first_val
+            ),
             format_ts(last_seen if isinstance(last_seen, (int, float)) else last_val),
             format_duration(duration),
             packet_text,
@@ -533,7 +609,9 @@ def _highlight_public_ips(text: str) -> str:
 
 def _finalize_output(lines: list[str], show_truncation_note: bool = True) -> str:
     if lines and show_truncation_note and not _VERBOSE_OUTPUT:
-        lines.append(muted("Output is summarized/truncated. Use -v to view all output."))
+        lines.append(
+            muted("Output is summarized/truncated. Use -v to view all output.")
+        )
     return _highlight_public_ips("\n".join(lines))
 
 
@@ -543,6 +621,68 @@ def _truncate_text(value: str, max_len: int = 80) -> str:
     if len(value) <= max_len:
         return value
     return value[: max_len - 1] + "…"
+
+
+def _pivot_packet_number(pivot: object) -> str:
+    if not isinstance(pivot, dict):
+        return "-"
+
+    def _normalize_packet(value: object) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return str(value) if value > 0 else None
+        if isinstance(value, float):
+            if value.is_integer() and value > 0:
+                return str(int(value))
+            return None
+        if isinstance(value, (list, tuple, set)):
+            numeric_values = sorted(
+                int(v)
+                for v in value
+                if isinstance(v, int) and int(v) > 0
+            )
+            if numeric_values:
+                return str(numeric_values[0])
+            for item in value:
+                normalized = _normalize_packet(item)
+                if normalized:
+                    return normalized
+            return None
+        text = str(value).strip()
+        if not text or text == "-":
+            return None
+        if text.isdigit() and int(text) > 0:
+            return text
+        return None
+
+    for key in (
+        "packet",
+        "packet_number",
+        "pkt",
+        "frame",
+        "first_packet",
+        "first_pkt",
+        "syn_packet",
+        "syn_packet_number",
+        "last_packet",
+    ):
+        normalized = _normalize_packet(pivot.get(key))
+        if normalized:
+            return normalized
+
+    for key in ("packet_refs", "packet_examples"):
+        normalized = _normalize_packet(pivot.get(key))
+        if normalized:
+            return normalized
+
+    packets_value = pivot.get("packets")
+    if isinstance(packets_value, (list, tuple, set)):
+        normalized = _normalize_packet(packets_value)
+        if normalized:
+            return normalized
+
+    return "-"
 
 
 def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
@@ -664,8 +804,12 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
         if key in unions:
             lines.append(_format_kv(label_text, str(len(unions[key]))))
 
-    client_counter = counters.get("client_ips") or counters.get("clients") or counters.get("src_ips")
-    server_counter = counters.get("server_ips") or counters.get("servers") or counters.get("dst_ips")
+    client_counter = (
+        counters.get("client_ips") or counters.get("clients") or counters.get("src_ips")
+    )
+    server_counter = (
+        counters.get("server_ips") or counters.get("servers") or counters.get("dst_ips")
+    )
     if client_counter or server_counter:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Endpoint Statistics"))
@@ -689,8 +833,10 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
     if counters:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Aggregated Counters"))
-        ordered_counters = sorted(counters.items(), key=lambda item: sum(item[1].values()), reverse=True)
-        for name, counter in ordered_counters[:_limit_value(4)]:
+        ordered_counters = sorted(
+            counters.items(), key=lambda item: sum(item[1].values()), reverse=True
+        )
+        for name, counter in ordered_counters[: _limit_value(4)]:
             lines.append(label(name.replace("_", " ").title()))
             rows = [["Item", "Count"]]
             for item, count in counter.most_common(_limit_value(10)):
@@ -701,11 +847,13 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Service Endpoints"))
         rows = [["Service", "Top Endpoints"]]
-        for service, counter in Counter({
-            svc: sum(cnt.values()) for svc, cnt in service_endpoints.items()
-        }).most_common(_limit_value(10)):
+        for service, counter in Counter(
+            {svc: sum(cnt.values()) for svc, cnt in service_endpoints.items()}
+        ).most_common(_limit_value(10)):
             endpoints = service_endpoints.get(service, Counter())
-            top_eps = ", ".join(f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3)))
+            top_eps = ", ".join(
+                f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3))
+            )
             rows.append([service, top_eps or "-"])
         lines.append(_format_table(rows))
 
@@ -713,7 +861,9 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Packet/Payload Size Analysis"))
 
-        def _render_bucket_table(bucket_store: dict[str, dict[str, float]], label_text: str) -> None:
+        def _render_bucket_table(
+            bucket_store: dict[str, dict[str, float]], label_text: str
+        ) -> None:
             if not bucket_store:
                 return
             total = sum(entry["count"] for entry in bucket_store.values())
@@ -723,14 +873,16 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
             for bucket_label, entry in bucket_store.items():
                 avg = (entry["sum"] / entry["count"]) if entry["count"] else 0.0
                 pct = (entry["count"] / total) * 100
-                rows.append([
-                    bucket_label,
-                    str(int(entry["count"])),
-                    f"{pct:.1f}%",
-                    str(int(entry["min"])) if entry["min"] else "0",
-                    f"{avg:.1f}",
-                    str(int(entry["max"])) if entry["max"] else "0",
-                ])
+                rows.append(
+                    [
+                        bucket_label,
+                        str(int(entry["count"])),
+                        f"{pct:.1f}%",
+                        str(int(entry["min"])) if entry["min"] else "0",
+                        f"{avg:.1f}",
+                        str(int(entry["max"])) if entry["max"] else "0",
+                    ]
+                )
             lines.append(label(label_text))
             lines.append(_format_table(rows))
 
@@ -757,7 +909,9 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
     return _finalize_output(lines)
 
 
-def _protocol_rows(protocol_counts: Counter[str], packet_count: int, limit: int) -> list[list[str]]:
+def _protocol_rows(
+    protocol_counts: Counter[str], packet_count: int, limit: int
+) -> list[list[str]]:
     rows = [["Protocol", "Packets", "Presence"]]
     for name, count in protocol_counts.most_common(limit):
         pct = "-"
@@ -782,8 +936,16 @@ def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
     lines.append(_format_kv("End", format_ts(summary.end_ts)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
     lines.append(_format_kv("Interfaces", str(len(summary.interface_stats))))
-    linktypes = sorted({iface.linktype for iface in summary.interface_stats if iface.linktype})
-    snaplens = sorted({iface.snaplen for iface in summary.interface_stats if iface.snaplen is not None})
+    linktypes = sorted(
+        {iface.linktype for iface in summary.interface_stats if iface.linktype}
+    )
+    snaplens = sorted(
+        {
+            iface.snaplen
+            for iface in summary.interface_stats
+            if iface.snaplen is not None
+        }
+    )
     if linktypes:
         lines.append(_format_kv("LinkTypes", ", ".join(linktypes)))
     if snaplens:
@@ -791,28 +953,50 @@ def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Interface Statistics"))
-    rows = [["Interface Name", "Dropped Packets", "Capture Filter", "Link Type", "Packet Size Limit"]]
+    rows = [
+        [
+            "Interface Name",
+            "Dropped Packets",
+            "Capture Filter",
+            "Link Type",
+            "Packet Size Limit",
+        ]
+    ]
     for iface in summary.interface_stats:
         if summary.file_type == "pcap":
-            dropped = str(iface.dropped_packets) if iface.dropped_packets is not None else "not recorded"
+            dropped = (
+                str(iface.dropped_packets)
+                if iface.dropped_packets is not None
+                else "not recorded"
+            )
             capture_filter = iface.capture_filter or "not recorded"
         else:
-            dropped = str(iface.dropped_packets) if iface.dropped_packets is not None else "-"
+            dropped = (
+                str(iface.dropped_packets) if iface.dropped_packets is not None else "-"
+            )
             capture_filter = iface.capture_filter or "-"
         link_type = _format_linktype(iface.linktype)
         snaplen = str(iface.snaplen) if iface.snaplen is not None else "-"
-        rows.append([
-            iface.name,
-            dropped,
-            capture_filter,
-            link_type,
-            snaplen,
-        ])
+        rows.append(
+            [
+                iface.name,
+                dropped,
+                capture_filter,
+                link_type,
+                snaplen,
+            ]
+        )
     lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Protocol Summary (presence across packets)"))
-    lines.append(_format_table(_protocol_rows(summary.protocol_counts, summary.packet_count, protocol_limit)))
+    lines.append(
+        _format_table(
+            _protocol_rows(
+                summary.protocol_counts, summary.packet_count, protocol_limit
+            )
+        )
+    )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("VLAN Summary"))
@@ -828,7 +1012,11 @@ def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Retransmissions"))
-    lines.append(_format_kv("TCP Retransmissions", str(int(getattr(summary, "retransmissions", 0) or 0))))
+    lines.append(
+        _format_kv(
+            "TCP Retransmissions", str(int(getattr(summary, "retransmissions", 0) or 0))
+        )
+    )
     lines.append(
         _format_kv(
             "Retransmission Rate",
@@ -837,13 +1025,17 @@ def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
     )
     tcp_packets = int(getattr(summary, "tcp_packets", 0) or 0)
     if tcp_packets == 0:
-        lines.append(muted("No TCP packets observed; retransmission heuristics not applicable."))
+        lines.append(
+            muted("No TCP packets observed; retransmission heuristics not applicable.")
+        )
     lines.append(SECTION_BAR)
 
     return _finalize_output(lines)
 
 
-def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = False) -> str:
+def render_vlan_summary(
+    summary: VlanSummary, limit: int = 20, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -851,7 +1043,9 @@ def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = F
     lines.append(SECTION_BAR)
 
     lines.append(_format_kv("Tagged Packets", str(summary.total_tagged_packets)))
-    lines.append(_format_kv("Tagged Bytes", format_bytes_as_mb(summary.total_tagged_bytes)))
+    lines.append(
+        _format_kv("Tagged Bytes", format_bytes_as_mb(summary.total_tagged_bytes))
+    )
 
     if summary.errors:
         lines.append(SUBSECTION_BAR)
@@ -868,19 +1062,36 @@ def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = F
     if summary.vlan_stats:
         lines.append(SUBSECTION_BAR)
         lines.append(header("VLAN Inventory"))
-        rows = [["VLAN", "Packets", "Bytes", "IPs", "Top Protocols", "First Seen", "Last Seen"]]
+        rows = [
+            [
+                "VLAN",
+                "Packets",
+                "Bytes",
+                "IPs",
+                "Top Protocols",
+                "First Seen",
+                "Last Seen",
+            ]
+        ]
         for vlan in summary.vlan_stats[:limit]:
             ip_count = len(vlan.src_ips.union(vlan.dst_ips))
-            proto_preview = ", ".join(name for name, _count in vlan.protocols.most_common(_limit_value(4))) or "-"
-            rows.append([
-                str(vlan.vlan_id),
-                str(vlan.packets),
-                format_bytes_as_mb(vlan.bytes),
-                str(ip_count),
-                proto_preview,
-                format_ts(vlan.first_seen),
-                format_ts(vlan.last_seen),
-            ])
+            proto_preview = (
+                ", ".join(
+                    name for name, _count in vlan.protocols.most_common(_limit_value(4))
+                )
+                or "-"
+            )
+            rows.append(
+                [
+                    str(vlan.vlan_id),
+                    str(vlan.packets),
+                    format_bytes_as_mb(vlan.bytes),
+                    str(ip_count),
+                    proto_preview,
+                    format_ts(vlan.first_seen),
+                    format_ts(vlan.last_seen),
+                ]
+            )
         lines.append(_format_table(rows))
 
         lines.append(SUBSECTION_BAR)
@@ -888,16 +1099,18 @@ def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = F
         ip_rows = [["VLAN", "IP Count", "IPs"]]
         for vlan in summary.vlan_stats[:limit]:
             ip_list = sorted(vlan.src_ips.union(vlan.dst_ips))
-            preview = ip_list[:_limit_value(10)]
+            preview = ip_list[: _limit_value(10)]
             if len(ip_list) > 10:
                 preview_text = ", ".join(preview) + f" (+{len(ip_list) - 10} more)"
             else:
                 preview_text = ", ".join(preview) if preview else "-"
-            ip_rows.append([
-                str(vlan.vlan_id),
-                str(len(ip_list)),
-                preview_text,
-            ])
+            ip_rows.append(
+                [
+                    str(vlan.vlan_id),
+                    str(len(ip_list)),
+                    preview_text,
+                ]
+            )
         lines.append(_format_table(ip_rows))
 
         if verbose:
@@ -908,7 +1121,8 @@ def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = F
                 ip_list = sorted(vlan.src_ips.union(vlan.dst_ips))
                 mac_list = sorted(vlan.src_macs.union(vlan.dst_macs))
                 proto_list = ", ".join(
-                    f"{name}({count})" for name, count in vlan.protocols.most_common(_limit_value(10))
+                    f"{name}({count})"
+                    for name, count in vlan.protocols.most_common(_limit_value(10))
                 )
                 lines.append(f"  IPs: {', '.join(ip_list) if ip_list else '-'}")
                 lines.append(f"  MACs: {', '.join(mac_list) if mac_list else '-'}")
@@ -940,7 +1154,9 @@ def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = F
                 lines.append(muted(f"  Packets: {packet_count}"))
             if unique_sources is not None or unique_destinations is not None:
                 src_val = str(unique_sources) if unique_sources is not None else "-"
-                dst_val = str(unique_destinations) if unique_destinations is not None else "-"
+                dst_val = (
+                    str(unique_destinations) if unique_destinations is not None else "-"
+                )
                 lines.append(muted(f"  Unique Sources/Dests: {src_val}/{dst_val}"))
             top_sources = item.get("top_sources")
             if top_sources:
@@ -955,7 +1171,9 @@ def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = F
     return _finalize_output(lines)
 
 
-def render_vlan_rollup(summaries: Iterable[VlanSummary], limit: int = 20, verbose: bool = False) -> str:
+def render_vlan_rollup(
+    summaries: Iterable[VlanSummary], limit: int = 20, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     summary_list = list(summaries)
     if not summary_list:
@@ -971,17 +1189,20 @@ def render_vlan_rollup(summaries: Iterable[VlanSummary], limit: int = 20, verbos
         total_tagged_bytes += summary.total_tagged_bytes
         errors.update(summary.errors)
         for stat in summary.vlan_stats:
-            info = combined.setdefault(stat.vlan_id, {
-                "packets": 0,
-                "bytes": 0,
-                "src_macs": set(),
-                "dst_macs": set(),
-                "src_ips": set(),
-                "dst_ips": set(),
-                "protocols": Counter(),
-                "first_seen": None,
-                "last_seen": None,
-            })
+            info = combined.setdefault(
+                stat.vlan_id,
+                {
+                    "packets": 0,
+                    "bytes": 0,
+                    "src_macs": set(),
+                    "dst_macs": set(),
+                    "src_ips": set(),
+                    "dst_ips": set(),
+                    "protocols": Counter(),
+                    "first_seen": None,
+                    "last_seen": None,
+                },
+            )
             info["packets"] = int(info["packets"]) + stat.packets
             info["bytes"] = int(info["bytes"]) + stat.bytes
             info["src_macs"].update(stat.src_macs)
@@ -1019,31 +1240,37 @@ def render_vlan_rollup(summaries: Iterable[VlanSummary], limit: int = 20, verbos
     if stats_list:
         vlan_ids = sorted(v.vlan_id for v in stats_list)
         if 1 in vlan_ids:
-            detections.append({
-                "type": "vlan_default_used",
-                "severity": "warning",
-                "summary": "VLAN 1 (default) observed",
-                "details": "Default VLAN is in use; consider verifying network segmentation policy.",
-            })
+            detections.append(
+                {
+                    "type": "vlan_default_used",
+                    "severity": "warning",
+                    "summary": "VLAN 1 (default) observed",
+                    "details": "Default VLAN is in use; consider verifying network segmentation policy.",
+                }
+            )
 
         total_packets = sum(v.packets for v in stats_list)
         for stat in stats_list:
             if total_packets > 0:
                 ratio = stat.packets / total_packets
                 if ratio > 0.8 and stat.packets > 1000:
-                    detections.append({
-                        "type": "vlan_traffic_concentration",
-                        "severity": "warning",
-                        "summary": f"VLAN {stat.vlan_id} carries {ratio:.1%} of tagged traffic",
-                        "details": "Check for misconfiguration or single-VLAN dependency.",
-                    })
+                    detections.append(
+                        {
+                            "type": "vlan_traffic_concentration",
+                            "severity": "warning",
+                            "summary": f"VLAN {stat.vlan_id} carries {ratio:.1%} of tagged traffic",
+                            "details": "Check for misconfiguration or single-VLAN dependency.",
+                        }
+                    )
                 if stat.packets < 10:
-                    detections.append({
-                        "type": "vlan_low_activity",
-                        "severity": "info",
-                        "summary": f"VLAN {stat.vlan_id} has low activity ({stat.packets} packets)",
-                        "details": "Low activity VLANs can be normal; validate against expectations.",
-                    })
+                    detections.append(
+                        {
+                            "type": "vlan_low_activity",
+                            "severity": "info",
+                            "summary": f"VLAN {stat.vlan_id} has low activity ({stat.packets} packets)",
+                            "details": "Low activity VLANs can be normal; validate against expectations.",
+                        }
+                    )
 
     rollup_summary = VlanSummary(
         path=Path("ALL_PCAPS"),
@@ -1055,7 +1282,10 @@ def render_vlan_rollup(summaries: Iterable[VlanSummary], limit: int = 20, verbos
     )
     return render_vlan_summary(rollup_summary, limit=limit, verbose=verbose)
 
-def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: bool = False) -> str:
+
+def render_domain_summary(
+    summary: "DomainAnalysis", limit: int = 25, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
 
     if not summary:
@@ -1102,14 +1332,24 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
             score += min(4, weight + min(2, count - 1))
             reasons.append(f"{key.replace('_', ' ')} evidence ({count})")
 
-        high_count = sum(1 for item in (summary.detections or []) if str(item.get("severity", "")).lower() in {"high", "critical"})
-        warning_count = sum(1 for item in (summary.detections or []) if str(item.get("severity", "")).lower() == "warning")
+        high_count = sum(
+            1
+            for item in (summary.detections or [])
+            if str(item.get("severity", "")).lower() in {"high", "critical"}
+        )
+        warning_count = sum(
+            1
+            for item in (summary.detections or [])
+            if str(item.get("severity", "")).lower() == "warning"
+        )
         if high_count:
             score += min(3, high_count)
             reasons.append(f"High-severity domain detections observed ({high_count})")
         if warning_count >= 2:
             score += 1
-            reasons.append(f"Multiple warning-level domain detections observed ({warning_count})")
+            reasons.append(
+                f"Multiple warning-level domain detections observed ({warning_count})"
+            )
 
         if score >= 8:
             verdict = "YES - high-confidence malicious or compromised domain activity is present."
@@ -1125,7 +1365,9 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
             confidence = "Low"
 
         if not reasons:
-            reasons.append("No high-confidence domain threat heuristic crossed threshold")
+            reasons.append(
+                "No high-confidence domain threat heuristic crossed threshold"
+            )
         return verdict, confidence, reasons, score
 
     verdict, confidence, verdict_reasons, verdict_score = _domain_verdict()
@@ -1139,7 +1381,7 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(8)]:
+    for reason in verdict_reasons[: _limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     if summary.clients:
@@ -1155,7 +1397,7 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
     if summary.detections:
         lines.append(muted("What:"))
         lines.append(muted("- Top domain detections"))
-        for item in summary.detections[:_limit_value(6)]:
+        for item in summary.detections[: _limit_value(6)]:
             lines.append(
                 muted(
                     f"- [{str(item.get('severity', 'info')).upper()}] {_redact_in_text(str(item.get('summary', '-')))}"
@@ -1164,7 +1406,7 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
     if getattr(summary, "incident_clusters", None):
         lines.append(muted("When:"))
         lines.append(muted("- Incident cluster context"))
-        for item in list(summary.incident_clusters or [])[:_limit_value(4)]:
+        for item in list(summary.incident_clusters or [])[: _limit_value(4)]:
             lines.append(
                 muted(
                     f"- {_redact_in_text(str(item.get('cluster', '-')))} host={_highlight_public_ips(str(item.get('host', '-')))} "
@@ -1191,22 +1433,40 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
         evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
         lines.append(label(label_text))
         if evidence_items:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for item in evidence_items[:_limit_value(8)]:
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
+            for item in evidence_items[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
 
-            if key in {"dcsync_replication_activity", "kerberos_ticket_abuse", "ntlm_downgrade_or_relay_exposure"}:
+            if key in {
+                "dcsync_replication_activity",
+                "kerberos_ticket_abuse",
+                "ntlm_downgrade_or_relay_exposure",
+            }:
                 risk = "High"
                 conf_level = "High"
-            elif key in {"ldap_bind_risk", "auth_sequence_plausibility", "dc_role_consistency"}:
+            elif key in {
+                "ldap_bind_risk",
+                "auth_sequence_plausibility",
+                "dc_role_consistency",
+            }:
                 risk = "Medium"
                 conf_level = "Medium"
             else:
                 risk = "Low"
                 conf_level = "Medium"
-            matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+            matrix_rows.append(
+                [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
+            )
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -1248,8 +1508,20 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Domain Servers & Clients"))
         rows = [["Servers", "Clients"]]
-        server_text = ", ".join(f"{ip}({count})" for ip, count in summary.servers.most_common(_limit_value(10))) or "-"
-        client_text = ", ".join(f"{ip}({count})" for ip, count in summary.clients.most_common(_limit_value(10))) or "-"
+        server_text = (
+            ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.servers.most_common(_limit_value(10))
+            )
+            or "-"
+        )
+        client_text = (
+            ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.clients.most_common(_limit_value(10))
+            )
+            or "-"
+        )
         rows.append([server_text, client_text])
         lines.append(_format_table(rows))
 
@@ -1258,7 +1530,15 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
         lines.append(header("Domain Conversations"))
         rows = [["Src", "Dst", "Port", "Proto", "Packets"]]
         for convo in summary.conversations[:limit]:
-            rows.append([convo.src_ip, convo.dst_ip, str(convo.dst_port), convo.proto, str(convo.packets)])
+            rows.append(
+                [
+                    convo.src_ip,
+                    convo.dst_ip,
+                    str(convo.dst_port),
+                    convo.proto,
+                    str(convo.packets),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if getattr(summary, "host_attack_paths", None):
@@ -1270,14 +1550,24 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
             for item in paths[:limit]:
                 targets = item.get("targets", [])
                 step_values = item.get("steps", [])
-                target_text = ", ".join(str(v) for v in targets[:3]) if isinstance(targets, list) and targets else "-"
-                steps_text = "; ".join(str(v) for v in step_values[:3]) if isinstance(step_values, list) and step_values else "-"
-                rows.append([
-                    _highlight_public_ips(str(item.get("host", "-"))),
-                    str(item.get("confidence", "-")),
-                    _truncate_text(target_text, 40),
-                    _truncate_text(steps_text, 80),
-                ])
+                target_text = (
+                    ", ".join(str(v) for v in targets[:3])
+                    if isinstance(targets, list) and targets
+                    else "-"
+                )
+                steps_text = (
+                    "; ".join(str(v) for v in step_values[:3])
+                    if isinstance(step_values, list) and step_values
+                    else "-"
+                )
+                rows.append(
+                    [
+                        _highlight_public_ips(str(item.get("host", "-"))),
+                        str(item.get("confidence", "-")),
+                        _truncate_text(target_text, 40),
+                        _truncate_text(steps_text, 80),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "incident_clusters", None):
@@ -1288,13 +1578,15 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
             rows = [["Cluster", "Host", "Signals", "Targets", "Confidence"]]
             for item in clusters[:limit]:
                 signals = item.get("indicators", [])
-                rows.append([
-                    str(item.get("cluster", "-")),
-                    _highlight_public_ips(str(item.get("host", "-"))),
-                    str(len(signals) if isinstance(signals, list) else 0),
-                    str(item.get("target_count", "-")),
-                    str(item.get("confidence", "-")),
-                ])
+                rows.append(
+                    [
+                        str(item.get("cluster", "-")),
+                        _highlight_public_ips(str(item.get("host", "-"))),
+                        str(len(signals) if isinstance(signals, list) else 0),
+                        str(item.get("target_count", "-")),
+                        str(item.get("confidence", "-")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "campaign_indicators", None):
@@ -1305,12 +1597,18 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
             rows = [["Indicator", "Value", "Hosts"]]
             for item in campaigns[:limit]:
                 hosts = item.get("hosts", [])
-                host_text = ", ".join(_highlight_public_ips(str(v)) for v in hosts[:4]) if isinstance(hosts, list) else "-"
-                rows.append([
-                    _truncate_text(str(item.get("indicator", "-")), 40),
-                    _truncate_text(str(item.get("value", "-")), 40),
-                    _truncate_text(host_text or "-", 60),
-                ])
+                host_text = (
+                    ", ".join(_highlight_public_ips(str(v)) for v in hosts[:4])
+                    if isinstance(hosts, list)
+                    else "-"
+                )
+                rows.append(
+                    [
+                        _truncate_text(str(item.get("indicator", "-")), 40),
+                        _truncate_text(str(item.get("value", "-")), 40),
+                        _truncate_text(host_text or "-", 60),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "dc_role_drift", None):
@@ -1321,12 +1619,18 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
             rows = [["Server", "Service Mix", "Packets"]]
             for item in drift[:limit]:
                 services = item.get("services", [])
-                svc_text = ", ".join(str(v) for v in services) if isinstance(services, list) else "-"
-                rows.append([
-                    _highlight_public_ips(str(item.get("server", "-"))),
-                    _truncate_text(svc_text, 60),
-                    str(item.get("packets", "-")),
-                ])
+                svc_text = (
+                    ", ".join(str(v) for v in services)
+                    if isinstance(services, list)
+                    else "-"
+                )
+                rows.append(
+                    [
+                        _highlight_public_ips(str(item.get("server", "-"))),
+                        _truncate_text(svc_text, 60),
+                        str(item.get("packets", "-")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "sequence_violations", None):
@@ -1336,12 +1640,14 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
             lines.append(header("Sequence Plausibility Violations"))
             rows = [["Source", "Reason", "Lateral Hits", "Auth Signals"]]
             for item in seq[:limit]:
-                rows.append([
-                    _highlight_public_ips(str(item.get("src", "-"))),
-                    _truncate_text(str(item.get("reason", "-")), 56),
-                    str(item.get("lateral_hits", "-")),
-                    str(item.get("auth_signals", "-")),
-                ])
+                rows.append(
+                    [
+                        _highlight_public_ips(str(item.get("src", "-"))),
+                        _truncate_text(str(item.get("reason", "-")), 56),
+                        str(item.get("lateral_hits", "-")),
+                        str(item.get("auth_signals", "-")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if summary.urls:
@@ -1437,18 +1743,22 @@ def render_domain_summary(summary: "DomainAnalysis", limit: int = 25, verbose: b
                 lines.append(muted(f"  {details}"))
 
     if getattr(summary, "benign_context", None):
-        benign_notes = [str(v) for v in (summary.benign_context or []) if str(v).strip()]
+        benign_notes = [
+            str(v) for v in (summary.benign_context or []) if str(v).strip()
+        ]
         if benign_notes:
             lines.append(SUBSECTION_BAR)
             lines.append(header("False-Positive Context"))
-            for note in benign_notes[:_limit_value(8)]:
+            for note in benign_notes[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(note)}"))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25, verbose: bool = False) -> str:
+def render_ldap_summary(
+    summary: "LdapAnalysis", limit: int = 25, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
 
     if not summary:
@@ -1468,9 +1778,21 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25, verbose: bool 
     lines.append(_format_kv("Duration", f"{summary.duration:.2f}s"))
     lines.append(_format_kv("Total Packets", str(summary.total_packets)))
     if summary.session_stats:
-        lines.append(_format_kv("LDAP Sessions", str(summary.session_stats.get("total_sessions", 0))))
-        lines.append(_format_kv("Unique Clients", str(summary.session_stats.get("unique_clients", 0))))
-        lines.append(_format_kv("Unique Servers", str(summary.session_stats.get("unique_servers", 0))))
+        lines.append(
+            _format_kv(
+                "LDAP Sessions", str(summary.session_stats.get("total_sessions", 0))
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Unique Clients", str(summary.session_stats.get("unique_clients", 0))
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Unique Servers", str(summary.session_stats.get("unique_servers", 0))
+            )
+        )
 
     if summary.ldap_domains:
         lines.append(SUBSECTION_BAR)
@@ -1484,8 +1806,20 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25, verbose: bool 
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top LDAP Servers & Clients"))
         rows = [["Servers", "Clients"]]
-        server_text = ", ".join(f"{ip}({count})" for ip, count in summary.servers.most_common(_limit_value(10))) or "-"
-        client_text = ", ".join(f"{ip}({count})" for ip, count in summary.clients.most_common(_limit_value(10))) or "-"
+        server_text = (
+            ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.servers.most_common(_limit_value(10))
+            )
+            or "-"
+        )
+        client_text = (
+            ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.clients.most_common(_limit_value(10))
+            )
+            or "-"
+        )
         rows.append([server_text, client_text])
         lines.append(_format_table(rows))
 
@@ -1509,7 +1843,15 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25, verbose: bool 
         lines.append(header("LDAP Conversations"))
         rows = [["Src", "Dst", "Port", "Proto", "Packets"]]
         for convo in summary.conversations[:limit]:
-            rows.append([convo.src_ip, convo.dst_ip, str(convo.dst_port), convo.proto, str(convo.packets)])
+            rows.append(
+                [
+                    convo.src_ip,
+                    convo.dst_ip,
+                    str(convo.dst_port),
+                    convo.proto,
+                    str(convo.packets),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.ldap_queries:
@@ -1657,7 +1999,9 @@ def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25, verbose: bool 
     return _finalize_output(lines)
 
 
-def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25, verbose: bool = False) -> str:
+def render_kerberos_summary(
+    summary: "KerberosAnalysis", limit: int = 25, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
 
     if not summary:
@@ -1683,16 +2027,28 @@ def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25, verbos
     lines.append(_format_kv("TCP Packets", str(getattr(summary, "tcp_packets", 0))))
     lines.append(_format_kv("UDP Packets", str(getattr(summary, "udp_packets", 0))))
     if summary.session_stats:
-        lines.append(_format_kv("Kerberos Sessions", str(summary.session_stats.get("total_sessions", 0))))
-        lines.append(_format_kv("Unique Clients", str(summary.session_stats.get("unique_clients", 0))))
-        lines.append(_format_kv("Unique Servers", str(summary.session_stats.get("unique_servers", 0))))
+        lines.append(
+            _format_kv(
+                "Kerberos Sessions", str(summary.session_stats.get("total_sessions", 0))
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Unique Clients", str(summary.session_stats.get("unique_clients", 0))
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Unique Servers", str(summary.session_stats.get("unique_servers", 0))
+            )
+        )
 
     attack_matrix = list(getattr(summary, "attack_matrix", []) or [])
     if attack_matrix:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Deterministic Kerberos Attack Overview"))
         rows = [["Attack Technique", "Status", "Severity", "Evidence"]]
-        for item in attack_matrix[:_limit_value(30)]:
+        for item in attack_matrix[: _limit_value(30)]:
             if not isinstance(item, dict):
                 continue
             status = str(item.get("status", "-"))
@@ -1710,12 +2066,14 @@ def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25, verbos
                 sev_text = warn("WARNING")
             else:
                 sev_text = ok("INFO")
-            rows.append([
-                str(item.get("attack", "-")),
-                status_text,
-                sev_text,
-                _truncate_text(_redact_in_text(evidence), 120),
-            ])
+            rows.append(
+                [
+                    str(item.get("attack", "-")),
+                    status_text,
+                    sev_text,
+                    _truncate_text(_redact_in_text(evidence), 120),
+                ]
+            )
         lines.append(_format_table(rows))
 
     deterministic_checks = dict(getattr(summary, "deterministic_checks", {}) or {})
@@ -1736,7 +2094,7 @@ def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25, verbos
             values = [str(v) for v in list(deterministic_checks.get(key, []) or [])]
             if values:
                 lines.append(warn(f"[!] {label_text}: {len(values)}"))
-                for entry in values[:_limit_value(5)]:
+                for entry in values[: _limit_value(5)]:
                     lines.append(muted(f"  - {_redact_in_text(entry)}"))
             else:
                 lines.append(ok(f"[ ] {label_text}: none"))
@@ -1745,8 +2103,20 @@ def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25, verbos
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Kerberos Servers & Clients"))
         rows = [["Servers", "Clients"]]
-        server_text = ", ".join(f"{ip}({count})" for ip, count in summary.servers.most_common(_limit_value(10))) or "-"
-        client_text = ", ".join(f"{ip}({count})" for ip, count in summary.clients.most_common(_limit_value(10))) or "-"
+        server_text = (
+            ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.servers.most_common(_limit_value(10))
+            )
+            or "-"
+        )
+        client_text = (
+            ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.clients.most_common(_limit_value(10))
+            )
+            or "-"
+        )
         rows.append([server_text, client_text])
         lines.append(_format_table(rows))
 
@@ -1770,7 +2140,15 @@ def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25, verbos
         lines.append(header("Kerberos Conversations"))
         rows = [["Src", "Dst", "Port", "Proto", "Packets"]]
         for convo in summary.conversations[:limit]:
-            rows.append([convo.src_ip, convo.dst_ip, str(convo.dst_port), convo.proto, str(convo.packets)])
+            rows.append(
+                [
+                    convo.src_ip,
+                    convo.dst_ip,
+                    str(convo.dst_port),
+                    convo.proto,
+                    str(convo.packets),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.request_types:
@@ -1853,14 +2231,16 @@ def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25, verbos
         lines.append(header("Principal Evidence (Per Flow)"))
         rows = [["Src", "Dst", "Port", "Proto", "Principal", "Kind"]]
         for item in summary.principal_evidence[:limit]:
-            rows.append([
-                str(item.get("src_ip", "-")),
-                str(item.get("dst_ip", "-")),
-                str(item.get("dst_port", "-")),
-                str(item.get("protocol", "-")),
-                _truncate_text(str(item.get("principal", "-")), 60),
-                str(item.get("kind", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("src_ip", "-")),
+                    str(item.get("dst_ip", "-")),
+                    str(item.get("dst_port", "-")),
+                    str(item.get("protocol", "-")),
+                    _truncate_text(str(item.get("principal", "-")), 60),
+                    str(item.get("kind", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.spns:
@@ -1934,9 +2314,11 @@ def render_kerberos_summary(summary: "KerberosAnalysis", limit: int = 25, verbos
     return _finalize_output(lines)
 
 
-def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = False) -> str:
-    verbose = True
-    limit = _FULL_OUTPUT_LIMIT
+def render_icmp_summary(
+    summary: IcmpSummary, limit: int = 12, verbose: bool = False
+) -> str:
+    limit = _apply_verbose_limit(limit) or limit
+
     def _icmpv4_type_name(type_id: int) -> str:
         return {
             0: "Echo Reply",
@@ -2059,6 +2441,7 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         if family == "icmpv6":
             return f"ICMPv6 {_icmpv6_type_name(type_num)}: {_icmpv6_code_name(type_num, code_num)} ({type_num}/{code_num})"
         return key
+
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"ICMP ANALYSIS :: {summary.path.name}"))
@@ -2074,7 +2457,11 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
     lines.append(_format_kv("Max Payload", f"{summary.max_payload_bytes} bytes"))
     lines.append(_format_kv("Payload Variants", str(summary.payload_size_variants)))
     if summary.duration_seconds:
-        pps = summary.total_packets / summary.duration_seconds if summary.duration_seconds else 0.0
+        pps = (
+            summary.total_packets / summary.duration_seconds
+            if summary.duration_seconds
+            else 0.0
+        )
         lines.append(_format_kv("ICMP Rate", f"{pps:.1f} pkt/s"))
 
     verdict = str(getattr(summary, "analyst_verdict", "") or "")
@@ -2087,7 +2474,7 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
             lines.append(_format_kv("Verdict", f"{verdict} (confidence: {confidence})"))
         else:
             lines.append(_format_kv("Verdict", verdict))
-        for reason in reasons[:_limit_value(8)]:
+        for reason in reasons[: _limit_value(8)]:
             lines.append(muted(f"- {reason}"))
 
     if summary.errors:
@@ -2117,7 +2504,7 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
             values = [str(v) for v in list(checks.get(key, []) or [])]
             if values:
                 lines.append(warn(f"[!] {label}: {len(values)}"))
-                for item in values[:_limit_value(8)]:
+                for item in values[: _limit_value(8)]:
                     lines.append(muted(f"  - {item}"))
             else:
                 lines.append(ok(f"[ ] {label}: none"))
@@ -2127,15 +2514,17 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         lines.append(SUBSECTION_BAR)
         lines.append(header("ICMP Risk Matrix"))
         rows = [["Category", "Risk", "Confidence", "Evidence"]]
-        for row in risk_matrix[:_limit_value(12)]:
+        for row in risk_matrix[: _limit_value(12)]:
             if not isinstance(row, dict):
                 continue
-            rows.append([
-                str(row.get("category", "")),
-                str(row.get("risk", "")),
-                str(row.get("confidence", "")),
-                str(row.get("evidence", "")),
-            ])
+            rows.append(
+                [
+                    str(row.get("category", "")),
+                    str(row.get("risk", "")),
+                    str(row.get("confidence", "")),
+                    str(row.get("evidence", "")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -2147,13 +2536,15 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         for profile in asymmetry_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("scope", "-")),
-                str(profile.get("requests", "-")),
-                str(profile.get("replies", "-")),
-                str(profile.get("reply_ratio", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("scope", "-")),
+                    str(profile.get("requests", "-")),
+                    str(profile.get("replies", "-")),
+                    str(profile.get("reply_ratio", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -2165,12 +2556,14 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         for profile in recon_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("source", "-")),
-                str(profile.get("targets", "-")),
-                str(profile.get("packets", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("source", "-")),
+                    str(profile.get("targets", "-")),
+                    str(profile.get("packets", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -2182,11 +2575,13 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         for profile in control_plane_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("type", "-")),
-                str(profile.get("count", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("type", "-")),
+                    str(profile.get("count", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -2198,11 +2593,13 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         for profile in fragmentation_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("packet_too_big", "-")),
-                str(profile.get("fragmentation_related", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("packet_too_big", "-")),
+                    str(profile.get("fragmentation_related", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -2214,13 +2611,15 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         for profile in cadence_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("flow", "-")),
-                str(profile.get("packets", "-")),
-                str(profile.get("duration_s", "-")),
-                str(profile.get("pps", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("flow", "-")),
+                    str(profile.get("packets", "-")),
+                    str(profile.get("duration_s", "-")),
+                    str(profile.get("pps", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -2232,13 +2631,15 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         for profile in tunneling_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("entropy", "-")),
-                str(profile.get("size", "-")),
-                str(profile.get("count", "-")),
-                str(profile.get("preview", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("entropy", "-")),
+                    str(profile.get("size", "-")),
+                    str(profile.get("count", "-")),
+                    str(profile.get("preview", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -2250,13 +2651,15 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         for profile in zone_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("src", "-")),
-                str(profile.get("dst", "-")),
-                str(profile.get("zone", "-")),
-                str(profile.get("packets", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("src", "-")),
+                    str(profile.get("dst", "-")),
+                    str(profile.get("zone", "-")),
+                    str(profile.get("packets", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -2268,13 +2671,15 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         for profile in role_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("host", "-")),
-                str(profile.get("dst", "-")),
-                str(profile.get("packets", "-")),
-                str(profile.get("reason", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("host", "-")),
+                    str(profile.get("dst", "-")),
+                    str(profile.get("packets", "-")),
+                    str(profile.get("reason", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -2286,12 +2691,14 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         for profile in ot_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("src", "-")),
-                str(profile.get("dst", "-")),
-                str(profile.get("packets", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("src", "-")),
+                    str(profile.get("dst", "-")),
+                    str(profile.get("packets", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -2303,12 +2710,15 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         for finding in corroborated_findings[:limit]:
             if not isinstance(finding, dict):
                 continue
-            rows.append([
-                str(finding.get("host", "-")),
-                str(finding.get("score", "-")),
-                str(finding.get("confidence", "-")),
-                ", ".join(str(v) for v in list(finding.get("reasons", []) or [])) or "-",
-            ])
+            rows.append(
+                [
+                    str(finding.get("host", "-")),
+                    str(finding.get("score", "-")),
+                    str(finding.get("confidence", "-")),
+                    ", ".join(str(v) for v in list(finding.get("reasons", []) or []))
+                    or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -2316,25 +2726,33 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
     if pivots:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Hunt Pivots"))
-        rows = [["Flow", "Protocol", "Packets", "Bytes", "Reasons"]]
+        rows = [["Flow", "Protocol", "Packet", "Packets", "Bytes", "Reasons"]]
         for pivot in pivots[:limit]:
             if not isinstance(pivot, dict):
                 continue
-            rows.append([
-                str(pivot.get("flow", "-")),
-                str(pivot.get("protocol", "-")),
-                str(pivot.get("packets", "-")),
-                format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
-                ", ".join(str(v) for v in list(pivot.get("reasons", []) or [])) or "-",
-            ])
+            rows.append(
+                [
+                    str(pivot.get("flow", "-")),
+                    str(pivot.get("protocol", "-")),
+                    _pivot_packet_number(pivot),
+                    str(pivot.get("packets", "-")),
+                    format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
+                    ", ".join(str(v) for v in list(pivot.get("reasons", []) or []))
+                    or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
-    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
+    false_positive_context = [
+        str(v)
+        for v in list(getattr(summary, "false_positive_context", []) or [])
+        if str(v).strip()
+    ]
     if false_positive_context:
         lines.append(SUBSECTION_BAR)
         lines.append(header("False-Positive Context"))
-        for item in false_positive_context[:_limit_value(8)]:
+        for item in false_positive_context[: _limit_value(8)]:
             lines.append(muted(f"- {item}"))
 
     if summary.type_counts:
@@ -2357,75 +2775,121 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
         lines.append(SUBSECTION_BAR)
         lines.append(header("ICMP Requests & Responses"))
         rows = [["Category", "Requests", "Responses"]]
-        categories = set(summary.request_counts.keys()).union(summary.response_counts.keys())
+        categories = set(summary.request_counts.keys()).union(
+            summary.response_counts.keys()
+        )
         for name in sorted(categories):
-            rows.append([
-                name,
-                str(summary.request_counts.get(name, 0)),
-                str(summary.response_counts.get(name, 0)),
-            ])
+            rows.append(
+                [
+                    name,
+                    str(summary.request_counts.get(name, 0)),
+                    str(summary.response_counts.get(name, 0)),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
         lines.append(header("ICMP Conversations"))
         rows = [["Src", "Dst", "Proto", "Packets", "Bytes", "First Seen", "Last Seen"]]
-        for convo in sorted(summary.conversations, key=lambda c: c.get("packets", 0), reverse=True):
-            rows.append([
-                str(convo.get("src", "-")),
-                str(convo.get("dst", "-")),
-                str(convo.get("protocol", "-")),
-                str(convo.get("packets", "-")),
-                format_bytes_as_mb(int(convo.get("bytes", 0))),
-                format_ts(convo.get("first_seen")),
-                format_ts(convo.get("last_seen")),
-            ])
+        for convo in sorted(
+            summary.conversations, key=lambda c: c.get("packets", 0), reverse=True
+        ):
+            rows.append(
+                [
+                    str(convo.get("src", "-")),
+                    str(convo.get("dst", "-")),
+                    str(convo.get("protocol", "-")),
+                    str(convo.get("packets", "-")),
+                    format_bytes_as_mb(int(convo.get("bytes", 0))),
+                    format_ts(convo.get("first_seen")),
+                    format_ts(convo.get("last_seen")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.sessions:
         lines.append(SUBSECTION_BAR)
         lines.append(header("ICMP Echo Sessions"))
-        rows = [["Src", "Dst", "ID", "Requests", "Replies", "Packets", "First Seen", "Last Seen"]]
+        rows = [
+            [
+                "Src",
+                "Dst",
+                "ID",
+                "Requests",
+                "Replies",
+                "Packets",
+                "First Seen",
+                "Last Seen",
+            ]
+        ]
         for sess in summary.sessions:
-            rows.append([
-                str(sess.get("src", "-")),
-                str(sess.get("dst", "-")),
-                str(sess.get("id", "-")),
-                str(sess.get("requests", "-")),
-                str(sess.get("replies", "-")),
-                str(sess.get("packets", "-")),
-                format_ts(sess.get("first_seen")),
-                format_ts(sess.get("last_seen")),
-            ])
+            rows.append(
+                [
+                    str(sess.get("src", "-")),
+                    str(sess.get("dst", "-")),
+                    str(sess.get("id", "-")),
+                    str(sess.get("requests", "-")),
+                    str(sess.get("replies", "-")),
+                    str(sess.get("packets", "-")),
+                    format_ts(sess.get("first_seen")),
+                    format_ts(sess.get("last_seen")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.payload_summaries:
         lines.append(SUBSECTION_BAR)
         lines.append(header("ICMP Payload Summary"))
-        rows = [["Payload (cleartext preview)", "Count", "Size", "Entropy", "Top Sources", "Top Destinations"]]
+        rows = [
+            [
+                "Payload (cleartext preview)",
+                "Count",
+                "Size",
+                "Entropy",
+                "Top Sources",
+                "Top Destinations",
+            ]
+        ]
         for item in summary.payload_summaries[:limit]:
-            top_src = ", ".join(f"{ip}({count})" for ip, count in item.get("top_sources", []))
-            top_dst = ", ".join(f"{ip}({count})" for ip, count in item.get("top_destinations", []))
-            rows.append([
-                str(item.get("payload_preview", "-")),
-                str(item.get("count", "-")),
-                str(item.get("size", "-")),
-                f"{item.get('entropy', 0):.2f}",
-                top_src or "-",
-                top_dst or "-",
-            ])
+            top_src = ", ".join(
+                f"{ip}({count})" for ip, count in item.get("top_sources", [])
+            )
+            top_dst = ", ".join(
+                f"{ip}({count})" for ip, count in item.get("top_destinations", [])
+            )
+            rows.append(
+                [
+                    str(item.get("payload_preview", "-")),
+                    str(item.get("count", "-")),
+                    str(item.get("size", "-")),
+                    f"{item.get('entropy', 0):.2f}",
+                    top_src or "-",
+                    top_dst or "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     if verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("ICMP Artifacts"))
-        lines.append(f"Sources: {', '.join(sorted(summary.src_ips)) if summary.src_ips else '-'}")
-        lines.append(f"Destinations: {', '.join(sorted(summary.dst_ips)) if summary.dst_ips else '-'}")
+        lines.append(
+            f"Sources: {', '.join(sorted(summary.src_ips)) if summary.src_ips else '-'}"
+        )
+        lines.append(
+            f"Destinations: {', '.join(sorted(summary.dst_ips)) if summary.dst_ips else '-'}"
+        )
         if summary.src_ip_counts:
-            top_sources = ", ".join(f"{ip}({count})" for ip, count in summary.src_ip_counts.most_common(_FULL_OUTPUT_LIMIT))
+            top_sources = ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.src_ip_counts.most_common(_FULL_OUTPUT_LIMIT)
+            )
             lines.append(f"Top Sources: {top_sources}")
         if summary.dst_ip_counts:
-            top_dests = ", ".join(f"{ip}({count})" for ip, count in summary.dst_ip_counts.most_common(_FULL_OUTPUT_LIMIT))
+            top_dests = ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.dst_ip_counts.most_common(_FULL_OUTPUT_LIMIT)
+            )
             lines.append(f"Top Destinations: {top_dests}")
 
     detections = _filtered_detections(summary, verbose)
@@ -2468,8 +2932,11 @@ def render_icmp_summary(summary: IcmpSummary, limit: int = 12, verbose: bool = F
     return _finalize_output(lines, show_truncation_note=False)
 
 
-def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_dns_summary(
+    summary: DnsSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
+
     def _dns_type_name(type_id: int) -> str:
         return {
             1: "A",
@@ -2532,6 +2999,7 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         if not info:
             return "-", "-"
         return str(info.get("score", "-")), str(info.get("rating", "-"))
+
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"DNS ANALYSIS :: {summary.path.name}"))
@@ -2553,7 +3021,11 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         score = 0
         reasons: list[str] = []
         detections = list(getattr(summary, "detections", []) or [])
-        warn_count = sum(1 for item in detections if str(item.get("severity", "")).lower() == "warning")
+        warn_count = sum(
+            1
+            for item in detections
+            if str(item.get("severity", "")).lower() == "warning"
+        )
         if warn_count:
             score += min(3, warn_count)
             reasons.append(f"Warning-level DNS detections observed ({warn_count})")
@@ -2571,14 +3043,20 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
             values = checks.get(key, []) if isinstance(checks, dict) else []
             if values:
                 score += 1
-                reasons.append(f"{key.replace('_', ' ')} evidence observed ({len(values)})")
+                reasons.append(
+                    f"{key.replace('_', ' ')} evidence observed ({len(values)})"
+                )
 
         if getattr(summary, "transaction_violations", None):
             score += 2
-            reasons.append(f"Transaction integrity violations observed ({len(summary.transaction_violations)})")
+            reasons.append(
+                f"Transaction integrity violations observed ({len(summary.transaction_violations)})"
+            )
         if getattr(summary, "resolver_drift", None):
             score += 1
-            reasons.append(f"Resolver drift observed ({len(summary.resolver_drift)} clients)")
+            reasons.append(
+                f"Resolver drift observed ({len(summary.resolver_drift)} clients)"
+            )
 
         if score >= 8:
             verdict = "YES - high-confidence suspicious DNS abuse or compromise indicators are present."
@@ -2587,7 +3065,9 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
             verdict = "LIKELY - significant suspicious DNS behavior is present."
             confidence = "Medium"
         elif score >= 2:
-            verdict = "POSSIBLE - weak-to-moderate suspicious DNS indicators are present."
+            verdict = (
+                "POSSIBLE - weak-to-moderate suspicious DNS indicators are present."
+            )
             confidence = "Low"
         else:
             verdict = "NO STRONG SIGNAL - no convincing high-risk DNS threat pattern from current heuristics."
@@ -2608,7 +3088,7 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(8)]:
+    for reason in verdict_reasons[: _limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     # Add concrete context for immediate triage.
@@ -2622,7 +3102,7 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         lines.append(muted("- Top DNS servers"))
         for server, count in summary.server_counts.most_common(_limit_value(8)):
             lines.append(muted(f"- {_highlight_public_ips(str(server))}: {int(count)}"))
-    if summary.qname_counts:
+    if verbose and summary.qname_counts:
         lines.append(muted("What:"))
         lines.append(muted("- Top queried names"))
         for qname, count in summary.qname_counts.most_common(_limit_value(6)):
@@ -2632,13 +3112,153 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         if tv:
             lines.append(muted("When:"))
             lines.append(muted("- Transaction integrity violations"))
-            for item in tv[:_limit_value(6)]:
+            for item in tv[: _limit_value(6)]:
                 lines.append(
                     muted(
                         f"- id={item.get('id', '-')} {_highlight_public_ips(str(item.get('src', '-')))}"
                         f"->{_highlight_public_ips(str(item.get('dst', '-')))} at {format_ts(item.get('ts'))}"
                     )
                 )
+
+    if not verbose:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Traffic Statistics"))
+        q_resp_ratio = "-"
+        if summary.response_packets:
+            q_resp_ratio = f"{summary.query_packets / max(1, summary.response_packets):.2f}"
+        lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+        lines.append(_format_kv("Query/Response Ratio", q_resp_ratio))
+        lines.append(_format_kv("Unique Clients", str(summary.unique_clients)))
+        lines.append(_format_kv("Unique Servers", str(summary.unique_servers)))
+        lines.append(_format_kv("Unique QNames", str(summary.unique_qnames)))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("DNS Service Statistics"))
+        if summary.type_counts:
+            rows = [["Query Type", "Count"]]
+            for name, count in summary.type_counts.most_common(15):
+                try:
+                    type_id = int(name)
+                    type_label = f"{_dns_type_name(type_id)} ({type_id})"
+                except Exception:
+                    type_label = str(name)
+                rows.append([type_label, str(count)])
+            lines.append(_format_table(rows))
+        if summary.rcode_counts:
+            rows = [["Response Code", "Count"]]
+            for name, count in summary.rcode_counts.most_common(15):
+                try:
+                    rcode_id = int(name)
+                    rcode_label = f"{_dns_rcode_name(rcode_id)} ({rcode_id})"
+                except Exception:
+                    rcode_label = str(name)
+                rows.append([rcode_label, str(count)])
+            lines.append(_format_table(rows))
+        if summary.opcode_counts:
+            rows = [["Opcode", "Count"]]
+            for opcode, count in summary.opcode_counts.most_common(15):
+                rows.append([f"{_dns_opcode_name(int(opcode))} ({opcode})", str(count)])
+            lines.append(_format_table(rows))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("DNS Client Statistics"))
+        if summary.client_counts:
+            rows = [["Client", "Queries"]]
+            for name, count in summary.client_counts.most_common(15):
+                rows.append([str(name), str(count)])
+            lines.append(_format_table(rows))
+        else:
+            lines.append(muted("No DNS clients observed."))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("DNS Server Statistics"))
+        if summary.server_counts:
+            rows = [["Server", "Responses"]]
+            for name, count in summary.server_counts.most_common(15):
+                rows.append([str(name), str(count)])
+            lines.append(_format_table(rows))
+        else:
+            lines.append(muted("No DNS servers observed."))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Most Queried Domains/URLs"))
+        if summary.qname_counts:
+            rows = [["QName", "Count"]]
+            for name, count in summary.qname_counts.most_common(15):
+                rows.append([str(name), str(count)])
+            lines.append(_format_table(rows))
+        else:
+            lines.append(muted("No queried names observed."))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Least Queried Domains/URLs"))
+        if summary.qname_counts:
+            rows = [["QName", "Count"]]
+            bottom_names = sorted(
+                summary.qname_counts.items(), key=lambda item: (item[1], item[0])
+            )[:15]
+            for name, count in bottom_names:
+                rows.append([str(name), str(count)])
+            lines.append(_format_table(rows))
+        else:
+            lines.append(muted("No queried names observed."))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Most Queried Base Domains"))
+        if summary.base_domain_counts:
+            rows = [["Base Domain", "Count"]]
+            for name, count in summary.base_domain_counts.most_common(15):
+                rows.append([str(name), str(count)])
+            lines.append(_format_table(rows))
+        else:
+            lines.append(muted("No base-domain observations available."))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Least Queried Base Domains"))
+        if summary.base_domain_counts:
+            rows = [["Base Domain", "Count"]]
+            bottom_domains = sorted(
+                summary.base_domain_counts.items(),
+                key=lambda item: (item[1], item[0]),
+            )[:15]
+            for name, count in bottom_domains:
+                rows.append([str(name), str(count)])
+            lines.append(_format_table(rows))
+        else:
+            lines.append(muted("No base-domain observations available."))
+
+        severe_items: list[dict[str, object]] = []
+        for item in list(getattr(summary, "detections", []) or []):
+            severity = str(item.get("severity", "info")).lower()
+            if severity in {"critical", "high", "medium", "warning"}:
+                severe_items.append(item)
+        if severe_items:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Medium/High/Critical Issues"))
+            for item in severe_items[:15]:
+                severity = str(item.get("severity", "info")).lower()
+                summary_text = _truncate_text(str(item.get("summary", "")), 120)
+                details = _truncate_text(str(item.get("details", "")), 140)
+                if severity == "critical":
+                    marker = danger("[CRITICAL]")
+                elif severity == "high":
+                    marker = danger("[HIGH]")
+                elif severity in {"medium", "warning"}:
+                    marker = warn("[MEDIUM]")
+                else:
+                    marker = ok("[INFO]")
+                lines.append(f"{marker} {summary_text}")
+                if details:
+                    lines.append(muted(f"  Details: {details}"))
+
+        if summary.errors:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Errors"))
+            for err in summary.errors[: _limit_value(12)]:
+                lines.append(danger(f"- {err}"))
+
+        lines.append(SECTION_BAR)
+        return _finalize_output(lines)
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Deterministic DNS Security Checks"))
@@ -2660,24 +3280,49 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         lines.append(label(label_text))
         if evidence_items:
             if key == "likely_benign_cdn_rotation":
-                lines.append(ok(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-                matrix_rows.append([label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"])
+                lines.append(
+                    ok(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
+                matrix_rows.append(
+                    [label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"]
+                )
             else:
-                lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-                if key in {"dns_tunneling_indicators", "dga_like_behavior", "fast_flux_or_rebinding", "zone_transfer_attempt"}:
+                lines.append(
+                    warn(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
+                if key in {
+                    "dns_tunneling_indicators",
+                    "dga_like_behavior",
+                    "fast_flux_or_rebinding",
+                    "zone_transfer_attempt",
+                }:
                     risk = "High"
                     conf_level = "High"
-                elif key in {"resolver_policy_violation", "dnssec_or_integrity_anomaly", "amplification_abuse_signal"}:
+                elif key in {
+                    "resolver_policy_violation",
+                    "dnssec_or_integrity_anomaly",
+                    "amplification_abuse_signal",
+                }:
                     risk = "Medium"
                     conf_level = "Medium"
                 else:
                     risk = "Low"
                     conf_level = "Low"
-                matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
-            for item in evidence_items[:_limit_value(8)]:
+                matrix_rows.append(
+                    [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
+                )
+            for item in evidence_items[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -2691,7 +3336,9 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         lines.append(_format_kv("mDNS Responses", str(summary.mdns_response_packets)))
         lines.append(_format_kv("mDNS Clients", str(summary.unique_mdns_clients)))
         lines.append(_format_kv("mDNS Servers", str(summary.unique_mdns_servers)))
-        lines.append(_format_kv("mDNS Error Responses", str(summary.mdns_error_responses)))
+        lines.append(
+            _format_kv("mDNS Error Responses", str(summary.mdns_error_responses))
+        )
     if summary.llmnr_packets:
         lines.append(_format_kv("LLMNR Packets", str(summary.llmnr_packets)))
         lines.append(_format_kv("LLMNR Queries", str(summary.llmnr_query_packets)))
@@ -2752,8 +3399,16 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         rows = [["Metric", "Query", "Response"]]
         metrics = ["count", "min", "max", "avg", "median", "p95"]
         for metric in metrics:
-            qval = summary.query_size_stats.get(metric, "-") if summary.query_size_stats else "-"
-            rval = summary.response_size_stats.get(metric, "-") if summary.response_size_stats else "-"
+            qval = (
+                summary.query_size_stats.get(metric, "-")
+                if summary.query_size_stats
+                else "-"
+            )
+            rval = (
+                summary.response_size_stats.get(metric, "-")
+                if summary.response_size_stats
+                else "-"
+            )
             if metric == "avg":
                 qval = f"{float(qval):.1f}" if isinstance(qval, (int, float)) else qval
                 rval = f"{float(rval):.1f}" if isinstance(rval, (int, float)) else rval
@@ -2815,7 +3470,9 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("Bottom Queried Names"))
         rows = [["QName", "Count"]]
-        bottom_names = sorted(summary.qname_counts.items(), key=lambda item: (item[1], item[0]))[:_limit_value(15)]
+        bottom_names = sorted(
+            summary.qname_counts.items(), key=lambda item: (item[1], item[0])
+        )[: _limit_value(15)]
         for name, count in bottom_names:
             rows.append([name, str(count)])
         lines.append(_format_table(rows))
@@ -2829,13 +3486,19 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
         lines.append(_format_table(rows))
 
     if summary.answers_by_qname:
-        candidates = [(name, answers) for name, answers in summary.answers_by_qname.items() if len(answers) > 1]
+        candidates = [
+            (name, answers)
+            for name, answers in summary.answers_by_qname.items()
+            if len(answers) > 1
+        ]
         if candidates:
             lines.append(SUBSECTION_BAR)
             lines.append(header("Answer Variability (QName)"))
             rows = [["QName", "Unique Answers", "Sample"]]
-            for name, answers in sorted(candidates, key=lambda item: len(item[1]), reverse=True)[:limit]:
-                sample = ", ".join(sorted(list(answers))[:_limit_value(3)])
+            for name, answers in sorted(
+                candidates, key=lambda item: len(item[1]), reverse=True
+            )[:limit]:
+                sample = ", ".join(sorted(list(answers))[: _limit_value(3)])
                 if len(answers) > _limit_value(3):
                     sample += "..."
                 rows.append([name, str(len(answers)), sample or "-"])
@@ -2848,32 +3511,50 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
             rows = [["Client", "Resolvers", "Public", "Private", "Top Resolvers"]]
             for item in summary.resolver_drift[:limit]:
                 tops = item.get("top_resolvers", [])
-                top_text = ", ".join(f"{ip}({count})" for ip, count in (tops[:3] if isinstance(tops, list) else []))
-                rows.append([
-                    str(item.get("client", "-")),
-                    str(item.get("resolver_count", "-")),
-                    str(item.get("public", "-")),
-                    str(item.get("private", "-")),
-                    top_text or "-",
-                ])
+                top_text = ", ".join(
+                    f"{ip}({count})"
+                    for ip, count in (tops[:3] if isinstance(tops, list) else [])
+                )
+                rows.append(
+                    [
+                        str(item.get("client", "-")),
+                        str(item.get("resolver_count", "-")),
+                        str(item.get("public", "-")),
+                        str(item.get("private", "-")),
+                        top_text or "-",
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "client_abuse_profiles", None):
         if summary.client_abuse_profiles:
             lines.append(SUBSECTION_BAR)
             lines.append(header("Client Abuse Profiles"))
-            rows = [["Client", "Queries", "Unique", "Unique Ratio", "Avg Entropy", "NXDOMAIN", "TXT", "Long"]]
+            rows = [
+                [
+                    "Client",
+                    "Queries",
+                    "Unique",
+                    "Unique Ratio",
+                    "Avg Entropy",
+                    "NXDOMAIN",
+                    "TXT",
+                    "Long",
+                ]
+            ]
             for item in summary.client_abuse_profiles[:limit]:
-                rows.append([
-                    str(item.get("client", "-")),
-                    str(item.get("queries", "-")),
-                    str(item.get("unique_qnames", "-")),
-                    str(item.get("unique_ratio", "-")),
-                    str(item.get("avg_entropy", "-")),
-                    str(item.get("nxdomain", "-")),
-                    str(item.get("txt_queries", "-")),
-                    str(item.get("long_queries", "-")),
-                ])
+                rows.append(
+                    [
+                        str(item.get("client", "-")),
+                        str(item.get("queries", "-")),
+                        str(item.get("unique_qnames", "-")),
+                        str(item.get("unique_ratio", "-")),
+                        str(item.get("avg_entropy", "-")),
+                        str(item.get("nxdomain", "-")),
+                        str(item.get("txt_queries", "-")),
+                        str(item.get("long_queries", "-")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "ttl_outliers", None):
@@ -2882,13 +3563,15 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
             lines.append(header("TTL Outliers"))
             rows = [["QName", "Samples", "Unique TTL", "Min TTL", "Max TTL"]]
             for item in summary.ttl_outliers[:limit]:
-                rows.append([
-                    _truncate_text(str(item.get("qname", "-")), 64),
-                    str(item.get("samples", "-")),
-                    str(item.get("unique_ttl", "-")),
-                    str(item.get("min_ttl", "-")),
-                    str(item.get("max_ttl", "-")),
-                ])
+                rows.append(
+                    [
+                        _truncate_text(str(item.get("qname", "-")), 64),
+                        str(item.get("samples", "-")),
+                        str(item.get("unique_ttl", "-")),
+                        str(item.get("min_ttl", "-")),
+                        str(item.get("max_ttl", "-")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "cname_anomalies", None):
@@ -2898,12 +3581,16 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
             rows = [["QName", "Targets", "Sample Targets"]]
             for item in summary.cname_anomalies[:limit]:
                 targets = item.get("targets", [])
-                target_text = ", ".join(str(v) for v in (targets[:3] if isinstance(targets, list) else []))
-                rows.append([
-                    _truncate_text(str(item.get("qname", "-")), 64),
-                    str(item.get("target_count", "-")),
-                    _truncate_text(target_text or "-", 80),
-                ])
+                target_text = ", ".join(
+                    str(v) for v in (targets[:3] if isinstance(targets, list) else [])
+                )
+                rows.append(
+                    [
+                        _truncate_text(str(item.get("qname", "-")), 64),
+                        str(item.get("target_count", "-")),
+                        _truncate_text(target_text or "-", 80),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "transaction_violations", None):
@@ -2912,12 +3599,14 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
             lines.append(header("Transaction Integrity Violations"))
             rows = [["DNS ID", "Source", "Destination", "Time"]]
             for item in summary.transaction_violations[:limit]:
-                rows.append([
-                    str(item.get("id", "-")),
-                    str(item.get("src", "-")),
-                    str(item.get("dst", "-")),
-                    format_ts(item.get("ts")),
-                ])
+                rows.append(
+                    [
+                        str(item.get("id", "-")),
+                        str(item.get("src", "-")),
+                        str(item.get("dst", "-")),
+                        format_ts(item.get("ts")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "amplification_candidates", None):
@@ -2926,13 +3615,15 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
             lines.append(header("Amplification Candidates"))
             rows = [["Client", "Resolver", "Query Bytes", "Response Bytes", "Ratio"]]
             for item in summary.amplification_candidates[:limit]:
-                rows.append([
-                    str(item.get("client", "-")),
-                    str(item.get("resolver", "-")),
-                    str(item.get("query_bytes", "-")),
-                    str(item.get("response_bytes", "-")),
-                    str(item.get("ratio", "-")),
-                ])
+                rows.append(
+                    [
+                        str(item.get("client", "-")),
+                        str(item.get("resolver", "-")),
+                        str(item.get("query_bytes", "-")),
+                        str(item.get("response_bytes", "-")),
+                        str(item.get("ratio", "-")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "timeline", None):
@@ -2941,29 +3632,41 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
             lines.append(header("Attack Timeline"))
             rows = [["Time", "Event", "Summary", "Details"]]
             for item in summary.timeline[:limit]:
-                rows.append([
-                    format_ts(item.get("ts")),
-                    str(item.get("event", "-")),
-                    _truncate_text(_redact_in_text(str(item.get("summary", "-"))), 56),
-                    _truncate_text(_redact_in_text(str(item.get("details", "-"))), 90),
-                ])
+                rows.append(
+                    [
+                        format_ts(item.get("ts")),
+                        str(item.get("event", "-")),
+                        _truncate_text(
+                            _redact_in_text(str(item.get("summary", "-"))), 56
+                        ),
+                        _truncate_text(
+                            _redact_in_text(str(item.get("details", "-"))), 90
+                        ),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "benign_context", None):
         if summary.benign_context:
             lines.append(SUBSECTION_BAR)
             lines.append(header("False-Positive Context"))
-            for item in summary.benign_context[:_limit_value(8)]:
+            for item in summary.benign_context[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     if summary.base_domain_answers:
-        candidates = [(name, answers) for name, answers in summary.base_domain_answers.items() if len(answers) > 1]
+        candidates = [
+            (name, answers)
+            for name, answers in summary.base_domain_answers.items()
+            if len(answers) > 1
+        ]
         if candidates:
             lines.append(SUBSECTION_BAR)
             lines.append(header("Answer Variability (Base Domain)"))
             rows = [["Domain", "Unique Answers", "Sample"]]
-            for name, answers in sorted(candidates, key=lambda item: len(item[1]), reverse=True)[:limit]:
-                sample = ", ".join(sorted(list(answers))[:_limit_value(3)])
+            for name, answers in sorted(
+                candidates, key=lambda item: len(item[1]), reverse=True
+            )[:limit]:
+                sample = ", ".join(sorted(list(answers))[: _limit_value(3)])
                 if len(answers) > _limit_value(3):
                     sample += "..."
                 rows.append([name, str(len(answers)), sample or "-"])
@@ -2996,18 +3699,19 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
     if summary.zone_transfer_requests:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Zone Transfer Requests"))
-        samples = ", ".join(sorted(summary.zone_transfer_requests)[:_limit_value(20)])
+        samples = ", ".join(sorted(summary.zone_transfer_requests)[: _limit_value(20)])
         lines.append(muted(samples or "-"))
 
     if summary.txt_query_names:
         lines.append(SUBSECTION_BAR)
         lines.append(header("TXT Query Names"))
-        samples = ", ".join(sorted(summary.txt_query_names)[:_limit_value(20)])
+        samples = ", ".join(sorted(summary.txt_query_names)[: _limit_value(20)])
         lines.append(muted(samples or "-"))
 
     if summary.vt_results:
         vt_hits = [
-            item for item in summary.vt_results.values()
+            item
+            for item in summary.vt_results.values()
             if int(item.get("score", 0) or 0) > 0
         ]
         lines.append(SUBSECTION_BAR)
@@ -3019,17 +3723,25 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
                 key=lambda entry: int(entry.get("score", 0) or 0),
                 reverse=True,
             )[:limit]:
-                last_seen = format_ts(item.get("last_analysis_date")) if item.get("last_analysis_date") else "-"
-                rows.append([
-                    str(item.get("domain", "-")),
-                    str(item.get("score", "-")),
-                    str(item.get("rating", "-")),
-                    str(item.get("reputation", "-")),
-                    last_seen,
-                ])
+                last_seen = (
+                    format_ts(item.get("last_analysis_date"))
+                    if item.get("last_analysis_date")
+                    else "-"
+                )
+                rows.append(
+                    [
+                        str(item.get("domain", "-")),
+                        str(item.get("score", "-")),
+                        str(item.get("rating", "-")),
+                        str(item.get("reputation", "-")),
+                        last_seen,
+                    ]
+                )
             lines.append(_format_table(rows))
         else:
-            lines.append(muted("No malicious/suspicious VirusTotal hits in sampled domains."))
+            lines.append(
+                muted("No malicious/suspicious VirusTotal hits in sampled domains.")
+            )
 
     if summary.llmnr_packets:
         lines.append(SUBSECTION_BAR)
@@ -3102,8 +3814,8 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
             count = int(item.get("count", 0) or 0)
             pct = (count / total_packets * 100) if total_packets else 0.0
             low, high = _bucket_range(bucket_label)
-            is_short = (high is not None and high <= 100)
-            is_long = (low >= 1201)
+            is_short = high is not None and high <= 100
+            is_long = low >= 1201
             notes: list[str] = []
             if is_short:
                 short_total += count
@@ -3119,22 +3831,41 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
                 dominant_pct = pct
                 dominant_bucket = bucket_label
             if notes:
-                outlier_rows.append([
-                    bucket_label,
-                    str(count),
-                    f"{pct:.1f}%",
-                    ", ".join(notes),
-                    f"{item.get('burst_rate', 0):.0f}",
-                    format_ts(item.get("burst_start")) if item.get("burst_start") else "-",
-                ])
+                outlier_rows.append(
+                    [
+                        bucket_label,
+                        str(count),
+                        f"{pct:.1f}%",
+                        ", ".join(notes),
+                        f"{item.get('burst_rate', 0):.0f}",
+                        format_ts(item.get("burst_start"))
+                        if item.get("burst_start")
+                        else "-",
+                    ]
+                )
 
         if total_packets:
             short_pct = (short_total / total_packets * 100) if total_packets else 0.0
             long_pct = (long_total / total_packets * 100) if total_packets else 0.0
-            lines.append(_format_kv("Very Short DNS Packets (<=100B)", f"{short_total} ({short_pct:.1f}%)"))
-            lines.append(_format_kv("Very Large DNS Packets (>=1201B)", f"{long_total} ({long_pct:.1f}%)"))
+            lines.append(
+                _format_kv(
+                    "Very Short DNS Packets (<=100B)",
+                    f"{short_total} ({short_pct:.1f}%)",
+                )
+            )
+            lines.append(
+                _format_kv(
+                    "Very Large DNS Packets (>=1201B)",
+                    f"{long_total} ({long_pct:.1f}%)",
+                )
+            )
             if dominant_bucket:
-                lines.append(_format_kv("Dominant Size Bucket", f"{dominant_bucket} ({dominant_pct:.1f}%)"))
+                lines.append(
+                    _format_kv(
+                        "Dominant Size Bucket",
+                        f"{dominant_bucket} ({dominant_pct:.1f}%)",
+                    )
+                )
 
         if outlier_rows:
             lines.append("")
@@ -3144,46 +3875,81 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
             lines.append(_format_table(rows))
 
         lines.append("")
-        rows = [["Size Bucket", "Count", "Avg", "Min", "Max", "Rate(pkt/s)", "%", "Burst Rate", "Burst Start"]]
+        rows = [
+            [
+                "Size Bucket",
+                "Count",
+                "Avg",
+                "Min",
+                "Max",
+                "Rate(pkt/s)",
+                "%",
+                "Burst Rate",
+                "Burst Start",
+            ]
+        ]
         for item in summary.packet_length_stats:
-            rows.append([
-                str(item.get("bucket", "-")),
-                str(item.get("count", "-")),
-                f"{item.get('avg', 0):.1f}",
-                str(item.get("min", "-")),
-                str(item.get("max", "-")),
-                f"{item.get('rate', 0):.2f}",
-                f"{item.get('pct', 0):.1f}%",
-                f"{item.get('burst_rate', 0):.0f}",
-                format_ts(item.get("burst_start")) if item.get("burst_start") else "-",
-            ])
+            rows.append(
+                [
+                    str(item.get("bucket", "-")),
+                    str(item.get("count", "-")),
+                    f"{item.get('avg', 0):.1f}",
+                    str(item.get("min", "-")),
+                    str(item.get("max", "-")),
+                    f"{item.get('rate', 0):.2f}",
+                    f"{item.get('pct', 0):.1f}%",
+                    f"{item.get('burst_rate', 0):.0f}",
+                    format_ts(item.get("burst_start"))
+                    if item.get("burst_start")
+                    else "-",
+                ]
+            )
         lines.append(_format_table(rows))
         lines.append("")
-        lines.append(muted(f"Distribution Sparkline: {sparkline([int(item.get('count', 0) or 0) for item in summary.packet_length_stats])}"))
+        lines.append(
+            muted(
+                f"Distribution Sparkline: {sparkline([int(item.get('count', 0) or 0) for item in summary.packet_length_stats])}"
+            )
+        )
 
     if summary.multicast_streams:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Multicast Streams Summary"))
-        rows = [["Group", "Proto", "Port", "Packets", "Bytes", "Sources", "First Seen", "Last Seen"]]
+        rows = [
+            [
+                "Group",
+                "Proto",
+                "Port",
+                "Packets",
+                "Bytes",
+                "Sources",
+                "First Seen",
+                "Last Seen",
+            ]
+        ]
         for item in summary.multicast_streams:
             sources = item.get("sources", [])
             source_text = ", ".join(f"{ip}({count})" for ip, count in sources)
-            rows.append([
-                str(item.get("group", "-")),
-                str(item.get("protocol", "-")),
-                str(item.get("port", "-")),
-                str(item.get("count", "-")),
-                format_bytes_as_mb(int(item.get("bytes", 0))),
-                source_text or "-",
-                format_ts(item.get("first_seen")),
-                format_ts(item.get("last_seen")),
-            ])
+            rows.append(
+                [
+                    str(item.get("group", "-")),
+                    str(item.get("protocol", "-")),
+                    str(item.get("port", "-")),
+                    str(item.get("count", "-")),
+                    format_bytes_as_mb(int(item.get("bytes", 0))),
+                    source_text or "-",
+                    format_ts(item.get("first_seen")),
+                    format_ts(item.get("last_seen")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if verbose and summary.qname_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("DNS Artifacts"))
-        qnames = ", ".join(name for name, _count in summary.qname_counts.most_common(_limit_value(25)))
+        qnames = ", ".join(
+            name for name, _count in summary.qname_counts.most_common(_limit_value(25))
+        )
         lines.append(f"Observed QNames: {qnames}")
 
     detections = _filtered_detections(summary, verbose)
@@ -3215,29 +3981,39 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
             artifacts = item.get("artifacts")
             if isinstance(artifacts, list) and artifacts:
                 lines.append(muted("  Artifacts:"))
-                for art in artifacts[:_limit_value(8)]:
+                for art in artifacts[: _limit_value(8)]:
                     lines.append(muted(f"    {str(art)}"))
                 if len(artifacts) > _limit_value(8):
-                    lines.append(muted(f"    ... {len(artifacts) - _limit_value(8)} more"))
+                    lines.append(
+                        muted(f"    ... {len(artifacts) - _limit_value(8)} more")
+                    )
 
             evidence = item.get("evidence")
             if isinstance(evidence, list) and evidence:
                 lines.append(muted("  Evidence:"))
-                for ev in evidence[:_limit_value(8)]:
+                for ev in evidence[: _limit_value(8)]:
                     lines.append(muted(f"    {str(ev)}"))
                 if len(evidence) > _limit_value(8):
-                    lines.append(muted(f"    ... {len(evidence) - _limit_value(8)} more"))
+                    lines.append(
+                        muted(f"    ... {len(evidence) - _limit_value(8)} more")
+                    )
 
             vt_findings = item.get("vt_findings")
             if isinstance(vt_findings, list) and vt_findings:
-                lines.append(muted("  VirusTotal (target | benign | suspicious | malicious | report):"))
-                for entry in vt_findings[:_limit_value(12)]:
+                lines.append(
+                    muted(
+                        "  VirusTotal (target | benign | suspicious | malicious | report):"
+                    )
+                )
+                for entry in vt_findings[: _limit_value(12)]:
                     target = str(entry.get("domain") or entry.get("target", "-"))
                     benign = int(entry.get("harmless", 0) or 0)
                     suspicious = int(entry.get("suspicious", 0) or 0)
                     malicious = int(entry.get("malicious", 0) or 0)
                     report = str(entry.get("report_url", "-"))
-                    vt_line = f"{target} | {benign} | {suspicious} | {malicious} | {report}"
+                    vt_line = (
+                        f"{target} | {benign} | {suspicious} | {malicious} | {report}"
+                    )
                     if malicious > 0:
                         lines.append(danger(f"    {vt_line}"))
                     elif suspicious > 0:
@@ -3245,14 +4021,19 @@ def render_dns_summary(summary: DnsSummary, limit: int = 12, verbose: bool = Fal
                     else:
                         lines.append(ok(f"    {vt_line}"))
                 if len(vt_findings) > _limit_value(12):
-                    lines.append(muted(f"    ... {len(vt_findings) - _limit_value(12)} more"))
+                    lines.append(
+                        muted(f"    ... {len(vt_findings) - _limit_value(12)} more")
+                    )
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_ips_summary(
+    summary: IpSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
+    concise_mode = not verbose
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"IP INTELLIGENCE & CONVERSATIONS :: {summary.path.name}"))
@@ -3269,7 +4050,9 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
     lines.append(_format_kv("Unique IPs", str(summary.unique_ips)))
     lines.append(_format_kv("Unique Sources", str(summary.unique_sources)))
     lines.append(_format_kv("Unique Destinations", str(summary.unique_destinations)))
-    lines.append(_format_kv("IPv4 / IPv6", f"{summary.ipv4_count} / {summary.ipv6_count}"))
+    lines.append(
+        _format_kv("IPv4 / IPv6", f"{summary.ipv4_count} / {summary.ipv6_count}")
+    )
     lines.append(_format_kv("Start", format_ts(summary.first_seen)))
     lines.append(_format_kv("End", format_ts(summary.last_seen)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
@@ -3278,18 +4061,18 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
     verdict = str(getattr(summary, "analyst_verdict", "") or "")
     confidence = str(getattr(summary, "analyst_confidence", "") or "").upper()
     reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or [])]
-    if verdict:
+    if verdict and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Analyst Verdict"))
         if confidence:
             lines.append(_format_kv("Verdict", f"{verdict} (confidence: {confidence})"))
         else:
             lines.append(_format_kv("Verdict", verdict))
-        for reason in reasons[:_limit_value(8)]:
+        for reason in reasons[: _limit_value(8)]:
             lines.append(muted(f"- {reason}"))
 
     checks = dict(getattr(summary, "deterministic_checks", {}) or {})
-    if checks:
+    if checks and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Deterministic IPS Security Checks"))
         check_labels = {
@@ -3306,132 +4089,157 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
             values = [str(v) for v in list(checks.get(key, []) or [])]
             if values:
                 lines.append(warn(f"[!] {label}: {len(values)}"))
-                for item in values[:_limit_value(8)]:
+                for item in values[: _limit_value(8)]:
                     lines.append(muted(f"  - {item}"))
             else:
                 lines.append(ok(f"[ ] {label}: none"))
 
     risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
-    if risk_matrix:
+    if risk_matrix and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("IPS Risk Matrix"))
         rows = [["Category", "Risk", "Confidence", "Evidence"]]
-        for row in risk_matrix[:_limit_value(12)]:
+        for row in risk_matrix[: _limit_value(12)]:
             if not isinstance(row, dict):
                 continue
-            rows.append([
-                str(row.get("category", "")),
-                str(row.get("risk", "")),
-                str(row.get("confidence", "")),
-                str(row.get("evidence", "")),
-            ])
+            rows.append(
+                [
+                    str(row.get("category", "")),
+                    str(row.get("risk", "")),
+                    str(row.get("confidence", "")),
+                    str(row.get("evidence", "")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
-    priority_asset_profiles = list(getattr(summary, "priority_asset_profiles", []) or [])
-    if priority_asset_profiles:
+    priority_asset_profiles = list(
+        getattr(summary, "priority_asset_profiles", []) or []
+    )
+    if priority_asset_profiles and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Priority Asset Impact"))
         rows = [["IP", "Score", "Peers", "Ports", "Packets Sent", "Confidence"]]
         for item in priority_asset_profiles[:limit]:
             if not isinstance(item, dict):
                 continue
-            rows.append([
-                str(item.get("ip", "-")),
-                str(item.get("score", "-")),
-                str(item.get("peers", "-")),
-                str(item.get("ports", "-")),
-                str(item.get("packets_sent", "-")),
-                str(item.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("ip", "-")),
+                    str(item.get("score", "-")),
+                    str(item.get("peers", "-")),
+                    str(item.get("ports", "-")),
+                    str(item.get("packets_sent", "-")),
+                    str(item.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
     exposure_profiles = list(getattr(summary, "exposure_profiles", []) or [])
-    if exposure_profiles:
+    if exposure_profiles and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Exposure Posture"))
-        rows = [["Src", "Dst", "Protocol", "Direction", "Packets", "Bytes", "Confidence"]]
+        rows = [
+            ["Src", "Dst", "Protocol", "Direction", "Packets", "Bytes", "Confidence"]
+        ]
         for item in exposure_profiles[:limit]:
             if not isinstance(item, dict):
                 continue
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("protocol", "-")),
-                str(item.get("direction", "-")),
-                str(item.get("packets", "-")),
-                str(item.get("bytes", "-")),
-                str(item.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("protocol", "-")),
+                    str(item.get("direction", "-")),
+                    str(item.get("packets", "-")),
+                    str(item.get("bytes", "-")),
+                    str(item.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
     corroborated_findings = list(getattr(summary, "corroborated_findings", []) or [])
-    if corroborated_findings:
+    if corroborated_findings and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Corroborated Findings"))
         rows = [["IP", "Score", "Confidence", "Reasons"]]
         for item in corroborated_findings[:limit]:
             if not isinstance(item, dict):
                 continue
-            reasons_text = "; ".join(str(v) for v in list(item.get("reasons", []) or [])[:3])
-            rows.append([
-                str(item.get("ip", "-")),
-                str(item.get("score", "-")),
-                str(item.get("confidence", "-")),
-                reasons_text or "-",
-            ])
+            reasons_text = "; ".join(
+                str(v) for v in list(item.get("reasons", []) or [])[:3]
+            )
+            rows.append(
+                [
+                    str(item.get("ip", "-")),
+                    str(item.get("score", "-")),
+                    str(item.get("confidence", "-")),
+                    reasons_text or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
-    infrastructure_clusters = list(getattr(summary, "infrastructure_clusters", []) or [])
-    if infrastructure_clusters:
+    infrastructure_clusters = list(
+        getattr(summary, "infrastructure_clusters", []) or []
+    )
+    if infrastructure_clusters and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Infrastructure Clusters"))
         rows = [["Cluster", "IP Count", "IPs", "Confidence"]]
         for item in infrastructure_clusters[:limit]:
             if not isinstance(item, dict):
                 continue
-            ips = ",".join(str(v) for v in list(item.get("ips", []) or [])[:_limit_value(5)])
-            rows.append([
-                str(item.get("cluster", "-")),
-                str(item.get("ip_count", "-")),
-                ips or "-",
-                str(item.get("confidence", "-")),
-            ])
+            ips = ",".join(
+                str(v) for v in list(item.get("ips", []) or [])[: _limit_value(5)]
+            )
+            rows.append(
+                [
+                    str(item.get("cluster", "-")),
+                    str(item.get("ip_count", "-")),
+                    ips or "-",
+                    str(item.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
     intent_profiles = list(getattr(summary, "intent_profiles", []) or [])
-    if intent_profiles:
+    if intent_profiles and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Intent Heuristics"))
         rows = [["Src", "Dst", "Protocol", "Ports", "Intent", "Confidence"]]
         for item in intent_profiles[:limit]:
             if not isinstance(item, dict):
                 continue
-            ports = ",".join(str(v) for v in list(item.get("ports", []) or [])[:_limit_value(6)])
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("protocol", "-")),
-                ports or "-",
-                str(item.get("intent", "-")),
-                str(item.get("confidence", "-")),
-            ])
+            ports = ",".join(
+                str(v) for v in list(item.get("ports", []) or [])[: _limit_value(6)]
+            )
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("protocol", "-")),
+                    ports or "-",
+                    str(item.get("intent", "-")),
+                    str(item.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("IP Protocol Utilization"))
-    rows = [["Protocol", "Packets", "% traffic"]]
-    for name, count in summary.protocol_counts.most_common(limit):
-        pct = (count / summary.total_packets * 100) if summary.total_packets else 0
-        rows.append([name, str(count), f"{pct:.1f}%"])
-    lines.append(_format_table(rows))
+    if verbose:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("IP Protocol Utilization"))
+        rows = [["Protocol", "Packets", "% traffic"]]
+        for name, count in summary.protocol_counts.most_common(limit):
+            pct = (count / summary.total_packets * 100) if summary.total_packets else 0
+            rows.append([name, str(count), f"{pct:.1f}%"])
+        lines.append(_format_table(rows))
 
-    if summary.ip_category_counts:
+    if summary.ip_category_counts and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Addressing Observations"))
         rows = [["Category", "Packets"]]
@@ -3449,11 +4257,13 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
         ]
         for cat in preferred:
             if summary.ip_category_counts.get(cat, 0) > 0:
-                rows.append([cat.replace("_", " "), str(summary.ip_category_counts[cat])])
+                rows.append(
+                    [cat.replace("_", " "), str(summary.ip_category_counts[cat])]
+                )
         lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Top Sources (prevalence)"))
+    lines.append(header("Top Sources"))
     rows = [["Source", "Packets", "% of IP traffic"]]
     for ip, count in summary.src_counts.most_common(limit):
         pct = (count / summary.total_packets * 100) if summary.total_packets else 0
@@ -3461,7 +4271,7 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
     lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Top Destinations (utilization)"))
+    lines.append(header("Top Destinations"))
     rows = [["Destination", "Packets", "% of IP traffic"]]
     for ip, count in summary.dst_counts.most_common(limit):
         pct = (count / summary.total_packets * 100) if summary.total_packets else 0
@@ -3469,9 +4279,29 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
     lines.append(_format_table(rows))
 
     if summary.ip_mac_counts:
+        endpoint_by_ip = {ep.ip: ep for ep in summary.endpoints}
+        confirmed_ports_by_ip = {
+            str(ip): sorted(
+                {
+                    int(port)
+                    for port in list(ports or [])
+                    if isinstance(port, int) or str(port).isdigit()
+                }
+            )
+            for ip, ports in (getattr(summary, "confirmed_tcp_service_ports", {}) or {}).items()
+        }
         lines.append(SUBSECTION_BAR)
-        lines.append(header("IP to MAC Mapping"))
-        rows = [["IP", "MACs (count)", "Observations", "Unique MACs"]]
+        lines.append(header("IP Host Details"))
+        rows = [
+            [
+                "IP",
+                "Hostname",
+                "MACs (count)",
+                "Service Ports",
+                "Traffic",
+                "Unique MACs",
+            ]
+        ]
         sorted_macs = sorted(
             summary.ip_mac_counts.items(),
             key=lambda item: sum(item[1].values()),
@@ -3479,114 +4309,119 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
         )
         for ip_value, mac_counts in sorted_macs[:limit]:
             macs = ", ".join(
-                f"{mac}({count})" for mac, count in mac_counts.most_common(_limit_value(3))
+                f"{mac}({count})"
+                for mac, count in mac_counts.most_common(_limit_value(3))
             )
             if len(mac_counts) > 3:
                 macs += "..."
-            rows.append([
-                ip_value,
-                macs or "-",
-                str(sum(mac_counts.values())),
-                str(len(mac_counts)),
-            ])
+            hostnames = list((summary.ip_hostnames or {}).get(ip_value, Counter()).items())
+            hostname_text = "-"
+            if hostnames:
+                hostnames = sorted(hostnames, key=lambda item: (-item[1], item[0]))
+                hostname_text = ", ".join(
+                    f"{name}({count})" for name, count in hostnames[:2]
+                )
+            endpoint = endpoint_by_ip.get(ip_value)
+            ports_text = "-"
+            traffic_text = "-"
+            confirmed_ports = confirmed_ports_by_ip.get(ip_value, [])
+            if confirmed_ports:
+                ports_text = ",".join(str(port) for port in confirmed_ports[:8])
+                if len(confirmed_ports) > 8:
+                        ports_text += "..."
+            if endpoint is not None:
+                traffic_text = (
+                    f"pkts s/r={endpoint.packets_sent}/{endpoint.packets_recv}, "
+                    f"bytes={format_bytes_as_mb(endpoint.bytes_sent + endpoint.bytes_recv)}"
+                )
+            rows.append(
+                [
+                    ip_value,
+                    _truncate_text(hostname_text, 42),
+                    macs or "-",
+                    _truncate_text(ports_text, 32),
+                    _truncate_text(traffic_text, 42),
+                    str(len(mac_counts)),
+                ]
+            )
         lines.append(_format_table(rows))
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Top Endpoints (bytes + peers)"))
     sorted_eps = sorted(
         summary.endpoints,
         key=lambda e: e.bytes_sent + e.bytes_recv,
         reverse=True,
     )[:limit]
-    rows = [["IP", "Sent", "Recv", "Total", "Peers", "Ports", "Protocols", "Geo", "ASN"]]
-    for ep in sorted_eps:
-        ports_str = ",".join(str(p) for p in ep.ports[:_limit_value(6)])
-        if len(ep.ports) > 6:
-            ports_str += "..."
-        proto_str = ",".join(ep.protocols[:_limit_value(4)])
-        if len(ep.protocols) > 4:
-            proto_str += "..."
-        rows.append([
-            ep.ip,
-            format_bytes_as_mb(ep.bytes_sent),
-            format_bytes_as_mb(ep.bytes_recv),
-            format_bytes_as_mb(ep.bytes_sent + ep.bytes_recv),
-            str(len(ep.peers)),
-            ports_str or "-",
-            proto_str or "-",
-            ep.geo or "-",
-            ep.asn or "-",
-        ])
-    lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Top IP Conversations"))
-    sorted_convs = sorted(summary.conversations, key=lambda c: c.bytes, reverse=True)[:limit]
-    rows = [["Src", "Dst", "Proto", "Packets", "Bytes", "Duration", "Ports"]]
-    for conv in sorted_convs:
-        duration = "-"
-        if conv.first_seen is not None and conv.last_seen is not None:
-            duration = format_duration(conv.last_seen - conv.first_seen)
-        ports_str = ",".join(str(p) for p in conv.ports[:_limit_value(6)])
-        if len(conv.ports) > 6:
-            ports_str += "..."
-        rows.append([
-            conv.src,
-            conv.dst,
-            conv.protocol,
-            str(conv.packets),
-            format_bytes_as_mb(conv.bytes),
-            duration,
-            ports_str or "-",
-        ])
-    lines.append(_format_table(rows))
-
-    if summary.tls_client_hellos:
+    if verbose:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("TLS Fingerprints & SNI"))
+        lines.append(header("Top Endpoints (bytes + peers)"))
+        rows = [
+            ["IP", "Sent", "Recv", "Total", "Peers", "Ports", "Protocols", "Geo", "ASN"]
+        ]
+        for ep in sorted_eps:
+            ports_str = ",".join(str(p) for p in ep.ports[: _limit_value(6)])
+            if len(ep.ports) > 6:
+                ports_str += "..."
+            proto_str = ",".join(ep.protocols[: _limit_value(4)])
+            if len(ep.protocols) > 4:
+                proto_str += "..."
+            rows.append(
+                [
+                    ep.ip,
+                    format_bytes_as_mb(ep.bytes_sent),
+                    format_bytes_as_mb(ep.bytes_recv),
+                    format_bytes_as_mb(ep.bytes_sent + ep.bytes_recv),
+                    str(len(ep.peers)),
+                    ports_str or "-",
+                    proto_str or "-",
+                    ep.geo or "-",
+                    ep.asn or "-",
+                ]
+            )
+        lines.append(_format_table(rows))
 
-        if summary.ja3_counts:
-            rows = [["JA3 (md5)", "Count"]]
-            for ja3, count in summary.ja3_counts.most_common(limit):
-                rows.append([ja3, str(count)])
-            lines.append(_format_table(rows))
+    if verbose:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top IP Conversations"))
+        sorted_convs = sorted(summary.conversations, key=lambda c: c.bytes, reverse=True)[
+            :limit
+        ]
+        rows = [["Src", "Dst", "Proto", "Packets", "Bytes", "Duration", "Ports"]]
+        for conv in sorted_convs:
+            duration = "-"
+            if conv.first_seen is not None and conv.last_seen is not None:
+                duration = format_duration(conv.last_seen - conv.first_seen)
+            ports_str = ",".join(str(p) for p in conv.ports[: _limit_value(6)])
+            if len(conv.ports) > 6:
+                ports_str += "..."
+            rows.append(
+                [
+                    conv.src,
+                    conv.dst,
+                    conv.protocol,
+                    str(conv.packets),
+                    format_bytes_as_mb(conv.bytes),
+                    duration,
+                    ports_str or "-",
+                ]
+            )
+        lines.append(_format_table(rows))
 
-        if summary.ja4_counts:
-            lines.append("")
-            rows = [["JA4 (heuristic)", "Count"]]
-            for ja4, count in summary.ja4_counts.most_common(limit):
-                rows.append([ja4, str(count)])
-            lines.append(_format_table(rows))
-
-        if summary.ja4s_counts:
-            lines.append("")
-            rows = [["JA4S (server)", "Count"]]
-            for ja4s, count in summary.ja4s_counts.most_common(limit):
-                rows.append([ja4s, str(count)])
-            lines.append(_format_table(rows))
-
-        if summary.sni_counts:
-            lines.append("")
-            rows = [["SNI", "Count", "Entropy"]]
-            for sni, count in summary.sni_counts.most_common(limit):
-                entropy = summary.sni_entropy.get(sni, 0.0)
-                rows.append([sni, str(count), f"{entropy:.2f}"])
-            lines.append(_format_table(rows))
-
-    if summary.ja_reputation_hits:
+    if summary.ja_reputation_hits and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("TLS Fingerprint Reputation"))
         rows = [["Type", "Fingerprint", "Label", "Count"]]
         for item in summary.ja_reputation_hits[:limit]:
-            rows.append([
-                str(item.get("type", "-")),
-                str(item.get("fingerprint", "-")),
-                str(item.get("label", "-")),
-                str(item.get("count", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("type", "-")),
+                    str(item.get("fingerprint", "-")),
+                    str(item.get("label", "-")),
+                    str(item.get("count", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
-    if summary.tls_cert_risks:
+    if summary.tls_cert_risks and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("TLS Certificate Risks"))
         rows = [["Server", "Risk Type", "Details"]]
@@ -3595,60 +4430,77 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
             dst = str(item.get("dst", "-"))
             risks = item.get("risks", [])
             if isinstance(risks, list):
-                for risk in risks[:_limit_value(5)]:
-                    rows.append([
-                        f"{src}->{dst}",
-                        str(risk.get("type", "-")),
-                        str(risk.get("details", "-")),
-                    ])
+                for risk in risks[: _limit_value(5)]:
+                    rows.append(
+                        [
+                            f"{src}->{dst}",
+                            str(risk.get("type", "-")),
+                            str(risk.get("details", "-")),
+                        ]
+                    )
         lines.append(_format_table(rows))
 
-    if summary.suspicious_port_profiles:
+    if summary.suspicious_port_profiles and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Suspicious Port Profiles"))
         rows = [["Type", "Source", "Unique Ports", "Unique Targets", "High Ports"]]
         for item in summary.suspicious_port_profiles[:limit]:
-            rows.append([
-                str(item.get("type", "-")),
-                str(item.get("src", "-")),
-                str(item.get("unique_ports", "-")),
-                str(item.get("unique_dsts", "-")),
-                str(item.get("high_ports", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("type", "-")),
+                    str(item.get("src", "-")),
+                    str(item.get("unique_ports", "-")),
+                    str(item.get("unique_dsts", "-")),
+                    str(item.get("high_ports", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
-    if summary.lateral_movement_scores:
+    if summary.lateral_movement_scores and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Lateral Movement Scoring"))
         rows = [["IP", "Score", "Peers", "Ports", "Packets Sent"]]
-        for item in sorted(summary.lateral_movement_scores, key=lambda x: x.get("score", 0), reverse=True)[:limit]:
-            rows.append([
-                str(item.get("ip", "-")),
-                str(item.get("score", "-")),
-                str(item.get("peers", "-")),
-                str(item.get("ports", "-")),
-                str(item.get("packets_sent", "-")),
-            ])
+        for item in sorted(
+            summary.lateral_movement_scores,
+            key=lambda x: x.get("score", 0),
+            reverse=True,
+        )[:limit]:
+            rows.append(
+                [
+                    str(item.get("ip", "-")),
+                    str(item.get("score", "-")),
+                    str(item.get("peers", "-")),
+                    str(item.get("ports", "-")),
+                    str(item.get("packets_sent", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     pivots = list(getattr(summary, "investigation_pivots", []) or [])
-    if pivots:
+    if pivots and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Hunt Pivots"))
-        rows = [["Flow", "Proto", "Packets", "Bytes", "Ports", "Reasons"]]
+        rows = [["Flow", "Proto", "Packet", "Packets", "Bytes", "Ports", "Reasons"]]
         for item in pivots[:limit]:
             if not isinstance(item, dict):
                 continue
-            ports = ",".join(str(v) for v in list(item.get("ports", []) or [])[:_limit_value(6)])
-            reasons_text = "; ".join(str(v) for v in list(item.get("reasons", []) or [])[:3])
-            rows.append([
-                str(item.get("flow", "-")),
-                str(item.get("protocol", "-")),
-                str(item.get("packets", "-")),
-                format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
-                ports or "-",
-                reasons_text or "-",
-            ])
+            ports = ",".join(
+                str(v) for v in list(item.get("ports", []) or [])[: _limit_value(6)]
+            )
+            reasons_text = "; ".join(
+                str(v) for v in list(item.get("reasons", []) or [])[:3]
+            )
+            rows.append(
+                [
+                    str(item.get("flow", "-")),
+                    str(item.get("protocol", "-")),
+                    _pivot_packet_number(item),
+                    str(item.get("packets", "-")),
+                    format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
+                    ports or "-",
+                    reasons_text or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -3660,15 +4512,24 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
             ep_duration = "-"
             if ep.first_seen is not None and ep.last_seen is not None:
                 ep_duration = format_duration(ep.last_seen - ep.first_seen)
-            rows.append([
-                ep.ip,
-                format_ts(ep.first_seen),
-                format_ts(ep.last_seen),
-                ep_duration,
-            ])
+            rows.append(
+                [
+                    ep.ip,
+                    format_ts(ep.first_seen),
+                    format_ts(ep.last_seen),
+                    ep_duration,
+                ]
+            )
         lines.append(_format_table(rows))
 
     detections = _filtered_detections(summary, verbose)
+    if concise_mode:
+        actionable = []
+        for item in detections:
+            severity = str(item.get("severity", "info")).lower()
+            if severity in {"critical", "high", "severe", "medium", "warning"}:
+                actionable.append(item)
+        detections = actionable
     if detections:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Anomalies & Threat Indicators"))
@@ -3676,10 +4537,12 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
             severity = item.get("severity", "info")
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
-            if severity == "warning":
+            if severity in {"warning", "medium"}:
                 marker = warn("[WARN]")
-            elif severity == "critical":
+            elif severity in {"critical", "severe"}:
                 marker = danger("[CRIT]")
+            elif severity == "high":
+                marker = danger("[HIGH]")
             else:
                 marker = ok("[INFO]")
             lines.append(f"{marker} {summary_text}")
@@ -3694,7 +4557,7 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
                 dst_text = ", ".join(f"{ip}({count})" for ip, count in top_destinations)
                 lines.append(muted(f"  Destinations: {dst_text}"))
 
-    if summary.intel_findings:
+    if summary.intel_findings and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Threat Intel Hits"))
         rows = [["IP", "Source", "Signal", "Details"]]
@@ -3731,25 +4594,32 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
             rows.append([ip, source, signal, "; ".join(details) or "-"])
         lines.append(_format_table(rows))
 
-    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or [])]
-    if false_positive_context:
+    false_positive_context = [
+        str(v) for v in list(getattr(summary, "false_positive_context", []) or [])
+    ]
+    if false_positive_context and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("False-Positive Context"))
-        for item in false_positive_context[:_limit_value(8)]:
+        for item in false_positive_context[: _limit_value(8)]:
             lines.append(muted(f"- {item}"))
+
+    if concise_mode:
+        lines.append(SUBSECTION_BAR)
+        lines.append(
+            muted(
+                "Default IPS view shows host details, top talkers, and medium/high/severe findings only."
+            )
+        )
+        lines.append(muted("Use `-v` for full IPS analytics and forensic context."))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = False) -> str:
-    limit = _FULL_OUTPUT_LIMIT
-    verbose = True
-    def _limit_value(_value: int) -> int:
-        return _FULL_OUTPUT_LIMIT
-
-    def _truncate_text(text: str, max_len: int = 0) -> str:
-        return str(text)
+def render_http_summary(
+    summary: HttpSummary, limit: int = 12, verbose: bool = False
+) -> str:
+    limit = _apply_verbose_limit(limit) or limit
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"HTTP ANALYSIS :: {summary.path.name}"))
@@ -3784,9 +4654,15 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
             "masscan",
         )
 
-        critical_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "critical")
-        high_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "high")
-        warning_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "warning")
+        critical_count = sum(
+            1 for d in detections if str(d.get("severity", "")).lower() == "critical"
+        )
+        high_count = sum(
+            1 for d in detections if str(d.get("severity", "")).lower() == "high"
+        )
+        warning_count = sum(
+            1 for d in detections if str(d.get("severity", "")).lower() == "warning"
+        )
 
         if critical_count:
             score += min(4, critical_count * 2)
@@ -3796,22 +4672,34 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
             reasons.append(f"High-severity HTTP findings detected ({high_count})")
         if warning_count >= 2:
             score += 1
-            reasons.append(f"Multiple warning-level HTTP findings detected ({warning_count})")
+            reasons.append(
+                f"Multiple warning-level HTTP findings detected ({warning_count})"
+            )
 
         if summary.downloads:
-            mismatch_count = sum(1 for item in summary.downloads if bool(item.get("mismatch")))
+            mismatch_count = sum(
+                1 for item in summary.downloads if bool(item.get("mismatch"))
+            )
             if mismatch_count:
                 score += 3
-                reasons.append(f"HTTP download type mismatches observed ({mismatch_count})")
+                reasons.append(
+                    f"HTTP download type mismatches observed ({mismatch_count})"
+                )
 
         suspicious_ua_hits = sum(
-            int(count) for ua, count in summary.user_agents.items() if any(tag in ua.lower() for tag in suspicious_ua_markers)
+            int(count)
+            for ua, count in summary.user_agents.items()
+            if any(tag in ua.lower() for tag in suspicious_ua_markers)
         )
         if suspicious_ua_hits:
             score += 1
-            reasons.append(f"Suspicious scanner/tool user-agents observed ({suspicious_ua_hits})")
+            reasons.append(
+                f"Suspicious scanner/tool user-agents observed ({suspicious_ua_hits})"
+            )
 
-        risky_method_hits = int(summary.method_counts.get("TRACE", 0)) + int(summary.method_counts.get("CONNECT", 0))
+        risky_method_hits = int(summary.method_counts.get("TRACE", 0)) + int(
+            summary.method_counts.get("CONNECT", 0)
+        )
         if risky_method_hits:
             score += 1
             reasons.append(f"Risky HTTP methods observed ({risky_method_hits})")
@@ -3868,7 +4756,7 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(10)]:
+    for reason in verdict_reasons[: _limit_value(10)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     # Add concrete context for immediate triage.
@@ -3887,11 +4775,13 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
         lines.append(muted("- Top target servers"))
         for server, count in summary.server_counts.most_common(_limit_value(8)):
             lines.append(muted(f"- {_highlight_public_ips(str(server))}: {int(count)}"))
-    suspicious_downloads = [item for item in summary.downloads if bool(item.get("mismatch"))]
+    suspicious_downloads = [
+        item for item in summary.downloads if bool(item.get("mismatch"))
+    ]
     if suspicious_downloads:
         lines.append(muted("What:"))
         lines.append(muted("- Suspicious downloads"))
-        for item in suspicious_downloads[:_limit_value(6)]:
+        for item in suspicious_downloads[: _limit_value(6)]:
             lines.append(
                 muted(
                     f"- {_highlight_public_ips(str(item.get('src', '-')))}"
@@ -3903,7 +4793,7 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
     if summary.detections:
         lines.append(muted("What:"))
         lines.append(muted("- Top detections"))
-        for det in summary.detections[:_limit_value(6)]:
+        for det in summary.detections[: _limit_value(6)]:
             lines.append(
                 muted(
                     f"- [{str(det.get('severity', 'info')).upper()}] "
@@ -3913,11 +4803,22 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Threat & Compromise Overview"))
-    detection_counts = Counter(str(item.get("severity", "info")).lower() for item in (summary.detections or []))
-    lines.append(_format_kv("Critical Findings", str(detection_counts.get("critical", 0))))
+    detection_counts = Counter(
+        str(item.get("severity", "info")).lower() for item in (summary.detections or [])
+    )
+    lines.append(
+        _format_kv("Critical Findings", str(detection_counts.get("critical", 0)))
+    )
     lines.append(_format_kv("High Findings", str(detection_counts.get("high", 0))))
-    lines.append(_format_kv("Warning Findings", str(detection_counts.get("warning", 0))))
-    lines.append(_format_kv("Suspicious Downloads", str(sum(1 for item in summary.downloads if bool(item.get("mismatch"))))))
+    lines.append(
+        _format_kv("Warning Findings", str(detection_counts.get("warning", 0)))
+    )
+    lines.append(
+        _format_kv(
+            "Suspicious Downloads",
+            str(sum(1 for item in summary.downloads if bool(item.get("mismatch")))),
+        )
+    )
     lines.append(_format_kv("POST Payload Samples", str(len(summary.post_payloads))))
     lines.append(_format_kv("Unique Session Tokens", str(len(summary.session_tokens))))
 
@@ -3936,7 +4837,9 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
                 matches.append(det)
         return matches
 
-    def _matching_detection_lines(keywords: tuple[str, ...], limit_lines: int = 4) -> list[str]:
+    def _matching_detection_lines(
+        keywords: tuple[str, ...], limit_lines: int = 4
+    ) -> list[str]:
         out: list[str] = []
         for det in _matching_detections(keywords):
             summary_text = str(det.get("summary", "") or "")
@@ -3947,7 +4850,11 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
             out.append(_redact_in_text(line))
             artifacts = det.get("artifacts")
             if isinstance(artifacts, list) and artifacts:
-                out.append(_redact_in_text("artifacts=" + ", ".join(str(v) for v in artifacts[:3])))
+                out.append(
+                    _redact_in_text(
+                        "artifacts=" + ", ".join(str(v) for v in artifacts[:3])
+                    )
+                )
             if len(out) >= limit_lines:
                 break
         return out[:limit_lines]
@@ -3956,14 +4863,29 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
         ("Authentication Abuse", ("authentication abuse", "authorization schemes")),
         ("Suspicious Upload Activity", ("upload profile", "upload")),
         ("Web Shell/Dropper Behavior", ("web shell", "dropper")),
-        ("HTTP Beaconing/C2-like Check-ins", ("periodic http check-in", "check-in behavior")),
+        (
+            "HTTP Beaconing/C2-like Check-ins",
+            ("periodic http check-in", "check-in behavior"),
+        ),
         ("URI/Token Obfuscation", ("high-entropy uri/token", "entropy")),
-        ("Host Header / Fronting Anomalies", ("host header / destination anomalies", "host-to-ip churn")),
+        (
+            "Host Header / Fronting Anomalies",
+            ("host header / destination anomalies", "host-to-ip churn"),
+        ),
         ("Method Misuse/Tunneling", ("method misuse/tunneling", "risky http methods")),
-        ("User-Agent Impersonation", ("browser ua impersonation", "suspicious user agents")),
+        (
+            "User-Agent Impersonation",
+            ("browser ua impersonation", "suspicious user agents"),
+        ),
         ("Session Token Replay", ("token replay", "token leakage")),
-        ("Burst/Fan-out Reconnaissance", ("burst/fan-out reconnaissance", "single http uri reached many targets")),
-        ("Content-Type/Payload Mismatch", ("content-type/payload mismatch", "file type discrepancies")),
+        (
+            "Burst/Fan-out Reconnaissance",
+            ("burst/fan-out reconnaissance", "single http uri reached many targets"),
+        ),
+        (
+            "Content-Type/Payload Mismatch",
+            ("content-type/payload mismatch", "file type discrepancies"),
+        ),
         ("Threat Intelligence Reputation", ("threat intelligence", "virustotal")),
     ]
 
@@ -4002,11 +4924,19 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
         lines.append(label(label_text))
         evidence_lines = _matching_detection_lines(keywords)
         if evidence_lines:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
             for item in evidence_lines:
                 lines.append(muted(f"- {item}"))
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
 
         risk, confidence_level, evidence_note = _matrix_rating_for_keywords(keywords)
         matrix_rows.append([label_text, risk, confidence_level, evidence_note])
@@ -4051,7 +4981,8 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
             note = "-"
             if ip_counter:
                 ip_text = ", ".join(
-                    f"{ip}({cnt})" for ip, cnt in ip_counter.most_common(_limit_value(3))
+                    f"{ip}({cnt})"
+                    for ip, cnt in ip_counter.most_common(_limit_value(3))
                 )
                 if len(ip_counter) > 3:
                     ip_text += "..."
@@ -4092,11 +5023,21 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
 
     if summary.url_counts:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Top URLs"))
-        rows = [["URL", "Count"]]
-        for url, count in summary.url_counts.most_common(limit):
-            rows.append([url, str(count)])
-        lines.append(_format_table(rows))
+        lines.append(header("Top 25 URLs"))
+        top_rows = [["URL", "Count"]]
+        for url, count in summary.url_counts.most_common(25):
+            top_rows.append([url, str(count)])
+        lines.append(_format_table(top_rows))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Bottom 25 URLs"))
+        bottom_rows = [["URL", "Count"]]
+        url_items = sorted(
+            summary.url_counts.items(), key=lambda item: (item[1], item[0])
+        )
+        for url, count in url_items[:25]:
+            bottom_rows.append([url, str(count)])
+        lines.append(_format_table(bottom_rows))
 
     if summary.user_agents:
         lines.append(SUBSECTION_BAR)
@@ -4110,7 +5051,9 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
         lines.append(SUBSECTION_BAR)
         lines.append(header("HTTP Referrer Analysis"))
 
-        def _normalize_referrer_items(items: list[tuple[str, int]], truncate: bool) -> list[tuple[str, int]]:
+        def _normalize_referrer_items(
+            items: list[tuple[str, int]], truncate: bool
+        ) -> list[tuple[str, int]]:
             ordered = sorted(items, key=lambda item: (-item[1], item[0]))
             if not truncate:
                 return ordered
@@ -4122,7 +5065,12 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
                 merged[display] = merged.get(display, 0) + count
             return sorted(merged.items(), key=lambda item: (-item[1], item[0]))
 
-        def _append_referrer_table(title: str, header_text: str, items: list[tuple[str, int]], truncate: bool = False) -> None:
+        def _append_referrer_table(
+            title: str,
+            header_text: str,
+            items: list[tuple[str, int]],
+            truncate: bool = False,
+        ) -> None:
             if not items:
                 return
             normalized = _normalize_referrer_items(items, truncate)
@@ -4151,15 +5099,23 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
 
         anomalies: list[str] = []
         if summary.referrer_https_to_http:
-            anomalies.append(f"Mixed content/downgrade referrers: {summary.referrer_https_to_http}")
+            anomalies.append(
+                f"Mixed content/downgrade referrers: {summary.referrer_https_to_http}"
+            )
         if summary.referrer_token_counts:
-            anomalies.append(f"Token-like strings in referrers: {sum(summary.referrer_token_counts.values())}")
+            anomalies.append(
+                f"Token-like strings in referrers: {sum(summary.referrer_token_counts.values())}"
+            )
         if summary.referrer_ip_hosts:
-            anomalies.append(f"IP-literal referrer hosts: {len(summary.referrer_ip_hosts)}")
+            anomalies.append(
+                f"IP-literal referrer hosts: {len(summary.referrer_ip_hosts)}"
+            )
         if summary.referrer_cross_host and summary.referrer_present:
             ratio = summary.referrer_cross_host / max(1, summary.referrer_present)
             if ratio > 0.7:
-                anomalies.append(f"High cross-site referrer rate: {summary.referrer_cross_host}/{summary.referrer_present}")
+                anomalies.append(
+                    f"High cross-site referrer rate: {summary.referrer_cross_host}/{summary.referrer_present}"
+                )
         if anomalies:
             lines.append(header("Referrer Anomalies/Threats"))
             for item in anomalies:
@@ -4197,12 +5153,16 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
             normalized_referrers = _normalize_referrer_items(raw_referrers, True)
             if normalized_referrers:
                 lines.append(label("Top Referrer URLs"))
-                count_width = max(1, max(len(str(count)) for _, count in normalized_referrers))
+                count_width = max(
+                    1, max(len(str(count)) for _, count in normalized_referrers)
+                )
                 rows = [[label("URL"), label("Host"), label("Count")]]
                 host_map = getattr(summary, "referrer_request_host_counts", {}) or {}
                 display_host_map: dict[str, Counter[str]] = defaultdict(Counter)
                 for ref_value, _ in raw_referrers:
-                    display_value = ref_value if verbose else _truncate_text(ref_value, max_len=96)
+                    display_value = (
+                        ref_value if verbose else _truncate_text(ref_value, max_len=96)
+                    )
                     host_counter = host_map.get(ref_value)
                     if not host_counter:
                         continue
@@ -4251,50 +5211,22 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
             rows.append([ctype, str(count)])
         lines.append(_format_table(rows))
 
-    if summary.file_artifacts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Files & Artifacts"))
-        rows = [["File", "Count"]]
-        for name, count in summary.file_artifacts.most_common(limit):
-            rows.append([name, str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.downloads:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Downloaded Files"))
-        rows = [["File", "Detected", "Expected", "Bytes", "Status", "Packet", "Src", "Dst"]]
-        for item in summary.downloads[:limit]:
-            name = str(item.get("filename", "-"))
-            detected = str(item.get("detected_type", "-"))
-            expected = str(item.get("expected_type", "-"))
-            if item.get("mismatch"):
-                detected = danger(detected)
-            rows.append([
-                name,
-                detected,
-                expected,
-                str(item.get("bytes", "-")),
-                str(item.get("status", "-")),
-                str(item.get("packet", "-")),
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-            ])
-        lines.append(_format_table(rows))
-
     if summary.post_payloads:
         lines.append(SUBSECTION_BAR)
         lines.append(header("HTTP POST Payloads"))
         rows = [["Src", "Dst", "Host", "URI", "Bytes", "Content-Type", "Sample"]]
         for item in summary.post_payloads[:limit]:
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("host", "-")) or "-",
-                str(item.get("uri", "-")),
-                str(item.get("bytes", "-")),
-                str(item.get("content_type", "-")) or "-",
-                str(item.get("sample", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("host", "-")) or "-",
+                    str(item.get("uri", "-")),
+                    str(item.get("bytes", "-")),
+                    str(item.get("content_type", "-")) or "-",
+                    str(item.get("sample", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.session_tokens:
@@ -4318,13 +5250,23 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
         def _http_methods(conv: object) -> object:
             methods = _conv_value(conv, "methods")
             if hasattr(methods, "most_common"):
-                return ",".join(f"{m}({c})" for m, c in methods.most_common(_limit_value(3))) or "-"
+                return (
+                    ",".join(
+                        f"{m}({c})" for m, c in methods.most_common(_limit_value(3))
+                    )
+                    or "-"
+                )
             return "-"
 
         def _http_statuses(conv: object) -> object:
             statuses = _conv_value(conv, "statuses")
             if hasattr(statuses, "most_common"):
-                return ",".join(f"{s}({c})" for s, c in statuses.most_common(_limit_value(3))) or "-"
+                return (
+                    ",".join(
+                        f"{s}({c})" for s, c in statuses.most_common(_limit_value(3))
+                    )
+                    or "-"
+                )
             return "-"
 
         lines.append(
@@ -4345,15 +5287,15 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
     if detections:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Detections"))
-        evidence_limit = _limit_value(6)
-        artifact_limit = _limit_value(8)
-        vt_limit = _limit_value(12)
+        vt_limit = _limit_value(8)
 
         def _format_ip_counts(value: object) -> str:
             if isinstance(value, Counter):
                 counter = value
             elif isinstance(value, dict):
-                counter = Counter({str(k): int(v) for k, v in value.items() if v is not None})
+                counter = Counter(
+                    {str(k): int(v) for k, v in value.items() if v is not None}
+                )
             elif isinstance(value, list):
                 counter = Counter(str(v) for v in value if v is not None)
             else:
@@ -4362,63 +5304,6 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
             if not items:
                 return "-"
             return ", ".join(f"{ip}({count})" for ip, count in items)
-
-        def _format_evidence_item(item: dict[str, object]) -> str:
-            parts: list[str] = []
-            pkt = item.get("packet")
-            if isinstance(pkt, int) or (isinstance(pkt, str) and pkt not in ("", "-")):
-                parts.append(f"pkt {pkt}")
-            src = item.get("src") or item.get("client") or item.get("ip")
-            dst = item.get("dst") or item.get("server")
-            if src or dst:
-                parts.append(f"{src or '-'} -> {dst or '-'}")
-            method = item.get("method")
-            if method:
-                parts.append(f"method {method}")
-            status = item.get("status")
-            if status:
-                parts.append(f"status {status}")
-            host = item.get("host")
-            if host:
-                parts.append(f"host {host}")
-            uri = item.get("uri") or item.get("url")
-            if uri:
-                safe_uri = _redact_in_text(str(uri))
-                parts.append(f"uri {_truncate_text(safe_uri, 80)}")
-            ua = item.get("user_agent")
-            if ua:
-                safe_ua = _redact_in_text(str(ua))
-                parts.append(f"ua {_truncate_text(safe_ua, 80)}")
-            ref = item.get("referrer")
-            if ref:
-                safe_ref = _redact_in_text(str(ref))
-                parts.append(f"referrer {_truncate_text(safe_ref, 80)}")
-            token_fp = item.get("token_fp")
-            if token_fp:
-                parts.append(f"token {token_fp}")
-            filename = item.get("filename")
-            if filename:
-                parts.append(f"file {filename}")
-            detected_type = item.get("detected_type")
-            expected_type = item.get("expected_type")
-            if detected_type or expected_type:
-                parts.append(f"type {detected_type or '-'} -> {expected_type or '-'}")
-            byte_count = item.get("bytes")
-            if byte_count not in (None, ""):
-                parts.append(f"bytes {byte_count}")
-            length = item.get("length")
-            if length not in (None, ""):
-                parts.append(f"len {length}")
-            content_type = item.get("content_type")
-            if content_type:
-                parts.append(f"ctype {content_type}")
-            server = item.get("server")
-            if server:
-                parts.append(f"server {server}")
-            ref_host = item.get("referrer_host")
-            if ref_host:
-                parts.append(f"ref_host {ref_host}")
-            return " | ".join(str(part) for part in parts if part)
 
         def _append_detail(label_text: str, value: str) -> None:
             if value:
@@ -4436,7 +5321,7 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
                 marker = ok("[INFO]")
             lines.append(f"{marker} {summary_text}")
             if details:
-                _append_detail("Details", details)
+                _append_detail("Details", _truncate_text(details, 160))
 
             ip_counts = item.get("ip_counts") or item.get("ips")
             if ip_counts:
@@ -4444,64 +5329,489 @@ def render_http_summary(summary: HttpSummary, limit: int = 12, verbose: bool = F
 
             packets = item.get("packets")
             if isinstance(packets, list):
-                pkt_values = [str(p) for p in packets if p not in (None, "")]
-                if pkt_values:
-                    display = ", ".join(pkt_values[:_limit_value(12)])
-                    if len(pkt_values) > _limit_value(12):
-                        display += "..."
-                    _append_detail("Packets", display)
+                pkt_count = len([p for p in packets if p not in (None, "")])
+                if pkt_count:
+                    _append_detail("Packets", f"{pkt_count} packet(s)")
 
             artifacts = item.get("artifacts")
             if isinstance(artifacts, list) and artifacts:
-                shown = artifacts[:artifact_limit]
-                lines.append(muted("  Artifacts:"))
-                for val in shown:
-                    display = _truncate_text(_redact_in_text(str(val)), 96)
-                    lines.append(muted(f"    {display}"))
-                if len(artifacts) > len(shown):
-                    lines.append(muted(f"    ... {len(artifacts) - len(shown)} more"))
+                _append_detail("Artifacts", f"{len(artifacts)} item(s)")
 
             vt_findings = item.get("vt_findings")
             if isinstance(vt_findings, list) and vt_findings:
-                lines.append(muted("  VirusTotal (target | benign | suspicious | malicious | report):"))
+                malicious_total = 0
+                suspicious_total = 0
                 for entry in vt_findings[:vt_limit]:
-                    target = str(entry.get("target", "-"))
-                    benign = int(entry.get("harmless", 0) or 0)
-                    suspicious = int(entry.get("suspicious", 0) or 0)
-                    malicious = int(entry.get("malicious", 0) or 0)
-                    report = str(entry.get("report_url", "-"))
-                    vt_line = f"{target} | {benign} | {suspicious} | {malicious} | {report}"
-                    if malicious > 0:
-                        lines.append(danger(f"    {vt_line}"))
-                    elif suspicious > 0:
-                        lines.append(warn(f"    {vt_line}"))
-                    else:
-                        lines.append(ok(f"    {vt_line}"))
-                if len(vt_findings) > vt_limit:
-                    lines.append(muted(f"    ... {len(vt_findings) - vt_limit} more"))
+                    malicious_total += int(entry.get("malicious", 0) or 0)
+                    suspicious_total += int(entry.get("suspicious", 0) or 0)
+                _append_detail(
+                    "VirusTotal",
+                    f"{len(vt_findings)} finding(s), suspicious={suspicious_total}, malicious={malicious_total}",
+                )
 
             evidence = item.get("evidence")
             if isinstance(evidence, list) and evidence:
-                lines.append(muted("  Evidence:"))
-                shown = 0
-                for ev in evidence:
-                    if shown >= evidence_limit:
-                        break
-                    if isinstance(ev, dict):
-                        ev_text = _format_evidence_item(ev)
-                    else:
-                        ev_text = str(ev)
-                    if ev_text:
-                        lines.append(muted(f"    {ev_text}"))
-                        shown += 1
-                if len(evidence) > shown:
-                    lines.append(muted(f"    ... {len(evidence) - shown} more"))
+                _append_detail("Evidence", f"{len(evidence)} item(s)")
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
 
 
-def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_webrequests_summary(
+    summary: WebRequestSummary,
+    limit: int = 15,
+    verbose: bool = False,
+    view: str = "minimal",
+) -> str:
+    limit = _apply_verbose_limit(limit) or limit
+    view_mode = str(view or "minimal").strip().lower()
+    if view_mode not in {"minimal", "simple", "full"}:
+        view_mode = "minimal"
+
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"WEB REQUESTS :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors if verbose else summary.errors[: _limit_value(12)]:
+            lines.append(danger(f"- {err}"))
+
+    lines.append(_format_kv("Scope", summary.target_ip if summary.scoped else "ALL"))
+    if str(getattr(summary, "search_query", "") or "").strip():
+        lines.append(_format_kv("Search Filter", str(summary.search_query)))
+    lines.append(_format_kv("HTTP Packets", str(summary.http_packets)))
+    lines.append(_format_kv("Matched Requests", str(summary.matched_requests)))
+    lines.append(_format_kv("Suspicious Requests", str(summary.suspicious_requests)))
+
+    if summary.method_counts:
+        lines.append(_format_kv("Methods", _format_counter(summary.method_counts, 8)))
+    if summary.host_counts:
+        lines.append(
+            _format_kv("Top Hosts", _format_counter(summary.host_counts, 6, key_max=50))
+        )
+    if (
+        getattr(summary, "vt_lookup_enabled", False)
+        or getattr(summary, "vt_results", None)
+        or getattr(summary, "vt_errors", None)
+    ):
+        lines.append(_format_kv("VT Lookup Enabled", "Yes" if summary.vt_lookup_enabled else "No"))
+        lines.append(_format_kv("VT Enriched Domains", str(len(summary.vt_results or {}))))
+
+    if summary.vt_results:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("VirusTotal Reputation"))
+        rows = [["Domain", "Mal", "Susp", "Rep", "Report"]]
+        ranked = sorted(
+            summary.vt_results.items(),
+            key=lambda item: (
+                int(item[1].get("malicious", 0) or 0),
+                int(item[1].get("suspicious", 0) or 0),
+                int(item[1].get("reputation", 0) or 0),
+            ),
+            reverse=True,
+        )
+        display_rows = ranked if verbose else ranked[: _limit_value(12)]
+        for domain, info in display_rows:
+            malicious = int(info.get("malicious", 0) or 0)
+            suspicious = int(info.get("suspicious", 0) or 0)
+            if not verbose and malicious <= 0 and suspicious <= 0:
+                continue
+            rows.append(
+                [
+                    _truncate_text(domain, 42),
+                    str(malicious),
+                    str(suspicious),
+                    str(info.get("reputation", "-")),
+                    _truncate_text(str(info.get("report_url", "-")), 74),
+                ]
+            )
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+        else:
+            lines.append(muted("No malicious/suspicious VirusTotal hits in sampled domains."))
+
+    if summary.requests:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Requests"))
+
+        rows: list[list[str]]
+        if view_mode == "minimal":
+            rows = [
+                [
+                    "Time",
+                    "Packet",
+                    "Method",
+                    "Request",
+                    "Remote",
+                    "Status",
+                    "Referer",
+                    "User Agent",
+                ]
+            ]
+            for item in summary.requests if verbose else summary.requests[:limit]:
+                status = "-"
+                if item.response_code is not None:
+                    status = str(item.response_code)
+                    if item.response_name and item.response_name != "-":
+                        status = f"{status} {item.response_name}"
+                referer = str(item.headers.get("referer", "") or "-")
+                user_agent = str(item.headers.get("user-agent", "") or "-")
+                rows.append(
+                    [
+                        format_ts(item.ts),
+                        str(item.packet_number),
+                        item.method,
+                        _truncate_text(f"{item.host}{item.uri}", 62),
+                        f"{item.dst_ip}:{item.dst_port or '-'}",
+                        status,
+                        _truncate_text(referer, 44),
+                        _truncate_text(user_agent, 56),
+                    ]
+                )
+        elif view_mode == "simple":
+            rows = [
+                ["Time", "Packet", "Method", "Host", "URI", "Src", "Dst", "Status", "Risk"]
+            ]
+            for item in summary.requests if verbose else summary.requests[:limit]:
+                status = "-"
+                if item.response_code is not None:
+                    status = str(item.response_code)
+                rows.append(
+                    [
+                        format_ts(item.ts),
+                        str(item.packet_number),
+                        item.method,
+                        _truncate_text(item.host or "-", 28),
+                        _truncate_text(item.uri or "-", 44),
+                        f"{item.src_ip}:{item.src_port or '-'}",
+                        f"{item.dst_ip}:{item.dst_port or '-'}",
+                        status,
+                        f"{item.risk_level} ({item.risk_score})",
+                    ]
+                )
+        else:
+            detailed_items = summary.requests if verbose else summary.requests[:limit]
+            for idx, item in enumerate(detailed_items, start=1):
+                status = "-"
+                if item.response_code is not None:
+                    status = str(item.response_code)
+                    if item.response_name and item.response_name != "-":
+                        status = f"{status} {item.response_name}"
+                reason_text = (
+                    ", ".join(item.risk_reasons[:3]) if item.risk_reasons else "-"
+                )
+                request_target = f"{item.host}{item.uri}" if item.host else item.uri
+                lines.append(
+                    label(
+                        f"[{idx}] {format_ts(item.ts)} {item.method} "
+                        f"{_truncate_text(request_target or '-', 120)}"
+                    )
+                )
+                lines.append(
+                    _format_kv(
+                        "Flow",
+                        f"{item.src_ip}:{item.src_port or '-'} -> {item.dst_ip}:{item.dst_port or '-'}",
+                    )
+                )
+                lines.append(_format_kv("Packet", str(item.packet_number)))
+                lines.append(
+                    _format_kv(
+                        "Request Line",
+                        item.request_line
+                        or f"{item.method} {item.uri} HTTP/{item.http_version}",
+                    )
+                )
+                lines.append(_format_kv("Status", status))
+                lines.append(_format_kv("Risk", f"{item.risk_level} ({item.risk_score})"))
+                lines.append(_format_kv("Reasons", reason_text))
+                if item.response_location:
+                    lines.append(_format_kv("Location", item.response_location))
+
+                if item.params:
+                    param_text = ", ".join(
+                        f"{k}={v}" if v else f"{k}="
+                        for k, v in item.params[: _limit_value(15)]
+                    )
+                    lines.append(_format_kv("Query Params", _truncate_text(param_text, 180)))
+
+                headers = dict(item.headers or {})
+                if headers:
+                    lines.append("Headers:")
+                    preferred_order = [
+                        "host",
+                        "referer",
+                        "user-agent",
+                        "content-type",
+                        "content-length",
+                        "origin",
+                        "cookie",
+                        "authorization",
+                    ]
+                    seen_header_keys: set[str] = set()
+                    for key in preferred_order:
+                        value = str(headers.get(key, "") or "").strip()
+                        if not value:
+                            continue
+                        seen_header_keys.add(key)
+                        lines.append(
+                            muted(f"  {key}: {_truncate_text(value, 220 if verbose else 140)}")
+                        )
+                    for key in sorted(headers.keys()):
+                        if key in seen_header_keys:
+                            continue
+                        value = str(headers.get(key, "") or "").strip()
+                        if not value:
+                            continue
+                        lines.append(
+                            muted(f"  {key}: {_truncate_text(value, 220 if verbose else 140)}")
+                        )
+
+                body_text = str(item.body or "")
+                if body_text:
+                    max_chars = 6000 if verbose else 1500
+                    clipped = body_text[:max_chars]
+                    lines.append("Body:")
+                    body_lines = clipped.splitlines() or [clipped]
+                    max_lines = 200 if verbose else 60
+                    for body_line in body_lines[:max_lines]:
+                        lines.append(muted(f"  {body_line}"))
+                    if len(body_text) > max_chars or len(body_lines) > max_lines:
+                        lines.append(
+                            muted(
+                                f"  ... truncated body ({len(body_text)} chars total)"
+                            )
+                        )
+                if idx < len(detailed_items):
+                    lines.append("")
+
+        if view_mode in {"minimal", "simple"}:
+            lines.append(_format_table(rows))
+        if not verbose and len(summary.requests) > limit:
+            lines.append(muted(f"... {len(summary.requests) - limit} more requests"))
+
+        def _host_is_ip_literal(host_value: str) -> bool:
+            text = str(host_value or "").strip()
+            if not text:
+                return False
+            if text.startswith("[") and "]" in text:
+                text = text[1 : text.index("]")]
+            elif ":" in text and text.count(":") == 1:
+                candidate, maybe_port = text.rsplit(":", 1)
+                if maybe_port.isdigit():
+                    text = candidate
+            try:
+                ipaddress.ip_address(text)
+                return True
+            except Exception:
+                return False
+
+        exe_re = re.compile(r"(?i)\.(exe|elf|dll|sys|msi|scr|jar|apk|bin)(?:$|[?#])")
+        interesting_rows: list[tuple[object, list[str], str]] = []
+        for item in summary.requests:
+            reasons: list[str] = []
+            request_target = f"{item.host or ''}{item.uri or ''}"
+            if exe_re.search(item.uri or "") or exe_re.search(
+                item.response_location or ""
+            ):
+                reasons.append("executable-target")
+            if _host_is_ip_literal(item.host or ""):
+                reasons.append("host-is-ip")
+            if not reasons:
+                continue
+            request_text = f"{item.host}{item.uri}" if item.host else item.uri
+            interesting_rows.append(
+                (
+                    item,
+                    reasons,
+                    _truncate_text(request_text or request_target or "-", 72),
+                )
+            )
+
+        if interesting_rows:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Interesting Requests"))
+            rows = [["Time", "Method", "Request", "Remote", "Status", "Reasons"]]
+            max_rows = max(limit, 8)
+            for item, reasons, req_text in interesting_rows[:max_rows]:
+                status = "-"
+                if item.response_code is not None:
+                    status = str(item.response_code)
+                    if item.response_name and item.response_name != "-":
+                        status = f"{status} {item.response_name}"
+                rows.append(
+                    [
+                        format_ts(item.ts),
+                        item.method,
+                        req_text,
+                        f"{item.dst_ip}:{item.dst_port or '-'}",
+                        status,
+                        ", ".join(reasons),
+                    ]
+                )
+            lines.append(_format_table(rows))
+            if len(interesting_rows) > max_rows:
+                lines.append(
+                    muted(
+                        f"... {len(interesting_rows) - max_rows} more interesting requests"
+                    )
+                )
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Hunt Pivots"))
+        pivot_rows = [["Type", "Packet", "Pivot", "Context"]]
+
+        host_ip_counter: Counter[str] = Counter()
+        host_ip_packet: dict[str, str] = {}
+        host_ip_methods: dict[str, set[str]] = defaultdict(set)
+        host_ip_remotes: dict[str, set[str]] = defaultdict(set)
+        executable_target_counter: Counter[str] = Counter()
+        executable_target_packet: dict[str, str] = {}
+        executable_target_context: dict[str, dict[str, object]] = {}
+        high_risk_counter: Counter[str] = Counter()
+        high_risk_packet: dict[str, str] = {}
+        high_risk_context: dict[str, dict[str, object]] = {}
+
+        exe_re = re.compile(r"(?i)\.(exe|elf|dll|sys|msi|scr|jar|apk|bin)(?:$|[?#])")
+        for item in summary.requests:
+            host_value = str(item.host or "").strip()
+            uri_value = str(item.uri or "")
+            location_value = str(item.response_location or "")
+            request_value = f"{host_value}{uri_value}" if host_value else uri_value
+            packet_number = getattr(item, "packet_number", None)
+            packet_text = (
+                str(packet_number)
+                if isinstance(packet_number, int) and packet_number > 0
+                else "-"
+            )
+
+            if host_value and _host_is_ip_literal(host_value):
+                host_ip_counter[host_value] += 1
+                host_ip_methods[host_value].add(str(item.method or "-"))
+                host_ip_remotes[host_value].add(
+                    f"{item.dst_ip}:{item.dst_port or '-'}"
+                )
+                if packet_text != "-" and host_value not in host_ip_packet:
+                    host_ip_packet[host_value] = packet_text
+
+            if exe_re.search(uri_value) or exe_re.search(location_value):
+                pivot_value = _truncate_text(request_value or "-", 80)
+                executable_target_counter[pivot_value] += 1
+                ctx = executable_target_context.setdefault(
+                    pivot_value,
+                    {"methods": set(), "remotes": set(), "statuses": set()},
+                )
+                methods = ctx.get("methods")
+                if isinstance(methods, set):
+                    methods.add(str(item.method or "-"))
+                remotes = ctx.get("remotes")
+                if isinstance(remotes, set):
+                    remotes.add(f"{item.dst_ip}:{item.dst_port or '-'}")
+                statuses = ctx.get("statuses")
+                if isinstance(statuses, set):
+                    status = (
+                        str(item.response_code)
+                        if item.response_code is not None
+                        else "-"
+                    )
+                    statuses.add(status)
+                if packet_text != "-" and pivot_value not in executable_target_packet:
+                    executable_target_packet[pivot_value] = packet_text
+
+            if (
+                str(item.risk_level or "").lower() in {"high", "medium"}
+                or int(item.risk_score or 0) >= 4
+            ):
+                pivot_value = _truncate_text(request_value or "-", 80)
+                high_risk_counter[pivot_value] += 1
+                ctx = high_risk_context.setdefault(
+                    pivot_value,
+                    {"methods": set(), "remotes": set(), "scores": []},
+                )
+                methods = ctx.get("methods")
+                if isinstance(methods, set):
+                    methods.add(str(item.method or "-"))
+                remotes = ctx.get("remotes")
+                if isinstance(remotes, set):
+                    remotes.add(f"{item.dst_ip}:{item.dst_port or '-'}")
+                scores = ctx.get("scores")
+                if isinstance(scores, list):
+                    scores.append(int(item.risk_score or 0))
+                if packet_text != "-" and pivot_value not in high_risk_packet:
+                    high_risk_packet[pivot_value] = packet_text
+
+        for host, count in host_ip_counter.most_common(_limit_value(8)):
+            methods = ",".join(sorted(host_ip_methods.get(host, set()) or {"-"}))
+            remotes = ",".join(
+                sorted(list(host_ip_remotes.get(host, set()) or {"-"}))[:3]
+            )
+            pivot_rows.append(
+                [
+                    "Host Header (IP)",
+                    host_ip_packet.get(host, "-"),
+                    host,
+                    f"requests={count} methods={methods} remotes={_truncate_text(remotes, 56)}",
+                ]
+            )
+
+        for request_value, count in executable_target_counter.most_common(
+            _limit_value(8)
+        ):
+            ctx = executable_target_context.get(request_value, {})
+            methods = ",".join(
+                sorted(v for v in list(ctx.get("methods", set()) or []) if v)[:3]
+            )
+            remotes = ",".join(
+                sorted(v for v in list(ctx.get("remotes", set()) or []) if v)[:3]
+            )
+            statuses = ",".join(
+                sorted(v for v in list(ctx.get("statuses", set()) or []) if v)[:3]
+            )
+            pivot_rows.append(
+                [
+                    "Executable Target",
+                    executable_target_packet.get(request_value, "-"),
+                    request_value,
+                    f"requests={count} methods={methods or '-'} status={statuses or '-'} remotes={_truncate_text(remotes or '-', 44)}",
+                ]
+            )
+
+        for request_value, count in high_risk_counter.most_common(_limit_value(8)):
+            ctx = high_risk_context.get(request_value, {})
+            methods = ",".join(
+                sorted(v for v in list(ctx.get("methods", set()) or []) if v)[:3]
+            )
+            remotes = ",".join(
+                sorted(v for v in list(ctx.get("remotes", set()) or []) if v)[:3]
+            )
+            scores = [int(v) for v in list(ctx.get("scores", []) or []) if int(v) >= 0]
+            max_score = max(scores) if scores else 0
+            pivot_rows.append(
+                [
+                    "High-Risk Request",
+                    high_risk_packet.get(request_value, "-"),
+                    request_value,
+                    f"hits={count} max_risk={max_score} methods={methods or '-'} remotes={_truncate_text(remotes or '-', 44)}",
+                ]
+            )
+
+        if len(pivot_rows) > 1:
+            lines.append(_format_table(pivot_rows))
+        else:
+            lines.append(muted("No strong hunt pivots identified."))
+    else:
+        lines.append(SUBSECTION_BAR)
+        lines.append(muted("No web requests matched current scope."))
+
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines, show_truncation_note=False)
+
+
+def render_ftp_summary(
+    summary: FtpSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -4550,14 +5860,22 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
                 score += min(4, weight + min(2, count - 1))
                 reasons.append(f"{key.replace('_', ' ')} evidence ({count})")
 
-        high_count = sum(1 for d in detections if str(d.get("severity", "")).lower() in {"high", "critical"})
-        med_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "medium")
+        high_count = sum(
+            1
+            for d in detections
+            if str(d.get("severity", "")).lower() in {"high", "critical"}
+        )
+        med_count = sum(
+            1 for d in detections if str(d.get("severity", "")).lower() == "medium"
+        )
         if high_count:
             score += min(3, high_count)
             reasons.append(f"High-severity FTP detections observed ({high_count})")
         if med_count >= 2:
             score += 1
-            reasons.append(f"Multiple medium-severity FTP detections observed ({med_count})")
+            reasons.append(
+                f"Multiple medium-severity FTP detections observed ({med_count})"
+            )
 
         if score >= 8:
             verdict = "YES - high-confidence malicious or compromised FTP activity is present."
@@ -4566,7 +5884,9 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
             verdict = "LIKELY - suspicious FTP activity with compromise indicators is present."
             confidence = "Medium"
         elif score >= 2:
-            verdict = "POSSIBLE - risky FTP behavior is present; corroboration recommended."
+            verdict = (
+                "POSSIBLE - risky FTP behavior is present; corroboration recommended."
+            )
             confidence = "Low"
         else:
             verdict = "NO STRONG SIGNAL - no convincing malicious FTP pattern from current heuristics."
@@ -4587,7 +5907,7 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(8)]:
+    for reason in verdict_reasons[: _limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     if summary.client_counts:
@@ -4610,7 +5930,7 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
         if clusters:
             lines.append(muted("When:"))
             lines.append(muted("- Incident cluster context"))
-            for item in clusters[:_limit_value(4)]:
+            for item in clusters[: _limit_value(4)]:
                 lines.append(
                     muted(
                         f"- {_redact_in_text(str(item.get('cluster', '-')))} host={_highlight_public_ips(str(item.get('host', '-')))} "
@@ -4637,11 +5957,21 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
         evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
         lines.append(label(label_text))
         if evidence_items:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for item in evidence_items[:_limit_value(8)]:
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
+            for item in evidence_items[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
 
-            if key in {"cleartext_credential_exposure", "bruteforce_or_spray", "data_channel_integrity", "high_risk_file_staging", "ftp_exfiltration_signal"}:
+            if key in {
+                "cleartext_credential_exposure",
+                "bruteforce_or_spray",
+                "data_channel_integrity",
+                "high_risk_file_staging",
+                "ftp_exfiltration_signal",
+            }:
                 risk = "High"
                 conf_level = "High"
             elif key in {"anonymous_or_guest_abuse", "active_passive_mode_abuse"}:
@@ -4650,9 +5980,15 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
             else:
                 risk = "Low"
                 conf_level = "Low"
-            matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+            matrix_rows.append(
+                [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
+            )
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -4686,7 +6022,9 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.user_counts:
         lines.append(SUBSECTION_BAR)
@@ -4761,12 +6099,24 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
             for item in paths[:limit]:
                 targets = item.get("targets", [])
                 steps = item.get("steps", [])
-                rows.append([
-                    _highlight_public_ips(str(item.get("host", "-"))),
-                    str(item.get("confidence", "-")),
-                    _truncate_text(", ".join(str(v) for v in targets[:4]) if isinstance(targets, list) else str(targets), 52),
-                    _truncate_text("; ".join(str(v) for v in steps[:3]) if isinstance(steps, list) else str(steps), 70),
-                ])
+                rows.append(
+                    [
+                        _highlight_public_ips(str(item.get("host", "-"))),
+                        str(item.get("confidence", "-")),
+                        _truncate_text(
+                            ", ".join(str(v) for v in targets[:4])
+                            if isinstance(targets, list)
+                            else str(targets),
+                            52,
+                        ),
+                        _truncate_text(
+                            "; ".join(str(v) for v in steps[:3])
+                            if isinstance(steps, list)
+                            else str(steps),
+                            70,
+                        ),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "incident_clusters", None):
@@ -4777,13 +6127,15 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
             rows = [["Cluster", "Host", "Signals", "Targets", "Confidence"]]
             for item in clusters[:limit]:
                 indicators = item.get("indicators", [])
-                rows.append([
-                    str(item.get("cluster", "-")),
-                    _highlight_public_ips(str(item.get("host", "-"))),
-                    str(len(indicators) if isinstance(indicators, list) else 0),
-                    str(item.get("target_count", "-")),
-                    str(item.get("confidence", "-")),
-                ])
+                rows.append(
+                    [
+                        str(item.get("cluster", "-")),
+                        _highlight_public_ips(str(item.get("host", "-"))),
+                        str(len(indicators) if isinstance(indicators, list) else 0),
+                        str(item.get("target_count", "-")),
+                        str(item.get("confidence", "-")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "campaign_indicators", None):
@@ -4794,11 +6146,20 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
             rows = [["Indicator", "Value", "Hosts"]]
             for item in campaigns[:limit]:
                 hosts = item.get("hosts", [])
-                rows.append([
-                    _truncate_text(str(item.get("indicator", "-")), 40),
-                    _truncate_text(_redact_in_text(str(item.get("value", "-"))), 40),
-                    _truncate_text(", ".join(_highlight_public_ips(str(v)) for v in hosts[:4]) if isinstance(hosts, list) else "-", 70),
-                ])
+                rows.append(
+                    [
+                        _truncate_text(str(item.get("indicator", "-")), 40),
+                        _truncate_text(
+                            _redact_in_text(str(item.get("value", "-"))), 40
+                        ),
+                        _truncate_text(
+                            ", ".join(_highlight_public_ips(str(v)) for v in hosts[:4])
+                            if isinstance(hosts, list)
+                            else "-",
+                            70,
+                        ),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     detections = _filtered_detections(summary, verbose)
@@ -4812,7 +6173,7 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
             if severity == "high":
                 marker = danger("[HIGH]")
             elif severity == "medium":
-                marker = warn("[MED]")
+                marker = warn("[WARN]")
             else:
                 marker = ok("[INFO]")
             lines.append(f"{marker} {summary_text}")
@@ -4833,21 +6194,18 @@ def render_ftp_summary(summary: FtpSummary, limit: int = 12, verbose: bool = Fal
         if notes:
             lines.append(SUBSECTION_BAR)
             lines.append(header("False-Positive Context"))
-            for note in notes[:_limit_value(8)]:
+            for note in notes[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(note)}"))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = False) -> str:
-    limit = _FULL_OUTPUT_LIMIT
-    verbose = True
-    def _limit_value(_value: int) -> int:
-        return _FULL_OUTPUT_LIMIT
-
-    def _truncate_text(text: str, max_len: int = 0) -> str:
-        return str(text)
+def render_tls_summary(
+    summary: TlsSummary, limit: int = 12, verbose: bool = False
+) -> str:
+    limit = _apply_verbose_limit(limit) or limit
+    concise_mode = not verbose
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"TLS/HTTPS ANALYSIS :: {summary.path.name}"))
@@ -4864,13 +6222,26 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
     lines.append(_format_kv("Total Packets", str(summary.total_packets)))
     lines.append(_format_kv("TLS Packets", str(summary.tls_packets)))
     if summary.total_packets:
-        lines.append(_format_kv("TLS Share", f"{(summary.tls_packets / max(summary.total_packets, 1)) * 100.0:.1f}%"))
-    if getattr(summary, "tls_like_packets", 0) and summary.tls_like_packets != summary.tls_packets:
+        lines.append(
+            _format_kv(
+                "TLS Share",
+                f"{(summary.tls_packets / max(summary.total_packets, 1)) * 100.0:.1f}%",
+            )
+        )
+    if (
+        getattr(summary, "tls_like_packets", 0)
+        and summary.tls_like_packets != summary.tls_packets
+    ):
         lines.append(_format_kv("TLS-Like Packets", str(summary.tls_like_packets)))
     lines.append(_format_kv("Client Hellos", str(summary.client_hellos)))
     lines.append(_format_kv("Server Hellos", str(summary.server_hellos)))
     if summary.client_hellos:
-        lines.append(_format_kv("Handshake Success", f"{(summary.server_hellos / max(summary.client_hellos, 1)) * 100.0:.1f}%"))
+        lines.append(
+            _format_kv(
+                "Handshake Success",
+                f"{(summary.server_hellos / max(summary.client_hellos, 1)) * 100.0:.1f}%",
+            )
+        )
     lines.append(_format_kv("Unique TLS Clients", str(len(summary.client_counts))))
     lines.append(_format_kv("Unique TLS Servers", str(len(summary.server_counts))))
     lines.append(_format_kv("TLS Conversations", str(len(summary.conversations))))
@@ -4883,9 +6254,15 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
         reasons: list[str] = []
         detections = list(getattr(summary, "detections", []) or [])
 
-        critical_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "critical")
-        high_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "high")
-        warning_count = sum(1 for d in detections if str(d.get("severity", "")).lower() == "warning")
+        critical_count = sum(
+            1 for d in detections if str(d.get("severity", "")).lower() == "critical"
+        )
+        high_count = sum(
+            1 for d in detections if str(d.get("severity", "")).lower() == "high"
+        )
+        warning_count = sum(
+            1 for d in detections if str(d.get("severity", "")).lower() == "warning"
+        )
         if critical_count:
             score += min(4, critical_count * 2)
             reasons.append(f"Critical TLS findings detected ({critical_count})")
@@ -4894,7 +6271,9 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             reasons.append(f"High-severity TLS findings detected ({high_count})")
         if warning_count >= 2:
             score += 1
-            reasons.append(f"Multiple warning-level TLS findings detected ({warning_count})")
+            reasons.append(
+                f"Multiple warning-level TLS findings detected ({warning_count})"
+            )
 
         if summary.weak_certs:
             score += 2
@@ -4904,10 +6283,14 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             reasons.append(f"Expired certificates detected ({summary.expired_certs})")
         if summary.self_signed_certs:
             score += 1
-            reasons.append(f"Self-signed certificates detected ({summary.self_signed_certs})")
+            reasons.append(
+                f"Self-signed certificates detected ({summary.self_signed_certs})"
+            )
         if summary.weak_ciphers:
             score += 1
-            reasons.append(f"Weak cipher suites detected ({sum(summary.weak_ciphers.values())})")
+            reasons.append(
+                f"Weak cipher suites detected ({sum(summary.weak_ciphers.values())})"
+            )
         if summary.sni_missing_no_ech >= 10 and summary.client_hellos:
             score += 1
             reasons.append(
@@ -4921,7 +6304,9 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             verdict = "LIKELY - significant TLS security issues are present and warrant response."
             confidence = "Medium"
         elif score >= 2:
-            verdict = "POSSIBLE - TLS security issues are present; corroboration recommended."
+            verdict = (
+                "POSSIBLE - TLS security issues are present; corroboration recommended."
+            )
             confidence = "Low"
         else:
             verdict = "NO STRONG SIGNAL - no convincing high-risk TLS compromise pattern from current heuristics."
@@ -4942,55 +6327,200 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(10)]:
+    for reason in verdict_reasons[: _limit_value(10)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
-    # Add concrete context for immediate triage.
-    if summary.server_counts:
-        lines.append(muted("Where:"))
-        lines.append(muted("- Top TLS servers"))
-        for server, count in summary.server_counts.most_common(_limit_value(8)):
-            lines.append(muted(f"- {_highlight_public_ips(str(server))}: {int(count)}"))
-    if summary.client_counts:
-        lines.append(muted("Who:"))
-        lines.append(muted("- Top TLS clients"))
-        for client, count in summary.client_counts.most_common(_limit_value(8)):
-            lines.append(muted(f"- {_highlight_public_ips(str(client))}: {int(count)}"))
-    if summary.sni_counts:
-        lines.append(muted("Where:"))
-        lines.append(muted("- Top SNI targets"))
-        for sni, count in summary.sni_counts.most_common(_limit_value(8)):
-            lines.append(muted(f"- {_redact_in_text(str(sni))}: {int(count)}"))
-    if summary.weak_ciphers:
-        lines.append(muted("What:"))
-        lines.append(muted("- Weak cipher evidence"))
-        for cipher_name, count in summary.weak_ciphers.most_common(_limit_value(6)):
-            lines.append(muted(f"- {_redact_in_text(str(cipher_name))}: {int(count)}"))
-    if summary.detections:
-        lines.append(muted("What:"))
-        lines.append(muted("- Top TLS detections"))
-        for det in summary.detections[:_limit_value(6)]:
-            lines.append(
-                muted(
-                    f"- [{str(det.get('severity', 'info')).upper()}] "
-                    f"{_redact_in_text(str(det.get('summary', '-')))}"
+    # Add concrete context for immediate triage (verbose mode).
+    if verbose:
+        if summary.server_counts:
+            lines.append(muted("Where:"))
+            lines.append(muted("- Top TLS servers"))
+            for server, count in summary.server_counts.most_common(_limit_value(8)):
+                lines.append(
+                    muted(f"- {_highlight_public_ips(str(server))}: {int(count)}")
                 )
-            )
+        if summary.client_counts:
+            lines.append(muted("Who:"))
+            lines.append(muted("- Top TLS clients"))
+            for client, count in summary.client_counts.most_common(_limit_value(8)):
+                lines.append(
+                    muted(f"- {_highlight_public_ips(str(client))}: {int(count)}")
+                )
+        if summary.sni_counts:
+            lines.append(muted("Where:"))
+            lines.append(muted("- Top SNI targets"))
+            for sni, count in summary.sni_counts.most_common(_limit_value(8)):
+                lines.append(muted(f"- {_redact_in_text(str(sni))}: {int(count)}"))
+        if summary.weak_ciphers:
+            lines.append(muted("What:"))
+            lines.append(muted("- Weak cipher evidence"))
+            for cipher_name, count in summary.weak_ciphers.most_common(_limit_value(6)):
+                lines.append(
+                    muted(f"- {_redact_in_text(str(cipher_name))}: {int(count)}")
+                )
+        if summary.detections:
+            lines.append(muted("What:"))
+            lines.append(muted("- Top TLS detections"))
+            for det in summary.detections[: _limit_value(6)]:
+                lines.append(
+                    muted(
+                        f"- [{str(det.get('severity', 'info')).upper()}] "
+                        f"{_redact_in_text(str(det.get('summary', '-')))}"
+                    )
+                )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Threat & Compromise Overview"))
-    detection_counts = Counter(str(item.get("severity", "info")).lower() for item in (summary.detections or []))
-    lines.append(_format_kv("Critical Findings", str(detection_counts.get("critical", 0))))
+    detection_counts = Counter(
+        str(item.get("severity", "info")).lower() for item in (summary.detections or [])
+    )
+    lines.append(
+        _format_kv("Critical Findings", str(detection_counts.get("critical", 0)))
+    )
     lines.append(_format_kv("High Findings", str(detection_counts.get("high", 0))))
-    lines.append(_format_kv("Warning Findings", str(detection_counts.get("warning", 0))))
+    lines.append(
+        _format_kv("Warning Findings", str(detection_counts.get("warning", 0)))
+    )
     lines.append(_format_kv("Weak Certificates", str(summary.weak_certs)))
     lines.append(_format_kv("Expired Certificates", str(summary.expired_certs)))
     lines.append(_format_kv("Self-Signed Certificates", str(summary.self_signed_certs)))
-    lines.append(_format_kv("Weak Cipher Observations", str(sum(summary.weak_ciphers.values()))))
-    lines.append(_format_kv("SNI Missing (no ECH)", f"{summary.sni_missing_no_ech}/{max(summary.client_hellos, 1)}"))
+    lines.append(
+        _format_kv("Weak Cipher Observations", str(sum(summary.weak_ciphers.values())))
+    )
+    lines.append(
+        _format_kv(
+            "SNI Missing (no ECH)",
+            f"{summary.sni_missing_no_ech}/{max(summary.client_hellos, 1)}",
+        )
+    )
+
+    if (
+        getattr(summary, "vt_lookup_enabled", False)
+        or getattr(summary, "vt_results", None)
+        or getattr(summary, "vt_errors", None)
+    ):
+        lines.append(_format_kv("VT Lookup Enabled", "Yes" if summary.vt_lookup_enabled else "No"))
+        lines.append(_format_kv("VT Enriched Domains", str(len(summary.vt_results or {}))))
+        if summary.vt_results:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("VirusTotal Reputation"))
+            rows = [["Domain", "Mal", "Susp", "Rep", "Report"]]
+            ranked = sorted(
+                summary.vt_results.items(),
+                key=lambda item: (
+                    int(item[1].get("malicious", 0) or 0),
+                    int(item[1].get("suspicious", 0) or 0),
+                    int(item[1].get("reputation", 0) or 0),
+                ),
+                reverse=True,
+            )
+            for domain, info in ranked[: _limit_value(15)]:
+                malicious = int(info.get("malicious", 0) or 0)
+                suspicious = int(info.get("suspicious", 0) or 0)
+                if not verbose and malicious <= 0 and suspicious <= 0:
+                    continue
+                rows.append(
+                    [
+                        _truncate_text(str(domain), 40),
+                        str(malicious),
+                        str(suspicious),
+                        str(info.get("reputation", "-")),
+                        _truncate_text(str(info.get("report_url", "-")), 72),
+                    ]
+                )
+            if len(rows) > 1:
+                lines.append(_format_table(rows))
+            else:
+                lines.append(
+                    muted("No malicious/suspicious VirusTotal hits in sampled domains.")
+                )
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Deterministic TLS Security Checks"))
+    lines.append(header("TLS/HTTPS Certificates Summary"))
+    lines.append(_format_kv("Certificates Observed", str(summary.cert_count)))
+    lines.append(_format_kv("Expired", str(summary.expired_certs)))
+    lines.append(_format_kv("Self-Signed", str(summary.self_signed_certs)))
+    lines.append(_format_kv("Weak Key", str(summary.weak_certs)))
+
+    def _parse_cert_not_after(value: str) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except Exception:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def _cert_issue_tags(cert) -> list[str]:
+        tags: list[str] = []
+        if str(cert.subject or "").strip() and str(cert.subject) == str(cert.issuer):
+            tags.append("self-signed")
+        if int(getattr(cert, "pubkey_size", 0) or 0) and int(
+            getattr(cert, "pubkey_size", 0) or 0
+        ) < 2048:
+            tags.append("weak-key")
+        sig_blob = str(getattr(cert, "sig_algo", "") or "").lower()
+        if any(marker in sig_blob for marker in ("sha1", "md5")):
+            tags.append("weak-signature")
+        expiry_dt = _parse_cert_not_after(str(getattr(cert, "not_after", "") or ""))
+        if expiry_dt is not None:
+            now = datetime.now(timezone.utc)
+            if expiry_dt < now:
+                tags.append("expired")
+            elif (expiry_dt - now).days <= 30:
+                tags.append("expiring<=30d")
+        return tags
+
+    cert_issue_totals: Counter[str] = Counter()
+    cert_rows = [
+        ["Certificate", "Issuer/Signer", "Expires", "Typical Issues", "Service/Flow"]
+    ]
+    cert_seen: set[str] = set()
+    cert_items = list(getattr(summary, "cert_artifacts", []) or [])
+    for cert in cert_items:
+        fingerprint = str(getattr(cert, "sha256", "") or "").strip()
+        if fingerprint and fingerprint in cert_seen:
+            continue
+        if fingerprint:
+            cert_seen.add(fingerprint)
+        issue_tags = _cert_issue_tags(cert)
+        cert_issue_totals.update(issue_tags)
+        cert_rows.append(
+            [
+                _truncate_text(_redact_in_text(str(getattr(cert, "subject", "-") or "-")), 36),
+                _truncate_text(
+                    _redact_in_text(str(getattr(cert, "issuer", "-") or "-")), 34
+                ),
+                str(getattr(cert, "not_after", "-") or "-"),
+                ", ".join(issue_tags) if issue_tags else "none-observed",
+                _truncate_text(
+                    _redact_in_text(
+                        str(getattr(cert, "sni", "") or getattr(cert, "dst_ip", "") or "-")
+                    ),
+                    28,
+                ),
+            ]
+        )
+        if len(cert_rows) >= (_limit_value(8) + 1 if concise_mode else _limit_value(limit) + 1):
+            break
+    if len(cert_rows) > 1:
+        lines.append(_format_table(cert_rows))
+    else:
+        lines.append(muted("No parsed certificate artifacts were captured."))
+
+    if cert_issue_totals:
+        lines.append(_format_kv("Issue Totals", _format_counter(cert_issue_totals, 6)))
+    else:
+        lines.append(muted("No common certificate hygiene issues identified in parsed artifacts."))
+
+    if verbose:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Deterministic TLS Security Checks"))
 
     detection_items = list(getattr(summary, "detections", []) or [])
 
@@ -5004,7 +6534,9 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
                 matches.append(det)
         return matches
 
-    def _matching_tls_lines(keywords: tuple[str, ...], limit_lines: int = 4) -> list[str]:
+    def _matching_tls_lines(
+        keywords: tuple[str, ...], limit_lines: int = 4
+    ) -> list[str]:
         out: list[str] = []
         for det in _matching_tls_detections(keywords):
             summary_text = str(det.get("summary", "") or "")
@@ -5017,7 +6549,9 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
                 break
         return out[:limit_lines]
 
-    def _tls_matrix_rating_for_keywords(keywords: tuple[str, ...]) -> tuple[str, str, str]:
+    def _tls_matrix_rating_for_keywords(
+        keywords: tuple[str, ...],
+    ) -> tuple[str, str, str]:
         matches = _matching_tls_detections(keywords)
         if not matches:
             return "None", "Low", "No matching detections"
@@ -5047,55 +6581,102 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
     tls_checks: list[tuple[str, tuple[str, ...]]] = [
         ("Certificate Pinning Drift", ("certificate pinning drift", "cert rotation")),
         ("JA3/JA4 Novelty", ("ja3 novelty", "ja4 novelty", "rarity spike")),
-        ("Fingerprint Cardinality Anomalies", ("cardinality anomaly", "ja3 to sni", "sni to ja3")),
+        (
+            "Fingerprint Cardinality Anomalies",
+            ("cardinality anomaly", "ja3 to sni", "sni to ja3"),
+        ),
         ("Cipher Downgrade Inconsistency", ("cipher downgrade inconsistency",)),
-        ("ALPN Mismatch/Anomalies", ("alpn mismatch", "alpn missing anomaly", "uncommon protocol tokens")),
+        (
+            "ALPN Mismatch/Anomalies",
+            ("alpn mismatch", "alpn missing anomaly", "uncommon protocol tokens"),
+        ),
         ("Certificate Validity Outliers", ("certificate validity outliers",)),
         ("Issuer/SAN Impersonation", ("impersonation heuristics", "issuer/san")),
         ("Handshake Periodicity", ("handshake periodicity",)),
-        ("Session Resumption Abuse", ("session resumption-heavy", "session resumption")),
-        ("SNI Evasion/Anomaly", ("sni missing", "high-entropy sni", "suspicious sni", "sni uses ip literal")),
-        ("Legacy/Weak TLS Crypto", ("legacy tls versions", "weak tls cipher", "weak tls certificate keys")),
-        ("TLS Handshake Failure Pattern", ("tls handshake failures", "without server hello")),
+        (
+            "Session Resumption Abuse",
+            ("session resumption-heavy", "session resumption"),
+        ),
+        (
+            "SNI Evasion/Anomaly",
+            (
+                "sni missing",
+                "high-entropy sni",
+                "suspicious sni",
+                "sni uses ip literal",
+            ),
+        ),
+        (
+            "Legacy/Weak TLS Crypto",
+            ("legacy tls versions", "weak tls cipher", "weak tls certificate keys"),
+        ),
+        (
+            "TLS Handshake Failure Pattern",
+            ("tls handshake failures", "without server hello"),
+        ),
     ]
 
-    tls_matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
-    for label_text, keywords in tls_checks:
-        lines.append(label(label_text))
-        evidence_lines = _matching_tls_lines(keywords)
-        if evidence_lines:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for item in evidence_lines:
-                lines.append(muted(f"- {item}"))
-        else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
-        risk, confidence_level, evidence_note = _tls_matrix_rating_for_keywords(keywords)
-        tls_matrix_rows.append([label_text, risk, confidence_level, evidence_note])
+    if verbose:
+        tls_matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+        for label_text, keywords in tls_checks:
+            lines.append(label(label_text))
+            evidence_lines = _matching_tls_lines(keywords)
+            if evidence_lines:
+                lines.append(
+                    warn(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
+                for item in evidence_lines:
+                    lines.append(muted(f"- {item}"))
+            else:
+                lines.append(
+                    ok(
+                        f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                    )
+                )
+            risk, confidence_level, evidence_note = _tls_matrix_rating_for_keywords(
+                keywords
+            )
+            tls_matrix_rows.append([label_text, risk, confidence_level, evidence_note])
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("TLS Risk Matrix"))
-    lines.append(_format_table(tls_matrix_rows))
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TLS Risk Matrix"))
+        lines.append(_format_table(tls_matrix_rows))
 
-    tls_total_bytes = sum(max(0, int(conv.bytes)) for conv in summary.conversations)
-    lines.append(_format_kv("TLS Bytes (Conversations)", str(tls_total_bytes)))
-    if summary.conversations:
-        lines.append(_format_kv("Avg Bytes / Conversation", f"{tls_total_bytes / max(len(summary.conversations), 1):.1f}"))
-        lines.append(_format_kv("Avg Packets / Conversation", f"{sum(int(conv.packets) for conv in summary.conversations) / max(len(summary.conversations), 1):.1f}"))
+        tls_total_bytes = sum(max(0, int(conv.bytes)) for conv in summary.conversations)
+        lines.append(_format_kv("TLS Bytes (Conversations)", str(tls_total_bytes)))
+        if summary.conversations:
+            lines.append(
+                _format_kv(
+                    "Avg Bytes / Conversation",
+                    f"{tls_total_bytes / max(len(summary.conversations), 1):.1f}",
+                )
+            )
+            lines.append(
+                _format_kv(
+                    "Avg Packets / Conversation",
+                    f"{sum(int(conv.packets) for conv in summary.conversations) / max(len(summary.conversations), 1):.1f}",
+                )
+            )
 
     if getattr(summary, "analysis_notes", None) and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Notes"))
-        for note in summary.analysis_notes[:_limit_value(8)]:
+        for note in summary.analysis_notes[: _limit_value(8)]:
             lines.append(muted(f"- {note}"))
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Systems Communicating Over TLS"))
-    if summary.client_counts or summary.server_counts:
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
-    else:
-        lines.append(muted("No TLS client/server pairs detected."))
+    if verbose:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Systems Communicating Over TLS"))
+        if summary.client_counts or summary.server_counts:
+            lines.append(
+                _format_client_server_table(summary.client_counts, summary.server_counts)
+            )
+        else:
+            lines.append(muted("No TLS client/server pairs detected."))
 
-    if summary.server_ports:
+    if summary.server_ports and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("TLS Service Ports"))
         port_total = sum(summary.server_ports.values())
@@ -5105,59 +6686,67 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             rows.append([str(port), str(count), f"{pct:.1f}%"])
         lines.append(_format_table(rows))
 
-    if summary.conversations:
+    if summary.conversations and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Traffic Statistics"))
-        rows = [["Client", "Server", "Port", "Packets", "Bytes", "First", "Last", "SNI"]]
-        for conv in summary.conversations[:_limit_value(limit)]:
-            rows.append([
-                conv.client_ip,
-                conv.server_ip,
-                str(conv.server_port),
-                str(conv.packets),
-                str(conv.bytes),
-                format_ts(conv.first_seen),
-                format_ts(conv.last_seen),
-                _truncate_text(_redact_in_text(conv.sni or "-"), 64),
-            ])
+        rows = [
+            ["Client", "Server", "Port", "Packets", "Bytes", "First", "Last", "SNI"]
+        ]
+        for conv in summary.conversations[: _limit_value(limit)]:
+            rows.append(
+                [
+                    conv.client_ip,
+                    conv.server_ip,
+                    str(conv.server_port),
+                    str(conv.packets),
+                    str(conv.bytes),
+                    format_ts(conv.first_seen),
+                    format_ts(conv.last_seen),
+                    _truncate_text(_redact_in_text(conv.sni or "-"), 64),
+                ]
+            )
         lines.append(_format_table(rows))
 
         repeated = [conv for conv in summary.conversations if int(conv.packets) >= 20]
         if repeated:
             lines.append(muted("Repeated TLS conversations (>=20 packets):"))
-            for conv in repeated[:_limit_value(10)]:
+            for conv in repeated[: _limit_value(10)]:
                 lines.append(
                     muted(
                         f"- {conv.client_ip} -> {conv.server_ip}:{conv.server_port} packets={conv.packets} bytes={conv.bytes}"
                     )
                 )
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Certificate Posture"))
-    lines.append(_format_kv("Certificates", str(summary.cert_count)))
-    lines.append(_format_kv("Self-Signed", str(summary.self_signed_certs)))
-    lines.append(_format_kv("Expired", str(summary.expired_certs)))
-    lines.append(_format_kv("Weak Keys", str(summary.weak_certs)))
-    if summary.cert_issuers:
-        rows = [["Issuer", "Count"]]
-        for issuer, count in summary.cert_issuers.most_common(_limit_value(limit)):
-            rows.append([_truncate_text(_redact_in_text(issuer), 96), str(count)])
-        lines.append(_format_table(rows))
-    if summary.cert_artifacts:
-        rows = [["Subject", "Issuer", "Not After", "Key", "SNI", "Flow"]]
-        for cert in summary.cert_artifacts[:_limit_value(limit)]:
-            key_text = f"{cert.pubkey_type} {cert.pubkey_size}" if cert.pubkey_type else "-"
-            rows.append([
-                _truncate_text(_redact_in_text(cert.subject), 40),
-                _truncate_text(_redact_in_text(cert.issuer), 34),
-                cert.not_after,
-                key_text,
-                _truncate_text(_redact_in_text(cert.sni or "-"), 28),
-                f"{cert.src_ip}->{cert.dst_ip}",
-            ])
-        lines.append(_format_table(rows))
-
-    if summary.versions:
+    if verbose:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Certificate Posture"))
+        lines.append(_format_kv("Certificates", str(summary.cert_count)))
+        lines.append(_format_kv("Self-Signed", str(summary.self_signed_certs)))
+        lines.append(_format_kv("Expired", str(summary.expired_certs)))
+        lines.append(_format_kv("Weak Keys", str(summary.weak_certs)))
+        if summary.cert_issuers:
+            rows = [["Issuer", "Count"]]
+            for issuer, count in summary.cert_issuers.most_common(_limit_value(limit)):
+                rows.append([_truncate_text(_redact_in_text(issuer), 96), str(count)])
+            lines.append(_format_table(rows))
+        if summary.cert_artifacts:
+            rows = [["Subject", "Issuer", "Not After", "Key", "SNI", "Flow"]]
+            for cert in summary.cert_artifacts[: _limit_value(limit)]:
+                key_text = (
+                    f"{cert.pubkey_type} {cert.pubkey_size}" if cert.pubkey_type else "-"
+                )
+                rows.append(
+                    [
+                        _truncate_text(_redact_in_text(cert.subject), 40),
+                        _truncate_text(_redact_in_text(cert.issuer), 34),
+                        cert.not_after,
+                        key_text,
+                        _truncate_text(_redact_in_text(cert.sni or "-"), 28),
+                        f"{cert.src_ip}->{cert.dst_ip}",
+                    ]
+                )
+            lines.append(_format_table(rows))
+    if summary.versions and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("TLS Versions"))
         rows = [["Version", "Count"]]
@@ -5165,7 +6754,7 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             rows.append([version, str(count)])
         lines.append(_format_table(rows))
 
-    if summary.cipher_suites:
+    if summary.cipher_suites and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Cipher Suites"))
         rows = [["Cipher", "Count", "Class"]]
@@ -5174,7 +6763,7 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             rows.append([str(name), str(count), klass])
         lines.append(_format_table(rows))
 
-    if summary.weak_ciphers:
+    if summary.weak_ciphers and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Weak/Legacy Ciphers"))
         rows = [["Cipher", "Count"]]
@@ -5199,19 +6788,28 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
         actionable.append(item)
 
     if summary.http_requests or summary.http_responses:
-        actionable.append({
-            "severity": "warning",
-            "summary": "Plaintext HTTP also present in this capture",
-            "details": (
-                f"Observed {summary.http_requests} plaintext request(s) and {summary.http_responses} response(s). "
-                "Review --http output for potential downgrade/mixed-security exposure."
-            ),
-        })
+        actionable.append(
+            {
+                "severity": "warning",
+                "summary": "Plaintext HTTP also present in this capture",
+                "details": (
+                    f"Observed {summary.http_requests} plaintext request(s) and {summary.http_responses} response(s). "
+                    "Review --http output for potential downgrade/mixed-security exposure."
+                ),
+            }
+        )
 
     if actionable:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Actionable TLS Findings"))
-        for item in actionable[:_limit_value(limit if verbose else max(6, limit // 2))]:
+        lines.append(header("Most Likely TLS Findings"))
+        if concise_mode:
+            ranked: list[dict[str, object]] = []
+            for item in actionable:
+                sev = str(item.get("severity", "info")).lower()
+                if sev in {"critical", "high", "warning"}:
+                    ranked.append(item)
+            actionable = ranked or actionable
+        for item in actionable[: _limit_value(limit if verbose else max(5, limit // 3))]:
             severity = str(item.get("severity", "info")).lower()
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
@@ -5227,6 +6825,15 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             if details:
                 lines.append(muted(f"  {details}"))
 
+    if concise_mode:
+        lines.append(SUBSECTION_BAR)
+        lines.append(
+            muted(
+                "Additional TLS context hidden in default view (deterministic checks, risk matrix, conversation stats, cert inventory, versions/ciphers/fingerprints, and artifacts)."
+            )
+        )
+        lines.append(muted("Use `-v` for full TLS forensic detail."))
+
     if summary.sni_counts and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top SNI"))
@@ -5235,7 +6842,7 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
             rows.append([_truncate_text(_redact_in_text(str(sni)), 96), str(count)])
         lines.append(_format_table(rows))
 
-    if summary.ja3_counts or summary.ja4_counts or summary.ja4s_counts:
+    if (summary.ja3_counts or summary.ja4_counts or summary.ja4s_counts) and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("TLS Fingerprint Intelligence"))
         if summary.ja3_counts:
@@ -5260,14 +6867,16 @@ def render_tls_summary(summary: TlsSummary, limit: int = 12, verbose: bool = Fal
     if summary.artifacts and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("TLS Artifacts"))
-        for item in summary.artifacts[:_limit_value(limit)]:
+        for item in summary.artifacts[: _limit_value(limit)]:
             lines.append(muted(f"- {_truncate_text(_redact_in_text(str(item)), 96)}"))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
 
 
-def render_aim_summary(summary: AimSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_aim_summary(
+    summary: AimSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -5293,7 +6902,9 @@ def render_aim_summary(summary: AimSummary, limit: int = 12, verbose: bool = Fal
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.server_ports:
         lines.append(SUBSECTION_BAR)
@@ -5347,40 +6958,54 @@ def render_aim_summary(summary: AimSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("Conversations"))
         rows = [["Client", "Server", "Port", "Packets", "Bytes", "First", "Last"]]
-        conversations = sorted(summary.conversations, key=lambda item: (item.packets, item.bytes), reverse=True)
+        conversations = sorted(
+            summary.conversations,
+            key=lambda item: (item.packets, item.bytes),
+            reverse=True,
+        )
         for conv in conversations[:limit]:
-            rows.append([
-                conv.client_ip,
-                conv.server_ip,
-                str(conv.server_port),
-                str(conv.packets),
-                format_bytes_as_mb(conv.bytes),
-                format_ts(conv.first_seen),
-                format_ts(conv.last_seen),
-            ])
+            rows.append(
+                [
+                    conv.client_ip,
+                    conv.server_ip,
+                    str(conv.server_port),
+                    str(conv.packets),
+                    format_bytes_as_mb(conv.bytes),
+                    format_ts(conv.first_seen),
+                    format_ts(conv.last_seen),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Forensic Artifacts"))
         rows = [["Kind", "Detail", "Packet", "Src", "Dst"]]
-        for item in summary.artifacts[:_limit_value(30)]:
-            rows.append([
-                item.kind,
-                _truncate_text(item.detail, 96),
-                str(item.packet_index),
-                item.src,
-                item.dst,
-            ])
+        for item in summary.artifacts[: _limit_value(30)]:
+            rows.append(
+                [
+                    item.kind,
+                    _truncate_text(item.detail, 96),
+                    str(item.packet_index),
+                    item.src,
+                    item.dst,
+                ]
+            )
         lines.append(_format_table(rows))
 
     detections = _filtered_detections(summary, verbose)
     if detections:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Detections"))
-        for item in detections[:_limit_value(20)]:
+        for item in detections[: _limit_value(20)]:
             severity = str(item.get("severity", "info")).lower()
-            prefix = danger("[HIGH]") if severity in {"high", "critical"} else warn("[WARN]") if severity == "warning" else ok("[INFO]")
+            prefix = (
+                danger("[HIGH]")
+                if severity in {"high", "critical"}
+                else warn("[WARN]")
+                if severity == "warning"
+                else ok("[INFO]")
+            )
             lines.append(f"{prefix} {item.get('summary', '-')}")
             details = str(item.get("details", "") or "").strip()
             if details:
@@ -5390,7 +7015,9 @@ def render_aim_summary(summary: AimSummary, limit: int = 12, verbose: bool = Fal
     return _finalize_output(lines, show_truncation_note=False)
 
 
-def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_ssh_summary(
+    summary: SshSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -5416,8 +7043,12 @@ def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = Fal
     lines.append(_format_kv("SSH Packets", str(summary.ssh_packets)))
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
     if summary.client_bytes or summary.server_bytes:
-        lines.append(_format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes)))
-        lines.append(_format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes)))
+        lines.append(
+            _format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes))
+        )
+        lines.append(
+            _format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes))
+        )
     if summary.duration_seconds is not None:
         lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
     lines.append(_format_kv("Sessions", str(summary.total_sessions)))
@@ -5435,7 +7066,9 @@ def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = Fal
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top SSH Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
@@ -5448,7 +7081,8 @@ def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = Fal
         rows = [["IP", "MACs"]]
         ranked_ips = sorted(
             summary.ip_to_macs.keys(),
-            key=lambda ip: summary.client_counts.get(ip, 0) + summary.server_counts.get(ip, 0),
+            key=lambda ip: summary.client_counts.get(ip, 0)
+            + summary.server_counts.get(ip, 0),
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
@@ -5460,12 +7094,20 @@ def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("SSH Versions"))
         rows = [["Client Versions", "Server Versions"]]
-        client_text = ", ".join(
-            f"{_truncate_text(name, 40)}({count})" for name, count in summary.client_versions.most_common(_limit_value(6))
-        ) or "-"
-        server_text = ", ".join(
-            f"{_truncate_text(name, 40)}({count})" for name, count in summary.server_versions.most_common(_limit_value(6))
-        ) or "-"
+        client_text = (
+            ", ".join(
+                f"{_truncate_text(name, 40)}({count})"
+                for name, count in summary.client_versions.most_common(_limit_value(6))
+            )
+            or "-"
+        )
+        server_text = (
+            ", ".join(
+                f"{_truncate_text(name, 40)}({count})"
+                for name, count in summary.server_versions.most_common(_limit_value(6))
+            )
+            or "-"
+        )
         rows.append([client_text, server_text])
         lines.append(_format_table(rows))
 
@@ -5473,12 +7115,20 @@ def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("SSH Software"))
         rows = [["Clients", "Servers"]]
-        client_text = ", ".join(
-            f"{_truncate_text(name, 40)}({count})" for name, count in summary.client_software.most_common(_limit_value(6))
-        ) or "-"
-        server_text = ", ".join(
-            f"{_truncate_text(name, 40)}({count})" for name, count in summary.server_software.most_common(_limit_value(6))
-        ) or "-"
+        client_text = (
+            ", ".join(
+                f"{_truncate_text(name, 40)}({count})"
+                for name, count in summary.client_software.most_common(_limit_value(6))
+            )
+            or "-"
+        )
+        server_text = (
+            ", ".join(
+                f"{_truncate_text(name, 40)}({count})"
+                for name, count in summary.server_software.most_common(_limit_value(6))
+            )
+            or "-"
+        )
         rows.append([client_text, server_text])
         lines.append(_format_table(rows))
 
@@ -5524,17 +7174,54 @@ def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = Fal
             rows.append([name, str(count)])
         lines.append(_format_table(rows))
 
-    if summary.kex_algorithms or summary.cipher_algorithms or summary.mac_algorithms or summary.host_key_algorithms:
+    if (
+        summary.kex_algorithms
+        or summary.cipher_algorithms
+        or summary.mac_algorithms
+        or summary.host_key_algorithms
+    ):
         lines.append(SUBSECTION_BAR)
         lines.append(header("Crypto Negotiation"))
         rows = [["KEX", "Host Key", "Cipher", "MAC", "Compression"]]
-        rows.append([
-            ", ".join(f"{name}({count})" for name, count in summary.kex_algorithms.most_common(_limit_value(3))) or "-",
-            ", ".join(f"{name}({count})" for name, count in summary.host_key_algorithms.most_common(_limit_value(3))) or "-",
-            ", ".join(f"{name}({count})" for name, count in summary.cipher_algorithms.most_common(_limit_value(3))) or "-",
-            ", ".join(f"{name}({count})" for name, count in summary.mac_algorithms.most_common(_limit_value(3))) or "-",
-            ", ".join(f"{name}({count})" for name, count in summary.compression_algorithms.most_common(_limit_value(3))) or "-",
-        ])
+        rows.append(
+            [
+                ", ".join(
+                    f"{name}({count})"
+                    for name, count in summary.kex_algorithms.most_common(
+                        _limit_value(3)
+                    )
+                )
+                or "-",
+                ", ".join(
+                    f"{name}({count})"
+                    for name, count in summary.host_key_algorithms.most_common(
+                        _limit_value(3)
+                    )
+                )
+                or "-",
+                ", ".join(
+                    f"{name}({count})"
+                    for name, count in summary.cipher_algorithms.most_common(
+                        _limit_value(3)
+                    )
+                )
+                or "-",
+                ", ".join(
+                    f"{name}({count})"
+                    for name, count in summary.mac_algorithms.most_common(
+                        _limit_value(3)
+                    )
+                )
+                or "-",
+                ", ".join(
+                    f"{name}({count})"
+                    for name, count in summary.compression_algorithms.most_common(
+                        _limit_value(3)
+                    )
+                )
+                or "-",
+            ]
+        )
         lines.append(_format_table(rows))
 
     if summary.auth_methods:
@@ -5559,30 +7246,39 @@ def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = Fal
         lines.append(header("Auth Outcomes (By Client)"))
         rows = [["Client", "Failures", "Successes"]]
         ranked_clients = sorted(
-            set(summary.auth_failures_by_client.keys()) | set(summary.auth_successes_by_client.keys()),
+            set(summary.auth_failures_by_client.keys())
+            | set(summary.auth_successes_by_client.keys()),
             key=lambda ip: summary.auth_failures_by_client.get(ip, 0),
             reverse=True,
         )
         for ip in ranked_clients[:limit]:
-            rows.append([
-                ip,
-                str(summary.auth_failures_by_client.get(ip, 0)),
-                str(summary.auth_successes_by_client.get(ip, 0)),
-            ])
+            rows.append(
+                [
+                    ip,
+                    str(summary.auth_failures_by_client.get(ip, 0)),
+                    str(summary.auth_successes_by_client.get(ip, 0)),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.request_counts or summary.response_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Requests & Responses"))
         rows = [["Requests", "Responses"]]
-        req_text = ", ".join(
-            f"{name.replace('SSH_MSG_', '')}({count})"
-            for name, count in summary.request_counts.most_common(_limit_value(6))
-        ) or "-"
-        resp_text = ", ".join(
-            f"{name.replace('SSH_MSG_', '')}({count})"
-            for name, count in summary.response_counts.most_common(_limit_value(6))
-        ) or "-"
+        req_text = (
+            ", ".join(
+                f"{name.replace('SSH_MSG_', '')}({count})"
+                for name, count in summary.request_counts.most_common(_limit_value(6))
+            )
+            or "-"
+        )
+        resp_text = (
+            ", ".join(
+                f"{name.replace('SSH_MSG_', '')}({count})"
+                for name, count in summary.response_counts.most_common(_limit_value(6))
+            )
+            or "-"
+        )
         rows.append([req_text, resp_text])
         lines.append(_format_table(rows))
 
@@ -5622,16 +7318,20 @@ def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Sessions"))
         rows = [["Client", "Server", "C->S MB", "S->C MB", "Packets", "Auth Fail/OK"]]
-        top_sessions = sorted(summary.conversations, key=lambda conv: conv.bytes, reverse=True)[:limit]
+        top_sessions = sorted(
+            summary.conversations, key=lambda conv: conv.bytes, reverse=True
+        )[:limit]
         for conv in top_sessions:
-            rows.append([
-                f"{conv.client_ip}:{conv.client_port}",
-                f"{conv.server_ip}:{conv.server_port}",
-                f"{conv.client_bytes / (1024 * 1024):.1f}",
-                f"{conv.server_bytes / (1024 * 1024):.1f}",
-                str(conv.packets),
-                f"{conv.auth_failures}/{conv.auth_successes}",
-            ])
+            rows.append(
+                [
+                    f"{conv.client_ip}:{conv.client_port}",
+                    f"{conv.server_ip}:{conv.server_port}",
+                    f"{conv.client_bytes / (1024 * 1024):.1f}",
+                    f"{conv.server_bytes / (1024 * 1024):.1f}",
+                    str(conv.packets),
+                    f"{conv.auth_failures}/{conv.auth_successes}",
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.anomalies:
@@ -5677,7 +7377,9 @@ def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = Fal
     return _finalize_output(lines)
 
 
-def render_rdp_summary(summary: RdpSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_rdp_summary(
+    summary: RdpSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -5697,8 +7399,12 @@ def render_rdp_summary(summary: RdpSummary, limit: int = 12, verbose: bool = Fal
     lines.append(_format_kv("RDP Packets", str(summary.rdp_packets)))
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
     if summary.client_bytes or summary.server_bytes:
-        lines.append(_format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes)))
-        lines.append(_format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes)))
+        lines.append(
+            _format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes))
+        )
+        lines.append(
+            _format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes))
+        )
     if summary.duration_seconds is not None:
         lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
     lines.append(_format_kv("Sessions", str(summary.total_sessions)))
@@ -5726,7 +7432,9 @@ def render_rdp_summary(summary: RdpSummary, limit: int = 12, verbose: bool = Fal
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top RDP Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
@@ -5734,7 +7442,9 @@ def render_rdp_summary(summary: RdpSummary, limit: int = 12, verbose: bool = Fal
         rows = [["Client", "Server", "Start", "End", "Duration", "Packets", "Size"]]
         if verbose:
             rows[0].extend(["UDP", "TLS"])
-        top_sessions = sorted(summary.conversations, key=lambda conv: conv.bytes, reverse=True)[:limit]
+        top_sessions = sorted(
+            summary.conversations, key=lambda conv: conv.bytes, reverse=True
+        )[:limit]
         for conv in top_sessions:
             duration = None
             if conv.first_seen is not None and conv.last_seen is not None:
@@ -5749,10 +7459,12 @@ def render_rdp_summary(summary: RdpSummary, limit: int = 12, verbose: bool = Fal
                 format_bytes_as_mb(conv.bytes),
             ]
             if verbose:
-                row.extend([
-                    "yes" if conv.udp_detected else "no",
-                    "yes" if conv.tls_detected else "no",
-                ])
+                row.extend(
+                    [
+                        "yes" if conv.udp_detected else "no",
+                        "yes" if conv.tls_detected else "no",
+                    ]
+                )
             rows.append(row)
         lines.append(_format_table(rows))
 
@@ -5762,7 +7474,8 @@ def render_rdp_summary(summary: RdpSummary, limit: int = 12, verbose: bool = Fal
         rows = [["IP", "MACs"]]
         ranked_ips = sorted(
             summary.ip_to_macs.keys(),
-            key=lambda ip: summary.client_counts.get(ip, 0) + summary.server_counts.get(ip, 0),
+            key=lambda ip: summary.client_counts.get(ip, 0)
+            + summary.server_counts.get(ip, 0),
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
@@ -5783,19 +7496,33 @@ def render_rdp_summary(summary: RdpSummary, limit: int = 12, verbose: bool = Fal
         lines.append(header("Security"))
         lines.append(_format_kv("TLS Handshakes Detected", str(summary.tls_handshakes)))
         if getattr(summary, "dtls_handshakes", 0):
-            lines.append(_format_kv("DTLS Handshakes Detected", str(summary.dtls_handshakes)))
+            lines.append(
+                _format_kv("DTLS Handshakes Detected", str(summary.dtls_handshakes))
+            )
 
     if getattr(summary, "requested_protocols", None):
         if summary.requested_protocols or summary.selected_protocols:
             lines.append(SUBSECTION_BAR)
             lines.append(header("RDP Negotiation"))
             rows = [["Requested", "Selected"]]
-            req_text = ", ".join(
-                f"{name}({count})" for name, count in summary.requested_protocols.most_common(_limit_value(6))
-            ) or "-"
-            sel_text = ", ".join(
-                f"{name}({count})" for name, count in summary.selected_protocols.most_common(_limit_value(6))
-            ) or "-"
+            req_text = (
+                ", ".join(
+                    f"{name}({count})"
+                    for name, count in summary.requested_protocols.most_common(
+                        _limit_value(6)
+                    )
+                )
+                or "-"
+            )
+            sel_text = (
+                ", ".join(
+                    f"{name}({count})"
+                    for name, count in summary.selected_protocols.most_common(
+                        _limit_value(6)
+                    )
+                )
+                or "-"
+            )
             rows.append([req_text, sel_text])
             lines.append(_format_table(rows))
 
@@ -5809,19 +7536,41 @@ def render_rdp_summary(summary: RdpSummary, limit: int = 12, verbose: bool = Fal
             lines.append(_format_table(rows))
 
     if getattr(summary, "decrypted_username", None):
-        if summary.decrypted_username or summary.decrypted_domain or summary.decrypted_client_name:
+        if (
+            summary.decrypted_username
+            or summary.decrypted_domain
+            or summary.decrypted_client_name
+        ):
             lines.append(SUBSECTION_BAR)
             lines.append(header("Decrypted Identity"))
             rows = [["Usernames", "Domains", "Client Names"]]
-            user_text = ", ".join(
-                f"{_truncate_text(name, 32)}({count})" for name, count in summary.decrypted_username.most_common(_limit_value(6))
-            ) or "-"
-            domain_text = ", ".join(
-                f"{_truncate_text(name, 32)}({count})" for name, count in summary.decrypted_domain.most_common(_limit_value(6))
-            ) or "-"
-            client_text = ", ".join(
-                f"{_truncate_text(name, 32)}({count})" for name, count in summary.decrypted_client_name.most_common(_limit_value(6))
-            ) or "-"
+            user_text = (
+                ", ".join(
+                    f"{_truncate_text(name, 32)}({count})"
+                    for name, count in summary.decrypted_username.most_common(
+                        _limit_value(6)
+                    )
+                )
+                or "-"
+            )
+            domain_text = (
+                ", ".join(
+                    f"{_truncate_text(name, 32)}({count})"
+                    for name, count in summary.decrypted_domain.most_common(
+                        _limit_value(6)
+                    )
+                )
+                or "-"
+            )
+            client_text = (
+                ", ".join(
+                    f"{_truncate_text(name, 32)}({count})"
+                    for name, count in summary.decrypted_client_name.most_common(
+                        _limit_value(6)
+                    )
+                )
+                or "-"
+            )
             rows.append([user_text, domain_text, client_text])
             lines.append(_format_table(rows))
 
@@ -5892,7 +7641,9 @@ def render_rdp_summary(summary: RdpSummary, limit: int = 12, verbose: bool = Fal
     return _finalize_output(lines)
 
 
-def render_telnet_summary(summary: TelnetSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_telnet_summary(
+    summary: TelnetSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -5912,8 +7663,12 @@ def render_telnet_summary(summary: TelnetSummary, limit: int = 12, verbose: bool
     lines.append(_format_kv("Telnet Packets", str(summary.telnet_packets)))
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
     if summary.client_bytes or summary.server_bytes:
-        lines.append(_format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes)))
-        lines.append(_format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes)))
+        lines.append(
+            _format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes))
+        )
+        lines.append(
+            _format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes))
+        )
     if summary.duration_seconds is not None:
         lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
     lines.append(_format_kv("Sessions", str(summary.total_sessions)))
@@ -5931,7 +7686,9 @@ def render_telnet_summary(summary: TelnetSummary, limit: int = 12, verbose: bool
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Telnet Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
@@ -5944,7 +7701,8 @@ def render_telnet_summary(summary: TelnetSummary, limit: int = 12, verbose: bool
         rows = [["IP", "MACs"]]
         ranked_ips = sorted(
             summary.ip_to_macs.keys(),
-            key=lambda ip: summary.client_counts.get(ip, 0) + summary.server_counts.get(ip, 0),
+            key=lambda ip: summary.client_counts.get(ip, 0)
+            + summary.server_counts.get(ip, 0),
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
@@ -5956,12 +7714,20 @@ def render_telnet_summary(summary: TelnetSummary, limit: int = 12, verbose: bool
         lines.append(SUBSECTION_BAR)
         lines.append(header("Credentials"))
         rows = [["Usernames", "Passwords"]]
-        user_text = ", ".join(
-            f"{name}({count})" for name, count in summary.usernames.most_common(_limit_value(6))
-        ) or "-"
-        pass_text = ", ".join(
-            f"{_truncate_text(_redact_secret(name), 20)}({count})" for name, count in summary.passwords.most_common(_limit_value(6))
-        ) or "-"
+        user_text = (
+            ", ".join(
+                f"{name}({count})"
+                for name, count in summary.usernames.most_common(_limit_value(6))
+            )
+            or "-"
+        )
+        pass_text = (
+            ", ".join(
+                f"{_truncate_text(_redact_secret(name), 20)}({count})"
+                for name, count in summary.passwords.most_common(_limit_value(6))
+            )
+            or "-"
+        )
         rows.append([user_text, pass_text])
         lines.append(_format_table(rows))
 
@@ -6029,23 +7795,29 @@ def render_telnet_summary(summary: TelnetSummary, limit: int = 12, verbose: bool
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Sessions"))
         rows = [["Client", "Server", "C->S MB", "S->C MB", "Packets", "Users"]]
-        top_sessions = sorted(summary.conversations, key=lambda conv: conv.bytes, reverse=True)[:limit]
+        top_sessions = sorted(
+            summary.conversations, key=lambda conv: conv.bytes, reverse=True
+        )[:limit]
         for conv in top_sessions:
-            rows.append([
-                f"{conv.client_ip}:{conv.client_port}",
-                f"{conv.server_ip}:{conv.server_port}",
-                f"{conv.client_bytes / (1024 * 1024):.1f}",
-                f"{conv.server_bytes / (1024 * 1024):.1f}",
-                str(conv.packets),
-                ", ".join(conv.usernames) if conv.usernames else "-",
-            ])
+            rows.append(
+                [
+                    f"{conv.client_ip}:{conv.client_port}",
+                    f"{conv.server_ip}:{conv.server_port}",
+                    f"{conv.client_bytes / (1024 * 1024):.1f}",
+                    f"{conv.server_bytes / (1024 * 1024):.1f}",
+                    str(conv.packets),
+                    ", ".join(conv.usernames) if conv.usernames else "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_vnc_summary(summary: VncSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_vnc_summary(
+    summary: VncSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -6065,8 +7837,12 @@ def render_vnc_summary(summary: VncSummary, limit: int = 12, verbose: bool = Fal
     lines.append(_format_kv("VNC Packets", str(summary.vnc_packets)))
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
     if summary.client_bytes or summary.server_bytes:
-        lines.append(_format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes)))
-        lines.append(_format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes)))
+        lines.append(
+            _format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes))
+        )
+        lines.append(
+            _format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes))
+        )
     if summary.duration_seconds is not None:
         lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
     lines.append(_format_kv("Sessions", str(summary.total_sessions)))
@@ -6084,7 +7860,9 @@ def render_vnc_summary(summary: VncSummary, limit: int = 12, verbose: bool = Fal
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top VNC Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
@@ -6097,7 +7875,8 @@ def render_vnc_summary(summary: VncSummary, limit: int = 12, verbose: bool = Fal
         rows = [["IP", "MACs"]]
         ranked_ips = sorted(
             summary.ip_to_macs.keys(),
-            key=lambda ip: summary.client_counts.get(ip, 0) + summary.server_counts.get(ip, 0),
+            key=lambda ip: summary.client_counts.get(ip, 0)
+            + summary.server_counts.get(ip, 0),
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
@@ -6109,12 +7888,20 @@ def render_vnc_summary(summary: VncSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("RFB Versions"))
         rows = [["Clients", "Servers"]]
-        client_text = ", ".join(
-            f"{name}({count})" for name, count in summary.client_banners.most_common(_limit_value(6))
-        ) or "-"
-        server_text = ", ".join(
-            f"{name}({count})" for name, count in summary.server_banners.most_common(_limit_value(6))
-        ) or "-"
+        client_text = (
+            ", ".join(
+                f"{name}({count})"
+                for name, count in summary.client_banners.most_common(_limit_value(6))
+            )
+            or "-"
+        )
+        server_text = (
+            ", ".join(
+                f"{name}({count})"
+                for name, count in summary.server_banners.most_common(_limit_value(6))
+            )
+            or "-"
+        )
         rows.append([client_text, server_text])
         lines.append(_format_table(rows))
 
@@ -6181,25 +7968,41 @@ def render_vnc_summary(summary: VncSummary, limit: int = 12, verbose: bool = Fal
     if summary.conversations and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Sessions"))
-        rows = [["Client", "Server", "C->S MB", "S->C MB", "Packets", "Client RFB", "Server RFB"]]
-        top_sessions = sorted(summary.conversations, key=lambda conv: conv.bytes, reverse=True)[:limit]
+        rows = [
+            [
+                "Client",
+                "Server",
+                "C->S MB",
+                "S->C MB",
+                "Packets",
+                "Client RFB",
+                "Server RFB",
+            ]
+        ]
+        top_sessions = sorted(
+            summary.conversations, key=lambda conv: conv.bytes, reverse=True
+        )[:limit]
         for conv in top_sessions:
-            rows.append([
-                f"{conv.client_ip}:{conv.client_port}",
-                f"{conv.server_ip}:{conv.server_port}",
-                f"{conv.client_bytes / (1024 * 1024):.1f}",
-                f"{conv.server_bytes / (1024 * 1024):.1f}",
-                str(conv.packets),
-                conv.client_banner or "-",
-                conv.server_banner or "-",
-            ])
+            rows.append(
+                [
+                    f"{conv.client_ip}:{conv.client_port}",
+                    f"{conv.server_ip}:{conv.server_port}",
+                    f"{conv.client_bytes / (1024 * 1024):.1f}",
+                    f"{conv.server_bytes / (1024 * 1024):.1f}",
+                    str(conv.packets),
+                    conv.client_banner or "-",
+                    conv.server_banner or "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_teamviewer_summary(summary: TeamviewerSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_teamviewer_summary(
+    summary: TeamviewerSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -6219,8 +8022,12 @@ def render_teamviewer_summary(summary: TeamviewerSummary, limit: int = 12, verbo
     lines.append(_format_kv("TeamViewer Packets", str(summary.tv_packets)))
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
     if summary.client_bytes or summary.server_bytes:
-        lines.append(_format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes)))
-        lines.append(_format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes)))
+        lines.append(
+            _format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes))
+        )
+        lines.append(
+            _format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes))
+        )
     if summary.duration_seconds is not None:
         lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
     lines.append(_format_kv("Sessions", str(summary.total_sessions)))
@@ -6248,7 +8055,9 @@ def render_teamviewer_summary(summary: TeamviewerSummary, limit: int = 12, verbo
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top TeamViewer Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
@@ -6261,7 +8070,8 @@ def render_teamviewer_summary(summary: TeamviewerSummary, limit: int = 12, verbo
         rows = [["IP", "MACs"]]
         ranked_ips = sorted(
             summary.ip_to_macs.keys(),
-            key=lambda ip: summary.client_counts.get(ip, 0) + summary.server_counts.get(ip, 0),
+            key=lambda ip: summary.client_counts.get(ip, 0)
+            + summary.server_counts.get(ip, 0),
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
@@ -6333,24 +8143,30 @@ def render_teamviewer_summary(summary: TeamviewerSummary, limit: int = 12, verbo
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Sessions"))
         rows = [["Client", "Server", "C->S MB", "S->C MB", "Packets", "UDP", "Hints"]]
-        top_sessions = sorted(summary.conversations, key=lambda conv: conv.bytes, reverse=True)[:limit]
+        top_sessions = sorted(
+            summary.conversations, key=lambda conv: conv.bytes, reverse=True
+        )[:limit]
         for conv in top_sessions:
-            rows.append([
-                f"{conv.client_ip}:{conv.client_port}",
-                f"{conv.server_ip}:{conv.server_port}",
-                f"{conv.client_bytes / (1024 * 1024):.1f}",
-                f"{conv.server_bytes / (1024 * 1024):.1f}",
-                str(conv.packets),
-                "yes" if conv.udp_detected else "no",
-                ", ".join(conv.hints) if conv.hints else "-",
-            ])
+            rows.append(
+                [
+                    f"{conv.client_ip}:{conv.client_port}",
+                    f"{conv.server_ip}:{conv.server_port}",
+                    f"{conv.client_bytes / (1024 * 1024):.1f}",
+                    f"{conv.server_bytes / (1024 * 1024):.1f}",
+                    str(conv.packets),
+                    "yes" if conv.udp_detected else "no",
+                    ", ".join(conv.hints) if conv.hints else "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_winrm_summary(summary: WinrmSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_winrm_summary(
+    summary: WinrmSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -6370,8 +8186,12 @@ def render_winrm_summary(summary: WinrmSummary, limit: int = 12, verbose: bool =
     lines.append(_format_kv("WinRM Packets", str(summary.winrm_packets)))
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
     if summary.client_bytes or summary.server_bytes:
-        lines.append(_format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes)))
-        lines.append(_format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes)))
+        lines.append(
+            _format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes))
+        )
+        lines.append(
+            _format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes))
+        )
     if summary.duration_seconds is not None:
         lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
     lines.append(_format_kv("Sessions", str(summary.total_sessions)))
@@ -6391,7 +8211,9 @@ def render_winrm_summary(summary: WinrmSummary, limit: int = 12, verbose: bool =
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top WinRM Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
@@ -6404,7 +8226,8 @@ def render_winrm_summary(summary: WinrmSummary, limit: int = 12, verbose: bool =
         rows = [["IP", "MACs"]]
         ranked_ips = sorted(
             summary.ip_to_macs.keys(),
-            key=lambda ip: summary.client_counts.get(ip, 0) + summary.server_counts.get(ip, 0),
+            key=lambda ip: summary.client_counts.get(ip, 0)
+            + summary.server_counts.get(ip, 0),
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
@@ -6500,24 +8323,30 @@ def render_winrm_summary(summary: WinrmSummary, limit: int = 12, verbose: bool =
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Sessions"))
         rows = [["Client", "Server", "C->S MB", "S->C MB", "Packets", "HTTP", "HTTPS"]]
-        top_sessions = sorted(summary.conversations, key=lambda conv: conv.bytes, reverse=True)[:limit]
+        top_sessions = sorted(
+            summary.conversations, key=lambda conv: conv.bytes, reverse=True
+        )[:limit]
         for conv in top_sessions:
-            rows.append([
-                f"{conv.client_ip}:{conv.client_port}",
-                f"{conv.server_ip}:{conv.server_port}",
-                f"{conv.client_bytes / (1024 * 1024):.1f}",
-                f"{conv.server_bytes / (1024 * 1024):.1f}",
-                str(conv.packets),
-                "yes" if conv.http_detected else "no",
-                "yes" if conv.https_detected else "no",
-            ])
+            rows.append(
+                [
+                    f"{conv.client_ip}:{conv.client_port}",
+                    f"{conv.server_ip}:{conv.server_port}",
+                    f"{conv.client_bytes / (1024 * 1024):.1f}",
+                    f"{conv.server_bytes / (1024 * 1024):.1f}",
+                    str(conv.packets),
+                    "yes" if conv.http_detected else "no",
+                    "yes" if conv.https_detected else "no",
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_wmic_summary(summary: WmicSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_wmic_summary(
+    summary: WmicSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -6537,8 +8366,12 @@ def render_wmic_summary(summary: WmicSummary, limit: int = 12, verbose: bool = F
     lines.append(_format_kv("WMIC Packets", str(summary.wmic_packets)))
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
     if summary.client_bytes or summary.server_bytes:
-        lines.append(_format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes)))
-        lines.append(_format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes)))
+        lines.append(
+            _format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes))
+        )
+        lines.append(
+            _format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes))
+        )
     if summary.duration_seconds is not None:
         lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
     lines.append(_format_kv("Sessions", str(summary.total_sessions)))
@@ -6556,7 +8389,9 @@ def render_wmic_summary(summary: WmicSummary, limit: int = 12, verbose: bool = F
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top WMIC Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
@@ -6569,7 +8404,8 @@ def render_wmic_summary(summary: WmicSummary, limit: int = 12, verbose: bool = F
         rows = [["IP", "MACs"]]
         ranked_ips = sorted(
             summary.ip_to_macs.keys(),
-            key=lambda ip: summary.client_counts.get(ip, 0) + summary.server_counts.get(ip, 0),
+            key=lambda ip: summary.client_counts.get(ip, 0)
+            + summary.server_counts.get(ip, 0),
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
@@ -6581,18 +8417,54 @@ def render_wmic_summary(summary: WmicSummary, limit: int = 12, verbose: bool = F
         lines.append(SUBSECTION_BAR)
         lines.append(header("Host Details"))
         rows = [["Hostnames", "IPs", "MACs"]]
-        host_text = ", ".join(name for name, _count in summary.hostnames.most_common(_limit_value(8))) if summary.hostnames else "-"
-        ip_text = ", ".join(ip for ip, _count in summary.ip_strings.most_common(_limit_value(8))) if summary.ip_strings else "-"
-        mac_text = ", ".join(mac for mac, _count in summary.mac_strings.most_common(_limit_value(6))) if summary.mac_strings else "-"
-        rows.append([_truncate_text(host_text, 60), _truncate_text(ip_text, 60), _truncate_text(mac_text, 60)])
+        host_text = (
+            ", ".join(
+                name for name, _count in summary.hostnames.most_common(_limit_value(8))
+            )
+            if summary.hostnames
+            else "-"
+        )
+        ip_text = (
+            ", ".join(
+                ip for ip, _count in summary.ip_strings.most_common(_limit_value(8))
+            )
+            if summary.ip_strings
+            else "-"
+        )
+        mac_text = (
+            ", ".join(
+                mac for mac, _count in summary.mac_strings.most_common(_limit_value(6))
+            )
+            if summary.mac_strings
+            else "-"
+        )
+        rows.append(
+            [
+                _truncate_text(host_text, 60),
+                _truncate_text(ip_text, 60),
+                _truncate_text(mac_text, 60),
+            ]
+        )
         lines.append(_format_table(rows))
 
     if summary.domains or summary.usernames:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Domain & Users"))
         rows = [["Domains", "Users"]]
-        domain_text = ", ".join(dom for dom, _count in summary.domains.most_common(_limit_value(8))) if summary.domains else "-"
-        user_text = ", ".join(user for user, _count in summary.usernames.most_common(_limit_value(8))) if summary.usernames else "-"
+        domain_text = (
+            ", ".join(
+                dom for dom, _count in summary.domains.most_common(_limit_value(8))
+            )
+            if summary.domains
+            else "-"
+        )
+        user_text = (
+            ", ".join(
+                user for user, _count in summary.usernames.most_common(_limit_value(8))
+            )
+            if summary.usernames
+            else "-"
+        )
         rows.append([_truncate_text(domain_text, 60), _truncate_text(user_text, 60)])
         lines.append(_format_table(rows))
 
@@ -6700,23 +8572,29 @@ def render_wmic_summary(summary: WmicSummary, limit: int = 12, verbose: bool = F
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Sessions"))
         rows = [["Client", "Server", "C->S MB", "S->C MB", "Packets", "Hints"]]
-        top_sessions = sorted(summary.conversations, key=lambda conv: conv.bytes, reverse=True)[:limit]
+        top_sessions = sorted(
+            summary.conversations, key=lambda conv: conv.bytes, reverse=True
+        )[:limit]
         for conv in top_sessions:
-            rows.append([
-                f"{conv.client_ip}:{conv.client_port}",
-                f"{conv.server_ip}:{conv.server_port}",
-                f"{conv.client_bytes / (1024 * 1024):.1f}",
-                f"{conv.server_bytes / (1024 * 1024):.1f}",
-                str(conv.packets),
-                ", ".join(conv.hints) if conv.hints else "-",
-            ])
+            rows.append(
+                [
+                    f"{conv.client_ip}:{conv.client_port}",
+                    f"{conv.server_ip}:{conv.server_port}",
+                    f"{conv.client_bytes / (1024 * 1024):.1f}",
+                    f"{conv.server_bytes / (1024 * 1024):.1f}",
+                    str(conv.packets),
+                    ", ".join(conv.hints) if conv.hints else "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_powershell_summary(summary: PowershellSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_powershell_summary(
+    summary: PowershellSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -6736,8 +8614,12 @@ def render_powershell_summary(summary: PowershellSummary, limit: int = 12, verbo
     lines.append(_format_kv("PowerShell Packets", str(summary.powershell_packets)))
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
     if summary.client_bytes or summary.server_bytes:
-        lines.append(_format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes)))
-        lines.append(_format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes)))
+        lines.append(
+            _format_kv("Client -> Server", format_bytes_as_mb(summary.client_bytes))
+        )
+        lines.append(
+            _format_kv("Server -> Client", format_bytes_as_mb(summary.server_bytes))
+        )
     if summary.duration_seconds is not None:
         lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
     lines.append(_format_kv("Sessions", str(summary.total_sessions)))
@@ -6755,7 +8637,9 @@ def render_powershell_summary(summary: PowershellSummary, limit: int = 12, verbo
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top PowerShell Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
@@ -6768,7 +8652,8 @@ def render_powershell_summary(summary: PowershellSummary, limit: int = 12, verbo
         rows = [["IP", "MACs"]]
         ranked_ips = sorted(
             summary.ip_to_macs.keys(),
-            key=lambda ip: summary.client_counts.get(ip, 0) + summary.server_counts.get(ip, 0),
+            key=lambda ip: summary.client_counts.get(ip, 0)
+            + summary.server_counts.get(ip, 0),
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
@@ -6780,18 +8665,54 @@ def render_powershell_summary(summary: PowershellSummary, limit: int = 12, verbo
         lines.append(SUBSECTION_BAR)
         lines.append(header("Host Details"))
         rows = [["Hostnames", "IPs", "MACs"]]
-        host_text = ", ".join(name for name, _count in summary.hostnames.most_common(_limit_value(8))) if summary.hostnames else "-"
-        ip_text = ", ".join(ip for ip, _count in summary.ip_strings.most_common(_limit_value(8))) if summary.ip_strings else "-"
-        mac_text = ", ".join(mac for mac, _count in summary.mac_strings.most_common(_limit_value(6))) if summary.mac_strings else "-"
-        rows.append([_truncate_text(host_text, 60), _truncate_text(ip_text, 60), _truncate_text(mac_text, 60)])
+        host_text = (
+            ", ".join(
+                name for name, _count in summary.hostnames.most_common(_limit_value(8))
+            )
+            if summary.hostnames
+            else "-"
+        )
+        ip_text = (
+            ", ".join(
+                ip for ip, _count in summary.ip_strings.most_common(_limit_value(8))
+            )
+            if summary.ip_strings
+            else "-"
+        )
+        mac_text = (
+            ", ".join(
+                mac for mac, _count in summary.mac_strings.most_common(_limit_value(6))
+            )
+            if summary.mac_strings
+            else "-"
+        )
+        rows.append(
+            [
+                _truncate_text(host_text, 60),
+                _truncate_text(ip_text, 60),
+                _truncate_text(mac_text, 60),
+            ]
+        )
         lines.append(_format_table(rows))
 
     if summary.domains or summary.usernames:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Domain & Users"))
         rows = [["Domains", "Users"]]
-        domain_text = ", ".join(dom for dom, _count in summary.domains.most_common(_limit_value(8))) if summary.domains else "-"
-        user_text = ", ".join(user for user, _count in summary.usernames.most_common(_limit_value(8))) if summary.usernames else "-"
+        domain_text = (
+            ", ".join(
+                dom for dom, _count in summary.domains.most_common(_limit_value(8))
+            )
+            if summary.domains
+            else "-"
+        )
+        user_text = (
+            ", ".join(
+                user for user, _count in summary.usernames.most_common(_limit_value(8))
+            )
+            if summary.usernames
+            else "-"
+        )
         rows.append([_truncate_text(domain_text, 60), _truncate_text(user_text, 60)])
         lines.append(_format_table(rows))
 
@@ -6883,23 +8804,29 @@ def render_powershell_summary(summary: PowershellSummary, limit: int = 12, verbo
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Sessions"))
         rows = [["Client", "Server", "C->S MB", "S->C MB", "Packets", "Hints"]]
-        top_sessions = sorted(summary.conversations, key=lambda conv: conv.bytes, reverse=True)[:limit]
+        top_sessions = sorted(
+            summary.conversations, key=lambda conv: conv.bytes, reverse=True
+        )[:limit]
         for conv in top_sessions:
-            rows.append([
-                f"{conv.client_ip}:{conv.client_port}",
-                f"{conv.server_ip}:{conv.server_port}",
-                f"{conv.client_bytes / (1024 * 1024):.1f}",
-                f"{conv.server_bytes / (1024 * 1024):.1f}",
-                str(conv.packets),
-                ", ".join(conv.hints) if conv.hints else "-",
-            ])
+            rows.append(
+                [
+                    f"{conv.client_ip}:{conv.client_port}",
+                    f"{conv.server_ip}:{conv.server_port}",
+                    f"{conv.client_bytes / (1024 * 1024):.1f}",
+                    f"{conv.server_bytes / (1024 * 1024):.1f}",
+                    str(conv.packets),
+                    ", ".join(conv.hints) if conv.hints else "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_syslog_summary(summary: SyslogSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_syslog_summary(
+    summary: SyslogSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -6935,7 +8862,9 @@ def render_syslog_summary(summary: SyslogSummary, limit: int = 12, verbose: bool
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Syslog Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.hostname_counts:
         lines.append(SUBSECTION_BAR)
@@ -6965,12 +8894,20 @@ def render_syslog_summary(summary: SyslogSummary, limit: int = 12, verbose: bool
         lines.append(SUBSECTION_BAR)
         lines.append(header("Facility & Severity"))
         rows = [["Facilities", "Severities"]]
-        facility_text = ", ".join(
-            f"{name}({count})" for name, count in summary.facility_counts.most_common(_limit_value(6))
-        ) or "-"
-        severity_text = ", ".join(
-            f"{name}({count})" for name, count in summary.severity_counts.most_common(_limit_value(6))
-        ) or "-"
+        facility_text = (
+            ", ".join(
+                f"{name}({count})"
+                for name, count in summary.facility_counts.most_common(_limit_value(6))
+            )
+            or "-"
+        )
+        severity_text = (
+            ", ".join(
+                f"{name}({count})"
+                for name, count in summary.severity_counts.most_common(_limit_value(6))
+            )
+            or "-"
+        )
         rows.append([facility_text, severity_text])
         lines.append(_format_table(rows))
 
@@ -7045,19 +8982,23 @@ def render_syslog_summary(summary: SyslogSummary, limit: int = 12, verbose: bool
         lines.append(header("Artifacts"))
         rows = [["Type", "Detail", "Src", "Dst"]]
         for item in summary.artifacts[:limit]:
-            rows.append([
-                str(item.kind),
-                _truncate_text(str(item.detail), 60),
-                str(item.src),
-                str(item.dst),
-            ])
+            rows.append(
+                [
+                    str(item.kind),
+                    _truncate_text(str(item.detail), 60),
+                    str(item.src),
+                    str(item.dst),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_snmp_summary(summary: SnmpSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_snmp_summary(
+    summary: SnmpSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -7093,7 +9034,9 @@ def render_snmp_summary(summary: SnmpSummary, limit: int = 12, verbose: bool = F
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top SNMP Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.version_counts:
         lines.append(SUBSECTION_BAR)
@@ -7196,19 +9139,23 @@ def render_snmp_summary(summary: SnmpSummary, limit: int = 12, verbose: bool = F
         lines.append(header("Artifacts"))
         rows = [["Type", "Detail", "Src", "Dst"]]
         for item in summary.artifacts[:limit]:
-            rows.append([
-                str(item.kind),
-                _truncate_text(str(item.detail), 60),
-                str(item.src),
-                str(item.dst),
-            ])
+            rows.append(
+                [
+                    str(item.kind),
+                    _truncate_text(str(item.detail), 60),
+                    str(item.src),
+                    str(item.dst),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_smtp_summary(summary: SmtpSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_smtp_summary(
+    summary: SmtpSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -7244,7 +9191,9 @@ def render_smtp_summary(summary: SmtpSummary, limit: int = 12, verbose: bool = F
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top SMTP Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.hostname_counts:
         lines.append(SUBSECTION_BAR)
@@ -7282,12 +9231,20 @@ def render_smtp_summary(summary: SmtpSummary, limit: int = 12, verbose: bool = F
         lines.append(SUBSECTION_BAR)
         lines.append(header("Auth Outcomes"))
         rows = [["Failures", "Successes"]]
-        fail_text = ", ".join(
-            f"{ip}({count})" for ip, count in summary.auth_failures.most_common(_limit_value(6))
-        ) or "-"
-        succ_text = ", ".join(
-            f"{ip}({count})" for ip, count in summary.auth_successes.most_common(_limit_value(6))
-        ) or "-"
+        fail_text = (
+            ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.auth_failures.most_common(_limit_value(6))
+            )
+            or "-"
+        )
+        succ_text = (
+            ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.auth_successes.most_common(_limit_value(6))
+            )
+            or "-"
+        )
         rows.append([fail_text, succ_text])
         lines.append(_format_table(rows))
 
@@ -7344,19 +9301,23 @@ def render_smtp_summary(summary: SmtpSummary, limit: int = 12, verbose: bool = F
         lines.append(header("Artifacts"))
         rows = [["Type", "Detail", "Src", "Dst"]]
         for item in summary.artifacts[:limit]:
-            rows.append([
-                str(item.kind),
-                _truncate_text(str(item.detail), 60),
-                str(item.src),
-                str(item.dst),
-            ])
+            rows.append(
+                [
+                    str(item.kind),
+                    _truncate_text(str(item.detail), 60),
+                    str(item.src),
+                    str(item.dst),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_rpc_summary(summary: RpcSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_rpc_summary(
+    summary: RpcSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     if not summary:
         return ""
@@ -7402,7 +9363,9 @@ def render_rpc_summary(summary: RpcSummary, limit: int = 12, verbose: bool = Fal
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top RPC Clients & Servers"))
-        lines.append(_format_client_server_table(summary.client_counts, summary.server_counts))
+        lines.append(
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
 
     if summary.pdu_counts:
         lines.append(SUBSECTION_BAR)
@@ -7435,7 +9398,13 @@ def render_rpc_summary(summary: RpcSummary, limit: int = 12, verbose: bool = Fal
         for share, count in summary.share_counts.most_common(limit):
             share_name = str(share).split("\\")[-1]
             share_type = "Admin" if share_name.upper().endswith("$") else "Normal"
-            rows.append([_truncate_text(_redact_in_text(str(share)), 70), str(count), share_type])
+            rows.append(
+                [
+                    _truncate_text(_redact_in_text(str(share)), 70),
+                    str(count),
+                    share_type,
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.pipe_counts:
@@ -7515,21 +9484,24 @@ def render_rpc_summary(summary: RpcSummary, limit: int = 12, verbose: bool = Fal
         lines.append(header("Artifacts"))
         rows = [["Type", "Detail", "Src", "Dst"]]
         for item in summary.artifacts[:limit]:
-            rows.append([
-                str(item.kind),
-                _truncate_text(str(item.detail), 60),
-                str(item.src),
-                str(item.dst),
-            ])
+            rows.append(
+                [
+                    str(item.kind),
+                    _truncate_text(str(item.detail), 60),
+                    str(item.src),
+                    str(item.dst),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = False) -> str:
-    verbose = True
-    limit = _FULL_OUTPUT_LIMIT
+def render_tcp_summary(
+    summary: TcpSummary, limit: int = 12, verbose: bool = False
+) -> str:
+    limit = _apply_verbose_limit(limit) or limit
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"TCP ANALYSIS :: {summary.path.name}"))
@@ -7551,23 +9523,52 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
             lines.append(_format_kv("Verdict", f"{verdict} (confidence: {confidence})"))
         else:
             lines.append(_format_kv("Verdict", verdict))
-        for reason in reasons[:_limit_value(8)]:
+        for reason in reasons[: _limit_value(8)]:
             lines.append(muted(f"- {reason}"))
 
-    tcp_packet_ratio = (summary.tcp_packets / summary.total_packets) if summary.total_packets else 0.0
-    tcp_byte_ratio = (summary.tcp_bytes / summary.total_bytes) if summary.total_bytes else 0.0
-    avg_tcp_pkt = (summary.tcp_bytes / summary.tcp_packets) if summary.tcp_packets else 0.0
-    avg_tcp_payload = (summary.tcp_payload_bytes / summary.tcp_packets) if summary.tcp_packets else 0.0
-    tcp_pps = (summary.tcp_packets / summary.duration_seconds) if summary.duration_seconds else 0.0
-    tcp_bps = (summary.tcp_bytes / summary.duration_seconds) if summary.duration_seconds else 0.0
+    tcp_packet_ratio = (
+        (summary.tcp_packets / summary.total_packets) if summary.total_packets else 0.0
+    )
+    tcp_byte_ratio = (
+        (summary.tcp_bytes / summary.total_bytes) if summary.total_bytes else 0.0
+    )
+    avg_tcp_pkt = (
+        (summary.tcp_bytes / summary.tcp_packets) if summary.tcp_packets else 0.0
+    )
+    avg_tcp_payload = (
+        (summary.tcp_payload_bytes / summary.tcp_packets)
+        if summary.tcp_packets
+        else 0.0
+    )
+    tcp_pps = (
+        (summary.tcp_packets / summary.duration_seconds)
+        if summary.duration_seconds
+        else 0.0
+    )
+    tcp_bps = (
+        (summary.tcp_bytes / summary.duration_seconds)
+        if summary.duration_seconds
+        else 0.0
+    )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Protocol Statistics"))
-    lines.append(_format_kv("TCP Packets", f"{summary.tcp_packets} ({tcp_packet_ratio:.1%})"))
-    lines.append(_format_kv("TCP Bytes", f"{format_bytes_as_mb(summary.tcp_bytes)} ({tcp_byte_ratio:.1%})"))
+    lines.append(
+        _format_kv("TCP Packets", f"{summary.tcp_packets} ({tcp_packet_ratio:.1%})")
+    )
+    lines.append(
+        _format_kv(
+            "TCP Bytes",
+            f"{format_bytes_as_mb(summary.tcp_bytes)} ({tcp_byte_ratio:.1%})",
+        )
+    )
     lines.append(_format_kv("Unique Clients", str(len(summary.client_counts))))
     lines.append(_format_kv("Unique Servers", str(len(summary.server_counts))))
-    lines.append(_format_kv("Unique Endpoints", str(len(getattr(summary, "endpoint_packets", {})))))
+    lines.append(
+        _format_kv(
+            "Unique Endpoints", str(len(getattr(summary, "endpoint_packets", {})))
+        )
+    )
     lines.append(_format_kv("Conversations", str(len(summary.conversations))))
     lines.append(_format_kv("Start", format_ts(summary.first_seen)))
     lines.append(_format_kv("End", format_ts(summary.last_seen)))
@@ -7577,7 +9578,9 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
     lines.append(header("Overall Traffic Statistics"))
     lines.append(_format_kv("Total Packets", str(summary.total_packets)))
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
-    lines.append(_format_kv("TCP Payload Bytes", format_bytes_as_mb(summary.tcp_payload_bytes)))
+    lines.append(
+        _format_kv("TCP Payload Bytes", format_bytes_as_mb(summary.tcp_payload_bytes))
+    )
     lines.append(_format_kv("Avg TCP Packet Size", f"{avg_tcp_pkt:.1f} bytes"))
     lines.append(_format_kv("Avg TCP Payload Size", f"{avg_tcp_payload:.1f} bytes"))
     lines.append(_format_kv("TCP Packets/sec", f"{tcp_pps:.2f}"))
@@ -7603,7 +9606,7 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
             values = [str(v) for v in list(checks.get(key, []) or [])]
             if values:
                 lines.append(warn(f"[!] {label}: {len(values)}"))
-                for item in values[:_limit_value(8)]:
+                for item in values[: _limit_value(8)]:
                     lines.append(muted(f"  - {item}"))
             else:
                 lines.append(ok(f"[ ] {label}: none"))
@@ -7613,15 +9616,17 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("TCP Risk Matrix"))
         rows = [["Category", "Risk", "Confidence", "Evidence"]]
-        for row in risk_matrix[:_limit_value(12)]:
+        for row in risk_matrix[: _limit_value(12)]:
             if not isinstance(row, dict):
                 continue
-            rows.append([
-                str(row.get("category", "")),
-                str(row.get("risk", "")),
-                str(row.get("confidence", "")),
-                str(row.get("evidence", "")),
-            ])
+            rows.append(
+                [
+                    str(row.get("category", "")),
+                    str(row.get("risk", "")),
+                    str(row.get("confidence", "")),
+                    str(row.get("evidence", "")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -7633,12 +9638,14 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         for profile in session_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("flow", "-")),
-                str(profile.get("issue", "-")),
-                str(profile.get("packets", 0)),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("flow", "-")),
+                    str(profile.get("issue", "-")),
+                    str(profile.get("packets", 0)),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -7650,13 +9657,15 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         for profile in recon_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("source", "-")),
-                str(profile.get("port", "-")),
-                str(profile.get("unique_ports", "-")),
-                str(profile.get("targets", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("source", "-")),
+                    str(profile.get("port", "-")),
+                    str(profile.get("unique_ports", "-")),
+                    str(profile.get("targets", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -7668,12 +9677,14 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         for profile in teardown_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("flow", "-")),
-                str(profile.get("rst", 0)),
-                str(profile.get("fin", 0)),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("flow", "-")),
+                    str(profile.get("rst", 0)),
+                    str(profile.get("fin", 0)),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -7685,13 +9696,15 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         for profile in cadence_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("flow", "-")),
-                str(profile.get("packets", 0)),
-                str(profile.get("duration_s", "-")),
-                str(profile.get("pps", "-")),
-                str(profile.get("avg_packet", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("flow", "-")),
+                    str(profile.get("packets", 0)),
+                    str(profile.get("duration_s", "-")),
+                    str(profile.get("pps", "-")),
+                    str(profile.get("avg_packet", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -7703,12 +9716,14 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         for profile in lateral_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("source", "-")),
-                str(profile.get("targets", "-")),
-                str(profile.get("admin_ports", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("source", "-")),
+                    str(profile.get("targets", "-")),
+                    str(profile.get("admin_ports", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -7720,12 +9735,14 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         for profile in egress_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("src", "-")),
-                str(profile.get("dst", "-")),
-                format_bytes_as_mb(int(profile.get("bytes", 0) or 0)),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("src", "-")),
+                    str(profile.get("dst", "-")),
+                    format_bytes_as_mb(int(profile.get("bytes", 0) or 0)),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -7737,13 +9754,15 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         for profile in role_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("host", "-")),
-                str(profile.get("dst", "-")),
-                str(profile.get("port", "-")),
-                str(profile.get("reason", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("host", "-")),
+                    str(profile.get("dst", "-")),
+                    str(profile.get("port", "-")),
+                    str(profile.get("reason", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -7755,12 +9774,14 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         for profile in transport_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("host", "-")),
-                str(profile.get("type", "-")),
-                str(profile.get("count", 0)),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("host", "-")),
+                    str(profile.get("type", "-")),
+                    str(profile.get("count", 0)),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -7772,12 +9793,15 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         for finding in corroborated_findings[:limit]:
             if not isinstance(finding, dict):
                 continue
-            rows.append([
-                str(finding.get("host", "-")),
-                str(finding.get("score", "-")),
-                str(finding.get("confidence", "-")),
-                ", ".join(str(v) for v in list(finding.get("reasons", []) or [])) or "-",
-            ])
+            rows.append(
+                [
+                    str(finding.get("host", "-")),
+                    str(finding.get("score", "-")),
+                    str(finding.get("confidence", "-")),
+                    ", ".join(str(v) for v in list(finding.get("reasons", []) or []))
+                    or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -7785,47 +9809,82 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
     if pivots:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Hunt Pivots"))
-        rows = [["Flow", "Packets", "Bytes", "SYN", "SYN-ACK", "RST", "Reasons"]]
+        rows = [
+            ["Flow", "Packet", "Packets", "Bytes", "SYN", "SYN-ACK", "RST", "Reasons"]
+        ]
         for pivot in pivots[:limit]:
             if not isinstance(pivot, dict):
                 continue
-            rows.append([
-                str(pivot.get("flow", "-")),
-                str(pivot.get("packets", 0)),
-                format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
-                str(pivot.get("syn", 0)),
-                str(pivot.get("syn_ack", 0)),
-                str(pivot.get("rst", 0)),
-                ", ".join(str(v) for v in list(pivot.get("reasons", []) or [])) or "-",
-            ])
+            rows.append(
+                [
+                    str(pivot.get("flow", "-")),
+                    _pivot_packet_number(pivot),
+                    str(pivot.get("packets", 0)),
+                    format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
+                    str(pivot.get("syn", 0)),
+                    str(pivot.get("syn_ack", 0)),
+                    str(pivot.get("rst", 0)),
+                    ", ".join(str(v) for v in list(pivot.get("reasons", []) or []))
+                    or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
-    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
+    false_positive_context = [
+        str(v)
+        for v in list(getattr(summary, "false_positive_context", []) or [])
+        if str(v).strip()
+    ]
     if false_positive_context:
         lines.append(SUBSECTION_BAR)
         lines.append(header("False-Positive Context"))
-        for item in false_positive_context[:_limit_value(8)]:
+        for item in false_positive_context[: _limit_value(8)]:
             lines.append(muted(f"- {item}"))
 
     if summary.packet_size_hist or summary.payload_size_hist:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Packet & Payload Size Distribution"))
-        bucket_labels = ["<=64", "65-128", "129-256", "257-512", "513-1024", "1025-1500", "1501-9000", ">9000"]
+        bucket_labels = [
+            "<=64",
+            "65-128",
+            "129-256",
+            "257-512",
+            "513-1024",
+            "1025-1500",
+            "1501-9000",
+            ">9000",
+        ]
         if summary.packet_size_hist:
-            packet_series = [summary.packet_size_hist.get(label, 0) for label in bucket_labels]
+            packet_series = [
+                summary.packet_size_hist.get(label, 0) for label in bucket_labels
+            ]
             lines.append(_format_kv("Packet Size Buckets", ", ".join(bucket_labels)))
             lines.append(_format_kv("Packet Size Spark", sparkline(packet_series)))
             stats = summary.packet_size_stats
-            lines.append(_format_kv("Packet Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+            lines.append(
+                _format_kv(
+                    "Packet Size Stats",
+                    f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}",
+                )
+            )
         if summary.payload_size_hist:
-            payload_series = [summary.payload_size_hist.get(label, 0) for label in bucket_labels]
+            payload_series = [
+                summary.payload_size_hist.get(label, 0) for label in bucket_labels
+            ]
             lines.append(_format_kv("Payload Size Buckets", ", ".join(bucket_labels)))
             lines.append(_format_kv("Payload Size Spark", sparkline(payload_series)))
             stats = summary.payload_size_stats
-            lines.append(_format_kv("Payload Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+            lines.append(
+                _format_kv(
+                    "Payload Size Stats",
+                    f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}",
+                )
+            )
         if summary.zero_payload_packets:
-            lines.append(_format_kv("Zero Payload Packets", str(summary.zero_payload_packets)))
+            lines.append(
+                _format_kv("Zero Payload Packets", str(summary.zero_payload_packets))
+            )
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
@@ -7860,10 +9919,14 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
             if isinstance(cast_sports, set):
                 cast_sports.add(int(convo.src_port))
             first_seen = bucket.get("first_seen")
-            if first_seen is None or (convo.first_seen is not None and convo.first_seen < first_seen):
+            if first_seen is None or (
+                convo.first_seen is not None and convo.first_seen < first_seen
+            ):
                 bucket["first_seen"] = convo.first_seen
             last_seen = bucket.get("last_seen")
-            if last_seen is None or (convo.last_seen is not None and convo.last_seen > last_seen):
+            if last_seen is None or (
+                convo.last_seen is not None and convo.last_seen > last_seen
+            ):
                 bucket["last_seen"] = convo.last_seen
 
         grouped_rows = sorted(
@@ -7878,32 +9941,52 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
             ),
         )
         conversation_group_limit = 40
-        rows = [["Src", "Dst", "Dport", "Flows", "Packets", "Bytes", "SYN", "SYN-ACK", "RST", "FIN", "Duration"]]
+        rows = [
+            [
+                "Src",
+                "Dst",
+                "Dport",
+                "Flows",
+                "Packets",
+                "Bytes",
+                "SYN",
+                "SYN-ACK",
+                "RST",
+                "FIN",
+                "Duration",
+            ]
+        ]
         for item in grouped_rows[:conversation_group_limit]:
             sports = item.get("sports", set())
             flow_count = len(sports) if isinstance(sports, set) else 0
             first_seen = item.get("first_seen")
             last_seen = item.get("last_seen")
             duration = None
-            if isinstance(first_seen, (int, float)) and isinstance(last_seen, (int, float)):
+            if isinstance(first_seen, (int, float)) and isinstance(
+                last_seen, (int, float)
+            ):
                 duration = max(0.0, float(last_seen) - float(first_seen))
-            rows.append([
-                str(item.get("src_ip", "-")),
-                str(item.get("dst_ip", "-")),
-                str(item.get("dst_port", "-")),
-                str(flow_count),
-                str(item.get("packets", 0)),
-                format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
-                str(item.get("syn", 0)),
-                str(item.get("syn_ack", 0)),
-                str(item.get("rst", 0)),
-                str(item.get("fin", 0)),
-                format_duration(duration),
-            ])
+            rows.append(
+                [
+                    str(item.get("src_ip", "-")),
+                    str(item.get("dst_ip", "-")),
+                    str(item.get("dst_port", "-")),
+                    str(flow_count),
+                    str(item.get("packets", 0)),
+                    format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
+                    str(item.get("syn", 0)),
+                    str(item.get("syn_ack", 0)),
+                    str(item.get("rst", 0)),
+                    str(item.get("fin", 0)),
+                    format_duration(duration),
+                ]
+            )
         lines.append(_format_table(rows))
         if len(grouped_rows) > conversation_group_limit:
             remaining = grouped_rows[conversation_group_limit:]
-            remaining_packets = sum(int(item.get("packets", 0) or 0) for item in remaining)
+            remaining_packets = sum(
+                int(item.get("packets", 0) or 0) for item in remaining
+            )
             remaining_bytes = sum(int(item.get("bytes", 0) or 0) for item in remaining)
             lines.append(
                 muted(
@@ -7926,29 +10009,41 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
             ),
         )
         session_group_limit = 35
-        rows = [["Client", "Server", "Flows", "Start", "End", "Duration", "Packets", "Size"]]
+        rows = [
+            ["Client", "Server", "Flows", "Start", "End", "Duration", "Packets", "Size"]
+        ]
         for item in session_rows[:session_group_limit]:
             sports = item.get("sports", set())
             flow_count = len(sports) if isinstance(sports, set) else 0
             first_seen = item.get("first_seen")
             last_seen = item.get("last_seen")
             duration = None
-            if isinstance(first_seen, (int, float)) and isinstance(last_seen, (int, float)):
+            if isinstance(first_seen, (int, float)) and isinstance(
+                last_seen, (int, float)
+            ):
                 duration = max(0.0, float(last_seen) - float(first_seen))
-            rows.append([
-                str(item.get("src_ip", "-")),
-                f"{item.get('dst_ip', '-')}:{item.get('dst_port', '-')}",
-                str(flow_count),
-                format_ts(first_seen if isinstance(first_seen, (int, float)) else None),
-                format_ts(last_seen if isinstance(last_seen, (int, float)) else None),
-                format_duration(duration),
-                str(item.get("packets", 0)),
-                format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
-            ])
+            rows.append(
+                [
+                    str(item.get("src_ip", "-")),
+                    f"{item.get('dst_ip', '-')}:{item.get('dst_port', '-')}",
+                    str(flow_count),
+                    format_ts(
+                        first_seen if isinstance(first_seen, (int, float)) else None
+                    ),
+                    format_ts(
+                        last_seen if isinstance(last_seen, (int, float)) else None
+                    ),
+                    format_duration(duration),
+                    str(item.get("packets", 0)),
+                    format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
+                ]
+            )
         lines.append(_format_table(rows))
         if len(session_rows) > session_group_limit:
             remaining = session_rows[session_group_limit:]
-            remaining_packets = sum(int(item.get("packets", 0) or 0) for item in remaining)
+            remaining_packets = sum(
+                int(item.get("packets", 0) or 0) for item in remaining
+            )
             lines.append(
                 muted(
                     f"{len(remaining)} additional grouped sessions "
@@ -7959,8 +10054,16 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("TCP Client/Server Statistics (Grouped by Endpoint)"))
-        client_bytes = summary.client_bytes if isinstance(summary.client_bytes, Counter) else Counter()
-        server_bytes = summary.server_bytes if isinstance(summary.server_bytes, Counter) else Counter()
+        client_bytes = (
+            summary.client_bytes
+            if isinstance(summary.client_bytes, Counter)
+            else Counter()
+        )
+        server_bytes = (
+            summary.server_bytes
+            if isinstance(summary.server_bytes, Counter)
+            else Counter()
+        )
         endpoints = set(summary.client_counts) | set(summary.server_counts)
         endpoint_rollups: list[dict[str, object]] = []
         for endpoint in endpoints:
@@ -7998,18 +10101,31 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
             )
         )
         role_limit = 40
-        rows = [["Endpoint", "As Client", "Client Bytes", "As Server", "Server Bytes", "Total Pkts", "Total Bytes", "Role"]]
+        rows = [
+            [
+                "Endpoint",
+                "As Client",
+                "Client Bytes",
+                "As Server",
+                "Server Bytes",
+                "Total Pkts",
+                "Total Bytes",
+                "Role",
+            ]
+        ]
         for row in endpoint_rollups[:role_limit]:
-            rows.append([
-                str(row["endpoint"]),
-                str(row["client_pkts"]),
-                format_bytes_as_mb(int(row["client_bytes"])),
-                str(row["server_pkts"]),
-                format_bytes_as_mb(int(row["server_bytes"])),
-                str(row["total_pkts"]),
-                format_bytes_as_mb(int(row["total_bytes"])),
-                str(row["role"]),
-            ])
+            rows.append(
+                [
+                    str(row["endpoint"]),
+                    str(row["client_pkts"]),
+                    format_bytes_as_mb(int(row["client_bytes"])),
+                    str(row["server_pkts"]),
+                    format_bytes_as_mb(int(row["server_bytes"])),
+                    str(row["total_pkts"]),
+                    format_bytes_as_mb(int(row["total_bytes"])),
+                    str(row["role"]),
+                ]
+            )
         lines.append(_format_table(rows))
         if len(endpoint_rollups) > role_limit:
             remaining = endpoint_rollups[role_limit:]
@@ -8026,7 +10142,11 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("TCP Endpoint Statistics (Top Endpoints)"))
         rows = [["Endpoint", "Packets", "Bytes"]]
-        endpoint_bytes = summary.endpoint_bytes if isinstance(summary.endpoint_bytes, Counter) else Counter()
+        endpoint_bytes = (
+            summary.endpoint_bytes
+            if isinstance(summary.endpoint_bytes, Counter)
+            else Counter()
+        )
         endpoint_limit = 40
         endpoint_ranked = summary.endpoint_packets.most_common()
         for ip, count in endpoint_ranked[:endpoint_limit]:
@@ -8035,7 +10155,9 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         if len(endpoint_ranked) > endpoint_limit:
             remaining = endpoint_ranked[endpoint_limit:]
             remaining_packets = sum(int(count) for _ip, count in remaining)
-            remaining_bytes = sum(int(endpoint_bytes.get(ip, 0)) for ip, _count in remaining)
+            remaining_bytes = sum(
+                int(endpoint_bytes.get(ip, 0)) for ip, _count in remaining
+            )
             lines.append(
                 muted(
                     f"{len(remaining)} additional endpoints omitted "
@@ -8047,7 +10169,11 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top TCP Destination Ports"))
         rows = [["Port", "Count", "Unique Dsts", "Top Destinations"]]
-        port_destinations = summary.port_destinations if isinstance(summary.port_destinations, dict) else {}
+        port_destinations = (
+            summary.port_destinations
+            if isinstance(summary.port_destinations, dict)
+            else {}
+        )
         port_limit = 40
         top_destination_limit = 8
         port_rows = summary.port_counts.most_common(port_limit)
@@ -8060,7 +10186,9 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
                 preview_items = []
             dst_text = ", ".join(f"{ip}({cnt})" for ip, cnt in preview_items) or "-"
             if unique_dsts > top_destination_limit:
-                dst_text = f"{dst_text}, ... +{unique_dsts - top_destination_limit} more"
+                dst_text = (
+                    f"{dst_text}, ... +{unique_dsts - top_destination_limit} more"
+                )
             rows.append([str(port), str(count), str(unique_dsts), dst_text])
         lines.append(_format_table(rows))
         if len(summary.port_counts) > port_limit:
@@ -8081,13 +10209,15 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
             client_note = str(svc.get("clients", "-"))
             if svc.get("client_count"):
                 client_note = f"{svc.get('client_count')} :: {client_note}"
-            rows.append([
-                str(svc.get("service", "-")),
-                str(svc.get("endpoint", "-")),
-                str(svc.get("port", "-")),
-                client_note,
-                str(svc.get("count", "-")),
-            ])
+            rows.append(
+                [
+                    str(svc.get("service", "-")),
+                    str(svc.get("endpoint", "-")),
+                    str(svc.get("port", "-")),
+                    client_note,
+                    str(svc.get("count", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.file_artifacts:
@@ -8128,9 +10258,10 @@ def render_tcp_summary(summary: TcpSummary, limit: int = 12, verbose: bool = Fal
     return _finalize_output(lines, show_truncation_note=False)
 
 
-def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = False) -> str:
-    verbose = True
-    limit = _FULL_OUTPUT_LIMIT
+def render_udp_summary(
+    summary: UdpSummary, limit: int = 12, verbose: bool = False
+) -> str:
+    limit = _apply_verbose_limit(limit) or limit
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"UDP ANALYSIS :: {summary.path.name}"))
@@ -8152,20 +10283,45 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
             lines.append(_format_kv("Verdict", f"{verdict} (confidence: {confidence})"))
         else:
             lines.append(_format_kv("Verdict", verdict))
-        for reason in reasons[:_limit_value(8)]:
+        for reason in reasons[: _limit_value(8)]:
             lines.append(muted(f"- {reason}"))
 
-    udp_packet_ratio = (summary.udp_packets / summary.total_packets) if summary.total_packets else 0.0
-    udp_byte_ratio = (summary.udp_bytes / summary.total_bytes) if summary.total_bytes else 0.0
-    avg_udp_pkt = (summary.udp_bytes / summary.udp_packets) if summary.udp_packets else 0.0
-    avg_udp_payload = (summary.udp_payload_bytes / summary.udp_packets) if summary.udp_packets else 0.0
-    udp_pps = (summary.udp_packets / summary.duration_seconds) if summary.duration_seconds else 0.0
-    udp_bps = (summary.udp_bytes / summary.duration_seconds) if summary.duration_seconds else 0.0
+    udp_packet_ratio = (
+        (summary.udp_packets / summary.total_packets) if summary.total_packets else 0.0
+    )
+    udp_byte_ratio = (
+        (summary.udp_bytes / summary.total_bytes) if summary.total_bytes else 0.0
+    )
+    avg_udp_pkt = (
+        (summary.udp_bytes / summary.udp_packets) if summary.udp_packets else 0.0
+    )
+    avg_udp_payload = (
+        (summary.udp_payload_bytes / summary.udp_packets)
+        if summary.udp_packets
+        else 0.0
+    )
+    udp_pps = (
+        (summary.udp_packets / summary.duration_seconds)
+        if summary.duration_seconds
+        else 0.0
+    )
+    udp_bps = (
+        (summary.udp_bytes / summary.duration_seconds)
+        if summary.duration_seconds
+        else 0.0
+    )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Protocol Statistics"))
-    lines.append(_format_kv("UDP Packets", f"{summary.udp_packets} ({udp_packet_ratio:.1%})"))
-    lines.append(_format_kv("UDP Bytes", f"{format_bytes_as_mb(summary.udp_bytes)} ({udp_byte_ratio:.1%})"))
+    lines.append(
+        _format_kv("UDP Packets", f"{summary.udp_packets} ({udp_packet_ratio:.1%})")
+    )
+    lines.append(
+        _format_kv(
+            "UDP Bytes",
+            f"{format_bytes_as_mb(summary.udp_bytes)} ({udp_byte_ratio:.1%})",
+        )
+    )
     lines.append(_format_kv("Unique Clients", str(len(summary.client_counts))))
     lines.append(_format_kv("Unique Servers", str(len(summary.server_counts))))
     lines.append(_format_kv("Unique Endpoints", str(len(summary.endpoint_packets))))
@@ -8178,7 +10334,9 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
     lines.append(header("Overall Traffic Statistics"))
     lines.append(_format_kv("Total Packets", str(summary.total_packets)))
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
-    lines.append(_format_kv("UDP Payload Bytes", format_bytes_as_mb(summary.udp_payload_bytes)))
+    lines.append(
+        _format_kv("UDP Payload Bytes", format_bytes_as_mb(summary.udp_payload_bytes))
+    )
     lines.append(_format_kv("Avg UDP Packet Size", f"{avg_udp_pkt:.1f} bytes"))
     lines.append(_format_kv("Avg UDP Payload Size", f"{avg_udp_payload:.1f} bytes"))
     lines.append(_format_kv("UDP Packets/sec", f"{udp_pps:.2f}"))
@@ -8205,7 +10363,7 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
             values = [str(v) for v in list(checks.get(key, []) or [])]
             if values:
                 lines.append(warn(f"[!] {label}: {len(values)}"))
-                for item in values[:_limit_value(8)]:
+                for item in values[: _limit_value(8)]:
                     lines.append(muted(f"  - {item}"))
             else:
                 lines.append(ok(f"[ ] {label}: none"))
@@ -8215,15 +10373,17 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("UDP Risk Matrix"))
         rows = [["Category", "Risk", "Confidence", "Evidence"]]
-        for row in risk_matrix[:_limit_value(12)]:
+        for row in risk_matrix[: _limit_value(12)]:
             if not isinstance(row, dict):
                 continue
-            rows.append([
-                str(row.get("category", "")),
-                str(row.get("risk", "")),
-                str(row.get("confidence", "")),
-                str(row.get("evidence", "")),
-            ])
+            rows.append(
+                [
+                    str(row.get("category", "")),
+                    str(row.get("risk", "")),
+                    str(row.get("confidence", "")),
+                    str(row.get("evidence", "")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -8235,12 +10395,14 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         for profile in asymmetry_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("flow", "-")),
-                str(profile.get("packets", 0)),
-                str(profile.get("avg_packet", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("flow", "-")),
+                    str(profile.get("packets", 0)),
+                    str(profile.get("avg_packet", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -8252,13 +10414,15 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         for profile in amplification_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("client", "-")),
-                str(profile.get("server", "-")),
-                str(profile.get("port", "-")),
-                str(profile.get("ratio", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("client", "-")),
+                    str(profile.get("server", "-")),
+                    str(profile.get("port", "-")),
+                    str(profile.get("ratio", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -8270,13 +10434,15 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         for profile in recon_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("source", "-")),
-                str(profile.get("port", "-")),
-                str(profile.get("unique_ports", "-")),
-                str(profile.get("targets", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("source", "-")),
+                    str(profile.get("port", "-")),
+                    str(profile.get("unique_ports", "-")),
+                    str(profile.get("targets", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -8288,13 +10454,15 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         for profile in cadence_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("flow", "-")),
-                str(profile.get("packets", 0)),
-                str(profile.get("duration_s", "-")),
-                str(profile.get("pps", "-")),
-                str(profile.get("avg_packet", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("flow", "-")),
+                    str(profile.get("packets", 0)),
+                    str(profile.get("duration_s", "-")),
+                    str(profile.get("pps", "-")),
+                    str(profile.get("avg_packet", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -8306,14 +10474,16 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         for profile in tunneling_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("host", "-")),
-                str(profile.get("queries", 0)),
-                str(profile.get("unique_ratio", "-")),
-                str(profile.get("avg_len", "-")),
-                str(profile.get("avg_entropy", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("host", "-")),
+                    str(profile.get("queries", 0)),
+                    str(profile.get("unique_ratio", "-")),
+                    str(profile.get("avg_len", "-")),
+                    str(profile.get("avg_entropy", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -8325,14 +10495,16 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         for profile in zone_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("src", "-")),
-                str(profile.get("dst", "-")),
-                str(profile.get("port", "-")),
-                str(profile.get("zone", "-")),
-                str(profile.get("packets", 0)),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("src", "-")),
+                    str(profile.get("dst", "-")),
+                    str(profile.get("port", "-")),
+                    str(profile.get("zone", "-")),
+                    str(profile.get("packets", 0)),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -8344,13 +10516,15 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         for profile in role_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("host", "-")),
-                str(profile.get("dst", "-")),
-                str(profile.get("port", "-")),
-                str(profile.get("reason", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("host", "-")),
+                    str(profile.get("dst", "-")),
+                    str(profile.get("port", "-")),
+                    str(profile.get("reason", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -8362,13 +10536,15 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         for profile in ot_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("src", "-")),
-                str(profile.get("dst", "-")),
-                str(profile.get("port", "-")),
-                str(profile.get("packets", 0)),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("src", "-")),
+                    str(profile.get("dst", "-")),
+                    str(profile.get("port", "-")),
+                    str(profile.get("packets", 0)),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -8380,13 +10556,15 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         for profile in transport_profiles[:limit]:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("src", "-")),
-                str(profile.get("dst", "-")),
-                str(profile.get("type", "-")),
-                format_bytes_as_mb(int(profile.get("bytes", 0) or 0)),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("src", "-")),
+                    str(profile.get("dst", "-")),
+                    str(profile.get("type", "-")),
+                    format_bytes_as_mb(int(profile.get("bytes", 0) or 0)),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -8398,12 +10576,15 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         for finding in corroborated_findings[:limit]:
             if not isinstance(finding, dict):
                 continue
-            rows.append([
-                str(finding.get("host", "-")),
-                str(finding.get("score", "-")),
-                str(finding.get("confidence", "-")),
-                ", ".join(str(v) for v in list(finding.get("reasons", []) or [])) or "-",
-            ])
+            rows.append(
+                [
+                    str(finding.get("host", "-")),
+                    str(finding.get("score", "-")),
+                    str(finding.get("confidence", "-")),
+                    ", ".join(str(v) for v in list(finding.get("reasons", []) or []))
+                    or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -8411,58 +10592,93 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
     if pivots:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Hunt Pivots"))
-        rows = [["Flow", "Packets", "Bytes", "Reasons"]]
+        rows = [["Flow", "Packet", "Packets", "Bytes", "Reasons"]]
         for pivot in pivots[:limit]:
             if not isinstance(pivot, dict):
                 continue
-            rows.append([
-                str(pivot.get("flow", "-")),
-                str(pivot.get("packets", 0)),
-                format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
-                ", ".join(str(v) for v in list(pivot.get("reasons", []) or [])) or "-",
-            ])
+            rows.append(
+                [
+                    str(pivot.get("flow", "-")),
+                    _pivot_packet_number(pivot),
+                    str(pivot.get("packets", 0)),
+                    format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
+                    ", ".join(str(v) for v in list(pivot.get("reasons", []) or []))
+                    or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
-    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
+    false_positive_context = [
+        str(v)
+        for v in list(getattr(summary, "false_positive_context", []) or [])
+        if str(v).strip()
+    ]
     if false_positive_context:
         lines.append(SUBSECTION_BAR)
         lines.append(header("False-Positive Context"))
-        for item in false_positive_context[:_limit_value(8)]:
+        for item in false_positive_context[: _limit_value(8)]:
             lines.append(muted(f"- {item}"))
 
     if summary.packet_size_hist or summary.payload_size_hist:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Packet & Payload Size Distribution"))
-        bucket_labels = ["<=64", "65-128", "129-256", "257-512", "513-1024", "1025-1500", "1501-9000", ">9000"]
+        bucket_labels = [
+            "<=64",
+            "65-128",
+            "129-256",
+            "257-512",
+            "513-1024",
+            "1025-1500",
+            "1501-9000",
+            ">9000",
+        ]
         if summary.packet_size_hist:
-            packet_series = [summary.packet_size_hist.get(label, 0) for label in bucket_labels]
+            packet_series = [
+                summary.packet_size_hist.get(label, 0) for label in bucket_labels
+            ]
             lines.append(_format_kv("Packet Size Buckets", ", ".join(bucket_labels)))
             lines.append(_format_kv("Packet Size Spark", sparkline(packet_series)))
             stats = summary.packet_size_stats
-            lines.append(_format_kv("Packet Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+            lines.append(
+                _format_kv(
+                    "Packet Size Stats",
+                    f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}",
+                )
+            )
         if summary.payload_size_hist:
-            payload_series = [summary.payload_size_hist.get(label, 0) for label in bucket_labels]
+            payload_series = [
+                summary.payload_size_hist.get(label, 0) for label in bucket_labels
+            ]
             lines.append(_format_kv("Payload Size Buckets", ", ".join(bucket_labels)))
             lines.append(_format_kv("Payload Size Spark", sparkline(payload_series)))
             stats = summary.payload_size_stats
-            lines.append(_format_kv("Payload Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+            lines.append(
+                _format_kv(
+                    "Payload Size Stats",
+                    f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}",
+                )
+            )
         if summary.zero_payload_packets:
-            lines.append(_format_kv("Zero Payload Packets", str(summary.zero_payload_packets)))
+            lines.append(
+                _format_kv("Zero Payload Packets", str(summary.zero_payload_packets))
+            )
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
         lines.append(header("UDP Conversations"))
         rows = [["Src", "Dst", "Sport", "Dport", "Packets", "Bytes"]]
         for convo in summary.conversations[:limit]:
-            rows.append([
-                convo.src_ip,
-                convo.dst_ip,
-                str(convo.src_port),
-                str(convo.dst_port),
-                str(convo.packets),
-                format_bytes_as_mb(convo.bytes),
-            ])
+            rows.append(
+                [
+                    convo.src_ip,
+                    convo.dst_ip,
+                    str(convo.src_port),
+                    str(convo.dst_port),
+                    str(convo.packets),
+                    format_bytes_as_mb(convo.bytes),
+                ]
+            )
         lines.append(_format_table(rows))
         lines.append(SUBSECTION_BAR)
         lines.append(header("UDP Sessions"))
@@ -8471,8 +10687,16 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
     if summary.client_counts or summary.server_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("UDP Client/Server Statistics"))
-        client_bytes = summary.client_bytes if isinstance(summary.client_bytes, Counter) else Counter()
-        server_bytes = summary.server_bytes if isinstance(summary.server_bytes, Counter) else Counter()
+        client_bytes = (
+            summary.client_bytes
+            if isinstance(summary.client_bytes, Counter)
+            else Counter()
+        )
+        server_bytes = (
+            summary.server_bytes
+            if isinstance(summary.server_bytes, Counter)
+            else Counter()
+        )
         rows = [["Client", "Server"]]
         client_list = [
             f"{ip}({summary.client_counts[ip]}/{format_bytes_as_mb(client_bytes.get(ip, 0))})"
@@ -8484,17 +10708,23 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         ]
         max_rows = max(len(client_list), len(server_list))
         for idx in range(max_rows):
-            rows.append([
-                client_list[idx] if idx < len(client_list) else "-",
-                server_list[idx] if idx < len(server_list) else "-",
-            ])
+            rows.append(
+                [
+                    client_list[idx] if idx < len(client_list) else "-",
+                    server_list[idx] if idx < len(server_list) else "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.endpoint_packets:
         lines.append(SUBSECTION_BAR)
         lines.append(header("UDP Endpoint Statistics"))
         rows = [["Endpoint", "Packets", "Bytes"]]
-        endpoint_bytes = summary.endpoint_bytes if isinstance(summary.endpoint_bytes, Counter) else Counter()
+        endpoint_bytes = (
+            summary.endpoint_bytes
+            if isinstance(summary.endpoint_bytes, Counter)
+            else Counter()
+        )
         for ip, count in summary.endpoint_packets.most_common(limit):
             rows.append([ip, str(count), format_bytes_as_mb(endpoint_bytes.get(ip, 0))])
         lines.append(_format_table(rows))
@@ -8503,10 +10733,19 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top UDP Destination Ports"))
         rows = [["Port", "Count", "Destinations"]]
-        port_destinations = summary.port_destinations if isinstance(summary.port_destinations, dict) else {}
+        port_destinations = (
+            summary.port_destinations
+            if isinstance(summary.port_destinations, dict)
+            else {}
+        )
         for port, count in summary.port_counts.most_common(limit):
             dsts = port_destinations.get(port, Counter())
-            dst_text = ", ".join(f"{ip}({cnt})" for ip, cnt in dsts.most_common(_FULL_OUTPUT_LIMIT)) or "-"
+            dst_text = (
+                ", ".join(
+                    f"{ip}({cnt})" for ip, cnt in dsts.most_common(_FULL_OUTPUT_LIMIT)
+                )
+                or "-"
+            )
             rows.append([str(port), str(count), dst_text])
         lines.append(_format_table(rows))
 
@@ -8518,13 +10757,15 @@ def render_udp_summary(summary: UdpSummary, limit: int = 12, verbose: bool = Fal
             client_note = str(svc.get("clients", "-"))
             if svc.get("client_count"):
                 client_note = f"{svc.get('client_count')} :: {client_note}"
-            rows.append([
-                str(svc.get("service", "-")),
-                str(svc.get("endpoint", "-")),
-                str(svc.get("port", "-")),
-                client_note,
-                str(svc.get("count", "-")),
-            ])
+            rows.append(
+                [
+                    str(svc.get("service", "-")),
+                    str(svc.get("endpoint", "-")),
+                    str(svc.get("port", "-")),
+                    client_note,
+                    str(svc.get("count", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.file_artifacts:
@@ -8623,7 +10864,9 @@ def _approx_hist_stats(hist: Counter[str]) -> dict[str, float]:
     }
 
 
-def render_udp_rollup(summaries: Iterable[UdpSummary], limit: int = 12, verbose: bool = False) -> str:
+def render_udp_rollup(
+    summaries: Iterable[UdpSummary], limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     summary_list = list(summaries)
     if not summary_list:
@@ -8657,12 +10900,14 @@ def render_udp_rollup(summaries: Iterable[UdpSummary], limit: int = 12, verbose:
     first_seen = None
     last_seen = None
 
-    conversations: dict[tuple[str, str, int, int], dict[str, object]] = defaultdict(lambda: {
-        "packets": 0,
-        "bytes": 0,
-        "first_seen": None,
-        "last_seen": None,
-    })
+    conversations: dict[tuple[str, str, int, int], dict[str, object]] = defaultdict(
+        lambda: {
+            "packets": 0,
+            "bytes": 0,
+            "first_seen": None,
+            "last_seen": None,
+        }
+    )
 
     detections: dict[tuple[str, str], dict[str, object]] = {}
     artifact_counts: Counter[str] = Counter()
@@ -8670,24 +10915,68 @@ def render_udp_rollup(summaries: Iterable[UdpSummary], limit: int = 12, verbose:
     services_agg: dict[tuple[str, str, int, str], dict[str, object]] = {}
 
     for item in summary_list:
-        client_counts.update(item.client_counts if isinstance(item.client_counts, Counter) else Counter())
-        client_bytes.update(item.client_bytes if isinstance(item.client_bytes, Counter) else Counter())
-        server_counts.update(item.server_counts if isinstance(item.server_counts, Counter) else Counter())
-        server_bytes.update(item.server_bytes if isinstance(item.server_bytes, Counter) else Counter())
-        port_counts.update(item.port_counts if isinstance(item.port_counts, Counter) else Counter())
-        endpoint_packets.update(item.endpoint_packets if isinstance(item.endpoint_packets, Counter) else Counter())
-        endpoint_bytes.update(item.endpoint_bytes if isinstance(item.endpoint_bytes, Counter) else Counter())
-        packet_size_hist.update(item.packet_size_hist if isinstance(item.packet_size_hist, Counter) else Counter())
-        payload_size_hist.update(item.payload_size_hist if isinstance(item.payload_size_hist, Counter) else Counter())
-        http_methods.update(item.http_methods if isinstance(item.http_methods, Counter) else Counter())
-        http_statuses.update(item.http_statuses if isinstance(item.http_statuses, Counter) else Counter())
-        http_urls.update(item.http_urls if isinstance(item.http_urls, Counter) else Counter())
-        http_user_agents.update(item.http_user_agents if isinstance(item.http_user_agents, Counter) else Counter())
-        http_files.update(item.http_files if isinstance(item.http_files, Counter) else Counter())
-        file_artifacts.update(item.file_artifacts if isinstance(item.file_artifacts, Counter) else Counter())
+        client_counts.update(
+            item.client_counts if isinstance(item.client_counts, Counter) else Counter()
+        )
+        client_bytes.update(
+            item.client_bytes if isinstance(item.client_bytes, Counter) else Counter()
+        )
+        server_counts.update(
+            item.server_counts if isinstance(item.server_counts, Counter) else Counter()
+        )
+        server_bytes.update(
+            item.server_bytes if isinstance(item.server_bytes, Counter) else Counter()
+        )
+        port_counts.update(
+            item.port_counts if isinstance(item.port_counts, Counter) else Counter()
+        )
+        endpoint_packets.update(
+            item.endpoint_packets
+            if isinstance(item.endpoint_packets, Counter)
+            else Counter()
+        )
+        endpoint_bytes.update(
+            item.endpoint_bytes
+            if isinstance(item.endpoint_bytes, Counter)
+            else Counter()
+        )
+        packet_size_hist.update(
+            item.packet_size_hist
+            if isinstance(item.packet_size_hist, Counter)
+            else Counter()
+        )
+        payload_size_hist.update(
+            item.payload_size_hist
+            if isinstance(item.payload_size_hist, Counter)
+            else Counter()
+        )
+        http_methods.update(
+            item.http_methods if isinstance(item.http_methods, Counter) else Counter()
+        )
+        http_statuses.update(
+            item.http_statuses if isinstance(item.http_statuses, Counter) else Counter()
+        )
+        http_urls.update(
+            item.http_urls if isinstance(item.http_urls, Counter) else Counter()
+        )
+        http_user_agents.update(
+            item.http_user_agents
+            if isinstance(item.http_user_agents, Counter)
+            else Counter()
+        )
+        http_files.update(
+            item.http_files if isinstance(item.http_files, Counter) else Counter()
+        )
+        file_artifacts.update(
+            item.file_artifacts
+            if isinstance(item.file_artifacts, Counter)
+            else Counter()
+        )
         errors.extend(item.errors if isinstance(item.errors, list) else [])
 
-        port_map = item.port_destinations if isinstance(item.port_destinations, dict) else {}
+        port_map = (
+            item.port_destinations if isinstance(item.port_destinations, dict) else {}
+        )
         for port, counter in port_map.items():
             if isinstance(counter, Counter):
                 port_destinations[port].update(counter)
@@ -8720,17 +11009,22 @@ def render_udp_rollup(summaries: Iterable[UdpSummary], limit: int = 12, verbose:
             port = int(svc.get("port", 0)) if str(svc.get("port", "")).isdigit() else 0
             proto = str(svc.get("proto", "UDP"))
             key = (service, endpoint, port, proto)
-            entry = services_agg.setdefault(key, {
-                "service": service,
-                "endpoint": endpoint,
-                "port": port,
-                "proto": proto,
-                "count": 0,
-                "client_count": 0,
-                "clients": set(),
-            })
+            entry = services_agg.setdefault(
+                key,
+                {
+                    "service": service,
+                    "endpoint": endpoint,
+                    "port": port,
+                    "proto": proto,
+                    "count": 0,
+                    "client_count": 0,
+                    "clients": set(),
+                },
+            )
             entry["count"] = int(entry["count"]) + int(svc.get("count", 0) or 0)
-            entry["client_count"] = int(entry["client_count"]) + int(svc.get("client_count", 0) or 0)
+            entry["client_count"] = int(entry["client_count"]) + int(
+                svc.get("client_count", 0) or 0
+            )
             clients_text = str(svc.get("clients", "-"))
             if clients_text and clients_text != "-":
                 for part in clients_text.split(","):
@@ -8751,29 +11045,33 @@ def render_udp_rollup(summaries: Iterable[UdpSummary], limit: int = 12, verbose:
 
     conversation_rows: list[UdpConversation] = []
     for (src_ip, dst_ip, sport, dport), info in conversations.items():
-        conversation_rows.append(UdpConversation(
-            src_ip=src_ip,
-            dst_ip=dst_ip,
-            src_port=sport,
-            dst_port=dport,
-            packets=int(info["packets"]),
-            bytes=int(info["bytes"]),
-            first_seen=info["first_seen"],
-            last_seen=info["last_seen"],
-        ))
+        conversation_rows.append(
+            UdpConversation(
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                src_port=sport,
+                dst_port=dport,
+                packets=int(info["packets"]),
+                bytes=int(info["bytes"]),
+                first_seen=info["first_seen"],
+                last_seen=info["last_seen"],
+            )
+        )
 
     services: list[dict[str, object]] = []
     for entry in services_agg.values():
-        clients_list = sorted(entry["clients"])[:_limit_value(5)]
-        services.append({
-            "service": entry["service"],
-            "endpoint": entry["endpoint"],
-            "port": entry["port"],
-            "proto": entry["proto"],
-            "count": entry["count"],
-            "client_count": entry["client_count"],
-            "clients": ", ".join(clients_list) if clients_list else "-",
-        })
+        clients_list = sorted(entry["clients"])[: _limit_value(5)]
+        services.append(
+            {
+                "service": entry["service"],
+                "endpoint": entry["endpoint"],
+                "port": entry["port"],
+                "proto": entry["proto"],
+                "count": entry["count"],
+                "client_count": entry["client_count"],
+                "clients": ", ".join(clients_list) if clients_list else "-",
+            }
+        )
 
     services.sort(key=lambda value: int(value.get("count", 0)), reverse=True)
     errors = sorted({err for err in errors if err})
@@ -8785,7 +11083,9 @@ def render_udp_rollup(summaries: Iterable[UdpSummary], limit: int = 12, verbose:
         udp_packets=udp_packets,
         udp_bytes=udp_bytes,
         udp_payload_bytes=udp_payload_bytes,
-        conversations=sorted(conversation_rows, key=lambda item: item.packets, reverse=True),
+        conversations=sorted(
+            conversation_rows, key=lambda item: item.packets, reverse=True
+        ),
         client_counts=client_counts,
         client_bytes=client_bytes,
         server_counts=server_counts,
@@ -8809,7 +11109,10 @@ def render_udp_rollup(summaries: Iterable[UdpSummary], limit: int = 12, verbose:
         file_artifacts=file_artifacts,
         services=services,
         detections=list(detections.values()),
-        artifacts=[f"{name} ({count})" for name, count in artifact_counts.most_common(_limit_value(20))],
+        artifacts=[
+            f"{name} ({count})"
+            for name, count in artifact_counts.most_common(_limit_value(20))
+        ],
         errors=errors,
         first_seen=first_seen,
         last_seen=last_seen,
@@ -8819,15 +11122,10 @@ def render_udp_rollup(summaries: Iterable[UdpSummary], limit: int = 12, verbose:
     return render_udp_summary(rollup, limit=limit, verbose=verbose)
 
 
-def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool = False) -> str:
-    # Analyst-heavy output: always render full detail regardless of -v.
-    limit = _FULL_OUTPUT_LIMIT
-    verbose = True
-    def _limit_value(_value: int) -> int:
-        return _FULL_OUTPUT_LIMIT
-
-    def _truncate_text(text: str, max_len: int = 0) -> str:
-        return str(text)
+def render_exfil_summary(
+    summary: ExfilSummary, limit: int = 12, verbose: bool = False
+) -> str:
+    limit = _apply_verbose_limit(limit) or limit
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"EXFILTRATION ANALYSIS :: {summary.path.name}"))
@@ -8841,7 +11139,9 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
 
     lines.append(_format_kv("Packets", str(summary.total_packets)))
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
-    lines.append(_format_kv("Outbound Bytes", format_bytes_as_mb(summary.outbound_bytes)))
+    lines.append(
+        _format_kv("Outbound Bytes", format_bytes_as_mb(summary.outbound_bytes))
+    )
     lines.append(_format_kv("Start", format_ts(summary.first_seen)))
     lines.append(_format_kv("End", format_ts(summary.last_seen)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
@@ -8855,10 +11155,14 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
         outbound_ratio = (outbound / max(total, 1)) if total > 0 else 0.0
         if outbound >= 5_000_000:
             score += 2
-            reasons.append(f"Outbound volume {format_bytes_as_mb(outbound)} exceeds high-risk threshold")
+            reasons.append(
+                f"Outbound volume {format_bytes_as_mb(outbound)} exceeds high-risk threshold"
+            )
         if total >= 2_000_000 and outbound_ratio >= 0.60:
             score += 1
-            reasons.append(f"Outbound ratio is {outbound_ratio * 100:.1f}% of capture bytes")
+            reasons.append(
+                f"Outbound ratio is {outbound_ratio * 100:.1f}% of capture bytes"
+            )
 
         if summary.outbound_flows:
             top = summary.outbound_flows[0]
@@ -8909,21 +11213,35 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
                 )
             else:
                 score += 3
-                reasons.append(f"DNS tunneling heuristics triggered by {len(summary.dns_tunnel_suspects)} source(s)")
+                reasons.append(
+                    f"DNS tunneling heuristics triggered by {len(summary.dns_tunnel_suspects)} source(s)"
+                )
         if summary.http_post_suspects:
             score += 1
-            reasons.append(f"Large HTTP POST channels detected ({len(summary.http_post_suspects)})")
+            reasons.append(
+                f"Large HTTP POST channels detected ({len(summary.http_post_suspects)})"
+            )
         if summary.file_exfil_suspects:
-            high_risk_files = [item for item in summary.file_exfil_suspects if int(item.get("risk_score", 0) or 0) >= 5]
+            high_risk_files = [
+                item
+                for item in summary.file_exfil_suspects
+                if int(item.get("risk_score", 0) or 0) >= 5
+            ]
             score += 2 if high_risk_files else 1
             reasons.append(
                 f"Suspicious file transfer suspects detected ({len(summary.file_exfil_suspects)}; high-risk={len(high_risk_files)})"
             )
         if summary.ot_flows:
-            large_ot = [item for item in summary.ot_flows if int(item.get("bytes", 0) or 0) >= 1_000_000]
+            large_ot = [
+                item
+                for item in summary.ot_flows
+                if int(item.get("bytes", 0) or 0) >= 1_000_000
+            ]
             if large_ot:
                 score += 1
-                reasons.append(f"Large OT/ICS control-port transfers observed ({len(large_ot)})")
+                reasons.append(
+                    f"Large OT/ICS control-port transfers observed ({len(large_ot)})"
+                )
 
         if score >= 7:
             verdict = "YES - exfiltration activity is likely occurring in this PCAP based on corroborated indicators."
@@ -8939,7 +11257,9 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
             confidence = "Low"
 
         if not reasons:
-            reasons.append("No high-confidence exfiltration heuristic crossed its threshold")
+            reasons.append(
+                "No high-confidence exfiltration heuristic crossed its threshold"
+            )
         return verdict, confidence, reasons, score
 
     verdict, confidence, verdict_reasons, verdict_score = _exfil_verdict()
@@ -8953,14 +11273,14 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(8)]:
+    for reason in verdict_reasons[: _limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     # Add concrete evidence context directly in the verdict block for analyst triage.
     if summary.outbound_flows:
         lines.append(muted("Where:"))
         lines.append(muted("- Dominant outbound flows"))
-        for item in summary.outbound_flows[:_limit_value(6)]:
+        for item in summary.outbound_flows[: _limit_value(6)]:
             lines.append(
                 muted(
                     f"- {item.get('src', '-')}->{item.get('dst', '-')} "
@@ -8973,7 +11293,7 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
     if summary.dns_tunnel_suspects:
         lines.append(muted("What:"))
         lines.append(muted("- DNS tunnel suspects"))
-        for item in summary.dns_tunnel_suspects[:_limit_value(6)]:
+        for item in summary.dns_tunnel_suspects[: _limit_value(6)]:
             lines.append(
                 muted(
                     f"- src={item.get('src', '-')} total={item.get('total', '-')} unique={item.get('unique', '-')} "
@@ -8984,7 +11304,7 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
     if summary.http_post_suspects:
         lines.append(muted("What:"))
         lines.append(muted("- HTTP POST exfil channels"))
-        for item in summary.http_post_suspects[:_limit_value(6)]:
+        for item in summary.http_post_suspects[: _limit_value(6)]:
             lines.append(
                 muted(
                     f"- {item.get('src', '-')}->{item.get('dst', '-')} host={item.get('host', '-')} "
@@ -8998,7 +11318,7 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
         if file_suspects:
             lines.append(muted("What:"))
             lines.append(muted("- File exfil suspects"))
-            for item in file_suspects[:_limit_value(6)]:
+            for item in file_suspects[: _limit_value(6)]:
                 lines.append(
                     muted(
                         f"- {item.get('src', '-')}->{item.get('dst', '-')} file={item.get('filename', '-')} "
@@ -9021,77 +11341,109 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
     ]
     protocol_checks = getattr(summary, "protocol_exfil_checks", {}) or {}
     for key, label_text in protocol_labels:
-        evidence = protocol_checks.get(key, []) if isinstance(protocol_checks, dict) else []
+        evidence = (
+            protocol_checks.get(key, []) if isinstance(protocol_checks, dict) else []
+        )
         lines.append(label(f"{label_text} Exfil Check"))
         if evidence:
-            lines.append(warn(f"Yes, there is evidence for {label_text} exfil, here is the evidence:"))
-            for item in evidence[:_limit_value(8 if verbose else 5)]:
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text} exfil, here is the evidence:"
+                )
+            )
+            for item in evidence[: _limit_value(8 if verbose else 5)]:
                 lines.append(muted(f"- {_redact_in_text(str(item))}"))
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text} exfil in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text} exfil in this capture."
+                )
+            )
 
     if summary.outbound_flows:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Outbound Flows (Private -> Public)"))
-        rows = [["Src", "Dst", "Proto", "DPort", "Packets", "Bytes", "Duration", "Rate"]]
+        rows = [
+            ["Src", "Dst", "Proto", "DPort", "Packets", "Bytes", "Duration", "Rate"]
+        ]
         for item in summary.outbound_flows[:limit]:
             duration_seconds = float(item.get("duration_seconds", 0.0) or 0.0)
             bytes_per_second = float(item.get("bytes_per_second", 0.0) or 0.0)
             dport = item.get("dst_port")
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("proto", "-")),
-                str(dport) if isinstance(dport, int) and dport > 0 else "-",
-                str(item.get("packets", "-")),
-                format_bytes_as_mb(int(item.get("bytes", 0))),
-                format_duration(duration_seconds),
-                f"{format_bytes_as_mb(int(bytes_per_second * 60))}/min" if bytes_per_second > 0 else "-",
-            ])
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("proto", "-")),
+                    str(dport) if isinstance(dport, int) and dport > 0 else "-",
+                    str(item.get("packets", "-")),
+                    format_bytes_as_mb(int(item.get("bytes", 0))),
+                    format_duration(duration_seconds),
+                    f"{format_bytes_as_mb(int(bytes_per_second * 60))}/min"
+                    if bytes_per_second > 0
+                    else "-",
+                ]
+            )
         lines.append(_format_table(rows))
         if summary.top_external_dsts:
             top_dst, top_bytes = summary.top_external_dsts.most_common(1)[0]
             share = (top_bytes / max(int(summary.outbound_bytes or 0), 1)) * 100.0
-            lines.append(muted(f"Primary external destination: {top_dst} ({format_bytes_as_mb(top_bytes)}, {share:.1f}% of outbound)"))
+            lines.append(
+                muted(
+                    f"Primary external destination: {top_dst} ({format_bytes_as_mb(top_bytes)}, {share:.1f}% of outbound)"
+                )
+            )
 
     if getattr(summary, "internal_flows", None):
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Internal Flows (Private -> Private)"))
-        rows = [["Src", "Dst", "Proto", "DPort", "Packets", "Bytes", "Duration", "Rate"]]
+        rows = [
+            ["Src", "Dst", "Proto", "DPort", "Packets", "Bytes", "Duration", "Rate"]
+        ]
         for item in summary.internal_flows[:limit]:
             duration_seconds = float(item.get("duration_seconds", 0.0) or 0.0)
             bytes_per_second = float(item.get("bytes_per_second", 0.0) or 0.0)
             dport = item.get("dst_port")
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("proto", "-")),
-                str(dport) if isinstance(dport, int) and dport > 0 else "-",
-                str(item.get("packets", "-")),
-                format_bytes_as_mb(int(item.get("bytes", 0))),
-                format_duration(duration_seconds),
-                f"{format_bytes_as_mb(int(bytes_per_second * 60))}/min" if bytes_per_second > 0 else "-",
-            ])
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("proto", "-")),
+                    str(dport) if isinstance(dport, int) and dport > 0 else "-",
+                    str(item.get("packets", "-")),
+                    format_bytes_as_mb(int(item.get("bytes", 0))),
+                    format_duration(duration_seconds),
+                    f"{format_bytes_as_mb(int(bytes_per_second * 60))}/min"
+                    if bytes_per_second > 0
+                    else "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     if getattr(summary, "ot_flows", None):
         lines.append(SUBSECTION_BAR)
         lines.append(header("OT/ICS Control-Port Flows"))
-        rows = [["Src", "Dst", "Proto", "DPort", "Packets", "Bytes", "Duration", "Rate"]]
+        rows = [
+            ["Src", "Dst", "Proto", "DPort", "Packets", "Bytes", "Duration", "Rate"]
+        ]
         for item in summary.ot_flows[:limit]:
             duration_seconds = float(item.get("duration_seconds", 0.0) or 0.0)
             bytes_per_second = float(item.get("bytes_per_second", 0.0) or 0.0)
             dport = item.get("dst_port")
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("proto", "-")),
-                str(dport) if isinstance(dport, int) and dport > 0 else "-",
-                str(item.get("packets", "-")),
-                format_bytes_as_mb(int(item.get("bytes", 0))),
-                format_duration(duration_seconds),
-                f"{format_bytes_as_mb(int(bytes_per_second * 60))}/min" if bytes_per_second > 0 else "-",
-            ])
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("proto", "-")),
+                    str(dport) if isinstance(dport, int) and dport > 0 else "-",
+                    str(item.get("packets", "-")),
+                    format_bytes_as_mb(int(item.get("bytes", 0))),
+                    format_duration(duration_seconds),
+                    f"{format_bytes_as_mb(int(bytes_per_second * 60))}/min"
+                    if bytes_per_second > 0
+                    else "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.dns_tunnel_suspects:
@@ -9099,50 +11451,81 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
         lines.append(header("DNS Tunneling Heuristics"))
         rows = [["Src", "Total", "Unique", "Long", "Entropy", "MaxLabel"]]
         for item in summary.dns_tunnel_suspects[:limit]:
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("total", "-")),
-                str(item.get("unique", "-")),
-                str(item.get("long", "-")),
-                str(item.get("avg_entropy", "-")),
-                str(item.get("max_label", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("total", "-")),
+                    str(item.get("unique", "-")),
+                    str(item.get("long", "-")),
+                    str(item.get("avg_entropy", "-")),
+                    str(item.get("max_label", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.http_post_suspects:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Large HTTP POST Payloads (Evidence)"))
-        rows = [["Src", "Dst", "Host", "URI", "Bytes", "Req", "Mode", "Risk", "Packets", "Assessment"]]
+        rows = [
+            [
+                "Src",
+                "Dst",
+                "Host",
+                "URI",
+                "Bytes",
+                "Req",
+                "Mode",
+                "Risk",
+                "Packets",
+                "Assessment",
+            ]
+        ]
         for item in summary.http_post_suspects[:limit]:
             bytes_val = int(item.get("bytes", 0) or 0)
             req_val = int(item.get("requests", 1) or 1)
             risk_score = int(item.get("risk_score", 0) or 0)
-            packet_examples = str(item.get("packet_examples", item.get("packet", "-")) or "-")
-            assessment = "high" if risk_score >= 3 or bytes_val >= 5_000_000 or req_val >= 30 else "medium"
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("host", "-")),
-                str(item.get("uri", "-")),
-                format_bytes_as_mb(bytes_val),
-                str(req_val),
-                str(item.get("mode", "single")),
-                str(risk_score),
-                packet_examples,
-                assessment,
-            ])
+            packet_examples = str(
+                item.get("packet_examples", item.get("packet", "-")) or "-"
+            )
+            assessment = (
+                "high"
+                if risk_score >= 3 or bytes_val >= 5_000_000 or req_val >= 30
+                else "medium"
+            )
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("host", "-")),
+                    str(item.get("uri", "-")),
+                    format_bytes_as_mb(bytes_val),
+                    str(req_val),
+                    str(item.get("mode", "single")),
+                    str(risk_score),
+                    packet_examples,
+                    assessment,
+                ]
+            )
         lines.append(_format_table(rows))
 
         lines.append(muted("HTTP POST Evidence Details:"))
-        for item in summary.http_post_suspects[:_limit_value(10 if verbose else 6)]:
+        for item in summary.http_post_suspects[: _limit_value(10 if verbose else 6)]:
             risk_score = int(item.get("risk_score", 0) or 0)
             risk_reasons = item.get("risk_reasons", [])
-            reason_text = ", ".join(str(v) for v in risk_reasons[:3]) if isinstance(risk_reasons, list) and risk_reasons else "-"
-            packet_examples = str(item.get("packet_examples", item.get("packet", "-")) or "-")
-            lines.append(muted(
-                f"- {item.get('src')}->{item.get('dst')} host={item.get('host')} risk={risk_score} "
-                f"why={_redact_in_text(reason_text)} packets={packet_examples}"
-            ))
+            reason_text = (
+                ", ".join(str(v) for v in risk_reasons[:3])
+                if isinstance(risk_reasons, list) and risk_reasons
+                else "-"
+            )
+            packet_examples = str(
+                item.get("packet_examples", item.get("packet", "-")) or "-"
+            )
+            lines.append(
+                muted(
+                    f"- {item.get('src')}->{item.get('dst')} host={item.get('host')} risk={risk_score} "
+                    f"why={_redact_in_text(reason_text)} packets={packet_examples}"
+                )
+            )
             sample_text = str(item.get("sample", "") or "").strip()
             if sample_text and sample_text != "-":
                 lines.append(muted(f"  sample={_redact_in_text(sample_text[:120])}"))
@@ -9153,34 +11536,52 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
         rows = [["Filename", "Size", "Note"]]
         for item in summary.file_artifacts[:limit]:
             size_val = item.get("size")
-            rows.append([
-                str(item.get("filename", "-")),
-                format_bytes_as_mb(int(size_val)) if isinstance(size_val, int) else "-",
-                str(item.get("note", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("filename", "-")),
+                    format_bytes_as_mb(int(size_val))
+                    if isinstance(size_val, int)
+                    else "-",
+                    str(item.get("note", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if getattr(summary, "file_exfil_suspects", None):
         lines.append(SUBSECTION_BAR)
         lines.append(header("Potential Exfil File Transfers (Evidence)"))
-        rows = [["Src", "Dst", "Proto", "File", "Type", "Size", "Risk", "Packet", "Note"]]
+        rows = [
+            ["Src", "Dst", "Proto", "File", "Type", "Size", "Risk", "Packet", "Note"]
+        ]
         for item in summary.file_exfil_suspects[:limit]:
             size_val = item.get("size")
             risk_score = int(item.get("risk_score", 0) or 0)
-            risk_text = "high" if risk_score >= 5 else "medium" if risk_score >= 3 else "low"
+            risk_text = (
+                "high" if risk_score >= 5 else "medium" if risk_score >= 3 else "low"
+            )
             reasons = item.get("risk_reasons", [])
-            reason_text = ", ".join(str(r) for r in reasons[:3]) if isinstance(reasons, list) and reasons else "-"
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("protocol", "-")),
-                str(item.get("filename", "-")),
-                str(item.get("file_type", "-") or "-"),
-                format_bytes_as_mb(int(size_val)) if isinstance(size_val, int) else "-",
-                f"{risk_text} ({risk_score})",
-                str(item.get("packet", "-")),
-                reason_text if reason_text != "-" else (str(item.get("note", "-")) if item.get("note") else "-"),
-            ])
+            reason_text = (
+                ", ".join(str(r) for r in reasons[:3])
+                if isinstance(reasons, list) and reasons
+                else "-"
+            )
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("protocol", "-")),
+                    str(item.get("filename", "-")),
+                    str(item.get("file_type", "-") or "-"),
+                    format_bytes_as_mb(int(size_val))
+                    if isinstance(size_val, int)
+                    else "-",
+                    f"{risk_text} ({risk_score})",
+                    str(item.get("packet", "-")),
+                    reason_text
+                    if reason_text != "-"
+                    else (str(item.get("note", "-")) if item.get("note") else "-"),
+                ]
+            )
         lines.append(_format_table(rows))
 
     detections = _filtered_detections(summary, verbose)
@@ -9204,7 +11605,7 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
                 lines.append(muted(f"  {details}"))
             evidence_items = item.get("evidence", [])
             if isinstance(evidence_items, list):
-                for evidence in evidence_items[:_limit_value(8)]:
+                for evidence in evidence_items[: _limit_value(8)]:
                     lines.append(muted(f"    - {_redact_in_text(str(evidence))}"))
 
     if summary.artifacts:
@@ -9217,7 +11618,9 @@ def render_exfil_summary(summary: ExfilSummary, limit: int = 12, verbose: bool =
     return _finalize_output(lines, show_truncation_note=False)
 
 
-def render_sizes_summary(summary: SizeSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_sizes_summary(
+    summary: SizeSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -9239,22 +11642,38 @@ def render_sizes_summary(summary: SizeSummary, limit: int = 12, verbose: bool = 
     if summary.buckets:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Packet Size Distribution"))
-        rows = [["Bucket", "Count", "Avg", "Min", "Max", "Rate(pkt/s)", "%", "Burst Rate", "Burst Start"]]
+        rows = [
+            [
+                "Bucket",
+                "Count",
+                "Avg",
+                "Min",
+                "Max",
+                "Rate(pkt/s)",
+                "%",
+                "Burst Rate",
+                "Burst Start",
+            ]
+        ]
         for bucket in summary.buckets:
-            rows.append([
-                bucket.label,
-                str(bucket.count),
-                f"{bucket.avg:.1f}",
-                str(bucket.min),
-                str(bucket.max),
-                f"{bucket.rate:.2f}",
-                f"{bucket.pct:.1f}%",
-                f"{bucket.burst_rate:.0f}",
-                format_ts(bucket.burst_start) if bucket.burst_start else "-",
-            ])
+            rows.append(
+                [
+                    bucket.label,
+                    str(bucket.count),
+                    f"{bucket.avg:.1f}",
+                    str(bucket.min),
+                    str(bucket.max),
+                    f"{bucket.rate:.2f}",
+                    f"{bucket.pct:.1f}%",
+                    f"{bucket.burst_rate:.0f}",
+                    format_ts(bucket.burst_start) if bucket.burst_start else "-",
+                ]
+            )
         lines.append(_format_table(rows))
         lines.append("")
-        lines.append(muted(f"Distribution Sparkline: {render_size_sparkline(summary.buckets)}"))
+        lines.append(
+            muted(f"Distribution Sparkline: {render_size_sparkline(summary.buckets)}")
+        )
 
     detections = _filtered_detections(summary, verbose)
     if detections:
@@ -9277,14 +11696,16 @@ def render_sizes_summary(summary: SizeSummary, limit: int = 12, verbose: bool = 
                 lines.append(muted(f"  {details}"))
             evidence_items = item.get("evidence", [])
             if isinstance(evidence_items, list):
-                for evidence in evidence_items[:_limit_value(8)]:
+                for evidence in evidence_items[: _limit_value(8)]:
                     lines.append(muted(f"    - {_redact_in_text(str(evidence))}"))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool = False) -> str:
+def render_beacon_summary(
+    summary: BeaconSummary, limit: int = 12, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -9297,34 +11718,61 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
     if getattr(summary, "campaign_summaries", None):
         lines.append(SUBSECTION_BAR)
         lines.append(header("Beacon Campaign Summary"))
-        rows = [["Campaign", "Host", "Cadence", "Flows", "Destinations", "Channels", "Max Score"]]
+        rows = [
+            [
+                "Campaign",
+                "Host",
+                "Cadence",
+                "Flows",
+                "Destinations",
+                "Channels",
+                "Max Score",
+            ]
+        ]
         for item in summary.campaign_summaries[:limit]:
-            rows.append([
-                str(item.get("campaign_id", "-")),
-                str(item.get("host", "-")),
-                str(item.get("cadence_family", "-")),
-                str(item.get("flows", "-")),
-                str(item.get("destinations", "-")),
-                str(item.get("channels", "-")),
-                str(item.get("max_score", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("campaign_id", "-")),
+                    str(item.get("host", "-")),
+                    str(item.get("cadence_family", "-")),
+                    str(item.get("flows", "-")),
+                    str(item.get("destinations", "-")),
+                    str(item.get("channels", "-")),
+                    str(item.get("max_score", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if getattr(summary, "host_rollups", None):
         lines.append(SUBSECTION_BAR)
         lines.append(header("Host-Centric Verdict Rollup"))
-        rows = [["Host", "Candidates", "Channels", "Destinations", "Top Cadence", "Max Score"]]
+        rows = [
+            [
+                "Host",
+                "Candidates",
+                "Channels",
+                "Destinations",
+                "Top Cadence",
+                "Max Score",
+            ]
+        ]
         for item in summary.host_rollups[:limit]:
             channels = item.get("channels", [])
-            channel_text = ",".join(str(v) for v in channels) if isinstance(channels, list) else str(channels)
-            rows.append([
-                str(item.get("host", "-")),
-                str(item.get("candidate_count", "-")),
-                channel_text or "-",
-                str(item.get("destinations", "-")),
-                f"{float(item.get('top_cadence_s', 0.0) or 0.0):.2f}s",
-                str(item.get("max_score", "-")),
-            ])
+            channel_text = (
+                ",".join(str(v) for v in channels)
+                if isinstance(channels, list)
+                else str(channels)
+            )
+            rows.append(
+                [
+                    str(item.get("host", "-")),
+                    str(item.get("candidate_count", "-")),
+                    channel_text or "-",
+                    str(item.get("destinations", "-")),
+                    f"{float(item.get('top_cadence_s', 0.0) or 0.0):.2f}s",
+                    str(item.get("max_score", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     def _beacon_verdict() -> tuple[str, str, list[str], int]:
@@ -9344,7 +11792,9 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
                 reasons.append(f"Top beacon candidate score is {top_score:.2f}")
             if len(candidates) >= 3:
                 score += 1
-                reasons.append(f"Multiple beacon candidates detected ({len(candidates)})")
+                reasons.append(
+                    f"Multiple beacon candidates detected ({len(candidates)})"
+                )
 
         protocol_hits = 0
         if isinstance(checks, dict):
@@ -9354,18 +11804,26 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
                     protocol_hits += 1
         if protocol_hits:
             score += min(2, protocol_hits)
-            reasons.append(f"Deterministic checks found evidence in {protocol_hits} protocol channel(s)")
+            reasons.append(
+                f"Deterministic checks found evidence in {protocol_hits} protocol channel(s)"
+            )
 
         if http_posts:
-            max_http_risk = max((int(item.get("risk_score", 0) or 0) for item in http_posts), default=0)
+            max_http_risk = max(
+                (int(item.get("risk_score", 0) or 0) for item in http_posts), default=0
+            )
             score += 2 if max_http_risk >= 3 else 1
-            reasons.append(f"HTTP POST beacon channels detected ({len(http_posts)}; max risk={max_http_risk})")
+            reasons.append(
+                f"HTTP POST beacon channels detected ({len(http_posts)}; max risk={max_http_risk})"
+            )
 
         if score >= 6:
             verdict = "YES - beaconing activity is likely occurring in this capture."
             confidence = "High"
         elif score >= 4:
-            verdict = "LIKELY - beaconing indicators are present with corroborating evidence."
+            verdict = (
+                "LIKELY - beaconing indicators are present with corroborating evidence."
+            )
             confidence = "Medium"
         elif score >= 2:
             verdict = "POSSIBLE - weak-to-moderate beaconing indicators are present."
@@ -9389,7 +11847,7 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Reasons:"))
-    for reason in verdict_reasons[:_limit_value(8)]:
+    for reason in verdict_reasons[: _limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     if summary.errors:
@@ -9401,22 +11859,24 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
     if summary.candidates:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Beacon Candidates (RITA-style scoring)"))
-        rows = [[
-            "Src",
-            "Dst",
-            "Proto",
-            "Count",
-            "Duration",
-            "Mean",
-            "MAD",
-            "Avg Bytes",
-            "Size MAD",
-            "Periodicity",
-            "Size",
-            "Duration",
-            "Count",
-            "Score",
-        ]]
+        rows = [
+            [
+                "Src",
+                "Dst",
+                "Proto",
+                "Count",
+                "Duration",
+                "Mean",
+                "MAD",
+                "Avg Bytes",
+                "Size MAD",
+                "Periodicity",
+                "Size",
+                "Duration",
+                "Count",
+                "Score",
+            ]
+        ]
         for cand in summary.candidates[:limit]:
             if cand.src_port and cand.dst_port:
                 proto_label = f"{cand.proto}:{cand.src_port}->{cand.dst_port}"
@@ -9431,28 +11891,34 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
                 score_text = warn(score_text)
             else:
                 score_text = ok(score_text)
-            duration_text = format_duration(cand.duration_seconds) if cand.duration_seconds else "-"
-            rows.append([
-                cand.src_ip,
-                cand.dst_ip,
-                proto_label,
-                str(cand.count),
-                duration_text,
-                f"{cand.mean_interval:.2f}s",
-                f"{cand.mad_interval:.2f}s",
-                f"{cand.avg_bytes:.0f}",
-                f"{cand.mad_bytes:.0f}",
-                f"{cand.periodicity_score:.2f}",
-                f"{cand.size_score:.2f}",
-                f"{cand.duration_score:.2f}",
-                f"{cand.count_score:.2f}",
-                score_text,
-            ])
+            duration_text = (
+                format_duration(cand.duration_seconds) if cand.duration_seconds else "-"
+            )
+            rows.append(
+                [
+                    cand.src_ip,
+                    cand.dst_ip,
+                    proto_label,
+                    str(cand.count),
+                    duration_text,
+                    f"{cand.mean_interval:.2f}s",
+                    f"{cand.mad_interval:.2f}s",
+                    f"{cand.avg_bytes:.0f}",
+                    f"{cand.mad_bytes:.0f}",
+                    f"{cand.periodicity_score:.2f}",
+                    f"{cand.size_score:.2f}",
+                    f"{cand.duration_score:.2f}",
+                    f"{cand.count_score:.2f}",
+                    score_text,
+                ]
+            )
         lines.append(_format_table(rows))
-        lines.append(muted(
-            "Scores: Periodicity=1-MAD/Median interval, Size=1-MAD/Median bytes, "
-            "Duration=duration/1h, Count=connections/50. Total score is weighted."
-        ))
+        lines.append(
+            muted(
+                "Scores: Periodicity=1-MAD/Median interval, Size=1-MAD/Median bytes, "
+                "Duration=duration/1h, Count=connections/50. Total score is weighted."
+            )
+        )
 
         lines.append(SUBSECTION_BAR)
         lines.append(header("Beacon Timelines"))
@@ -9460,23 +11926,24 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
             graph = sparkline(cand.timeline)
             lines.append(f"{cand.src_ip} -> {cand.dst_ip}  {graph}")
             if verbose:
-                lines.append(muted(
-                    "  Mean {mean:.2f}s | Median {median:.2f}s | MAD {mad:.2f}s | "
-                    "Avg Bytes {avg_bytes:.0f} | Size MAD {size_mad:.0f} | "
-                    "Scores P:{p:.2f} S:{s:.2f} D:{d:.2f} C:{c:.2f} | Total {score:.2f}"
-                    .format(
-                        mean=cand.mean_interval,
-                        median=cand.median_interval,
-                        mad=cand.mad_interval,
-                        avg_bytes=cand.avg_bytes,
-                        size_mad=cand.mad_bytes,
-                        p=cand.periodicity_score,
-                        s=cand.size_score,
-                        d=cand.duration_score,
-                        c=cand.count_score,
-                        score=cand.score,
+                lines.append(
+                    muted(
+                        "  Mean {mean:.2f}s | Median {median:.2f}s | MAD {mad:.2f}s | "
+                        "Avg Bytes {avg_bytes:.0f} | Size MAD {size_mad:.0f} | "
+                        "Scores P:{p:.2f} S:{s:.2f} D:{d:.2f} C:{c:.2f} | Total {score:.2f}".format(
+                            mean=cand.mean_interval,
+                            median=cand.median_interval,
+                            mad=cand.mad_interval,
+                            avg_bytes=cand.avg_bytes,
+                            size_mad=cand.mad_bytes,
+                            p=cand.periodicity_score,
+                            s=cand.size_score,
+                            d=cand.duration_score,
+                            c=cand.count_score,
+                            score=cand.score,
+                        )
                     )
-                ))
+                )
 
     detections = _filtered_detections(summary, verbose)
     if detections:
@@ -9497,15 +11964,20 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
                 lines.append(muted(f"  {details}"))
             top_sources = item.get("top_sources")
             if isinstance(top_sources, list) and top_sources:
-                src_text = ", ".join(f"{ip}({count})" for ip, count in top_sources[:_limit_value(6)])
+                src_text = ", ".join(
+                    f"{ip}({count})" for ip, count in top_sources[: _limit_value(6)]
+                )
                 lines.append(muted(f"  Sources: {src_text}"))
             top_destinations = item.get("top_destinations")
             if isinstance(top_destinations, list) and top_destinations:
-                dst_text = ", ".join(f"{ip}({count})" for ip, count in top_destinations[:_limit_value(6)])
+                dst_text = ", ".join(
+                    f"{ip}({count})"
+                    for ip, count in top_destinations[: _limit_value(6)]
+                )
                 lines.append(muted(f"  Destinations: {dst_text}"))
             evidence_items = item.get("evidence", [])
             if isinstance(evidence_items, list) and evidence_items:
-                for evidence in evidence_items[:_limit_value(8)]:
+                for evidence in evidence_items[: _limit_value(8)]:
                     lines.append(muted(f"    - {_redact_in_text(str(evidence))}"))
 
     checks = getattr(summary, "protocol_beacon_checks", {}) or {}
@@ -9521,11 +11993,17 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
         evidence = checks.get(key) if isinstance(checks, dict) else []
         evidence_items = [str(item) for item in (evidence or []) if str(item).strip()]
         if evidence_items:
-            lines.append(danger(f"Yes, there is evidence for {proto_label} beaconing, here is the evidence:"))
-            for item in evidence_items[:_limit_value(10)]:
+            lines.append(
+                danger(
+                    f"Yes, there is evidence for {proto_label} beaconing, here is the evidence:"
+                )
+            )
+            for item in evidence_items[: _limit_value(10)]:
                 lines.append(muted(f"  - {_redact_in_text(item)}"))
         else:
-            lines.append(ok(f"No, there is no strong evidence for {proto_label} beaconing."))
+            lines.append(
+                ok(f"No, there is no strong evidence for {proto_label} beaconing.")
+            )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Deterministic Beacon Category Checks"))
@@ -9541,26 +12019,48 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
 
     matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for key, label_text in category_labels:
-        evidence = category_checks.get(key, []) if isinstance(category_checks, dict) else []
+        evidence = (
+            category_checks.get(key, []) if isinstance(category_checks, dict) else []
+        )
         evidence_items = [str(item) for item in (evidence or []) if str(item).strip()]
         lines.append(label(label_text))
         if evidence_items:
             if key == "benign_periodic_likely":
-                lines.append(ok(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                lines.append(
+                    ok(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
             else:
-                lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for item in evidence_items[:_limit_value(10 if verbose else 6)]:
+                lines.append(
+                    warn(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
+            for item in evidence_items[: _limit_value(10 if verbose else 6)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
             if key == "benign_periodic_likely":
-                matrix_rows.append([label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"])
+                matrix_rows.append(
+                    [label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"]
+                )
             elif key in {"multi_target_synchronized", "cross_protocol_cadence"}:
-                matrix_rows.append([label_text, "High", "High", f"{len(evidence_items)} signal(s)"])
+                matrix_rows.append(
+                    [label_text, "High", "High", f"{len(evidence_items)} signal(s)"]
+                )
             elif key in {"single_target_periodic_c2", "low_slow_persistence"}:
-                matrix_rows.append([label_text, "Medium", "Medium", f"{len(evidence_items)} signal(s)"])
+                matrix_rows.append(
+                    [label_text, "Medium", "Medium", f"{len(evidence_items)} signal(s)"]
+                )
             else:
-                matrix_rows.append([label_text, "Medium", "Low", f"{len(evidence_items)} signal(s)"])
+                matrix_rows.append(
+                    [label_text, "Medium", "Low", f"{len(evidence_items)} signal(s)"]
+                )
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -9580,54 +12080,79 @@ def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool
     if pivots:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Actionable Hunting Pivots"))
-        rows = [["Src", "Dst", "Proto", "Interval", "Score", "URI Hash", "First", "Last"]]
+        rows = [
+            ["Src", "Dst", "Proto", "Interval", "Score", "URI Hash", "First", "Last"]
+        ]
         for item in pivots[:limit]:
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("proto", "-")),
-                f"{float(item.get('interval', 0.0) or 0.0):.2f}s",
-                str(item.get("score", "-")),
-                str(item.get("uri_template_hash", "-")),
-                format_ts(item.get("first_seen")),
-                format_ts(item.get("last_seen")),
-            ])
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("proto", "-")),
+                    f"{float(item.get('interval', 0.0) or 0.0):.2f}s",
+                    str(item.get("score", "-")),
+                    str(item.get("uri_template_hash", "-")),
+                    format_ts(item.get("first_seen")),
+                    format_ts(item.get("last_seen")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     explainability = list(getattr(summary, "explainability", []) or [])
     if explainability:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Explainability"))
-        for item in explainability[:_limit_value(12 if verbose else 8)]:
+        for item in explainability[: _limit_value(12 if verbose else 8)]:
             lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     http_post_beacons = list(getattr(summary, "http_post_beacons", []) or [])
     if http_post_beacons:
         lines.append(SUBSECTION_BAR)
         lines.append(header("HTTP POST Beacon Discovery"))
-        rows = [["Source", "Destination", "Host", "URI(s)", "Req", "Bytes", "Stability", "Linked", "Risk", "Packets"]]
-        for item in http_post_beacons[:_limit_value(10)]:
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("host", "-")),
-                str(item.get("uri", "-")),
-                str(int(item.get("requests", 0) or 0)),
-                str(int(item.get("bytes", 0) or 0)),
-                f"{float(item.get('size_stability', 0.0) or 0.0):.2f}",
-                f"{float(item.get('linked_beacon_score', 0.0) or 0.0):.2f}",
-                str(int(item.get("risk_score", 0) or 0)),
-                str(item.get("packet_examples", "-")),
-            ])
+        rows = [
+            [
+                "Source",
+                "Destination",
+                "Host",
+                "URI(s)",
+                "Req",
+                "Bytes",
+                "Stability",
+                "Linked",
+                "Risk",
+                "Packets",
+            ]
+        ]
+        for item in http_post_beacons[: _limit_value(10)]:
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("host", "-")),
+                    str(item.get("uri", "-")),
+                    str(int(item.get("requests", 0) or 0)),
+                    str(int(item.get("bytes", 0) or 0)),
+                    f"{float(item.get('size_stability', 0.0) or 0.0):.2f}",
+                    f"{float(item.get('linked_beacon_score', 0.0) or 0.0):.2f}",
+                    str(int(item.get("risk_score", 0) or 0)),
+                    str(item.get("packet_examples", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
         lines.append(muted("HTTP POST Beacon Evidence Details:"))
-        for item in http_post_beacons[:_limit_value(10 if verbose else 6)]:
+        for item in http_post_beacons[: _limit_value(10 if verbose else 6)]:
             reason_values = item.get("risk_reasons", [])
-            reason_text = ", ".join(str(v) for v in reason_values[:3]) if isinstance(reason_values, list) and reason_values else "-"
-            lines.append(muted(
-                f"- {item.get('src')}->{item.get('dst')} host={item.get('host')} risk={int(item.get('risk_score', 0) or 0)} "
-                f"why={_redact_in_text(reason_text)}"
-            ))
+            reason_text = (
+                ", ".join(str(v) for v in reason_values[:3])
+                if isinstance(reason_values, list) and reason_values
+                else "-"
+            )
+            lines.append(
+                muted(
+                    f"- {item.get('src')}->{item.get('dst')} host={item.get('host')} risk={int(item.get('risk_score', 0) or 0)} "
+                    f"why={_redact_in_text(reason_text)}"
+                )
+            )
             sample_text = str(item.get("sample", "") or "").strip()
             if sample_text and sample_text != "-":
                 lines.append(muted(f"  sample={_redact_in_text(sample_text[:120])}"))
@@ -9642,7 +12167,7 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
     lines.append(header(f"THREATS OVERVIEW :: {summary.path.name}"))
     lines.append(SECTION_BAR)
 
-    def _highlight_public_ips(text: str) -> str:
+    def _highlight_public_ips_local(text: str) -> str:
         tokens = text.split()
         for idx, token in enumerate(tokens):
             stripped = token.strip("[](),;|")
@@ -9665,6 +12190,30 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
     def _severity_rank(value: object) -> int:
         sev = _severity_level(value)
         return {"critical": 0, "high": 1, "warning": 2, "info": 3}.get(sev, 3)
+
+    def _confidence_level(value: object) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"high", "medium", "low"}:
+            return text
+        if text in {"med", "moderate"}:
+            return "medium"
+        if text in {"very-high", "very high", "strong"}:
+            return "high"
+        if text in {"weak", "none", "unknown"}:
+            return "low"
+        try:
+            numeric = float(text)
+            if numeric >= 0.75:
+                return "high"
+            if numeric >= 0.45:
+                return "medium"
+            return "low"
+        except Exception:
+            return "-"
+
+    def _confidence_rank(value: object) -> int:
+        level = _confidence_level(value)
+        return {"high": 0, "medium": 1, "low": 2}.get(level, 3)
 
     def _is_network_attack_detection(item: dict[str, object]) -> bool:
         source = str(item.get("source", "")).strip().lower()
@@ -9697,6 +12246,7 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
             "credential",
             "execution",
             "safety",
+            "correlation",
         }
         if source in network_sources:
             return True
@@ -9742,7 +12292,11 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
         sev = _severity_level(item.get("severity", "info"))
         base = {"critical": 50, "high": 35, "warning": 20, "info": 0}.get(sev, 0)
         evidence = item.get("evidence")
-        evidence_count = len(evidence) if isinstance(evidence, list) else (1 if isinstance(evidence, str) and evidence.strip() else 0)
+        evidence_count = (
+            len(evidence)
+            if isinstance(evidence, list)
+            else (1 if isinstance(evidence, str) and evidence.strip() else 0)
+        )
         peer_signal = max(
             _pair_max_count(item.get("top_sources")),
             _pair_max_count(item.get("top_destinations")),
@@ -9756,7 +12310,12 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
                 detail_count = max(detail_count, int(token))
             except Exception:
                 continue
-        return base + min(12, evidence_count * 3) + min(12, peer_signal) + (2 if detail_count >= 10 else 0)
+        return (
+            base
+            + min(12, evidence_count * 3)
+            + min(12, peer_signal)
+            + (2 if detail_count >= 10 else 0)
+        )
 
     def _is_noisy_low_signal(item: dict[str, object], strength: int) -> bool:
         sev = _severity_level(item.get("severity", "info"))
@@ -9781,7 +12340,13 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
             "potential ",
         )
         has_context = False
-        for key in ("top_sources", "top_destinations", "top_clients", "top_servers", "evidence"):
+        for key in (
+            "top_sources",
+            "top_destinations",
+            "top_clients",
+            "top_servers",
+            "evidence",
+        ):
             value = item.get(key)
             if isinstance(value, list) and value:
                 has_context = True
@@ -9790,12 +12355,47 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
                 has_context = True
                 break
 
-        min_strength = 24
+        min_strength = 26
         if any(token in blob for token in noisy_tokens):
-            min_strength = 28
+            min_strength = 31
         if not has_context:
-            min_strength += 3
+            min_strength += 4
         return strength < min_strength
+
+    high_priority_tokens = (
+        "critical",
+        "multi-stage",
+        "correlation",
+        "beacon",
+        "c2",
+        "credential",
+        "lateral",
+        "exfil",
+        "threat-intel",
+        "brute-force",
+        "internet-exposed",
+        "ids alert",
+        "suspicious command/tooling",
+    )
+    noisy_summary_tokens = (
+        "telemetry",
+        "activity observed",
+        "candidate flow",
+        "ot protocol activity observed",
+        "ot protocol function operations observed",
+        "ot diagnostic/maintenance operations observed",
+        "safety plc/sis traffic detected",
+        "high traffic concentration on a target",
+        "broad outbound external communication",
+    )
+
+    def _is_priority_summary(text: str) -> bool:
+        lowered = text.lower()
+        return any(token in lowered for token in high_priority_tokens)
+
+    def _is_noisy_summary(text: str) -> bool:
+        lowered = text.lower()
+        return any(token in lowered for token in noisy_summary_tokens)
 
     raw_detections = [
         item
@@ -9804,15 +12404,16 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
     ]
 
     filtered: list[dict[str, object]] = []
-    suppressed_count = 0
+    suppressed: list[dict[str, object]] = []
     for item in raw_detections:
         strength = _detection_strength(item)
-        if _is_noisy_low_signal(item, strength):
-            suppressed_count += 1
-            continue
         enriched = dict(item)
         enriched["_strength"] = strength
         enriched["_severity"] = _severity_level(item.get("severity", "info"))
+        enriched["_confidence"] = _confidence_level(item.get("confidence", "-"))
+        if _is_noisy_low_signal(item, strength):
+            suppressed.append(enriched)
+            continue
         filtered.append(enriched)
 
     def _threats_verdict() -> tuple[str, str, list[str], int]:
@@ -9837,25 +12438,196 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
             reasons.append(f"Detection volume after filtering: {len(filtered)}")
         if summary.public_ot_pairs:
             score += 1
-            reasons.append(f"Public OT/ICS communication pairs: {len(summary.public_ot_pairs)}")
+            reasons.append(
+                f"Public OT/ICS communication pairs: {len(summary.public_ot_pairs)}"
+            )
         if getattr(summary, "suricata_metadata", None):
             score += 1
             reasons.append("Suricata corroboration present")
 
         if score >= 8:
-            return "YES - high-confidence attack activity is present.", "High", reasons, score
+            return (
+                "YES - high-confidence attack activity is present.",
+                "High",
+                reasons,
+                score,
+            )
         if score >= 5:
-            return "LIKELY - suspicious attack activity is present.", "Medium", reasons, score
+            return (
+                "LIKELY - suspicious attack activity is present.",
+                "Medium",
+                reasons,
+                score,
+            )
         if score >= 3:
-            return "POSSIBLE - moderate threat indicators are present.", "Low", reasons, score
+            return (
+                "POSSIBLE - moderate threat indicators are present.",
+                "Low",
+                reasons,
+                score,
+            )
         if filtered:
-            return "LOW SIGNAL - weak threat indicators are present but not strongly corroborated.", "Low", reasons, score
-        return "NO STRONG SIGNAL - no high-confidence threat pattern after filtering.", "Low", reasons if reasons else ["Low-confidence/noisy detections were suppressed"], score
+            return (
+                "LOW SIGNAL - weak threat indicators are present but not strongly corroborated.",
+                "Low",
+                reasons,
+                score,
+            )
+        return (
+            "NO STRONG SIGNAL - no high-confidence threat pattern after filtering.",
+            "Low",
+            reasons if reasons else ["Low-confidence/noisy detections were suppressed"],
+            score,
+        )
+
+    def _rollup_likelihood(item: dict[str, object]) -> int:
+        sev = _severity_level(item.get("severity", "info"))
+        score = {"critical": 90, "high": 72, "warning": 48, "info": 12}.get(sev, 0)
+        score += min(20, int(item.get("count", 0) or 0) * 3)
+        score += min(16, int(item.get("strength", 0) or 0) // 2)
+        conf_rank = int(item.get("confidence_rank", 3) or 3)
+        score += {0: 14, 1: 8, 2: 3, 3: 0}.get(conf_rank, 0)
+        if bool(item.get("priority", False)):
+            score += 12
+        if bool(item.get("noisy", False)):
+            score -= 14
+        src_counter = item.get("src_counts")
+        dst_counter = item.get("dst_counts")
+        if isinstance(src_counter, Counter) and src_counter:
+            score += 3
+        if isinstance(dst_counter, Counter) and dst_counter:
+            score += 3
+        evidence_values = item.get("evidence", [])
+        if isinstance(evidence_values, list):
+            score += min(6, len(evidence_values) * 2)
+        return score
+
+    def _build_rollups(
+        values: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], Counter[str], Counter[str]]:
+        rollups: dict[tuple[str, str, str], dict[str, object]] = {}
+        overall_sources: Counter[str] = Counter()
+        overall_destinations: Counter[str] = Counter()
+        for item in values:
+            severity = str(item.get("_severity", "info"))
+            source = str(item.get("source", "Threats"))
+            summary_text = str(item.get("summary", "")).strip() or "Detection"
+            key = (severity, source, summary_text)
+            bucket = rollups.get(key)
+            if bucket is None:
+                bucket = {
+                    "severity": severity,
+                    "source": source,
+                    "summary": summary_text,
+                    "count": 0,
+                    "strength": 0,
+                    "details": "",
+                    "src_counts": Counter(),
+                    "dst_counts": Counter(),
+                    "evidence": [],
+                    "confidence_rank": 3,
+                    "priority": _is_priority_summary(summary_text),
+                    "noisy": _is_noisy_summary(summary_text),
+                }
+                rollups[key] = bucket
+
+            bucket["count"] = int(bucket["count"]) + 1
+            bucket["strength"] = max(
+                int(bucket["strength"]), int(item.get("_strength", 0) or 0)
+            )
+            bucket["confidence_rank"] = min(
+                int(bucket["confidence_rank"]),
+                _confidence_rank(item.get("_confidence", item.get("confidence", "-"))),
+            )
+            details = str(item.get("details", "")).strip()
+            if details and not str(bucket["details"]).strip():
+                bucket["details"] = details
+
+            for key_name, target_counter in (
+                ("top_sources", bucket["src_counts"]),
+                ("top_clients", bucket["src_counts"]),
+                ("top_destinations", bucket["dst_counts"]),
+                ("top_servers", bucket["dst_counts"]),
+            ):
+                pair_values = item.get(key_name)
+                if not isinstance(pair_values, list):
+                    continue
+                for pair in pair_values[: _limit_value(8)]:
+                    if not isinstance(pair, tuple) or len(pair) < 2:
+                        continue
+                    label_text = str(pair[0]).strip()
+                    if not label_text:
+                        continue
+                    try:
+                        pair_count = int(pair[1])
+                    except Exception:
+                        continue
+                    target_counter[label_text] += pair_count
+                    if key_name in {"top_sources", "top_clients"}:
+                        overall_sources[label_text] += pair_count
+                    else:
+                        overall_destinations[label_text] += pair_count
+
+            bucket_evidence = bucket["evidence"]
+            evidence_value = item.get("evidence")
+            candidates: list[str] = []
+            if isinstance(evidence_value, list):
+                candidates.extend(str(entry) for entry in evidence_value)
+            elif isinstance(evidence_value, str) and evidence_value.strip():
+                candidates.append(evidence_value)
+            for entry in candidates:
+                cleaned = str(entry).strip()
+                if not cleaned or cleaned in bucket_evidence:
+                    continue
+                bucket_evidence.append(cleaned)
+                if len(bucket_evidence) >= 10:
+                    break
+
+        ranked_rollups = list(rollups.values())
+        for item in ranked_rollups:
+            conf_rank = int(item.get("confidence_rank", 3) or 3)
+            item["confidence"] = {0: "high", 1: "medium", 2: "low"}.get(conf_rank, "-")
+            item["likelihood"] = _rollup_likelihood(item)
+        ranked_rollups.sort(
+            key=lambda item: (
+                _severity_rank(item.get("severity", "info")),
+                -int(item.get("likelihood", 0) or 0),
+                -int(item.get("count", 0) or 0),
+                str(item.get("source", "")),
+                str(item.get("summary", "")),
+            )
+        )
+        return ranked_rollups, overall_sources, overall_destinations
+
+    def _select_concise_rollups(
+        values: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        concise: list[dict[str, object]] = []
+        for item in values:
+            sev = _severity_level(item.get("severity", "info"))
+            likelihood = int(item.get("likelihood", 0) or 0)
+            priority = bool(item.get("priority", False))
+            noisy = bool(item.get("noisy", False))
+            if sev in {"critical", "high"}:
+                if noisy and not priority and likelihood < 72:
+                    continue
+                concise.append(item)
+                continue
+            if sev != "warning":
+                continue
+            if likelihood < 68 and not (priority and likelihood >= 58):
+                continue
+            if noisy and not priority:
+                continue
+            concise.append(item)
+        if concise:
+            return concise[:6]
+        return values[:3]
 
     if summary.errors:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Errors"))
-        for err in summary.errors[:_limit_value(8)]:
+        for err in summary.errors[: _limit_value(8)]:
             lines.append(danger(f"- {err}"))
 
     verdict, confidence, verdict_reasons, verdict_score = _threats_verdict()
@@ -9863,21 +12635,37 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
     lines.append(header("Analyst Verdict"))
     if verdict.startswith("YES"):
         lines.append(danger(verdict))
-    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE") or verdict.startswith("LOW SIGNAL"):
+    elif (
+        verdict.startswith("LIKELY")
+        or verdict.startswith("POSSIBLE")
+        or verdict.startswith("LOW SIGNAL")
+    ):
         lines.append(warn(verdict))
     else:
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     if verdict_reasons:
         lines.append(muted("Why:"))
-        for reason in verdict_reasons[:_limit_value(6)]:
+        for reason in verdict_reasons[: _limit_value(6)]:
             lines.append(muted(f"- {_redact_in_text(reason)}"))
+
+    ranked_rollups, overall_sources, overall_destinations = _build_rollups(filtered)
+    shown_rollups = (
+        ranked_rollups if verbose else _select_concise_rollups(ranked_rollups)
+    )
+    suppressed_rollups: list[dict[str, object]] = []
+    if suppressed:
+        suppressed_rollups, _, _ = _build_rollups(suppressed)
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Snapshot"))
     lines.append(_format_kv("Threat Detections (raw)", str(len(raw_detections))))
     lines.append(_format_kv("Threat Detections (kept)", str(len(filtered))))
-    lines.append(_format_kv("Suppressed as low-confidence/noisy", str(suppressed_count)))
+    if verbose:
+        lines.append(
+            _format_kv("Suppressed as low-confidence/noisy", str(len(suppressed)))
+        )
+    lines.append(_format_kv("Likely Categories Shown", str(len(shown_rollups))))
     if summary.total_packets:
         lines.append(_format_kv("Packets", str(summary.total_packets)))
     if summary.first_seen is not None or summary.last_seen is not None:
@@ -9886,100 +12674,78 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
     if summary.duration is not None:
         lines.append(_format_kv("Duration", f"{summary.duration:.1f}s"))
 
+    hypotheses = list(getattr(summary, "threat_hypotheses", []) or [])
+    if hypotheses:
+
+        def _hyp_evidence(value: object) -> int:
+            try:
+                return int(str(value).strip())
+            except Exception:
+                return 0
+
+        hypotheses = [
+            item
+            for item in hypotheses
+            if isinstance(item, dict) and str(item.get("hypothesis", "")).strip()
+        ]
+        hypotheses.sort(
+            key=lambda item: (
+                _confidence_rank(item.get("confidence", "-")),
+                -_hyp_evidence(item.get("evidence", 0)),
+                str(item.get("hypothesis", "")),
+            )
+        )
+        if hypotheses:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Most Likely Scenarios"))
+            for item in hypotheses[: _limit_value(6 if verbose else 2)]:
+                conf = _confidence_level(item.get("confidence", "-"))
+                ev_count = _hyp_evidence(item.get("evidence", 0))
+                if conf == "high":
+                    marker = danger("[HIGH]")
+                elif conf == "medium":
+                    marker = warn("[MED]")
+                else:
+                    marker = muted("[LOW]")
+                suffix = f"(confidence={conf}, signals={ev_count})"
+                lines.append(
+                    f"{marker} {_redact_in_text(str(item.get('hypothesis', '-')))} {muted(suffix)}"
+                )
+
     if not filtered:
         lines.append(SUBSECTION_BAR)
         lines.append(ok("No notable high-confidence threats after noise suppression."))
-        if suppressed_count:
-            lines.append(muted("Use `-v` to inspect suppressed low-confidence detections for hunt context."))
+        if len(suppressed):
+            lines.append(
+                muted(
+                    "Use `-v` to inspect suppressed low-confidence detections for hunt context."
+                )
+            )
         lines.append(SECTION_BAR)
         return _finalize_output(lines, show_truncation_note=False)
 
-    rollups: dict[tuple[str, str, str], dict[str, object]] = {}
-    overall_sources: Counter[str] = Counter()
-    overall_destinations: Counter[str] = Counter()
-
-    for item in filtered:
-        severity = str(item.get("_severity", "info"))
-        source = str(item.get("source", "Threats"))
-        summary_text = str(item.get("summary", "")).strip() or "Detection"
-        key = (severity, source, summary_text)
-        bucket = rollups.get(key)
-        if bucket is None:
-            bucket = {
-                "severity": severity,
-                "source": source,
-                "summary": summary_text,
-                "count": 0,
-                "strength": 0,
-                "details": "",
-                "src_counts": Counter(),
-                "dst_counts": Counter(),
-                "evidence": [],
-            }
-            rollups[key] = bucket
-
-        bucket["count"] = int(bucket["count"]) + 1
-        bucket["strength"] = max(int(bucket["strength"]), int(item.get("_strength", 0)))
-        details = str(item.get("details", "")).strip()
-        if details and not str(bucket["details"]).strip():
-            bucket["details"] = details
-
-        for key_name, target_counter in (
-            ("top_sources", bucket["src_counts"]),
-            ("top_clients", bucket["src_counts"]),
-            ("top_destinations", bucket["dst_counts"]),
-            ("top_servers", bucket["dst_counts"]),
-        ):
-            values = item.get(key_name)
-            if not isinstance(values, list):
-                continue
-            for pair in values[:_limit_value(8)]:
-                if not isinstance(pair, tuple) or len(pair) < 2:
-                    continue
-                label_text = str(pair[0])
-                try:
-                    pair_count = int(pair[1])
-                except Exception:
-                    continue
-                target_counter[label_text] += pair_count
-                if key_name in {"top_sources", "top_clients"}:
-                    overall_sources[label_text] += pair_count
-                else:
-                    overall_destinations[label_text] += pair_count
-
-        bucket_evidence = bucket["evidence"]
-        evidence_value = item.get("evidence")
-        candidates: list[str] = []
-        if isinstance(evidence_value, list):
-            candidates.extend(str(entry) for entry in evidence_value)
-        elif isinstance(evidence_value, str) and evidence_value.strip():
-            candidates.append(evidence_value)
-        for entry in candidates:
-            cleaned = str(entry).strip()
-            if not cleaned:
-                continue
-            if cleaned in bucket_evidence:
-                continue
-            bucket_evidence.append(cleaned)
-            if len(bucket_evidence) >= 8:
-                break
-
-    ranked_rollups = sorted(
-        rollups.values(),
-        key=lambda item: (
-            _severity_rank(item.get("severity", "info")),
-            -int(item.get("count", 0) or 0),
-            -int(item.get("strength", 0) or 0),
-            str(item.get("source", "")),
-            str(item.get("summary", "")),
-        ),
-    )
-
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Detection Summary (Ranked)"))
-    rows = [["Sev", "Source", "Detection", "Hits", "Top Source", "Top Destination"]]
-    max_rows = _limit_value(24 if verbose else 12)
-    shown_rollups = ranked_rollups[:max_rows]
+    lines.append(
+        header("Detection Summary (Ranked)" if verbose else "Most Likely Detections")
+    )
+    if verbose:
+        rows = [
+            [
+                "Sev",
+                "Source",
+                "Detection",
+                "Hits",
+                "Confidence",
+                "Likely",
+                "Top Source",
+                "Top Destination",
+            ]
+        ]
+        max_rows = _limit_value(20)
+    else:
+        rows = [["Sev", "Detection", "Hits", "Confidence", "Top Source", "Top Target"]]
+        max_rows = _limit_value(6)
+    shown_rollups = shown_rollups[:max_rows]
     for item in shown_rollups:
         sev_text = str(item.get("severity", "info")).upper()[:4]
         src_counter = item.get("src_counts", Counter())
@@ -9988,39 +12754,78 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
         top_dst = "-"
         if isinstance(src_counter, Counter) and src_counter:
             src_ip, src_count = src_counter.most_common(1)[0]
-            top_src = f"{_highlight_public_ips(str(src_ip))}({int(src_count)})"
+            top_src = f"{_highlight_public_ips_local(str(src_ip))}({int(src_count)})"
         if isinstance(dst_counter, Counter) and dst_counter:
             dst_ip, dst_count = dst_counter.most_common(1)[0]
-            top_dst = f"{_highlight_public_ips(str(dst_ip))}({int(dst_count)})"
-        rows.append([
-            sev_text,
-            str(item.get("source", "-")),
-            _highlight_public_ips(_redact_in_text(str(item.get("summary", "-")))),
-            str(int(item.get("count", 0) or 0)),
-            top_src,
-            top_dst,
-        ])
+            top_dst = f"{_highlight_public_ips_local(str(dst_ip))}({int(dst_count)})"
+        confidence_text = str(item.get("confidence", "-")).upper()
+        if verbose:
+            rows.append(
+                [
+                    sev_text,
+                    str(item.get("source", "-")),
+                    _highlight_public_ips_local(
+                        _redact_in_text(str(item.get("summary", "-")))
+                    ),
+                    str(int(item.get("count", 0) or 0)),
+                    confidence_text,
+                    str(int(item.get("likelihood", 0) or 0)),
+                    top_src,
+                    top_dst,
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    sev_text,
+                    _highlight_public_ips_local(
+                        _redact_in_text(str(item.get("summary", "-")))
+                    ),
+                    str(int(item.get("count", 0) or 0)),
+                    confidence_text,
+                    top_src,
+                    top_dst,
+                ]
+            )
     lines.append(_format_table(rows))
 
     hidden_rollups = max(0, len(ranked_rollups) - len(shown_rollups))
-    if hidden_rollups:
-        lines.append(muted(f"{hidden_rollups} additional rolled-up detection category(s) hidden for readability."))
+    if hidden_rollups and not verbose:
+        lines.append(
+            muted(
+                f"{hidden_rollups} additional high-signal category(s) hidden. Use `-v` for full ranked output."
+            )
+        )
+    if len(suppressed_rollups) and not verbose:
+        lines.append(
+            muted(
+                f"{len(suppressed_rollups)} low-signal/noisy category(s) hidden. Use `-v` to inspect."
+            )
+        )
 
-    if overall_sources or overall_destinations:
+    if (overall_sources or overall_destinations) and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Actors"))
         if overall_sources:
             lines.append(muted("Likely Sources:"))
-            for ip_value, count in overall_sources.most_common(_limit_value(8 if verbose else 6)):
-                lines.append(muted(f"- {_highlight_public_ips(str(ip_value))}: {int(count)}"))
+            for ip_value, count in overall_sources.most_common(_limit_value(8)):
+                lines.append(
+                    muted(
+                        f"- {_highlight_public_ips_local(str(ip_value))}: {int(count)}"
+                    )
+                )
         if overall_destinations:
             lines.append(muted("Likely Targets:"))
-            for ip_value, count in overall_destinations.most_common(_limit_value(8 if verbose else 6)):
-                lines.append(muted(f"- {_highlight_public_ips(str(ip_value))}: {int(count)}"))
+            for ip_value, count in overall_destinations.most_common(_limit_value(8)):
+                lines.append(
+                    muted(
+                        f"- {_highlight_public_ips_local(str(ip_value))}: {int(count)}"
+                    )
+                )
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Priority Evidence"))
-    evidence_limit = _limit_value(12 if verbose else 6)
+    lines.append(header("Priority Evidence" if verbose else "Key Evidence"))
+    evidence_limit = _limit_value(12 if verbose else 4)
     for item in shown_rollups[:evidence_limit]:
         sev = str(item.get("severity", "info")).lower()
         if sev == "critical":
@@ -10031,45 +12836,67 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
             marker = warn("[WARN]")
         source_text = str(item.get("source", "Threats"))
         hit_count = int(item.get("count", 0) or 0)
-        context_text = muted(f"({source_text}, hits={hit_count})")
+        likelihood = int(item.get("likelihood", 0) or 0)
+        confidence_text = str(item.get("confidence", "-")).upper()
+        context_text = muted(
+            f"({source_text}, hits={hit_count}, conf={confidence_text}, likely={likelihood})"
+        )
         lines.append(
-            f"{marker} {_highlight_public_ips(_redact_in_text(str(item.get('summary', '-'))))} "
-            f"{context_text}"
+            f"{marker} {_highlight_public_ips_local(_redact_in_text(str(item.get('summary', '-'))))} {context_text}"
         )
         detail_text = str(item.get("details", "")).strip()
-        if detail_text:
-            lines.append(muted(f"  {_highlight_public_ips(_redact_in_text(_truncate_text(detail_text, 180)))}"))
+        show_detail = bool(detail_text) and (verbose or sev in {"critical", "high"})
+        if show_detail:
+            lines.append(
+                muted(
+                    f"  {_highlight_public_ips_local(_redact_in_text(_truncate_text(detail_text, 180)))}"
+                )
+            )
         evidence_values = item.get("evidence", [])
         if isinstance(evidence_values, list) and evidence_values:
-            for entry in evidence_values[:_limit_value(4 if verbose else 1)]:
-                lines.append(muted(f"    - {_highlight_public_ips(_redact_in_text(str(entry)))}"))
+            for entry in evidence_values[: _limit_value(4 if verbose else 1)]:
+                lines.append(
+                    muted(
+                        f"    - {_highlight_public_ips_local(_redact_in_text(str(entry)))}"
+                    )
+                )
 
     if summary.ot_protocol_counts or summary.public_ot_pairs or summary.ot_risk_score:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("OT Context"))
-        if summary.ot_protocol_counts:
+        lines.append(header("OT Context" if verbose else "OT Risk Signal"))
+        if verbose and summary.ot_protocol_counts:
             proto_text = ", ".join(
                 f"{name} ({count})"
-                for name, count in sorted(summary.ot_protocol_counts.items(), key=lambda pair: (-int(pair[1]), str(pair[0])))[:_limit_value(8)]
+                for name, count in sorted(
+                    summary.ot_protocol_counts.items(),
+                    key=lambda pair: (-int(pair[1]), str(pair[0])),
+                )[: _limit_value(8)]
             )
             lines.append(_format_kv("OT Protocols", proto_text))
         if summary.public_ot_pairs:
-            lines.append(_format_kv("Public OT Flows", str(len(summary.public_ot_pairs))))
+            lines.append(
+                _format_kv("Public OT Flows", str(len(summary.public_ot_pairs)))
+            )
         if summary.ot_risk_score:
             posture = "LOW"
             if summary.ot_risk_score >= 60:
                 posture = "HIGH"
             elif summary.ot_risk_score >= 25:
                 posture = "MEDIUM"
-            lines.append(_format_kv("OT Risk Posture", f"{summary.ot_risk_score}/100 ({posture})"))
-            if summary.ot_risk_findings:
-                for finding in summary.ot_risk_findings[:_limit_value(6 if verbose else 3)]:
-                    lines.append(muted(f"- {_redact_in_text(str(finding))}"))
+            lines.append(
+                _format_kv(
+                    "OT Risk Posture", f"{summary.ot_risk_score}/100 ({posture})"
+                )
+            )
+        if summary.ot_risk_findings:
+            ot_findings = summary.ot_risk_findings[: _limit_value(6 if verbose else 1)]
+            for finding in ot_findings:
+                lines.append(muted(f"- {_redact_in_text(str(finding))}"))
 
-    if summary.storyline:
+    if summary.storyline and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Attack Storyline"))
-        for story_line in summary.storyline[:_limit_value(8 if verbose else 4)]:
+        for story_line in summary.storyline[: _limit_value(8)]:
             lines.append(muted(f"- {_redact_in_text(str(story_line))}"))
 
     suricata_mode = bool(getattr(summary, "suricata_metadata", None)) or any(
@@ -10080,8 +12907,8 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
         suricata_event_counts = getattr(summary, "suricata_event_counts", {}) or {}
         suricata_pivots = getattr(summary, "suricata_pivots", {}) or {}
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Suricata Snapshot"))
-        if suricata_metadata:
+        lines.append(header("Suricata Snapshot" if verbose else "IDS Corroboration"))
+        if verbose and suricata_metadata:
             for key, label_text in (
                 ("engine", "Engine"),
                 ("version", "Version"),
@@ -10097,7 +12924,7 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
             top_events = sorted(
                 suricata_event_counts.items(),
                 key=lambda pair: (-int(pair[1]), str(pair[0])),
-            )[:_limit_value(8 if verbose else 4)]
+            )[: _limit_value(8 if verbose else 4)]
             event_text = ", ".join(f"{name}({count})" for name, count in top_events)
             if event_text:
                 lines.append(_format_kv("Top Event Types", event_text))
@@ -10105,22 +12932,43 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
             top_signatures = suricata_pivots.get("top_signatures", []) or []
             if top_signatures:
                 lines.append(muted("Top Signatures:"))
-                for signature, count in top_signatures[:_limit_value(10 if verbose else 5)]:
-                    lines.append(muted(f"- {_redact_in_text(str(signature))}: {int(count)}"))
+                for signature, count in top_signatures[
+                    : _limit_value(10 if verbose else 3)
+                ]:
+                    lines.append(
+                        muted(f"- {_redact_in_text(str(signature))}: {int(count)}")
+                    )
+
+    if verbose and suppressed_rollups:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Suppressed / Low-Signal Context"))
+        rows = [["Sev", "Source", "Detection", "Hits", "Likely"]]
+        for item in suppressed_rollups[: _limit_value(12)]:
+            rows.append(
+                [
+                    str(item.get("severity", "info")).upper()[:4],
+                    str(item.get("source", "-")),
+                    _highlight_public_ips_local(
+                        _redact_in_text(str(item.get("summary", "-")))
+                    ),
+                    str(int(item.get("count", 0) or 0)),
+                    str(int(item.get("likelihood", 0) or 0)),
+                ]
+            )
+        lines.append(_format_table(rows))
+
+    if not verbose:
+        lines.append(
+            muted(
+                "Use `-v` for full threat inventory, low-signal context, actor pivots, OT storyline, and Suricata diagnostics."
+            )
+        )
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
-    # MITRE is an analyst-first report: always render full detail regardless of -v.
-    verbose = True
-    def _limit_value(_value: int) -> int:
-        return _FULL_OUTPUT_LIMIT
-
-    def _truncate_text(text: str, max_len: int = 0) -> str:
-        return str(text)
-
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"MITRE ATT&CK MAPPING :: {summary.path.name}"))
@@ -10128,9 +12976,17 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("ATT&CK Corpus"))
-    lines.append(_format_kv("Enterprise Corpus", str(getattr(summary, "attack_enterprise_version", "-"))))
-    lines.append(_format_kv("ICS Corpus", str(getattr(summary, "attack_ics_version", "-"))))
-    lines.append(_format_kv("Mapping Pack", str(getattr(summary, "mapping_pack_version", "-"))))
+    lines.append(
+        _format_kv(
+            "Enterprise Corpus", str(getattr(summary, "attack_enterprise_version", "-"))
+        )
+    )
+    lines.append(
+        _format_kv("ICS Corpus", str(getattr(summary, "attack_ics_version", "-")))
+    )
+    lines.append(
+        _format_kv("Mapping Pack", str(getattr(summary, "mapping_pack_version", "-")))
+    )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Executive Assessment"))
@@ -10143,7 +12999,7 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
     else:
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", confidence))
-    for reason in (getattr(summary, "executive_reasons", []) or [])[:_limit_value(8)]:
+    for reason in (getattr(summary, "executive_reasons", []) or [])[: _limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(str(reason))}"))
 
     checks = getattr(summary, "checks", {}) or {}
@@ -10161,14 +13017,28 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
         evidence_items = [str(v) for v in (evidence or []) if str(v).strip()]
         lines.append(label(label_text))
         if evidence_items:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for item in evidence_items[:_limit_value(8 if verbose else 5)]:
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
+            for item in evidence_items[: _limit_value(8 if verbose else 5)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-            risk = "High" if key in {"cross_signal_corroboration", "ics_process_impact"} else "Medium"
+            risk = (
+                "High"
+                if key in {"cross_signal_corroboration", "ics_process_impact"}
+                else "Medium"
+            )
             conf_level = "High" if len(evidence_items) >= 2 else "Medium"
-            matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+            matrix_rows.append(
+                [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
+            )
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching evidence"])
 
     lines.append(SUBSECTION_BAR)
@@ -10178,7 +13048,7 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
     if summary.errors:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Errors"))
-        for err in summary.errors[:_limit_value(10)]:
+        for err in summary.errors[: _limit_value(10)]:
             lines.append(danger(f"- {err}"))
 
     lines.append(SUBSECTION_BAR)
@@ -10186,7 +13056,9 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
     lines.append(_format_kv("Total Detections", str(summary.total_detections)))
     lines.append(_format_kv("Mapped to ATT&CK", str(summary.mapped_detections)))
     if summary.total_detections > 0:
-        ratio = (float(summary.mapped_detections) / float(summary.total_detections)) * 100.0
+        ratio = (
+            float(summary.mapped_detections) / float(summary.total_detections)
+        ) * 100.0
         lines.append(_format_kv("Mapping Ratio", f"{ratio:.1f}%"))
     if summary.first_seen is not None:
         lines.append(_format_kv("First Seen", format_ts(summary.first_seen)))
@@ -10194,29 +13066,56 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
         lines.append(_format_kv("Last Seen", format_ts(summary.last_seen)))
     if summary.duration_seconds is not None:
         lines.append(_format_kv("Duration", f"{summary.duration_seconds:.1f}s"))
-    lines.append(_format_kv("Framework Split", _format_counter(summary.framework_counts, 4)))
-    lines.append(_format_kv("Top Tactics", _format_counter(summary.tactic_counts, 8, key_max=56)))
-    lines.append(_format_kv("Top Techniques", _format_counter(summary.technique_counts, 10, key_max=64)))
-    lines.append(_format_kv("Top Procedures", _format_counter(summary.procedure_counts, 8, key_max=70)))
+    lines.append(
+        _format_kv("Framework Split", _format_counter(summary.framework_counts, 4))
+    )
+    lines.append(
+        _format_kv("Top Tactics", _format_counter(summary.tactic_counts, 8, key_max=56))
+    )
+    lines.append(
+        _format_kv(
+            "Top Techniques", _format_counter(summary.technique_counts, 10, key_max=64)
+        )
+    )
+    lines.append(
+        _format_kv(
+            "Top Procedures", _format_counter(summary.procedure_counts, 8, key_max=70)
+        )
+    )
 
     technique_heat = list(getattr(summary, "technique_heat", []) or [])
     if technique_heat:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Technique Heat Table"))
-        rows = [["Framework", "Tactic", "Technique", "Count", "Hosts", "Sources", "Evidence", "Confidence", "First", "Last"]]
-        for item in technique_heat[:_limit_value(30 if verbose else 14)]:
-            rows.append([
-                str(item.get("framework", "-")),
-                str(item.get("tactic", "-")),
-                f"{item.get('technique', '-')} ({item.get('technique_id', '-')})",
-                str(item.get("count", "-")),
-                str(item.get("host_count", "-")),
-                str(item.get("source_count", "-")),
-                str(item.get("evidence_count", "-")),
-                str(item.get("confidence", "-")),
-                format_ts(item.get("first_seen")),
-                format_ts(item.get("last_seen")),
-            ])
+        rows = [
+            [
+                "Framework",
+                "Tactic",
+                "Technique",
+                "Count",
+                "Hosts",
+                "Sources",
+                "Evidence",
+                "Confidence",
+                "First",
+                "Last",
+            ]
+        ]
+        for item in technique_heat[: _limit_value(30 if verbose else 14)]:
+            rows.append(
+                [
+                    str(item.get("framework", "-")),
+                    str(item.get("tactic", "-")),
+                    f"{item.get('technique', '-')} ({item.get('technique_id', '-')})",
+                    str(item.get("count", "-")),
+                    str(item.get("host_count", "-")),
+                    str(item.get("source_count", "-")),
+                    str(item.get("evidence_count", "-")),
+                    str(item.get("confidence", "-")),
+                    format_ts(item.get("first_seen")),
+                    format_ts(item.get("last_seen")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     host_paths = getattr(summary, "host_attack_paths", {}) or {}
@@ -10225,22 +13124,30 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Host-Centric ATT&CK Chains"))
         rows = [["Host", "Role(s)", "Chain Length", "Chain Preview"]]
-        for host, chain in list(host_paths.items())[:_limit_value(24 if verbose else 10)]:
-            role_text = ",".join(host_roles.get(host, [])[:4]) if isinstance(host_roles, dict) else "-"
+        for host, chain in list(host_paths.items())[
+            : _limit_value(24 if verbose else 10)
+        ]:
+            role_text = (
+                ",".join(host_roles.get(host, [])[:4])
+                if isinstance(host_roles, dict)
+                else "-"
+            )
             preview = " -> ".join(chain[:3]) if chain else "-"
-            rows.append([
-                str(host),
-                role_text or "-",
-                str(len(chain)),
-                _truncate_text(preview, 120),
-            ])
+            rows.append(
+                [
+                    str(host),
+                    role_text or "-",
+                    str(len(chain)),
+                    _truncate_text(preview, 120),
+                ]
+            )
         lines.append(_format_table(rows))
 
     sequence_issues = list(getattr(summary, "sequence_issues", []) or [])
     if sequence_issues:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Sequence Plausibility Warnings"))
-        for item in sequence_issues[:_limit_value(10 if verbose else 6)]:
+        for item in sequence_issues[: _limit_value(10 if verbose else 6)]:
             lines.append(warn(f"- {_redact_in_text(str(item))}"))
 
     lines.append(SUBSECTION_BAR)
@@ -10248,7 +13155,7 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
     if summary.attack_path:
         unique_nodes: list[str] = []
         seen_nodes: set[str] = set()
-        for edge in summary.attack_path[:_limit_value(40 if verbose else 20)]:
+        for edge in summary.attack_path[: _limit_value(40 if verbose else 20)]:
             lines.append(f"  {muted('->')} {edge}")
             for node in [part.strip() for part in edge.split("->") if part.strip()]:
                 if node not in seen_nodes:
@@ -10256,19 +13163,38 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
                     unique_nodes.append(node)
         if unique_nodes:
             lines.append(muted("Path Nodes:"))
-            for idx, node in enumerate(unique_nodes[:_limit_value(18 if verbose else 10)], start=1):
+            for idx, node in enumerate(
+                unique_nodes[: _limit_value(18 if verbose else 10)], start=1
+            ):
                 lines.append(muted(f"  {idx:02d}. {node}"))
     else:
-        lines.append(muted("No attack chain could be inferred from current detections."))
+        lines.append(
+            muted("No attack chain could be inferred from current detections.")
+        )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Evidence and Artifacts/IOC"))
-    lines.append(_format_kv("IOC Highlights", _format_counter(summary.ioc_counts, 12, key_max=56)))
-    lines.append(_format_kv("Artifact Highlights", _format_counter(summary.artifact_counts, 12, key_max=56)))
+    lines.append(
+        _format_kv(
+            "IOC Highlights", _format_counter(summary.ioc_counts, 12, key_max=56)
+        )
+    )
+    lines.append(
+        _format_kv(
+            "Artifact Highlights",
+            _format_counter(summary.artifact_counts, 12, key_max=56),
+        )
+    )
     total_evidence_items = sum(len(hit.evidence) for hit in summary.hits)
-    total_packet_refs = sum(len(list(getattr(hit, "packet_refs", []) or [])) for hit in summary.hits)
-    total_flow_refs = sum(len(list(getattr(hit, "flow_refs", []) or [])) for hit in summary.hits)
-    total_host_refs = sum(len(list(getattr(hit, "host_refs", []) or [])) for hit in summary.hits)
+    total_packet_refs = sum(
+        len(list(getattr(hit, "packet_refs", []) or [])) for hit in summary.hits
+    )
+    total_flow_refs = sum(
+        len(list(getattr(hit, "flow_refs", []) or [])) for hit in summary.hits
+    )
+    total_host_refs = sum(
+        len(list(getattr(hit, "host_refs", []) or [])) for hit in summary.hits
+    )
     lines.append(_format_kv("Evidence Entries", str(total_evidence_items)))
     lines.append(_format_kv("Packet References", str(total_packet_refs)))
     lines.append(_format_kv("Flow References", str(total_flow_refs)))
@@ -10277,18 +13203,31 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
     if summary.hits:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Evidence Deep Dive"))
-        rows = [["Technique", "Source", "Severity", "Confidence", "Evidence", "Packets", "Flows", "Hosts"]]
-        for hit in summary.hits[:_limit_value(200)]:
-            rows.append([
-                f"{hit.technique} ({hit.technique_id})",
-                str(hit.source),
-                str(hit.severity),
-                str(hit.confidence),
-                str(len(hit.evidence)),
-                str(len(list(getattr(hit, "packet_refs", []) or []))),
-                str(len(list(getattr(hit, "flow_refs", []) or []))),
-                str(len(list(getattr(hit, "host_refs", []) or []))),
-            ])
+        rows = [
+            [
+                "Technique",
+                "Source",
+                "Severity",
+                "Confidence",
+                "Evidence",
+                "Packets",
+                "Flows",
+                "Hosts",
+            ]
+        ]
+        for hit in summary.hits[: _limit_value(200)]:
+            rows.append(
+                [
+                    f"{hit.technique} ({hit.technique_id})",
+                    str(hit.source),
+                    str(hit.severity),
+                    str(hit.confidence),
+                    str(len(hit.evidence)),
+                    str(len(list(getattr(hit, "packet_refs", []) or []))),
+                    str(len(list(getattr(hit, "flow_refs", []) or []))),
+                    str(len(list(getattr(hit, "host_refs", []) or []))),
+                ]
+            )
         lines.append(_format_table(rows))
 
     pivots = list(getattr(summary, "investigation_pivots", []) or [])
@@ -10296,28 +13235,46 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Investigation Pivots"))
         rows = [["Technique", "Source", "Hosts", "Flows", "Packets", "IOC/Artifact"]]
-        for item in pivots[:_limit_value(18 if verbose else 8)]:
+        for item in pivots[: _limit_value(18 if verbose else 8)]:
             hosts = item.get("hosts", [])
             flows = item.get("flows", [])
             packets = item.get("packets", [])
             iocs = item.get("iocs", [])
             artifacts = item.get("artifacts", [])
-            ioc_art = ", ".join([str(v) for v in (iocs[:2] if isinstance(iocs, list) else [])] + [str(v) for v in (artifacts[:2] if isinstance(artifacts, list) else [])])
-            rows.append([
-                f"{item.get('technique_id', '-')} {item.get('tactic', '-')}",
-                str(item.get("source", "-")),
-                ",".join(str(v) for v in (hosts[:3] if isinstance(hosts, list) else [])) or "-",
-                ",".join(str(v) for v in (flows[:2] if isinstance(flows, list) else [])) or "-",
-                ",".join(str(v) for v in (packets[:4] if isinstance(packets, list) else [])) or "-",
-                _truncate_text(ioc_art or "-", 120),
-            ])
+            ioc_art = ", ".join(
+                [str(v) for v in (iocs[:2] if isinstance(iocs, list) else [])]
+                + [
+                    str(v)
+                    for v in (artifacts[:2] if isinstance(artifacts, list) else [])
+                ]
+            )
+            rows.append(
+                [
+                    f"{item.get('technique_id', '-')} {item.get('tactic', '-')}",
+                    str(item.get("source", "-")),
+                    ",".join(
+                        str(v) for v in (hosts[:3] if isinstance(hosts, list) else [])
+                    )
+                    or "-",
+                    ",".join(
+                        str(v) for v in (flows[:2] if isinstance(flows, list) else [])
+                    )
+                    or "-",
+                    ",".join(
+                        str(v)
+                        for v in (packets[:4] if isinstance(packets, list) else [])
+                    )
+                    or "-",
+                    _truncate_text(ioc_art or "-", 120),
+                ]
+            )
         lines.append(_format_table(rows))
 
     alternates = list(getattr(summary, "alternate_explanations", []) or [])
     if alternates:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Alternative Explanations"))
-        for item in alternates[:_limit_value(8)]:
+        for item in alternates[: _limit_value(8)]:
             lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     if summary.hits:
@@ -10331,43 +13288,103 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
             )
             lines.append(label(title))
             lines.append(muted(f"  Procedure: {hit.procedure}"))
-            lines.append(muted(f"  Source/Severity/Confidence: {hit.source} / {hit.severity} / {hit.confidence}"))
+            lines.append(
+                muted(
+                    f"  Source/Severity/Confidence: {hit.source} / {hit.severity} / {hit.confidence}"
+                )
+            )
             lines.append(muted(f"  Occurrence: {hit.occurrence}"))
-            lines.append(muted(f"  First/Last Seen: {format_ts(hit.first_seen)} / {format_ts(hit.last_seen)}"))
-            lines.append(muted(f"  Corroborating Sources: {int(getattr(hit, 'corroborating_sources', 0) or 0)}"))
+            lines.append(
+                muted(
+                    f"  First/Last Seen: {format_ts(hit.first_seen)} / {format_ts(hit.last_seen)}"
+                )
+            )
+            lines.append(
+                muted(
+                    f"  Corroborating Sources: {int(getattr(hit, 'corroborating_sources', 0) or 0)}"
+                )
+            )
             if getattr(hit, "rationale", ""):
-                lines.append(muted(f"  Rationale: {_truncate_text(_redact_in_text(str(hit.rationale)), 260)}"))
+                lines.append(
+                    muted(
+                        f"  Rationale: {_truncate_text(_redact_in_text(str(hit.rationale)), 260)}"
+                    )
+                )
             if getattr(hit, "matched_keywords", None):
-                lines.append(muted(f"  Matched Keywords: {', '.join(list(getattr(hit, 'matched_keywords', []) or [])[:8])}"))
+                lines.append(
+                    muted(
+                        f"  Matched Keywords: {', '.join(list(getattr(hit, 'matched_keywords', []) or [])[:8])}"
+                    )
+                )
             if getattr(hit, "packet_refs", None):
-                lines.append(muted(f"  Packet Refs: {', '.join(list(getattr(hit, 'packet_refs', []) or [])[:8])}"))
+                lines.append(
+                    muted(
+                        f"  Packet Refs: {', '.join(list(getattr(hit, 'packet_refs', []) or [])[:8])}"
+                    )
+                )
             if getattr(hit, "flow_refs", None):
-                lines.append(muted(f"  Flow Refs: {', '.join(list(getattr(hit, 'flow_refs', []) or [])[:4])}"))
+                lines.append(
+                    muted(
+                        f"  Flow Refs: {', '.join(list(getattr(hit, 'flow_refs', []) or [])[:4])}"
+                    )
+                )
             if getattr(hit, "host_refs", None):
-                lines.append(muted(f"  Host Refs: {', '.join(list(getattr(hit, 'host_refs', []) or [])[:8])}"))
+                lines.append(
+                    muted(
+                        f"  Host Refs: {', '.join(list(getattr(hit, 'host_refs', []) or [])[:8])}"
+                    )
+                )
             if getattr(hit, "contradictory_signals", None):
-                lines.append(muted(f"  Contradictions: {', '.join(list(getattr(hit, 'contradictory_signals', []) or []))}"))
+                lines.append(
+                    muted(
+                        f"  Contradictions: {', '.join(list(getattr(hit, 'contradictory_signals', []) or []))}"
+                    )
+                )
             if hit.details:
-                lines.append(muted(f"  Explanation: {_truncate_text(_redact_in_text(hit.details), 240)}"))
+                lines.append(
+                    muted(
+                        f"  Explanation: {_truncate_text(_redact_in_text(hit.details), 240)}"
+                    )
+                )
             if hit.evidence:
                 lines.append(muted("  Evidence:"))
-                for idx, evidence in enumerate(hit.evidence[:_limit_value(200)], start=1):
-                    lines.append(muted(f"    {idx:02d}. {_redact_in_text(str(evidence))}"))
+                for idx, evidence in enumerate(
+                    hit.evidence[: _limit_value(200)], start=1
+                ):
+                    lines.append(
+                        muted(f"    {idx:02d}. {_redact_in_text(str(evidence))}")
+                    )
             if hit.artifacts:
-                lines.append(muted(f"  Artifacts: {', '.join(hit.artifacts[:_limit_value(40)])}"))
+                lines.append(
+                    muted(
+                        f"  Artifacts: {', '.join(hit.artifacts[: _limit_value(40)])}"
+                    )
+                )
             if hit.iocs:
-                lines.append(muted(f"  IOC: {', '.join(hit.iocs[:_limit_value(40)])}"))
+                lines.append(muted(f"  IOC: {', '.join(hit.iocs[: _limit_value(40)])}"))
         hidden = max(0, len(summary.hits) - max_hits)
         if hidden:
-            lines.append(muted(f"{hidden} additional mapped TTP entries suppressed for readability."))
+            lines.append(
+                muted(
+                    f"{hidden} additional mapped TTP entries suppressed for readability."
+                )
+            )
     else:
-        lines.append(muted("No MITRE ATT&CK TTP mappings were derived from this capture."))
+        lines.append(
+            muted("No MITRE ATT&CK TTP mappings were derived from this capture.")
+        )
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
 
 
-def render_files_summary(summary: FileTransferSummary, limit: int | None = None, verbose: bool = False) -> str:
+def render_files_summary(
+    summary: FileTransferSummary, limit: int | None = None, verbose: bool = False
+) -> str:
+    previous_verbose_state = _VERBOSE_OUTPUT
+    forced_verbose_state = bool(verbose and not previous_verbose_state)
+    if forced_verbose_state:
+        set_verbose_output(True)
     limit = _apply_verbose_limit(limit)
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -10409,14 +13426,22 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
             score += min(4, base_weight + min(2, count - 1))
             reasons.append(f"{key.replace('_', ' ')} evidence ({count})")
 
-        high_findings = sum(1 for d in detections if str(d.get("severity", "")).lower() in {"high", "critical"})
-        warn_findings = sum(1 for d in detections if str(d.get("severity", "")).lower() == "warning")
+        high_findings = sum(
+            1
+            for d in detections
+            if str(d.get("severity", "")).lower() in {"high", "critical"}
+        )
+        warn_findings = sum(
+            1 for d in detections if str(d.get("severity", "")).lower() == "warning"
+        )
         if high_findings:
             score += min(3, high_findings)
             reasons.append(f"High-severity file detections observed ({high_findings})")
         if warn_findings >= 2:
             score += 1
-            reasons.append(f"Multiple warning-level file detections observed ({warn_findings})")
+            reasons.append(
+                f"Multiple warning-level file detections observed ({warn_findings})"
+            )
 
         if score >= 8:
             verdict = "YES - high-confidence malicious file activity is present."
@@ -10446,7 +13471,7 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(8)]:
+    for reason in verdict_reasons[: _limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     if summary.artifacts:
@@ -10464,7 +13489,9 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
 
         lines.append(muted("What:"))
         lines.append(muted("- Top transferred filenames"))
-        name_counts = Counter(item.filename for item in summary.artifacts if item.filename)
+        name_counts = Counter(
+            item.filename for item in summary.artifacts if item.filename
+        )
         for name, count in name_counts.most_common(_limit_value(6)):
             lines.append(muted(f"- {_redact_in_text(str(name))}: {int(count)}"))
 
@@ -10473,7 +13500,7 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
         if clusters:
             lines.append(muted("When:"))
             lines.append(muted("- Incident cluster context"))
-            for item in clusters[:_limit_value(4)]:
+            for item in clusters[: _limit_value(4)]:
                 lines.append(
                     muted(
                         f"- {_redact_in_text(str(item.get('cluster', '-')))} src={_highlight_public_ips(str(item.get('src', '-')))} "
@@ -10500,11 +13527,21 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
         evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
         lines.append(label(label_text))
         if evidence_items:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for item in evidence_items[:_limit_value(8)]:
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
+            for item in evidence_items[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
 
-            if key in {"multi_signal_masquerade", "archive_container_abuse", "macro_script_lolbas_staging", "exfiltration_file_movement", "lateral_copy_propagation"}:
+            if key in {
+                "multi_signal_masquerade",
+                "archive_container_abuse",
+                "macro_script_lolbas_staging",
+                "exfiltration_file_movement",
+                "lateral_copy_propagation",
+            }:
                 risk = "High"
                 conf_level = "High"
             elif key in {"auth_file_correlation", "reputation_or_prevalence_outlier"}:
@@ -10513,9 +13550,15 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
             else:
                 risk = "Low"
                 conf_level = "Low"
-            matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+            matrix_rows.append(
+                [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
+            )
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -10530,7 +13573,20 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
         type_extensions = {
             "EXE/DLL": {".exe", ".dll", ".sys", ".scr", ".cpl", ".ocx"},
             "PDF": {".pdf"},
-            "ZIP/Office": {".zip", ".docx", ".xlsx", ".pptx", ".jar", ".apk", ".odt", ".ods", ".odp", ".docm", ".xlsm", ".pptm"},
+            "ZIP/Office": {
+                ".zip",
+                ".docx",
+                ".xlsx",
+                ".pptx",
+                ".jar",
+                ".apk",
+                ".odt",
+                ".ods",
+                ".odp",
+                ".docm",
+                ".xlsm",
+                ".pptm",
+            },
             "ELF": {".elf", ".so", ".bin", ".out"},
             "PNG": {".png"},
             "JPG": {".jpg", ".jpeg"},
@@ -10540,46 +13596,71 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
             "X509": {".cer", ".crt", ".pem", ".der", ".p7b", ".pfx", ".p12"},
             "DICOM": {".dcm"},
         }
-        rows = [["Protocol", "Filename", "Type", "Size", "Packet", "Src", "Dst", "Hostname", "Content Type", "Note"]]
+        rows = [
+            [
+                "Protocol",
+                "Filename",
+                "Type",
+                "Size",
+                "Packet",
+                "Src",
+                "Dst",
+                "Hostname",
+                "Content Type",
+                "Note",
+            ]
+        ]
         for item in summary.artifacts[:effective_limit]:
-            size = format_bytes_as_mb(item.size_bytes) if item.size_bytes is not None else "-"
+            size = (
+                format_bytes_as_mb(item.size_bytes)
+                if item.size_bytes is not None
+                else "-"
+            )
             # Fallback for old artifacts without file_type
             ftype = getattr(item, "file_type", "UNKNOWN")
             hostname = getattr(item, "hostname", None) or "-"
-            
+
             # Apply coloring
             colored_filename = item.filename
             colored_ftype = ftype
-            
+
             # Orange for executables (type) and red background for filenames
             if ftype in executable_types:
                 colored_ftype = orange(ftype)
                 colored_filename = danger_bg(item.filename)
-            
+
             # Orange for BINARY filenames
             if ftype == "BINARY":
                 colored_filename = orange(item.filename)
-            
+
             # Red for extension mismatch
             if ftype in type_extensions:
                 expected_exts = type_extensions[ftype]
                 filename_lower = item.filename.lower()
-                has_expected_ext = any(filename_lower.endswith(ext) for ext in expected_exts)
-                if not has_expected_ext and item.filename != "http_response.bin" and not item.filename.startswith("extracted_"):
+                has_expected_ext = any(
+                    filename_lower.endswith(ext) for ext in expected_exts
+                )
+                if (
+                    not has_expected_ext
+                    and item.filename != "http_response.bin"
+                    and not item.filename.startswith("extracted_")
+                ):
                     colored_filename = danger(item.filename)
-            
-            rows.append([
-                item.protocol,
-                colored_filename,
-                colored_ftype,
-                size,
-                str(item.packet_index),
-                item.src_ip,
-                item.dst_ip,
-                hostname,
-                getattr(item, "content_type", "-"),
-                item.note or "-",
-            ])
+
+            rows.append(
+                [
+                    item.protocol,
+                    colored_filename,
+                    colored_ftype,
+                    size,
+                    str(item.packet_index),
+                    item.src_ip,
+                    item.dst_ip,
+                    hostname,
+                    getattr(item, "content_type", "-"),
+                    item.note or "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     if getattr(summary, "lineage_chains", None):
@@ -10591,11 +13672,23 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
             for item in chains[:effective_limit]:
                 steps = item.get("steps", [])
                 evidence = item.get("evidence", [])
-                rows.append([
-                    _highlight_public_ips(str(item.get("src", "-"))),
-                    _truncate_text("; ".join(str(v) for v in steps[:3]) if isinstance(steps, list) else str(steps), 70),
-                    _truncate_text(", ".join(_redact_in_text(str(v)) for v in evidence[:4]) if isinstance(evidence, list) else _redact_in_text(str(evidence)), 90),
-                ])
+                rows.append(
+                    [
+                        _highlight_public_ips(str(item.get("src", "-"))),
+                        _truncate_text(
+                            "; ".join(str(v) for v in steps[:3])
+                            if isinstance(steps, list)
+                            else str(steps),
+                            70,
+                        ),
+                        _truncate_text(
+                            ", ".join(_redact_in_text(str(v)) for v in evidence[:4])
+                            if isinstance(evidence, list)
+                            else _redact_in_text(str(evidence)),
+                            90,
+                        ),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "incident_clusters", None):
@@ -10606,13 +13699,20 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
             rows = [["Cluster", "Source", "Artifacts", "Findings", "Confidence"]]
             for item in clusters[:effective_limit]:
                 findings = item.get("findings", [])
-                rows.append([
-                    str(item.get("cluster", "-")),
-                    _highlight_public_ips(str(item.get("src", "-"))),
-                    str(item.get("artifacts", "-")),
-                    _truncate_text("; ".join(str(v) for v in findings[:3]) if isinstance(findings, list) else str(findings), 76),
-                    str(item.get("confidence", "-")),
-                ])
+                rows.append(
+                    [
+                        str(item.get("cluster", "-")),
+                        _highlight_public_ips(str(item.get("src", "-"))),
+                        str(item.get("artifacts", "-")),
+                        _truncate_text(
+                            "; ".join(str(v) for v in findings[:3])
+                            if isinstance(findings, list)
+                            else str(findings),
+                            76,
+                        ),
+                        str(item.get("confidence", "-")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "campaign_indicators", None):
@@ -10623,12 +13723,20 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
             rows = [["Indicator", "Value", "Hosts"]]
             for item in campaigns[:effective_limit]:
                 hosts = item.get("hosts", [])
-                host_text = ", ".join(_highlight_public_ips(str(v)) for v in hosts[:4]) if isinstance(hosts, list) else "-"
-                rows.append([
-                    _truncate_text(str(item.get("indicator", "-")), 42),
-                    _truncate_text(_redact_in_text(str(item.get("value", "-"))), 42),
-                    _truncate_text(host_text or "-", 68),
-                ])
+                host_text = (
+                    ", ".join(_highlight_public_ips(str(v)) for v in hosts[:4])
+                    if isinstance(hosts, list)
+                    else "-"
+                )
+                rows.append(
+                    [
+                        _truncate_text(str(item.get("indicator", "-")), 42),
+                        _truncate_text(
+                            _redact_in_text(str(item.get("value", "-"))), 42
+                        ),
+                        _truncate_text(host_text or "-", 68),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if summary.extracted:
@@ -10640,7 +13748,9 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
     if summary.views:
         lines.append(SUBSECTION_BAR)
         raw_mode = any(bool(item.get("raw")) for item in summary.views)
-        lines.append(header("File View (Raw Text)" if raw_mode else "File View (ASCII/HEX)"))
+        lines.append(
+            header("File View (Raw Text)" if raw_mode else "File View (ASCII/HEX)")
+        )
         for item in summary.views:
             filename = str(item.get("filename", ""))
             payload = item.get("payload")
@@ -10676,16 +13786,17 @@ def render_files_summary(summary: FileTransferSummary, limit: int | None = None,
         if notes:
             lines.append(SUBSECTION_BAR)
             lines.append(header("False-Positive Context"))
-            for note in notes[:_limit_value(8)]:
+            for note in notes[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(note)}"))
 
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    output = _finalize_output(lines, show_truncation_note=not verbose)
+    if forced_verbose_state:
+        set_verbose_output(previous_verbose_state)
+    return output
 
 
 def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) -> str:
-    # Protocol output is intentionally always full-detail for analyst workflows.
-    verbose = True
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"PROTOCOL & CONVERSATION ANALYSIS :: {summary.path.name}"))
@@ -10773,12 +13884,14 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         for row in risk_matrix:
             if not isinstance(row, dict):
                 continue
-            rows.append([
-                str(row.get("category", "")),
-                str(row.get("risk", "")),
-                str(row.get("confidence", "")),
-                str(row.get("evidence", "")),
-            ])
+            rows.append(
+                [
+                    str(row.get("category", "")),
+                    str(row.get("risk", "")),
+                    str(row.get("confidence", "")),
+                    str(row.get("evidence", "")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -10790,12 +13903,15 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         for finding in corroborated_findings:
             if not isinstance(finding, dict):
                 continue
-            rows.append([
-                str(finding.get("host", "-")),
-                str(finding.get("score", 0)),
-                str(finding.get("confidence", "-")),
-                ", ".join(str(v) for v in list(finding.get("reasons", []) or [])) or "-",
-            ])
+            rows.append(
+                [
+                    str(finding.get("host", "-")),
+                    str(finding.get("score", 0)),
+                    str(finding.get("confidence", "-")),
+                    ", ".join(str(v) for v in list(finding.get("reasons", []) or []))
+                    or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -10807,12 +13923,15 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         for profile in sequence_profiles:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("entity", "-")),
-                " -> ".join(str(v) for v in list(profile.get("sequence", []) or [])) or "-",
-                str(profile.get("evidence_count", 0)),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("entity", "-")),
+                    " -> ".join(str(v) for v in list(profile.get("sequence", []) or []))
+                    or "-",
+                    str(profile.get("evidence_count", 0)),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -10824,14 +13943,16 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         for profile in zone_profiles:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("src", "-")),
-                str(profile.get("dst", "-")),
-                str(profile.get("protocol", "-")),
-                str(profile.get("zone_pair", "-")),
-                str(profile.get("packets", 0)),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("src", "-")),
+                    str(profile.get("dst", "-")),
+                    str(profile.get("protocol", "-")),
+                    str(profile.get("zone_pair", "-")),
+                    str(profile.get("packets", 0)),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -10843,12 +13964,14 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         for profile in baseline_profiles:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("protocol", "-")),
-                str(profile.get("baseline_prevalence", "-")),
-                str(profile.get("current_prevalence_pct", "-")),
-                str(profile.get("status", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("protocol", "-")),
+                    str(profile.get("baseline_prevalence", "-")),
+                    str(profile.get("current_prevalence_pct", "-")),
+                    str(profile.get("status", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -10860,14 +13983,16 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         for profile in tunneling_profiles:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("src", "-")),
-                str(profile.get("dst", "-")),
-                str(profile.get("protocol", "-")),
-                str(profile.get("avg_payload", "-")),
-                str(profile.get("packets", 0)),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("src", "-")),
+                    str(profile.get("dst", "-")),
+                    str(profile.get("protocol", "-")),
+                    str(profile.get("avg_payload", "-")),
+                    str(profile.get("packets", 0)),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -10879,14 +14004,16 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         for profile in beacon_profiles:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("src", "-")),
-                str(profile.get("dst", "-")),
-                str(profile.get("protocol", "-")),
-                str(profile.get("packets", 0)),
-                str(profile.get("duration_s", "-")),
-                str(profile.get("pps", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("src", "-")),
+                    str(profile.get("dst", "-")),
+                    str(profile.get("protocol", "-")),
+                    str(profile.get("packets", 0)),
+                    str(profile.get("duration_s", "-")),
+                    str(profile.get("pps", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -10898,13 +14025,15 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         for profile in role_profiles:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("host", "-")),
-                str(profile.get("protocol", "-")),
-                str(profile.get("protocol_count", 0)),
-                str(profile.get("zone", "-")),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("host", "-")),
+                    str(profile.get("protocol", "-")),
+                    str(profile.get("protocol_count", 0)),
+                    str(profile.get("zone", "-")),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
@@ -10912,22 +14041,28 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
     if pivots:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Hunt Pivots"))
-        rows = [["Conversation", "Protocol", "Packets", "Bytes", "Reasons"]]
+        rows = [["Conversation", "Protocol", "Packet", "Packets", "Bytes", "Reasons"]]
         for pivot in pivots:
             if not isinstance(pivot, dict):
                 continue
-            rows.append([
-                str(pivot.get("conversation", "-")),
-                str(pivot.get("protocol", "-")),
-                str(pivot.get("packets", 0)),
-                format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
-                ", ".join(str(v) for v in list(pivot.get("reasons", []) or [])) or "-",
-            ])
+            rows.append(
+                [
+                    str(pivot.get("conversation", "-")),
+                    str(pivot.get("protocol", "-")),
+                    _pivot_packet_number(pivot),
+                    str(pivot.get("packets", 0)),
+                    format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
+                    ", ".join(str(v) for v in list(pivot.get("reasons", []) or []))
+                    or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
     false_positive_context = [
-        str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()
+        str(v)
+        for v in list(getattr(summary, "false_positive_context", []) or [])
+        if str(v).strip()
     ]
     if false_positive_context:
         lines.append(SUBSECTION_BAR)
@@ -10938,25 +14073,34 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
     # 2. Hierarchy
     lines.append(SUBSECTION_BAR)
     lines.append(header("Protocol Hierarchy"))
-    
+
     def _clean_proto_name(name: str) -> str:
         # 1. Scapy "Layer in Layer" simplification
         if " in ICMP" in name:
-             name = name.replace(" in ICMP", " (quoted)")
-             
+            name = name.replace(" in ICMP", " (quoted)")
+
         # 2. Shorten verbose IPv6/ICMPv6 names
         mappings = [
-            ("ICMPv6 Neighbor Discovery - Neighbor Solicitation", "ICMPv6 Neighbor Sol."),
-            ("ICMPv6 Neighbor Discovery - Neighbor Advertisement", "ICMPv6 Neighbor Adv."),
+            (
+                "ICMPv6 Neighbor Discovery - Neighbor Solicitation",
+                "ICMPv6 Neighbor Sol.",
+            ),
+            (
+                "ICMPv6 Neighbor Discovery - Neighbor Advertisement",
+                "ICMPv6 Neighbor Adv.",
+            ),
             ("ICMPv6 Neighbor Discovery - Router Solicitation", "ICMPv6 Router Sol."),
             ("ICMPv6 Neighbor Discovery - Router Advertisement", "ICMPv6 Router Adv."),
-            ("ICMPv6 Neighbor Discovery Option - Scapy Unimplemented", "ICMPv6 Option (Unknown)"),
+            (
+                "ICMPv6 Neighbor Discovery Option - Scapy Unimplemented",
+                "ICMPv6 Option (Unknown)",
+            ),
             ("ICMPv6 Neighbor Discovery Option", "ICMPv6 Option"),
             ("IPv6 Extension Header - Hop-by-Hop Options Header", "IPv6 Hop-by-Hop"),
             ("IPv6 Extension Header", "IPv6 Ext"),
             ("MLDv2 - Multicast Listener Report", "MLDv2 Report"),
         ]
-        
+
         for old, new in mappings:
             if old in name:
                 name = name.replace(old, new)
@@ -10965,33 +14109,39 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
     def render_node(node, depth=0):
         res = []
         indent = "  " * depth
-        
+
         # Display:  |- HTTP (50 pkts, 10.2%)
         tree_char = "|- " if depth > 0 else ""
-        
+
         clean_name = _clean_proto_name(node.name)
         name_display = f"{indent}{tree_char}{clean_name}"
         stats_display = f"{node.packets} pkts, {format_bytes_as_mb(node.bytes)}"
-        
+
         # Dynamic padding calc could be better but fixed width for now
         res.append(f"{name_display:<50} {stats_display}")
-        
+
         # Sort sub-protocols by packet count for better visibility
-        sorted_subs = sorted(node.sub_protocols.values(), key=lambda x: x.packets, reverse=True)
-        
+        sorted_subs = sorted(
+            node.sub_protocols.values(), key=lambda x: x.packets, reverse=True
+        )
+
         for sub in sorted_subs:
             res.extend(render_node(sub, depth + 1))
         return res
-        
+
     hierarchy_lines = render_node(summary.hierarchy)
     # Remove Root if it's just a wrapper
     if len(summary.hierarchy.sub_protocols) > 0:
         hierarchy_lines = []
         # Sort root children too
-        sorted_root_subs = sorted(summary.hierarchy.sub_protocols.values(), key=lambda x: x.packets, reverse=True)
+        sorted_root_subs = sorted(
+            summary.hierarchy.sub_protocols.values(),
+            key=lambda x: x.packets,
+            reverse=True,
+        )
         for sub in sorted_root_subs:
             hierarchy_lines.extend(render_node(sub, 0))
-            
+
     lines.extend(hierarchy_lines)
 
     # 3. Anomalies / Threats
@@ -11027,7 +14177,13 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
             )
             limit = len(grouped_items)
             for (sev, a_type, desc), data in grouped_items[:limit]:
-                sev_color = danger if sev in ("HIGH", "CRITICAL") else warn if sev == "MEDIUM" else muted
+                sev_color = (
+                    danger
+                    if sev in ("HIGH", "CRITICAL")
+                    else warn
+                    if sev == "MEDIUM"
+                    else muted
+                )
                 lines.append(sev_color(f"[{sev}] {a_type}: {desc} (x{data['count']})"))
                 examples = data.get("examples", [])
                 if examples:
@@ -11040,108 +14196,164 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
     # 4. Conversations (Top 10 by bytes)
     lines.append(SUBSECTION_BAR)
     lines.append(header("Top Conversations (by volume)"))
-    
+
     sorted_convs = sorted(summary.conversations, key=lambda c: c.bytes, reverse=True)
-    
+
     rows = [["Src", "Dst", "Proto", "Packets", "Bytes", "Duration", "Ports"]]
     for c in sorted_convs:
         # Sort ports by value for consistent display
         ports_list = sorted(list(c.ports))
         ports_str = ",".join(map(str, ports_list))
-        
+
         dur = format_duration(c.end_ts - c.start_ts)
-        rows.append([
-            c.src, c.dst, c.protocol, str(c.packets), 
-            format_bytes_as_mb(c.bytes), dur, ports_str
-        ])
+        rows.append(
+            [
+                c.src,
+                c.dst,
+                c.protocol,
+                str(c.packets),
+                format_bytes_as_mb(c.bytes),
+                dur,
+                ports_str,
+            ]
+        )
     lines.append(_format_table(rows))
 
     if verbose:
         # 5. Top Endpoints
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Endpoints"))
-        sorted_eps = sorted(summary.endpoints, key=lambda e: e.bytes_sent + e.bytes_recv, reverse=True)
+        sorted_eps = sorted(
+            summary.endpoints, key=lambda e: e.bytes_sent + e.bytes_recv, reverse=True
+        )
         rows = [["Address", "Sent", "Recv", "Total Bytes", "Protocols"]]
         for e in sorted_eps:
-             protos = ",".join(sorted(str(p) for p in list(e.protocols)))
-             rows.append([
-                 e.address, 
-                 str(e.packets_sent), 
-                 str(e.packets_recv), 
-                 format_bytes_as_mb(e.bytes_sent + e.bytes_recv), 
-                 protos
-             ])
+            protos = ",".join(sorted(str(p) for p in list(e.protocols)))
+            rows.append(
+                [
+                    e.address,
+                    str(e.packets_sent),
+                    str(e.packets_recv),
+                    format_bytes_as_mb(e.bytes_sent + e.bytes_recv),
+                    protos,
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
 
 
-def render_services_summary(summary: ServiceSummary) -> str:
+def _service_asset_key(asset: ServiceAsset) -> str:
+    return f"{asset.ip}:{asset.port}"
+
+
+def render_services_summary(summary: ServiceSummary, verbose: bool = False) -> str:
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"SERVICE DISCOVERY & RISK ANALYSIS :: {summary.path.name}"))
     lines.append(SECTION_BAR)
-    
+
     if summary.errors:
         lines.append(SUBSECTION_BAR)
         for err in summary.errors:
             lines.append(danger(f"Error: {err}"))
-            
+
+    confirmed_assets = [
+        asset
+        for asset in summary.assets
+        if asset.protocol == "TCP" and bool(getattr(asset, "handshake_confirmed", False))
+    ]
+    displayed_assets = summary.assets if verbose else confirmed_assets
+    displayed_keys = {_service_asset_key(asset) for asset in displayed_assets}
+
     lines.append(_format_kv("Total Services", str(summary.total_services)))
-    
+    lines.append(_format_kv("Confirmed TCP Services", str(len(confirmed_assets))))
+    if not verbose:
+        hidden_count = max(0, summary.total_services - len(confirmed_assets))
+        lines.append(_format_kv("Hidden (Unconfirmed/UDP)", str(hidden_count)))
+
     # 1. Active Services Inventory
     lines.append(SUBSECTION_BAR)
     lines.append(header("Active Services (Servers)"))
-    
-    if not summary.assets:
-        lines.append(muted("No active services identified (no SYN-ACK/Response traffic seen)."))
+
+    if not displayed_assets:
+        lines.append(
+            muted(
+                "No handshake-confirmed TCP services identified. Use `-v` to include inferred/UDP service observations."
+            )
+        )
     else:
         rows = [["Address", "Port", "Proto", "Service", "Software", "Clients", "Vol"]]
-        for asset in summary.assets:
+        if verbose:
+            rows[0].append("Discovery")
+        for asset in displayed_assets:
             software = asset.software or "-"
             vol = format_bytes_as_mb(asset.bytes)
-            rows.append([
+            row = [
                 asset.ip,
                 str(asset.port),
                 asset.protocol,
                 asset.service_name,
                 software,
                 str(len(asset.clients)),
-                vol
-            ])
+                vol,
+            ]
+            if verbose:
+                row.append(str(getattr(asset, "discovery_method", "observed")))
+            rows.append(row)
         lines.append(_format_table(rows))
 
-    if summary.hierarchy:
+    if summary.hierarchy and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Service Prevalence"))
         rows = [["Service", "Count"]]
-        for name, count in sorted(summary.hierarchy.items(), key=lambda item: item[1], reverse=True):
+        for name, count in sorted(
+            summary.hierarchy.items(), key=lambda item: item[1], reverse=True
+        ):
             rows.append([name, str(count)])
         lines.append(_format_table(rows))
 
-    banners = [asset for asset in summary.assets if asset.software]
-    if banners:
+    banners = [asset for asset in displayed_assets if asset.software]
+    if banners and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Service Banners"))
         rows = [["Address", "Port", "Service", "Banner"]]
         for asset in banners:
-            rows.append([
-                asset.ip,
-                str(asset.port),
-                asset.service_name,
-                asset.software or "-",
-            ])
+            rows.append(
+                [
+                    asset.ip,
+                    str(asset.port),
+                    asset.service_name,
+                    asset.software or "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     # 2. Risks / Threats
     lines.append(SUBSECTION_BAR)
     lines.append(header("Cybersecurity Risks"))
-    
-    if not summary.risks:
+
+    risk_pool = list(summary.risks)
+    if not verbose:
+        risk_pool = [
+            risk
+            for risk in risk_pool
+            if str(risk.severity or "").upper() in {"CRITICAL", "HIGH", "MEDIUM"}
+            and str(risk.affected_asset or "").split("/", 1)[0] in displayed_keys
+        ]
+    if not risk_pool:
         lines.append(ok("No high-confidence service risks detected."))
     else:
-        for risk in sorted(summary.risks, key=lambda x: x.severity):
+        severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        sorted_risks = sorted(
+            risk_pool,
+            key=lambda x: (
+                severity_rank.get(str(x.severity or "").upper(), 99),
+                str(x.title or ""),
+            ),
+        )
+        for risk in sorted_risks:
             sev_color = danger if risk.severity in ("CRITICAL", "HIGH") else warn
             if risk.severity == "LOW":
                 sev_color = muted
@@ -11165,7 +14377,7 @@ def render_services_summary(summary: ServiceSummary) -> str:
                 lines.append(muted(f"- {reason}"))
 
     checks = dict(getattr(summary, "deterministic_checks", {}) or {})
-    if checks:
+    if checks and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Deterministic Service Security Checks"))
         check_labels = {
@@ -11190,131 +14402,169 @@ def render_services_summary(summary: ServiceSummary) -> str:
                 lines.append(ok(f"[ ] {label}: none"))
 
     risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
-    if risk_matrix:
+    if risk_matrix and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Service Risk Matrix"))
         rows = [["Category", "Risk", "Confidence", "Evidence"]]
         for row in risk_matrix:
             if not isinstance(row, dict):
                 continue
-            rows.append([
-                str(row.get("category", "")),
-                str(row.get("risk", "")),
-                str(row.get("confidence", "")),
-                str(row.get("evidence", "")),
-            ])
+            rows.append(
+                [
+                    str(row.get("category", "")),
+                    str(row.get("risk", "")),
+                    str(row.get("confidence", "")),
+                    str(row.get("evidence", "")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
     mismatch_profiles = list(getattr(summary, "service_mismatch_profiles", []) or [])
-    if mismatch_profiles:
+    if mismatch_profiles and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Service Mismatch Profiles"))
         rows = [["Asset", "Service", "Software", "Reasons"]]
         for profile in mismatch_profiles:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("asset", "-")),
-                str(profile.get("service", "-")),
-                str(profile.get("software", "-")),
-                ", ".join(str(v) for v in list(profile.get("reasons", []) or [])) or "-",
-            ])
+            rows.append(
+                [
+                    str(profile.get("asset", "-")),
+                    str(profile.get("service", "-")),
+                    str(profile.get("software", "-")),
+                    ", ".join(str(v) for v in list(profile.get("reasons", []) or []))
+                    or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
     drift_profiles = list(getattr(summary, "service_drift_profiles", []) or [])
-    if drift_profiles:
+    if drift_profiles and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Service Drift Profiles"))
         rows = [["Host", "Service", "Ports", "Banner Count"]]
         for profile in drift_profiles:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("host", "-")),
-                str(profile.get("service", "-")),
-                ",".join(str(v) for v in list(profile.get("ports", []) or [])) or "-",
-                str(profile.get("banner_count", 0)),
-            ])
+            rows.append(
+                [
+                    str(profile.get("host", "-")),
+                    str(profile.get("service", "-")),
+                    ",".join(str(v) for v in list(profile.get("ports", []) or []))
+                    or "-",
+                    str(profile.get("banner_count", 0)),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
     lateral_profiles = list(getattr(summary, "lateral_surface_profiles", []) or [])
-    if lateral_profiles:
+    if lateral_profiles and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Lateral Surface Profiles"))
         rows = [["Host", "Admin Ports", "Count", "Confidence"]]
         for profile in lateral_profiles:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("host", "-")),
-                ",".join(str(v) for v in list(profile.get("admin_ports", []) or [])) or "-",
-                str(profile.get("admin_port_count", 0)),
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("host", "-")),
+                    ",".join(str(v) for v in list(profile.get("admin_ports", []) or []))
+                    or "-",
+                    str(profile.get("admin_port_count", 0)),
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
     boundary_profiles = list(getattr(summary, "boundary_exposure_profiles", []) or [])
-    if boundary_profiles:
+    if boundary_profiles and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Boundary Exposure Profiles"))
         rows = [["Asset", "Service", "Clients", "Packets"]]
         for profile in boundary_profiles:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("asset", "-")),
-                str(profile.get("service", "-")),
-                str(profile.get("clients", 0)),
-                str(profile.get("packets", 0)),
-            ])
+            rows.append(
+                [
+                    str(profile.get("asset", "-")),
+                    str(profile.get("service", "-")),
+                    str(profile.get("clients", 0)),
+                    str(profile.get("packets", 0)),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
     ot_it_profiles = list(getattr(summary, "ot_it_crossing_profiles", []) or [])
-    if ot_it_profiles:
+    if ot_it_profiles and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("OT/IT Crossing Profiles"))
         rows = [["Host", "OT Ports", "Admin Ports", "Confidence"]]
         for profile in ot_it_profiles:
             if not isinstance(profile, dict):
                 continue
-            rows.append([
-                str(profile.get("host", "-")),
-                ",".join(str(v) for v in list(profile.get("ot_ports", []) or [])) or "-",
-                ",".join(str(v) for v in list(profile.get("admin_ports", []) or [])) or "-",
-                str(profile.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(profile.get("host", "-")),
+                    ",".join(str(v) for v in list(profile.get("ot_ports", []) or []))
+                    or "-",
+                    ",".join(str(v) for v in list(profile.get("admin_ports", []) or []))
+                    or "-",
+                    str(profile.get("confidence", "-")),
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
     pivots = list(getattr(summary, "investigation_pivots", []) or [])
-    if pivots:
+    if pivots and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Hunt Pivots"))
-        rows = [["Asset", "Service", "Clients", "Packets", "Reasons"]]
+        rows = [["Asset", "Service", "Packet", "Clients", "Packets", "Reasons"]]
         for pivot in pivots:
             if not isinstance(pivot, dict):
                 continue
-            rows.append([
-                str(pivot.get("asset", "-")),
-                str(pivot.get("service", "-")),
-                str(pivot.get("clients", 0)),
-                str(pivot.get("packets", 0)),
-                ", ".join(str(v) for v in list(pivot.get("reasons", []) or [])) or "-",
-            ])
+            rows.append(
+                [
+                    str(pivot.get("asset", "-")),
+                    str(pivot.get("service", "-")),
+                    _pivot_packet_number(pivot),
+                    str(pivot.get("clients", 0)),
+                    str(pivot.get("packets", 0)),
+                    ", ".join(str(v) for v in list(pivot.get("reasons", []) or []))
+                    or "-",
+                ]
+            )
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
-    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
-    if false_positive_context:
+    false_positive_context = [
+        str(v)
+        for v in list(getattr(summary, "false_positive_context", []) or [])
+        if str(v).strip()
+    ]
+    if false_positive_context and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("False-Positive Context"))
         for item in false_positive_context:
             lines.append(muted(f"- {item}"))
+
+    if not verbose:
+        lines.append(SUBSECTION_BAR)
+        lines.append(
+            muted(
+                "Default view shows handshake-confirmed TCP services and likely risks only."
+            )
+        )
+        lines.append(
+            muted(
+                "Use `-v` to include inferred TCP/UDP services, low-severity risks, and full deterministic profile detail."
+            )
+        )
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
@@ -11327,7 +14577,9 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
     lines.append(SECTION_BAR)
     effective_verbose = _VERBOSE_OUTPUT or verbose
 
-    def _preview_values(values: object, limit: int = 3, max_len: int = 60, show_count: bool = True) -> str:
+    def _preview_values(
+        values: object, limit: int = 3, max_len: int = 60, show_count: bool = True
+    ) -> str:
         if not values:
             return "-"
         if effective_verbose:
@@ -11371,12 +14623,16 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
             return False
         if not any(ch.isalpha() for ch in token):
             return False
-        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.@$ ")
+        allowed = set(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.@$ "
+        )
         if any(ch not in allowed for ch in token):
             return False
         return True
 
-    def _smb_preview_tokens(values: object, limit: int = 3, max_len: int = 60) -> tuple[str, bool]:
+    def _smb_preview_tokens(
+        values: object, limit: int = 3, max_len: int = 60
+    ) -> tuple[str, bool]:
         if not values:
             return "-", False
         if effective_verbose:
@@ -11425,12 +14681,16 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
             return False
         if not any(ch.isalpha() for ch in token):
             return False
-        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.@$")
+        allowed = set(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.@$"
+        )
         if any(ch not in allowed for ch in token):
             return False
         return True
 
-    def _smb_preview_tokens(values: object, limit: int = 3, max_len: int = 60) -> tuple[str, bool]:
+    def _smb_preview_tokens(
+        values: object, limit: int = 3, max_len: int = 60
+    ) -> tuple[str, bool]:
         if not values:
             return "-", False
         items: list[str]
@@ -11471,25 +14731,42 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
 
     lines.append(_format_kv("SMB Packets", str(summary.smb_packets)))
     if getattr(summary, "smb_ports", None):
-        ports_text = ", ".join(
-            f"{port} ({count})" for port, count in summary.smb_ports.most_common(_limit_value(6))
-        ) if summary.smb_ports else "-"
+        ports_text = (
+            ", ".join(
+                f"{port} ({count})"
+                for port, count in summary.smb_ports.most_common(_limit_value(6))
+            )
+            if summary.smb_ports
+            else "-"
+        )
         lines.append(_format_kv("SMB Ports", ports_text))
-    versions_text = ", ".join([f"{k} ({v})" for k, v in summary.versions.items()]) if summary.versions else "-"
+    versions_text = (
+        ", ".join([f"{k} ({v})" for k, v in summary.versions.items()])
+        if summary.versions
+        else "-"
+    )
     lines.append(_format_kv("SMB Versions", versions_text))
     lines.append(_format_kv("Unique Clients", str(len(summary.clients))))
     lines.append(_format_kv("Unique Servers", str(len(summary.servers))))
     lines.append(_format_kv("Sessions", str(len(summary.sessions))))
     if getattr(summary, "signed_packets", 0) or getattr(summary, "unsigned_packets", 0):
-        signed_text = f"{summary.signed_packets} signed / {summary.unsigned_packets} unsigned"
+        signed_text = (
+            f"{summary.signed_packets} signed / {summary.unsigned_packets} unsigned"
+        )
         lines.append(_format_kv("Signed Packets", signed_text))
     if getattr(summary, "encrypted_packets", 0):
-        encrypted_sessions = sum(1 for sess in summary.sessions if getattr(sess, "encrypted", False))
+        encrypted_sessions = sum(
+            1 for sess in summary.sessions if getattr(sess, "encrypted", False)
+        )
         lines.append(_format_kv("Encrypted Packets", str(summary.encrypted_packets)))
         lines.append(_format_kv("Encrypted Sessions", str(encrypted_sessions)))
-    
+
     if summary.versions.get("SMB1"):
-        lines.append(danger(f"SMBv1 DETECTED: {summary.versions['SMB1']} packets! Legacy/Insecure."))
+        lines.append(
+            danger(
+                f"SMBv1 DETECTED: {summary.versions['SMB1']} packets! Legacy/Insecure."
+            )
+        )
 
     # 0. Request/Response Summary
     lines.append(SUBSECTION_BAR)
@@ -11530,9 +14807,16 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
         rows = [["Server", "Share Path", "Count", "Type"]]
         for s in summary.shares:
             stype = "Admin" if s.is_admin else "Normal"
-            rows.append([s.server_ip, _truncate_text(_redact_in_text(str(s.name)), 60), str(s.connect_count), stype])
+            rows.append(
+                [
+                    s.server_ip,
+                    _truncate_text(_redact_in_text(str(s.name)), 60),
+                    str(s.connect_count),
+                    stype,
+                ]
+            )
         lines.append(_format_table(rows))
-    
+
     # 3. Top Clients/Servers
     lines.append(SUBSECTION_BAR)
     lines.append(header("Top Clients"))
@@ -11540,7 +14824,7 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
     for ip, count in summary.top_clients.most_common(_limit_value(5)):
         rows.append([ip, str(count)])
     lines.append(_format_table(rows))
-    
+
     lines.append("")
     lines.append(header("Top Servers"))
     rows = [["Server IP", "Packets"]]
@@ -11583,10 +14867,24 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
         rows = [["Server", "Dialects", "Signing Required", "Shares", "Capabilities"]]
         for srv in summary.servers:
             dialects = _preview_values(srv.dialects, limit=3, max_len=50)
-            signing = "Yes" if srv.signing_required else ("No" if srv.signing_required is not None else "-")
+            signing = (
+                "Yes"
+                if srv.signing_required
+                else ("No" if srv.signing_required is not None else "-")
+            )
             if effective_verbose:
-                shares = _preview_values(srv.shares, limit=_FULL_OUTPUT_LIMIT, max_len=_FULL_OUTPUT_LIMIT, show_count=False)
-                caps = _preview_values(srv.capabilities, limit=_FULL_OUTPUT_LIMIT, max_len=_FULL_OUTPUT_LIMIT, show_count=False)
+                shares = _preview_values(
+                    srv.shares,
+                    limit=_FULL_OUTPUT_LIMIT,
+                    max_len=_FULL_OUTPUT_LIMIT,
+                    show_count=False,
+                )
+                caps = _preview_values(
+                    srv.capabilities,
+                    limit=_FULL_OUTPUT_LIMIT,
+                    max_len=_FULL_OUTPUT_LIMIT,
+                    show_count=False,
+                )
             else:
                 shares = _preview_values(srv.shares, limit=1, max_len=80)
                 caps = _preview_values(srv.capabilities, limit=3, max_len=60)
@@ -11605,27 +14903,53 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
             dialects = _preview_values(cli.dialects, limit=3, max_len=50)
             guid = cli.client_guid or "-"
             if effective_verbose:
-                users = _preview_values(cli.usernames, limit=_FULL_OUTPUT_LIMIT, max_len=_FULL_OUTPUT_LIMIT, show_count=False)
-                domains = _preview_values(cli.domains, limit=_FULL_OUTPUT_LIMIT, max_len=_FULL_OUTPUT_LIMIT, show_count=False)
+                users = _preview_values(
+                    cli.usernames,
+                    limit=_FULL_OUTPUT_LIMIT,
+                    max_len=_FULL_OUTPUT_LIMIT,
+                    show_count=False,
+                )
+                domains = _preview_values(
+                    cli.domains,
+                    limit=_FULL_OUTPUT_LIMIT,
+                    max_len=_FULL_OUTPUT_LIMIT,
+                    show_count=False,
+                )
                 users_filtered = False
                 domains_filtered = False
             else:
-                users, users_filtered = _smb_preview_tokens(cli.usernames, limit=3, max_len=60)
-                domains, domains_filtered = _smb_preview_tokens(cli.domains, limit=3, max_len=60)
+                users, users_filtered = _smb_preview_tokens(
+                    cli.usernames, limit=3, max_len=60
+                )
+                domains, domains_filtered = _smb_preview_tokens(
+                    cli.domains, limit=3, max_len=60
+                )
                 if users_filtered or domains_filtered:
                     filtered_notice = True
             rows.append([cli.ip, dialects, guid, users, domains])
         lines.append(_format_table(rows))
         noisy_clients = [
-            cli.ip for cli in summary.clients
-            if (len(getattr(cli, "usernames", [])) > 20 or len(getattr(cli, "domains", [])) > 20)
+            cli.ip
+            for cli in summary.clients
+            if (
+                len(getattr(cli, "usernames", [])) > 20
+                or len(getattr(cli, "domains", [])) > 20
+            )
         ]
         if noisy_clients:
             if not effective_verbose:
-                lines.append(muted("Large user/domain lists may include noisy string extraction; use -v for full lists."))
+                lines.append(
+                    muted(
+                        "Large user/domain lists may include noisy string extraction; use -v for full lists."
+                    )
+                )
         if filtered_notice:
             if not effective_verbose:
-                lines.append(muted("User/domain previews are filtered for readable tokens; use -v for raw lists."))
+                lines.append(
+                    muted(
+                        "User/domain previews are filtered for readable tokens; use -v for raw lists."
+                    )
+                )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Discovered Usernames"))
@@ -11675,60 +14999,82 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
                 client_workstation_map[cli.ip] = next(iter(cli.workstations))
             if getattr(cli, "workstation_candidates", None):
                 client_workstation_candidates[cli.ip] = list(cli.workstation_candidates)
-        rows = [[
-            "Client",
-            "Server",
-            "Session",
-            "Version",
-            "User",
-            "Domain",
-            "Workstation",
-            "Auth",
-            "Signing Req",
-            "Signing Used",
-            "Encrypt Req",
-            "Encrypted",
-            "Packets",
-            "Bytes",
-            "First Seen",
-            "Last Seen",
-            "Duration",
-        ]]
+        rows = [
+            [
+                "Client",
+                "Server",
+                "Session",
+                "Version",
+                "User",
+                "Domain",
+                "Workstation",
+                "Auth",
+                "Signing Req",
+                "Signing Used",
+                "Encrypt Req",
+                "Encrypted",
+                "Packets",
+                "Bytes",
+                "First Seen",
+                "Last Seen",
+                "Duration",
+            ]
+        ]
         for sess in summary.sessions:
             display_user = sess.username or client_user_map.get(sess.client_ip) or "-"
             display_domain = sess.domain or client_domain_map.get(sess.client_ip) or "-"
-            display_workstation = sess.workstation or client_workstation_map.get(sess.client_ip) or "-"
+            display_workstation = (
+                sess.workstation or client_workstation_map.get(sess.client_ip) or "-"
+            )
             signed_used = "-"
-            if getattr(sess, "signed_packets", 0) and getattr(sess, "unsigned_packets", 0):
+            if getattr(sess, "signed_packets", 0) and getattr(
+                sess, "unsigned_packets", 0
+            ):
                 signed_used = "Mixed"
             elif getattr(sess, "signed_packets", 0):
                 signed_used = "Yes"
             elif getattr(sess, "unsigned_packets", 0):
                 signed_used = "No"
-            encrypt_req = "Yes" if getattr(sess, "encryption_required", None) else ("No" if sess.encryption_required is not None else "-")
+            encrypt_req = (
+                "Yes"
+                if getattr(sess, "encryption_required", None)
+                else ("No" if sess.encryption_required is not None else "-")
+            )
             encrypted = "Yes" if getattr(sess, "encrypted", False) else "No"
             duration = None
             if sess.start_ts and sess.last_seen:
                 duration = max(0.0, sess.last_seen - sess.start_ts)
-            rows.append([
-                sess.client_ip,
-                sess.server_ip,
-                str(sess.session_id) if sess.session_id is not None else "-",
-                sess.smb_version or "-",
-                _truncate_text(_redact_in_text(str(display_user)), 30) if display_user else "-",
-                _truncate_text(_redact_in_text(str(display_domain)), 30) if display_domain else "-",
-                _truncate_text(_redact_in_text(str(display_workstation)), 30) if display_workstation else "-",
-                _truncate_text(_redact_in_text(str(sess.auth_type)), 20) if sess.auth_type else "-",
-                "Yes" if sess.signing_required else ("No" if sess.signing_required is not None else "-"),
-                signed_used,
-                encrypt_req,
-                encrypted,
-                str(sess.packets),
-                format_bytes_as_mb(sess.bytes) if sess.bytes else "-",
-                format_ts(sess.start_ts if sess.start_ts else None),
-                format_ts(sess.last_seen if sess.last_seen else None),
-                format_duration(duration),
-            ])
+            rows.append(
+                [
+                    sess.client_ip,
+                    sess.server_ip,
+                    str(sess.session_id) if sess.session_id is not None else "-",
+                    sess.smb_version or "-",
+                    _truncate_text(_redact_in_text(str(display_user)), 30)
+                    if display_user
+                    else "-",
+                    _truncate_text(_redact_in_text(str(display_domain)), 30)
+                    if display_domain
+                    else "-",
+                    _truncate_text(_redact_in_text(str(display_workstation)), 30)
+                    if display_workstation
+                    else "-",
+                    _truncate_text(_redact_in_text(str(sess.auth_type)), 20)
+                    if sess.auth_type
+                    else "-",
+                    "Yes"
+                    if sess.signing_required
+                    else ("No" if sess.signing_required is not None else "-"),
+                    signed_used,
+                    encrypt_req,
+                    encrypted,
+                    str(sess.packets),
+                    format_bytes_as_mb(sess.bytes) if sess.bytes else "-",
+                    format_ts(sess.start_ts if sess.start_ts else None),
+                    format_ts(sess.last_seen if sess.last_seen else None),
+                    format_duration(duration),
+                ]
+            )
         lines.append(_format_table(rows))
 
         if verbose and client_workstation_candidates:
@@ -11737,7 +15083,10 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
             rows = [["Client", "Candidates"]]
             for ip in sorted(client_workstation_candidates.keys()):
                 candidates = sorted(client_workstation_candidates.get(ip, []))
-                preview = ", ".join(_truncate_text(_redact_in_text(c), 30) for c in candidates[:_limit_value(10)])
+                preview = ", ".join(
+                    _truncate_text(_redact_in_text(c), 30)
+                    for c in candidates[: _limit_value(10)]
+                )
                 if len(candidates) > _limit_value(10):
                     preview += f" (+{len(candidates) - _limit_value(10)} more)"
                 rows.append([ip, preview or "-"])
@@ -11747,7 +15096,20 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
     lines.append(SUBSECTION_BAR)
     lines.append(header("SMB Files & Artifacts"))
     if summary.files:
-        suspicious_ext = {".exe", ".dll", ".ps1", ".bat", ".vbs", ".js", ".scr", ".sys", ".lnk", ".zip", ".rar", ".7z"}
+        suspicious_ext = {
+            ".exe",
+            ".dll",
+            ".ps1",
+            ".bat",
+            ".vbs",
+            ".js",
+            ".scr",
+            ".sys",
+            ".lnk",
+            ".zip",
+            ".rar",
+            ".7z",
+        }
         known_ops: dict[tuple[str, str, str, str], dict[str, object]] = {}
         unknown_ops: dict[tuple[str, str, str, str], dict[str, object]] = {}
 
@@ -11768,17 +15130,20 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
             file_id = item.file_id or ""
             if _is_unknown(filename):
                 ukey = (action, share, client, server)
-                entry = unknown_ops.setdefault(ukey, {
-                    "action": action,
-                    "share": share,
-                    "client": client,
-                    "server": server,
-                    "count": 0,
-                    "bytes": 0,
-                    "first_ts": None,
-                    "last_ts": None,
-                    "file_ids": set(),
-                })
+                entry = unknown_ops.setdefault(
+                    ukey,
+                    {
+                        "action": action,
+                        "share": share,
+                        "client": client,
+                        "server": server,
+                        "count": 0,
+                        "bytes": 0,
+                        "first_ts": None,
+                        "last_ts": None,
+                        "file_ids": set(),
+                    },
+                )
                 entry["count"] = int(entry["count"]) + 1
                 entry["bytes"] = int(entry["bytes"]) + size
                 if file_id:
@@ -11792,17 +15157,20 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
                 continue
 
             key = (filename, share, client, server)
-            entry = known_ops.setdefault(key, {
-                "filename": filename,
-                "share": share,
-                "client": client,
-                "server": server,
-                "actions": Counter(),
-                "bytes": 0,
-                "file_ids": set(),
-                "first_ts": None,
-                "last_ts": None,
-            })
+            entry = known_ops.setdefault(
+                key,
+                {
+                    "filename": filename,
+                    "share": share,
+                    "client": client,
+                    "server": server,
+                    "actions": Counter(),
+                    "bytes": 0,
+                    "file_ids": set(),
+                    "first_ts": None,
+                    "last_ts": None,
+                },
+            )
             entry["actions"][action] += 1
             entry["bytes"] = int(entry["bytes"]) + size
             if item.file_id:
@@ -11816,17 +15184,39 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
 
         if known_ops or unknown_ops:
             lines.append(muted("File Operations (Aggregated)"))
-            rows = [["File", "Share", "Activity", "Bytes", "Client", "Server", "First Seen", "Last Seen", "File IDs", "Flags"]]
+            rows = [
+                [
+                    "File",
+                    "Share",
+                    "Activity",
+                    "Bytes",
+                    "Client",
+                    "Server",
+                    "First Seen",
+                    "Last Seen",
+                    "File IDs",
+                    "Flags",
+                ]
+            ]
+
             def _known_sort(entry: dict[str, object]) -> tuple[int, int]:
                 total_bytes = int(entry.get("bytes", 0))
-                action_count = sum(int(v) for v in entry.get("actions", Counter()).values())
+                action_count = sum(
+                    int(v) for v in entry.get("actions", Counter()).values()
+                )
                 return (total_bytes, action_count)
 
-            for entry in sorted(known_ops.values(), key=_known_sort, reverse=True)[:_limit_value(20)]:
+            for entry in sorted(known_ops.values(), key=_known_sort, reverse=True)[
+                : _limit_value(20)
+            ]:
                 actions = entry.get("actions", Counter())
-                action_text = ", ".join(
-                    f"{name} x{count}" for name, count in actions.most_common(3)
-                ) if actions else "-"
+                action_text = (
+                    ", ".join(
+                        f"{name} x{count}" for name, count in actions.most_common(3)
+                    )
+                    if actions
+                    else "-"
+                )
                 if actions and len(actions) > 3:
                     action_text += " …"
                 filename = str(entry.get("filename", "-"))
@@ -11835,7 +15225,11 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
                 lower_name = filename.lower()
                 if any(lower_name.endswith(ext) for ext in suspicious_ext):
                     flags.append("SuspiciousExt")
-                if "admin$" in share.lower() or "ipc$" in share.lower() or share.lower().endswith("\\c$"):
+                if (
+                    "admin$" in share.lower()
+                    or "ipc$" in share.lower()
+                    or share.lower().endswith("\\c$")
+                ):
                     flags.append("AdminShare")
                 if "\\pipe\\" in lower_name:
                     flags.append("NamedPipe")
@@ -11844,39 +15238,53 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
                 file_id_text = ", ".join(file_ids[:3]) if file_ids else "-"
                 if len(file_ids) > 3:
                     file_id_text += f" (+{len(file_ids) - 3} more)"
-                rows.append([
-                    _truncate_text(_redact_in_text(filename), 80),
-                    _truncate_text(_redact_in_text(share), 60),
-                    action_text,
-                    format_bytes_as_mb(int(entry.get("bytes", 0))) if entry.get("bytes") else "-",
-                    entry.get("client", "-"),
-                    entry.get("server", "-"),
-                    format_ts(entry.get("first_ts")),
-                    format_ts(entry.get("last_ts")),
-                    _truncate_text(file_id_text, 60),
-                    flag_text,
-                ])
-
-            if unknown_ops:
-                def _unknown_sort(entry: dict[str, object]) -> tuple[int, int]:
-                    return (int(entry.get("bytes", 0)), int(entry.get("count", 0)))
-                for entry in sorted(unknown_ops.values(), key=_unknown_sort, reverse=True)[:_limit_value(15)]:
-                    file_ids = sorted(entry.get("file_ids", set()))
-                    file_id_text = ", ".join(file_ids[:3]) if file_ids else "-"
-                    if len(file_ids) > 3:
-                        file_id_text += f" (+{len(file_ids) - 3} more)"
-                    rows.append([
-                        "(unknown)",
-                        _truncate_text(_redact_in_text(str(entry.get("share", "-"))), 50),
-                        f"{entry.get('action', '-') } x{entry.get('count', 0)}",
-                        format_bytes_as_mb(int(entry.get("bytes", 0))) if entry.get("bytes") else "-",
+                rows.append(
+                    [
+                        _truncate_text(_redact_in_text(filename), 80),
+                        _truncate_text(_redact_in_text(share), 60),
+                        action_text,
+                        format_bytes_as_mb(int(entry.get("bytes", 0)))
+                        if entry.get("bytes")
+                        else "-",
                         entry.get("client", "-"),
                         entry.get("server", "-"),
                         format_ts(entry.get("first_ts")),
                         format_ts(entry.get("last_ts")),
                         _truncate_text(file_id_text, 60),
-                        "UnknownName",
-                    ])
+                        flag_text,
+                    ]
+                )
+
+            if unknown_ops:
+
+                def _unknown_sort(entry: dict[str, object]) -> tuple[int, int]:
+                    return (int(entry.get("bytes", 0)), int(entry.get("count", 0)))
+
+                for entry in sorted(
+                    unknown_ops.values(), key=_unknown_sort, reverse=True
+                )[: _limit_value(15)]:
+                    file_ids = sorted(entry.get("file_ids", set()))
+                    file_id_text = ", ".join(file_ids[:3]) if file_ids else "-"
+                    if len(file_ids) > 3:
+                        file_id_text += f" (+{len(file_ids) - 3} more)"
+                    rows.append(
+                        [
+                            "(unknown)",
+                            _truncate_text(
+                                _redact_in_text(str(entry.get("share", "-"))), 50
+                            ),
+                            f"{entry.get('action', '-')} x{entry.get('count', 0)}",
+                            format_bytes_as_mb(int(entry.get("bytes", 0)))
+                            if entry.get("bytes")
+                            else "-",
+                            entry.get("client", "-"),
+                            entry.get("server", "-"),
+                            format_ts(entry.get("first_ts")),
+                            format_ts(entry.get("last_ts")),
+                            _truncate_text(file_id_text, 60),
+                            "UnknownName",
+                        ]
+                    )
 
             lines.append(_format_table(rows))
 
@@ -11891,13 +15299,13 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
         if pipes:
             pipe_text = ", ".join(
                 _truncate_text(_redact_in_text(str(item)), 80)
-                for item in pipes[:_limit_value(10)]
+                for item in pipes[: _limit_value(10)]
             )
             lines.append(muted(f"Named Pipes: {pipe_text}"))
         if other:
             safe_artifacts = ", ".join(
                 _truncate_text(_redact_in_text(str(item)), 80)
-                for item in other[:_limit_value(15)]
+                for item in other[: _limit_value(15)]
             )
             lines.append(muted(f"Artifacts: {safe_artifacts}"))
 
@@ -11928,18 +15336,23 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
         rows = [["Severity", "Count", "Indicators"]]
         for sev in severity_order:
             if severity_counts.get(sev):
-                indicators = Counter(a.title for a in summary.anomalies if a.severity == sev)
+                indicators = Counter(
+                    a.title for a in summary.anomalies if a.severity == sev
+                )
                 indicator_text = ", ".join(
-                    f"{title} ({count})" for title, count in indicators.most_common(_limit_value(5))
+                    f"{title} ({count})"
+                    for title, count in indicators.most_common(_limit_value(5))
                 )
                 sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
                 if sev == "LOW":
                     sev_color = muted
-                rows.append([
-                    sev_color(sev),
-                    str(severity_counts[sev]),
-                    muted(indicator_text) if indicator_text else muted("-"),
-                ])
+                rows.append(
+                    [
+                        sev_color(sev),
+                        str(severity_counts[sev]),
+                        muted(indicator_text) if indicator_text else muted("-"),
+                    ]
+                )
         lines.append(_format_table(rows))
 
         if verbose:
@@ -11956,32 +15369,126 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
     else:
         lines.append(SUBSECTION_BAR)
         lines.append(header("SMB Lateral Movement Scoring"))
-        top_scores = sorted(summary.lateral_movement, key=lambda x: x.get("score", 0), reverse=True)[:_limit_value(5)]
+        top_scores = sorted(
+            summary.lateral_movement, key=lambda x: x.get("score", 0), reverse=True
+        )[: _limit_value(5)]
         rows = [["Client", "Servers", "Admin Shares", "Failures", "Score"]]
         for item in top_scores:
-            rows.append([
-                str(item.get("client", "-")),
-                str(item.get("servers", "-")),
-                str(item.get("admin_shares", "-")),
-                str(item.get("failures", "-")),
-                str(item.get("score", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("client", "-")),
+                    str(item.get("servers", "-")),
+                    str(item.get("admin_shares", "-")),
+                    str(item.get("failures", "-")),
+                    str(item.get("score", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
         if verbose:
             lines.append(SUBSECTION_BAR)
             lines.append(header("SMB Lateral Movement Scoring (Detailed)"))
             rows = [["Client", "Servers", "Admin Shares", "Failures", "Score"]]
-            for item in summary.lateral_movement[:_limit_value(10)]:
-                rows.append([
-                    str(item.get("client", "-")),
-                    str(item.get("servers", "-")),
-                    str(item.get("admin_shares", "-")),
-                    str(item.get("failures", "-")),
-                    str(item.get("score", "-")),
-                ])
+            for item in summary.lateral_movement[: _limit_value(10)]:
+                rows.append(
+                    [
+                        str(item.get("client", "-")),
+                        str(item.get("servers", "-")),
+                        str(item.get("admin_shares", "-")),
+                        str(item.get("failures", "-")),
+                        str(item.get("score", "-")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines)
+
+
+def render_mac_lookup_summary(summary: MacLookupSummary) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"IP -> MAC LOOKUP :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+    query_all = not summary.query_ip
+    lines.append(_format_kv("Query IP", summary.query_ip or "ALL"))
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        for err in summary.errors:
+            lines.append(danger(f"Error: {err}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("IP -> MAC Pairs" if query_all else "MAC Addresses"))
+    if not summary.associations:
+        lines.append(
+            muted(
+                "No IP->MAC associations found."
+                if query_all
+                else "No associated MAC addresses found for the queried IP."
+            )
+        )
+    else:
+        if query_all:
+            unique_pairs = sorted({(hit.ip, hit.mac) for hit in summary.associations})
+            lines.append(_format_kv("Unique Pairs", str(len(unique_pairs))))
+            rows = [["IP Address", "MAC Address", "Manufacturer"]]
+            for ip_value, mac_value in unique_pairs:
+                rows.append([ip_value, mac_value, mac_manufacturer(mac_value)])
+        else:
+            unique_macs = sorted({hit.mac for hit in summary.associations})
+            lines.append(_format_kv("Unique MACs", str(len(unique_macs))))
+            rows = [["MAC Address", "Manufacturer"]]
+            for mac_value in unique_macs:
+                rows.append([mac_value, mac_manufacturer(mac_value)])
+        lines.append(_format_table(rows))
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines)
+
+
+def render_ip_lookup_summary(summary: IpLookupSummary) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"MAC -> IP LOOKUP :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
+    query_all = not summary.query_mac
+    lines.append(_format_kv("Query MAC", summary.query_mac or "ALL"))
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        for err in summary.errors:
+            lines.append(danger(f"Error: {err}"))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("MAC -> IP Pairs" if query_all else "IP Addresses"))
+    if not summary.associations:
+        lines.append(
+            muted(
+                "No MAC->IP associations found."
+                if query_all
+                else "No associated IP addresses found for the queried MAC."
+            )
+        )
+    else:
+        if query_all:
+            unique_pairs = sorted({(hit.mac, hit.ip) for hit in summary.associations})
+            lines.append(_format_kv("Unique Pairs", str(len(unique_pairs))))
+            rows = [["MAC Address", "IP Address", "Hostname"]]
+            for mac_value, ip_value in unique_pairs:
+                hostnames = list((summary.ip_hostnames or {}).get(ip_value, []))
+                hostname_text = ", ".join(hostnames[:2]) if hostnames else "-"
+                rows.append([mac_value, ip_value, _truncate_text(hostname_text, 44)])
+        else:
+            unique_ips = sorted({hit.ip for hit in summary.associations})
+            lines.append(_format_kv("Unique IPs", str(len(unique_ips))))
+            rows = [["IP Address", "Hostname"]]
+            for ip_value in unique_ips:
+                hostnames = list((summary.ip_hostnames or {}).get(ip_value, []))
+                hostname_text = ", ".join(hostnames[:2]) if hostnames else "-"
+                rows.append([ip_value, _truncate_text(hostname_text, 44)])
+        lines.append(_format_table(rows))
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
@@ -11999,7 +15506,11 @@ def render_nfs_summary(summary: NfsSummary) -> str:
             lines.append(danger(f"- {err}"))
 
     lines.append(_format_kv("NFS Packets", str(summary.nfs_packets)))
-    versions_text = ", ".join([f"{k} ({v})" for k, v in summary.versions.items()]) if summary.versions else "-"
+    versions_text = (
+        ", ".join([f"{k} ({v})" for k, v in summary.versions.items()])
+        if summary.versions
+        else "-"
+    )
     lines.append(_format_kv("NFS Versions", versions_text))
     lines.append(_format_kv("Unique Clients", str(len(summary.clients))))
     lines.append(_format_kv("Unique Servers", str(len(summary.servers))))
@@ -12013,7 +15524,13 @@ def render_nfs_summary(summary: NfsSummary) -> str:
         rows = [["Procedure", "Requests", "Responses"]]
         all_cmds = set(summary.requests.keys()).union(summary.responses.keys())
         for cmd in sorted(all_cmds):
-            rows.append([cmd, str(summary.requests.get(cmd, 0)), str(summary.responses.get(cmd, 0))])
+            rows.append(
+                [
+                    cmd,
+                    str(summary.requests.get(cmd, 0)),
+                    str(summary.responses.get(cmd, 0)),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
@@ -12057,13 +15574,15 @@ def render_nfs_summary(summary: NfsSummary) -> str:
     else:
         rows = [["Server", "Versions", "Packets", "First Seen", "Last Seen"]]
         for srv in summary.servers:
-            rows.append([
-                srv.ip,
-                ", ".join(sorted(srv.versions)) if srv.versions else "-",
-                str(srv.packets),
-                format_ts(srv.first_seen),
-                format_ts(srv.last_seen),
-            ])
+            rows.append(
+                [
+                    srv.ip,
+                    ", ".join(sorted(srv.versions)) if srv.versions else "-",
+                    str(srv.packets),
+                    format_ts(srv.first_seen),
+                    format_ts(srv.last_seen),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
@@ -12075,33 +15594,39 @@ def render_nfs_summary(summary: NfsSummary) -> str:
         for cli in summary.clients:
             users = ", ".join(sorted(cli.usernames)) if cli.usernames else "-"
             uids = ", ".join(str(uid) for uid in sorted(cli.uids)) if cli.uids else "-"
-            rows.append([
-                cli.ip,
-                ", ".join(sorted(cli.versions)) if cli.versions else "-",
-                users,
-                uids,
-                str(cli.packets),
-            ])
+            rows.append(
+                [
+                    cli.ip,
+                    ", ".join(sorted(cli.versions)) if cli.versions else "-",
+                    users,
+                    uids,
+                    str(cli.packets),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("NFS Files & Artifacts"))
     if summary.files:
         rows = [["Action", "Name", "Client", "Server", "Time"]]
-        for item in summary.files[:_limit_value(20)]:
-            rows.append([
-                item.action,
-                item.name,
-                item.client_ip,
-                item.server_ip,
-                format_ts(item.ts),
-            ])
+        for item in summary.files[: _limit_value(20)]:
+            rows.append(
+                [
+                    item.action,
+                    item.name,
+                    item.client_ip,
+                    item.server_ip,
+                    format_ts(item.ts),
+                ]
+            )
         lines.append(_format_table(rows))
     else:
         lines.append(muted("No file operations decoded."))
 
     if summary.artifacts:
-        lines.append(muted("Artifacts: " + ", ".join(summary.artifacts[:_limit_value(25)])))
+        lines.append(
+            muted("Artifacts: " + ", ".join(summary.artifacts[: _limit_value(25)]))
+        )
 
     if summary.observed_users:
         lines.append(SUBSECTION_BAR)
@@ -12178,15 +15703,28 @@ def render_strings_summary(summary: StringsSummary) -> str:
         if summary.suspicious_details:
             for item in summary.suspicious_details:
                 reasons = ", ".join(item.get("reasons", [])) or "-"
-                top_src = ", ".join(f"{ip}({count})" for ip, count in item.get("top_sources", [])) or "-"
-                top_dst = ", ".join(f"{ip}({count})" for ip, count in item.get("top_destinations", [])) or "-"
-                rows.append([
-                    str(item.get("value", "-")),
-                    str(item.get("count", "-")),
-                    reasons,
-                    top_src,
-                    top_dst,
-                ])
+                top_src = (
+                    ", ".join(
+                        f"{ip}({count})" for ip, count in item.get("top_sources", [])
+                    )
+                    or "-"
+                )
+                top_dst = (
+                    ", ".join(
+                        f"{ip}({count})"
+                        for ip, count in item.get("top_destinations", [])
+                    )
+                    or "-"
+                )
+                rows.append(
+                    [
+                        str(item.get("value", "-")),
+                        str(item.get("count", "-")),
+                        reasons,
+                        top_src,
+                        top_dst,
+                    ]
+                )
         else:
             for item in summary.suspicious_strings:
                 rows.append([item.value, str(item.count), "-", "-", "-"])
@@ -12251,46 +15789,27 @@ def render_search_summary(summary: SearchSummary) -> str:
     if not summary.hits:
         lines.append(muted("No matches found."))
     else:
-        header_row = ["Pkt", "Time", "Src", "Dst", "Proto", "Sport", "Dport", "Len"]
-        data_rows = []
+        rows = [
+            ["Pkt", "Time", "Src", "Dst", "Proto", "Sport", "Dport", "Len", "Context"]
+        ]
         for hit in summary.hits:
-            data_rows.append([
-                str(hit.packet_number),
-                format_ts(hit.ts),
-                hit.src_ip,
-                hit.dst_ip,
-                hit.protocol,
-                str(hit.src_port) if hit.src_port is not None else "-",
-                str(hit.dst_port) if hit.dst_port is not None else "-",
-                str(hit.payload_len),
-            ])
-
-        def _visible_len(text: str) -> int:
-            return len(re.sub(r"\x1b\[[0-9;]*m", "", text))
-
-        rows = [header_row] + data_rows
-        widths = [max(_visible_len(row[i]) for row in rows) for i in range(len(header_row))]
-
-        def _format_row(row: list[str]) -> str:
-            parts = []
-            for idx, value in enumerate(row):
-                pad = widths[idx] - _visible_len(value)
-                parts.append(value + (" " * max(0, pad)))
-            return "  ".join(parts)
-
-        lines.append(_format_row(header_row))
-        context_indent = " " * (widths[0] + 2)
-        for hit, row in zip(summary.hits, data_rows):
-            lines.append(_format_row(row))
             context_text = _truncate_text(hit.context, 80)
             if context_text:
                 context_text = _highlight_search_text(context_text, summary.query)
-                context_lines = context_text.splitlines() or [""]
-                label_text = "Context: "
-                lines.append(f"{context_indent}{label_text}{context_lines[0]}")
-                continuation_indent = context_indent + (" " * len(label_text))
-                for extra_line in context_lines[1:]:
-                    lines.append(f"{continuation_indent}{extra_line}")
+            rows.append(
+                [
+                    str(hit.packet_number),
+                    format_ts(hit.ts),
+                    hit.src_ip,
+                    hit.dst_ip,
+                    hit.protocol,
+                    str(hit.src_port) if hit.src_port is not None else "-",
+                    str(hit.dst_port) if hit.dst_port is not None else "-",
+                    str(hit.payload_len),
+                    context_text or "-",
+                ]
+            )
+        lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
@@ -12325,13 +15844,15 @@ def render_search_rollup(summaries: Iterable[SearchSummary], limit: int = 20) ->
         if summary.truncated:
             truncated_pcaps += 1
         err_count = len(summary.errors)
-        rows.append([
-            summary.path.name,
-            str(summary.matches),
-            str(summary.total_packets),
-            str(len(summary.hits)),
-            str(err_count),
-        ])
+        rows.append(
+            [
+                summary.path.name,
+                str(summary.matches),
+                str(summary.total_packets),
+                str(len(summary.hits)),
+                str(err_count),
+            ]
+        )
         for err in summary.errors:
             all_errors.append(f"{summary.path.name}: {err}")
 
@@ -12349,23 +15870,38 @@ def render_search_rollup(summaries: Iterable[SearchSummary], limit: int = 20) ->
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Top Match Details"))
-    detail_rows = [["PCAP", "Pkt", "Time", "Src", "Dst", "Proto", "Sport", "Dport", "Len", "Context"]]
+    detail_rows = [
+        [
+            "PCAP",
+            "Pkt",
+            "Time",
+            "Src",
+            "Dst",
+            "Proto",
+            "Sport",
+            "Dport",
+            "Len",
+            "Context",
+        ]
+    ]
     for summary in sorted(summary_list, key=lambda item: item.matches, reverse=True):
         for hit in summary.hits:
             if len(detail_rows) > limit:
                 break
-            detail_rows.append([
-                summary.path.name,
-                str(hit.packet_number),
-                format_ts(hit.ts),
-                hit.src_ip,
-                hit.dst_ip,
-                hit.protocol,
-                str(hit.src_port) if hit.src_port is not None else "-",
-                str(hit.dst_port) if hit.dst_port is not None else "-",
-                str(hit.payload_len),
-                _truncate_text(hit.context, 80),
-            ])
+            detail_rows.append(
+                [
+                    summary.path.name,
+                    str(hit.packet_number),
+                    format_ts(hit.ts),
+                    hit.src_ip,
+                    hit.dst_ip,
+                    hit.protocol,
+                    str(hit.src_port) if hit.src_port is not None else "-",
+                    str(hit.dst_port) if hit.dst_port is not None else "-",
+                    str(hit.payload_len),
+                    _truncate_text(hit.context, 80),
+                ]
+            )
         if len(detail_rows) > limit:
             break
 
@@ -12375,12 +15911,14 @@ def render_search_rollup(summaries: Iterable[SearchSummary], limit: int = 20) ->
         lines.append(_format_table(detail_rows))
         shown = len(detail_rows) - 1
         if shown < total_hits:
-            lines.append(warn(f"[WARN] Showing first {shown} hit rows across all pcaps."))
+            lines.append(
+                warn(f"[WARN] Showing first {shown} hit rows across all pcaps.")
+            )
 
     if all_errors:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Errors"))
-        for err in all_errors[:_limit_value(25)]:
+        for err in all_errors[: _limit_value(25)]:
             lines.append(danger(f"- {err}"))
         if len(all_errors) > 25:
             lines.append(muted(f"... {len(all_errors) - 25} more errors"))
@@ -12420,7 +15958,10 @@ def render_creds_summary(summary: CredentialSummary) -> str:
     def _format_protocols(protocol_counts: Counter[str]) -> str:
         if not protocol_counts:
             return "-"
-        parts = [f"{name}({count})" for name, count in protocol_counts.most_common(_limit_value(5))]
+        parts = [
+            f"{name}({count})"
+            for name, count in protocol_counts.most_common(_limit_value(5))
+        ]
         remaining = len(protocol_counts) - len(parts)
         if remaining > 0:
             parts.append(f"+{remaining}")
@@ -12575,7 +16116,11 @@ def render_creds_summary(summary: CredentialSummary) -> str:
     lines.append(SUBSECTION_BAR)
     lines.append(header("Protocol Coverage"))
     if not protocol_totals:
-        lines.append(muted("No credential material detected across supported IT/OT protocol decoders."))
+        lines.append(
+            muted(
+                "No credential material detected across supported IT/OT protocol decoders."
+            )
+        )
     else:
         protocol_rows = [["Family", "Protocol", "Hits"]]
         sorted_protocols = sorted(
@@ -12586,7 +16131,7 @@ def render_creds_summary(summary: CredentialSummary) -> str:
                 str(item[0]).lower(),
             ),
         )
-        for proto, count in sorted_protocols[:_limit_value(24)]:
+        for proto, count in sorted_protocols[: _limit_value(24)]:
             protocol_rows.append([_protocol_family(str(proto)), str(proto), str(count)])
         lines.append(_format_table(protocol_rows))
 
@@ -12600,23 +16145,33 @@ def render_creds_summary(summary: CredentialSummary) -> str:
             username_groups.items(),
             key=lambda pair: (
                 family_rank.get(
-                    _entry_family(pair[1].get("protocols", Counter()) if isinstance(pair[1].get("protocols", Counter()), Counter) else Counter()),
+                    _entry_family(
+                        pair[1].get("protocols", Counter())
+                        if isinstance(pair[1].get("protocols", Counter()), Counter)
+                        else Counter()
+                    ),
                     99,
                 ),
                 -int(pair[1].get("hits", 0)),
                 pair[0].lower(),
             ),
         )
-        for username, item in sorted_users[:_limit_value(80)]:
+        for username, item in sorted_users[: _limit_value(80)]:
             protocols = item.get("protocols", Counter())
             packets = item.get("packets", set())
-            user_rows.append([
-                _entry_family(protocols if isinstance(protocols, Counter) else Counter()),
-                username,
-                _format_protocols(protocols if isinstance(protocols, Counter) else Counter()),
-                _format_packets(packets if isinstance(packets, set) else set()),
-                str(item.get("hits", 0)),
-            ])
+            user_rows.append(
+                [
+                    _entry_family(
+                        protocols if isinstance(protocols, Counter) else Counter()
+                    ),
+                    username,
+                    _format_protocols(
+                        protocols if isinstance(protocols, Counter) else Counter()
+                    ),
+                    _format_packets(packets if isinstance(packets, set) else set()),
+                    str(item.get("hits", 0)),
+                ]
+            )
         lines.append(_format_table(user_rows))
 
     lines.append(SUBSECTION_BAR)
@@ -12629,23 +16184,33 @@ def render_creds_summary(summary: CredentialSummary) -> str:
             secret_groups.items(),
             key=lambda pair: (
                 family_rank.get(
-                    _entry_family(pair[1].get("protocols", Counter()) if isinstance(pair[1].get("protocols", Counter()), Counter) else Counter()),
+                    _entry_family(
+                        pair[1].get("protocols", Counter())
+                        if isinstance(pair[1].get("protocols", Counter()), Counter)
+                        else Counter()
+                    ),
                     99,
                 ),
                 -int(pair[1].get("hits", 0)),
                 pair[0].lower(),
             ),
         )
-        for secret, item in sorted_secrets[:_limit_value(80)]:
+        for secret, item in sorted_secrets[: _limit_value(80)]:
             protocols = item.get("protocols", Counter())
             packets = item.get("packets", set())
-            secret_rows.append([
-                _entry_family(protocols if isinstance(protocols, Counter) else Counter()),
-                _display_secret(secret),
-                _format_protocols(protocols if isinstance(protocols, Counter) else Counter()),
-                _format_packets(packets if isinstance(packets, set) else set()),
-                str(item.get("hits", 0)),
-            ])
+            secret_rows.append(
+                [
+                    _entry_family(
+                        protocols if isinstance(protocols, Counter) else Counter()
+                    ),
+                    _display_secret(secret),
+                    _format_protocols(
+                        protocols if isinstance(protocols, Counter) else Counter()
+                    ),
+                    _format_packets(packets if isinstance(packets, set) else set()),
+                    str(item.get("hits", 0)),
+                ]
+            )
         lines.append(_format_table(secret_rows))
 
     lines.append(SUBSECTION_BAR)
@@ -12653,12 +16218,18 @@ def render_creds_summary(summary: CredentialSummary) -> str:
     if not pair_groups:
         lines.append(muted("No correlated username+secret pairs discovered."))
     else:
-        pair_rows = [["Family", "Username", "Secret/Token", "Protocols", "Packets", "Hits"]]
+        pair_rows = [
+            ["Family", "Username", "Secret/Token", "Protocols", "Packets", "Hits"]
+        ]
         sorted_pairs = sorted(
             pair_groups.items(),
             key=lambda pair: (
                 family_rank.get(
-                    _entry_family(pair[1].get("protocols", Counter()) if isinstance(pair[1].get("protocols", Counter()), Counter) else Counter()),
+                    _entry_family(
+                        pair[1].get("protocols", Counter())
+                        if isinstance(pair[1].get("protocols", Counter()), Counter)
+                        else Counter()
+                    ),
                     99,
                 ),
                 -int(pair[1].get("hits", 0)),
@@ -12666,21 +16237,31 @@ def render_creds_summary(summary: CredentialSummary) -> str:
                 pair[0][1].lower(),
             ),
         )
-        for (username, secret), item in sorted_pairs[:_limit_value(80)]:
+        for (username, secret), item in sorted_pairs[: _limit_value(80)]:
             protocols = item.get("protocols", Counter())
             packets = item.get("packets", set())
-            pair_rows.append([
-                _entry_family(protocols if isinstance(protocols, Counter) else Counter()),
-                username,
-                _display_secret(secret),
-                _format_protocols(protocols if isinstance(protocols, Counter) else Counter()),
-                _format_packets(packets if isinstance(packets, set) else set()),
-                str(item.get("hits", 0)),
-            ])
+            pair_rows.append(
+                [
+                    _entry_family(
+                        protocols if isinstance(protocols, Counter) else Counter()
+                    ),
+                    username,
+                    _display_secret(secret),
+                    _format_protocols(
+                        protocols if isinstance(protocols, Counter) else Counter()
+                    ),
+                    _format_packets(packets if isinstance(packets, set) else set()),
+                    str(item.get("hits", 0)),
+                ]
+            )
         lines.append(_format_table(pair_rows))
 
     if summary.truncated:
-        lines.append(warn(f"[WARN] Detection stage truncated and returned first {len(summary.hits)} matches."))
+        lines.append(
+            warn(
+                f"[WARN] Detection stage truncated and returned first {len(summary.hits)} matches."
+            )
+        )
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
@@ -12717,7 +16298,9 @@ def render_secrets_summary(summary: SecretsSummary) -> str:
     if not summary.hits:
         lines.append(muted("No reversible obfuscated secrets detected."))
     else:
-        rows = [["Type", "Secret", "Cleartext", "Location", "Src", "Dst", "Proto", "Note"]]
+        rows = [
+            ["Type", "Secret", "Cleartext", "Location", "Src", "Dst", "Proto", "Note"]
+        ]
         for hit in summary.hits:
             secret_value = hit.encoded
             clear_value = hit.decoded
@@ -12733,16 +16316,18 @@ def render_secrets_summary(summary: SecretsSummary) -> str:
                 src = f"{src}:{hit.src_port}"
             if hit.dst_port is not None:
                 dst = f"{dst}:{hit.dst_port}"
-            rows.append([
-                hit.kind,
-                _truncate_text(secret_value, 48),
-                _truncate_text(clear_value, 64),
-                location,
-                src,
-                dst,
-                hit.protocol,
-                _truncate_text(hit.note or "-", 40),
-            ])
+            rows.append(
+                [
+                    hit.kind,
+                    _truncate_text(secret_value, 48),
+                    _truncate_text(clear_value, 64),
+                    location,
+                    src,
+                    dst,
+                    hit.protocol,
+                    _truncate_text(hit.note or "-", 40),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
@@ -12772,19 +16357,27 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
             reasons.append(f"Weak key certificates detected ({len(summary.weak_keys)})")
         if summary.weak_signatures:
             score += min(2, len(summary.weak_signatures))
-            reasons.append(f"Weak signature algorithms detected ({len(summary.weak_signatures)})")
+            reasons.append(
+                f"Weak signature algorithms detected ({len(summary.weak_signatures)})"
+            )
         if summary.expired:
             score += 1
-            reasons.append(f"Expired/invalid certificates detected ({len(summary.expired)})")
+            reasons.append(
+                f"Expired/invalid certificates detected ({len(summary.expired)})"
+            )
         if summary.eku_mismatches or summary.key_usage_issues:
             score += 1
             reasons.append("EKU/KeyUsage mismatches observed")
         if summary.name_mismatches:
             score += 1
-            reasons.append(f"Name/SAN mismatches observed ({len(summary.name_mismatches)})")
+            reasons.append(
+                f"Name/SAN mismatches observed ({len(summary.name_mismatches)})"
+            )
         if summary.issuer_impersonation:
             score += 2
-            reasons.append(f"Issuer/SAN impersonation signals observed ({len(summary.issuer_impersonation)})")
+            reasons.append(
+                f"Issuer/SAN impersonation signals observed ({len(summary.issuer_impersonation)})"
+            )
         if summary.fingerprint_reuse or summary.serial_reuse:
             score += 1
             reasons.append("Fingerprint/serial reuse across contexts observed")
@@ -12803,7 +16396,9 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
             confidence = "Low"
 
         if not reasons:
-            reasons.append("No high-confidence certificate threat heuristic crossed threshold")
+            reasons.append(
+                "No high-confidence certificate threat heuristic crossed threshold"
+            )
         return verdict, confidence, reasons, score
 
     verdict, confidence, verdict_reasons, verdict_score = _cert_verdict()
@@ -12817,7 +16412,7 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(10)]:
+    for reason in verdict_reasons[: _limit_value(10)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     lines.append(SUBSECTION_BAR)
@@ -12825,21 +16420,42 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
 
     checks: list[tuple[str, list[dict[str, object]]]] = [
         ("Chain/Trust Gaps", list(getattr(summary, "chain_gaps", []) or [])),
-        ("Weak Signature Algorithms", list(getattr(summary, "weak_signatures", []) or [])),
-        ("EKU/KeyUsage Mismatch", list(getattr(summary, "eku_mismatches", []) or []) + list(getattr(summary, "key_usage_issues", []) or [])),
+        (
+            "Weak Signature Algorithms",
+            list(getattr(summary, "weak_signatures", []) or []),
+        ),
+        (
+            "EKU/KeyUsage Mismatch",
+            list(getattr(summary, "eku_mismatches", []) or [])
+            + list(getattr(summary, "key_usage_issues", []) or []),
+        ),
         ("Name/SAN Mismatch", list(getattr(summary, "name_mismatches", []) or [])),
         ("Validity Outliers", list(getattr(summary, "validity_outliers", []) or [])),
-        ("Issuer/SAN Impersonation", list(getattr(summary, "issuer_impersonation", []) or [])),
-        ("Fingerprint/Serial Reuse", list(getattr(summary, "fingerprint_reuse", []) or []) + list(getattr(summary, "serial_reuse", []) or [])),
-        ("Revocation Posture Gaps", list(getattr(summary, "revocation_gaps", []) or [])),
+        (
+            "Issuer/SAN Impersonation",
+            list(getattr(summary, "issuer_impersonation", []) or []),
+        ),
+        (
+            "Fingerprint/Serial Reuse",
+            list(getattr(summary, "fingerprint_reuse", []) or [])
+            + list(getattr(summary, "serial_reuse", []) or []),
+        ),
+        (
+            "Revocation Posture Gaps",
+            list(getattr(summary, "revocation_gaps", []) or []),
+        ),
     ]
 
     matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for label_text, evidence_items in checks:
         lines.append(label(label_text))
         if evidence_items:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for item in evidence_items[:_limit_value(6)]:
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
+            for item in evidence_items[: _limit_value(6)]:
                 if isinstance(item, dict):
                     if "subject" in item and "reason" in item:
                         ev = f"subject={item.get('subject')} reason={item.get('reason')} src={item.get('src', '-')} dst={item.get('dst', '-')}"
@@ -12853,14 +16469,33 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
                     ev = str(item)
                 lines.append(muted(f"- {_redact_in_text(ev)}"))
 
-            if label_text in {"Weak Signature Algorithms", "Issuer/SAN Impersonation", "Fingerprint/Serial Reuse"}:
-                matrix_rows.append([label_text, "High", "High", f"{len(evidence_items)} signal(s)"])
-            elif label_text in {"Chain/Trust Gaps", "EKU/KeyUsage Mismatch", "Name/SAN Mismatch", "Validity Outliers"}:
-                matrix_rows.append([label_text, "Medium", "Medium", f"{len(evidence_items)} signal(s)"])
+            if label_text in {
+                "Weak Signature Algorithms",
+                "Issuer/SAN Impersonation",
+                "Fingerprint/Serial Reuse",
+            }:
+                matrix_rows.append(
+                    [label_text, "High", "High", f"{len(evidence_items)} signal(s)"]
+                )
+            elif label_text in {
+                "Chain/Trust Gaps",
+                "EKU/KeyUsage Mismatch",
+                "Name/SAN Mismatch",
+                "Validity Outliers",
+            }:
+                matrix_rows.append(
+                    [label_text, "Medium", "Medium", f"{len(evidence_items)} signal(s)"]
+                )
             else:
-                matrix_rows.append([label_text, "Low", "Low", f"{len(evidence_items)} signal(s)"])
+                matrix_rows.append(
+                    [label_text, "Low", "Low", f"{len(evidence_items)} signal(s)"]
+                )
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -12871,16 +16506,20 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
     if endpoint_profiles:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Endpoint Certificate Profiles"))
-        rows = [["Endpoint", "Certs", "Subjects", "Issuers", "Flows", "Latest NotAfter"]]
-        for item in endpoint_profiles[:_limit_value(12)]:
-            rows.append([
-                str(item.get("endpoint", "-")),
-                str(item.get("fingerprints", "-")),
-                str(item.get("subjects", "-")),
-                str(item.get("issuers", "-")),
-                str(item.get("flows", "-")),
-                str(item.get("latest_not_after", "-")),
-            ])
+        rows = [
+            ["Endpoint", "Certs", "Subjects", "Issuers", "Flows", "Latest NotAfter"]
+        ]
+        for item in endpoint_profiles[: _limit_value(12)]:
+            rows.append(
+                [
+                    str(item.get("endpoint", "-")),
+                    str(item.get("fingerprints", "-")),
+                    str(item.get("subjects", "-")),
+                    str(item.get("issuers", "-")),
+                    str(item.get("flows", "-")),
+                    str(item.get("latest_not_after", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     timeline = list(getattr(summary, "timeline", []) or [])
@@ -12888,30 +16527,34 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Certificate Timeline"))
         rows = [["Event", "Subject", "Issuer", "Src", "Dst", "NotAfter"]]
-        for item in timeline[:_limit_value(15)]:
-            rows.append([
-                str(item.get("event", "-")),
-                _truncate_text(str(item.get("subject", "-")), 48),
-                _truncate_text(str(item.get("issuer", "-")), 48),
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("not_after", "-")),
-            ])
+        for item in timeline[: _limit_value(15)]:
+            rows.append(
+                [
+                    str(item.get("event", "-")),
+                    _truncate_text(str(item.get("subject", "-")), 48),
+                    _truncate_text(str(item.get("issuer", "-")), 48),
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("not_after", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Actionable Hunting Pivots"))
         rows = [["SHA256", "Serial", "Subject", "Issuer", "SAN", "Flow"]]
-        for cert in summary.artifacts[:_limit_value(12)]:
-            rows.append([
-                cert.sha256[:12],
-                cert.serial,
-                _truncate_text(cert.subject, 30),
-                _truncate_text(cert.issuer, 30),
-                _truncate_text(cert.san, 24),
-                f"{cert.src_ip}->{cert.dst_ip}",
-            ])
+        for cert in summary.artifacts[: _limit_value(12)]:
+            rows.append(
+                [
+                    cert.sha256[:12],
+                    cert.serial,
+                    _truncate_text(cert.subject, 30),
+                    _truncate_text(cert.issuer, 30),
+                    _truncate_text(cert.san, 24),
+                    f"{cert.src_ip}->{cert.dst_ip}",
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.subjects:
@@ -12942,54 +16585,70 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Weak Keys"))
         rows = [["Subject", "Key Size", "Src", "Dst"]]
-        for item in summary.weak_keys[:_limit_value(10)]:
-            rows.append([
-                str(item.get("subject", "-")),
-                str(item.get("size", "-")),
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-            ])
+        for item in summary.weak_keys[: _limit_value(10)]:
+            rows.append(
+                [
+                    str(item.get("subject", "-")),
+                    str(item.get("size", "-")),
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.expired:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Expired / Invalid Certificates"))
-        lines.append(muted("  Expired or invalid validity windows can indicate misconfigurations, expired infrastructure, or opportunistic interception."))
+        lines.append(
+            muted(
+                "  Expired or invalid validity windows can indicate misconfigurations, expired infrastructure, or opportunistic interception."
+            )
+        )
         rows = [["Subject", "Reason", "Src", "Dst"]]
-        for item in summary.expired[:_limit_value(10)]:
-            rows.append([
-                str(item.get("subject", "-")),
-                str(item.get("reason", "-")),
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-            ])
+        for item in summary.expired[: _limit_value(10)]:
+            rows.append(
+                [
+                    str(item.get("subject", "-")),
+                    str(item.get("reason", "-")),
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.self_signed:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Self-Signed Certificates"))
-        lines.append(muted("  Self-signed certs may be benign in labs but can also signal spoofed services, internal C2, or TLS interception."))
+        lines.append(
+            muted(
+                "  Self-signed certs may be benign in labs but can also signal spoofed services, internal C2, or TLS interception."
+            )
+        )
         rows = [["Subject", "Src", "Dst"]]
-        for item in summary.self_signed[:_limit_value(10)]:
-            rows.append([
-                str(item.get("subject", "-")),
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-            ])
+        for item in summary.self_signed[: _limit_value(10)]:
+            rows.append(
+                [
+                    str(item.get("subject", "-")),
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Certificate Artifacts"))
         rows = [["Subject", "Issuer", "Not After", "Key", "SHA256"]]
-        for cert in summary.artifacts[:_limit_value(10)]:
-            rows.append([
-                cert.subject,
-                cert.issuer,
-                cert.not_after,
-                f"{cert.pubkey_type} {cert.pubkey_size}",
-                cert.sha256[:_limit_value(32)] + "...",
-            ])
+        for cert in summary.artifacts[: _limit_value(10)]:
+            rows.append(
+                [
+                    cert.subject,
+                    cert.issuer,
+                    cert.not_after,
+                    f"{cert.pubkey_type} {cert.pubkey_size}",
+                    cert.sha256[: _limit_value(32)] + "...",
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
@@ -13026,7 +16685,10 @@ def render_health_summary(summary: HealthSummary) -> str:
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Analyst Verdict"))
-    verdict = summary.analyst_verdict or "NO STRONG SIGNAL - no convincing high-confidence health risk pattern from current heuristics"
+    verdict = (
+        summary.analyst_verdict
+        or "NO STRONG SIGNAL - no convincing high-confidence health risk pattern from current heuristics"
+    )
     confidence = (summary.analyst_confidence or "low").strip().lower()
     if verdict.startswith("YES"):
         lines.append(danger(verdict))
@@ -13037,7 +16699,7 @@ def render_health_summary(summary: HealthSummary) -> str:
     lines.append(_format_kv("Confidence", confidence.capitalize()))
     if summary.analyst_reasons:
         lines.append(muted("Why confidence:"))
-        for reason in summary.analyst_reasons[:_limit_value(8)]:
+        for reason in summary.analyst_reasons[: _limit_value(8)]:
             lines.append(muted(f"- {_redact_in_text(str(reason))}"))
 
     lines.append(SUBSECTION_BAR)
@@ -13058,17 +16720,43 @@ def render_health_summary(summary: HealthSummary) -> str:
     ]
     matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for key, label_text in check_labels:
-        evidence_items = [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
+        evidence_items = [
+            str(v) for v in list(checks.get(key, []) or []) if str(v).strip()
+        ]
         lines.append(label(label_text))
         if evidence_items:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for item in evidence_items[:_limit_value(6)]:
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
+            for item in evidence_items[: _limit_value(6)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-            risk = "High" if key in {"udp_reflection_amplification", "snmp_exposure_risk", "ot_cycle_instability", "sequence_degradation_chain"} else "Medium"
-            conf = "High" if key in {"snmp_exposure_risk", "evidence_provenance"} else "Medium"
-            matrix_rows.append([label_text, risk, conf, f"{len(evidence_items)} signal(s)"])
+            risk = (
+                "High"
+                if key
+                in {
+                    "udp_reflection_amplification",
+                    "snmp_exposure_risk",
+                    "ot_cycle_instability",
+                    "sequence_degradation_chain",
+                }
+                else "Medium"
+            )
+            conf = (
+                "High"
+                if key in {"snmp_exposure_risk", "evidence_provenance"}
+                else "Medium"
+            )
+            matrix_rows.append(
+                [label_text, risk, conf, f"{len(evidence_items)} signal(s)"]
+            )
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -13080,50 +16768,82 @@ def render_health_summary(summary: HealthSummary) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Sequence-Based Degradation Checks"))
         rows = [["Sequence", "Confidence", "Details"]]
-        for item in sequence_rows[:_limit_value(10)]:
-            rows.append([
-                str(item.get("sequence", "-")),
-                str(item.get("confidence", "-")).upper(),
-                _truncate_text(str(item.get("details", "-")), 90),
-            ])
+        for item in sequence_rows[: _limit_value(10)]:
+            rows.append(
+                [
+                    str(item.get("sequence", "-")),
+                    str(item.get("confidence", "-")).upper(),
+                    _truncate_text(str(item.get("details", "-")), 90),
+                ]
+            )
         lines.append(_format_table(rows))
 
     host_rows = list(getattr(summary, "host_risk_profiles", []) or [])
     if host_rows:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Per-Host Risk Profiles"))
-        rows = [["Host", "Score", "Severity", "Confidence", "SYN", "RST", "ZeroWin", "Targets", "Reasons"]]
-        for item in host_rows[:_limit_value(12)]:
+        rows = [
+            [
+                "Host",
+                "Score",
+                "Severity",
+                "Confidence",
+                "SYN",
+                "RST",
+                "ZeroWin",
+                "Targets",
+                "Reasons",
+            ]
+        ]
+        for item in host_rows[: _limit_value(12)]:
             reasons = item.get("reasons", [])
-            reason_text = " | ".join(str(v) for v in reasons[:3]) if isinstance(reasons, list) else str(reasons)
-            rows.append([
-                str(item.get("host", "-")),
-                str(item.get("score", "-")),
-                str(item.get("severity", "-")).upper(),
-                str(item.get("confidence", "-")).upper(),
-                str(item.get("syn", "-")),
-                str(item.get("rst", "-")),
-                str(item.get("zero_window", "-")),
-                str(item.get("targets", "-")),
-                _truncate_text(reason_text or "-", 72),
-            ])
+            reason_text = (
+                " | ".join(str(v) for v in reasons[:3])
+                if isinstance(reasons, list)
+                else str(reasons)
+            )
+            rows.append(
+                [
+                    str(item.get("host", "-")),
+                    str(item.get("score", "-")),
+                    str(item.get("severity", "-")).upper(),
+                    str(item.get("confidence", "-")).upper(),
+                    str(item.get("syn", "-")),
+                    str(item.get("rst", "-")),
+                    str(item.get("zero_window", "-")),
+                    str(item.get("targets", "-")),
+                    _truncate_text(reason_text or "-", 72),
+                ]
+            )
         lines.append(_format_table(rows))
 
     outlier_rows = list(getattr(summary, "outlier_windows", []) or [])
     if outlier_rows:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Temporal Outlier Windows"))
-        rows = [["Metric", "Window Start", "Window End", "Value", "Baseline", "Threshold", "Sample"]]
-        for item in outlier_rows[:_limit_value(12)]:
-            rows.append([
-                str(item.get("metric", "-")),
-                format_ts(item.get("window_start")),
-                format_ts(item.get("window_end")),
-                str(item.get("value", "-")),
-                str(item.get("baseline", "-")),
-                str(item.get("threshold", "-")),
-                _truncate_text(str(item.get("sample", "-")), 72),
-            ])
+        rows = [
+            [
+                "Metric",
+                "Window Start",
+                "Window End",
+                "Value",
+                "Baseline",
+                "Threshold",
+                "Sample",
+            ]
+        ]
+        for item in outlier_rows[: _limit_value(12)]:
+            rows.append(
+                [
+                    str(item.get("metric", "-")),
+                    format_ts(item.get("window_start")),
+                    format_ts(item.get("window_end")),
+                    str(item.get("value", "-")),
+                    str(item.get("baseline", "-")),
+                    str(item.get("threshold", "-")),
+                    _truncate_text(str(item.get("sample", "-")), 72),
+                ]
+            )
         lines.append(_format_table(rows))
 
     snmp_rows = list(getattr(summary, "snmp_risks", []) or [])
@@ -13131,11 +16851,13 @@ def render_health_summary(summary: HealthSummary) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("SNMP Security Analytics"))
         rows = [["Risk", "Details"]]
-        for item in snmp_rows[:_limit_value(10)]:
-            rows.append([
-                str(item.get("risk", "-")),
-                _truncate_text(str(item.get("details", "-")), 96),
-            ])
+        for item in snmp_rows[: _limit_value(10)]:
+            rows.append(
+                [
+                    str(item.get("risk", "-")),
+                    _truncate_text(str(item.get("details", "-")), 96),
+                ]
+            )
         lines.append(_format_table(rows))
 
     ot_rows = list(getattr(summary, "ot_risk_profiles", []) or [])
@@ -13143,22 +16865,24 @@ def render_health_summary(summary: HealthSummary) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("OT Health Safety Checks"))
         rows = [["Family", "Session", "Avg(s)", "Std(s)", "CV", "Samples", "Severity"]]
-        for item in ot_rows[:_limit_value(10)]:
-            rows.append([
-                str(item.get("family", "-")),
-                _truncate_text(str(item.get("session", "-")), 44),
-                f"{float(item.get('avg', 0.0)):.3f}",
-                f"{float(item.get('std', 0.0)):.3f}",
-                f"{float(item.get('cv', 0.0)):.2f}",
-                str(item.get("count", "-")),
-                str(item.get("severity", "-")).upper(),
-            ])
+        for item in ot_rows[: _limit_value(10)]:
+            rows.append(
+                [
+                    str(item.get("family", "-")),
+                    _truncate_text(str(item.get("session", "-")), 44),
+                    f"{float(item.get('avg', 0.0)):.3f}",
+                    f"{float(item.get('std', 0.0)):.3f}",
+                    f"{float(item.get('cv', 0.0)):.2f}",
+                    str(item.get("count", "-")),
+                    str(item.get("severity", "-")).upper(),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.zone_anomalies:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Peer Trust Zoning Checks"))
-        for item in summary.zone_anomalies[:_limit_value(10)]:
+        for item in summary.zone_anomalies[: _limit_value(10)]:
             lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     anchors = list(getattr(summary, "evidence_anchors", []) or [])
@@ -13166,38 +16890,52 @@ def render_health_summary(summary: HealthSummary) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Evidence Anchors"))
         rows = [["Packet", "Signal", "Details"]]
-        for item in anchors[:_limit_value(12)]:
-            rows.append([
-                str(item.get("packet", "-")),
-                str(item.get("signal", "-")),
-                _truncate_text(str(item.get("details", "-")), 88),
-            ])
+        for item in anchors[: _limit_value(12)]:
+            rows.append(
+                [
+                    str(item.get("packet", "-")),
+                    str(item.get("signal", "-")),
+                    _truncate_text(str(item.get("details", "-")), 88),
+                ]
+            )
         lines.append(_format_table(rows))
 
     benign = list(getattr(summary, "benign_context", []) or [])
     if benign:
         lines.append(SUBSECTION_BAR)
         lines.append(header("False-Positive Context"))
-        for item in benign[:_limit_value(8)]:
+        for item in benign[: _limit_value(8)]:
             lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Retransmissions"))
     lines.append(_format_kv("TCP Retransmissions", str(summary.retransmissions)))
-    lines.append(_format_kv("Retransmission Rate", f"{summary.retransmission_rate:.2%}"))
+    lines.append(
+        _format_kv("Retransmission Rate", f"{summary.retransmission_rate:.2%}")
+    )
 
     if summary.endpoint_bytes:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Talkers"))
         rows = [["Endpoint", "Packets", "Bytes"]]
-        endpoint_packets = summary.endpoint_packets if isinstance(summary.endpoint_packets, Counter) else Counter()
-        endpoint_bytes = summary.endpoint_bytes if isinstance(summary.endpoint_bytes, Counter) else Counter()
+        endpoint_packets = (
+            summary.endpoint_packets
+            if isinstance(summary.endpoint_packets, Counter)
+            else Counter()
+        )
+        endpoint_bytes = (
+            summary.endpoint_bytes
+            if isinstance(summary.endpoint_bytes, Counter)
+            else Counter()
+        )
         for ip, byte_count in endpoint_bytes.most_common(_limit_value(10)):
-            rows.append([
-                ip,
-                str(endpoint_packets.get(ip, 0)),
-                format_bytes_as_mb(byte_count),
-            ])
+            rows.append(
+                [
+                    ip,
+                    str(endpoint_packets.get(ip, 0)),
+                    format_bytes_as_mb(byte_count),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.flow_duration_buckets:
@@ -13210,7 +16948,11 @@ def render_health_summary(summary: HealthSummary) -> str:
                 continue
             counts = [int(buckets.get(bucket, 0)) for bucket in bucket_order]
             lines.append(_format_kv(f"{label_text} Buckets", ", ".join(bucket_order)))
-            lines.append(_format_kv(f"{label_text} Counts", ", ".join(str(val) for val in counts)))
+            lines.append(
+                _format_kv(
+                    f"{label_text} Counts", ", ".join(str(val) for val in counts)
+                )
+            )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("TTL / Hop Limit"))
@@ -13229,27 +16971,66 @@ def render_health_summary(summary: HealthSummary) -> str:
     lines.append(_format_kv("Zero-Window", str(summary.tcp_zero_window)))
     lines.append(_format_kv("Small-Window", str(summary.tcp_small_window)))
     if summary.tcp_zero_window_sources:
-        top_zero = ", ".join(f"{ip}({count})" for ip, count in summary.tcp_zero_window_sources.most_common(_limit_value(5)))
+        top_zero = ", ".join(
+            f"{ip}({count})"
+            for ip, count in summary.tcp_zero_window_sources.most_common(
+                _limit_value(5)
+            )
+        )
         lines.append(_format_kv("Zero-Window Sources", top_zero))
     if summary.tcp_rst_sources:
-        top_rst = ", ".join(f"{ip}({count})" for ip, count in summary.tcp_rst_sources.most_common(_limit_value(5)))
+        top_rst = ", ".join(
+            f"{ip}({count})"
+            for ip, count in summary.tcp_rst_sources.most_common(_limit_value(5))
+        )
         lines.append(_format_kv("RST Sources", top_rst))
     if summary.udp_amp_candidates:
-        lines.append(_format_kv("UDP Amplification", str(len(summary.udp_amp_candidates))))
-        lines.append(_format_kv("Top Candidates", ", ".join(summary.udp_amp_candidates[:_limit_value(5)])))
+        lines.append(
+            _format_kv("UDP Amplification", str(len(summary.udp_amp_candidates)))
+        )
+        lines.append(
+            _format_kv(
+                "Top Candidates",
+                ", ".join(summary.udp_amp_candidates[: _limit_value(5)]),
+            )
+        )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Quality of Service (DSCP/ECN)"))
-    top_dscp = ", ".join(f"{dscp}({count})" for dscp, count in summary.dscp_counts.most_common(_limit_value(5))) or "-"
-    top_ecn = ", ".join(f"{ecn}({count})" for ecn, count in summary.ecn_counts.most_common(_limit_value(5))) or "-"
+    top_dscp = (
+        ", ".join(
+            f"{dscp}({count})"
+            for dscp, count in summary.dscp_counts.most_common(_limit_value(5))
+        )
+        or "-"
+    )
+    top_ecn = (
+        ", ".join(
+            f"{ecn}({count})"
+            for ecn, count in summary.ecn_counts.most_common(_limit_value(5))
+        )
+        or "-"
+    )
     lines.append(_format_kv("Top DSCP", top_dscp))
     lines.append(_format_kv("Top ECN", top_ecn))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("SNMP"))
     lines.append(_format_kv("SNMP Packets", str(summary.snmp_packets)))
-    versions = ", ".join(f"{ver}({count})" for ver, count in summary.snmp_versions.most_common(_limit_value(5))) or "-"
-    communities = ", ".join(f"{comm}({count})" for comm, count in summary.snmp_communities.most_common(_limit_value(5))) or "-"
+    versions = (
+        ", ".join(
+            f"{ver}({count})"
+            for ver, count in summary.snmp_versions.most_common(_limit_value(5))
+        )
+        or "-"
+    )
+    communities = (
+        ", ".join(
+            f"{comm}({count})"
+            for comm, count in summary.snmp_communities.most_common(_limit_value(5))
+        )
+        or "-"
+    )
     lines.append(_format_kv("Versions", versions))
     lines.append(_format_kv("Communities", communities))
 
@@ -13272,15 +17053,17 @@ def render_health_summary(summary: HealthSummary) -> str:
             lines.append(muted(label_text))
             rows = [["Session", "Avg(s)", "Std(s)", "CV", "Min", "Max", "Samples"]]
             for item in entries:
-                rows.append([
-                    str(item.get("session", "-")),
-                    f"{float(item.get('avg', 0.0)):.3f}",
-                    f"{float(item.get('std', 0.0)):.3f}",
-                    f"{float(item.get('cv', 0.0)):.2f}",
-                    f"{float(item.get('min', 0.0)):.3f}",
-                    f"{float(item.get('max', 0.0)):.3f}",
-                    str(item.get("count", 0)),
-                ])
+                rows.append(
+                    [
+                        str(item.get("session", "-")),
+                        f"{float(item.get('avg', 0.0)):.3f}",
+                        f"{float(item.get('std', 0.0)):.3f}",
+                        f"{float(item.get('cv', 0.0)):.2f}",
+                        f"{float(item.get('min', 0.0)):.3f}",
+                        f"{float(item.get('max', 0.0)):.3f}",
+                        str(item.get("count", 0)),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if summary.findings:
@@ -13304,15 +17087,10 @@ def render_health_summary(summary: HealthSummary) -> str:
     return _finalize_output(lines)
 
 
-def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verbose: bool = False) -> str:
-    # Analyst-heavy output: always render full detail regardless of -v.
-    limit = _FULL_OUTPUT_LIMIT
-    verbose = True
-    def _limit_value(_value: int) -> int:
-        return _FULL_OUTPUT_LIMIT
-
-    def _truncate_text(text: str, max_len: int = 0) -> str:
-        return str(text)
+def render_compromised_summary(
+    summary: CompromiseSummary, limit: int = 20, verbose: bool = False
+) -> str:
+    limit = _apply_verbose_limit(limit) or limit
 
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -13322,7 +17100,7 @@ def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verb
     if summary.errors:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Errors"))
-        for err in (summary.errors if verbose else summary.errors[:_limit_value(20)]):
+        for err in summary.errors if verbose else summary.errors[: _limit_value(20)]:
             lines.append(danger(f"- {err}"))
         if not verbose and len(summary.errors) > 20:
             lines.append(muted(f"... {len(summary.errors) - 20} more errors"))
@@ -13333,22 +17111,34 @@ def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verb
     def _compromised_verdict() -> tuple[str, str, list[str], int]:
         score = 0
         reasons: list[str] = []
-        high_hosts = [host for host in summary.compromised_hosts if host.severity in {"high", "critical"}]
+        high_hosts = [
+            host
+            for host in summary.compromised_hosts
+            if host.severity in {"high", "critical"}
+        ]
         if high_hosts:
             score += min(4, len(high_hosts))
-            reasons.append(f"High-severity compromised hosts identified ({len(high_hosts)})")
+            reasons.append(
+                f"High-severity compromised hosts identified ({len(high_hosts)})"
+            )
         if getattr(summary, "incidents", None):
             score += 1
             reasons.append(f"Incident clusters detected ({len(summary.incidents)})")
         if getattr(summary, "campaigns", None):
             score += 2
-            reasons.append(f"Shared campaign indicators across hosts ({len(summary.campaigns)})")
+            reasons.append(
+                f"Shared campaign indicators across hosts ({len(summary.campaigns)})"
+            )
 
         checks = getattr(summary, "deterministic_checks", {}) or {}
-        staged = checks.get("multi_stage_sequence", []) if isinstance(checks, dict) else []
+        staged = (
+            checks.get("multi_stage_sequence", []) if isinstance(checks, dict) else []
+        )
         if staged:
             score += 2
-            reasons.append(f"Multi-stage compromise sequencing observed ({len(staged)})")
+            reasons.append(
+                f"Multi-stage compromise sequencing observed ({len(staged)})"
+            )
 
         if score >= 7:
             verdict = "YES - high-confidence host compromise activity is present."
@@ -13378,14 +17168,16 @@ def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verb
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(8)]:
+    for reason in verdict_reasons[: _limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     # Add concrete evidence context directly in the verdict block for analyst triage.
-    if summary.compromised_hosts:
+    incidents = list(getattr(summary, "incidents", []) or [])
+    campaigns = list(getattr(summary, "campaigns", []) or [])
+    if verbose and summary.compromised_hosts:
         lines.append(muted("Who:"))
         lines.append(muted("- Compromised hosts"))
-        for host in summary.compromised_hosts[:_limit_value(8)]:
+        for host in summary.compromised_hosts[: _limit_value(8)]:
             lines.append(
                 muted(
                     f"- {(host.hostname or '-')} ({host.ip}) severity={host.severity} "
@@ -13393,13 +17185,16 @@ def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verb
                 )
             )
 
-    incidents = list(getattr(summary, "incidents", []) or [])
-    if incidents:
+    if verbose and incidents:
         lines.append(muted("When:"))
         lines.append(muted("- Incident clusters"))
-        for item in incidents[:_limit_value(8)]:
+        for item in incidents[: _limit_value(8)]:
             stages = item.get("stages", [])
-            stage_text = ",".join(str(v) for v in stages[:5]) if isinstance(stages, list) else str(stages)
+            stage_text = (
+                ",".join(str(v) for v in stages[:5])
+                if isinstance(stages, list)
+                else str(stages)
+            )
             lines.append(
                 muted(
                     f"- host={item.get('ip', '-')} events={item.get('count', '-')} "
@@ -13408,19 +17203,93 @@ def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verb
                 )
             )
 
-    campaigns = list(getattr(summary, "campaigns", []) or [])
-    if campaigns:
+    if verbose and campaigns:
         lines.append(muted("What:"))
         lines.append(muted("- Shared campaign indicators"))
-        for item in campaigns[:_limit_value(8)]:
+        for item in campaigns[: _limit_value(8)]:
             hosts = item.get("hosts", [])
-            host_text = ", ".join(str(v) for v in hosts[:_limit_value(5)]) if isinstance(hosts, list) else str(hosts)
+            host_text = (
+                ", ".join(str(v) for v in hosts[: _limit_value(5)])
+                if isinstance(hosts, list)
+                else str(hosts)
+            )
             lines.append(
                 muted(
                     f"- {item.get('campaign_id', '-')} ioc={_redact_in_text(str(item.get('ioc', '-')))} "
                     f"host_count={item.get('host_count', '-')} hosts={host_text or '-'}"
                 )
             )
+
+    if not verbose:
+        if not summary.compromised_hosts:
+            lines.append(SUBSECTION_BAR)
+            lines.append(
+                ok("No hosts met compromise thresholds based on available evidence.")
+            )
+            lines.append(SECTION_BAR)
+            return _finalize_output(lines, show_truncation_note=False)
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Most Likely Compromised Hosts"))
+        rows = [["Host", "IP", "Severity", "Score", "Detection Time", "Why"]]
+        for host in summary.compromised_hosts[: _limit_value(limit)]:
+            evidence_text = " | ".join(host.evidence[:2]) if host.evidence else "-"
+            rows.append(
+                [
+                    host.hostname or "-",
+                    host.ip,
+                    str(host.severity).upper(),
+                    str(host.score),
+                    format_ts(host.detection_time),
+                    _truncate_text(evidence_text, 78),
+                ]
+            )
+        lines.append(_format_table(rows))
+        if len(summary.compromised_hosts) > _limit_value(limit):
+            lines.append(
+                muted(
+                    f"... {len(summary.compromised_hosts) - _limit_value(limit)} additional compromised hosts"
+                )
+            )
+
+        severe_detections: list[dict[str, object]] = []
+        for item in list(getattr(summary, "detections", []) or []):
+            severity = str(item.get("severity", "info")).lower()
+            if severity in {"critical", "high", "warning", "medium"}:
+                severe_detections.append(item)
+        if severe_detections:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Most Likely Issues"))
+            for item in severe_detections[: _limit_value(12)]:
+                severity = str(item.get("severity", "info")).lower()
+                summary_text = _truncate_text(str(item.get("summary", "")), 120)
+                details = _truncate_text(str(item.get("details", "")), 140)
+                if severity == "critical":
+                    marker = danger("[CRITICAL]")
+                elif severity == "high":
+                    marker = danger("[HIGH]")
+                else:
+                    marker = warn("[MEDIUM]")
+                lines.append(f"{marker} {summary_text}")
+                if details:
+                    lines.append(muted(f"  Details: {details}"))
+
+        if incidents:
+            lines.append(
+                _format_kv("Incident Clusters", str(len(incidents)))
+            )
+        if campaigns:
+            lines.append(
+                _format_kv("Shared Campaign Indicators", str(len(campaigns)))
+            )
+        if summary.errors:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Errors"))
+            for err in summary.errors[: _limit_value(12)]:
+                lines.append(danger(f"- {err}"))
+
+        lines.append(SECTION_BAR)
+        return _finalize_output(lines, show_truncation_note=False)
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Deterministic Compromise Checks"))
@@ -13442,18 +17311,40 @@ def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verb
         lines.append(label(label_text))
         if evidence_items:
             if key == "benign_automation_likely":
-                lines.append(ok(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+                lines.append(
+                    ok(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
                 risk = "Low"
                 conf_level = "Medium"
             else:
-                lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-                risk = "High" if key in {"multi_stage_sequence", "high_confidence_ioc"} else "Medium"
-                conf_level = "High" if key in {"multi_stage_sequence", "high_confidence_ioc"} else "Medium"
-            for item in evidence_items[:_limit_value(8 if verbose else 5)]:
+                lines.append(
+                    warn(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
+                risk = (
+                    "High"
+                    if key in {"multi_stage_sequence", "high_confidence_ioc"}
+                    else "Medium"
+                )
+                conf_level = (
+                    "High"
+                    if key in {"multi_stage_sequence", "high_confidence_ioc"}
+                    else "Medium"
+                )
+            for item in evidence_items[: _limit_value(8 if verbose else 5)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-            matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
+            matrix_rows.append(
+                [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
+            )
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -13464,19 +17355,23 @@ def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verb
     if priority_rows:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Host Priority Queue"))
-        rows = [["Host", "IP", "Score", "Severity", "Stages", "IOC Count", "Detection Time"]]
+        rows = [
+            ["Host", "IP", "Score", "Severity", "Stages", "IOC Count", "Detection Time"]
+        ]
         for item in priority_rows[:limit]:
             stages = item.get("stages", [])
             stage_text = ",".join(stages) if isinstance(stages, list) else str(stages)
-            rows.append([
-                str(item.get("host", "-")),
-                str(item.get("ip", "-")),
-                str(item.get("score", "-")),
-                str(item.get("severity", "-")),
-                stage_text or "-",
-                str(item.get("ioc_count", "-")),
-                format_ts(item.get("detection_time")),
-            ])
+            rows.append(
+                [
+                    str(item.get("host", "-")),
+                    str(item.get("ip", "-")),
+                    str(item.get("score", "-")),
+                    str(item.get("severity", "-")),
+                    stage_text or "-",
+                    str(item.get("ioc_count", "-")),
+                    format_ts(item.get("detection_time")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     incidents = list(getattr(summary, "incidents", []) or [])
@@ -13491,14 +17386,18 @@ def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verb
             if isinstance(first_ts, (int, float)) and isinstance(last_ts, (int, float)):
                 duration = max(0.0, float(last_ts) - float(first_ts))
             stages = item.get("stages", [])
-            rows.append([
-                str(item.get("ip", "-")),
-                format_ts(first_ts),
-                format_ts(last_ts),
-                str(item.get("count", "-")),
-                ",".join(str(v) for v in stages) if isinstance(stages, list) else str(stages),
-                format_duration(duration),
-            ])
+            rows.append(
+                [
+                    str(item.get("ip", "-")),
+                    format_ts(first_ts),
+                    format_ts(last_ts),
+                    str(item.get("count", "-")),
+                    ",".join(str(v) for v in stages)
+                    if isinstance(stages, list)
+                    else str(stages),
+                    format_duration(duration),
+                ]
+            )
         lines.append(_format_table(rows))
 
     campaigns = list(getattr(summary, "campaigns", []) or [])
@@ -13508,59 +17407,85 @@ def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verb
         rows = [["Campaign", "Shared IOC", "Host Count", "Hosts"]]
         for item in campaigns[:limit]:
             hosts = item.get("hosts", [])
-            host_text = ", ".join(str(v) for v in hosts[:_limit_value(4)]) if isinstance(hosts, list) else str(hosts)
+            host_text = (
+                ", ".join(str(v) for v in hosts[: _limit_value(4)])
+                if isinstance(hosts, list)
+                else str(hosts)
+            )
             if isinstance(hosts, list) and len(hosts) > _limit_value(4):
                 host_text += "..."
-            rows.append([
-                str(item.get("campaign_id", "-")),
-                _truncate_text(str(item.get("ioc", "-")), 48),
-                str(item.get("host_count", "-")),
-                host_text or "-",
-            ])
+            rows.append(
+                [
+                    str(item.get("campaign_id", "-")),
+                    _truncate_text(str(item.get("ioc", "-")), 48),
+                    str(item.get("host_count", "-")),
+                    host_text or "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     benign_context = list(getattr(summary, "benign_context", []) or [])
     if benign_context:
         lines.append(SUBSECTION_BAR)
         lines.append(header("False-Positive Context"))
-        for item in benign_context[:_limit_value(10 if verbose else 6)]:
+        for item in benign_context[: _limit_value(10 if verbose else 6)]:
             lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     if not summary.compromised_hosts:
         lines.append(SUBSECTION_BAR)
-        lines.append(ok("No hosts met compromise thresholds based on available evidence."))
+        lines.append(
+            ok("No hosts met compromise thresholds based on available evidence.")
+        )
         lines.append(SECTION_BAR)
         return _finalize_output(lines, show_truncation_note=False)
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Compromised Hosts"))
     rows = [["Hostname", "IP", "Detection Time", "Explanation", "Evidence", "IOCs"]]
-    row_hosts = summary.compromised_hosts if verbose else summary.compromised_hosts[:limit]
+    row_hosts = (
+        summary.compromised_hosts if verbose else summary.compromised_hosts[:limit]
+    )
     for host in row_hosts:
         evidence_text = " | ".join(host.evidence[:3]) if host.evidence else "-"
         ioc_text = ", ".join(host.iocs[:4]) if host.iocs else "-"
-        rows.append([
-            host.hostname or "-",
-            host.ip,
-            format_ts(host.detection_time),
-            _truncate_text(host.explanation or "-", 60),
-            _truncate_text(evidence_text, 70),
-            _truncate_text(ioc_text, 60),
-        ])
+        rows.append(
+            [
+                host.hostname or "-",
+                host.ip,
+                format_ts(host.detection_time),
+                _truncate_text(host.explanation or "-", 60),
+                _truncate_text(evidence_text, 70),
+                _truncate_text(ioc_text, 60),
+            ]
+        )
     lines.append(_format_table(rows))
     if not verbose and len(summary.compromised_hosts) > limit:
-        lines.append(muted(f"... {len(summary.compromised_hosts) - limit} additional compromised hosts"))
+        lines.append(
+            muted(
+                f"... {len(summary.compromised_hosts) - limit} additional compromised hosts"
+            )
+        )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Forensics Notes"))
-    lines.append(muted("- Compromise assessment is heuristic and should be validated with endpoint telemetry."))
-    lines.append(muted("- Evidence and IOCs are extracted from high-signal detections (beaconing, exfil, creds, threats)."))
+    lines.append(
+        muted(
+            "- Compromise assessment is heuristic and should be validated with endpoint telemetry."
+        )
+    )
+    lines.append(
+        muted(
+            "- Evidence and IOCs are extracted from high-signal detections (beaconing, exfil, creds, threats)."
+        )
+    )
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
 
 
-def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = False) -> str:
+def render_hosts_summary(
+    summary: HostSummary, limit: int = 30, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -13570,7 +17495,7 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
     if summary.errors:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Errors"))
-        for err in (summary.errors if verbose else summary.errors[:_limit_value(20)]):
+        for err in summary.errors if verbose else summary.errors[: _limit_value(20)]:
             lines.append(danger(f"- {err}"))
         if not verbose and len(summary.errors) > 20:
             lines.append(muted(f"... {len(summary.errors) - 20} more errors"))
@@ -13593,9 +17518,18 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Analyst Verdict"))
-    verdict = str(getattr(summary, "analyst_verdict", "") or "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE HOST RISK PATTERN")
-    confidence = str(getattr(summary, "analyst_confidence", "low") or "low").capitalize()
-    reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or []) if str(v).strip()]
+    verdict = str(
+        getattr(summary, "analyst_verdict", "")
+        or "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE HOST RISK PATTERN"
+    )
+    confidence = str(
+        getattr(summary, "analyst_confidence", "low") or "low"
+    ).capitalize()
+    reasons = [
+        str(v)
+        for v in list(getattr(summary, "analyst_reasons", []) or [])
+        if str(v).strip()
+    ]
     if verdict.startswith("YES"):
         lines.append(danger(verdict))
     elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
@@ -13604,7 +17538,7 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", confidence))
     lines.append(muted("Why confidence:"))
-    for reason in reasons[:_limit_value(8)]:
+    for reason in reasons[: _limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     checks = getattr(summary, "deterministic_checks", {}) or {}
@@ -13625,33 +17559,47 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
         lines.append(label(label_text))
         values = [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
         if values:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for value in values[:_limit_value(8)]:
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
+            for value in values[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(value)}"))
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Host Risk Matrix"))
     matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     matrix_items = list(getattr(summary, "risk_matrix", []) or [])
     if matrix_items:
-        for item in matrix_items[:_limit_value(12)]:
-            matrix_rows.append([
-                str(item.get("category", "-")),
-                str(item.get("risk", "-")),
-                str(item.get("confidence", "-")),
-                str(item.get("evidence", "-")),
-            ])
+        for item in matrix_items[: _limit_value(12)]:
+            matrix_rows.append(
+                [
+                    str(item.get("category", "-")),
+                    str(item.get("risk", "-")),
+                    str(item.get("confidence", "-")),
+                    str(item.get("evidence", "-")),
+                ]
+            )
     else:
         for key, label_text in check_labels[:6]:
-            evidence_count = len([str(v) for v in list(checks.get(key, []) or []) if str(v).strip()])
-            matrix_rows.append([
-                label_text,
-                "Medium" if evidence_count else "None",
-                "Medium" if evidence_count else "Low",
-                str(evidence_count) if evidence_count else "No matching detections",
-            ])
+            evidence_count = len(
+                [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
+            )
+            matrix_rows.append(
+                [
+                    label_text,
+                    "Medium" if evidence_count else "None",
+                    "Medium" if evidence_count else "Low",
+                    str(evidence_count) if evidence_count else "No matching detections",
+                ]
+            )
     lines.append(_format_table(matrix_rows))
 
     lines.append(SUBSECTION_BAR)
@@ -13683,7 +17631,9 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
                         label_text = f"{label_text} ({software})"
                 entries.append(label_text)
             port_limit = _limit_value(6)
-            display = ", ".join(_truncate_text(item, 48) for item in entries[:port_limit])
+            display = ", ".join(
+                _truncate_text(item, 48) for item in entries[:port_limit]
+            )
             if len(entries) > port_limit:
                 display += "..."
             return display or "-"
@@ -13693,18 +17643,24 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
             mac_display = _join_limited(host.mac_addresses, _limit_value(3), 48)
             host_display = _join_limited(host.hostnames, _limit_value(3), 48)
             os_display = _truncate_text(host.operating_system or "Unknown", 28)
-            sent_display = f"{format_bytes_as_mb(host.bytes_sent)} ({host.packets_sent})"
-            recv_display = f"{format_bytes_as_mb(host.bytes_recv)} ({host.packets_recv})"
+            sent_display = (
+                f"{format_bytes_as_mb(host.bytes_sent)} ({host.packets_sent})"
+            )
+            recv_display = (
+                f"{format_bytes_as_mb(host.bytes_recv)} ({host.packets_recv})"
+            )
             ports_display = _format_ports(host.open_ports)
-            rows.append([
-                host.ip,
-                mac_display,
-                host_display,
-                os_display,
-                sent_display,
-                recv_display,
-                ports_display,
-            ])
+            rows.append(
+                [
+                    host.ip,
+                    mac_display,
+                    host_display,
+                    os_display,
+                    sent_display,
+                    recv_display,
+                    ports_display,
+                ]
+            )
         lines.append(_format_table(rows))
         if not verbose and len(summary.hosts) > limit:
             lines.append(muted(f"... {len(summary.hosts) - limit} additional hosts"))
@@ -13714,16 +17670,27 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
         lines.append(SUBSECTION_BAR)
         lines.append(header("Priority Host Queue"))
         rows = [["Host", "Score", "Severity", "Confidence", "OS", "Reasons"]]
-        for item in host_risks[:_limit_value(limit if verbose else 15)]:
+        for item in host_risks[: _limit_value(limit if verbose else 15)]:
             reasons_val = item.get("reasons", [])
-            rows.append([
-                str(item.get("host", "-")),
-                str(item.get("score", "-")),
-                str(item.get("severity", "-")),
-                str(item.get("confidence", "-")),
-                _truncate_text(str(item.get("os", "-")), 32),
-                _truncate_text(", ".join(str(v) for v in (reasons_val[:3] if isinstance(reasons_val, list) else [])) or "-", 90),
-            ])
+            rows.append(
+                [
+                    str(item.get("host", "-")),
+                    str(item.get("score", "-")),
+                    str(item.get("severity", "-")),
+                    str(item.get("confidence", "-")),
+                    _truncate_text(str(item.get("os", "-")), 32),
+                    _truncate_text(
+                        ", ".join(
+                            str(v)
+                            for v in (
+                                reasons_val[:3] if isinstance(reasons_val, list) else []
+                            )
+                        )
+                        or "-",
+                        90,
+                    ),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lateral_profiles = list(getattr(summary, "lateral_movement_profiles", []) or [])
@@ -13731,14 +17698,19 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
         lines.append(SUBSECTION_BAR)
         lines.append(header("Lateral Movement Analytics"))
         rows = [["Host", "Admin Ports", "Port Count", "Confidence"]]
-        for item in lateral_profiles[:_limit_value(limit if verbose else 12)]:
+        for item in lateral_profiles[: _limit_value(limit if verbose else 12)]:
             ports = item.get("admin_ports", [])
-            rows.append([
-                str(item.get("host", "-")),
-                ", ".join(str(v) for v in (ports[:8] if isinstance(ports, list) else [])) or "-",
-                str(item.get("admin_port_count", "-")),
-                str(item.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("host", "-")),
+                    ", ".join(
+                        str(v) for v in (ports[:8] if isinstance(ports, list) else [])
+                    )
+                    or "-",
+                    str(item.get("admin_port_count", "-")),
+                    str(item.get("confidence", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     role_drift = list(getattr(summary, "role_drift_profiles", []) or [])
@@ -13746,17 +17718,44 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
         lines.append(SUBSECTION_BAR)
         lines.append(header("Role Drift Profiles"))
         rows = [["Host", "Roles", "Hostnames", "Admin Ports", "OS"]]
-        for item in role_drift[:_limit_value(limit if verbose else 12)]:
+        for item in role_drift[: _limit_value(limit if verbose else 12)]:
             roles = item.get("roles", [])
             hostnames = item.get("hostnames", [])
             admin_ports = item.get("admin_ports", [])
-            rows.append([
-                str(item.get("host", "-")),
-                _truncate_text(", ".join(str(v) for v in (roles[:4] if isinstance(roles, list) else [])) or "-", 50),
-                _truncate_text(", ".join(str(v) for v in (hostnames[:3] if isinstance(hostnames, list) else [])) or "-", 70),
-                _truncate_text(", ".join(str(v) for v in (admin_ports[:8] if isinstance(admin_ports, list) else [])) or "-", 40),
-                _truncate_text(str(item.get("os", "-")), 28),
-            ])
+            rows.append(
+                [
+                    str(item.get("host", "-")),
+                    _truncate_text(
+                        ", ".join(
+                            str(v)
+                            for v in (roles[:4] if isinstance(roles, list) else [])
+                        )
+                        or "-",
+                        50,
+                    ),
+                    _truncate_text(
+                        ", ".join(
+                            str(v)
+                            for v in (
+                                hostnames[:3] if isinstance(hostnames, list) else []
+                            )
+                        )
+                        or "-",
+                        70,
+                    ),
+                    _truncate_text(
+                        ", ".join(
+                            str(v)
+                            for v in (
+                                admin_ports[:8] if isinstance(admin_ports, list) else []
+                            )
+                        )
+                        or "-",
+                        40,
+                    ),
+                    _truncate_text(str(item.get("os", "-")), 28),
+                ]
+            )
         lines.append(_format_table(rows))
 
     identity_drift = list(getattr(summary, "identity_drift_profiles", []) or [])
@@ -13764,13 +17763,22 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
         lines.append(SUBSECTION_BAR)
         lines.append(header("Identity Drift Profiles"))
         rows = [["Hostname", "Host Count", "Hosts"]]
-        for item in identity_drift[:_limit_value(limit if verbose else 12)]:
+        for item in identity_drift[: _limit_value(limit if verbose else 12)]:
             hosts = item.get("hosts", [])
-            rows.append([
-                _truncate_text(str(item.get("hostname", "-")), 50),
-                str(item.get("host_count", "-")),
-                _truncate_text(", ".join(str(v) for v in (hosts[:6] if isinstance(hosts, list) else [])) or "-", 90),
-            ])
+            rows.append(
+                [
+                    _truncate_text(str(item.get("hostname", "-")), 50),
+                    str(item.get("host_count", "-")),
+                    _truncate_text(
+                        ", ".join(
+                            str(v)
+                            for v in (hosts[:6] if isinstance(hosts, list) else [])
+                        )
+                        or "-",
+                        90,
+                    ),
+                ]
+            )
         lines.append(_format_table(rows))
 
     clusters = list(getattr(summary, "incident_clusters", []) or [])
@@ -13778,40 +17786,74 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
         lines.append(SUBSECTION_BAR)
         lines.append(header("Incident Clusters"))
         rows = [["Cluster", "Host", "Indicators", "Targets", "Confidence"]]
-        for item in clusters[:_limit_value(limit if verbose else 12)]:
+        for item in clusters[: _limit_value(limit if verbose else 12)]:
             indicators = item.get("indicators", [])
-            rows.append([
-                str(item.get("cluster", "-")),
-                str(item.get("host", "-")),
-                str(len(indicators) if isinstance(indicators, list) else 0),
-                str(item.get("target_count", "-")),
-                str(item.get("confidence", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("cluster", "-")),
+                    str(item.get("host", "-")),
+                    str(len(indicators) if isinstance(indicators, list) else 0),
+                    str(item.get("target_count", "-")),
+                    str(item.get("confidence", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     pivots = list(getattr(summary, "investigation_pivots", []) or [])
     if pivots:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Hunt Pivots"))
-        rows = [["Host", "Hostnames", "OS", "Ports", "Why"]]
-        for item in pivots[:_limit_value(limit if verbose else 12)]:
+        rows = [["Host", "Packet", "Hostnames", "OS", "Ports", "Why"]]
+        for item in pivots[: _limit_value(limit if verbose else 12)]:
             hostnames = item.get("hostnames", [])
             ports = item.get("ports", [])
             reasons_val = item.get("reasons", [])
-            rows.append([
-                str(item.get("host", "-")),
-                _truncate_text(", ".join(str(v) for v in (hostnames[:3] if isinstance(hostnames, list) else [])) or "-", 60),
-                _truncate_text(str(item.get("os", "-")), 28),
-                _truncate_text(", ".join(str(v) for v in (ports[:6] if isinstance(ports, list) else [])) or "-", 80),
-                _truncate_text(", ".join(str(v) for v in (reasons_val[:3] if isinstance(reasons_val, list) else [])) or "-", 90),
-            ])
+            rows.append(
+                [
+                    str(item.get("host", "-")),
+                    _pivot_packet_number(item),
+                    _truncate_text(
+                        ", ".join(
+                            str(v)
+                            for v in (
+                                hostnames[:3] if isinstance(hostnames, list) else []
+                            )
+                        )
+                        or "-",
+                        60,
+                    ),
+                    _truncate_text(str(item.get("os", "-")), 28),
+                    _truncate_text(
+                        ", ".join(
+                            str(v)
+                            for v in (ports[:6] if isinstance(ports, list) else [])
+                        )
+                        or "-",
+                        80,
+                    ),
+                    _truncate_text(
+                        ", ".join(
+                            str(v)
+                            for v in (
+                                reasons_val[:3] if isinstance(reasons_val, list) else []
+                            )
+                        )
+                        or "-",
+                        90,
+                    ),
+                ]
+            )
         lines.append(_format_table(rows))
 
-    false_positive = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
+    false_positive = [
+        str(v)
+        for v in list(getattr(summary, "false_positive_context", []) or [])
+        if str(v).strip()
+    ]
     if false_positive:
         lines.append(SUBSECTION_BAR)
         lines.append(header("False-Positive Context"))
-        for note in false_positive[:_limit_value(8)]:
+        for note in false_positive[: _limit_value(8)]:
             lines.append(muted(f"- {_redact_in_text(note)}"))
 
     if verbose:
@@ -13821,11 +17863,13 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
         for host in summary.hosts:
             if not host.os_evidence:
                 continue
-            evidence_rows.append([
-                host.ip,
-                host.operating_system or "Unknown",
-                _truncate_text(" | ".join(host.os_evidence), 120),
-            ])
+            evidence_rows.append(
+                [
+                    host.ip,
+                    host.operating_system or "Unknown",
+                    _truncate_text(" | ".join(host.os_evidence), 120),
+                ]
+            )
         if len(evidence_rows) == 1:
             lines.append(muted("No OS fingerprinting evidence captured for hosts."))
         else:
@@ -13833,1218 +17877,1116 @@ def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = 
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Forensics Notes"))
-    lines.append(muted("- OS guesses are passive and should be confirmed with endpoint telemetry."))
-    lines.append(muted("- Open ports are inferred from server-side responses or banners; absence does not imply closed."))
-    lines.append(muted("- MACs are derived from IP/Ethernet/ARP mapping and can change across segments."))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
-
-
-def render_hostname_summary(summary: HostnameSummary, limit: int = 25, verbose: bool = False) -> str:
-    limit = _apply_verbose_limit(limit)
-    lines: list[str] = []
-    all_ip_mode = not bool(summary.target_ip)
-    lines.append(SECTION_BAR)
-    lines.append(header(f"HOSTNAME DISCOVERY :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-
-    if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        error_rows = summary.errors if verbose else summary.errors[:_limit_value(25)]
-        for err in error_rows:
-            lines.append(danger(f"- {err}"))
-        if not verbose and len(summary.errors) > 25:
-            lines.append(muted(f"... {len(summary.errors) - 25} more errors"))
-
-    lines.append(_format_kv("Target IP", summary.target_ip or "ALL"))
-    lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
-    lines.append(_format_kv("Relevant Packets", str(summary.relevant_packets)))
-    lines.append(_format_kv("Hostnames Found", str(len({item.hostname for item in summary.findings}))))
-    lines.append(_format_kv("Evidence Rows", str(sum(item.count for item in summary.findings))))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Analyst Verdict"))
-    verdict = str(getattr(summary, "analyst_verdict", "") or "NO STRONG SIGNAL - NO CONVINCING HOSTNAME ABUSE PATTERN FROM CURRENT HEURISTICS")
-    confidence = str(getattr(summary, "analyst_confidence", "low") or "low").capitalize()
-    reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or []) if str(v).strip()]
-    if verdict.startswith("YES"):
-        lines.append(danger(verdict))
-    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
-        lines.append(warn(verdict))
-    else:
-        lines.append(ok(verdict))
-    lines.append(_format_kv("Confidence", confidence))
-    lines.append(muted("Why confidence:"))
-    for reason in reasons[:_limit_value(8)]:
-        lines.append(muted(f"- {_redact_in_text(reason)}"))
-
-    checks = getattr(summary, "deterministic_checks", {}) or {}
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Deterministic Hostname Security Checks"))
-    check_labels = [
-        ("hostname_collision_or_spoofing", "Hostname Collision or Spoofing"),
-        ("ip_alias_or_fronting_anomaly", "IP Alias or Fronting Anomaly"),
-        ("cross_protocol_corroboration", "Cross-Protocol Corroboration"),
-        ("hostname_temporal_drift", "Hostname Temporal Drift"),
-        ("protocol_identity_mismatch", "Protocol Identity Mismatch"),
-        ("ad_naming_privilege_abuse", "AD/Privileged Naming Abuse"),
-        ("suspicious_naming_pattern", "Suspicious Naming Pattern"),
-        ("boundary_leak_or_cross_zone", "Boundary Leakage/Cross-Zone"),
-        ("evidence_provenance", "Evidence Provenance"),
-    ]
-    for key, label_text in check_labels:
-        lines.append(label(label_text))
-        values = [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
-        if values:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for value in values[:_limit_value(8)]:
-                lines.append(muted(f"- {_redact_in_text(value)}"))
-        else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Hostname Risk Matrix"))
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
-    matrix_items = list(getattr(summary, "risk_matrix", []) or [])
-    if matrix_items:
-        for item in matrix_items[:_limit_value(12)]:
-            matrix_rows.append([
-                str(item.get("category", "-")),
-                str(item.get("risk", "-")),
-                str(item.get("confidence", "-")),
-                str(item.get("evidence", "-")),
-            ])
-    else:
-        for key, label_text in check_labels[:8]:
-            evidence_count = len([str(v) for v in list(checks.get(key, []) or []) if str(v).strip()])
-            matrix_rows.append([
-                label_text,
-                "Medium" if evidence_count else "None",
-                "Medium" if evidence_count else "Low",
-                str(evidence_count) if evidence_count else "No matching detections",
-            ])
-    lines.append(_format_table(matrix_rows))
-
-    if summary.protocol_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Protocol Evidence"))
-        rows = [["Protocol", "Count"]]
-        proto_limit = None if verbose else 10
-        for proto, count in summary.protocol_counts.most_common(proto_limit):
-            rows.append([str(proto), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.method_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Discovery Methods"))
-        rows = [["Method", "Count"]]
-        method_limit = None if verbose else 12
-        for method, count in summary.method_counts.most_common(method_limit):
-            rows.append([str(method), str(count)])
-        lines.append(_format_table(rows))
-
-    conflict_profiles = list(getattr(summary, "conflict_profiles", []) or [])
-    if conflict_profiles:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Conflict Profiles"))
-        rows = [["Type", "Hostname/IP", "Scope", "Evidence", "Methods"]]
-        for item in conflict_profiles[:_limit_value(limit if verbose else 12)]:
-            profile_type = str(item.get("type", "-") or "-")
-            if profile_type == "hostname_to_many_ips":
-                identity = str(item.get("hostname", "-"))
-                scope = f"ips={int(item.get('ip_count', 0) or 0)}"
-            else:
-                identity = str(item.get("ip", "-"))
-                scope = f"hosts={int(item.get('host_count', 0) or 0)}"
-            methods = item.get("methods", [])
-            rows.append([
-                profile_type,
-                identity,
-                scope,
-                str(item.get("evidence", "-")),
-                _truncate_text(", ".join(str(v) for v in methods[:4]) if isinstance(methods, list) else "-", 70),
-            ])
-        lines.append(_format_table(rows))
-
-    drift_profiles = list(getattr(summary, "drift_profiles", []) or [])
-    if drift_profiles:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Temporal Drift Profiles"))
-        rows = [["Hostname", "First Seen", "Last Seen", "IP Count", "IPs"]]
-        for item in drift_profiles[:_limit_value(limit if verbose else 10)]:
-            ips = item.get("ips", [])
-            rows.append([
-                str(item.get("hostname", "-")),
-                format_ts(item.get("first_seen")),
-                format_ts(item.get("last_seen")),
-                str(item.get("ip_count", "-")),
-                _truncate_text(", ".join(str(v) for v in (ips[:5] if isinstance(ips, list) else [])) or "-", 80),
-            ])
-        lines.append(_format_table(rows))
-
-    corroboration = list(getattr(summary, "cross_protocol_corroboration", []) or [])
-    if corroboration:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Cross-Protocol Corroboration"))
-        rows = [["Hostname", "Protocols", "Methods", "Confidence", "Evidence"]]
-        for item in corroboration[:_limit_value(limit if verbose else 12)]:
-            protocols = item.get("protocols", [])
-            methods = item.get("methods", [])
-            rows.append([
-                str(item.get("hostname", "-")),
-                _truncate_text(", ".join(str(v) for v in (protocols[:4] if isinstance(protocols, list) else [])) or "-", 50),
-                _truncate_text(", ".join(str(v) for v in (methods[:3] if isinstance(methods, list) else [])) or "-", 70),
-                str(item.get("confidence", "-")),
-                str(item.get("evidence", "-")),
-            ])
-        lines.append(_format_table(rows))
-
-    suspicious_names = list(getattr(summary, "suspicious_name_profiles", []) or [])
-    if suspicious_names:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Suspicious Naming Analytics"))
-        rows = [["Hostname", "Reasons", "Entropy", "Evidence", "Mapped IPs"]]
-        for item in suspicious_names[:_limit_value(limit if verbose else 12)]:
-            reasons_val = item.get("reasons", [])
-            ips = item.get("ips", [])
-            rows.append([
-                str(item.get("hostname", "-")),
-                _truncate_text(", ".join(str(v) for v in (reasons_val[:4] if isinstance(reasons_val, list) else [])) or "-", 70),
-                str(item.get("entropy", "-")),
-                str(item.get("evidence", "-")),
-                _truncate_text(", ".join(str(v) for v in (ips[:4] if isinstance(ips, list) else [])) or "-", 70),
-            ])
-        lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("IP ↔ Hostname Correlation"))
-    if not summary.findings:
-        lines.append(muted("No hostname-to-IP correlation evidence found in inspected protocols."))
-    else:
-        ip_hosts: dict[str, set[str]] = defaultdict(set)
-        ip_evidence: Counter[str] = Counter()
-        for finding in summary.findings:
-            if not finding.mapped_ip:
-                continue
-            ip_hosts[finding.mapped_ip].add(finding.hostname)
-            ip_evidence[finding.mapped_ip] += finding.count
-
-        if not ip_hosts:
-            lines.append(muted("No attributable IP mappings were extracted from hostname evidence."))
-        else:
-            rows = [["IP Address", "Hostnames", "Evidence"]]
-            corr_limit = None if verbose else limit
-            for ip_addr, evidence_count in ip_evidence.most_common(corr_limit):
-                hosts = sorted(ip_hosts.get(ip_addr, set()))
-                host_display = ", ".join(hosts) if verbose else ", ".join(hosts[:_limit_value(3)])
-                rows.append([ip_addr, host_display, str(evidence_count)])
-            lines.append(_format_table(rows))
-            if not verbose and len(ip_evidence) > limit:
-                lines.append(muted(f"... {len(ip_evidence) - limit} additional IP correlation rows"))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Discovered Hostnames"))
-    if not summary.findings:
-        if all_ip_mode:
-            lines.append(muted("No hostname evidence found in inspected protocols."))
-        else:
-            lines.append(muted("No hostname evidence found for target IP in inspected protocols."))
-    else:
-        rows = [["Hostname", "Mapped IP", "Method", "Protocol", "Confidence", "Seen", "Flow", "Details"]]
-        row_findings = summary.findings if verbose else summary.findings[:limit]
-        for finding in row_findings:
-            confidence = str(finding.confidence)
-            if confidence == "HIGH":
-                confidence_display = ok(confidence)
-            elif confidence == "MEDIUM":
-                confidence_display = warn(confidence)
-            else:
-                confidence_display = muted(confidence)
-
-            rows.append([
-                str(finding.hostname),
-                str(finding.mapped_ip or "-"),
-                str(finding.method),
-                str(finding.protocol),
-                confidence_display,
-                str(finding.count),
-                f"{finding.src_ip} -> {finding.dst_ip}",
-                str(finding.details) if verbose else _truncate_text(str(finding.details), 70),
-            ])
-        lines.append(_format_table(rows))
-        if not verbose and len(summary.findings) > limit:
-            lines.append(muted(f"... {len(summary.findings) - limit} additional hostname evidence rows"))
-
-    pivots = list(getattr(summary, "investigation_pivots", []) or [])
-    if pivots:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Hunt Pivots"))
-        rows = [["Hostname", "Mapped IPs", "Methods", "First Packet", "Last Packet"]]
-        for item in pivots[:_limit_value(limit if verbose else 12)]:
-            mapped_ips = item.get("mapped_ips", [])
-            methods = item.get("methods", [])
-            rows.append([
-                str(item.get("hostname", "-")),
-                _truncate_text(", ".join(str(v) for v in (mapped_ips[:4] if isinstance(mapped_ips, list) else [])) or "-", 60),
-                _truncate_text(", ".join(str(v) for v in (methods[:3] if isinstance(methods, list) else [])) or "-", 70),
-                str(item.get("first_packet", "-")),
-                str(item.get("last_packet", "-")),
-            ])
-        lines.append(_format_table(rows))
-
-    false_positive_context = [str(v) for v in list(getattr(summary, "false_positive_context", []) or []) if str(v).strip()]
-    if false_positive_context:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("False-Positive Context"))
-        for note in false_positive_context[:_limit_value(8)]:
-            lines.append(muted(f"- {_redact_in_text(note)}"))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Forensics Notes"))
-    lines.append(muted("- DNS A/AAAA and PTR mappings are strongest hostname-to-IP attribution evidence."))
-    lines.append(muted("- HTTP Host and TLS SNI indicate intended server name and can reveal virtual-host targeting."))
-    lines.append(muted("- NTLM/NetBIOS names are contextual clues and may reflect client/workstation naming."))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
-
-
-def render_hostdetails_summary(summary: HostDetailsSummary, limit: int = 20, verbose: bool = False) -> str:
-    limit = _apply_verbose_limit(limit)
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"HOST DETAILS :: {summary.target_ip} :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-    target_ip = summary.target_ip
-
-    def _matches_target(value: object) -> bool:
-        if value is None:
-            return False
-        if isinstance(value, str):
-            return target_ip in value
-        if isinstance(value, (list, tuple, set)):
-            return any(_matches_target(item) for item in value)
-        if isinstance(value, dict):
-            return any(_matches_target(item) for item in value.values())
-        return target_ip in str(value)
-
-    if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in (summary.errors if verbose else summary.errors[:_limit_value(20)]):
-            lines.append(danger(f"- {err}"))
-        if not verbose and len(summary.errors) > 20:
-            lines.append(muted(f"... {len(summary.errors) - 20} more errors"))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Host Details"))
-    lines.append(_format_kv("IP Address", summary.target_ip))
-    lines.append(_format_kv("Associated MAC", ", ".join(summary.mac_addresses[:_limit_value(6)]) if summary.mac_addresses else "-"))
-    lines.append(_format_kv("Operating System", summary.operating_system or "Unknown"))
-    lines.append(_format_kv("OS Evidence", " | ".join(summary.os_evidence[:_limit_value(4)]) if summary.os_evidence else "-"))
-    lines.append(_format_kv("Hostname", ", ".join(summary.hostnames[:_limit_value(8)]) if summary.hostnames else "-"))
-    if summary.relevant_packets == 0:
-        lines.append(warn("No host-relevant packets matched the target IP in this capture. Results may be incomplete."))
-
-    def _classify_stage(category: str, summary_text: str, details_text: str) -> str | None:
-        text = f"{category} {summary_text} {details_text}".lower()
-        if any(token in text for token in ("scan", "probe", "recon", "enumeration", "icmp", "nbns", "mdns")):
-            return "Recon"
-        if any(token in text for token in ("auth", "login", "credential", "kerberos", "ntlm", "password", "ldap", "domain service")):
-            return "Access"
-        if any(token in text for token in ("powershell", "wmic", "winrm", "telnet command", "cmd.exe", "execution")):
-            return "Execution"
-        if any(token in text for token in ("beacon", "c2", "command and control")):
-            return "C2"
-        if any(token in text for token in ("http post", "upload", "stor", "exfil", "file artifact")):
-            return "Exfil"
-        if any(token in text for token in ("write", "setpoint", "trip", "shutdown", "impact", "firmware")):
-            return "Impact"
-        return None
-
-    timeline_items = list(summary.timeline_events or [])
-    detections = list(summary.detections or [])
-    attack_categories = summary.attack_categories or Counter()
-    file_transfers = list(summary.file_transfers or [])
-    dns_items = list(summary.dns_queries or [])
-    user_items = list(summary.user_evidence or [])
-
-    stage_order = ["Recon", "Access", "Execution", "C2", "Exfil", "Impact"]
-    stage_times: dict[str, list[float]] = {name: [] for name in stage_order}
-    stage_evidence: dict[str, list[str]] = {name: [] for name in stage_order}
-    for event in timeline_items:
-        stage = _classify_stage(str(event.get("category", "")), str(event.get("summary", "")), str(event.get("details", "")))
-        if not stage:
-            continue
-        ts = event.get("ts")
-        if isinstance(ts, (int, float)):
-            stage_times[stage].append(float(ts))
-        if len(stage_evidence[stage]) < 5:
-            stage_evidence[stage].append(f"{event.get('category', '-')}: {event.get('summary', '-')}")
-
-    sequence_rows: list[dict[str, object]] = []
-    for stage in stage_order:
-        values = sorted(stage_times[stage])
-        if not values:
-            continue
-        sequence_rows.append({
-            "stage": stage,
-            "first": values[0],
-            "last": values[-1],
-            "count": len(values),
-            "dwell": max(0.0, values[-1] - values[0]),
-            "evidence": stage_evidence[stage][:3],
-        })
-
-    present_stage_names = [str(item.get("stage", "")) for item in sequence_rows]
-    sequence_violations: list[str] = []
-    if "Execution" in present_stage_names and "Access" not in present_stage_names:
-        sequence_violations.append("Execution-like activity without clear access precursor")
-    if "Exfil" in present_stage_names and "Execution" not in present_stage_names:
-        sequence_violations.append("Exfiltration-like activity without clear execution stage")
-    if "Impact" in present_stage_names and "Recon" not in present_stage_names:
-        sequence_violations.append("Impact-like activity seen without early recon/discovery evidence")
-
-    high_detection_count = sum(1 for item in detections if str(item.get("severity", "")).lower() in {"high", "critical"})
-    warning_detection_count = sum(1 for item in detections if str(item.get("severity", "")).lower() in {"warning", "warn", "medium"})
-
-    def _entropy(value: str) -> float:
-        if not value:
-            return 0.0
-        counter = Counter(value)
-        total = float(len(value))
-        import math
-        return -sum((count / total) * math.log2(count / total) for count in counter.values() if count)
-
-    high_entropy_domains: list[str] = []
-    dns_by_name: dict[str, list[float]] = {}
-    for item in dns_items:
-        name = str(item.get("name", "") or "")
-        if not name:
-            continue
-        labels = [part for part in name.split(".") if part]
-        longest = max((len(label) for label in labels), default=0)
-        ent = _entropy(name)
-        if longest >= 24 or ent >= 3.8:
-            high_entropy_domains.append(f"{name} (entropy={ent:.2f})")
-        ts = item.get("ts")
-        if isinstance(ts, (int, float)):
-            dns_by_name.setdefault(name.lower(), []).append(float(ts))
-
-    dns_periodic: list[str] = []
-    for name, timestamps in dns_by_name.items():
-        values = sorted(set(timestamps))
-        if len(values) < 4:
-            continue
-        intervals = [values[idx] - values[idx - 1] for idx in range(1, len(values)) if values[idx] - values[idx - 1] > 0]
-        if len(intervals) < 3:
-            continue
-        mean = sum(intervals) / len(intervals)
-        if mean <= 0:
-            continue
-        import math
-        variance = sum((v - mean) ** 2 for v in intervals) / len(intervals)
-        std = math.sqrt(variance)
-        cv = std / mean if mean else 1.0
-        if 3.0 <= mean <= 3600.0 and cv <= 0.35:
-            dns_periodic.append(f"{name} interval={mean:.1f}s cv={cv:.2f}")
-
-    suspicious_extensions = {".exe", ".dll", ".ps1", ".vbs", ".bat", ".scr", ".js", ".hta"}
-    risky_files: list[str] = []
-    hash_hosts: dict[str, set[str]] = {}
-    public_exfil_files: list[str] = []
-    for item in file_transfers:
-        filename = str(item.get("filename", "") or "")
-        file_type = str(item.get("file_type", "") or "")
-        ext = ""
-        if "." in filename:
-            ext = "." + filename.rsplit(".", 1)[1].lower()
-        if ext in suspicious_extensions or any(token in file_type.lower() for token in ("exe", "dll", "script", "archive")):
-            risky_files.append(f"{filename} type={file_type or '-'} dir={item.get('direction', '-')}")
-        sha256 = str(item.get("sha256", "") or "")
-        if sha256:
-            peer = str(item.get("dst_ip", "-") if str(item.get("src_ip", "")) == summary.target_ip else item.get("src_ip", "-"))
-            hash_hosts.setdefault(sha256, set()).add(peer)
-        dst_ip = str(item.get("dst_ip", "") or "")
-        src_ip = str(item.get("src_ip", "") or "")
-        if src_ip == summary.target_ip:
-            try:
-                if ipaddress.ip_address(dst_ip).is_global:
-                    public_exfil_files.append(f"{filename or '-'} -> {dst_ip}")
-            except Exception:
-                pass
-
-    propagated_hashes = [f"{digest[:12]} to {len(hosts)} hosts" for digest, hosts in hash_hosts.items() if len(hosts) >= 2]
-
-    privileged_markers = {"administrator", "domain admin", "enterprise admin", "root", "admin"}
-    privileged_users: Counter[str] = Counter()
-    user_by_method: Counter[str] = Counter()
-    for item in user_items:
-        user = str(item.get("username", "") or "").lower()
-        method = str(item.get("method", "") or "")
-        if method:
-            user_by_method[method] += 1
-        if any(marker in user for marker in privileged_markers):
-            privileged_users[user or "-"] += 1
-
-    peer_risk: Counter[str] = Counter()
-    for peer, count in summary.peer_counts.most_common(30):
-        peer_risk[peer] += int(count // 5)
-    for item in detections:
-        for ip_value, count in item.get("top_sources", []) or []:
-            peer_risk[str(ip_value)] += int(count)
-        for ip_value, count in item.get("top_destinations", []) or []:
-            peer_risk[str(ip_value)] += int(count)
-
-    attack_path_steps: list[str] = []
-    if attack_categories.get("scanning_probe", 0):
-        attack_path_steps.append("Recon/scan indicators")
-    if attack_categories.get("bruteforce_auth", 0) or privileged_users:
-        attack_path_steps.append("Access/credential indicators")
-    if attack_categories.get("malware_tooling", 0):
-        attack_path_steps.append("Execution tooling indicators")
-    if attack_categories.get("lateral_movement", 0):
-        attack_path_steps.append("Lateral movement indicators")
-    if attack_categories.get("beaconing", 0):
-        attack_path_steps.append("C2/beacon indicators")
-    if attack_categories.get("exfiltration", 0) or public_exfil_files:
-        attack_path_steps.append("Exfiltration indicators")
-    if attack_categories.get("ot_ics", 0):
-        attack_path_steps.append("OT/ICS impact pathway")
-
-    deterministic_checks: dict[str, list[str]] = {
-        "credential_abuse_concentration": [],
-        "lateral_movement_fanout": [],
-        "execution_tooling_chain": [],
-        "exfiltration_chain": [],
-        "dns_c2_periodicity": [],
-        "ot_control_impact_sequence": [],
-        "identity_privilege_spread": [],
-        "cross_zone_service_access": [],
-        "file_risk_staging": [],
-        "evidence_provenance": [],
-    }
-
-    if warning_detection_count or high_detection_count:
-        deterministic_checks["credential_abuse_concentration"].extend([
-            f"high/critical detections={high_detection_count}",
-            f"warning detections={warning_detection_count}",
-        ])
-    top_peers = summary.peer_counts.most_common(8)
-    if top_peers and len(top_peers) >= 3:
-        deterministic_checks["lateral_movement_fanout"].append(
-            f"host touched {len(summary.peer_counts)} peers; top peer volume {top_peers[0][0]}({top_peers[0][1]})"
+    lines.append(
+        muted(
+            "- OS guesses are passive and should be confirmed with endpoint telemetry."
         )
-    if attack_categories.get("malware_tooling", 0) or any("powershell" in str(item.get("summary", "")).lower() for item in timeline_items):
-        deterministic_checks["execution_tooling_chain"].append("Execution tooling indicators present in timeline/detections")
-    deterministic_checks["exfiltration_chain"].extend(public_exfil_files[:6])
-    deterministic_checks["dns_c2_periodicity"].extend(dns_periodic[:6])
-    if attack_categories.get("ot_ics", 0):
-        deterministic_checks["ot_control_impact_sequence"].append("OT/ICS protocol indicators linked to host activity")
-    if privileged_users:
-        deterministic_checks["identity_privilege_spread"].extend([f"{user}({count})" for user, count in privileged_users.most_common(5)])
-    for conv in summary.conversations:
-        peer = str(conv.get("peer", ""))
-        if not peer:
-            continue
-        try:
-            peer_ip = ipaddress.ip_address(peer)
-            local_private = ipaddress.ip_address(summary.target_ip).is_private
-            if peer_ip.is_private != local_private:
-                deterministic_checks["cross_zone_service_access"].append(
-                    f"{summary.target_ip} -> {peer} protocol={conv.get('protocol', '-')}, ports={conv.get('ports', '-') }"
-                )
-        except Exception:
-            continue
-    deterministic_checks["file_risk_staging"].extend((risky_files + propagated_hashes)[:8])
+    )
+    lines.append(
+        muted(
+            "- Open ports are inferred from server-side responses or banners; absence does not imply closed."
+        )
+    )
+    lines.append(
+        muted(
+            "- MACs are derived from IP/Ethernet/ARP mapping and can change across segments."
+        )
+    )
 
-    anchor_rows: list[dict[str, object]] = []
-    for item in file_transfers:
-        pkt = item.get("packet_index")
-        if pkt is None:
-            continue
-        anchor_rows.append({
-            "packet": pkt,
-            "source": "files",
-            "signal": f"{item.get('filename', '-')}",
-            "details": f"{item.get('src_ip', '-')}: {item.get('src_port', '-')} -> {item.get('dst_ip', '-')}: {item.get('dst_port', '-')} {item.get('protocol', '-')}",
-        })
-    for event in timeline_items:
-        pkt = event.get("packet_index")
-        if pkt is None:
-            continue
-        anchor_rows.append({
-            "packet": pkt,
-            "source": event.get("source", "timeline"),
-            "signal": event.get("summary", "-"),
-            "details": event.get("details", "-"),
-        })
-    anchor_rows.sort(key=lambda item: (item.get("packet") is None, item.get("packet")))
-    if anchor_rows:
-        deterministic_checks["evidence_provenance"].append(f"{len(anchor_rows)} packet-anchored evidence row(s)")
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines)
 
-    verdict_score = 0
-    verdict_score += 2 if deterministic_checks["execution_tooling_chain"] else 0
-    verdict_score += 2 if deterministic_checks["exfiltration_chain"] else 0
-    verdict_score += 1 if deterministic_checks["credential_abuse_concentration"] else 0
-    verdict_score += 1 if deterministic_checks["lateral_movement_fanout"] else 0
-    verdict_score += 1 if deterministic_checks["dns_c2_periodicity"] else 0
-    verdict_score += 1 if deterministic_checks["identity_privilege_spread"] else 0
-    verdict_score += 1 if deterministic_checks["ot_control_impact_sequence"] else 0
-    verdict_score += 1 if deterministic_checks["cross_zone_service_access"] else 0
-    verdict_score += 1 if deterministic_checks["file_risk_staging"] else 0
 
-    verdict_reasons: list[str] = []
-    if deterministic_checks["execution_tooling_chain"]:
-        verdict_reasons.append("Execution tooling behavior observed")
-    if deterministic_checks["exfiltration_chain"]:
-        verdict_reasons.append("Possible host exfiltration chain observed")
-    if deterministic_checks["lateral_movement_fanout"]:
-        verdict_reasons.append("Broad peer fan-out from host")
-    if deterministic_checks["dns_c2_periodicity"]:
-        verdict_reasons.append("Beacon-like DNS periodicity observed")
-    if deterministic_checks["identity_privilege_spread"]:
-        verdict_reasons.append("Privileged identity usage pattern observed")
-    if deterministic_checks["ot_control_impact_sequence"]:
-        verdict_reasons.append("OT/ICS control-impact signals linked to host")
-    if sequence_violations:
-        verdict_reasons.extend(sequence_violations[:2])
+def render_hostname_summary(
+    summary: HostnameSummary, limit: int = 25, verbose: bool = False
+) -> str:
+    force_full_output = bool(summary.target_ip) or bool(
+        str(getattr(summary, "hostname_query", "") or "").strip()
+    )
+    restore_verbose_flag: bool | None = None
+    if force_full_output and not _VERBOSE_OUTPUT:
+        restore_verbose_flag = _VERBOSE_OUTPUT
+        set_verbose_output(True)
+    if force_full_output:
+        verbose = True
 
-    if verdict_score >= 8:
-        host_verdict = "YES - HIGH-CONFIDENCE HOST COMPROMISE/ABUSE PATTERN DETECTED"
-        host_confidence = "high"
-    elif verdict_score >= 5:
-        host_verdict = "LIKELY - MULTIPLE CORROBORATING HOST-RISK INDICATORS DETECTED"
-        host_confidence = "medium"
-    elif verdict_score >= 3:
-        host_verdict = "POSSIBLE - HOST-RISK INDICATORS REQUIRE CORROBORATION"
-        host_confidence = "medium"
-    else:
-        host_verdict = "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE HOST ABUSE PATTERN"
-        host_confidence = "low"
+    limit = _apply_verbose_limit(limit)
+    lines: list[str] = []
+    try:
+        all_ip_mode = not bool(summary.target_ip)
+        lines.append(SECTION_BAR)
+        lines.append(header(f"HOSTNAME DISCOVERY :: {summary.path.name}"))
+        lines.append(SECTION_BAR)
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Analyst Verdict"))
-    if host_verdict.startswith("YES"):
-        lines.append(danger(host_verdict))
-    elif host_verdict.startswith("LIKELY") or host_verdict.startswith("POSSIBLE"):
-        lines.append(warn(host_verdict))
-    else:
-        lines.append(ok(host_verdict))
-    lines.append(_format_kv("Confidence", f"{host_confidence.capitalize()} (score={verdict_score})"))
-    lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(8)]:
-        lines.append(muted(f"- {_redact_in_text(reason)}"))
+        if summary.errors:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Errors"))
+            error_rows = summary.errors if verbose else summary.errors[: _limit_value(25)]
+            for err in error_rows:
+                lines.append(danger(f"- {err}"))
+            if not verbose and len(summary.errors) > 25:
+                lines.append(muted(f"... {len(summary.errors) - 25} more errors"))
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Deterministic Host Security Checks"))
-    check_labels = [
-        ("credential_abuse_concentration", "Credential Abuse Concentration"),
-        ("lateral_movement_fanout", "Lateral Movement Fan-Out"),
-        ("execution_tooling_chain", "Execution Tooling Chain"),
-        ("exfiltration_chain", "Exfiltration Chain"),
-        ("dns_c2_periodicity", "DNS C2/Beacon Periodicity"),
-        ("ot_control_impact_sequence", "OT Control-Impact Sequence"),
-        ("identity_privilege_spread", "Identity Privilege Spread"),
-        ("cross_zone_service_access", "Cross-Zone Service Access"),
-        ("file_risk_staging", "File-Risk Staging"),
-        ("evidence_provenance", "Evidence Provenance"),
-    ]
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
-    for key, label_text in check_labels:
-        evidence_items = [str(v) for v in deterministic_checks.get(key, []) if str(v).strip()]
-        lines.append(label(label_text))
-        if evidence_items:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for item in evidence_items[:_limit_value(6)]:
-                lines.append(muted(f"- {_redact_in_text(item)}"))
-            risk = "High" if key in {"execution_tooling_chain", "exfiltration_chain", "ot_control_impact_sequence", "identity_privilege_spread"} else "Medium"
-            conf = "High" if key in {"evidence_provenance", "execution_tooling_chain"} else "Medium"
-            matrix_rows.append([label_text, risk, conf, f"{len(evidence_items)} signal(s)"])
+        lines.append(_format_kv("Target IP", summary.target_ip or "ALL"))
+        if str(getattr(summary, "hostname_query", "") or "").strip():
+            lines.append(_format_kv("Hostname Filter", str(summary.hostname_query)))
+        if getattr(summary, "port_filter", None):
+            lines.append(_format_kv("Port Filter", str(summary.port_filter)))
+        if str(getattr(summary, "search_query", "") or "").strip():
+            lines.append(_format_kv("Search Filter", str(summary.search_query)))
+        lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
+        lines.append(_format_kv("Relevant Packets", str(summary.relevant_packets)))
+        lines.append(
+            _format_kv(
+                "Hostnames Found", str(len({item.hostname for item in summary.findings}))
+            )
+        )
+        lines.append(
+            _format_kv("Evidence Rows", str(sum(item.count for item in summary.findings)))
+        )
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Analyst Verdict"))
+        verdict = str(
+            getattr(summary, "analyst_verdict", "")
+            or "NO STRONG SIGNAL - NO CONVINCING HOSTNAME ABUSE PATTERN FROM CURRENT HEURISTICS"
+        )
+        confidence = str(
+            getattr(summary, "analyst_confidence", "low") or "low"
+        ).capitalize()
+        reasons = [
+            str(v)
+            for v in list(getattr(summary, "analyst_reasons", []) or [])
+            if str(v).strip()
+        ]
+        if verdict.startswith("YES"):
+            lines.append(danger(verdict))
+        elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
+            lines.append(warn(verdict))
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
+            lines.append(ok(verdict))
+        lines.append(_format_kv("Confidence", confidence))
+        lines.append(muted("Why confidence:"))
+        for reason in reasons[: _limit_value(8)]:
+            lines.append(muted(f"- {_redact_in_text(reason)}"))
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Host Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
-
-    if sequence_rows:
+        checks = getattr(summary, "deterministic_checks", {}) or {}
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Sequence Plausibility"))
-        rows = [["Stage", "First", "Last", "Count", "Dwell", "Evidence"]]
-        for item in sequence_rows[:_limit_value(10)]:
-            rows.append([
-                str(item.get("stage", "-")),
-                format_ts(item.get("first")),
-                format_ts(item.get("last")),
-                str(item.get("count", "-")),
-                format_duration(item.get("dwell")),
-                _truncate_text(" | ".join(str(v) for v in item.get("evidence", [])[:2]), 64),
-            ])
-        lines.append(_format_table(rows))
-    if sequence_violations:
-        lines.append(muted("Sequence violations:"))
-        for item in sequence_violations[:_limit_value(6)]:
-            lines.append(warn(f"- {_redact_in_text(item)}"))
-
-    if attack_path_steps:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Attack Path Summary"))
-        path_text = " -> ".join(attack_path_steps[:6])
-        lines.append(muted(f"- {path_text}"))
-        targets = [peer for peer, _ in summary.peer_counts.most_common(_limit_value(5))]
-        if targets:
-            lines.append(muted(f"- Primary peer targets: {', '.join(targets)}"))
-
-    if peer_risk:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Remote Host Risk"))
-        rows = [["Peer", "Risk Score", "Evidence Count"]]
-        for peer, score in peer_risk.most_common(_limit_value(10)):
-            rows.append([peer, str(score), str(summary.peer_counts.get(peer, 0))])
-        lines.append(_format_table(rows))
-
-    if user_items:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Identity Abuse Analytics"))
-        rows = [["Signal", "Details"]]
-        if privileged_users:
-            rows.append(["Privileged Identities", ", ".join(f"{user}({count})" for user, count in privileged_users.most_common(5))])
-        if user_by_method:
-            rows.append(["Identity Collection Methods", ", ".join(f"{method}({count})" for method, count in user_by_method.most_common(6))])
-        if len(rows) == 1:
-            rows.append(["Status", "No strong identity abuse concentration detected"])
-        lines.append(_format_table(rows))
-
-    if high_entropy_domains or dns_periodic:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("DNS Behavior Checks"))
-        if high_entropy_domains:
-            lines.append(muted("- High-entropy/suspicious DNS queries:"))
-            for item in high_entropy_domains[:_limit_value(6)]:
-                lines.append(muted(f"- {_redact_in_text(item)}"))
-        if dns_periodic:
-            lines.append(muted("- Periodic DNS patterns:"))
-            for item in dns_periodic[:_limit_value(6)]:
-                lines.append(muted(f"- {_redact_in_text(item)}"))
-
-    if risky_files or propagated_hashes or public_exfil_files:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("File Risk Checks"))
-        for item in (risky_files + propagated_hashes + public_exfil_files)[:_limit_value(10)]:
-            lines.append(muted(f"- {_redact_in_text(item)}"))
-
-    if anchor_rows:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Evidence Anchors"))
-        rows = [["Packet", "Source", "Signal", "Details"]]
-        for item in anchor_rows[:_limit_value(12)]:
-            rows.append([
-                str(item.get("packet", "-")),
-                str(item.get("source", "-")),
-                _truncate_text(str(item.get("signal", "-")), 30),
-                _truncate_text(_redact_in_text(str(item.get("details", "-"))), 84),
-            ])
-        lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("ATT&CK Tactic Mapping"))
-    tactic_rows = [["Tactic", "Evidence"]]
-    mapping = [
-        ("TA0043 Reconnaissance", int(attack_categories.get("scanning_probe", 0))),
-        ("TA0001 Initial Access", int(attack_categories.get("bruteforce_auth", 0))),
-        ("TA0002 Execution", int(attack_categories.get("malware_tooling", 0))),
-        ("TA0008 Lateral Movement", int(attack_categories.get("lateral_movement", 0))),
-        ("TA0011 Command and Control", int(attack_categories.get("beaconing", 0))),
-        ("TA0010 Exfiltration", int(attack_categories.get("exfiltration", 0))),
-        ("TA0040 Impact", int(attack_categories.get("dos_impact", 0)) + int(attack_categories.get("ot_ics", 0))),
-    ]
-    for name, count in mapping:
-        if count > 0:
-            tactic_rows.append([name, str(count)])
-    if len(tactic_rows) == 1:
-        tactic_rows.append(["No strong tactic mapping", "0"])
-    lines.append(_format_table(tactic_rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Top Hunt Pivots"))
-    pivot_rows = [["Pivot Type", "Value"]]
-    for peer, _count in summary.peer_counts.most_common(_limit_value(3)):
-        pivot_rows.append(["Peer IP", peer])
-    for item in file_transfers[:_limit_value(3)]:
-        sha256 = str(item.get("sha256", "") or "")
-        if sha256:
-            pivot_rows.append(["File SHA256", sha256])
-    for item in dns_items[:_limit_value(3)]:
-        name = str(item.get("name", "") or "")
-        if name:
-            pivot_rows.append(["Domain", name])
-    for item in user_items[:_limit_value(3)]:
-        username = str(item.get("username", "") or "")
-        if username and username != "-":
-            pivot_rows.append(["Username", username])
-    if len(pivot_rows) == 1:
-        pivot_rows.append(["Status", "No strong pivots extracted"])
-    lines.append(_format_table(pivot_rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("False-Positive Context"))
-    benign_context: list[str] = []
-    if not deterministic_checks["execution_tooling_chain"]:
-        benign_context.append("No strong host execution-tooling chain was identified")
-    if not deterministic_checks["dns_c2_periodicity"]:
-        benign_context.append("No high-confidence beacon-like DNS periodicity was detected")
-    if not deterministic_checks["cross_zone_service_access"]:
-        benign_context.append("No cross-zone service access drift was detected for this host")
-    if not deterministic_checks["file_risk_staging"]:
-        benign_context.append("No strong malicious file staging chain was reconstructed")
-    for item in benign_context[:_limit_value(6)]:
-        lines.append(muted(f"- {_redact_in_text(item)}"))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Hostname Evidence"))
-    hostname_findings = [item for item in summary.hostname_findings if _matches_target(item)]
-    if hostname_findings:
-        rows = [["Hostname", "Mapped IP", "Method", "Protocol", "Confidence", "Seen", "Flow", "Details"]]
-        row_findings = hostname_findings if verbose else hostname_findings[:limit]
-        for finding in row_findings:
-            confidence = str(finding.get("confidence", ""))
-            if confidence == "HIGH":
-                confidence_display = ok(confidence)
-            elif confidence == "MEDIUM":
-                confidence_display = warn(confidence)
+        lines.append(header("Deterministic Hostname Security Checks"))
+        check_labels = [
+            ("hostname_collision_or_spoofing", "Hostname Collision or Spoofing"),
+            ("ip_alias_or_fronting_anomaly", "IP Alias or Fronting Anomaly"),
+            ("cross_protocol_corroboration", "Cross-Protocol Corroboration"),
+            ("hostname_temporal_drift", "Hostname Temporal Drift"),
+            ("protocol_identity_mismatch", "Protocol Identity Mismatch"),
+            ("ad_naming_privilege_abuse", "AD/Privileged Naming Abuse"),
+            ("suspicious_naming_pattern", "Suspicious Naming Pattern"),
+            ("boundary_leak_or_cross_zone", "Boundary Leakage/Cross-Zone"),
+            ("evidence_provenance", "Evidence Provenance"),
+        ]
+        for key, label_text in check_labels:
+            lines.append(label(label_text))
+            values = [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
+            if values:
+                lines.append(
+                    warn(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
+                for value in values[: _limit_value(8)]:
+                    lines.append(muted(f"- {_redact_in_text(value)}"))
             else:
-                confidence_display = muted(confidence or "-")
-            flow = f"{finding.get('src_ip', '-')} -> {finding.get('dst_ip', '-')}"
-            rows.append([
-                _truncate_text(str(finding.get("hostname", "-")), 40),
-                str(finding.get("mapped_ip", "-")),
-                _truncate_text(str(finding.get("method", "-")), 28),
-                str(finding.get("protocol", "-")),
-                confidence_display,
-                str(finding.get("count", "-")),
-                _truncate_text(flow, 36),
-                _truncate_text(_redact_in_text(str(finding.get("details", "-"))), 70),
-            ])
-        lines.append(_format_table(rows))
-        if not verbose and len(hostname_findings) > limit:
-            lines.append(muted(f"... {len(hostname_findings) - limit} additional hostname evidence rows"))
-    else:
-        lines.append(muted("No hostname evidence found for target IP in inspected protocols."))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Services Discovered"))
-    services = [item for item in summary.services if _matches_target(item)]
-    if services:
-        rows = [["Role", "Asset", "Service", "Proto", "Packets", "Bytes", "Peers", "Software"]]
-        for item in (services if verbose else services[:limit]):
-            rows.append([
-                str(item.get("role", "-")),
-                str(item.get("asset", "-")),
-                str(item.get("service", "-")),
-                str(item.get("protocol", "-")),
-                str(item.get("packets", "-")),
-                format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
-                str(item.get("peers", "-")),
-                str(item.get("software", "-")),
-            ])
-        lines.append(_format_table(rows))
-        if not verbose and len(services) > limit:
-            lines.append(muted(f"... {len(services) - limit} additional service rows"))
-    else:
-        lines.append(muted("No services discovered for target IP."))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("User Evidence"))
-    user_evidence = [item for item in summary.user_evidence if _matches_target(item)]
-    if user_evidence:
-        rows = [["User", "Domain", "Full Name", "Method", "Location", "Details"]]
-        evidence_rows = user_evidence if verbose else user_evidence[:limit]
-        for item in evidence_rows:
-            rows.append([
-                str(item.get("username", "-")),
-                str(item.get("domain", "-")),
-                str(item.get("full_name", "-")),
-                str(item.get("method", "-")),
-                str(item.get("location", "-")),
-                str(item.get("details", "-")),
-            ])
-        lines.append(_format_table(rows))
-        if not verbose and len(user_evidence) > limit:
-            lines.append(muted(f"... {len(user_evidence) - limit} additional user evidence rows"))
+                lines.append(
+                    ok(
+                        f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                    )
+                )
 
         lines.append(SUBSECTION_BAR)
-        lines.append(header("User Summary"))
-        grouped_users: dict[tuple[str, str], set[str]] = {}
-        grouped_fullnames: dict[tuple[str, str], set[str]] = {}
-        grouped_counts: Counter[tuple[str, str]] = Counter()
-        empty_tokens = {"", "-", "unknown", "n/a", "none"}
-        for item in user_evidence:
-            method = str(item.get("method", "-"))
-            domain = str(item.get("domain", "-"))
-            user = str(item.get("username", "-"))
-            full_name = str(item.get("full_name", "-"))
-            grouped_users.setdefault((method, domain), set()).add(user)
-            if full_name.strip().lower() not in empty_tokens:
-                grouped_fullnames.setdefault((method, domain), set()).add(full_name)
-            grouped_counts[(method, domain)] += 1
-        rows = [["Method", "Domain", "Users", "Full Names", "Evidence Rows"]]
-        for (method, domain), count in grouped_counts.most_common():
-            users = sorted(grouped_users.get((method, domain), set()))
-            full_names = sorted(grouped_fullnames.get((method, domain), set()))
-            user_value = users[0] if users else "-"
-            name_value = full_names[0] if full_names else "-"
-            rows.append([method, domain, user_value, name_value, str(count)])
-            for idx in range(1, max(len(users), len(full_names))):
-                next_user = f"  {users[idx]}" if idx < len(users) else ""
-                next_name = f"  {full_names[idx]}" if idx < len(full_names) else ""
-                rows.append(["", "", next_user, next_name, ""])
-        lines.append(_format_table(rows))
-    else:
-        lines.append(muted("No usernames attributed to the target IP."))
+        lines.append(header("Hostname Risk Matrix"))
+        matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
+        matrix_items = list(getattr(summary, "risk_matrix", []) or [])
+        if matrix_items:
+            for item in matrix_items[: _limit_value(12)]:
+                matrix_rows.append(
+                    [
+                        str(item.get("category", "-")),
+                        str(item.get("risk", "-")),
+                        str(item.get("confidence", "-")),
+                        str(item.get("evidence", "-")),
+                    ]
+                )
+        else:
+            for key, label_text in check_labels[:8]:
+                evidence_count = len(
+                    [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
+                )
+                matrix_rows.append(
+                    [
+                        label_text,
+                        "Medium" if evidence_count else "None",
+                        "Medium" if evidence_count else "Low",
+                        str(evidence_count) if evidence_count else "No matching detections",
+                    ]
+                )
+        lines.append(_format_table(matrix_rows))
+
+        if summary.protocol_counts:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Protocol Evidence"))
+            rows = [["Protocol", "Count"]]
+            proto_limit = None if verbose else 10
+            for proto, count in summary.protocol_counts.most_common(proto_limit):
+                rows.append([str(proto), str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.method_counts:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Discovery Methods"))
+            rows = [["Method", "Count"]]
+            method_limit = None if verbose else 12
+            for method, count in summary.method_counts.most_common(method_limit):
+                rows.append([str(method), str(count)])
+            lines.append(_format_table(rows))
+
+        conflict_profiles = list(getattr(summary, "conflict_profiles", []) or [])
+        if conflict_profiles:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Conflict Profiles"))
+            rows = [["Type", "Hostname/IP", "Scope", "Evidence", "Methods"]]
+            for item in conflict_profiles[: _limit_value(limit if verbose else 12)]:
+                profile_type = str(item.get("type", "-") or "-")
+                if profile_type == "hostname_to_many_ips":
+                    identity = str(item.get("hostname", "-"))
+                    scope = f"ips={int(item.get('ip_count', 0) or 0)}"
+                else:
+                    identity = str(item.get("ip", "-"))
+                    scope = f"hosts={int(item.get('host_count', 0) or 0)}"
+                methods = item.get("methods", [])
+                rows.append(
+                    [
+                        profile_type,
+                        identity,
+                        scope,
+                        str(item.get("evidence", "-")),
+                        _truncate_text(
+                            ", ".join(str(v) for v in methods[:4])
+                            if isinstance(methods, list)
+                            else "-",
+                            70,
+                        ),
+                    ]
+                )
+            lines.append(_format_table(rows))
+
+        drift_profiles = list(getattr(summary, "drift_profiles", []) or [])
+        if drift_profiles:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Temporal Drift Profiles"))
+            rows = [["Hostname", "First Seen", "Last Seen", "IP Count", "IPs"]]
+            for item in drift_profiles[: _limit_value(limit if verbose else 10)]:
+                ips = item.get("ips", [])
+                rows.append(
+                    [
+                        str(item.get("hostname", "-")),
+                        format_ts(item.get("first_seen")),
+                        format_ts(item.get("last_seen")),
+                        str(item.get("ip_count", "-")),
+                        _truncate_text(
+                            ", ".join(
+                                str(v) for v in (ips[:5] if isinstance(ips, list) else [])
+                            )
+                            or "-",
+                            80,
+                        ),
+                    ]
+                )
+            lines.append(_format_table(rows))
+
+        corroboration = list(getattr(summary, "cross_protocol_corroboration", []) or [])
+        if corroboration:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Cross-Protocol Corroboration"))
+            rows = [["Hostname", "Protocols", "Methods", "Confidence", "Evidence"]]
+            for item in corroboration[: _limit_value(limit if verbose else 12)]:
+                protocols = item.get("protocols", [])
+                methods = item.get("methods", [])
+                rows.append(
+                    [
+                        str(item.get("hostname", "-")),
+                        _truncate_text(
+                            ", ".join(
+                                str(v)
+                                for v in (
+                                    protocols[:4] if isinstance(protocols, list) else []
+                                )
+                            )
+                            or "-",
+                            50,
+                        ),
+                        _truncate_text(
+                            ", ".join(
+                                str(v)
+                                for v in (methods[:3] if isinstance(methods, list) else [])
+                            )
+                            or "-",
+                            70,
+                        ),
+                        str(item.get("confidence", "-")),
+                        str(item.get("evidence", "-")),
+                    ]
+                )
+            lines.append(_format_table(rows))
+
+        suspicious_names = list(getattr(summary, "suspicious_name_profiles", []) or [])
+        if suspicious_names:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Suspicious Naming Analytics"))
+            rows = [["Hostname", "Reasons", "Entropy", "Evidence", "Mapped IPs"]]
+            for item in suspicious_names[: _limit_value(limit if verbose else 12)]:
+                reasons_val = item.get("reasons", [])
+                ips = item.get("ips", [])
+                rows.append(
+                    [
+                        str(item.get("hostname", "-")),
+                        _truncate_text(
+                            ", ".join(
+                                str(v)
+                                for v in (
+                                    reasons_val[:4] if isinstance(reasons_val, list) else []
+                                )
+                            )
+                            or "-",
+                            70,
+                        ),
+                        str(item.get("entropy", "-")),
+                        str(item.get("evidence", "-")),
+                        _truncate_text(
+                            ", ".join(
+                                str(v) for v in (ips[:4] if isinstance(ips, list) else [])
+                            )
+                            or "-",
+                            70,
+                        ),
+                    ]
+                )
+            lines.append(_format_table(rows))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("IP ↔ Hostname Correlation"))
+        if not summary.findings:
+            lines.append(
+                muted(
+                    "No hostname-to-IP correlation evidence found in inspected protocols."
+                )
+            )
+        else:
+            ip_hosts: dict[str, set[str]] = defaultdict(set)
+            ip_evidence: Counter[str] = Counter()
+            for finding in summary.findings:
+                if not finding.mapped_ip:
+                    continue
+                ip_hosts[finding.mapped_ip].add(finding.hostname)
+                ip_evidence[finding.mapped_ip] += finding.count
+
+            if not ip_hosts:
+                lines.append(
+                    muted(
+                        "No attributable IP mappings were extracted from hostname evidence."
+                    )
+                )
+            else:
+                rows = [["IP Address", "Hostnames", "Evidence"]]
+                corr_limit = None if verbose else limit
+                for ip_addr, evidence_count in ip_evidence.most_common(corr_limit):
+                    hosts = sorted(ip_hosts.get(ip_addr, set()))
+                    host_display = (
+                        ", ".join(hosts) if verbose else ", ".join(hosts[: _limit_value(3)])
+                    )
+                    rows.append([ip_addr, host_display, str(evidence_count)])
+                lines.append(_format_table(rows))
+                if not verbose and len(ip_evidence) > limit:
+                    lines.append(
+                        muted(
+                            f"... {len(ip_evidence) - limit} additional IP correlation rows"
+                        )
+                    )
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Discovered Hostnames"))
+        if not summary.findings:
+            if all_ip_mode:
+                lines.append(muted("No hostname evidence found in inspected protocols."))
+            else:
+                lines.append(
+                    muted(
+                        "No hostname evidence found for target IP in inspected protocols."
+                    )
+                )
+        else:
+            rows = [
+                [
+                    "Hostname",
+                    "Mapped IP",
+                    "Method",
+                    "Protocol",
+                    "Confidence",
+                    "Seen",
+                    "Flow",
+                    "Details",
+                ]
+            ]
+            row_findings = summary.findings if verbose else summary.findings[:limit]
+            for finding in row_findings:
+                confidence = str(finding.confidence)
+                if confidence == "HIGH":
+                    confidence_display = ok(confidence)
+                elif confidence == "MEDIUM":
+                    confidence_display = warn(confidence)
+                else:
+                    confidence_display = muted(confidence)
+
+                rows.append(
+                    [
+                        str(finding.hostname),
+                        str(finding.mapped_ip or "-"),
+                        str(finding.method),
+                        str(finding.protocol),
+                        confidence_display,
+                        str(finding.count),
+                        f"{finding.src_ip} -> {finding.dst_ip}",
+                        str(finding.details)
+                        if verbose
+                        else _truncate_text(str(finding.details), 70),
+                    ]
+                )
+            lines.append(_format_table(rows))
+            if not verbose and len(summary.findings) > limit:
+                lines.append(
+                    muted(
+                        f"... {len(summary.findings) - limit} additional hostname evidence rows"
+                    )
+                )
+
+        pivots = list(getattr(summary, "investigation_pivots", []) or [])
+        if pivots:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Top Hunt Pivots"))
+            rows = [
+                [
+                    "Hostname",
+                    "Packet",
+                    "Mapped IPs",
+                    "Methods",
+                    "First Packet",
+                    "Last Packet",
+                ]
+            ]
+            for item in pivots[: _limit_value(limit if verbose else 12)]:
+                mapped_ips = item.get("mapped_ips", [])
+                methods = item.get("methods", [])
+                rows.append(
+                    [
+                        str(item.get("hostname", "-")),
+                        _pivot_packet_number(item),
+                        _truncate_text(
+                            ", ".join(
+                                str(v)
+                                for v in (
+                                    mapped_ips[:4] if isinstance(mapped_ips, list) else []
+                                )
+                            )
+                            or "-",
+                            60,
+                        ),
+                        _truncate_text(
+                            ", ".join(
+                                str(v)
+                                for v in (methods[:3] if isinstance(methods, list) else [])
+                            )
+                            or "-",
+                            70,
+                        ),
+                        str(item.get("first_packet", "-")),
+                        str(item.get("last_packet", "-")),
+                    ]
+                )
+            lines.append(_format_table(rows))
+
+        false_positive_context = [
+            str(v)
+            for v in list(getattr(summary, "false_positive_context", []) or [])
+            if str(v).strip()
+        ]
+        if false_positive_context:
+            lines.append(
+                SUBSECTION_BAR
+            )
+            lines.append(header("False-Positive Context"))
+            for note in false_positive_context[: _limit_value(8)]:
+                lines.append(muted(f"- {_redact_in_text(note)}"))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Forensics Notes"))
+        lines.append(
+            muted(
+                "- DNS A/AAAA and PTR mappings are strongest hostname-to-IP attribution evidence."
+            )
+        )
+        lines.append(
+            muted(
+                "- HTTP Host and TLS SNI indicate intended server name and can reveal virtual-host targeting."
+            )
+        )
+        lines.append(
+            muted(
+                "- NTLM/NetBIOS names are contextual clues and may reflect client/workstation naming."
+            )
+        )
+
+        lines.append(SECTION_BAR)
+        return _finalize_output(lines)
+    finally:
+        if restore_verbose_flag is not None:
+            set_verbose_output(restore_verbose_flag)
+
+
+def render_hostdetails_summary(
+    summary: HostDetailsSummary, limit: int = 20, verbose: bool = False
+) -> str:
+    limit = _apply_verbose_limit(limit)
+    lines: list[str] = []
+    target_ip = str(summary.target_ip)
+
+    lines.append(SECTION_BAR)
+    lines.append(header(f"HOST DETAILS :: {target_ip} :: {summary.path.name}"))
+    lines.append(SECTION_BAR)
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Files Transferred"))
-    file_transfers = [item for item in summary.file_transfers if _matches_target(item)]
-    if file_transfers:
-        rows = [["Direction", "Type", "Filename", "Size", "Proto", "Flow", "Details", "Hashes"]]
-        transfer_rows = file_transfers if verbose else file_transfers[:limit]
-        for item in transfer_rows:
-            direction = str(item.get("direction", "-"))
-            if direction == "upload":
-                direction_display = warn(direction)
-            elif direction == "download":
-                direction_display = ok(direction)
-            elif direction == "loopback":
-                direction_display = muted(direction)
-            else:
-                direction_display = direction or "-"
-            kind = str(item.get("kind", "-"))
-            if kind == "artifact":
-                kind_display = ok(kind)
-            elif kind == "candidate":
-                kind_display = muted(kind)
-            else:
-                kind_display = kind or "-"
-
-            size_value = item.get("size_bytes") or item.get("bytes")
-            size_text = format_bytes_as_mb(int(size_value)) if size_value else "-"
-            proto = str(item.get("protocol", "-"))
-            src_port = item.get("src_port")
-            dst_port = item.get("dst_port")
-            src_port_text = str(src_port) if src_port is not None else "-"
-            dst_port_text = str(dst_port) if dst_port is not None else "-"
-            flow = f"{item.get('src_ip', '-')}:{src_port_text} -> {item.get('dst_ip', '-')}:{dst_port_text}"
-
-            details_bits: list[str] = []
-            note = str(item.get("note", "") or "").strip()
-            if note:
-                details_bits.append(note)
-            file_type = str(item.get("file_type", "") or "").strip()
-            if file_type and file_type.upper() != "UNKNOWN":
-                details_bits.append(f"type={file_type}")
-            hostname = str(item.get("hostname", "") or "").strip()
-            if hostname:
-                details_bits.append(f"host={hostname}")
-            content_type = str(item.get("content_type", "") or "").strip()
-            if content_type:
-                details_bits.append(f"content-type={content_type}")
-            packets = item.get("packets")
-            if packets is not None:
-                details_bits.append(f"packets={packets}")
-            packet_index = item.get("packet_index")
-            if packet_index is not None:
-                details_bits.append(f"pkt={packet_index}")
-            first_seen = item.get("first_seen")
-            last_seen = item.get("last_seen")
-            if first_seen is not None:
-                details_bits.append(f"first={format_ts(first_seen)}")
-            if last_seen is not None and last_seen != first_seen:
-                details_bits.append(f"last={format_ts(last_seen)}")
-            details_text = " | ".join(details_bits) if details_bits else "-"
-
-            hashes_bits: list[str] = []
-            sha256 = str(item.get("sha256", "") or "").strip()
-            if sha256:
-                hashes_bits.append(f"sha256={sha256[:12]}")
-            md5 = str(item.get("md5", "") or "").strip()
-            if md5:
-                hashes_bits.append(f"md5={md5[:8]}")
-            hashes_text = " ".join(hashes_bits) if hashes_bits else "-"
-
-            rows.append([
-                direction_display,
-                kind_display,
-                _truncate_text(str(item.get("filename", "-")), 36),
-                size_text,
-                proto,
-                _truncate_text(_redact_in_text(flow), 42),
-                _truncate_text(_redact_in_text(details_text), 90),
-                _truncate_text(hashes_text, 36),
-            ])
-        lines.append(_format_table(rows))
-        if not verbose and len(file_transfers) > limit:
-            lines.append(muted(f"... {len(file_transfers) - limit} additional file transfers"))
-    else:
-        lines.append(muted("No file transfers attributed to the target IP."))
+    lines.append(header("Host Identity"))
+    lines.append(
+        _format_kv(
+            "Hostname",
+            ", ".join(summary.hostnames[: _limit_value(8)])
+            if summary.hostnames
+            else "-",
+        )
+    )
+    lines.append(_format_kv("IP Address", target_ip))
+    lines.append(
+        _format_kv(
+            "MAC Address",
+            ", ".join(summary.mac_addresses[: _limit_value(8)])
+            if summary.mac_addresses
+            else "-",
+        )
+    )
+    if str(getattr(summary, "hostname_query", "") or "").strip():
+        lines.append(_format_kv("Hostname Filter", str(summary.hostname_query)))
+    if getattr(summary, "port_filter", None):
+        lines.append(_format_kv("Port Filter", str(summary.port_filter)))
+    if str(getattr(summary, "search_query", "") or "").strip():
+        lines.append(_format_kv("Search Filter", str(summary.search_query)))
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Traffic Overview"))
-    lines.append(_format_kv("Packets (PCAP)", str(summary.total_packets)))
+    lines.append(header("Traffic Statistics"))
     lines.append(_format_kv("Packets (Host Relevance)", str(summary.relevant_packets)))
-    lines.append(_format_kv("Sent / Received", f"{summary.packets_sent} / {summary.packets_recv}"))
-    lines.append(_format_kv("Bytes Sent", format_bytes_as_mb(summary.bytes_sent)))
-    lines.append(_format_kv("Bytes Received", format_bytes_as_mb(summary.bytes_recv)))
-    lines.append(_format_kv("Start", format_ts(summary.first_seen)))
-    lines.append(_format_kv("End", format_ts(summary.last_seen)))
+    lines.append(
+        _format_kv(
+            "Sent / Received Packets",
+            f"{summary.packets_sent} / {summary.packets_recv}",
+        )
+    )
+    lines.append(
+        _format_kv(
+            "Bytes Sent / Received",
+            f"{format_bytes_as_mb(summary.bytes_sent)} / {format_bytes_as_mb(summary.bytes_recv)}",
+        )
+    )
+    lines.append(_format_kv("First Seen", format_ts(summary.first_seen)))
+    lines.append(_format_kv("Last Seen", format_ts(summary.last_seen)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("DNS Queries Performed"))
-    if summary.dns_queries:
-        dns_items = [item for item in summary.dns_queries if _matches_target(item)]
-        query_counts: Counter[str] = Counter()
-        for item in dns_items:
-            name = str(item.get("name", "-"))
-            if name and name != "-":
-                query_counts[name] += 1
-        top_limit = 10
-        if query_counts:
-            lines.append(muted("Top 10 Most Queried"))
-            rows = [["Query", "Count"]]
-            for name, count in query_counts.most_common(top_limit):
-                rows.append([name, str(count)])
-            lines.append(_format_table(rows))
-
-            lines.append(muted("Top 10 Least Queried"))
-            least = sorted(query_counts.items(), key=lambda kv: (kv[1], kv[0]))[:top_limit]
-            rows = [["Query", "Count"]]
-            for name, count in least:
-                rows.append([name, str(count)])
-            lines.append(_format_table(rows))
-        else:
-            lines.append(muted("No DNS queries attributed to the target IP."))
-    else:
-        lines.append(muted("No DNS queries attributed to the target IP."))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Remote Hosts (Top Peers)"))
-    if summary.peer_counts:
-        rows = [["Peer", "Hostname(s)", "Evidence Count"]]
-        peer_hostnames: dict[str, set[str]] = {}
-        for finding in summary.hostname_findings:
-            src_ip = str(finding.get("src_ip", "") or "")
-            dst_ip = str(finding.get("dst_ip", "") or "")
-            hostname = str(finding.get("hostname", "") or "")
-            if not hostname:
-                continue
-            mapped_ip = str(finding.get("mapped_ip", "") or "")
-            if mapped_ip and mapped_ip != summary.target_ip:
-                peer_hostnames.setdefault(mapped_ip, set()).add(hostname)
-                continue
-            for ip_value in {src_ip, dst_ip}:
-                if not ip_value or ip_value == summary.target_ip:
-                    continue
-                peer_hostnames.setdefault(ip_value, set()).add(hostname)
-        for peer, count in summary.peer_counts.most_common(limit):
-            hostnames = ", ".join(sorted(peer_hostnames.get(peer, set()))[:3]) or "-"
-            rows.append([peer, hostnames, str(count)])
-        lines.append(_format_table(rows))
-    else:
-        lines.append(muted("No peer connections attributed to the target IP."))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Protocol Activity"))
-    if summary.protocol_counts:
-        rows = [["Protocol", "Count"]]
-        for proto, count in summary.protocol_counts.most_common(limit):
-            rows.append([proto, str(count)])
-        lines.append(_format_table(rows))
-    else:
-        lines.append(muted("No protocol activity attributed to the target IP."))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Conversations"))
-    if summary.conversations:
-        conv_source = [item for item in summary.conversations if _matches_target(item)]
-        conv_limit = 25 if not verbose else len(conv_source)
-        conv_rows = conv_source if verbose else conv_source[:conv_limit]
-        rows = [["Flow", "Service", "Protocol", "Packets", "Bytes", "Start", "End"]]
-        for item in conv_rows:
-            direction = str(item.get("direction", "-")).lower()
-            peer = str(item.get("peer", "-"))
-            proto = str(item.get("protocol", "-"))
-            packets = str(item.get("packets", "-"))
-            bytes_count = str(item.get("bytes", "-"))
-            start_ts = format_ts(item.get("first_seen"))
-            end_ts = format_ts(item.get("last_seen"))
-            ports_text = str(item.get("ports", "-"))
-            ports = [p.strip() for p in ports_text.split(",") if p.strip()] if ports_text and ports_text != "-" else ["-"]
-            for port in ports:
-                service = "-"
-                if port.isdigit():
-                    service = COMMON_PORTS.get(int(port), "-")
-                if direction == "outbound":
-                    flow = f"{summary.target_ip}:{port} -> {peer}"
-                elif direction == "inbound":
-                    flow = f"{peer}:{port} -> {summary.target_ip}"
-                else:
-                    flow = f"{summary.target_ip}:{port} -> {peer}"
-                rows.append([flow, service, proto, packets, bytes_count, start_ts, end_ts])
-        lines.append(_format_table(rows))
-        if not verbose and len(conv_source) > len(conv_rows):
-            lines.append(muted(f"... {len(conv_source) - len(conv_rows)} additional conversation rows"))
-    else:
-        lines.append(muted("No conversations attributed to the target IP."))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Activity Timeline"))
-    lines.append(muted("Time | Category | Summary | Details"))
-    if summary.timeline_events:
-        timeline_events = [item for item in summary.timeline_events if _matches_target(item)]
-        event_rows = timeline_events if verbose else timeline_events[:_limit_value(limit * 3)]
-
-        def _timeline_severity(summary_text: str, details_text: str, category: str) -> str:
-            text = f"{summary_text} {details_text}".lower()
-            if "handshake incomplete" in text or "final ack missing" in text:
-                return "suspicious"
-            if "potential port scan" in text or "scan" in text or "probe" in text:
-                return "suspicious"
-            if "http post" in text:
-                return "suspicious"
-            if "file artifact" in text:
-                if any(token in text for token in [
-                    "(exe/dll)", "(archive)", ".exe", ".dll", ".ps1", ".vbs", ".bat", ".scr", ".js"
-                ]):
-                    return "malicious"
-                return "suspicious"
-            if "tcp connect attempt" in text and any(f":{port}" in text for port in (445, 3389, 22, 23, 135, 139, 5985, 5986)):
-                return "suspicious"
-            if any(token in text for token in ("write", "control", "start", "stop", "setpoint", "program", "firmware")):
-                if category in {"Modbus", "DNP3", "IEC-104", "S7", "CIP", "ENIP", "BACnet", "OPC UA", "PROFINET"}:
-                    return "suspicious"
-            return "info"
-
-        for event in event_rows:
-            summary_text = str(event.get("summary", ""))
-            details_text = _redact_in_text(str(event.get("details", "")))
-            category = str(event.get("category", ""))
-            severity = _timeline_severity(summary_text, details_text, category)
-            if severity == "malicious":
-                summary_text = danger(summary_text)
-            elif severity == "suspicious":
-                summary_text = warn(summary_text)
-            summary_text = summary_text.replace(
-                "[C2] [Payload] File artifact",
-                warn_bg("[C2] [Payload] File artifact"),
+    lines.append(header("Services Running On Host (SYN/ACK)"))
+    local_services = [
+        item
+        for item in (summary.services or [])
+        if str(item.get("role", "")).lower() == "server"
+        and str(item.get("asset", "")).startswith(f"{target_ip}:")
+    ]
+    if local_services:
+        rows = [["Service", "Port", "Proto", "Software", "Packets", "Bytes", "Clients"]]
+        for item in local_services:
+            rows.append(
+                [
+                    str(item.get("service", "-")),
+                    str(item.get("port", "-")),
+                    str(item.get("protocol", "-")),
+                    _truncate_text(str(item.get("software", "-") or "-"), 32),
+                    str(item.get("packets", "-")),
+                    format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
+                    _truncate_text(str(item.get("peers", "-") or "-"), 36),
+                ]
             )
-            lines.append(
-                f"{format_ts(event.get('ts'))} | {category} | {summary_text} | {details_text}"
-            )
-        if not verbose and len(timeline_events) > len(event_rows):
-            lines.append(muted(f"... {len(timeline_events) - len(event_rows)} additional timeline events"))
+        lines.append(_format_table(rows))
     else:
-        lines.append(muted("No timeline events attributed to the target IP."))
+        lines.append(muted("No SYN/ACK-confirmed services found on this host."))
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Detections / IOCs"))
-    detections = [item for item in _filtered_detections(summary, verbose) if _matches_target(item)]
-    if detections:
+    if not verbose:
+        web_items = [
+            item
+            for item in (summary.web_requests or [])
+            if str(item.get("src_ip", "")) == target_ip
+        ]
+        dns_items = [
+            item
+            for item in (summary.dns_queries or [])
+            if str(item.get("src_ip", "")) == target_ip
+        ]
+        download_items = [
+            item
+            for item in (summary.file_transfers or [])
+            if str(item.get("direction", "")).lower() == "download"
+            and str(item.get("dst_ip", "")) == target_ip
+        ]
+        outbound_conversations = [
+            item
+            for item in (summary.conversations or [])
+            if str(item.get("direction", "")).lower() == "outbound"
+            and str(item.get("peer", ""))
+            and str(item.get("peer", "")) != target_ip
+        ]
 
-        flow_pattern = re.compile(
-            r"(?P<src>[0-9A-Fa-f:.]+)(?::(?P<sport>\d{1,5}))?\s*->\s*(?P<dst>[0-9A-Fa-f:.]+)(?::(?P<dport>\d{1,5}))?"
+        unique_web_targets = {
+            str(item.get("dst_ip", "") or "")
+            for item in web_items
+            if str(item.get("dst_ip", "") or "")
+        }
+        unique_dns_names = {
+            str(item.get("name", "") or "")
+            for item in dns_items
+            if str(item.get("name", "") or "")
+        }
+        remote_peers = {
+            str(item.get("peer", "") or "")
+            for item in outbound_conversations
+            if str(item.get("peer", "") or "")
+        }
+
+        top_web_risk = sorted(
+            web_items,
+            key=lambda item: int(item.get("risk_score", 0) or 0),
+            reverse=True,
+        )[: _limit_value(3)]
+
+        top_dns_counts: Counter[str] = Counter(
+            str(item.get("name", "-") or "-") for item in dns_items
         )
 
-        def _normalize_flow(flow_text: str) -> str | None:
-            match = flow_pattern.search(flow_text)
-            if not match:
-                return None
-            src = match.group("src")
-            dst = match.group("dst")
-            sport = match.group("sport") or "-"
-            dport = match.group("dport") or "-"
-            if not src or not dst:
-                return None
-            return f"{src}:{sport}->{dst}:{dport}"
+        top_remote = sorted(
+            outbound_conversations,
+            key=lambda item: int(item.get("bytes", 0) or 0),
+            reverse=True,
+        )[: _limit_value(3)]
 
-        for item in (detections if verbose else detections[:limit * 3]):
-            severity = str(item.get("severity", "info")).lower()
-            source = str(item.get("source", "HostDetails"))
-            summary_text = str(item.get("summary", ""))
-            details = str(item.get("details", ""))
-            if severity == "critical":
-                marker = danger("[CRIT]")
-            elif severity == "high":
-                marker = danger("[HIGH]")
-            elif severity in {"warning", "warn", "medium"}:
-                marker = warn("[WARN]")
-            else:
-                marker = ok("[INFO]")
-            lines.append(f"{marker} [{source}] {summary_text}")
-            if details:
-                lines.append(muted(f"  {details}"))
+        total_download_bytes = 0
+        download_names: Counter[str] = Counter()
+        for item in download_items:
+            total_download_bytes += int(
+                item.get("size_bytes") or item.get("bytes") or 0
+            )
+            filename = str(item.get("filename", "-") or "-")
+            download_names[filename] += 1
 
-            flow_values: list[str] = []
-            seen_flows: set[str] = set()
-            for blob in [details] + [str(value) for value in (item.get("evidence", []) or [])]:
-                normalized = _normalize_flow(_redact_in_text(blob))
-                if not normalized or normalized in seen_flows:
-                    continue
-                seen_flows.add(normalized)
-                flow_values.append(normalized)
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Non-Essential Activity Summary"))
+        lines.append(
+            _format_kv(
+                "Web Requests",
+                f"{len(web_items)} events across {len(unique_web_targets)} remote targets",
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Remote Service Conversations",
+                f"{len(outbound_conversations)} flows across {len(remote_peers)} peers",
+            )
+        )
+        lines.append(
+            _format_kv(
+                "DNS Queries",
+                f"{len(dns_items)} events across {len(unique_dns_names)} unique names",
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Downloads",
+                f"{len(download_items)} events totaling {format_bytes_as_mb(total_download_bytes) if total_download_bytes else '-'}",
+            )
+        )
 
-            if flow_values:
-                lines.append(muted(f"  Flow Summary: {', '.join(flow_values[:_limit_value(4)])}"))
+        if top_web_risk:
+            lines.append(muted("Top risky web requests:"))
+            for item in top_web_risk:
+                req = f"{item.get('host', '-')}{item.get('uri', '')}"
+                lines.append(
+                    muted(
+                        f"- {item.get('method', '-')} {_truncate_text(req, 64)} risk={item.get('risk_level', '-')}({item.get('risk_score', 0)}) status={item.get('response_code', '-')}"
+                    )
+                )
 
-            top_sources = item.get("top_sources")
-            if isinstance(top_sources, list) and top_sources:
-                src_text = ", ".join(f"{ip}({count})" for ip, count in top_sources[:_limit_value(6)])
-                lines.append(muted(f"  Top Sources: {src_text}"))
-            top_destinations = item.get("top_destinations")
-            if isinstance(top_destinations, list) and top_destinations:
-                dst_text = ", ".join(f"{ip}({count})" for ip, count in top_destinations[:_limit_value(6)])
-                lines.append(muted(f"  Top Destinations: {dst_text}"))
-            evidence_items = item.get("evidence")
-            if isinstance(evidence_items, list) and evidence_items:
-                lines.append(muted("  Evidence:"))
-                for evidence in evidence_items[:_limit_value(10)]:
-                    lines.append(muted(f"    - {_redact_in_text(str(evidence))}"))
-        if not verbose and len(detections) > limit * 3:
-            lines.append(muted(f"... {len(detections) - (limit * 3)} additional detections"))
-    else:
-        lines.append(ok("No host-specific detections or IOCs observed."))
+        top_dns = top_dns_counts.most_common(_limit_value(3))
+        if top_dns:
+            lines.append(muted("Top DNS queries:"))
+            for name, count in top_dns:
+                lines.append(muted(f"- {_truncate_text(name, 72)} ({count})"))
+
+        if top_remote:
+            lines.append(muted("Top remote services by bytes:"))
+            for item in top_remote:
+                lines.append(
+                    muted(
+                        f"- {item.get('peer', '-')} proto={item.get('protocol', '-')} bytes={format_bytes_as_mb(int(item.get('bytes', 0) or 0))} packets={item.get('packets', '-')}"
+                    )
+                )
+
+        top_downloads = download_names.most_common(_limit_value(3))
+        if top_downloads:
+            lines.append(muted("Top downloaded filenames:"))
+            for name, count in top_downloads:
+                lines.append(muted(f"- {_truncate_text(name, 60)} ({count})"))
+
+        lines.append(
+            muted("Use -v to expand full rows, timestamps, and detailed pivot tables.")
+        )
+        lines.append(SECTION_BAR)
+        return _finalize_output(lines, show_truncation_note=False)
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Attack Categories"))
-    if summary.attack_categories:
-        rows = [["Category", "Signals"]]
-        for category, count in summary.attack_categories.most_common(limit):
-            rows.append([category.replace("_", " "), str(count)])
+    lines.append(header("Web Requests Made By Host"))
+    web_requests = [
+        item
+        for item in (summary.web_requests or [])
+        if str(item.get("src_ip", "")) == target_ip
+    ]
+    ordered_requests: list[
+        tuple[tuple[str, str, str, str, str, str, str], dict[str, object]]
+    ] = []
+    if web_requests:
+        grouped_requests: dict[
+            tuple[str, str, str, str, str, str, str], dict[str, object]
+        ] = {}
+        for item in web_requests:
+            request_value = f"{item.get('host', '-')}{item.get('uri', '')}"
+            status_code = item.get("response_code")
+            status_name = str(item.get("response_name", "") or "")
+            status_text = "-"
+            if status_code:
+                status_text = str(status_code)
+                if status_name and status_name != "-":
+                    status_text = f"{status_text} {status_name}"
+            key = (
+                str(item.get("method", "-")),
+                request_value,
+                str(item.get("dst_ip", "-")),
+                str(item.get("dst_port", "-")),
+                status_text,
+                str(item.get("risk_level", "-")),
+                str(item.get("risk_score", "-")),
+            )
+            bucket = grouped_requests.setdefault(
+                key,
+                {
+                    "count": 0,
+                    "first": item.get("ts"),
+                    "last": item.get("ts"),
+                    "first_packet": _pivot_packet_number(item),
+                },
+            )
+            bucket["count"] = int(bucket.get("count", 0) or 0) + 1
+            packet_text = _pivot_packet_number(item)
+            if bucket.get("first_packet") in {None, "-", ""} and packet_text != "-":
+                bucket["first_packet"] = packet_text
+            ts = item.get("ts")
+            if isinstance(ts, (int, float)) and (
+                bucket.get("first") is None or ts < bucket.get("first")
+            ):
+                bucket["first"] = ts
+            if isinstance(ts, (int, float)) and (
+                bucket.get("last") is None or ts > bucket.get("last")
+            ):
+                bucket["last"] = ts
+
+        rows = [
+            ["Method", "Request", "Remote", "Status", "Risk", "Hits", "First", "Last"]
+        ]
+        ordered_requests = sorted(
+            grouped_requests.items(),
+            key=lambda item: int(item[1].get("count", 0) or 0),
+            reverse=True,
+        )
+        for (
+            method,
+            request_value,
+            dst_ip,
+            dst_port,
+            status_text,
+            risk_level,
+            risk_score,
+        ), bucket in ordered_requests:
+            rows.append(
+                [
+                    method,
+                    _truncate_text(request_value, 58),
+                    f"{dst_ip}:{dst_port}",
+                    status_text,
+                    f"{risk_level} ({risk_score})",
+                    str(bucket.get("count", "-")),
+                    format_ts(bucket.get("first")),
+                    format_ts(bucket.get("last")),
+                ]
+            )
         lines.append(_format_table(rows))
     else:
-        lines.append(muted("No attack categories inferred for target IP."))
+        lines.append(muted("No web requests from this host were identified."))
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Artifacts"))
-    if summary.artifacts:
-        artifact_source = [item for item in summary.artifacts if _matches_target(item)]
-        artifact_rows = artifact_source if verbose else artifact_source[:limit]
-        for item in artifact_rows:
-            lines.append(muted(f"- {item}"))
-        if not verbose and len(artifact_source) > limit:
-            lines.append(muted(f"... {len(artifact_source) - limit} additional artifacts"))
+    lines.append(header("Remote Services Established By Host"))
+    remote_agg: dict[tuple[str, str, str], dict[str, object]] = {}
+    sorted_rows: list[tuple[tuple[str, str, str], dict[str, object]]] = []
+    for conv in summary.conversations or []:
+        if str(conv.get("direction", "")).lower() != "outbound":
+            continue
+        peer = str(conv.get("peer", "") or "")
+        if not peer or peer == target_ip:
+            continue
+        proto = str(conv.get("protocol", "-") or "-")
+        ports = [
+            p.strip()
+            for p in str(conv.get("ports", "") or "").split(",")
+            if p.strip().isdigit()
+        ]
+        if not ports:
+            ports = ["-"]
+        for port in ports:
+            service_name = COMMON_PORTS.get(int(port), "-") if port.isdigit() else "-"
+            key = (peer, port, proto)
+            row = remote_agg.setdefault(
+                key,
+                {
+                    "packets": 0,
+                    "bytes": 0,
+                    "first_seen": conv.get("first_seen"),
+                    "last_seen": conv.get("last_seen"),
+                    "service": service_name,
+                    "first_packet": _pivot_packet_number(conv),
+                },
+            )
+            row["packets"] = int(row.get("packets", 0) or 0) + int(
+                conv.get("packets", 0) or 0
+            )
+            row["bytes"] = int(row.get("bytes", 0) or 0) + int(
+                conv.get("bytes", 0) or 0
+            )
+            packet_text = _pivot_packet_number(conv)
+            if row.get("first_packet") in {None, "-", ""} and packet_text != "-":
+                row["first_packet"] = packet_text
+            first_seen = conv.get("first_seen")
+            if isinstance(first_seen, (int, float)) and (
+                row.get("first_seen") is None or first_seen < row.get("first_seen")
+            ):
+                row["first_seen"] = first_seen
+            last_seen = conv.get("last_seen")
+            if isinstance(last_seen, (int, float)) and (
+                row.get("last_seen") is None or last_seen > row.get("last_seen")
+            ):
+                row["last_seen"] = last_seen
+
+    if remote_agg:
+        rows = [
+            [
+                "Remote Host",
+                "Port",
+                "Service",
+                "Proto",
+                "Packets",
+                "Bytes",
+                "First",
+                "Last",
+            ]
+        ]
+        sorted_rows = sorted(
+            remote_agg.items(),
+            key=lambda item: int(item[1].get("bytes", 0) or 0),
+            reverse=True,
+        )
+        for (peer, port, proto), data in sorted_rows:
+            rows.append(
+                [
+                    peer,
+                    port,
+                    str(data.get("service", "-")),
+                    proto,
+                    str(data.get("packets", "-")),
+                    format_bytes_as_mb(int(data.get("bytes", 0) or 0)),
+                    format_ts(data.get("first_seen")),
+                    format_ts(data.get("last_seen")),
+                ]
+            )
+        lines.append(_format_table(rows))
     else:
-        lines.append(muted("No host-specific artifacts extracted."))
+        lines.append(
+            muted("No remote services established by this host were identified.")
+        )
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("DNS Queries Made By Host"))
+    dns_items = [
+        item
+        for item in (summary.dns_queries or [])
+        if str(item.get("src_ip", "")) == target_ip
+    ]
+    sorted_dns: list[tuple[tuple[str, str], dict[str, object]]] = []
+    if dns_items:
+        dns_agg: dict[tuple[str, str], dict[str, object]] = {}
+        for item in dns_items:
+            name = str(item.get("name", "-") or "-")
+            qtype = str(item.get("qtype", "-") or "-")
+            key = (name, qtype)
+            row = dns_agg.setdefault(
+                key,
+                {
+                    "count": 0,
+                    "first": item.get("ts"),
+                    "last": item.get("ts"),
+                    "first_packet": _pivot_packet_number(item),
+                },
+            )
+            row["count"] = int(row.get("count", 0) or 0) + 1
+            packet_text = _pivot_packet_number(item)
+            if row.get("first_packet") in {None, "-", ""} and packet_text != "-":
+                row["first_packet"] = packet_text
+            ts = item.get("ts")
+            if isinstance(ts, (int, float)) and (
+                row.get("first") is None or ts < row.get("first")
+            ):
+                row["first"] = ts
+            if isinstance(ts, (int, float)) and (
+                row.get("last") is None or ts > row.get("last")
+            ):
+                row["last"] = ts
+
+        rows = [["Query", "Type", "Count", "First", "Last"]]
+        sorted_dns = sorted(
+            dns_agg.items(),
+            key=lambda item: int(item[1].get("count", 0) or 0),
+            reverse=True,
+        )
+        for (name, qtype), data in sorted_dns:
+            rows.append(
+                [
+                    _truncate_text(name, 56),
+                    qtype,
+                    str(data.get("count", "-")),
+                    format_ts(data.get("first")),
+                    format_ts(data.get("last")),
+                ]
+            )
+        lines.append(_format_table(rows))
+    else:
+        lines.append(muted("No DNS queries made by this host were identified."))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Files Downloaded By Host"))
+    downloads = [
+        item
+        for item in (summary.file_transfers or [])
+        if str(item.get("direction", "")).lower() == "download"
+        and str(item.get("dst_ip", "")) == target_ip
+    ]
+    ordered_downloads: list[
+        tuple[tuple[str, str, str, str, str], dict[str, object]]
+    ] = []
+    if downloads:
+        grouped_downloads: dict[tuple[str, str, str, str, str], dict[str, object]] = {}
+        for item in downloads:
+            size_value = int(item.get("size_bytes") or item.get("bytes") or 0)
+            src_port = item.get("src_port")
+            src_port_text = str(src_port) if src_port is not None else "-"
+            source_text = f"{item.get('src_ip', '-')}:{src_port_text}"
+            hash_bits: list[str] = []
+            sha = str(item.get("sha256", "") or "").strip()
+            md5 = str(item.get("md5", "") or "").strip()
+            if sha:
+                hash_bits.append(f"sha256={sha[:12]}")
+            if md5:
+                hash_bits.append(f"md5={md5[:8]}")
+            key = (
+                str(item.get("filename", "-") or "-"),
+                source_text,
+                str(item.get("protocol", "-")),
+                str(item.get("file_type", "-") or "-"),
+                " ".join(hash_bits) if hash_bits else "-",
+            )
+            bucket = grouped_downloads.setdefault(
+                key,
+                {
+                    "count": 0,
+                    "total_bytes": 0,
+                    "first": item.get("first_seen"),
+                    "last": item.get("last_seen"),
+                    "first_packet": _pivot_packet_number(item),
+                },
+            )
+            bucket["count"] = int(bucket.get("count", 0) or 0) + 1
+            bucket["total_bytes"] = int(bucket.get("total_bytes", 0) or 0) + size_value
+            packet_text = _pivot_packet_number(item)
+            if (
+                bucket.get("first_packet") in {None, "-", ""}
+                and packet_text != "-"
+            ):
+                bucket["first_packet"] = packet_text
+            first_seen = item.get("first_seen")
+            if isinstance(first_seen, (int, float)) and (
+                bucket.get("first") is None or first_seen < bucket.get("first")
+            ):
+                bucket["first"] = first_seen
+            last_seen = item.get("last_seen")
+            if isinstance(last_seen, (int, float)) and (
+                bucket.get("last") is None or last_seen > bucket.get("last")
+            ):
+                bucket["last"] = last_seen
+
+        rows = [
+            [
+                "Filename",
+                "Source",
+                "Proto",
+                "Type",
+                "Hashes",
+                "Events",
+                "Total Size",
+                "First",
+                "Last",
+            ]
+        ]
+        ordered_downloads = sorted(
+            grouped_downloads.items(),
+            key=lambda item: int(item[1].get("total_bytes", 0) or 0),
+            reverse=True,
+        )
+        for (
+            filename,
+            source_text,
+            proto,
+            file_type,
+            hashes,
+        ), bucket in ordered_downloads:
+            total_size = int(bucket.get("total_bytes", 0) or 0)
+            rows.append(
+                [
+                    _truncate_text(filename, 36),
+                    source_text,
+                    proto,
+                    _truncate_text(file_type, 20),
+                    hashes,
+                    str(bucket.get("count", "-")),
+                    format_bytes_as_mb(total_size) if total_size else "-",
+                    format_ts(bucket.get("first")),
+                    format_ts(bucket.get("last")),
+                ]
+            )
+        lines.append(_format_table(rows))
+    else:
+        lines.append(muted("No downloaded files attributed to this host."))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Hunt Pivots"))
+    pivot_rows = [["Type", "Packet", "Pivot", "Context"]]
+
+    for (peer, port, proto), data in sorted_rows[: _limit_value(10)]:
+        context = f"service={data.get('service', '-')} bytes={format_bytes_as_mb(int(data.get('bytes', 0) or 0))} packets={data.get('packets', '-')}"
+        pivot_rows.append(
+            [
+                "Remote Service",
+                str(data.get("first_packet", "-")),
+                f"{peer}:{port}/{proto}",
+                context,
+            ]
+        )
+
+    for (name, qtype), data in sorted_dns[: _limit_value(10)]:
+        context = f"count={data.get('count', '-')} first={format_ts(data.get('first'))} last={format_ts(data.get('last'))}"
+        pivot_rows.append(
+            [
+                "DNS Query",
+                str(data.get("first_packet", "-")),
+                f"{name} ({qtype})",
+                context,
+            ]
+        )
+
+    for (
+        method,
+        request_value,
+        dst_ip,
+        dst_port,
+        status_text,
+        _risk_level,
+        _risk_score,
+    ), bucket in ordered_requests[: _limit_value(10)]:
+        context = f"hits={bucket.get('count', '-')} status={status_text} remote={dst_ip}:{dst_port}"
+        pivot_rows.append(
+            [
+                "Web Request",
+                str(bucket.get("first_packet", "-")),
+                f"{method} {_truncate_text(request_value, 60)}",
+                context,
+            ]
+        )
+
+    for (filename, source_text, proto, file_type, hashes), bucket in ordered_downloads[
+        : _limit_value(10)
+    ]:
+        total_size = int(bucket.get("total_bytes", 0) or 0)
+        hash_text = hashes if hashes and hashes != "-" else "no-hash"
+        context = (
+            f"events={bucket.get('count', '-')} total={format_bytes_as_mb(total_size) if total_size else '-'} "
+            f"src={source_text} proto={proto} type={file_type or '-'} {hash_text}"
+        )
+        pivot_rows.append(
+            [
+                "Downloaded File",
+                str(bucket.get("first_packet", "-")),
+                filename,
+                context,
+            ]
+        )
+
+    for peer, count in summary.peer_counts.most_common(_limit_value(10)):
+        pivot_rows.append(["Top Peer", "-", peer, f"packets={count}"])
+
+    if len(pivot_rows) > 1:
+        lines.append(_format_table(pivot_rows))
+    else:
+        lines.append(muted("No host-specific pivots were identified."))
 
     lines.append(SECTION_BAR)
-    return _highlight_public_ips("\n".join(lines))
+    return _finalize_output(lines, show_truncation_note=False)
 
 
-def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose: bool = False) -> str:
-    limit = _apply_verbose_limit(limit)
+def render_timeline_summary(
+    summary: TimelineSummary, limit: int = 200, verbose: bool = False
+) -> str:
+    limit = _apply_verbose_limit(limit) or limit
+
+    def _mal(text: str) -> str:
+        return danger_bg(text)
+
+    def _sus(text: str) -> str:
+        return suspicious_bg(text)
+
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"TIMELINE :: {summary.target_ip} :: {summary.path.name}"))
@@ -15081,23 +19023,99 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Analyst Verdict"))
-    verdict_text = summary.analyst_verdict or "NO STRONG SIGNAL - timeline heuristics did not cross confidence threshold"
+    verdict_text = (
+        summary.analyst_verdict
+        or "NO STRONG SIGNAL - timeline heuristics did not cross confidence threshold"
+    )
     confidence_text = (summary.analyst_confidence or "low").strip().lower()
     if verdict_text.startswith("YES"):
-        lines.append(danger(verdict_text))
+        lines.append(_mal(verdict_text))
     elif verdict_text.startswith("LIKELY") or verdict_text.startswith("POSSIBLE"):
-        lines.append(warn(verdict_text))
+        lines.append(_sus(verdict_text))
     else:
         lines.append(ok(verdict_text))
     lines.append(_format_kv("Confidence", confidence_text.capitalize()))
     if summary.analyst_reasons:
         lines.append(muted("Why confidence:"))
-        for reason in summary.analyst_reasons[:_limit_value(10 if verbose else 6)]:
+        for reason in summary.analyst_reasons[: _limit_value(10 if verbose else 6)]:
             lines.append(muted(f"- {_redact_in_text(str(reason))}"))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Deterministic Timeline Security Checks"))
     checks = summary.deterministic_checks or {}
+
+    def _style_timeline_artifact_line(text: str) -> str:
+        lowered = str(text or "").lower()
+        malicious_tokens = (
+            "malware",
+            "ransomware",
+            "c2",
+            "command-and-control",
+            ".exe",
+            ".dll",
+            ".ps1",
+            ".vbs",
+            ".bat",
+            ".scr",
+            "credential theft",
+            "payload",
+        )
+        suspicious_tokens = (
+            "exfiltration",
+            "exfil",
+            "beacon",
+            "lateral movement",
+            "port scan",
+            "brute force",
+            "suspicious",
+            "http post",
+            "handshake incomplete",
+            "final ack missing",
+            "write command",
+            "control command",
+        )
+        line = f"- {_redact_in_text(str(text))}"
+
+        # Only apply alert styling to concrete artifact/evidence lines.
+        artifact_markers = (
+            "pkt=",
+            "packet=",
+            "packet ",
+            "flow=",
+            "src=",
+            "dst=",
+            "remote=",
+            "domain=",
+            "host=",
+            "uri=",
+            "sni=",
+            "sha256=",
+            "md5=",
+            "http://",
+            "https://",
+            "tcp/",
+            "udp/",
+            "dns",
+            "->",
+        )
+        has_artifact_marker = any(marker in lowered for marker in artifact_markers)
+        if not has_artifact_marker:
+            if re.search(r"\b(?:pkt|packet)\s*\d+\b", lowered):
+                has_artifact_marker = True
+            elif re.search(
+                r"\b\d{1,3}(?:\.\d{1,3}){3}\b", lowered
+            ) and any(token in lowered for token in suspicious_tokens + malicious_tokens):
+                has_artifact_marker = True
+
+        if not has_artifact_marker:
+            return muted(line)
+
+        if any(token in lowered for token in malicious_tokens):
+            return _mal(line)
+        if any(token in lowered for token in suspicious_tokens):
+            return _sus(line)
+        return muted(line)
+
     check_labels = [
         ("recon_to_access_sequence", "Recon to Access Sequence"),
         ("access_to_execution_sequence", "Access to Execution Sequence"),
@@ -15112,17 +19130,40 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
     ]
     matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for key, label_text in check_labels:
-        evidence_items = [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
+        evidence_items = [
+            str(v) for v in list(checks.get(key, []) or []) if str(v).strip()
+        ]
         lines.append(label(label_text))
         if evidence_items:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-            for item in evidence_items[:_limit_value(8 if verbose else 5)]:
-                lines.append(muted(f"- {_redact_in_text(item)}"))
-            risk = "High" if key in {"execution_to_c2_or_exfil", "exfiltration_chain", "ot_impact_signal"} else "Medium"
-            conf = "High" if key in {"execution_to_c2_or_exfil", "evidence_provenance"} else "Medium"
-            matrix_rows.append([label_text, risk, conf, f"{len(evidence_items)} signal(s)"])
+            lines.append(
+                f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+            )
+            for item in evidence_items[: _limit_value(8 if verbose else 5)]:
+                lines.append(_style_timeline_artifact_line(item))
+            risk = (
+                "High"
+                if key
+                in {
+                    "execution_to_c2_or_exfil",
+                    "exfiltration_chain",
+                    "ot_impact_signal",
+                }
+                else "Medium"
+            )
+            conf = (
+                "High"
+                if key in {"execution_to_c2_or_exfil", "evidence_provenance"}
+                else "Medium"
+            )
+            matrix_rows.append(
+                [label_text, risk, conf, f"{len(evidence_items)} signal(s)"]
+            )
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -15134,44 +19175,59 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Sequence Plausibility Timeline"))
         rows = [["Stage", "First Seen", "Last Seen", "Count", "Dwell", "Evidence"]]
-        for item in sequence_rows[:_limit_value(20 if verbose else 10)]:
+        for item in sequence_rows[: _limit_value(20 if verbose else 10)]:
             evidence = item.get("evidence", [])
             if isinstance(evidence, list):
                 evidence_text = " | ".join(str(v) for v in evidence[:3])
             else:
                 evidence_text = str(evidence)
-            rows.append([
-                str(item.get("stage", "-")),
-                format_ts(item.get("first_ts")),
-                format_ts(item.get("last_ts")),
-                str(item.get("count", "-")),
-                format_duration(item.get("dwell")),
-                _truncate_text(evidence_text or "-", 70),
-            ])
+            rows.append(
+                [
+                    str(item.get("stage", "-")),
+                    format_ts(item.get("first_ts")),
+                    format_ts(item.get("last_ts")),
+                    str(item.get("count", "-")),
+                    format_duration(item.get("dwell")),
+                    _truncate_text(evidence_text or "-", 70),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.sequence_violations:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Sequence Violations"))
-        for item in summary.sequence_violations[:_limit_value(10 if verbose else 6)]:
-            lines.append(warn(f"- {_redact_in_text(str(item))}"))
+        for item in summary.sequence_violations[: _limit_value(10 if verbose else 6)]:
+            lines.append(_style_timeline_artifact_line(str(item)))
 
     beacon_rows = list(getattr(summary, "beacon_candidates", []) or [])
     if beacon_rows:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Beaconing Candidates"))
-        rows = [["Peer", "Category", "Signal", "Count", "Mean Interval", "Jitter", "CV", "Confidence"]]
-        for item in beacon_rows[:_limit_value(12 if verbose else 8)]:
-            rows.append([
-                str(item.get("peer", "-")),
-                str(item.get("category", "-")),
-                _truncate_text(str(item.get("summary", "-")), 32),
-                str(item.get("count", "-")),
-                f"{item.get('mean_interval', '-')}s",
-                f"{item.get('jitter', '-')}s",
-                str(item.get("cv", "-")),
-                str(item.get("confidence", "-")).upper(),
-            ])
+        rows = [
+            [
+                "Peer",
+                "Category",
+                "Signal",
+                "Count",
+                "Mean Interval",
+                "Jitter",
+                "CV",
+                "Confidence",
+            ]
+        ]
+        for item in beacon_rows[: _limit_value(12 if verbose else 8)]:
+            rows.append(
+                [
+                    str(item.get("peer", "-")),
+                    str(item.get("category", "-")),
+                    _truncate_text(str(item.get("summary", "-")), 32),
+                    str(item.get("count", "-")),
+                    f"{item.get('mean_interval', '-')}s",
+                    f"{item.get('jitter', '-')}s",
+                    str(item.get("cv", "-")),
+                    str(item.get("confidence", "-")).upper(),
+                ]
+            )
         lines.append(_format_table(rows))
 
     auth_rows = list(getattr(summary, "auth_abuse_profiles", []) or [])
@@ -15179,14 +19235,16 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Authentication Abuse Profiles"))
         rows = [["Source", "Target", "Attempts", "Target Count", "Confidence"]]
-        for item in auth_rows[:_limit_value(12 if verbose else 8)]:
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("attempts", "-")),
-                str(item.get("target_count", "-")),
-                str(item.get("confidence", "-")).upper(),
-            ])
+        for item in auth_rows[: _limit_value(12 if verbose else 8)]:
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("attempts", "-")),
+                    str(item.get("target_count", "-")),
+                    str(item.get("confidence", "-")).upper(),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lateral_rows = list(getattr(summary, "lateral_movement_paths", []) or [])
@@ -15194,59 +19252,52 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Lateral Movement Paths"))
         rows = [["Source", "Peers", "Admin Hits", "Top Peers", "Confidence"]]
-        for item in lateral_rows[:_limit_value(12 if verbose else 8)]:
+        for item in lateral_rows[: _limit_value(12 if verbose else 8)]:
             peers = item.get("peers", [])
-            peer_text = ", ".join(str(v) for v in peers[:4]) if isinstance(peers, list) else str(peers)
-            rows.append([
-                str(item.get("src", "-")),
-                str(item.get("peer_count", "-")),
-                str(item.get("admin_hits", "-")),
-                _truncate_text(peer_text or "-", 48),
-                str(item.get("confidence", "-")).upper(),
-            ])
+            peer_text = (
+                ", ".join(str(v) for v in peers[:4])
+                if isinstance(peers, list)
+                else str(peers)
+            )
+            rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("peer_count", "-")),
+                    str(item.get("admin_hits", "-")),
+                    _truncate_text(peer_text or "-", 48),
+                    str(item.get("confidence", "-")).upper(),
+                ]
+            )
         lines.append(_format_table(rows))
 
     exfil_rows = list(getattr(summary, "exfiltration_chains", []) or [])
     if exfil_rows:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Exfiltration Chain Signals"))
-        for item in exfil_rows[:_limit_value(14 if verbose else 8)]:
-            lines.append(muted(f"- {_redact_in_text(str(item.get('signal', '-')))}"))
+        for item in exfil_rows[: _limit_value(14 if verbose else 8)]:
+            lines.append(_style_timeline_artifact_line(str(item.get("signal", "-"))))
 
     ot_impact_rows = list(getattr(summary, "ot_impact_signals", []) or [])
     if ot_impact_rows:
         lines.append(SUBSECTION_BAR)
         lines.append(header("OT Impact Signals"))
         rows = [["Protocol", "Summary", "Timestamp", "Details"]]
-        for item in ot_impact_rows[:_limit_value(14 if verbose else 8)]:
-            rows.append([
-                str(item.get("protocol", "-")),
-                _truncate_text(str(item.get("summary", "-")), 32),
-                format_ts(item.get("ts")),
-                _truncate_text(_redact_in_text(str(item.get("details", "-"))), 80),
-            ])
-        lines.append(_format_table(rows))
-
-    anchors = list(getattr(summary, "evidence_anchors", []) or [])
-    if anchors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Evidence Anchors"))
-        rows = [["Packet", "Source", "Category", "Summary", "Details"]]
-        for item in anchors[:_limit_value(18 if verbose else 10)]:
-            rows.append([
-                str(item.get("packet", "-")),
-                str(item.get("source", "-")),
-                str(item.get("category", "-")),
-                _truncate_text(str(item.get("summary", "-")), 28),
-                _truncate_text(_redact_in_text(str(item.get("details", "-"))), 72),
-            ])
+        for item in ot_impact_rows[: _limit_value(14 if verbose else 8)]:
+            rows.append(
+                [
+                    str(item.get("protocol", "-")),
+                    _truncate_text(str(item.get("summary", "-")), 32),
+                    format_ts(item.get("ts")),
+                    _truncate_text(_redact_in_text(str(item.get("details", "-"))), 80),
+                ]
+            )
         lines.append(_format_table(rows))
 
     benign_rows = list(getattr(summary, "benign_context", []) or [])
     if benign_rows:
         lines.append(SUBSECTION_BAR)
         lines.append(header("False-Positive Context"))
-        for item in benign_rows[:_limit_value(10 if verbose else 6)]:
+        for item in benign_rows[: _limit_value(10 if verbose else 6)]:
             lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     if summary.errors:
@@ -15264,22 +19315,56 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
         if "http post" in text:
             return "suspicious"
         if "file artifact" in text:
-            if any(token in text for token in [
-                "(exe/dll)", "(archive)", ".exe", ".dll", ".ps1", ".vbs", ".bat", ".scr", ".js"
-            ]):
+            if any(
+                token in text
+                for token in [
+                    "(exe/dll)",
+                    "(archive)",
+                    ".exe",
+                    ".dll",
+                    ".ps1",
+                    ".vbs",
+                    ".bat",
+                    ".scr",
+                    ".js",
+                ]
+            ):
                 return "malicious"
             return "suspicious"
         if "tcp connect attempt" in text:
             for port in (445, 3389, 22, 23, 135, 139, 5985, 5986):
                 if f":{port}" in text:
                     return "suspicious"
-        if any(token in text for token in ("write", "control", "start", "stop", "setpoint", "program", "firmware")):
-            if item.category in {"Modbus", "DNP3", "IEC-104", "S7", "CIP", "ENIP", "BACnet", "OPC UA", "PROFINET"}:
+        if any(
+            token in text
+            for token in (
+                "write",
+                "control",
+                "start",
+                "stop",
+                "setpoint",
+                "program",
+                "firmware",
+            )
+        ):
+            if item.category in {
+                "Modbus",
+                "DNP3",
+                "IEC-104",
+                "S7",
+                "CIP",
+                "ENIP",
+                "BACnet",
+                "OPC UA",
+                "PROFINET",
+            }:
                 return "suspicious"
         return "info"
 
     def _highlight_c2_payload_file_artifact(text: str) -> str:
-        return text.replace("[C2] [Payload] File artifact", warn_bg("[C2] [Payload] File artifact"))
+        return text.replace(
+            "[C2] [Payload] File artifact", _sus("[C2] [Payload] File artifact")
+        )
 
     def _highlight_ips(text: str, target_ip: str) -> str:
         tokens = text.split()
@@ -15322,29 +19407,280 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
             candidates.append(value)
         return candidates
 
+    def _dns_base_domain(name: str) -> str:
+        parts = [part for part in str(name).strip(".").split(".") if part]
+        if len(parts) >= 2:
+            return ".".join(parts[-2:]).lower()
+        return str(name).strip(".").lower()
+
+    def _timeline_vt_info(name: str) -> dict[str, object] | None:
+        if not summary.vt_results:
+            return None
+        key = str(name or "").strip(".").lower()
+        if not key:
+            return None
+        info = summary.vt_results.get(key)
+        if info is None:
+            info = summary.vt_results.get(_dns_base_domain(key))
+        if not isinstance(info, dict):
+            return None
+        return info
+
+    vt_malicious_domains: set[str] = set()
+    vt_suspicious_domains: set[str] = set()
+    vt_malicious_ips: set[str] = set()
+    vt_suspicious_ips: set[str] = set()
+    for key, info in dict(summary.vt_results or {}).items():
+        if not isinstance(info, dict):
+            continue
+        domain = str(info.get("domain", key) or key).strip(".").lower()
+        if not domain:
+            continue
+        malicious = int(info.get("malicious", 0) or 0)
+        suspicious = int(info.get("suspicious", 0) or 0)
+        score = int(info.get("score", 0) or 0)
+        if malicious > 0:
+            vt_malicious_domains.add(domain)
+        elif suspicious > 0 or score > 0:
+            vt_suspicious_domains.add(domain)
+
+        ip_candidates: set[str] = set()
+        for field_name in ("ips", "resolved_ips"):
+            values = info.get(field_name)
+            if isinstance(values, list):
+                for value in values:
+                    ip_text = str(value or "").strip()
+                    try:
+                        ipaddress.ip_address(ip_text)
+                    except Exception:
+                        continue
+                    ip_candidates.add(ip_text)
+        records = info.get("last_dns_records")
+        if isinstance(records, list):
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                ip_text = str(record.get("value", "") or "").strip()
+                try:
+                    ipaddress.ip_address(ip_text)
+                except Exception:
+                    continue
+                ip_candidates.add(ip_text)
+        if malicious > 0:
+            vt_malicious_ips.update(ip_candidates)
+        elif suspicious > 0 or score > 0:
+            vt_suspicious_ips.update(ip_candidates)
+
+    def _extract_domains(text: str) -> list[str]:
+        if not text:
+            return []
+        hits = re.findall(
+            r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}\b",
+            text,
+        )
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for value in hits:
+            lowered = value.strip(".").lower()
+            if not lowered or lowered in seen:
+                continue
+            seen.add(lowered)
+            ordered.append(lowered)
+        return ordered
+
+    def _highlight_vt_artifacts(text: str) -> str:
+        if not text:
+            return text
+        if not (
+            vt_malicious_domains
+            or vt_suspicious_domains
+            or vt_malicious_ips
+            or vt_suspicious_ips
+        ):
+            return text
+
+        highlighted = text
+
+        # Highlight URL hosts first so full URLs stand out by VT risk.
+        for match in re.finditer(
+            r"https?://[^\s)\]>]+", highlighted, flags=re.IGNORECASE
+        ):
+            token = match.group(0)
+            host = re.sub(r"^https?://", "", token, flags=re.IGNORECASE)
+            host = host.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+            host = host.split("@", 1)[-1].split(":", 1)[0].strip(".[]").lower()
+            if (
+                host in vt_malicious_domains
+                or _dns_base_domain(host) in vt_malicious_domains
+            ):
+                highlighted = highlighted.replace(token, _mal(token))
+            elif (
+                host in vt_suspicious_domains
+                or _dns_base_domain(host) in vt_suspicious_domains
+            ):
+                highlighted = highlighted.replace(token, _sus(token))
+
+        # Highlight standalone domains.
+        for domain in _extract_domains(highlighted):
+            if (
+                domain in vt_malicious_domains
+                or _dns_base_domain(domain) in vt_malicious_domains
+            ):
+                highlighted = re.sub(
+                    rf"\b{re.escape(domain)}\b",
+                    _mal(domain),
+                    highlighted,
+                    flags=re.IGNORECASE,
+                )
+            elif (
+                domain in vt_suspicious_domains
+                or _dns_base_domain(domain) in vt_suspicious_domains
+            ):
+                highlighted = re.sub(
+                    rf"\b{re.escape(domain)}\b",
+                    _sus(domain),
+                    highlighted,
+                    flags=re.IGNORECASE,
+                )
+
+        # Highlight IPs if VT provided resolved/risky addresses.
+        for match in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", highlighted):
+            try:
+                ip_text = str(ipaddress.ip_address(match))
+            except Exception:
+                continue
+            if ip_text in vt_malicious_ips:
+                highlighted = re.sub(
+                    rf"\b{re.escape(match)}\b", _mal(match), highlighted
+                )
+            elif ip_text in vt_suspicious_ips:
+                highlighted = re.sub(
+                    rf"\b{re.escape(match)}\b", _sus(match), highlighted
+                )
+
+        return highlighted
+
+    def _highlight_executable_artifacts(text: str) -> str:
+        if not text:
+            return text
+        pattern = re.compile(
+            r"\b[\w./\\-]+\.(?:exe|elf|dll|sys|bin|scr|msi|apk|dmg|pkg|jar)\b",
+            re.IGNORECASE,
+        )
+        return pattern.sub(lambda match: _mal(match.group(0)), text)
+
+    def _vt_event_match(text: str) -> tuple[str, int, int, int, str] | None:
+        best: tuple[str, int, int, int, str] | None = None
+        for domain in _extract_domains(text):
+            info = _timeline_vt_info(domain)
+            if not info:
+                continue
+            malicious = int(info.get("malicious", 0) or 0)
+            suspicious = int(info.get("suspicious", 0) or 0)
+            score = int(info.get("score", 0) or 0)
+            rating = str(info.get("rating", "-") or "-")
+            candidate = (domain, score, malicious, suspicious, rating)
+            if best is None:
+                best = candidate
+                continue
+            if (candidate[2], candidate[3], candidate[1]) > (best[2], best[3], best[1]):
+                best = candidate
+        return best
+
     def _event_tags(item: TimelineEvent) -> list[str]:
         text = f"{item.category} {item.summary} {item.details}".lower()
         tags: list[str] = []
-        if any(token in text for token in ("scan", "recon", "probe", "enumeration", "icmp", "arp", "nbns", "mdns")):
+        if any(
+            token in text
+            for token in (
+                "scan",
+                "recon",
+                "probe",
+                "enumeration",
+                "icmp",
+                "arp",
+                "nbns",
+                "mdns",
+            )
+        ):
             tags.append("Recon")
-        if any(token in text for token in ("dns", "hostname", "domain", "netbios", "whoami", "ipconfig")):
+        if any(
+            token in text
+            for token in ("dns", "hostname", "domain", "netbios", "whoami", "ipconfig")
+        ):
             tags.append("Discovery")
-        if any(token in text for token in ("auth", "login", "credential", "ntlm", "kerberos", "password")):
+        if any(
+            token in text
+            for token in ("auth", "login", "credential", "ntlm", "kerberos", "password")
+        ):
             tags.append("Credential")
-        if any(token in text for token in ("smb", "rdp", "winrm", "wmic", "ssh", "rpc", "lateral", "pivot")):
+        if any(
+            token in text
+            for token in (
+                "smb",
+                "rdp",
+                "winrm",
+                "wmic",
+                "ssh",
+                "rpc",
+                "lateral",
+                "pivot",
+            )
+        ):
             tags.append("Lateral")
-        if any(token in text for token in ("powershell", "cmd.exe", "rundll32", "regsvr32", "mshta", "bitsadmin", "wmic", "schtasks", "msiexec")):
+        if any(
+            token in text
+            for token in (
+                "powershell",
+                "cmd.exe",
+                "rundll32",
+                "regsvr32",
+                "mshta",
+                "bitsadmin",
+                "wmic",
+                "schtasks",
+                "msiexec",
+            )
+        ):
             tags.append("Execution")
             tags.append("LOLBAS")
         if any(token in text for token in ("beacon", "c2", "command and control")):
             tags.append("C2")
-        if any(token in text for token in ("exfil", "tunnel", "dns txt", "http post", "upload")):
+        if any(
+            token in text
+            for token in ("exfil", "tunnel", "dns txt", "http post", "upload")
+        ):
             tags.append("Exfil")
-        if any(token in text for token in ("write", "setpoint", "operate", "trip", "shutdown", "stop", "start")) and item.category in {"Modbus", "DNP3", "IEC-104", "S7", "CIP", "ENIP", "BACnet", "OPC UA", "PROFINET", "Triconex/SIS"}:
+        if any(
+            token in text
+            for token in (
+                "write",
+                "setpoint",
+                "operate",
+                "trip",
+                "shutdown",
+                "stop",
+                "start",
+            )
+        ) and item.category in {
+            "Modbus",
+            "DNP3",
+            "IEC-104",
+            "S7",
+            "CIP",
+            "ENIP",
+            "BACnet",
+            "OPC UA",
+            "PROFINET",
+            "Triconex/SIS",
+        }:
             tags.append("OT Control")
         if any(token in text for token in ("dos", "flood", "impact", "disruption")):
             tags.append("Impact")
-        if any(token in text for token in (".exe", ".dll", ".ps1", ".vbs", ".bat", ".scr", ".js")):
+        if any(
+            token in text
+            for token in (".exe", ".dll", ".ps1", ".vbs", ".bat", ".scr", ".js")
+        ):
             tags.append("Payload")
         if not tags:
             return []
@@ -15361,23 +19697,90 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
     if summary.dns_queries:
         lines.append(SUBSECTION_BAR)
         lines.append(header("DNS Queries Performed"))
-        dns_rows = summary.dns_queries if verbose else summary.dns_queries[:_limit_value(limit)]
+        dns_rows = summary.dns_queries
         for item in dns_rows:
             qtype = item.qtype or "-"
             port = item.dst_port if item.dst_port is not None else "-"
             detail = f"{item.src_ip} -> {item.dst_ip}:{port} {item.protocol}"
             detail = _highlight_ips(_redact_in_text(detail), summary.target_ip)
-            lines.append(muted(f"- {format_ts(item.ts)} {item.name} (type {qtype}) {detail}"))
-        if not verbose and len(summary.dns_queries) > len(dns_rows):
-            lines.append(muted(f"... {len(summary.dns_queries) - len(dns_rows)} additional DNS queries"))
+            vt_info = _timeline_vt_info(item.name)
+            vt_suffix = ""
+            if vt_info:
+                vt_score = int(vt_info.get("score", 0) or 0)
+                vt_rating = str(vt_info.get("rating", "-") or "-")
+                vt_mal = int(vt_info.get("malicious", 0) or 0)
+                vt_sus = int(vt_info.get("suspicious", 0) or 0)
+                vt_suffix = f" VT(score={vt_score} rating={vt_rating} sus={vt_sus} mal={vt_mal})"
+            query_text = (
+                f"- {format_ts(item.ts)} {item.name} (type {qtype}) {detail}{vt_suffix}"
+            )
+            if vt_info and int(vt_info.get("malicious", 0) or 0) > 0:
+                lines.append(_mal(query_text))
+            elif vt_info and (
+                int(vt_info.get("suspicious", 0) or 0) > 0
+                or int(vt_info.get("score", 0) or 0) > 0
+            ):
+                lines.append(_sus(query_text))
+            else:
+                lines.append(muted(query_text))
 
-    if summary.file_downloads:
+    if summary.vt_lookup_enabled or summary.vt_results or summary.vt_errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("VirusTotal Enrichment"))
+        lines.append(
+            _format_kv(
+                "VT Lookup Enabled", "Yes" if summary.vt_lookup_enabled else "No"
+            )
+        )
+        lines.append(
+            _format_kv("VT Enriched Domains", str(len(summary.vt_results or {})))
+        )
+        if summary.vt_results:
+            rows = [
+                ["Domain", "Score", "Rating", "Suspicious", "Malicious", "Reputation"]
+            ]
+            vt_items = sorted(
+                summary.vt_results.items(),
+                key=lambda item: (
+                    int(item[1].get("malicious", 0) or 0),
+                    int(item[1].get("suspicious", 0) or 0),
+                    int(item[1].get("score", 0) or 0),
+                ),
+                reverse=True,
+            )
+            for domain, info in vt_items:
+                rows.append(
+                    [
+                        str(domain),
+                        str(info.get("score", "-")),
+                        str(info.get("rating", "-")),
+                        str(info.get("suspicious", "-")),
+                        str(info.get("malicious", "-")),
+                        str(info.get("reputation", "-")),
+                    ]
+                )
+            lines.append(_format_table(rows))
+        if summary.vt_errors:
+            lines.append(muted("VT errors:"))
+            for err in summary.vt_errors:
+                lines.append(_sus(f"- {err}"))
+
+    scoped_downloads = [
+        item
+        for item in list(summary.file_downloads or [])
+        if str(getattr(item, "dst_ip", "") or "") == str(summary.target_ip)
+    ]
+    if scoped_downloads:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Files Downloaded"))
-        file_rows = summary.file_downloads if verbose else summary.file_downloads[:_limit_value(limit)]
+        file_rows = scoped_downloads
         for item in file_rows:
-            size_text = f"{item.size_bytes} bytes" if item.size_bytes is not None else "-"
+            size_text = (
+                f"{item.size_bytes} bytes" if item.size_bytes is not None else "-"
+            )
             meta_bits = []
+            if getattr(item, "packet_number", None) is not None:
+                meta_bits.append(f"pkt={item.packet_number}")
             if item.hostname:
                 meta_bits.append(f"host={item.hostname}")
             if item.content_type:
@@ -15393,10 +19796,8 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
             if meta_text:
                 line = f"{line} {meta_text}"
             lines.append(muted(line))
-        if not verbose and len(summary.file_downloads) > len(file_rows):
-            lines.append(muted(f"... {len(summary.file_downloads) - len(file_rows)} additional downloads"))
 
-    event_limit = len(summary.events)
+    event_limit = min(len(summary.events), int(limit))
     lines.append(SUBSECTION_BAR)
     lines.append(header("Activity Timeline"))
     lines.append(muted("Time | Category | Summary | Details"))
@@ -15405,15 +19806,23 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
     for event in summary.events[:event_limit]:
         severity = _severity_for_event(event)
         summary_text = event.summary
+        vt_match = _vt_event_match(f"{event.summary} {event.details}")
+        if vt_match is not None:
+            vt_domain, vt_score, vt_malicious, vt_suspicious, vt_rating = vt_match
+            summary_text = f"[VT:{vt_domain} score={vt_score} rating={vt_rating} sus={vt_suspicious} mal={vt_malicious}] {summary_text}"
+            if vt_malicious > 0:
+                severity = "malicious"
+            elif vt_suspicious > 0 or vt_score > 0:
+                severity = "suspicious"
         tags = _event_tags(event)
         for tag in tags:
             tag_counts[tag] += 1
         if tags:
             summary_text = f"[{'] ['.join(tags)}] {summary_text}"
         if severity == "malicious":
-            summary_text = danger(summary_text)
+            summary_text = _mal(summary_text)
         elif severity == "suspicious":
-            summary_text = warn(summary_text)
+            summary_text = _sus(summary_text)
         summary_text = _highlight_c2_payload_file_artifact(summary_text)
         details_text = _highlight_ips(_redact_in_text(event.details), summary.target_ip)
         actor_ip = None
@@ -15432,15 +19841,21 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
                     if 0 <= dt <= 600:
                         link = f"linked to {prev_cat}: {_truncate_text(prev_summary, max_len=48)} (+{dt:.0f}s)"
                         details_text = f"{details_text} | {link}"
-                last_event_by_actor[actor_ip] = (float(event.ts), event.category, event.summary)
-        lines.append(f"{format_ts(event.ts)} | {event.category} | {summary_text} | {details_text}")
+                last_event_by_actor[actor_ip] = (
+                    float(event.ts),
+                    event.category,
+                    event.summary,
+                )
+        lines.append(
+            f"{format_ts(event.ts)} | {event.category} | {summary_text} | {details_text}"
+        )
 
     if summary.category_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Category Overview"))
-        categories = sorted(summary.category_counts.items(), key=lambda item: (-item[1], item[0]))
-        if not verbose:
-            categories = categories[:_limit_value(12)]
+        categories = sorted(
+            summary.category_counts.items(), key=lambda item: (-item[1], item[0])
+        )
         for name, count in categories:
             lines.append(muted(f"- {name}: {count}"))
 
@@ -15453,27 +19868,24 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
     if summary.ot_protocol_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("OT Protocols Seen"))
-        for name, count in sorted(summary.ot_protocol_counts.items(), key=lambda item: (-item[1], item[0])):
+        for name, count in sorted(
+            summary.ot_protocol_counts.items(), key=lambda item: (-item[1], item[0])
+        ):
             lines.append(muted(f"- {name}: {count}"))
 
     if summary.ot_activity_bins:
         lines.append(SUBSECTION_BAR)
         lines.append(header("OT Activity Sparklines"))
-        for name, bins in sorted(summary.ot_activity_bins.items(), key=lambda item: (-sum(item[1]), item[0])):
+        for name, bins in sorted(
+            summary.ot_activity_bins.items(), key=lambda item: (-sum(item[1]), item[0])
+        ):
             graph = sparkline(bins)
             lines.append(muted(f"- {name}: {graph} ({sum(bins)})"))
-    if summary.non_ot_activity_bins:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Non-OT Activity Sparkline"))
-        graph = sparkline(summary.non_ot_activity_bins)
-        lines.append(muted(f"- Non-OT: {graph} ({sum(summary.non_ot_activity_bins)})"))
 
     if summary.peer_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Peers"))
         peer_items = Counter(summary.peer_counts).most_common()
-        if not verbose:
-            peer_items = peer_items[:_limit_value(10)]
         for peer, count in peer_items:
             peer_text = _highlight_ips(peer, summary.target_ip)
             lines.append(muted(f"- {peer_text}: {count}"))
@@ -15482,14 +19894,80 @@ def render_timeline_summary(summary: TimelineSummary, limit: int = 200, verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Ports"))
         port_items = Counter(summary.port_counts).most_common()
-        if not verbose:
-            port_items = port_items[:_limit_value(10)]
         for port, count in port_items:
             svc = COMMON_PORTS.get(port, "-")
             lines.append(muted(f"- {port} ({svc}): {count}"))
 
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Hunt Pivots"))
+    pivot_rows = [["Type", "Packet", "Pivot", "Context"]]
+
+    for item in beacon_rows:
+        pivot_rows.append(
+            [
+                "Beacon",
+                _pivot_packet_number(item),
+                str(item.get("peer", "-")),
+                f"mean={item.get('mean_interval', '-')}s cv={item.get('cv', '-')} count={item.get('count', '-')} conf={str(item.get('confidence', '-')).upper()}",
+            ]
+        )
+
+    for item in auth_rows:
+        src = str(item.get("src", "-"))
+        dst = str(item.get("dst", "-"))
+        pivot_rows.append(
+            [
+                "Auth Abuse",
+                _pivot_packet_number(item),
+                f"{src} -> {dst}",
+                f"attempts={item.get('attempts', '-')} targets={item.get('target_count', '-')} conf={str(item.get('confidence', '-')).upper()}",
+            ]
+        )
+
+    for item in lateral_rows:
+        src = str(item.get("src", "-"))
+        peers = item.get("peers", [])
+        peer_text = (
+            ", ".join(str(v) for v in peers[:6])
+            if isinstance(peers, list)
+            else str(peers)
+        )
+        pivot_rows.append(
+            [
+                "Lateral",
+                _pivot_packet_number(item),
+                src,
+                f"peer_count={item.get('peer_count', '-')} admin_hits={item.get('admin_hits', '-')} peers={_truncate_text(peer_text or '-', 56)}",
+            ]
+        )
+
+    for item in exfil_rows:
+        signal = str(item.get("signal", "-") or "-")
+        pivot_rows.append(
+            [
+                "Exfil",
+                _pivot_packet_number(item),
+                _truncate_text(signal, 56),
+                _truncate_text(_redact_in_text(signal), 96),
+            ]
+        )
+
+    if len(pivot_rows) > 1:
+        lines.append(_format_table(pivot_rows))
+    else:
+        lines.append(muted("No hunt pivots identified in timeline analysis."))
+
+    for idx, line in enumerate(lines):
+        if line == SECTION_BAR or line == SUBSECTION_BAR:
+            continue
+        rendered_line = _highlight_executable_artifacts(line)
+        if summary.vt_lookup_enabled or summary.vt_results:
+            rendered_line = _highlight_vt_artifacts(rendered_line)
+        lines[idx] = rendered_line
+
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
+
 
 def render_ntlm_summary(summary: "NtlmAnalysis") -> str:
     """
@@ -15519,7 +19997,7 @@ def render_ntlm_summary(summary: "NtlmAnalysis") -> str:
     lines.append(_format_kv("Unique Domains", str(len(summary.unique_domains))))
     lines.append(_format_kv("Unique Sources", str(len(summary.src_counts))))
     lines.append(_format_kv("Unique Destinations", str(len(summary.dst_counts))))
-    
+
     # Check for legacy NTLM usage
     legacy_count = sum(1 for s in summary.sessions if s.version == "NTLMv1")
     if legacy_count > 0:
@@ -15539,26 +20017,30 @@ def render_ntlm_summary(summary: "NtlmAnalysis") -> str:
             if dom not in by_domain:
                 by_domain[dom] = []
             by_domain[dom].append(user)
-        
+
         for dom, users in sorted(by_domain.items()):
             display_dom = dom if dom != "<NO_DOMAIN>" else "(No Domain)"
             lines.append(highlight(f"Domain: {display_dom}"))
             for u in sorted(users):
                 lines.append(f"  - {u}")
 
-    # 3. Workstations
+        # 3. Workstations
         # 4. Requests & Responses
         if summary.request_counts or summary.response_counts:
             lines.append(SUBSECTION_BAR)
             lines.append(header("NTLM Requests & Responses"))
             rows = [["Message", "Requests", "Responses"]]
-            all_msgs = set(summary.request_counts.keys()).union(summary.response_counts.keys())
+            all_msgs = set(summary.request_counts.keys()).union(
+                summary.response_counts.keys()
+            )
             for name in sorted(all_msgs):
-                rows.append([
-                    name,
-                    str(summary.request_counts.get(name, 0)),
-                    str(summary.response_counts.get(name, 0)),
-                ])
+                rows.append(
+                    [
+                        name,
+                        str(summary.request_counts.get(name, 0)),
+                        str(summary.response_counts.get(name, 0)),
+                    ]
+                )
             lines.append(_format_table(rows))
 
         if summary.services:
@@ -15584,15 +20066,19 @@ def render_ntlm_summary(summary: "NtlmAnalysis") -> str:
             lines.append(muted("No NTLM conversations summarized."))
         else:
             rows = [["Src", "Dst", "Ports", "Packets", "First Seen", "Last Seen"]]
-            for convo in sorted(summary.conversations, key=lambda c: c.packets, reverse=True)[:_limit_value(12)]:
-                rows.append([
-                    convo.src_ip,
-                    convo.dst_ip,
-                    f"{convo.src_port}->{convo.dst_port}",
-                    str(convo.packets),
-                    format_ts(convo.first_seen),
-                    format_ts(convo.last_seen),
-                ])
+            for convo in sorted(
+                summary.conversations, key=lambda c: c.packets, reverse=True
+            )[: _limit_value(12)]:
+                rows.append(
+                    [
+                        convo.src_ip,
+                        convo.dst_ip,
+                        f"{convo.src_port}->{convo.dst_port}",
+                        str(convo.packets),
+                        format_ts(convo.first_seen),
+                        format_ts(convo.last_seen),
+                    ]
+                )
             lines.append(_format_table(rows))
 
         # 6. Artifacts
@@ -15600,7 +20086,7 @@ def render_ntlm_summary(summary: "NtlmAnalysis") -> str:
             lines.append(SUBSECTION_BAR)
             lines.append(header("NTLM Artifacts"))
             rows = [["Artifact", "Description"]]
-            for item in summary.artifacts[:_limit_value(15)]:
+            for item in summary.artifacts[: _limit_value(15)]:
                 rows.append([item.value, item.description])
             lines.append(_format_table(rows))
     lines.append(SUBSECTION_BAR)
@@ -15614,24 +20100,28 @@ def render_ntlm_summary(summary: "NtlmAnalysis") -> str:
     # 4. Session Details (Top 10)
     lines.append(SUBSECTION_BAR)
     lines.append(header("Recent NTLM Sessions (Max 10)"))
-    
-    sorted_sessions = sorted(summary.sessions, key=lambda x: x.ts, reverse=True)[:_limit_value(10)]
+
+    sorted_sessions = sorted(summary.sessions, key=lambda x: x.ts, reverse=True)[
+        : _limit_value(10)
+    ]
     if not sorted_sessions:
         lines.append(muted("No sessions."))
     else:
         # Table Header
         # TS | Src -> Dst | User | Domain | Ver
         row_fmt = "{:<20} | {:<35} | {:<15} | {:<15} | {:<10}"
-        lines.append(muted(row_fmt.format("Timestamp", "Src -> Dst", "User", "Domain", "Ver")))
+        lines.append(
+            muted(row_fmt.format("Timestamp", "Src -> Dst", "User", "Domain", "Ver"))
+        )
         lines.append(muted("-" * 105))
-        
+
         for s in sorted_sessions:
             ts_str = format_ts(s.ts)
             flow_str = f"{s.src_ip}:{s.src_port} -> {s.dst_ip}:{s.dst_port}"
             user_str = s.username if s.username else "-"
             dom_str = s.domain if s.domain else "-"
             ver_str = s.version
-            
+
             line_str = row_fmt.format(ts_str, flow_str, user_str, dom_str, ver_str)
             if s.version == "NTLMv1":
                 lines.append(danger(line_str))
@@ -15643,7 +20133,6 @@ def render_ntlm_summary(summary: "NtlmAnalysis") -> str:
 
 
 def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
-
     if not summary:
         return ""
 
@@ -15655,14 +20144,16 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
     if summary.errors:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Errors"))
-        for err in summary.errors[:_limit_value(25)]:
+        for err in summary.errors[: _limit_value(25)]:
             lines.append(danger(f"- {err}"))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Overall Traffic Statistics"))
     lines.append(_format_kv("Scan Duration", f"{summary.duration:.2f}s"))
     lines.append(_format_kv("Total NetBIOS Packets", str(summary.total_packets)))
-    lines.append(_format_kv("Total NetBIOS Bytes", format_bytes_as_mb(summary.total_bytes)))
+    lines.append(
+        _format_kv("Total NetBIOS Bytes", format_bytes_as_mb(summary.total_bytes))
+    )
     lines.append(_format_kv("Unique Hosts", str(len(summary.hosts))))
     lines.append(_format_kv("Unique Sources", str(len(summary.src_counts))))
     lines.append(_format_kv("Unique Destinations", str(len(summary.dst_counts))))
@@ -15687,12 +20178,14 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
         endpoints = Counter(summary.src_counts)
         endpoints.update(summary.dst_counts)
         for endpoint, count in endpoints.most_common(_limit_value(15)):
-            rows.append([
-                endpoint,
-                str(count),
-                format_bytes_as_mb(summary.endpoint_bytes_sent.get(endpoint, 0)),
-                format_bytes_as_mb(summary.endpoint_bytes_recv.get(endpoint, 0)),
-            ])
+            rows.append(
+                [
+                    endpoint,
+                    str(count),
+                    format_bytes_as_mb(summary.endpoint_bytes_sent.get(endpoint, 0)),
+                    format_bytes_as_mb(summary.endpoint_bytes_recv.get(endpoint, 0)),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
@@ -15724,7 +20217,14 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
         for idx in range(max_len):
             c_ip, c_cnt = clients[idx] if idx < len(clients) else ("-", 0)
             s_ip, s_cnt = servers[idx] if idx < len(servers) else ("-", 0)
-            rows.append([c_ip, str(c_cnt) if c_ip != "-" else "-", s_ip, str(s_cnt) if s_ip != "-" else "-"])
+            rows.append(
+                [
+                    c_ip,
+                    str(c_cnt) if c_ip != "-" else "-",
+                    s_ip,
+                    str(s_cnt) if s_ip != "-" else "-",
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
@@ -15757,9 +20257,46 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
     if not summary.service_endpoints:
         lines.append(muted("No service endpoint mapping available."))
     else:
+        # Consolidated per-service view for the full capture.
+        overview_rows = [
+            [
+                "Service",
+                "Total Hits",
+                "Unique Endpoint Flows",
+                "Top Endpoint Flow",
+                "Top Flow Hits",
+            ]
+        ]
+        for service, counter in sorted(
+            summary.service_endpoints.items(),
+            key=lambda item: int(
+                summary.service_counts.get(item[0], sum(item[1].values()))
+            ),
+            reverse=True,
+        ):
+            top_endpoint, top_count = ("-", 0)
+            if counter:
+                top_endpoint, top_count = counter.most_common(1)[0]
+            overview_rows.append(
+                [
+                    service,
+                    str(
+                        int(summary.service_counts.get(service, sum(counter.values())))
+                    ),
+                    str(len(counter)),
+                    str(top_endpoint),
+                    str(int(top_count)),
+                ]
+            )
+        lines.append(header("Consolidated Services Overview (Entire PCAP)"))
+        lines.append(_format_table(overview_rows))
+
+        lines.append(header("Per-Service Endpoint Flows"))
         rows = [["Service", "Top Endpoints"]]
         for service, counter in summary.service_endpoints.items():
-            endpoints = ", ".join(f"{ep} ({cnt})" for ep, cnt in counter.most_common(_limit_value(5)))
+            endpoints = ", ".join(
+                f"{ep} ({cnt})" for ep, cnt in counter.most_common(_limit_value(5))
+            )
             rows.append([service, endpoints or "-"])
         lines.append(_format_table(rows))
 
@@ -15789,8 +20326,10 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
             if not host.names:
                 lines.append(muted("  (No advertised names seen)"))
             else:
-                for item in host.names[:_limit_value(20)]:
-                    lines.append(f"  - {item.name:<16} <0x{item.suffix:02X}> : {item.type_str}")
+                for item in host.names[: _limit_value(20)]:
+                    lines.append(
+                        f"  - {item.name:<16} <0x{item.suffix:02X}> : {item.type_str}"
+                    )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Observed NetBIOS Names"))
@@ -15820,34 +20359,40 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
     lines.append(SUBSECTION_BAR)
     lines.append(header("Conversations & Sessions"))
     if summary.conversations:
-        rows = [["Src", "Dst", "Proto", "Ports", "Pkts", "Req", "Resp", "First", "Last"]]
-        for convo in summary.conversations[:_limit_value(12)]:
-            rows.append([
-                convo.src_ip,
-                convo.dst_ip,
-                convo.protocol,
-                f"{convo.src_port}->{convo.dst_port}",
-                str(convo.packets),
-                str(convo.requests),
-                str(convo.responses),
-                format_ts(convo.first_seen),
-                format_ts(convo.last_seen),
-            ])
+        rows = [
+            ["Src", "Dst", "Proto", "Ports", "Pkts", "Req", "Resp", "First", "Last"]
+        ]
+        for convo in summary.conversations[: _limit_value(12)]:
+            rows.append(
+                [
+                    convo.src_ip,
+                    convo.dst_ip,
+                    convo.protocol,
+                    f"{convo.src_port}->{convo.dst_port}",
+                    str(convo.packets),
+                    str(convo.requests),
+                    str(convo.responses),
+                    format_ts(convo.first_seen),
+                    format_ts(convo.last_seen),
+                ]
+            )
         lines.append(_format_table(rows))
     else:
         lines.append(muted("No NetBIOS conversations summarized."))
 
     if summary.sessions:
         rows = [["Src", "Dst", "Ports", "Pkts", "First", "Last"]]
-        for sess in summary.sessions[:_limit_value(12)]:
-            rows.append([
-                sess.src_ip,
-                sess.dst_ip,
-                f"{sess.src_port}->{sess.dst_port}",
-                str(sess.packets),
-                format_ts(sess.first_seen),
-                format_ts(sess.last_seen),
-            ])
+        for sess in summary.sessions[: _limit_value(12)]:
+            rows.append(
+                [
+                    sess.src_ip,
+                    sess.dst_ip,
+                    f"{sess.src_port}->{sess.dst_port}",
+                    str(sess.packets),
+                    format_ts(sess.first_seen),
+                    format_ts(sess.last_seen),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
@@ -15903,7 +20448,7 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
     if summary.files_discovered:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Files Discovered"))
-        for item in summary.files_discovered[:_limit_value(30)]:
+        for item in summary.files_discovered[: _limit_value(30)]:
             lines.append(f"  - {item}")
 
     if summary.plaintext_observed:
@@ -15917,22 +20462,26 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
     if summary.anomalies:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Anomalies & Attack Signals"))
-        for item in summary.anomalies[:_limit_value(40)]:
+        for item in summary.anomalies[: _limit_value(40)]:
             sev_color = danger if item.severity in ("HIGH", "CRITICAL") else warn
             lines.append(sev_color(f"[{item.severity}] {item.type}: {item.details}"))
-            lines.append(muted(f"  {item.src_ip} -> {item.dst_ip} @ {format_ts(item.timestamp)}"))
+            lines.append(
+                muted(f"  {item.src_ip} -> {item.dst_ip} @ {format_ts(item.timestamp)}")
+            )
 
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Additional Artifacts"))
-        for value in summary.artifacts[:_limit_value(40)]:
+        for value in summary.artifacts[: _limit_value(40)]:
             lines.append(f"  - {_truncate_text(value, 120)}")
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
-def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = False) -> str:
+def render_arp_summary(
+    summary: ArpSummary, limit: int = 15, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -15957,29 +20506,46 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
     def _arp_verdict() -> tuple[str, str, list[str], int]:
         score = 0
         reasons: list[str] = []
-        high_anomalies = sum(1 for item in summary.anomalies if item.severity in {"HIGH", "CRITICAL"})
-        med_anomalies = sum(1 for item in summary.anomalies if item.severity == "MEDIUM")
+        high_anomalies = sum(
+            1 for item in summary.anomalies if item.severity in {"HIGH", "CRITICAL"}
+        )
+        med_anomalies = sum(
+            1 for item in summary.anomalies if item.severity == "MEDIUM"
+        )
         if high_anomalies:
             score += min(5, high_anomalies * 2)
             reasons.append(f"High-severity ARP anomalies observed ({high_anomalies})")
         if med_anomalies >= 2:
             score += 1
-            reasons.append(f"Multiple medium-severity ARP anomalies observed ({med_anomalies})")
+            reasons.append(
+                f"Multiple medium-severity ARP anomalies observed ({med_anomalies})"
+            )
         if summary.unsolicited_replies >= 20:
             score += 2
-            reasons.append(f"Unsolicited ARP replies are elevated ({summary.unsolicited_replies})")
-        if getattr(summary, "gateway_ip", "") and len(getattr(summary, "gateway_mac_candidates", {})) > 1:
+            reasons.append(
+                f"Unsolicited ARP replies are elevated ({summary.unsolicited_replies})"
+            )
+        if (
+            getattr(summary, "gateway_ip", "")
+            and len(getattr(summary, "gateway_mac_candidates", {})) > 1
+        ):
             score += 2
             reasons.append("Gateway ARP MAC mapping changed")
         if summary.gratuitous_arp >= 25:
             score += 1
-            reasons.append(f"Excess gratuitous ARP frames observed ({summary.gratuitous_arp})")
+            reasons.append(
+                f"Excess gratuitous ARP frames observed ({summary.gratuitous_arp})"
+            )
 
         if score >= 7:
-            verdict = "YES - high-confidence ARP poisoning or MITM-style behavior is present."
+            verdict = (
+                "YES - high-confidence ARP poisoning or MITM-style behavior is present."
+            )
             confidence = "High"
         elif score >= 4:
-            verdict = "LIKELY - suspicious ARP behavior with attack indicators is present."
+            verdict = (
+                "LIKELY - suspicious ARP behavior with attack indicators is present."
+            )
             confidence = "Medium"
         elif score >= 2:
             verdict = "POSSIBLE - potentially malicious ARP behavior observed; corroboration recommended."
@@ -16003,13 +20569,17 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(10)]:
+    for reason in verdict_reasons[: _limit_value(10)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     # Add concrete context for immediate triage.
     if summary.gateway_ip:
         lines.append(muted("Where:"))
-        lines.append(muted(f"- Gateway under observation: {_highlight_public_ips(summary.gateway_ip)}"))
+        lines.append(
+            muted(
+                f"- Gateway under observation: {_highlight_public_ips(summary.gateway_ip)}"
+            )
+        )
     if summary.gateway_mac_candidates:
         lines.append(muted("What:"))
         lines.append(muted("- Gateway MAC candidates"))
@@ -16018,22 +20588,52 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
     if summary.victim_conflicts:
         lines.append(muted("Who:"))
         lines.append(muted("- Victim conflict highlights"))
-        for ip_value, mac_counter in sorted(summary.victim_conflicts.items(), key=lambda item: sum(item[1].values()), reverse=True)[:_limit_value(6)]:
-            claims = ", ".join(f"{mac}({cnt})" for mac, cnt in mac_counter.most_common(4))
-            lines.append(muted(f"- {_highlight_public_ips(ip_value)} claimed by {claims}"))
+        for ip_value, mac_counter in sorted(
+            summary.victim_conflicts.items(),
+            key=lambda item: sum(item[1].values()),
+            reverse=True,
+        )[: _limit_value(6)]:
+            claims = ", ".join(
+                f"{mac}({cnt})" for mac, cnt in mac_counter.most_common(4)
+            )
+            lines.append(
+                muted(f"- {_highlight_public_ips(ip_value)} claimed by {claims}")
+            )
     if summary.anomalies:
         lines.append(muted("When:"))
         lines.append(muted("- Top ARP anomalies"))
-        for item in summary.anomalies[:_limit_value(6)]:
-            lines.append(muted(f"- [{item.severity}] {_redact_in_text(item.title)}: {_redact_in_text(item.description)}"))
+        for item in summary.anomalies[: _limit_value(6)]:
+            lines.append(
+                muted(
+                    f"- [{item.severity}] {_redact_in_text(item.title)}: {_redact_in_text(item.description)}"
+                )
+            )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Threat & Compromise Overview"))
     lines.append(_format_kv("Threat Categories", str(sum(summary.threats.values()))))
     lines.append(_format_kv("Anomalies", str(len(summary.anomalies))))
-    lines.append(_format_kv("High Severity Anomalies", str(sum(1 for item in summary.anomalies if item.severity in {"HIGH", "CRITICAL"}))))
-    lines.append(_format_kv("Benign Indicators", str(sum(getattr(summary, "benign_indicators", Counter()).values()))))
-    lines.append(_format_kv("Gateway Candidate", getattr(summary, "gateway_ip", "-") or "-"))
+    lines.append(
+        _format_kv(
+            "High Severity Anomalies",
+            str(
+                sum(
+                    1
+                    for item in summary.anomalies
+                    if item.severity in {"HIGH", "CRITICAL"}
+                )
+            ),
+        )
+    )
+    lines.append(
+        _format_kv(
+            "Benign Indicators",
+            str(sum(getattr(summary, "benign_indicators", Counter()).values())),
+        )
+    )
+    lines.append(
+        _format_kv("Gateway Candidate", getattr(summary, "gateway_ip", "-") or "-")
+    )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Deterministic ARP Security Checks"))
@@ -16051,7 +20651,7 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
             blob = text.lower()
             if any(token in blob for token in lowered_tokens):
                 matches.append(text)
-        return matches[:_limit_value(4)]
+        return matches[: _limit_value(4)]
 
     checks: list[tuple[str, tuple[str, ...]]] = [
         ("Gateway ARP Integrity", ("gateway", "mac flip", "integrity")),
@@ -16069,15 +20669,27 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
         lines.append(label(label_text))
         evidence = _arp_signal(*tokens)
         if evidence:
-            lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
             for item in evidence:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-            high_hits = sum(1 for item in evidence if "high" in item.lower() or "poison" in item.lower())
+            high_hits = sum(
+                1
+                for item in evidence
+                if "high" in item.lower() or "poison" in item.lower()
+            )
             risk = "High" if high_hits > 0 else "Medium"
             conf = "High" if len(evidence) >= 2 else "Medium"
             matrix_rows.append([label_text, risk, conf, f"{len(evidence)} signal(s)"])
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -16102,7 +20714,10 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
             key=lambda item: sum(item[1].values()),
             reverse=True,
         )[:limit]:
-            mac_text = ", ".join(f"{mac}({count})" for mac, count in mac_counter.most_common(_limit_value(3)))
+            mac_text = ", ".join(
+                f"{mac}({count})"
+                for mac, count in mac_counter.most_common(_limit_value(3))
+            )
             rows.append([victim_ip, mac_text or "-", str(sum(mac_counter.values()))])
         lines.append(_format_table(rows))
 
@@ -16111,12 +20726,14 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
         lines.append(header("Attack Chain Timeline"))
         rows = [["Timestamp", "Event", "Source", "Destination"]]
         for item in summary.timeline[:limit]:
-            rows.append([
-                format_ts(item.ts),
-                _truncate_text(_redact_in_text(item.detail), 88),
-                item.src,
-                item.dst,
-            ])
+            rows.append(
+                [
+                    format_ts(item.ts),
+                    _truncate_text(_redact_in_text(item.detail), 88),
+                    item.src,
+                    item.dst,
+                ]
+            )
         lines.append(_format_table(rows))
 
     if getattr(summary, "proxy_arp_candidates", None):
@@ -16124,19 +20741,36 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
         lines.append(header("Proxy ARP Candidates"))
         rows = [["MAC", "Dst Targets", "Claimed IPs"]]
         for item in summary.proxy_arp_candidates[:limit]:
-            rows.append([
-                str(item.get("mac", "-")),
-                str(item.get("dst_targets", "-")),
-                str(item.get("claimed_ips", "-")),
-            ])
+            rows.append(
+                [
+                    str(item.get("mac", "-")),
+                    str(item.get("dst_targets", "-")),
+                    str(item.get("claimed_ips", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if getattr(summary, "reply_latency_summary", None):
         lines.append(SUBSECTION_BAR)
         lines.append(header("Reply Timing"))
-        lines.append(_format_kv("Median Reply Latency", f"{float(summary.reply_latency_summary.get('median_s', 0.0)) * 1000.0:.2f} ms"))
-        lines.append(_format_kv("p95 Reply Latency", f"{float(summary.reply_latency_summary.get('p95_s', 0.0)) * 1000.0:.2f} ms"))
-        lines.append(_format_kv("Samples", str(int(float(summary.reply_latency_summary.get('samples', 0.0))))))
+        lines.append(
+            _format_kv(
+                "Median Reply Latency",
+                f"{float(summary.reply_latency_summary.get('median_s', 0.0)) * 1000.0:.2f} ms",
+            )
+        )
+        lines.append(
+            _format_kv(
+                "p95 Reply Latency",
+                f"{float(summary.reply_latency_summary.get('p95_s', 0.0)) * 1000.0:.2f} ms",
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Samples",
+                str(int(float(summary.reply_latency_summary.get("samples", 0.0)))),
+            )
+        )
 
     if getattr(summary, "pps_by_source", None):
         lines.append(SUBSECTION_BAR)
@@ -16152,18 +20786,31 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
     if not summary.conversations:
         lines.append(muted("No ARP conversations identified."))
     else:
-        rows = [["Src IP", "Dst IP", "Src MAC", "Dst MAC", "Opcode", "Packets", "First", "Last"]]
+        rows = [
+            [
+                "Src IP",
+                "Dst IP",
+                "Src MAC",
+                "Dst MAC",
+                "Opcode",
+                "Packets",
+                "First",
+                "Last",
+            ]
+        ]
         for item in summary.conversations[:limit]:
-            rows.append([
-                item.src_ip,
-                item.dst_ip,
-                item.src_mac,
-                item.dst_mac,
-                item.opcode,
-                str(item.packets),
-                format_ts(item.first_seen),
-                format_ts(item.last_seen),
-            ])
+            rows.append(
+                [
+                    item.src_ip,
+                    item.dst_ip,
+                    item.src_mac,
+                    item.dst_mac,
+                    item.opcode,
+                    str(item.packets),
+                    format_ts(item.first_seen),
+                    format_ts(item.last_seen),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
@@ -16212,7 +20859,11 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
     lines.append(SUBSECTION_BAR)
     lines.append(header("Client/Server Versions"))
     if not summary.client_versions and not summary.server_versions:
-        lines.append(muted("No explicit ARP stack versions available; using hw/proto tuple fingerprints."))
+        lines.append(
+            muted(
+                "No explicit ARP stack versions available; using hw/proto tuple fingerprints."
+            )
+        )
     else:
         if summary.client_versions:
             rows = [["Client Fingerprint", "Count"]]
@@ -16260,14 +20911,16 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
     else:
         rows = [["Client", "Server", "Requests", "Replies", "First", "Last"]]
         for sess in summary.sessions[:limit]:
-            rows.append([
-                sess.client_ip,
-                sess.server_ip,
-                str(sess.requests),
-                str(sess.replies),
-                format_ts(sess.first_seen),
-                format_ts(sess.last_seen),
-            ])
+            rows.append(
+                [
+                    sess.client_ip,
+                    sess.server_ip,
+                    str(sess.requests),
+                    str(sess.replies),
+                    format_ts(sess.first_seen),
+                    format_ts(sess.last_seen),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
@@ -16291,7 +20944,15 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
     else:
         rows = [["Kind", "Detail", "Src", "Dst", "TS"]]
         for item in summary.artifacts[:limit]:
-            rows.append([item.kind, _truncate_text(item.detail, 72), item.src, item.dst, format_ts(item.ts)])
+            rows.append(
+                [
+                    item.kind,
+                    _truncate_text(item.detail, 72),
+                    item.src,
+                    item.dst,
+                    format_ts(item.ts),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if verbose and summary.opcode_counts:
@@ -16306,15 +20967,13 @@ def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = Fal
     return _finalize_output(lines)
 
 
-def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = False) -> str:
-    # Analyst-heavy DHCP output always renders full detail regardless of -v.
-    limit = _FULL_OUTPUT_LIMIT
-
-    def _limit_value(value: int) -> int:
-        return _FULL_OUTPUT_LIMIT
+def render_dhcp_summary(
+    summary: DhcpSummary, limit: int = 15, verbose: bool = False
+) -> str:
+    limit = _apply_verbose_limit(limit) or limit
 
     def _truncate_text_local(value: str, max_len: int = 80) -> str:
-        return str(value)
+        return _truncate_text(str(value), max_len)
 
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -16324,7 +20983,7 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
     if summary.errors:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Errors"))
-        for err in summary.errors[:_limit_value(25)]:
+        for err in summary.errors[: _limit_value(25)]:
             lines.append(danger(f"- {err}"))
 
     lines.append(_format_kv("Scan Duration", f"{summary.duration:.2f}s"))
@@ -16336,22 +20995,32 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
     def _dhcp_verdict() -> tuple[str, str, list[str], int]:
         score = 0
         reasons: list[str] = []
-        high_anomalies = sum(1 for item in summary.anomalies if item.severity in {"HIGH", "CRITICAL"})
+        high_anomalies = sum(
+            1 for item in summary.anomalies if item.severity in {"HIGH", "CRITICAL"}
+        )
         if high_anomalies:
             score += min(4, high_anomalies)
             reasons.append(f"High-severity DHCP anomalies observed ({high_anomalies})")
         if summary.transaction_violations:
             score += 2
-            reasons.append(f"Transaction integrity violations observed ({len(summary.transaction_violations)})")
+            reasons.append(
+                f"Transaction integrity violations observed ({len(summary.transaction_violations)})"
+            )
         if summary.policy_tampering:
             score += 2
-            reasons.append(f"DHCP policy tampering/drift observed ({len(summary.policy_tampering)})")
+            reasons.append(
+                f"DHCP policy tampering/drift observed ({len(summary.policy_tampering)})"
+            )
         if summary.lease_conflicts:
             score += 2
-            reasons.append(f"Duplicate lease assignment conflicts observed ({len(summary.lease_conflicts)})")
+            reasons.append(
+                f"Duplicate lease assignment conflicts observed ({len(summary.lease_conflicts)})"
+            )
         if summary.relay_anomalies:
             score += 1
-            reasons.append(f"Relay-agent anomalies observed ({len(summary.relay_anomalies)})")
+            reasons.append(
+                f"Relay-agent anomalies observed ({len(summary.relay_anomalies)})"
+            )
         if summary.attacks.get("Rogue DHCP Server", 0):
             score += 2
             reasons.append("Competing/rogue DHCP server evidence observed")
@@ -16360,7 +21029,9 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
             reasons.append("DHCP starvation/exhaustion behavior observed")
 
         if score >= 8:
-            verdict = "YES - high-confidence DHCP abuse or policy-hijack activity is present."
+            verdict = (
+                "YES - high-confidence DHCP abuse or policy-hijack activity is present."
+            )
             confidence = "High"
         elif score >= 5:
             verdict = "LIKELY - significant suspicious DHCP activity is present."
@@ -16387,7 +21058,7 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[:_limit_value(8)]:
+    for reason in verdict_reasons[: _limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     # Add concrete context for immediate triage.
@@ -16395,7 +21066,9 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
         lines.append(muted("Where:"))
         lines.append(muted("- Top DHCP servers"))
         for server, count in summary.server_details.most_common(_limit_value(8)):
-            lines.append(muted(f"- {_highlight_public_ips(str(server))}: {int(count)} packets"))
+            lines.append(
+                muted(f"- {_highlight_public_ips(str(server))}: {int(count)} packets")
+            )
     if summary.client_details:
         lines.append(muted("Who:"))
         lines.append(muted("- Top DHCP clients"))
@@ -16411,7 +21084,7 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
         if violations:
             lines.append(muted("When:"))
             lines.append(muted("- Transaction violations"))
-            for item in violations[:_limit_value(6)]:
+            for item in violations[: _limit_value(6)]:
                 lines.append(
                     muted(
                         f"- {item.get('type', '-')} xid={item.get('xid', '-')} "
@@ -16427,9 +21100,15 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
         ("transaction_integrity_violation", "Transaction Integrity Violation"),
         ("rogue_competing_server_evidence", "Rogue/Competing Server Evidence"),
         ("starvation_exhaustion_behavior", "Starvation/Exhaustion Behavior"),
-        ("option_tampering_router_dns_routes_wpad_pxe", "Option Tampering (Router/DNS/Routes/WPAD/PXE)"),
+        (
+            "option_tampering_router_dns_routes_wpad_pxe",
+            "Option Tampering (Router/DNS/Routes/WPAD/PXE)",
+        ),
         ("relay_abuse_option82", "Relay Abuse / Option 82 Anomaly"),
-        ("lease_conflict_duplicate_assignment", "Lease Conflict / Duplicate Assignment"),
+        (
+            "lease_conflict_duplicate_assignment",
+            "Lease Conflict / Duplicate Assignment",
+        ),
         ("beacon_periodic_dhcp", "Periodic DHCP Beacon Behavior"),
         ("likely_benign_failover_context", "Likely Benign Failover Context"),
     ]
@@ -16441,24 +21120,48 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
         lines.append(label(label_text))
         if evidence_items:
             if key == "likely_benign_failover_context":
-                lines.append(ok(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-                matrix_rows.append([label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"])
+                lines.append(
+                    ok(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
+                matrix_rows.append(
+                    [label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"]
+                )
             else:
-                lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-                if key in {"transaction_integrity_violation", "option_tampering_router_dns_routes_wpad_pxe", "lease_conflict_duplicate_assignment"}:
+                lines.append(
+                    warn(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
+                if key in {
+                    "transaction_integrity_violation",
+                    "option_tampering_router_dns_routes_wpad_pxe",
+                    "lease_conflict_duplicate_assignment",
+                }:
                     risk = "High"
                     conf_level = "High"
-                elif key in {"rogue_competing_server_evidence", "starvation_exhaustion_behavior", "relay_abuse_option82"}:
+                elif key in {
+                    "rogue_competing_server_evidence",
+                    "starvation_exhaustion_behavior",
+                    "relay_abuse_option82",
+                }:
                     risk = "Medium"
                     conf_level = "Medium"
                 else:
                     risk = "Low"
                     conf_level = "Low"
-                matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
-            for item in evidence_items[:_limit_value(8)]:
+                matrix_rows.append(
+                    [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
+                )
+            for item in evidence_items[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -16526,7 +21229,9 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
             rows.append([_truncate_text_local(value, 72), str(count)])
         lines.append(_format_table(rows))
 
-    device_hits = [item for item in summary.artifacts if str(getattr(item, "kind", "")) == "device"]
+    device_hits = [
+        item for item in summary.artifacts if str(getattr(item, "kind", "")) == "device"
+    ]
     if device_hits:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Device Fingerprints"))
@@ -16541,7 +21246,8 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
         rows = [["Fingerprint", "Count", "Top Endpoints"]]
         for detail, count in device_counts.most_common(limit):
             top_eps = ", ".join(
-                f"{ep} ({cnt})" for ep, cnt in device_endpoints[detail].most_common(_limit_value(3))
+                f"{ep} ({cnt})"
+                for ep, cnt in device_endpoints[detail].most_common(_limit_value(3))
             )
             rows.append([_truncate_text_local(detail, 90), str(count), top_eps or "-"])
         lines.append(_format_table(rows))
@@ -16603,33 +21309,49 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
     if summary.conversations:
         rows = [["Src", "Dst", "Msg", "Ports", "Packets", "First", "Last"]]
         for item in summary.conversations[:limit]:
-            rows.append([
-                item.src_ip,
-                item.dst_ip,
-                item.message_type,
-                f"{item.src_port}->{item.dst_port}",
-                str(item.packets),
-                format_ts(item.first_seen),
-                format_ts(item.last_seen),
-            ])
+            rows.append(
+                [
+                    item.src_ip,
+                    item.dst_ip,
+                    item.message_type,
+                    f"{item.src_port}->{item.dst_port}",
+                    str(item.packets),
+                    format_ts(item.first_seen),
+                    format_ts(item.last_seen),
+                ]
+            )
         lines.append(_format_table(rows))
     else:
         lines.append(muted("No DHCP conversations identified."))
 
     if summary.sessions:
-        rows = [["Client MAC", "Client IP", "Server", "Req", "Offer", "Ack", "Nak", "First", "Last"]]
+        rows = [
+            [
+                "Client MAC",
+                "Client IP",
+                "Server",
+                "Req",
+                "Offer",
+                "Ack",
+                "Nak",
+                "First",
+                "Last",
+            ]
+        ]
         for item in summary.sessions[:limit]:
-            rows.append([
-                item.client_mac,
-                item.client_ip,
-                item.server_ip,
-                str(item.requests),
-                str(item.offers),
-                str(item.acks),
-                str(item.naks),
-                format_ts(item.first_seen),
-                format_ts(item.last_seen),
-            ])
+            rows.append(
+                [
+                    item.client_mac,
+                    item.client_ip,
+                    item.server_ip,
+                    str(item.requests),
+                    str(item.offers),
+                    str(item.acks),
+                    str(item.naks),
+                    format_ts(item.first_seen),
+                    format_ts(item.last_seen),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if getattr(summary, "server_policy_profiles", None):
@@ -16638,33 +21360,49 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
             lines.append(header("Server Policy Profiles"))
             rows = [["Server", "Router", "DNS", "Domain", "WPAD", "Routes", "PXE"]]
             for item in summary.server_policy_profiles[:limit]:
-                pxe_value = str(item.get("bootfile_value", "") or item.get("tftp_value", "") or "-")
-                rows.append([
-                    str(item.get("server", "-")),
-                    _truncate_text_local(str(item.get("router_value", "-")), 22),
-                    _truncate_text_local(str(item.get("dns_value", "-")), 22),
-                    _truncate_text_local(str(item.get("domain_value", "-")), 18),
-                    _truncate_text_local(str(item.get("wpad_value", "-")), 16),
-                    _truncate_text_local(str(item.get("routes_value", "-")), 18),
-                    _truncate_text_local(pxe_value, 18),
-                ])
+                pxe_value = str(
+                    item.get("bootfile_value", "") or item.get("tftp_value", "") or "-"
+                )
+                rows.append(
+                    [
+                        str(item.get("server", "-")),
+                        _truncate_text_local(str(item.get("router_value", "-")), 22),
+                        _truncate_text_local(str(item.get("dns_value", "-")), 22),
+                        _truncate_text_local(str(item.get("domain_value", "-")), 18),
+                        _truncate_text_local(str(item.get("wpad_value", "-")), 16),
+                        _truncate_text_local(str(item.get("routes_value", "-")), 18),
+                        _truncate_text_local(pxe_value, 18),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "client_abuse_profiles", None):
         if summary.client_abuse_profiles:
             lines.append(SUBSECTION_BAR)
             lines.append(header("Client Abuse Profiles"))
-            rows = [["Client MAC", "Req", "Requested IPs", "XIDs", "Hostnames", "Client IDs", "Vendors"]]
+            rows = [
+                [
+                    "Client MAC",
+                    "Req",
+                    "Requested IPs",
+                    "XIDs",
+                    "Hostnames",
+                    "Client IDs",
+                    "Vendors",
+                ]
+            ]
             for item in summary.client_abuse_profiles[:limit]:
-                rows.append([
-                    str(item.get("client_mac", "-")),
-                    str(item.get("requests", "-")),
-                    str(item.get("requested_ip_count", "-")),
-                    str(item.get("xid_count", "-")),
-                    str(item.get("hostname_count", "-")),
-                    str(item.get("client_id_count", "-")),
-                    str(item.get("vendor_class_count", "-")),
-                ])
+                rows.append(
+                    [
+                        str(item.get("client_mac", "-")),
+                        str(item.get("requests", "-")),
+                        str(item.get("requested_ip_count", "-")),
+                        str(item.get("xid_count", "-")),
+                        str(item.get("hostname_count", "-")),
+                        str(item.get("client_id_count", "-")),
+                        str(item.get("vendor_class_count", "-")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "policy_tampering", None):
@@ -16674,11 +21412,15 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
             rows = [["Server", "Signals"]]
             for item in summary.policy_tampering[:limit]:
                 drift = item.get("drift", [])
-                drift_text = "; ".join(str(v) for v in (drift[:3] if isinstance(drift, list) else [drift]))
-                rows.append([
-                    str(item.get("server", "-")),
-                    _truncate_text_local(drift_text or "-", 92),
-                ])
+                drift_text = "; ".join(
+                    str(v) for v in (drift[:3] if isinstance(drift, list) else [drift])
+                )
+                rows.append(
+                    [
+                        str(item.get("server", "-")),
+                        _truncate_text_local(drift_text or "-", 92),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "transaction_violations", None):
@@ -16687,14 +21429,16 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
             lines.append(header("Transaction Integrity Violations"))
             rows = [["Type", "Server", "Client", "XID", "Flow", "Time"]]
             for item in summary.transaction_violations[:limit]:
-                rows.append([
-                    str(item.get("type", "-")),
-                    str(item.get("server", "-")),
-                    str(item.get("client_mac", "-")),
-                    str(item.get("xid", "-")),
-                    f"{item.get('src', '-')}->{item.get('dst', '-')}",
-                    format_ts(item.get("ts")),
-                ])
+                rows.append(
+                    [
+                        str(item.get("type", "-")),
+                        str(item.get("server", "-")),
+                        str(item.get("client_mac", "-")),
+                        str(item.get("xid", "-")),
+                        f"{item.get('src', '-')}->{item.get('dst', '-')}",
+                        format_ts(item.get("ts")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "lease_conflicts", None):
@@ -16704,12 +21448,17 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
             rows = [["IP", "Client Count", "Clients"]]
             for item in summary.lease_conflicts[:limit]:
                 clients = item.get("clients", [])
-                client_text = ", ".join(str(v) for v in (clients[:4] if isinstance(clients, list) else [clients]))
-                rows.append([
-                    str(item.get("ip", "-")),
-                    str(item.get("count", "-")),
-                    client_text,
-                ])
+                client_text = ", ".join(
+                    str(v)
+                    for v in (clients[:4] if isinstance(clients, list) else [clients])
+                )
+                rows.append(
+                    [
+                        str(item.get("ip", "-")),
+                        str(item.get("count", "-")),
+                        client_text,
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "relay_anomalies", None):
@@ -16719,13 +21468,18 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
             rows = [["Relay", "Servers", "Clients", "Top Servers"]]
             for item in summary.relay_anomalies[:limit]:
                 servers = item.get("servers", [])
-                top_servers = ", ".join(str(v) for v in (servers[:3] if isinstance(servers, list) else [servers]))
-                rows.append([
-                    str(item.get("relay", "-")),
-                    str(item.get("server_count", "-")),
-                    str(item.get("client_count", "-")),
-                    top_servers,
-                ])
+                top_servers = ", ".join(
+                    str(v)
+                    for v in (servers[:3] if isinstance(servers, list) else [servers])
+                )
+                rows.append(
+                    [
+                        str(item.get("relay", "-")),
+                        str(item.get("server_count", "-")),
+                        str(item.get("client_count", "-")),
+                        top_servers,
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "timeline", None):
@@ -16734,19 +21488,23 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
             lines.append(header("Attack Chain Timeline"))
             rows = [["Time", "Event", "Detail", "Flow"]]
             for item in summary.timeline[:limit]:
-                rows.append([
-                    format_ts(item.get("ts")),
-                    str(item.get("event", "-")),
-                    _truncate_text_local(_redact_in_text(str(item.get("detail", "-"))), 96),
-                    f"{item.get('src', '-')}->{item.get('dst', '-')}",
-                ])
+                rows.append(
+                    [
+                        format_ts(item.get("ts")),
+                        str(item.get("event", "-")),
+                        _truncate_text_local(
+                            _redact_in_text(str(item.get("detail", "-"))), 96
+                        ),
+                        f"{item.get('src', '-')}->{item.get('dst', '-')}",
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if getattr(summary, "benign_context", None):
         if summary.benign_context:
             lines.append(SUBSECTION_BAR)
             lines.append(header("False-Positive Context"))
-            for item in summary.benign_context[:_limit_value(8)]:
+            for item in summary.benign_context[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     lines.append(SUBSECTION_BAR)
@@ -16754,7 +21512,15 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
     if summary.artifacts:
         rows = [["Kind", "Detail", "Src", "Dst", "TS"]]
         for item in summary.artifacts[:limit]:
-            rows.append([item.kind, _truncate_text_local(item.detail, 72), item.src, item.dst, format_ts(item.ts)])
+            rows.append(
+                [
+                    item.kind,
+                    _truncate_text_local(item.detail, 72),
+                    item.src,
+                    item.dst,
+                    format_ts(item.ts),
+                ]
+            )
         lines.append(_format_table(rows))
     else:
         lines.append(muted("No DHCP artifacts recorded."))
@@ -16775,6 +21541,7 @@ def render_dhcp_summary(summary: DhcpSummary, limit: int = 15, verbose: bool = F
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
+
 
 def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> str:
     """
@@ -16805,7 +21572,9 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
     modbus_packet_ratio = (modbus_packets / total_packets) if total_packets else 0.0
     modbus_byte_ratio = (modbus_bytes / total_bytes) if total_bytes else 0.0
     avg_modbus_pkt = (modbus_bytes / modbus_packets) if modbus_packets else 0.0
-    avg_modbus_payload = (modbus_payload_bytes / modbus_packets) if modbus_packets else 0.0
+    avg_modbus_payload = (
+        (modbus_payload_bytes / modbus_packets) if modbus_packets else 0.0
+    )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Overall Traffic Statistics"))
@@ -16820,15 +21589,26 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Modbus Protocol Statistics"))
-    lines.append(_format_kv("Modbus Packets", f"{modbus_packets} ({modbus_packet_ratio:.1%})"))
-    lines.append(_format_kv("Modbus Bytes", f"{format_bytes_as_mb(modbus_bytes)} ({modbus_byte_ratio:.1%})"))
-    lines.append(_format_kv("Modbus Payload Bytes", format_bytes_as_mb(modbus_payload_bytes)))
+    lines.append(
+        _format_kv("Modbus Packets", f"{modbus_packets} ({modbus_packet_ratio:.1%})")
+    )
+    lines.append(
+        _format_kv(
+            "Modbus Bytes",
+            f"{format_bytes_as_mb(modbus_bytes)} ({modbus_byte_ratio:.1%})",
+        )
+    )
+    lines.append(
+        _format_kv("Modbus Payload Bytes", format_bytes_as_mb(modbus_payload_bytes))
+    )
     lines.append(_format_kv("Avg Modbus Packet Size", f"{avg_modbus_pkt:.1f} bytes"))
-    lines.append(_format_kv("Avg Modbus Payload Size", f"{avg_modbus_payload:.1f} bytes"))
+    lines.append(
+        _format_kv("Avg Modbus Payload Size", f"{avg_modbus_payload:.1f} bytes")
+    )
     lines.append(_format_kv("Unique Clients", str(summary.unique_clients)))
     lines.append(_format_kv("Unique Servers", str(summary.unique_servers)))
     lines.append(_format_kv("Error Rate", f"{summary.error_rate:.2f}%"))
-    
+
     # 2. Function Codes
     lines.append(SUBSECTION_BAR)
     lines.append(header("Observed Commands"))
@@ -16838,7 +21618,10 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
         for func, count in summary.func_counts.most_common():
             lowered = func.lower()
             is_write = "write" in lowered
-            is_diag = any(token in lowered for token in ("diagnostic", "encapsulated", "report server", "file"))
+            is_diag = any(
+                token in lowered
+                for token in ("diagnostic", "encapsulated", "report server", "file")
+            )
             if is_write:
                 color = danger
             elif is_diag:
@@ -16846,7 +21629,7 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
             else:
                 color = _identity_text
             lines.append(color(f"{func:<40} : {count}"))
-            
+
     # 3. Unit IDs
     lines.append(SUBSECTION_BAR)
     lines.append(header("Active Unit IDs"))
@@ -16866,11 +21649,13 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
     if summary.endpoint_packets:
         rows = [["Endpoint", "Packets", "Bytes"]]
         for ip, count in summary.endpoint_packets.most_common(_limit_value(10)):
-            rows.append([
-                ip,
-                str(count),
-                format_bytes_as_mb(summary.endpoint_bytes.get(ip, 0)),
-            ])
+            rows.append(
+                [
+                    ip,
+                    str(count),
+                    format_bytes_as_mb(summary.endpoint_bytes.get(ip, 0)),
+                ]
+            )
         lines.append(_format_table(rows))
     else:
         lines.append(muted("No Modbus endpoints detected."))
@@ -16878,7 +21663,11 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
     lines.append(SUBSECTION_BAR)
     lines.append(header("Client/Server Statistics"))
     col_width = 45
-    lines.append(highlight(f"{'Clients (Controllers)':<{col_width}} | {'Servers (PLCs/Sensors)'}"))
+    lines.append(
+        highlight(
+            f"{'Clients (Controllers)':<{col_width}} | {'Servers (PLCs/Sensors)'}"
+        )
+    )
     lines.append(muted("-" * 90))
     clients = summary.src_ips.most_common(_limit_value(10))
     servers = summary.dst_ips.most_common(_limit_value(10))
@@ -16900,23 +21689,28 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
         lines.append(SUBSECTION_BAR)
         lines.append(header("Modbus Services (Endpoints)"))
         rows = [["Service", "Top Endpoints"]]
-        for func_name, counter in Counter({
-            name: sum(cnt.values()) for name, cnt in summary.service_endpoints.items()
-        }).most_common(_limit_value(10)):
+        for func_name, counter in Counter(
+            {name: sum(cnt.values()) for name, cnt in summary.service_endpoints.items()}
+        ).most_common(_limit_value(10)):
             endpoints = summary.service_endpoints.get(func_name, Counter())
-            top_eps = ", ".join(f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3)))
+            top_eps = ", ".join(
+                f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3))
+            )
             rows.append([func_name, top_eps or "-"])
         lines.append(_format_table(rows))
 
     if summary.artifacts:
         equipment_hits = [
-            artifact for artifact in summary.artifacts
+            artifact
+            for artifact in summary.artifacts
             if str(getattr(artifact, "kind", "")) == "equipment"
         ]
         if equipment_hits:
             lines.append(SUBSECTION_BAR)
             lines.append(header("Equipment Inventory"))
-            counts = Counter(str(getattr(artifact, "detail", "")) for artifact in equipment_hits)
+            counts = Counter(
+                str(getattr(artifact, "detail", "")) for artifact in equipment_hits
+            )
             endpoints: dict[str, Counter[str]] = defaultdict(Counter)
             for artifact in equipment_hits:
                 detail = str(getattr(artifact, "detail", ""))
@@ -16926,19 +21720,23 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
             rows = [["Equipment", "Count", "Top Endpoints"]]
             for detail, count in counts.most_common(_limit_value(12)):
                 top_eps = ", ".join(
-                    f"{ep} ({cnt})" for ep, cnt in endpoints[detail].most_common(_limit_value(3))
+                    f"{ep} ({cnt})"
+                    for ep, cnt in endpoints[detail].most_common(_limit_value(3))
                 )
                 rows.append([detail, str(count), top_eps or "-"])
             lines.append(_format_table(rows))
 
         device_hits = [
-            artifact for artifact in summary.artifacts
+            artifact
+            for artifact in summary.artifacts
             if str(getattr(artifact, "kind", "")) == "device"
         ]
         if device_hits:
             lines.append(SUBSECTION_BAR)
             lines.append(header("Device Fingerprints"))
-            counts = Counter(str(getattr(artifact, "detail", "")) for artifact in device_hits)
+            counts = Counter(
+                str(getattr(artifact, "detail", "")) for artifact in device_hits
+            )
             endpoints: dict[str, Counter[str]] = defaultdict(Counter)
             for artifact in device_hits:
                 detail = str(getattr(artifact, "detail", ""))
@@ -16948,7 +21746,8 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
             rows = [["Fingerprint", "Count", "Top Endpoints"]]
             for detail, count in counts.most_common(_limit_value(12)):
                 top_eps = ", ".join(
-                    f"{ep} ({cnt})" for ep, cnt in endpoints[detail].most_common(_limit_value(3))
+                    f"{ep} ({cnt})"
+                    for ep, cnt in endpoints[detail].most_common(_limit_value(3))
                 )
                 rows.append([_truncate_text(detail, 90), str(count), top_eps or "-"])
             lines.append(_format_table(rows))
@@ -16956,35 +21755,68 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
     if summary.packet_size_hist or summary.payload_size_hist:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Packet & Payload Size Distribution"))
-        bucket_labels = ["<=64", "65-128", "129-256", "257-512", "513-1024", "1025-1500", "1501-9000", ">9000"]
+        bucket_labels = [
+            "<=64",
+            "65-128",
+            "129-256",
+            "257-512",
+            "513-1024",
+            "1025-1500",
+            "1501-9000",
+            ">9000",
+        ]
         if summary.packet_size_hist:
-            packet_series = [summary.packet_size_hist.get(label, 0) for label in bucket_labels]
+            packet_series = [
+                summary.packet_size_hist.get(label, 0) for label in bucket_labels
+            ]
             lines.append(_format_kv("Packet Size Buckets", ", ".join(bucket_labels)))
             lines.append(_format_kv("Packet Size Spark", sparkline(packet_series)))
             stats = summary.packet_size_stats
-            lines.append(_format_kv("Packet Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+            lines.append(
+                _format_kv(
+                    "Packet Size Stats",
+                    f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}",
+                )
+            )
         if summary.payload_size_hist:
-            payload_series = [summary.payload_size_hist.get(label, 0) for label in bucket_labels]
+            payload_series = [
+                summary.payload_size_hist.get(label, 0) for label in bucket_labels
+            ]
             lines.append(_format_kv("Payload Size Buckets", ", ".join(bucket_labels)))
             lines.append(_format_kv("Payload Size Spark", sparkline(payload_series)))
             stats = summary.payload_size_stats
-            lines.append(_format_kv("Payload Size Stats", f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+            lines.append(
+                _format_kv(
+                    "Payload Size Stats",
+                    f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}",
+                )
+            )
 
     if summary.flow_duration_buckets:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Flow Duration Distribution"))
         bucket_order = ["<=1s", "1-10s", "10-60s", "1-5m", "5-30m", ">30m"]
-        for key, label_text in (("all", "All"), ("requests", "Requests"), ("responses", "Responses")):
+        for key, label_text in (
+            ("all", "All"),
+            ("requests", "Requests"),
+            ("responses", "Responses"),
+        ):
             buckets = summary.flow_duration_buckets.get(key, Counter())
             if not buckets:
                 continue
             counts = [int(buckets.get(bucket, 0)) for bucket in bucket_order]
             lines.append(_format_kv(f"{label_text} Buckets", ", ".join(bucket_order)))
-            lines.append(_format_kv(f"{label_text} Counts", ", ".join(str(val) for val in counts)))
+            lines.append(
+                _format_kv(
+                    f"{label_text} Counts", ", ".join(str(val) for val in counts)
+                )
+            )
 
     if summary.messages:
         exception_counts = Counter(
-            f"{msg.exception_desc or 'Exception'}" for msg in summary.messages if msg.is_exception
+            f"{msg.exception_desc or 'Exception'}"
+            for msg in summary.messages
+            if msg.is_exception
         )
         if exception_counts:
             lines.append(SUBSECTION_BAR)
@@ -16999,15 +21831,17 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
             lines.append(SUBSECTION_BAR)
             lines.append(header("Write Value Changes (Preview)"))
             rows = [["Target", "Old", "New", "Src", "Dst", "TS"]]
-            for item in summary.value_changes[:_limit_value(8)]:
-                rows.append([
-                    str(item.get("target", "")),
-                    str(item.get("old", "")),
-                    str(item.get("new", "")),
-                    str(item.get("src", "")),
-                    str(item.get("dst", "")),
-                    format_ts(item.get("ts")),
-                ])
+            for item in summary.value_changes[: _limit_value(8)]:
+                rows.append(
+                    [
+                        str(item.get("target", "")),
+                        str(item.get("old", "")),
+                        str(item.get("new", "")),
+                        str(item.get("src", "")),
+                        str(item.get("dst", "")),
+                        format_ts(item.get("ts")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     # 5. Anomalies
@@ -17036,13 +21870,15 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
         else:
             # Sort by severity
             sev_map = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-            sorted_anoms = sorted(summary.anomalies, key=lambda x: sev_map.get(x.severity, 99))
-            
+            sorted_anoms = sorted(
+                summary.anomalies, key=lambda x: sev_map.get(x.severity, 99)
+            )
+
             for a in sorted_anoms:
                 sev_color = danger if a.severity in ("CRITICAL", "HIGH") else warn
                 if a.severity == "LOW":
                     sev_color = muted
-                
+
                 lines.append(sev_color(f"[{a.severity}] {a.title}"))
                 lines.append(f"  {a.description}")
                 lines.append(muted(f"  Src: {a.src} -> Dst: {a.dst}"))
@@ -17129,7 +21965,9 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
             dst = str(getattr(artifact, "dst", "?"))
             device_endpoints[detail][f"{src} -> {dst}"] += 1
         for key in ("all", "requests", "responses"):
-            flow_duration_buckets[key].update(summary.flow_duration_buckets.get(key, Counter()))
+            flow_duration_buckets[key].update(
+                summary.flow_duration_buckets.get(key, Counter())
+            )
         total_messages += len(summary.messages)
         total_exceptions += sum(1 for msg in summary.messages if msg.is_exception)
         all_anomalies.extend(summary.anomalies)
@@ -17156,7 +21994,11 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
     lines.append(_format_kv("Total Bytes", format_bytes_as_mb(total_bytes)))
     lines.append(_format_kv("Modbus Packets", str(total_modbus_packets)))
     lines.append(_format_kv("Modbus Bytes", format_bytes_as_mb(total_modbus_bytes)))
-    lines.append(_format_kv("Modbus Payload Bytes", format_bytes_as_mb(total_modbus_payload_bytes)))
+    lines.append(
+        _format_kv(
+            "Modbus Payload Bytes", format_bytes_as_mb(total_modbus_payload_bytes)
+        )
+    )
     lines.append(_format_kv("Total Messages", str(total_messages)))
     lines.append(_format_kv("Unique Clients", str(len(src_ips))))
     lines.append(_format_kv("Unique Servers", str(len(dst_ips))))
@@ -17186,7 +22028,11 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
     lines.append(SUBSECTION_BAR)
     lines.append(header("Modbus Endpoints"))
     col_width = 45
-    lines.append(highlight(f"{'Clients (Controllers)':<{col_width}} | {'Servers (PLCs/Sensors)'}"))
+    lines.append(
+        highlight(
+            f"{'Clients (Controllers)':<{col_width}} | {'Servers (PLCs/Sensors)'}"
+        )
+    )
     lines.append(muted("-" * 90))
     clients = src_ips.most_common(_limit_value(10))
     servers = dst_ips.most_common(_limit_value(10))
@@ -17207,22 +22053,26 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
         lines.append(header("Top Endpoints"))
         rows = [["Endpoint", "Packets", "Bytes"]]
         for ip, count in endpoint_packets.most_common(_limit_value(10)):
-            rows.append([
-                ip,
-                str(count),
-                format_bytes_as_mb(endpoint_bytes.get(ip, 0)),
-            ])
+            rows.append(
+                [
+                    ip,
+                    str(count),
+                    format_bytes_as_mb(endpoint_bytes.get(ip, 0)),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if service_endpoints:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Modbus Services (Endpoints)"))
         rows = [["Service", "Top Endpoints"]]
-        for func_name, counter in Counter({
-            name: sum(cnt.values()) for name, cnt in service_endpoints.items()
-        }).most_common(_limit_value(10)):
+        for func_name, counter in Counter(
+            {name: sum(cnt.values()) for name, cnt in service_endpoints.items()}
+        ).most_common(_limit_value(10)):
             endpoints = service_endpoints.get(func_name, Counter())
-            top_eps = ", ".join(f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3)))
+            top_eps = ", ".join(
+                f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3))
+            )
             rows.append([func_name, top_eps or "-"])
         lines.append(_format_table(rows))
 
@@ -17232,7 +22082,8 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
         rows = [["Equipment", "Count", "Top Endpoints"]]
         for detail, count in equipment_counts.most_common(_limit_value(12)):
             top_eps = ", ".join(
-                f"{ep} ({cnt})" for ep, cnt in equipment_endpoints[detail].most_common(_limit_value(3))
+                f"{ep} ({cnt})"
+                for ep, cnt in equipment_endpoints[detail].most_common(_limit_value(3))
             )
             rows.append([detail, str(count), top_eps or "-"])
         lines.append(_format_table(rows))
@@ -17243,7 +22094,8 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
         rows = [["Fingerprint", "Count", "Top Endpoints"]]
         for detail, count in device_counts.most_common(_limit_value(12)):
             top_eps = ", ".join(
-                f"{ep} ({cnt})" for ep, cnt in device_endpoints[detail].most_common(_limit_value(3))
+                f"{ep} ({cnt})"
+                for ep, cnt in device_endpoints[detail].most_common(_limit_value(3))
             )
             rows.append([_truncate_text(detail, 90), str(count), top_eps or "-"])
         lines.append(_format_table(rows))
@@ -17251,13 +22103,24 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
     if packet_size_hist or payload_size_hist:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Packet & Payload Size Distribution"))
-        bucket_labels = ["<=64", "65-128", "129-256", "257-512", "513-1024", "1025-1500", "1501-9000", ">9000"]
+        bucket_labels = [
+            "<=64",
+            "65-128",
+            "129-256",
+            "257-512",
+            "513-1024",
+            "1025-1500",
+            "1501-9000",
+            ">9000",
+        ]
         if packet_size_hist:
             packet_series = [packet_size_hist.get(label, 0) for label in bucket_labels]
             lines.append(_format_kv("Packet Size Buckets", ", ".join(bucket_labels)))
             lines.append(_format_kv("Packet Size Spark", sparkline(packet_series)))
         if payload_size_hist:
-            payload_series = [payload_size_hist.get(label, 0) for label in bucket_labels]
+            payload_series = [
+                payload_size_hist.get(label, 0) for label in bucket_labels
+            ]
             lines.append(_format_kv("Payload Size Buckets", ", ".join(bucket_labels)))
             lines.append(_format_kv("Payload Size Spark", sparkline(payload_series)))
 
@@ -17265,13 +22128,21 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Flow Duration Distribution"))
         bucket_order = ["<=1s", "1-10s", "10-60s", "1-5m", "5-30m", ">30m"]
-        for key, label_text in (("all", "All"), ("requests", "Requests"), ("responses", "Responses")):
+        for key, label_text in (
+            ("all", "All"),
+            ("requests", "Requests"),
+            ("responses", "Responses"),
+        ):
             buckets = flow_duration_buckets.get(key, Counter())
             if not buckets:
                 continue
             counts = [int(buckets.get(bucket, 0)) for bucket in bucket_order]
             lines.append(_format_kv(f"{label_text} Buckets", ", ".join(bucket_order)))
-            lines.append(_format_kv(f"{label_text} Counts", ", ".join(str(val) for val in counts)))
+            lines.append(
+                _format_kv(
+                    f"{label_text} Counts", ", ".join(str(val) for val in counts)
+                )
+            )
 
     if all_anomalies:
         lines.append(SUBSECTION_BAR)
@@ -17296,6 +22167,7 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
+
 def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
     """
     Render DNP3 analysis results.
@@ -17315,7 +22187,7 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
     lines.append(_format_kv("DNP3 Packets", str(summary.dnp3_packets)))
     lines.append(_format_kv("Active TCP/UDP IPs", str(len(summary.ip_endpoints))))
     lines.append(_format_kv("DNP3 Addresses", str(summary.unique_dnp3_addresses)))
-    
+
     # 2. Function Codes
     lines.append(SUBSECTION_BAR)
     lines.append(header("Function Code Usage"))
@@ -17326,14 +22198,16 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
             # Highlight potentially dangerous functions
             is_risk = any(x in func for x in ["Write", "Restart", "File", "Freeze"])
             c = danger if is_risk else lambda x: x
-            
+
             lines.append(c(f"{func:<40} : {count}"))
 
     # 2b. Object Groups / Variations
     if getattr(summary, "object_group_counts", None):
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Object Groups"))
-        lines.append(_format_kv("Groups", _format_counter(summary.object_group_counts, 6)))
+        lines.append(
+            _format_kv("Groups", _format_counter(summary.object_group_counts, 6))
+        )
     if getattr(summary, "object_counts", None):
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Object Variations"))
@@ -17344,19 +22218,21 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
             lines.append(SUBSECTION_BAR)
             lines.append(header("Value Changes (Preview)"))
             rows = [["Point", "Old", "New", "Src", "Dst", "TS"]]
-            for item in summary.value_changes[:_limit_value(8)]:
+            for item in summary.value_changes[: _limit_value(8)]:
                 group = item.get("group")
                 variation = item.get("variation")
                 index = item.get("index")
                 label = f"{group}.{variation}[{index}]"
-                rows.append([
-                    label,
-                    str(item.get("old", "")),
-                    str(item.get("new", "")),
-                    str(item.get("src", "")),
-                    str(item.get("dst", "")),
-                    format_ts(item.get("ts")),
-                ])
+                rows.append(
+                    [
+                        label,
+                        str(item.get("old", "")),
+                        str(item.get("new", "")),
+                        str(item.get("src", "")),
+                        str(item.get("dst", "")),
+                        format_ts(item.get("ts")),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     # 3. Addresses
@@ -17375,16 +22251,18 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
     if summary.anomalies:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Anomalies & Threats"))
-        
+
         # Sort by severity
         sev_map = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-        sorted_anoms = sorted(summary.anomalies, key=lambda x: sev_map.get(x.severity, 99))
-        
+        sorted_anoms = sorted(
+            summary.anomalies, key=lambda x: sev_map.get(x.severity, 99)
+        )
+
         for a in sorted_anoms:
             sev_color = danger if a.severity in ("CRITICAL", "HIGH") else warn
             if a.severity == "LOW":
                 sev_color = muted
-            
+
             lines.append(sev_color(f"[{a.severity}] {a.title}"))
             lines.append(f"  {a.description}")
             lines.append(muted(f"  Src: {a.src} -> Dst: {a.dst}"))
@@ -17487,7 +22365,9 @@ def render_dnp3_rollup(summaries: Iterable["Dnp3Analysis"]) -> str:
     return _finalize_output(lines)
 
 
-def _render_industrial_summary(title: str, summary: object, packet_label: str = "Protocol Packets") -> str:
+def _render_industrial_summary(
+    title: str, summary: object, packet_label: str = "Protocol Packets"
+) -> str:
     if not summary:
         return ""
 
@@ -17561,30 +22441,42 @@ def _render_industrial_summary(title: str, summary: object, packet_label: str = 
         lines.append(SUBSECTION_BAR)
         lines.append(header("Artifacts & Observations"))
         rows = [["Type", "Detail", "Src", "Dst"]]
-        for artifact in artifacts[:_limit_value(12)]:
-            rows.append([
-                str(getattr(artifact, "kind", "artifact")),
-                str(getattr(artifact, "detail", ""))[:_limit_value(80)],
-                str(getattr(artifact, "src", "?")),
-                str(getattr(artifact, "dst", "?")),
-            ])
+        for artifact in artifacts[: _limit_value(12)]:
+            rows.append(
+                [
+                    str(getattr(artifact, "kind", "artifact")),
+                    str(getattr(artifact, "detail", ""))[: _limit_value(80)],
+                    str(getattr(artifact, "src", "?")),
+                    str(getattr(artifact, "dst", "?")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if anomalies:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Anomalies & Events"))
-        for anomaly in anomalies[:_limit_value(12)]:
+        for anomaly in anomalies[: _limit_value(12)]:
             sev = getattr(anomaly, "severity", "INFO")
             sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
-            lines.append(sev_color(f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"))
-            lines.append(muted(f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"))
+            lines.append(
+                sev_color(
+                    f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"
+                )
+            )
+            lines.append(
+                muted(
+                    f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"
+                )
+            )
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
 def render_iec104_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("IEC-104", summary, packet_label="IEC-104 Packets")
+    return _render_industrial_summary(
+        "IEC-104", summary, packet_label="IEC-104 Packets"
+    )
 
 
 def render_bacnet_summary(summary: "IndustrialAnalysis") -> str:
@@ -17617,7 +22509,12 @@ def render_enip_summary(summary: "ENIPAnalysis") -> str:
     lines.append(_format_kv("ENIP Throughput", format_speed_bps(int(rate * 8))))
     lines.append(_format_kv("Requests", str(summary.requests)))
     lines.append(_format_kv("Responses", str(summary.responses)))
-    lines.append(_format_kv("Connected/Unconnected", f"{summary.connected_packets}/{summary.unconnected_packets}"))
+    lines.append(
+        _format_kv(
+            "Connected/Unconnected",
+            f"{summary.connected_packets}/{summary.unconnected_packets}",
+        )
+    )
     lines.append(_format_kv("I/O Packets (UDP/2222)", str(summary.io_packets)))
     lines.append(_format_kv("Unique Clients", str(len(summary.client_ips))))
     lines.append(_format_kv("Unique Servers", str(len(summary.server_ips))))
@@ -17709,8 +22606,12 @@ def render_enip_summary(summary: "ENIPAnalysis") -> str:
             rows.append([display, str(count), risk])
         lines.append(_format_table(rows))
 
-        high_risk_total = sum(getattr(summary, "high_risk_services", Counter()).values())
-        suspicious_total = sum(getattr(summary, "suspicious_services", Counter()).values())
+        high_risk_total = sum(
+            getattr(summary, "high_risk_services", Counter()).values()
+        )
+        suspicious_total = sum(
+            getattr(summary, "suspicious_services", Counter()).values()
+        )
         total_services = sum(summary.cip_services.values())
         normal_total = max(0, total_services - high_risk_total - suspicious_total)
         lines.append(SUBSECTION_BAR)
@@ -17743,16 +22644,21 @@ def render_enip_summary(summary: "ENIPAnalysis") -> str:
     if getattr(summary, "identities", None):
         lines.append(SUBSECTION_BAR)
         lines.append(header("Device Inventory (ListIdentity)"))
-        rows = [[
-            "IP",
-            "Vendor ID",
-            "Device Type",
-            "Product Code",
-            "Revision",
-            "Serial",
-            "Product Name",
-        ]]
-        def _format_identity_label(name: object | None, code: object | None, label: str) -> str:
+        rows = [
+            [
+                "IP",
+                "Vendor ID",
+                "Device Type",
+                "Product Code",
+                "Revision",
+                "Serial",
+                "Product Name",
+            ]
+        ]
+
+        def _format_identity_label(
+            name: object | None, code: object | None, label: str
+        ) -> str:
             if name:
                 return f"{name} ({code})"
             if code is None or code == "-":
@@ -17765,35 +22671,41 @@ def render_enip_summary(summary: "ENIPAnalysis") -> str:
                 return f"Unknown {label} (0)"
             return f"{label} {code_val}"
 
-        for ident in summary.identities[:_limit_value(20)]:
+        for ident in summary.identities[: _limit_value(20)]:
             vendor_id = getattr(ident, "vendor_id", "-")
             vendor_name = getattr(ident, "vendor_name", None)
             vendor_display = _format_identity_label(vendor_name, vendor_id, "Vendor")
 
             device_type = getattr(ident, "device_type", "-")
             device_type_name = getattr(ident, "device_type_name", None)
-            device_display = _format_identity_label(device_type_name, device_type, "DeviceType")
+            device_display = _format_identity_label(
+                device_type_name, device_type, "DeviceType"
+            )
 
             product_code = getattr(ident, "product_code", "-")
             product_name = getattr(ident, "product_code_name", None)
-            product_display = _format_identity_label(product_name, product_code, "Product")
+            product_display = _format_identity_label(
+                product_name, product_code, "Product"
+            )
 
-            rows.append([
-                str(getattr(ident, "src_ip", "?")),
-                vendor_display,
-                device_display,
-                product_display,
-                str(getattr(ident, "revision", "-")),
-                str(getattr(ident, "serial_number", "-")),
-                _truncate_text(str(getattr(ident, "product_name", "-")), 32),
-            ])
+            rows.append(
+                [
+                    str(getattr(ident, "src_ip", "?")),
+                    vendor_display,
+                    device_display,
+                    product_display,
+                    str(getattr(ident, "revision", "-")),
+                    str(getattr(ident, "serial_number", "-")),
+                    _truncate_text(str(getattr(ident, "product_name", "-")), 32),
+                ]
+            )
         lines.append(_format_table(rows))
 
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Artifacts & Observations"))
         rows = [[label("Type"), label("Detail"), label("Src"), label("Dst")]]
-        for artifact in summary.artifacts[:_limit_value(12)]:
+        for artifact in summary.artifacts[: _limit_value(12)]:
             kind = str(getattr(artifact, "kind", "artifact"))
             detail = str(getattr(artifact, "detail", ""))
             detail = " ".join(detail.split())
@@ -17807,7 +22719,7 @@ def render_enip_summary(summary: "ENIPAnalysis") -> str:
                             continue
                         unique.append(tok)
                         seen.add(tok)
-                    preview = ", ".join(unique[:_limit_value(4)])
+                    preview = ", ".join(unique[: _limit_value(4)])
                     extra = len(unique) - 4
                     if extra > 0:
                         preview = f"{preview} (+{extra})"
@@ -17832,14 +22744,24 @@ def render_enip_summary(summary: "ENIPAnalysis") -> str:
     lines.append(header("Anomalies & Threats"))
     if summary.anomalies:
         sev_map = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-        sorted_anoms = sorted(summary.anomalies, key=lambda x: sev_map.get(x.severity, 99))
-        for anomaly in sorted_anoms[:_limit_value(20)]:
+        sorted_anoms = sorted(
+            summary.anomalies, key=lambda x: sev_map.get(x.severity, 99)
+        )
+        for anomaly in sorted_anoms[: _limit_value(20)]:
             sev = getattr(anomaly, "severity", "INFO")
             sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
             if sev == "LOW":
                 sev_color = muted
-            lines.append(sev_color(f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"))
-            lines.append(muted(f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"))
+            lines.append(
+                sev_color(
+                    f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"
+                )
+            )
+            lines.append(
+                muted(
+                    f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"
+                )
+            )
     else:
         lines.append(muted("No ENIP anomalies detected."))
 
@@ -17875,7 +22797,9 @@ def _render_ot_protocol_summary(
     anomalies = getattr(summary, "anomalies", [])
     errors = getattr(summary, "errors", [])
 
-    def _summarize_buckets(buckets: list[_SizeBucketLike]) -> tuple[int, float, int, int]:
+    def _summarize_buckets(
+        buckets: list[_SizeBucketLike],
+    ) -> tuple[int, float, int, int]:
         total = sum(bucket.count for bucket in buckets)
         if not total:
             return 0, 0.0, 0, 0
@@ -17904,7 +22828,9 @@ def _render_ot_protocol_summary(
     lines.append(_format_kv("Total Bytes", str(total_bytes)))
     lines.append(_format_kv(f"{title} Bytes", str(protocol_bytes)))
     if protocol_packets:
-        lines.append(_format_kv("Avg Packet Size", f"{protocol_bytes / protocol_packets:.1f}"))
+        lines.append(
+            _format_kv("Avg Packet Size", f"{protocol_bytes / protocol_packets:.1f}")
+        )
 
     if packet_buckets or payload_buckets:
         lines.append(SUBSECTION_BAR)
@@ -17977,7 +22903,9 @@ def _render_ot_protocol_summary(
         rows = [["Service", "Top Endpoints"]]
         for service, _count in commands.most_common(_limit_value(10)):
             endpoints = service_endpoints.get(str(service), Counter())
-            top_eps = ", ".join(f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3)))
+            top_eps = ", ".join(
+                f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3))
+            )
             rows.append([str(service), top_eps or "-"])
         lines.append(_format_table(rows))
 
@@ -17985,23 +22913,28 @@ def _render_ot_protocol_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Artifacts & Observations"))
         rows = [["Type", "Detail", "Src", "Dst"]]
-        for artifact in artifacts[:_limit_value(16)]:
-            rows.append([
-                str(getattr(artifact, "kind", "artifact")),
-                str(getattr(artifact, "detail", ""))[:_limit_value(80)],
-                str(getattr(artifact, "src", "?")),
-                str(getattr(artifact, "dst", "?")),
-            ])
+        for artifact in artifacts[: _limit_value(16)]:
+            rows.append(
+                [
+                    str(getattr(artifact, "kind", "artifact")),
+                    str(getattr(artifact, "detail", ""))[: _limit_value(80)],
+                    str(getattr(artifact, "src", "?")),
+                    str(getattr(artifact, "dst", "?")),
+                ]
+            )
         lines.append(_format_table(rows))
 
         equipment_hits = [
-            artifact for artifact in artifacts
+            artifact
+            for artifact in artifacts
             if str(getattr(artifact, "kind", "")) == "equipment"
         ]
         if equipment_hits:
             lines.append(SUBSECTION_BAR)
             lines.append(header("Equipment Inventory"))
-            counts = Counter(str(getattr(artifact, "detail", "")) for artifact in equipment_hits)
+            counts = Counter(
+                str(getattr(artifact, "detail", "")) for artifact in equipment_hits
+            )
             endpoints: dict[str, Counter[str]] = defaultdict(Counter)
             for artifact in equipment_hits:
                 detail = str(getattr(artifact, "detail", ""))
@@ -18011,7 +22944,8 @@ def _render_ot_protocol_summary(
             rows = [["Equipment", "Count", "Top Endpoints"]]
             for detail, count in counts.most_common(_limit_value(12)):
                 top_eps = ", ".join(
-                    f"{ep} ({cnt})" for ep, cnt in endpoints[detail].most_common(_limit_value(3))
+                    f"{ep} ({cnt})"
+                    for ep, cnt in endpoints[detail].most_common(_limit_value(3))
                 )
                 rows.append([detail, str(count), top_eps or "-"])
             lines.append(_format_table(rows))
@@ -18019,11 +22953,19 @@ def _render_ot_protocol_summary(
     if anomalies:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Anomalies & Threat Indicators"))
-        for anomaly in anomalies[:_limit_value(16)]:
+        for anomaly in anomalies[: _limit_value(16)]:
             sev = getattr(anomaly, "severity", "INFO")
             sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
-            lines.append(sev_color(f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"))
-            lines.append(muted(f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"))
+            lines.append(
+                sev_color(
+                    f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"
+                )
+            )
+            lines.append(
+                muted(
+                    f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"
+                )
+            )
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
@@ -18054,7 +22996,9 @@ def render_opc_summary(summary: "IndustrialAnalysis") -> str:
 
 
 def render_ethercat_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("EtherCAT", summary, packet_label="EtherCAT Packets")
+    return _render_industrial_summary(
+        "EtherCAT", summary, packet_label="EtherCAT Packets"
+    )
 
 
 def render_fins_summary(summary: "IndustrialAnalysis") -> str:
@@ -18062,7 +23006,9 @@ def render_fins_summary(summary: "IndustrialAnalysis") -> str:
 
 
 def render_crimson_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("Crimson V3", summary, packet_label="Crimson Packets")
+    return _render_industrial_summary(
+        "Crimson V3", summary, packet_label="Crimson Packets"
+    )
 
 
 def render_pcworx_summary(summary: "IndustrialAnalysis") -> str:
@@ -18070,7 +23016,9 @@ def render_pcworx_summary(summary: "IndustrialAnalysis") -> str:
 
 
 def render_melsec_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("MELSEC-Q", summary, packet_label="MELSEC Packets")
+    return _render_industrial_summary(
+        "MELSEC-Q", summary, packet_label="MELSEC Packets"
+    )
 
 
 def render_cip_summary(summary: "CIPAnalysis") -> str:
@@ -18099,7 +23047,12 @@ def render_cip_summary(summary: "CIPAnalysis") -> str:
     lines.append(_format_kv("CIP Throughput", format_speed_bps(int(rate * 8))))
     lines.append(_format_kv("Requests", str(summary.requests)))
     lines.append(_format_kv("Responses", str(summary.responses)))
-    lines.append(_format_kv("Connected/Unconnected", f"{summary.connected_packets}/{summary.unconnected_packets}"))
+    lines.append(
+        _format_kv(
+            "Connected/Unconnected",
+            f"{summary.connected_packets}/{summary.unconnected_packets}",
+        )
+    )
     lines.append(_format_kv("I/O Packets (UDP/2222)", str(summary.io_packets)))
     lines.append(_format_kv("Unique Clients", str(len(summary.client_ips))))
     lines.append(_format_kv("Unique Servers", str(len(summary.server_ips))))
@@ -18193,14 +23146,18 @@ def render_cip_summary(summary: "CIPAnalysis") -> str:
 
         if summary.source_risky_commands:
             rows = [["Source", "High-Risk Commands"]]
-            for src, count in summary.source_risky_commands.most_common(_limit_value(10)):
+            for src, count in summary.source_risky_commands.most_common(
+                _limit_value(10)
+            ):
                 rows.append([str(src), str(count)])
             lines.append(label("Top Risky Command Sources"))
             lines.append(_format_table(rows))
 
         if summary.server_error_responses:
             rows = [["Server", "Failed Responses"]]
-            for server, count in summary.server_error_responses.most_common(_limit_value(10)):
+            for server, count in summary.server_error_responses.most_common(
+                _limit_value(10)
+            ):
                 rows.append([str(server), str(count)])
             lines.append(label("Error-Heavy Servers"))
             lines.append(_format_table(rows))
@@ -18249,7 +23206,9 @@ def render_cip_summary(summary: "CIPAnalysis") -> str:
 
         if summary.service_error_counts:
             rows = [["Service", "Failed Responses"]]
-            for service, count in summary.service_error_counts.most_common(_limit_value(12)):
+            for service, count in summary.service_error_counts.most_common(
+                _limit_value(12)
+            ):
                 rows.append([str(service), str(count)])
             lines.append(label("Error Responses by Service"))
             lines.append(_format_table(rows))
@@ -18258,27 +23217,39 @@ def render_cip_summary(summary: "CIPAnalysis") -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Artifacts & Observations"))
         rows = [["Type", "Detail", "Src", "Dst"]]
-        for artifact in summary.artifacts[:_limit_value(12)]:
-            rows.append([
-                str(getattr(artifact, "kind", "artifact")),
-                _truncate_text(str(getattr(artifact, "detail", "")), 80),
-                str(getattr(artifact, "src", "?")),
-                str(getattr(artifact, "dst", "?")),
-            ])
+        for artifact in summary.artifacts[: _limit_value(12)]:
+            rows.append(
+                [
+                    str(getattr(artifact, "kind", "artifact")),
+                    _truncate_text(str(getattr(artifact, "detail", "")), 80),
+                    str(getattr(artifact, "src", "?")),
+                    str(getattr(artifact, "dst", "?")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Anomalies & Threats"))
     if summary.anomalies:
         sev_map = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-        sorted_anoms = sorted(summary.anomalies, key=lambda x: sev_map.get(x.severity, 99))
-        for anomaly in sorted_anoms[:_limit_value(20)]:
+        sorted_anoms = sorted(
+            summary.anomalies, key=lambda x: sev_map.get(x.severity, 99)
+        )
+        for anomaly in sorted_anoms[: _limit_value(20)]:
             sev = getattr(anomaly, "severity", "INFO")
             sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
             if sev == "LOW":
                 sev_color = muted
-            lines.append(sev_color(f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"))
-            lines.append(muted(f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"))
+            lines.append(
+                sev_color(
+                    f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"
+                )
+            )
+            lines.append(
+                muted(
+                    f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"
+                )
+            )
     else:
         lines.append(muted("No CIP anomalies detected."))
 
@@ -18291,11 +23262,15 @@ def render_odesys_summary(summary: "IndustrialAnalysis") -> str:
 
 
 def render_niagara_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("Niagara Fox", summary, packet_label="Niagara Packets")
+    return _render_industrial_summary(
+        "Niagara Fox", summary, packet_label="Niagara Packets"
+    )
 
 
 def render_mms_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("IEC 61850 MMS", summary, packet_label="MMS Packets")
+    return _render_industrial_summary(
+        "IEC 61850 MMS", summary, packet_label="MMS Packets"
+    )
 
 
 def render_srtp_summary(summary: "IndustrialAnalysis") -> str:
@@ -18315,15 +23290,21 @@ def render_csp_summary(summary: "IndustrialAnalysis") -> str:
 
 
 def render_modicon_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("Modicon", summary, packet_label="Modicon Packets")
+    return _render_industrial_summary(
+        "Modicon", summary, packet_label="Modicon Packets"
+    )
 
 
 def render_yokogawa_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("Yokogawa Vnet/IP", summary, packet_label="Yokogawa Packets")
+    return _render_industrial_summary(
+        "Yokogawa Vnet/IP", summary, packet_label="Yokogawa Packets"
+    )
 
 
 def render_honeywell_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("Honeywell CDA", summary, packet_label="Honeywell Packets")
+    return _render_industrial_summary(
+        "Honeywell CDA", summary, packet_label="Honeywell Packets"
+    )
 
 
 def render_mqtt_summary(summary: "IndustrialAnalysis") -> str:
@@ -18339,11 +23320,15 @@ def render_hart_summary(summary: "IndustrialAnalysis") -> str:
 
 
 def render_prconos_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("ProConOS", summary, packet_label="ProConOS Packets")
+    return _render_industrial_summary(
+        "ProConOS", summary, packet_label="ProConOS Packets"
+    )
 
 
 def render_iccp_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("ICCP/TASE.2", summary, packet_label="ICCP Packets")
+    return _render_industrial_summary(
+        "ICCP/TASE.2", summary, packet_label="ICCP Packets"
+    )
 
 
 def render_pcapmeta_summary(summary: PcapMetaSummary) -> str:
@@ -18354,7 +23339,11 @@ def render_pcapmeta_summary(summary: PcapMetaSummary) -> str:
     lines.append(_format_kv("Snaplen", str(summary.snaplen or "-")))
     lines.append(_format_kv("Interfaces", str(summary.interface_count)))
     if summary.interface_names:
-        lines.append(_format_kv("Interface Names", ", ".join(summary.interface_names[:_limit_value(6)])))
+        lines.append(
+            _format_kv(
+                "Interface Names", ", ".join(summary.interface_names[: _limit_value(6)])
+            )
+        )
     if summary.dropcount is not None:
         lines.append(_format_kv("Drop Count", str(summary.dropcount)))
     if summary.errors:
@@ -18410,7 +23399,9 @@ def render_vpn_summary(summary: VpnSummary) -> str:
     return _finalize_output(lines)
 
 
-def render_routing_summary(summary: RoutingSummary, limit: int = 200, verbose: bool = False) -> str:
+def render_routing_summary(
+    summary: RoutingSummary, limit: int = 200, verbose: bool = False
+) -> str:
     limit = _apply_verbose_limit(limit)
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -18458,9 +23449,13 @@ def render_routing_summary(summary: RoutingSummary, limit: int = 200, verbose: b
         lines.append(SUBSECTION_BAR)
         lines.append(header("BGP Prefixes"))
         if summary.bgp_prefix_counts:
-            lines.append(muted(f"- Announced: {_format_counter(summary.bgp_prefix_counts, 8)}"))
+            lines.append(
+                muted(f"- Announced: {_format_counter(summary.bgp_prefix_counts, 8)}")
+            )
         if summary.bgp_withdraw_counts:
-            lines.append(muted(f"- Withdrawn: {_format_counter(summary.bgp_withdraw_counts, 8)}"))
+            lines.append(
+                muted(f"- Withdrawn: {_format_counter(summary.bgp_withdraw_counts, 8)}")
+            )
 
     if summary.bgp_next_hop_counts:
         lines.append(SUBSECTION_BAR)
@@ -18507,7 +23502,9 @@ def render_routing_summary(summary: RoutingSummary, limit: int = 200, verbose: b
     if summary.isis_reachability_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("IS-IS Reachability"))
-        for prefix, count in summary.isis_reachability_counts.most_common(_limit_value(8)):
+        for prefix, count in summary.isis_reachability_counts.most_common(
+            _limit_value(8)
+        ):
             lines.append(muted(f"- {prefix}: {count}"))
 
     if summary.isis_tlv_counts:
@@ -18557,7 +23554,7 @@ def render_routing_summary(summary: RoutingSummary, limit: int = 200, verbose: b
         lines.append(header("Sessions"))
         sessions = sorted(summary.sessions, key=lambda s: s.packets, reverse=True)
         if not verbose:
-            sessions = sessions[:_limit_value(12)]
+            sessions = sessions[: _limit_value(12)]
         for sess in sessions:
             ports = ""
             if sess.src_port or sess.dst_port:
@@ -18595,7 +23592,7 @@ def render_routing_summary(summary: RoutingSummary, limit: int = 200, verbose: b
     if detections:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Detections"))
-        for item in detections[:_limit_value(10)]:
+        for item in detections[: _limit_value(10)]:
             sev = str(item.get("severity", "info")).upper()
             summary_text = _redact_in_text(str(item.get("summary", "")))
             details = _redact_in_text(str(item.get("details", "")))
@@ -18609,18 +23606,24 @@ def render_routing_summary(summary: RoutingSummary, limit: int = 200, verbose: b
     if summary.insights:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Insights"))
-        for item in summary.insights[:_limit_value(8)]:
+        for item in summary.insights[: _limit_value(8)]:
             lines.append(muted(f"- {_redact_in_text(str(item))}"))
 
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Artifacts"))
-        artifact_rows = summary.artifacts if verbose else summary.artifacts[:_limit_value(20)]
+        artifact_rows = (
+            summary.artifacts if verbose else summary.artifacts[: _limit_value(20)]
+        )
         for item in artifact_rows:
             detail = _redact_in_text(str(getattr(item, "detail", item)))
             lines.append(muted(f"- {detail}"))
         if not verbose and len(summary.artifacts) > _limit_value(20):
-            lines.append(muted(f"... {len(summary.artifacts) - _limit_value(20)} additional artifacts"))
+            lines.append(
+                muted(
+                    f"... {len(summary.artifacts) - _limit_value(20)} additional artifacts"
+                )
+            )
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
@@ -18643,11 +23646,17 @@ def render_goose_summary(summary: GooseSummary, verbose: bool = False) -> str:
     if getattr(summary, "conf_revs", None):
         lines.append(_format_kv("confRev", _format_counter(summary.conf_revs, 5)))
     if getattr(summary, "num_entries", None):
-        lines.append(_format_kv("numDatSetEntries", _format_counter(summary.num_entries, 5)))
+        lines.append(
+            _format_kv("numDatSetEntries", _format_counter(summary.num_entries, 5))
+        )
     if getattr(summary, "all_data_lengths", None):
-        lines.append(_format_kv("allData Len", _format_counter(summary.all_data_lengths, 5)))
+        lines.append(
+            _format_kv("allData Len", _format_counter(summary.all_data_lengths, 5))
+        )
     if getattr(summary, "data_type_counts", None):
-        lines.append(_format_kv("Data Types", _format_counter(summary.data_type_counts, 6)))
+        lines.append(
+            _format_kv("Data Types", _format_counter(summary.data_type_counts, 6))
+        )
     if getattr(summary, "data_value_samples", None):
         samples = ", ".join(
             f"{_truncate_text(name, 40)}({count})"
@@ -18658,7 +23667,7 @@ def render_goose_summary(summary: GooseSummary, verbose: bool = False) -> str:
     detections = _filtered_detections(summary, verbose)
     if detections:
         lines.append(header("Detections"))
-        for item in detections[:_limit_value(6)]:
+        for item in detections[: _limit_value(6)]:
             sev = str(item.get("severity", "info")).upper()
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
@@ -18682,9 +23691,13 @@ def render_sv_summary(summary: SvSummary, verbose: bool = False) -> str:
     if getattr(summary, "conf_revs", None):
         lines.append(_format_kv("ConfRev", _format_counter(summary.conf_revs, 5)))
     if getattr(summary, "seq_data_lengths", None):
-        lines.append(_format_kv("SeqOfData Len", _format_counter(summary.seq_data_lengths, 5)))
+        lines.append(
+            _format_kv("SeqOfData Len", _format_counter(summary.seq_data_lengths, 5))
+        )
     if getattr(summary, "data_type_counts", None):
-        lines.append(_format_kv("SeqOfData Types", _format_counter(summary.data_type_counts, 5)))
+        lines.append(
+            _format_kv("SeqOfData Types", _format_counter(summary.data_type_counts, 5))
+        )
     if getattr(summary, "data_value_samples", None):
         samples = ", ".join(
             f"{_truncate_text(name, 40)}({count})"
@@ -18697,7 +23710,7 @@ def render_sv_summary(summary: SvSummary, verbose: bool = False) -> str:
     detections = _filtered_detections(summary, verbose)
     if detections:
         lines.append(header("Detections"))
-        for item in detections[:_limit_value(6)]:
+        for item in detections[: _limit_value(6)]:
             sev = str(item.get("severity", "info")).upper()
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
@@ -18719,9 +23732,13 @@ def render_lldp_dcp_summary(summary: LldpDcpSummary, verbose: bool = False) -> s
     lines.append(_format_kv("Port IDs", _format_counter(summary.port_ids, 5)))
     lines.append(_format_kv("DCP Frame IDs", _format_counter(summary.dcp_frame_ids, 5)))
     if getattr(summary, "dcp_services", None):
-        lines.append(_format_kv("DCP Services", _format_counter(summary.dcp_services, 5)))
+        lines.append(
+            _format_kv("DCP Services", _format_counter(summary.dcp_services, 5))
+        )
     if getattr(summary, "dcp_device_names", None):
-        lines.append(_format_kv("DCP Device Names", _format_counter(summary.dcp_device_names, 5)))
+        lines.append(
+            _format_kv("DCP Device Names", _format_counter(summary.dcp_device_names, 5))
+        )
     if getattr(summary, "dcp_ips", None):
         lines.append(_format_kv("DCP IPs", _format_counter(summary.dcp_ips, 5)))
     if getattr(summary, "artifacts", None):
@@ -18732,7 +23749,8 @@ def render_lldp_dcp_summary(summary: LldpDcpSummary, verbose: bool = False) -> s
         )
         if device_counts:
             preview = ", ".join(
-                f"{_truncate_text(detail, 60)}({count})" for detail, count in device_counts.most_common(5)
+                f"{_truncate_text(detail, 60)}({count})"
+                for detail, count in device_counts.most_common(5)
             )
             lines.append(_format_kv("Device Fingerprints", preview))
     if summary.errors:
@@ -18740,7 +23758,7 @@ def render_lldp_dcp_summary(summary: LldpDcpSummary, verbose: bool = False) -> s
     detections = _filtered_detections(summary, verbose)
     if detections:
         lines.append(header("Detections"))
-        for item in detections[:_limit_value(6)]:
+        for item in detections[: _limit_value(6)]:
             sev = str(item.get("severity", "info")).upper()
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
@@ -18759,13 +23777,17 @@ def render_ptp_summary(summary: PtpSummary, verbose: bool = False) -> str:
     lines.append(_format_kv("Message Types", _format_counter(summary.msg_types, 6)))
     if getattr(summary, "domain_numbers", None):
         lines.append(_format_kv("Domains", _format_counter(summary.domain_numbers, 6)))
-    lines.append(_format_kv("Top Sources", _format_counter(summary.src_macs or summary.src_ips, 5)))
+    lines.append(
+        _format_kv(
+            "Top Sources", _format_counter(summary.src_macs or summary.src_ips, 5)
+        )
+    )
     if summary.errors:
         lines.append(_format_kv("Errors", "; ".join(summary.errors)))
     detections = _filtered_detections(summary, verbose)
     if detections:
         lines.append(header("Detections"))
-        for item in detections[:_limit_value(6)]:
+        for item in detections[: _limit_value(6)]:
             sev = str(item.get("severity", "info")).upper()
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
@@ -18787,38 +23809,456 @@ def render_opc_classic_summary(summary: OpcClassicSummary) -> str:
     return _finalize_output(lines)
 
 
-def render_streams_summary(summary: StreamSummary) -> str:
+def render_streams_summary(summary: StreamSummary, verbose: bool = False) -> str:
     lines = [header("STREAM ANALYSIS")]
-    lines.append(_format_kv("Total Streams", str(summary.total_streams)))
-    if summary.top_streams:
-        lines.append(_format_kv("Top Stream IDs", ", ".join(summary.top_streams[:_limit_value(6)])))
-    if summary.lookup_stream_id:
-        lines.append(_format_kv("Lookup Stream ID", summary.lookup_stream_id))
-        lines.append(_format_kv("Lookup 5-Tuple", summary.lookup_tuple or "Not found"))
-    if summary.streams:
-        lines.append(header("Top Streams" if not summary.streams_full else "All Streams"))
-        ordered = sorted(summary.streams, key=lambda item: item.bytes, reverse=True)
-        top = ordered if summary.streams_full else ordered[:_limit_value(10)]
-        for rec in top:
-            tuple_text = f"TCP {rec.src}:{rec.src_port} <-> {rec.dst}:{rec.dst_port}"
-            client_gap_text = ",".join(f"@{g['at_seq']}+{g['gap_bytes']}" for g in rec.client_gaps) or "-"
-            server_gap_text = ",".join(f"@{g['at_seq']}+{g['gap_bytes']}" for g in rec.server_gaps) or "-"
-            gap_text = f"client_gaps={client_gap_text} server_gaps={server_gap_text}"
-            lines.append(f"{rec.stream_id} {tuple_text} {gap_text}")
+    selected_stream = None
     if summary.followed_stream_id:
-        lines.append(_format_kv("Followed Stream", summary.followed_stream_id))
-        if summary.followed_client_payload:
-            lines.append("Client Payload (first 256 bytes):")
-            lines.append(hexdump(summary.followed_client_payload[:_limit_value(256)]))
-        if summary.followed_server_payload:
-            lines.append("Server Payload (first 256 bytes):")
-            lines.append(hexdump(summary.followed_server_payload[:_limit_value(256)]))
+        selected_stream = next(
+            (
+                rec
+                for rec in summary.streams
+                if rec.stream_id == summary.followed_stream_id
+            ),
+            None,
+        )
+    complete_streams = [
+        rec for rec in summary.streams if not rec.client_gaps and not rec.server_gaps
+    ]
+    incomplete_streams = [
+        rec for rec in summary.streams if rec.client_gaps or rec.server_gaps
+    ]
+    all_ordered = sorted(
+        summary.streams,
+        key=lambda item: (
+            item.first_seen is None,
+            item.first_seen if item.first_seen is not None else 0.0,
+            item.last_seen if item.last_seen is not None else 0.0,
+            item.stream_id,
+        ),
+    )
+    lines.append(_format_kv("Total Streams", str(summary.total_streams)))
+    if summary.established_only and summary.observed_streams:
+        lines.append(_format_kv("Observed Streams", str(summary.observed_streams)))
+    if summary.stream_search:
+        lines.append(_format_kv("Search Term", summary.stream_search))
+    lines.append(_format_kv("Complete Streams", str(len(complete_streams))))
+    lines.append(_format_kv("Incomplete Streams", str(len(incomplete_streams))))
+    if (
+        summary.established_only
+        and summary.total_streams == 0
+        and summary.observed_streams > 0
+    ):
+        lines.append(
+            muted(
+                "No streams met -established (completed 3-way handshake). Run without -established to review attempted TCP connections."
+            )
+        )
+    if summary.followed_stream_id:
+        lines.append(_format_kv("Selected Stream ID", summary.followed_stream_id))
+        lines.append(_format_kv("Selected 5-Tuple", summary.lookup_tuple or "Not found"))
+    if selected_stream:
+        lines.append(header("Selected Stream"))
+        top = [selected_stream]
+    elif summary.streams:
+        lines.append(header("All Streams"))
+        top = all_ordered
+    else:
+        top = []
+
+    if top:
+        rows = [
+            [
+                "Stream ID",
+                "Flow",
+                "Start",
+                "Stop",
+                "Duration",
+                "Traffic",
+                "Hostnames",
+                "Service",
+                "Reassembly",
+            ]
+        ]
+
+        for rec in top:
+            flow = f"{rec.client_ip}:{rec.client_port} -> {rec.server_ip}:{rec.server_port}"
+            duration = None
+            if rec.first_seen is not None and rec.last_seen is not None:
+                duration = max(0.0, rec.last_seen - rec.first_seen)
+            traffic_text = f"{rec.packets} pkt / {format_bytes_as_mb(rec.bytes)}"
+            hostnames_text = f"{rec.client_ip} -> {rec.server_ip}"
+            service_text = COMMON_PORTS.get(
+                int(rec.server_port), f"TCP/{int(rec.server_port)}"
+            )
+            state_text = "complete"
+            if rec.client_gaps or rec.server_gaps:
+                state_text = f"gaps c={len(rec.client_gaps)} s={len(rec.server_gaps)}"
+            rows.append(
+                [
+                    rec.stream_id,
+                    flow,
+                    format_ts(rec.first_seen),
+                    format_ts(rec.last_seen),
+                    format_duration(duration),
+                    traffic_text,
+                    hostnames_text,
+                    service_text,
+                    state_text,
+                ]
+            )
+        lines.append(_format_table(rows))
+    if summary.followed_stream_id and not selected_stream:
+        lines.append(
+            muted(f"Selected stream ID not found: {summary.followed_stream_id}")
+        )
+    if selected_stream:
+        duration = None
+        if (
+            selected_stream.first_seen is not None
+            and selected_stream.last_seen is not None
+        ):
+            duration = max(0.0, selected_stream.last_seen - selected_stream.first_seen)
+        lines.append(header("Selected Stream Metadata"))
+        lines.append(
+            _format_kv(
+                "Endpoints",
+                f"{selected_stream.src}:{selected_stream.src_port} <-> {selected_stream.dst}:{selected_stream.dst_port}",
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Client -> Server",
+                f"{selected_stream.client_ip}:{selected_stream.client_port} -> {selected_stream.server_ip}:{selected_stream.server_port}",
+            )
+        )
+        lines.append(
+            _format_kv("First Seen", format_ts(selected_stream.first_seen))
+        )
+        lines.append(_format_kv("Last Seen", format_ts(selected_stream.last_seen)))
+        lines.append(_format_kv("Duration", format_duration(duration)))
+        lines.append(_format_kv("Packets", str(selected_stream.packets)))
+        lines.append(_format_kv("Bytes", str(selected_stream.bytes)))
+        lines.append(
+            _format_kv(
+                "First Packet Number",
+                str(selected_stream.first_packet_number)
+                if selected_stream.first_packet_number is not None
+                else "-",
+            )
+        )
+        lines.append(
+            _format_kv(
+                "SYN Packet Number",
+                str(selected_stream.syn_packet_number)
+                if selected_stream.syn_packet_number is not None
+                else "-",
+            )
+        )
+    if summary.followed_packets is not None:
+        lines.append(header("Selected Stream Packets"))
+        if summary.followed_packets:
+            rows = [
+                [
+                    "Pkt #",
+                    "Time",
+                    "Dir",
+                    "Source",
+                    "Destination",
+                    "Flags",
+                    "Seq",
+                    "Ack",
+                    "Win",
+                    "Frame Bytes",
+                    "Payload Bytes",
+                ]
+            ]
+            for item in summary.followed_packets:
+                rows.append(
+                    [
+                        str(item.packet_number),
+                        format_ts(item.ts),
+                        item.direction,
+                        f"{item.src}:{item.src_port}",
+                        f"{item.dst}:{item.dst_port}",
+                        item.flags,
+                        str(item.seq),
+                        str(item.ack),
+                        str(item.window),
+                        str(item.packet_bytes),
+                        str(item.payload_bytes),
+                    ]
+                )
+            lines.append(_format_table(rows))
+        else:
+            lines.append(muted("No packets matched the selected stream ID."))
+    if summary.followed_stream_id:
+        lines.append(header("Selected Stream Reassembly"))
+        lines.append(_format_kv("Stream ID", summary.followed_stream_id))
         if summary.followed_client_gaps:
-            gap_line = ", ".join(f"@{g['at_seq']}+{g['gap_bytes']}" for g in summary.followed_client_gaps[:_limit_value(6)])
-            lines.append(_format_kv("Client Gaps", gap_line))
+            lines.append(
+                _format_kv(
+                    "Client Gaps",
+                    ", ".join(
+                        f"seq {gap.get('at_seq', 0)} (+{gap.get('gap_bytes', 0)})"
+                        for gap in summary.followed_client_gaps
+                    ),
+                )
+            )
         if summary.followed_server_gaps:
-            gap_line = ", ".join(f"@{g['at_seq']}+{g['gap_bytes']}" for g in summary.followed_server_gaps[:_limit_value(6)])
-            lines.append(_format_kv("Server Gaps", gap_line))
+            lines.append(
+                _format_kv(
+                    "Server Gaps",
+                    ", ".join(
+                        f"seq {gap.get('at_seq', 0)} (+{gap.get('gap_bytes', 0)})"
+                        for gap in summary.followed_server_gaps
+                    ),
+                )
+            )
+        client_payload = summary.followed_client_payload or b""
+        server_payload = summary.followed_server_payload or b""
+        lines.append(f"Client Payload ({len(client_payload)} bytes):")
+        lines.append(hexdump(client_payload) if client_payload else "-")
+        lines.append(f"Server Payload ({len(server_payload)} bytes):")
+        lines.append(hexdump(server_payload) if server_payload else "-")
+    return _finalize_output(lines, show_truncation_note=False)
+
+
+def render_malware_summary(summary: MalwareSummary, verbose: bool = False) -> str:
+    lines = [header("MALWARE ANALYSIS")]
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("IP Packets", str(summary.analyzed_ip_packets)))
+    lines.append(_format_kv("Total Bytes", str(summary.total_bytes)))
+    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+    lines.append(_format_kv("Internal Hosts", str(summary.unique_internal_hosts)))
+    lines.append(_format_kv("External Hosts", str(summary.unique_external_hosts)))
+    lines.append(_format_kv("Protocols", _format_counter(summary.protocol_counts, 6)))
+    lines.append(_format_kv("Top Sources", _format_counter(summary.source_counts, 6)))
+    lines.append(
+        _format_kv("Top Destinations", _format_counter(summary.destination_counts, 6))
+    )
+    lines.append(
+        _format_kv("Top Ports", _format_counter(summary.destination_port_counts, 6))
+    )
+    lines.append(_format_kv("Downloads", str(len(summary.suspicious_downloads))))
+    lines.append(_format_kv("Uploads", str(len(summary.suspicious_uploads))))
+    lines.append(_format_kv("Exfil Signals", str(len(summary.suspicious_exfil))))
+    lines.append(_format_kv("Beacon Signals", str(len(summary.suspicious_beacons))))
+    lines.append(_format_kv("C2 Signals", str(len(summary.c2_signals))))
+    detections = _filtered_detections(summary, verbose)
+    if detections:
+        lines.append(header("Detections"))
+        for item in detections[: _limit_value(8)]:
+            sev = str(item.get("severity", "info")).upper()
+            summary_text = str(item.get("summary", ""))
+            details = str(item.get("details", ""))
+            lines.append(warn(f"[{sev}] {summary_text}"))
+            if details:
+                lines.append(muted(f"  {details}"))
+    if summary.discoveries:
+        lines.append(header("Findings"))
+        for item in summary.discoveries[: _limit_value(6)]:
+            title = str(item.get("title", "-"))
+            explanation = str(item.get("explanation", ""))
+            lines.append(muted(f"- {title}"))
+            if explanation:
+                lines.append(muted(f"  {_truncate_text(explanation, 120)}"))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors[: _limit_value(4)])))
+    return _finalize_output(lines)
+
+
+def render_email_summary(
+    summary: EmailSummary, verbose: bool = False, show_timeline: bool = False
+) -> str:
+    lines = [header("EMAIL ANALYSIS")]
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("Email Packets", str(summary.email_packets)))
+    lines.append(_format_kv("Messages", str(summary.total_messages)))
+    lines.append(_format_kv("Clients", str(summary.unique_clients)))
+    lines.append(_format_kv("Servers", str(summary.unique_servers)))
+    lines.append(_format_kv("Protocols", _format_counter(summary.protocol_counts, 6)))
+    lines.append(_format_kv("Server Ports", _format_counter(summary.server_ports, 6)))
+    lines.append(_format_kv("Top Senders", _format_counter(summary.from_counts, 6)))
+    lines.append(_format_kv("Top Recipients", _format_counter(summary.to_counts, 6)))
+    lines.append(_format_kv("Auth Methods", _format_counter(summary.auth_methods, 6)))
+    if summary.webmail_provider_counts:
+        lines.append(
+            _format_kv(
+                "Webmail Providers", _format_counter(summary.webmail_provider_counts, 6)
+            )
+        )
+    if summary.attachment_counts:
+        lines.append(
+            _format_kv("Attachments", _format_counter(summary.attachment_counts, 6))
+        )
+    detections = _filtered_detections(summary, verbose)
+    if detections:
+        lines.append(header("Detections"))
+        for item in detections[: _limit_value(8)]:
+            sev = str(item.get("severity", "info")).upper()
+            title = str(item.get("title") or item.get("summary") or "Detection")
+            details = str(item.get("details", ""))
+            lines.append(warn(f"[{sev}] {title}"))
+            if details:
+                lines.append(muted(f"  {details}"))
+    if show_timeline and summary.timeline_events:
+        lines.append(header("Timeline"))
+        rows = [["Time", "Protocol", "Direction", "Stage", "Detail"]]
+        for ev in summary.timeline_events[: _limit_value(12)]:
+            rows.append(
+                [
+                    format_ts(getattr(ev, "ts", None)),
+                    getattr(ev, "protocol", "-"),
+                    getattr(ev, "direction", "-"),
+                    getattr(ev, "stage", "-"),
+                    _truncate_text(getattr(ev, "detail", "-"), 64),
+                ]
+            )
+        lines.append(_format_table(rows))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors[: _limit_value(4)])))
+    return _finalize_output(lines)
+
+
+def render_qos_summary(summary: QosSummary, verbose: bool = False) -> str:
+    lines = [header("QOS ANALYSIS")]
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("IP Packets", str(summary.total_ip_packets)))
+    lines.append(_format_kv("QoS Packets", str(summary.qos_packets)))
+    lines.append(_format_kv("IP QoS", str(summary.ip_qos_packets)))
+    lines.append(_format_kv("Wireless QoS", str(summary.wireless_qos_packets)))
+    lines.append(_format_kv("High Priority", str(summary.high_priority_packets)))
+    lines.append(_format_kv("DSCP", _format_counter(summary.dscp_counts, 8)))
+    lines.append(_format_kv("ECN", _format_counter(summary.ecn_counts, 4)))
+    lines.append(_format_kv("VLAN PCP", _format_counter(summary.vlan_pcp_counts, 6)))
+    lines.append(_format_kv("WMM TID", _format_counter(summary.wmm_tid_counts, 8)))
+    lines.append(_format_kv("Top Sources", _format_counter(summary.src_counts, 6)))
+    lines.append(_format_kv("Top Destinations", _format_counter(summary.dst_counts, 6)))
+    detections = _filtered_detections(summary, verbose)
+    if detections:
+        lines.append(header("Detections"))
+        for item in detections[: _limit_value(8)]:
+            sev = str(item.get("severity", "info")).upper()
+            title = str(item.get("title") or item.get("summary") or "Detection")
+            details = str(item.get("details", ""))
+            lines.append(warn(f"[{sev}] {title}"))
+            if details:
+                lines.append(muted(f"  {details}"))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors[: _limit_value(4)])))
+    return _finalize_output(lines)
+
+
+def render_wlan_summary(summary: WlanSummary) -> str:
+    lines = [header("WLAN ANALYSIS")]
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("WLAN Packets", str(summary.wlan_packets)))
+    lines.append(
+        _format_kv(
+            "Mgmt/Data/Ctrl",
+            f"{summary.mgmt_packets}/{summary.data_packets}/{summary.control_packets}",
+        )
+    )
+    lines.append(_format_kv("Protected Data", str(summary.protected_data_packets)))
+    lines.append(_format_kv("Open Data", str(summary.open_data_packets)))
+    lines.append(_format_kv("EAPOL", str(summary.eapol_packets)))
+    lines.append(_format_kv("Networks", str(summary.unique_networks)))
+    lines.append(_format_kv("Clients", str(summary.unique_clients)))
+    lines.append(_format_kv("Security", _format_counter(summary.security_counts, 6)))
+    lines.append(_format_kv("PHY", _format_counter(summary.phy_counts, 6)))
+    lines.append(_format_kv("Top SSIDs", _format_counter(summary.ssid_counts, 8)))
+    lines.append(_format_kv("Channels", _format_counter(summary.channel_counts, 8)))
+    if summary.detections:
+        lines.append(header("Detections"))
+        for item in summary.detections[: _limit_value(8)]:
+            sev = str(item.get("severity", "info")).upper()
+            title = str(item.get("title") or item.get("summary") or "Detection")
+            details = str(item.get("details", ""))
+            lines.append(warn(f"[{sev}] {title}"))
+            if details:
+                lines.append(muted(f"  {details}"))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors[: _limit_value(4)])))
+    return _finalize_output(lines)
+
+
+def render_ssdp_summary(summary: SsdpSummary, verbose: bool = False) -> str:
+    lines = [header("SSDP ANALYSIS")]
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("UDP Packets", str(summary.udp_packets)))
+    lines.append(_format_kv("SSDP Packets", str(summary.ssdp_packets)))
+    lines.append(_format_kv("M-SEARCH", str(summary.msearch_count)))
+    lines.append(_format_kv("NOTIFY", str(summary.notify_count)))
+    lines.append(_format_kv("Responses", str(summary.response_count)))
+    lines.append(_format_kv("Top Clients", _format_counter(summary.client_counts, 6)))
+    lines.append(_format_kv("Top Servers", _format_counter(summary.server_counts, 6)))
+    lines.append(_format_kv("Targets", _format_counter(summary.target_port_counts, 6)))
+    lines.append(_format_kv("USN", _format_counter(summary.usn_counts, 6)))
+    lines.append(_format_kv("Location", _format_counter(summary.location_counts, 4)))
+    findings = (
+        summary.detections
+        if verbose
+        else [
+            d
+            for d in summary.detections
+            if str(d.get("severity", "")).lower() not in {"info", "informational"}
+        ]
+    )
+    if findings:
+        lines.append(header("Detections"))
+        for item in findings[: _limit_value(8)]:
+            sev = str(item.get("severity", "info")).upper()
+            title = str(item.get("title") or item.get("summary") or "Detection")
+            details = str(item.get("details", ""))
+            lines.append(warn(f"[{sev}] {title}"))
+            if details:
+                lines.append(muted(f"  {details}"))
+    if summary.anomalies:
+        lines.append(header("Anomalies"))
+        for item in summary.anomalies[: _limit_value(6)]:
+            lines.append(muted(f"- {_truncate_text(str(item), 120)}"))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors[: _limit_value(4)])))
+    return _finalize_output(lines)
+
+
+def render_scan_summary(summary: ScanSummary, verbose: bool = False) -> str:
+    lines = [header("SCAN ANALYSIS")]
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("Relevant Packets", str(summary.relevant_packets)))
+    lines.append(_format_kv("Scanner Count", str(summary.scanner_count)))
+    if summary.scan_sources:
+        rows = [["Scanner", "Type", "Targets", "Ports", "SYN", "Software", "Top Ports"]]
+        for item in summary.scan_sources[: _limit_value(12)]:
+            rows.append(
+                [
+                    item.scanner_ip,
+                    item.scan_type,
+                    str(item.unique_targets),
+                    str(item.unique_ports),
+                    str(item.syn_packets),
+                    item.scanner_software_guess,
+                    ",".join(str(p) for p in item.top_ports[:6]) or "-",
+                ]
+            )
+        lines.append(_format_table(rows))
+    if verbose and summary.scan_sources:
+        lines.append(header("Top Targets"))
+        rows = [["Scanner", "Target", "Open Ports", "Brute Force Attempts"]]
+        for src in summary.scan_sources[: _limit_value(5)]:
+            for tgt in src.targets[: _limit_value(4)]:
+                rows.append(
+                    [
+                        src.scanner_ip,
+                        tgt.target_ip,
+                        ",".join(str(p) for p in tgt.open_ports[:6]) or "-",
+                        str(tgt.brute_force_attempts),
+                    ]
+                )
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+    if summary.errors:
+        lines.append(_format_kv("Errors", "; ".join(summary.errors[: _limit_value(4)])))
     return _finalize_output(lines)
 
 
@@ -18831,16 +24271,27 @@ def render_ctf_summary(summary: CtfSummary) -> str:
     lines.append(_format_kv("Packets", str(summary.total_packets)))
     lines.append(_format_kv("Hits", str(len(summary.hits))))
     lines.append(_format_kv("Decoded Hits", str(len(summary.decoded_hits))))
-    lines.append(_format_kv("Candidate Findings", str(len(getattr(summary, "candidate_findings", []) or []))))
+    lines.append(
+        _format_kv(
+            "Candidate Findings",
+            str(len(getattr(summary, "candidate_findings", []) or [])),
+        )
+    )
     lines.append(_format_kv("Start", format_ts(getattr(summary, "first_seen", None))))
     lines.append(_format_kv("End", format_ts(getattr(summary, "last_seen", None))))
-    lines.append(_format_kv("Duration", format_duration(getattr(summary, "duration_seconds", None))))
+    lines.append(
+        _format_kv(
+            "Duration", format_duration(getattr(summary, "duration_seconds", None))
+        )
+    )
 
     def _ctf_verdict() -> tuple[str, str, list[str], int]:
         score = 0
         reasons: list[str] = []
         high_conf = int(getattr(summary, "confidence_counts", Counter()).get("high", 0))
-        medium_conf = int(getattr(summary, "confidence_counts", Counter()).get("medium", 0))
+        medium_conf = int(
+            getattr(summary, "confidence_counts", Counter()).get("medium", 0)
+        )
         checks = getattr(summary, "deterministic_checks", {}) or {}
 
         if high_conf:
@@ -18848,7 +24299,9 @@ def render_ctf_summary(summary: CtfSummary) -> str:
             reasons.append(f"High-confidence CTF candidates observed ({high_conf})")
         if medium_conf >= 2:
             score += 1
-            reasons.append(f"Multiple medium-confidence candidates observed ({medium_conf})")
+            reasons.append(
+                f"Multiple medium-confidence candidates observed ({medium_conf})"
+            )
         if checks.get("decoded_wrapper_pattern_present"):
             score += 2
             reasons.append("Decoded wrapper-pattern matches observed")
@@ -18890,25 +24343,27 @@ def render_ctf_summary(summary: CtfSummary) -> str:
         lines.append(ok(verdict))
     lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
     lines.append(muted("Reasons:"))
-    for reason in verdict_reasons[:_limit_value(8)]:
+    for reason in verdict_reasons[: _limit_value(8)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
     if summary.token_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Tokens"))
-        lines.append(_format_kv("Token Frequency", _format_counter(summary.token_counts, 10)))
+        lines.append(
+            _format_kv("Token Frequency", _format_counter(summary.token_counts, 10))
+        )
 
     if summary.decoded_hits:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Decoded Wrapper Hits"))
-        for item in summary.decoded_hits[:_limit_value(8)]:
+        for item in summary.decoded_hits[: _limit_value(8)]:
             lines.append(muted(f"- {_redact_in_text(item)}"))
 
     if getattr(summary, "file_hints", None):
         if summary.file_hints:
             lines.append(SUBSECTION_BAR)
             lines.append(header("Challenge File Hints"))
-            for item in summary.file_hints[:_limit_value(10)]:
+            for item in summary.file_hints[: _limit_value(10)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
 
     lines.append(SUBSECTION_BAR)
@@ -18931,17 +24386,47 @@ def render_ctf_summary(summary: CtfSummary) -> str:
         lines.append(label(label_text))
         if evidence_items:
             if key == "likely_secret_not_flag":
-                lines.append(ok(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-                matrix_rows.append([label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"])
+                lines.append(
+                    ok(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
+                matrix_rows.append(
+                    [label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"]
+                )
             else:
-                lines.append(warn(f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"))
-                risk = "High" if key in {"flag_wrapper_pattern_present", "decoded_wrapper_pattern_present", "stream_reassembled_match"} else "Medium"
-                conf_level = "High" if key in {"decoded_wrapper_pattern_present", "multi_source_corroboration"} else "Medium"
-                matrix_rows.append([label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"])
-            for item in evidence_items[:_limit_value(8)]:
+                lines.append(
+                    warn(
+                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                    )
+                )
+                risk = (
+                    "High"
+                    if key
+                    in {
+                        "flag_wrapper_pattern_present",
+                        "decoded_wrapper_pattern_present",
+                        "stream_reassembled_match",
+                    }
+                    else "Medium"
+                )
+                conf_level = (
+                    "High"
+                    if key
+                    in {"decoded_wrapper_pattern_present", "multi_source_corroboration"}
+                    else "Medium"
+                )
+                matrix_rows.append(
+                    [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
+                )
+            for item in evidence_items[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
         else:
-            lines.append(ok(f"No, there is no strong evidence for {label_text.lower()} in this capture."))
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
             matrix_rows.append([label_text, "None", "Low", "No matching detections"])
 
     lines.append(SUBSECTION_BAR)
@@ -18952,18 +24437,33 @@ def render_ctf_summary(summary: CtfSummary) -> str:
     if findings:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Candidate Provenance"))
-        rows = [["Candidate", "Score", "Confidence", "Decode", "Source", "Flow", "Packet", "Time"]]
-        for item in findings[:_limit_value(15)]:
-            rows.append([
-                _truncate_text(_redact_in_text(str(item.get("candidate", "-"))), 36),
-                str(item.get("score", "-")),
-                str(item.get("confidence", "-")),
-                str(item.get("decode_chain", "raw")),
-                str(item.get("source", "-")),
-                f"{item.get('src', '-')}->{item.get('dst', '-')}",
-                str(item.get("packet", "-")),
-                format_ts(item.get("ts")),
-            ])
+        rows = [
+            [
+                "Candidate",
+                "Score",
+                "Confidence",
+                "Decode",
+                "Source",
+                "Flow",
+                "Packet",
+                "Time",
+            ]
+        ]
+        for item in findings[: _limit_value(15)]:
+            rows.append(
+                [
+                    _truncate_text(
+                        _redact_in_text(str(item.get("candidate", "-"))), 36
+                    ),
+                    str(item.get("score", "-")),
+                    str(item.get("confidence", "-")),
+                    str(item.get("decode_chain", "raw")),
+                    str(item.get("source", "-")),
+                    f"{item.get('src', '-')}->{item.get('dst', '-')}",
+                    str(item.get("packet", "-")),
+                    format_ts(item.get("ts")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     timeline = list(getattr(summary, "timeline", []) or [])
@@ -18971,15 +24471,19 @@ def render_ctf_summary(summary: CtfSummary) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Timeline"))
         rows = [["Time", "Event", "Candidate", "Confidence", "Flow", "Packet"]]
-        for item in timeline[:_limit_value(15)]:
-            rows.append([
-                format_ts(item.get("ts")),
-                str(item.get("event", "-")),
-                _truncate_text(_redact_in_text(str(item.get("candidate", "-"))), 42),
-                str(item.get("confidence", "-")),
-                f"{item.get('src', '-')}->{item.get('dst', '-')}",
-                str(item.get("packet", "-")),
-            ])
+        for item in timeline[: _limit_value(15)]:
+            rows.append(
+                [
+                    format_ts(item.get("ts")),
+                    str(item.get("event", "-")),
+                    _truncate_text(
+                        _redact_in_text(str(item.get("candidate", "-"))), 42
+                    ),
+                    str(item.get("confidence", "-")),
+                    f"{item.get('src', '-')}->{item.get('dst', '-')}",
+                    str(item.get("packet", "-")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     pivots = list(getattr(summary, "hunting_pivots", []) or [])
@@ -18987,22 +24491,26 @@ def render_ctf_summary(summary: CtfSummary) -> str:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Actionable Hunting Pivots"))
         rows = [["Packet", "Source", "Destination", "Proto", "Candidate", "Decode"]]
-        for item in pivots[:_limit_value(15)]:
-            rows.append([
-                str(item.get("packet", "-")),
-                str(item.get("src", "-")),
-                str(item.get("dst", "-")),
-                str(item.get("protocol", "-")),
-                _truncate_text(_redact_in_text(str(item.get("candidate", "-"))), 42),
-                str(item.get("decode_chain", "raw")),
-            ])
+        for item in pivots[: _limit_value(15)]:
+            rows.append(
+                [
+                    str(item.get("packet", "-")),
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("protocol", "-")),
+                    _truncate_text(
+                        _redact_in_text(str(item.get("candidate", "-"))), 42
+                    ),
+                    str(item.get("decode_chain", "raw")),
+                ]
+            )
         lines.append(_format_table(rows))
 
     false_context = list(getattr(summary, "false_positive_context", []) or [])
     if false_context:
         lines.append(SUBSECTION_BAR)
         lines.append(header("False-Positive Context"))
-        for item in false_context[:_limit_value(8)]:
+        for item in false_context[: _limit_value(8)]:
             lines.append(muted(f"- {_redact_in_text(item)}"))
 
     lines.append(SECTION_BAR)
@@ -19016,7 +24524,9 @@ def render_ioc_summary(summary: IocSummary) -> str:
     lines.append(_format_kv("Hash Hits", _format_counter(summary.hash_hits, 6)))
     if getattr(summary, "source_counts", None):
         if summary.source_counts:
-            lines.append(_format_kv("Sources", _format_counter(summary.source_counts, 6)))
+            lines.append(
+                _format_kv("Sources", _format_counter(summary.source_counts, 6))
+            )
     if getattr(summary, "tag_counts", None):
         if summary.tag_counts:
             lines.append(_format_kv("Tags", _format_counter(summary.tag_counts, 6)))
@@ -19034,69 +24544,153 @@ def render_obfuscation_summary(summary) -> str:
     lines = [header("OBFUSCATION / TUNNELING")]
     lines.append(_format_kv("Packets", str(summary.total_packets)))
     lines.append(_format_kv("Payload Bytes", str(summary.total_payload_bytes)))
-    lines.append(_format_kv("Suspicious Packets", str(getattr(summary, "suspicious_packets", 0))))
-    lines.append(_format_kv("Suspicious Bytes", str(getattr(summary, "suspicious_payload_bytes", 0))))
+    lines.append(
+        _format_kv("Suspicious Packets", str(getattr(summary, "suspicious_packets", 0)))
+    )
+    lines.append(
+        _format_kv(
+            "Suspicious Bytes", str(getattr(summary, "suspicious_payload_bytes", 0))
+        )
+    )
     if getattr(summary, "total_payload_bytes", 0):
-        suspicious_share = (getattr(summary, "suspicious_payload_bytes", 0) / summary.total_payload_bytes) * 100.0
+        suspicious_share = (
+            getattr(summary, "suspicious_payload_bytes", 0)
+            / summary.total_payload_bytes
+        ) * 100.0
         lines.append(_format_kv("Suspicious Byte Share", f"{suspicious_share:.1f}%"))
     lines.append(_format_kv("Start", format_ts(getattr(summary, "first_seen", None))))
     lines.append(_format_kv("End", format_ts(getattr(summary, "last_seen", None))))
-    lines.append(_format_kv("Duration", format_duration(getattr(summary, "duration_seconds", None))))
+    lines.append(
+        _format_kv(
+            "Duration", format_duration(getattr(summary, "duration_seconds", None))
+        )
+    )
     duration = getattr(summary, "duration_seconds", None)
-    if isinstance(duration, (int, float)) and duration > 0 and summary.total_payload_bytes:
-        lines.append(_format_kv("Observed Throughput", format_speed_bps(int((summary.total_payload_bytes * 8) / duration))))
-    if isinstance(duration, (int, float)) and duration > 0 and getattr(summary, "suspicious_payload_bytes", 0):
-        lines.append(_format_kv("Suspicious Throughput", format_speed_bps(int((summary.suspicious_payload_bytes * 8) / duration))))
-    lines.append(_format_kv("Sessions (Susp/Total)", f"{getattr(summary, 'suspicious_sessions', 0)}/{getattr(summary, 'total_sessions', 0)}"))
+    if (
+        isinstance(duration, (int, float))
+        and duration > 0
+        and summary.total_payload_bytes
+    ):
+        lines.append(
+            _format_kv(
+                "Observed Throughput",
+                format_speed_bps(int((summary.total_payload_bytes * 8) / duration)),
+            )
+        )
+    if (
+        isinstance(duration, (int, float))
+        and duration > 0
+        and getattr(summary, "suspicious_payload_bytes", 0)
+    ):
+        lines.append(
+            _format_kv(
+                "Suspicious Throughput",
+                format_speed_bps(
+                    int((summary.suspicious_payload_bytes * 8) / duration)
+                ),
+            )
+        )
+    lines.append(
+        _format_kv(
+            "Sessions (Susp/Total)",
+            f"{getattr(summary, 'suspicious_sessions', 0)}/{getattr(summary, 'total_sessions', 0)}",
+        )
+    )
     lines.append(_format_kv("High Entropy Hits", str(len(summary.high_entropy_hits))))
     lines.append(_format_kv("Base64 Hits", str(len(summary.base64_hits))))
     lines.append(_format_kv("Hex Hits", str(len(summary.hex_hits))))
     if getattr(summary, "hit_kind_counts", None):
         if summary.hit_kind_counts:
-            lines.append(_format_kv("Hit Kinds", _format_counter(summary.hit_kind_counts, 6)))
+            lines.append(
+                _format_kv("Hit Kinds", _format_counter(summary.hit_kind_counts, 6))
+            )
     if summary.source_counts:
-        lines.append(_format_kv("Top Sources", _format_counter(summary.source_counts, 6)))
+        lines.append(
+            _format_kv("Top Sources", _format_counter(summary.source_counts, 6))
+        )
     if summary.destination_counts:
-        lines.append(_format_kv("Top Destinations", _format_counter(summary.destination_counts, 6)))
+        lines.append(
+            _format_kv(
+                "Top Destinations", _format_counter(summary.destination_counts, 6)
+            )
+        )
     if getattr(summary, "protocol_counts", None):
         if summary.protocol_counts:
-            lines.append(_format_kv("Suspicious Protocols", _format_counter(summary.protocol_counts, 6)))
+            lines.append(
+                _format_kv(
+                    "Suspicious Protocols", _format_counter(summary.protocol_counts, 6)
+                )
+            )
     if getattr(summary, "port_counts", None):
         if summary.port_counts:
-            lines.append(_format_kv("Suspicious Ports", _format_counter(summary.port_counts, 6)))
+            lines.append(
+                _format_kv("Suspicious Ports", _format_counter(summary.port_counts, 6))
+            )
     if getattr(summary, "ioc_counts", None):
         if summary.ioc_counts:
-            lines.append(_format_kv("Recovered IOCs", _format_counter(summary.ioc_counts, 8)))
+            lines.append(
+                _format_kv("Recovered IOCs", _format_counter(summary.ioc_counts, 8))
+            )
     if getattr(summary, "attack_counts", None):
         if summary.attack_counts:
-            lines.append(_format_kv("Attack Signals", _format_counter(summary.attack_counts, 8)))
+            lines.append(
+                _format_kv("Attack Signals", _format_counter(summary.attack_counts, 8))
+            )
 
     session_lookup: dict[str, object] = {}
     if getattr(summary, "session_stats", None):
         session_lookup = {str(item.flow_id): item for item in summary.session_stats}
 
     if getattr(summary, "session_stats", None):
-        suspicious_sessions = [item for item in summary.session_stats if getattr(item, "suspicious_packets", 0)]
+        suspicious_sessions = [
+            item
+            for item in summary.session_stats
+            if getattr(item, "suspicious_packets", 0)
+        ]
         if suspicious_sessions:
             lines.append(header("Suspicious Sessions"))
-            rows = [["Session", "Hits(H/B/X)", "Packets", "Payload", "Susp Bytes", "Timerange", "Duration"]]
-            for item in suspicious_sessions[:_limit_value(8)]:
+            rows = [
+                [
+                    "Session",
+                    "Hits(H/B/X)",
+                    "Packets",
+                    "Payload",
+                    "Susp Bytes",
+                    "Timerange",
+                    "Duration",
+                ]
+            ]
+            for item in suspicious_sessions[: _limit_value(8)]:
                 timerange = f"{format_ts(getattr(item, 'first_seen', None))} -> {format_ts(getattr(item, 'last_seen', None))}"
-                rows.append([
-                    getattr(item, "flow_id", "-"),
-                    f"{getattr(item, 'high_entropy_hits', 0)}/{getattr(item, 'base64_hits', 0)}/{getattr(item, 'hex_hits', 0)}",
-                    str(getattr(item, "packets", 0)),
-                    str(getattr(item, "payload_bytes", 0)),
-                    str(getattr(item, "suspicious_payload_bytes", 0)),
-                    timerange,
-                    format_duration(getattr(item, "duration_seconds", None)),
-                ])
+                rows.append(
+                    [
+                        getattr(item, "flow_id", "-"),
+                        f"{getattr(item, 'high_entropy_hits', 0)}/{getattr(item, 'base64_hits', 0)}/{getattr(item, 'hex_hits', 0)}",
+                        str(getattr(item, "packets", 0)),
+                        str(getattr(item, "payload_bytes", 0)),
+                        str(getattr(item, "suspicious_payload_bytes", 0)),
+                        timerange,
+                        format_duration(getattr(item, "duration_seconds", None)),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if summary.high_entropy_hits:
         lines.append(header("High-Entropy Samples"))
-        rows = [["Time", "Session", "Len", "Entropy", "Print", "Timerange", "Session Stats", "Traffic", "Reasoning"]]
-        for hit in summary.high_entropy_hits[:_limit_value(8)]:
+        rows = [
+            [
+                "Time",
+                "Session",
+                "Len",
+                "Entropy",
+                "Print",
+                "Timerange",
+                "Session Stats",
+                "Traffic",
+                "Reasoning",
+            ]
+        ]
+        for hit in summary.high_entropy_hits[: _limit_value(8)]:
             session = session_lookup.get(str(getattr(hit, "flow_id", "")))
             timerange = "-"
             session_stats = "-"
@@ -19109,25 +24703,33 @@ def render_obfuscation_summary(summary) -> str:
                     f"hits={getattr(session, 'high_entropy_hits', 0)}/{getattr(session, 'base64_hits', 0)}/{getattr(session, 'hex_hits', 0)}"
                 )
                 payload_bytes = int(getattr(session, "payload_bytes", 0) or 0)
-                suspicious_bytes = int(getattr(session, "suspicious_payload_bytes", 0) or 0)
+                suspicious_bytes = int(
+                    getattr(session, "suspicious_payload_bytes", 0) or 0
+                )
                 if payload_bytes > 0:
                     traffic = f"{suspicious_bytes}/{payload_bytes} ({(suspicious_bytes / payload_bytes) * 100.0:.1f}%)"
                 else:
                     traffic = f"{suspicious_bytes}/0"
-            rows.append([
-                format_ts(getattr(hit, "ts", None)),
-                getattr(hit, "flow_id", f"{hit.src}:{hit.src_port}->{hit.dst}:{hit.dst_port}"),
-                str(hit.length),
-                f"{hit.entropy:.2f}",
-                f"{getattr(hit, 'printable_ratio', 0.0):.2f}",
-                timerange,
-                session_stats,
-                traffic,
-                _truncate_text(getattr(hit, "reasoning", "-"), 96),
-            ])
+            rows.append(
+                [
+                    format_ts(getattr(hit, "ts", None)),
+                    getattr(
+                        hit,
+                        "flow_id",
+                        f"{hit.src}:{hit.src_port}->{hit.dst}:{hit.dst_port}",
+                    ),
+                    str(hit.length),
+                    f"{hit.entropy:.2f}",
+                    f"{getattr(hit, 'printable_ratio', 0.0):.2f}",
+                    timerange,
+                    session_stats,
+                    traffic,
+                    _truncate_text(getattr(hit, "reasoning", "-"), 96),
+                ]
+            )
         lines.append(_format_table(rows))
         lines.append(muted("Evidence:"))
-        for hit in summary.high_entropy_hits[:_limit_value(6)]:
+        for hit in summary.high_entropy_hits[: _limit_value(6)]:
             lines.append(
                 muted(
                     f"pkt={getattr(hit, 'packet_index', '-')} "
@@ -19140,22 +24742,34 @@ def render_obfuscation_summary(summary) -> str:
     if getattr(summary, "artifacts", None):
         if summary.artifacts:
             lines.append(header("Recovered Artifacts"))
-            rows = [["Type", "Value", "Source", "Session", "Time", "Confidence", "Reasoning"]]
-            for item in summary.artifacts[:_limit_value(12)]:
-                rows.append([
-                    getattr(item, "kind", "-"),
-                    _truncate_text(str(getattr(item, "value", "-")), 56),
-                    getattr(item, "source_kind", "-"),
-                    _truncate_text(getattr(item, "flow_id", "-"), 44),
-                    format_ts(getattr(item, "ts", None)),
-                    getattr(item, "confidence", "-"),
-                    _truncate_text(getattr(item, "reasoning", "-"), 84),
-                ])
+            rows = [
+                [
+                    "Type",
+                    "Value",
+                    "Source",
+                    "Session",
+                    "Time",
+                    "Confidence",
+                    "Reasoning",
+                ]
+            ]
+            for item in summary.artifacts[: _limit_value(12)]:
+                rows.append(
+                    [
+                        getattr(item, "kind", "-"),
+                        _truncate_text(str(getattr(item, "value", "-")), 56),
+                        getattr(item, "source_kind", "-"),
+                        _truncate_text(getattr(item, "flow_id", "-"), 44),
+                        format_ts(getattr(item, "ts", None)),
+                        getattr(item, "confidence", "-"),
+                        _truncate_text(getattr(item, "reasoning", "-"), 84),
+                    ]
+                )
             lines.append(_format_table(rows))
 
     if summary.base64_hits:
         lines.append(header("Base64 Samples"))
-        for hit in summary.base64_hits[:_limit_value(4)]:
+        for hit in summary.base64_hits[: _limit_value(4)]:
             lines.append(
                 muted(
                     f"{format_ts(getattr(hit, 'ts', None))} "
@@ -19167,7 +24781,7 @@ def render_obfuscation_summary(summary) -> str:
             )
     if summary.hex_hits:
         lines.append(header("Hex Samples"))
-        for hit in summary.hex_hits[:_limit_value(4)]:
+        for hit in summary.hex_hits[: _limit_value(4)]:
             lines.append(
                 muted(
                     f"{format_ts(getattr(hit, 'ts', None))} "
@@ -19181,7 +24795,6 @@ def render_obfuscation_summary(summary) -> str:
 
 
 def render_control_loop_summary(summary) -> str:
-
     if not summary:
         return ""
     lines = [header("CONTROL LOOP ANALYSIS")]
@@ -19190,30 +24803,37 @@ def render_control_loop_summary(summary) -> str:
     if summary.kind_counts:
         lines.append(_format_kv("Findings", _format_counter(summary.kind_counts, 6)))
     if summary.source_counts:
-        lines.append(_format_kv("Top Sources", _format_counter(summary.source_counts, 6)))
+        lines.append(
+            _format_kv("Top Sources", _format_counter(summary.source_counts, 6))
+        )
     if summary.destination_counts:
-        lines.append(_format_kv("Top Destinations", _format_counter(summary.destination_counts, 6)))
+        lines.append(
+            _format_kv(
+                "Top Destinations", _format_counter(summary.destination_counts, 6)
+            )
+        )
     if summary.errors:
         lines.append(_format_kv("Errors", "; ".join(summary.errors)))
     if summary.findings:
         rows = [["Proto", "Target", "Kind", "Delta", "Src", "Dst"]]
-        for item in summary.findings[:_limit_value(10)]:
+        for item in summary.findings[: _limit_value(10)]:
             delta = item.delta
             delta_text = f"{delta:.1f}" if isinstance(delta, (int, float)) else "-"
-            rows.append([
-                item.protocol,
-                item.target,
-                item.kind,
-                delta_text,
-                item.src or "-",
-                item.dst or "-",
-            ])
+            rows.append(
+                [
+                    item.protocol,
+                    item.target,
+                    item.kind,
+                    delta_text,
+                    item.src or "-",
+                    item.dst or "-",
+                ]
+            )
         lines.append(_format_table(rows))
     return _finalize_output(lines)
 
 
 def render_safety_summary(summary) -> str:
-
     if not summary:
         return ""
     lines = [header("SAFETY SYSTEMS")]
@@ -19222,26 +24842,33 @@ def render_safety_summary(summary) -> str:
     if summary.service_counts:
         lines.append(_format_kv("Services", _format_counter(summary.service_counts, 6)))
     if summary.source_counts:
-        lines.append(_format_kv("Top Sources", _format_counter(summary.source_counts, 6)))
+        lines.append(
+            _format_kv("Top Sources", _format_counter(summary.source_counts, 6))
+        )
     if summary.destination_counts:
-        lines.append(_format_kv("Top Destinations", _format_counter(summary.destination_counts, 6)))
+        lines.append(
+            _format_kv(
+                "Top Destinations", _format_counter(summary.destination_counts, 6)
+            )
+        )
     if summary.errors:
         lines.append(_format_kv("Errors", "; ".join(summary.errors)))
     if summary.hits:
         rows = [["Proto", "Service", "Src", "Dst"]]
-        for hit in summary.hits[:_limit_value(10)]:
-            rows.append([
-                hit.protocol,
-                hit.service,
-                f"{hit.src}:{hit.src_port}",
-                f"{hit.dst}:{hit.dst_port}",
-            ])
+        for hit in summary.hits[: _limit_value(10)]:
+            rows.append(
+                [
+                    hit.protocol,
+                    hit.service,
+                    f"{hit.src}:{hit.src_port}",
+                    f"{hit.dst}:{hit.dst_port}",
+                ]
+            )
         lines.append(_format_table(rows))
     return _finalize_output(lines)
 
 
 def render_carve_summary(summary) -> str:
-
     if not summary:
         return ""
     lines = [header("STREAM CARVING")]
@@ -19253,21 +24880,24 @@ def render_carve_summary(summary) -> str:
         lines.append(_format_kv("Errors", "; ".join(summary.errors)))
     if summary.hits:
         rows = [["Stream", "Dir", "Type", "Len", "Src", "Dst"]]
-        for hit in summary.hits[:_limit_value(10)]:
-            rows.append([
-                hit.stream_id,
-                hit.direction,
-                hit.file_type,
-                str(hit.length),
-                f"{hit.src}:{hit.src_port}",
-                f"{hit.dst}:{hit.dst_port}",
-            ])
+        for hit in summary.hits[: _limit_value(10)]:
+            rows.append(
+                [
+                    hit.stream_id,
+                    hit.direction,
+                    hit.file_type,
+                    str(hit.length),
+                    f"{hit.src}:{hit.src_port}",
+                    f"{hit.dst}:{hit.dst_port}",
+                ]
+            )
         lines.append(_format_table(rows))
     return _finalize_output(lines)
 
 
-def render_correlation_summary(summary, min_count: int = 2, verbose: bool = False) -> str:
-
+def render_correlation_summary(
+    summary, min_count: int = 2, verbose: bool = False
+) -> str:
     if not summary:
         return ""
     lines = [header("CORRELATION (MULTI-PCAP)")]
@@ -19295,13 +24925,12 @@ def render_correlation_summary(summary, min_count: int = 2, verbose: bool = Fals
     if verbose:
         if summary.host_presence:
             lines.append(header("Host Presence"))
-            for ip, pcaps in list(summary.host_presence.items())[:_limit_value(6)]:
+            for ip, pcaps in list(summary.host_presence.items())[: _limit_value(6)]:
                 lines.append(muted(f"{ip}: {', '.join(pcaps)}"))
     return _finalize_output(lines)
 
 
 def render_rules_summary(summary) -> str:
-
     if not summary:
         return ""
     lines = [header("RULES ANALYSIS")]
@@ -19312,20 +24941,19 @@ def render_rules_summary(summary) -> str:
     if summary.hits:
         lines.append(header("Rule Hits"))
         rows = [["Rule", "Severity", "Count", "Sources"]]
-        for hit in summary.hits[:_limit_value(10)]:
+        for hit in summary.hits[: _limit_value(10)]:
             sources = ", ".join(hit.sources) if hit.sources else "-"
             rows.append([hit.title, hit.severity.upper(), str(hit.count), sources])
         lines.append(_format_table(rows))
-        for hit in summary.hits[:_limit_value(5)]:
+        for hit in summary.hits[: _limit_value(5)]:
             if hit.examples:
                 lines.append(muted(f"{hit.title} examples:"))
-                for example in hit.examples[:_limit_value(3)]:
+                for example in hit.examples[: _limit_value(3)]:
                     lines.append(muted(f"  {example}"))
     return _finalize_output(lines)
 
 
 def render_baseline_delta(delta) -> str:
-
     if not delta:
         return ""
     lines = [header("BASELINE DRIFT")]
@@ -19343,24 +24971,28 @@ def render_baseline_delta(delta) -> str:
     lines.append(_format_kv("Missing OT Commands", str(len(delta.missing_ot_commands))))
     lines.append(_format_kv("OT Command Changes", str(len(delta.ot_command_changes))))
     lines.append(_format_kv("New Control Targets", str(len(delta.new_control_targets))))
-    lines.append(_format_kv("Missing Control Targets", str(len(delta.missing_control_targets))))
+    lines.append(
+        _format_kv("Missing Control Targets", str(len(delta.missing_control_targets)))
+    )
 
     if delta.new_hosts:
         lines.append(header("New Hosts"))
-        lines.append(muted(", ".join(delta.new_hosts[:_limit_value(10)])))
+        lines.append(muted(", ".join(delta.new_hosts[: _limit_value(10)])))
     if delta.missing_hosts:
         lines.append(header("Missing Hosts"))
-        lines.append(muted(", ".join(delta.missing_hosts[:_limit_value(10)])))
+        lines.append(muted(", ".join(delta.missing_hosts[: _limit_value(10)])))
     if delta.host_changes:
         lines.append(header("Host Changes"))
         rows = [["Host", "Change"]]
-        for item in delta.host_changes[:_limit_value(8)]:
+        for item in delta.host_changes[: _limit_value(8)]:
             ip = item.get("ip", "")
             changes = []
             if item.get("new_hostnames"):
                 changes.append(f"new_hostnames={len(item.get('new_hostnames'))}")
             if item.get("missing_hostnames"):
-                changes.append(f"missing_hostnames={len(item.get('missing_hostnames'))}")
+                changes.append(
+                    f"missing_hostnames={len(item.get('missing_hostnames'))}"
+                )
             if item.get("new_ports"):
                 changes.append(f"new_ports={len(item.get('new_ports'))}")
             if item.get("missing_ports"):
@@ -19372,7 +25004,7 @@ def render_baseline_delta(delta) -> str:
     if delta.service_changes:
         lines.append(header("Service Changes"))
         rows = [["Service", "Change"]]
-        for item in delta.service_changes[:_limit_value(8)]:
+        for item in delta.service_changes[: _limit_value(8)]:
             label = f"{item.get('ip')}:{item.get('port')}/{item.get('protocol')}"
             change = f"{item.get('from_service')} -> {item.get('to_service')}"
             if item.get("from_software") or item.get("to_software"):
@@ -19382,19 +25014,20 @@ def render_baseline_delta(delta) -> str:
     if delta.ot_command_changes:
         lines.append(header("OT Command Drift"))
         rows = [["Command", "Baseline", "Current", "Delta"]]
-        for item in delta.ot_command_changes[:_limit_value(8)]:
-            rows.append([
-                str(item.get("command", "")),
-                str(item.get("baseline", "")),
-                str(item.get("current", "")),
-                str(item.get("delta", "")),
-            ])
+        for item in delta.ot_command_changes[: _limit_value(8)]:
+            rows.append(
+                [
+                    str(item.get("command", "")),
+                    str(item.get("baseline", "")),
+                    str(item.get("current", "")),
+                    str(item.get("delta", "")),
+                ]
+            )
         lines.append(_format_table(rows))
     return _finalize_output(lines)
 
 
 def render_decrypt_summary(summary) -> str:
-
     if not summary:
         return ""
     lines = [header(f"{summary.protocol} DECRYPTION")]
@@ -19409,7 +25042,9 @@ def render_decrypt_summary(summary) -> str:
     return _finalize_output(lines)
 
 
-def render_ot_commands_summary(summary: OtCommandSummary, session_limit: int = 10, verbose: bool = False) -> str:
+def render_ot_commands_summary(
+    summary: OtCommandSummary, session_limit: int = 10, verbose: bool = False
+) -> str:
     lines = [header("OT COMMANDS")]
     if getattr(summary, "fast_mode", False):
         lines.append(_format_kv("Mode", "FAST (port heuristic)"))
@@ -19417,16 +25052,24 @@ def render_ot_commands_summary(summary: OtCommandSummary, session_limit: int = 1
             lines.append(muted(f"- {note}"))
     lines.append(_format_kv("Commands", _format_counter(summary.command_counts, 8)))
     lines.append(_format_kv("Top Sources", _format_counter(summary.sources, 5)))
-    lines.append(_format_kv("Top Destinations", _format_counter(summary.destinations, 5)))
+    lines.append(
+        _format_kv("Top Destinations", _format_counter(summary.destinations, 5))
+    )
     if getattr(summary, "control_rate_per_min", None) is not None:
         rate = float(summary.control_rate_per_min or 0.0)
         lines.append(_format_kv("Control Rate", f"{rate:.2f}/min"))
-        lines.append(_format_kv("Control Burst (60s)", str(getattr(summary, "control_burst_max", 0))))
+        lines.append(
+            _format_kv(
+                "Control Burst (60s)", str(getattr(summary, "control_burst_max", 0))
+            )
+        )
     if getattr(summary, "command_sessions", None):
         lines.append(header("Top Command Sessions"))
         rows = [["Session", "Count", "First Seen", "Last Seen"]]
         session_times = getattr(summary, "command_session_times", {}) or {}
-        for session, count in summary.command_sessions.most_common(_limit_value(session_limit)):
+        for session, count in summary.command_sessions.most_common(
+            _limit_value(session_limit)
+        ):
             first, last = session_times.get(session, (None, None))
             rows.append([session, str(count), format_ts(first), format_ts(last)])
         lines.append(_format_table(rows))
@@ -19446,7 +25089,7 @@ def render_ot_commands_summary(summary: OtCommandSummary, session_limit: int = 1
     detections = _filtered_detections(summary, verbose)
     if detections:
         lines.append(header("Detections"))
-        for item in detections[:_limit_value(6)]:
+        for item in detections[: _limit_value(6)]:
             sev = str(item.get("severity", "info")).upper()
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
@@ -19473,7 +25116,7 @@ def render_iec101_103_summary(summary: Iec101103Summary, verbose: bool = False) 
     detections = _filtered_detections(summary, verbose)
     if detections:
         lines.append(header("Detections"))
-        for item in detections[:_limit_value(6)]:
+        for item in detections[: _limit_value(6)]:
             sev = str(item.get("severity", "info")).upper()
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))

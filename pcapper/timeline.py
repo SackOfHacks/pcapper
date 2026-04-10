@@ -1,41 +1,51 @@
 from __future__ import annotations
 
+import ipaddress
+import os
+import re
+import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
-import re
-import ipaddress
-import statistics
 
-from .pcap_cache import get_reader
-from .utils import safe_float, counter_inc, decode_payload
-from .files import analyze_files
-from .powershell import PS_COMMAND_RE
-from .wmic import WMIC_COMMAND_RE
-from .winrm import WINRM_PORTS, WSMAN_RE
-from .telnet import TELNET_PORTS
-from .modbus import FUNC_NAMES as MODBUS_FUNC_NAMES, EXCEPTION_CODES as MODBUS_EXC_CODES
-from .cip import ENIP_COMMANDS
-from .opc import OPC_TYPES, OPC_UA_PORT
-from .modbus import MODBUS_TCP_PORT
-from .dnp3 import DNP3_PORT
-from .iec104 import IEC104_PORT
-from .s7 import S7_PORT
 from .bacnet import BACNET_PORT
-from .profinet import PROFINET_PORTS
-from .dnp3 import analyze_dnp3
-from .iec104 import analyze_iec104
-from .s7 import analyze_s7
+from .cip import ENIP_COMMANDS
+from .creds import analyze_creds
+from .dnp3 import DNP3_PORT, analyze_dnp3
+from .dns import _vt_lookup_domains
+from .files import analyze_files
+from .iec104 import IEC104_PORT, analyze_iec104
+from .modbus import EXCEPTION_CODES as MODBUS_EXC_CODES
+from .modbus import FUNC_NAMES as MODBUS_FUNC_NAMES
+from .modbus import MODBUS_TCP_PORT
+from .opc import OPC_TYPES, OPC_UA_PORT
 from .ot_risk import compute_ot_risk_posture, dedupe_findings
-from .progress import run_with_busy_status
+from .pcap_cache import get_reader
+from .powershell import PS_COMMAND_RE
+from .profinet import PROFINET_PORTS
+from .progress import build_statusbar, run_with_busy_status
+from .s7 import S7_PORT, analyze_s7
+from .telnet import TELNET_PORTS
+from .utils import counter_inc, decode_payload, safe_float
+from .winrm import WINRM_PORTS, WSMAN_RE
+from .wmic import WMIC_COMMAND_RE
 
 try:
-    from scapy.layers.inet import IP, TCP, UDP  # type: ignore
-    from scapy.layers.inet import ICMP  # type: ignore
-    from scapy.layers.inet6 import IPv6  # type: ignore
-    from scapy.layers.inet6 import ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6ND_NS, ICMPv6ND_NA  # type: ignore
     from scapy.layers.dns import DNS, DNSQR  # type: ignore
+    from scapy.layers.inet import (  # type: ignore
+        ICMP,  # type: ignore
+        IP,
+        TCP,
+        UDP,
+    )
+    from scapy.layers.inet6 import (  # type: ignore
+        ICMPv6EchoReply,
+        ICMPv6EchoRequest,
+        ICMPv6ND_NA,
+        ICMPv6ND_NS,
+        IPv6,  # type: ignore
+    )
 except Exception:  # pragma: no cover
     IP = None  # type: ignore
     TCP = None  # type: ignore
@@ -50,7 +60,11 @@ except Exception:  # pragma: no cover
     ICMPv6ND_NA = None  # type: ignore
 
 try:
-    from scapy.layers.netbios import NBNS, NBNSQueryRequest, NBNSQueryResponse  # type: ignore
+    from scapy.layers.netbios import (  # type: ignore
+        NBNS,
+        NBNSQueryRequest,
+        NBNSQueryResponse,
+    )
 except Exception:  # pragma: no cover
     NBNS = None  # type: ignore
     NBNSQueryRequest = None  # type: ignore
@@ -81,6 +95,7 @@ class DNSQueryDetail:
 @dataclass(frozen=True)
 class FileDownloadDetail:
     ts: Optional[float]
+    packet_number: Optional[int]
     protocol: str
     src_ip: str
     dst_ip: str
@@ -129,6 +144,51 @@ class TimelineSummary:
     ot_impact_signals: list[dict[str, object]] = field(default_factory=list)
     evidence_anchors: list[dict[str, object]] = field(default_factory=list)
     benign_context: list[str] = field(default_factory=list)
+    vt_lookup_enabled: bool = False
+    vt_results: dict[str, dict[str, object]] = field(default_factory=dict)
+    vt_errors: list[str] = field(default_factory=list)
+
+
+_DNS_QTYPE_NAMES: dict[int, str] = {
+    1: "A",
+    2: "NS",
+    5: "CNAME",
+    6: "SOA",
+    12: "PTR",
+    15: "MX",
+    16: "TXT",
+    28: "AAAA",
+    33: "SRV",
+    41: "OPT",
+    43: "DS",
+    46: "RRSIG",
+    47: "NSEC",
+    48: "DNSKEY",
+    50: "NSEC3",
+    51: "NSEC3PARAM",
+    65: "HTTPS",
+    99: "SPF",
+    252: "AXFR",
+    255: "ANY",
+}
+
+
+def _dns_qtype_label(qtype: object) -> str:
+    if qtype is None:
+        return "-"
+    try:
+        code = int(qtype)
+    except Exception:
+        return str(qtype)
+    name = _DNS_QTYPE_NAMES.get(code, f"TYPE{code}")
+    return f"{name} ({code})"
+
+
+def _dns_base_domain(name: str) -> str:
+    labels = [part for part in str(name or "").strip(".").lower().split(".") if part]
+    if len(labels) >= 2:
+        return ".".join(labels[-2:])
+    return ".".join(labels)
 
 
 def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSummary:
@@ -169,6 +229,9 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
             ot_impact_signals=[],
             evidence_anchors=[],
             benign_context=[],
+            vt_lookup_enabled=False,
+            vt_results={},
+            vt_errors=[],
         )
 
     target_ip = summary_list[0].target_ip
@@ -212,12 +275,21 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
     merged_ot_impact: list[dict[str, object]] = []
     merged_anchors: list[dict[str, object]] = []
     merged_benign: list[str] = []
+    merged_vt_enabled = False
+    merged_vt_results: dict[str, dict[str, object]] = {}
+    merged_vt_errors: list[str] = []
 
     for item in summary_list:
         if item.first_seen is not None:
-            first_seen = item.first_seen if first_seen is None else min(first_seen, item.first_seen)
+            first_seen = (
+                item.first_seen
+                if first_seen is None
+                else min(first_seen, item.first_seen)
+            )
         if item.last_seen is not None:
-            last_seen = item.last_seen if last_seen is None else max(last_seen, item.last_seen)
+            last_seen = (
+                item.last_seen if last_seen is None else max(last_seen, item.last_seen)
+            )
         category_counts.update(item.category_counts or {})
         peer_counts.update(item.peer_counts or {})
         port_counts.update(item.port_counts or {})
@@ -235,19 +307,33 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
             if not non_ot_bins:
                 non_ot_bins = [0] * len(item.non_ot_activity_bins)
             if len(non_ot_bins) < len(item.non_ot_activity_bins):
-                non_ot_bins.extend([0] * (len(item.non_ot_activity_bins) - len(non_ot_bins)))
+                non_ot_bins.extend(
+                    [0] * (len(item.non_ot_activity_bins) - len(non_ot_bins))
+                )
             for idx, val in enumerate(item.non_ot_activity_bins):
                 non_ot_bins[idx] += val
         if item.dns_queries:
             for entry in item.dns_queries:
-                key = (entry.src_ip, entry.dst_ip, entry.name.lower(), entry.dst_port, entry.protocol)
+                key = (
+                    entry.src_ip,
+                    entry.dst_ip,
+                    entry.name.lower(),
+                    entry.dst_port,
+                    entry.protocol,
+                )
                 if key in seen_dns_keys:
                     continue
                 seen_dns_keys.add(key)
                 merged_dns_queries.append(entry)
         if item.file_downloads:
             for entry in item.file_downloads:
-                key = (entry.protocol, entry.src_ip, entry.dst_ip, entry.filename, entry.file_type)
+                key = (
+                    entry.protocol,
+                    entry.src_ip,
+                    entry.dst_ip,
+                    entry.filename,
+                    entry.file_type,
+                )
                 if key in seen_file_keys:
                     continue
                 seen_file_keys.add(key)
@@ -284,6 +370,36 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
             for value in item.benign_context:
                 if value not in merged_benign:
                     merged_benign.append(value)
+        if item.vt_lookup_enabled:
+            merged_vt_enabled = True
+        if item.vt_results:
+            for key, value in item.vt_results.items():
+                key_text = str(key).strip().lower()
+                if not key_text:
+                    continue
+                if key_text not in merged_vt_results:
+                    merged_vt_results[key_text] = dict(value)
+                    continue
+                current = merged_vt_results[key_text]
+                try:
+                    cur_mal = int(current.get("malicious", 0) or 0)
+                    cur_sus = int(current.get("suspicious", 0) or 0)
+                except Exception:
+                    cur_mal = 0
+                    cur_sus = 0
+                try:
+                    new_mal = int(value.get("malicious", 0) or 0)
+                    new_sus = int(value.get("suspicious", 0) or 0)
+                except Exception:
+                    new_mal = 0
+                    new_sus = 0
+                if (new_mal, new_sus) > (cur_mal, cur_sus):
+                    merged_vt_results[key_text] = dict(value)
+        if item.vt_errors:
+            for err in item.vt_errors:
+                err_text = str(err).strip()
+                if err_text and err_text not in merged_vt_errors:
+                    merged_vt_errors.append(err_text)
 
     duration = None
     if first_seen is not None and last_seen is not None:
@@ -306,11 +422,17 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
         ot_activity_bin_count=ot_bin_count,
         non_ot_activity_bins=non_ot_bins,
         non_ot_activity_bin_count=non_ot_bin_count,
-        dns_queries=sorted(merged_dns_queries, key=lambda item: (item.ts is None, item.ts)),
-        file_downloads=sorted(merged_file_downloads, key=lambda item: (item.ts is None, item.ts)),
+        dns_queries=sorted(
+            merged_dns_queries, key=lambda item: (item.ts is None, item.ts)
+        ),
+        file_downloads=sorted(
+            merged_file_downloads, key=lambda item: (item.ts is None, item.ts)
+        ),
     )
     risk_score, risk_findings = _compute_ot_risk_posture(merged.events, target_ip)
-    storyline = _compute_ot_storyline(merged.events, target_ip, merged.ot_protocol_counts, risk_score, risk_findings)
+    storyline = _compute_ot_storyline(
+        merged.events, target_ip, merged.ot_protocol_counts, risk_score, risk_findings
+    )
     merged_hunt_context = _build_timeline_hunting_context(
         merged.events,
         target_ip,
@@ -342,20 +464,58 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
         file_downloads=merged.file_downloads,
         analyst_verdict=str(merged_hunt_context.get("analyst_verdict", "")),
         analyst_confidence=str(merged_hunt_context.get("analyst_confidence", "low")),
-        analyst_reasons=[str(v) for v in list(merged_hunt_context.get("analyst_reasons", merged_reasons) or [])],
+        analyst_reasons=[
+            str(v)
+            for v in list(
+                merged_hunt_context.get("analyst_reasons", merged_reasons) or []
+            )
+        ],
         deterministic_checks={
             str(k): [str(v) for v in list(values or [])]
-            for k, values in dict(merged_hunt_context.get("deterministic_checks", merged_checks) or {}).items()
+            for k, values in dict(
+                merged_hunt_context.get("deterministic_checks", merged_checks) or {}
+            ).items()
         },
-        sequence_timeline=list(merged_hunt_context.get("sequence_timeline", merged_sequence_timeline) or []),
-        sequence_violations=[str(v) for v in list(merged_hunt_context.get("sequence_violations", merged_sequence_violations) or [])],
-        beacon_candidates=list(merged_hunt_context.get("beacon_candidates", merged_beacons) or []),
-        auth_abuse_profiles=list(merged_hunt_context.get("auth_abuse_profiles", merged_auth_abuse) or []),
-        lateral_movement_paths=list(merged_hunt_context.get("lateral_movement_paths", merged_lateral_paths) or []),
-        exfiltration_chains=list(merged_hunt_context.get("exfiltration_chains", merged_exfil_chains) or []),
-        ot_impact_signals=list(merged_hunt_context.get("ot_impact_signals", merged_ot_impact) or []),
-        evidence_anchors=list(merged_hunt_context.get("evidence_anchors", merged_anchors) or []),
-        benign_context=[str(v) for v in list(merged_hunt_context.get("benign_context", merged_benign) or [])],
+        sequence_timeline=list(
+            merged_hunt_context.get("sequence_timeline", merged_sequence_timeline) or []
+        ),
+        sequence_violations=[
+            str(v)
+            for v in list(
+                merged_hunt_context.get(
+                    "sequence_violations", merged_sequence_violations
+                )
+                or []
+            )
+        ],
+        beacon_candidates=list(
+            merged_hunt_context.get("beacon_candidates", merged_beacons) or []
+        ),
+        auth_abuse_profiles=list(
+            merged_hunt_context.get("auth_abuse_profiles", merged_auth_abuse) or []
+        ),
+        lateral_movement_paths=list(
+            merged_hunt_context.get("lateral_movement_paths", merged_lateral_paths)
+            or []
+        ),
+        exfiltration_chains=list(
+            merged_hunt_context.get("exfiltration_chains", merged_exfil_chains) or []
+        ),
+        ot_impact_signals=list(
+            merged_hunt_context.get("ot_impact_signals", merged_ot_impact) or []
+        ),
+        evidence_anchors=list(
+            merged_hunt_context.get("evidence_anchors", merged_anchors) or []
+        ),
+        benign_context=[
+            str(v)
+            for v in list(
+                merged_hunt_context.get("benign_context", merged_benign) or []
+            )
+        ],
+        vt_lookup_enabled=merged_vt_enabled,
+        vt_results=merged_vt_results,
+        vt_errors=merged_vt_errors,
     )
     return merged
 
@@ -449,11 +609,41 @@ TIMELINE_CATEGORIES = tuple(sorted(OT_CATEGORIES | NON_OT_CATEGORIES, key=str.ca
 
 FTP_CONTROL_PORTS = {21, 2100, 2121, 8021}
 FTP_COMMANDS = {
-    "USER", "PASS", "ACCT", "CWD", "CDUP", "PWD", "XPWD",
-    "LIST", "NLST", "MLSD", "MLST", "RETR", "STOR", "APPE",
-    "DELE", "RMD", "MKD", "RNFR", "RNTO", "TYPE", "SYST",
-    "FEAT", "STAT", "NOOP", "QUIT", "PASV", "EPSV", "PORT",
-    "EPRT", "AUTH", "PBSZ", "PROT", "SITE", "OPTS", "HOST",
+    "USER",
+    "PASS",
+    "ACCT",
+    "CWD",
+    "CDUP",
+    "PWD",
+    "XPWD",
+    "LIST",
+    "NLST",
+    "MLSD",
+    "MLST",
+    "RETR",
+    "STOR",
+    "APPE",
+    "DELE",
+    "RMD",
+    "MKD",
+    "RNFR",
+    "RNTO",
+    "TYPE",
+    "SYST",
+    "FEAT",
+    "STAT",
+    "NOOP",
+    "QUIT",
+    "PASV",
+    "EPSV",
+    "PORT",
+    "EPRT",
+    "AUTH",
+    "PBSZ",
+    "PROT",
+    "SITE",
+    "OPTS",
+    "HOST",
 }
 FTP_RESPONSE_RE = re.compile(r"^(\d{3})(?:[ -].*)?$")
 
@@ -475,7 +665,18 @@ def _extract_email_action(service: str, first_line: str) -> str | None:
 
     if service.startswith("SMTP"):
         smtp_cmds = (
-            "EHLO", "HELO", "MAIL FROM", "RCPT TO", "DATA", "STARTTLS", "AUTH", "QUIT", "NOOP", "RSET", "VRFY", "EXPN"
+            "EHLO",
+            "HELO",
+            "MAIL FROM",
+            "RCPT TO",
+            "DATA",
+            "STARTTLS",
+            "AUTH",
+            "QUIT",
+            "NOOP",
+            "RSET",
+            "VRFY",
+            "EXPN",
         )
         for cmd in smtp_cmds:
             if upper.startswith(cmd):
@@ -485,7 +686,20 @@ def _extract_email_action(service: str, first_line: str) -> str | None:
 
     if service.startswith("IMAP"):
         imap_cmds = (
-            "LOGIN", "AUTHENTICATE", "SELECT", "EXAMINE", "FETCH", "UID", "SEARCH", "STORE", "COPY", "APPEND", "IDLE", "LOGOUT", "STARTTLS", "CAPABILITY"
+            "LOGIN",
+            "AUTHENTICATE",
+            "SELECT",
+            "EXAMINE",
+            "FETCH",
+            "UID",
+            "SEARCH",
+            "STORE",
+            "COPY",
+            "APPEND",
+            "IDLE",
+            "LOGOUT",
+            "STARTTLS",
+            "CAPABILITY",
         )
         parts = upper.split()
         if parts:
@@ -500,7 +714,19 @@ def _extract_email_action(service: str, first_line: str) -> str | None:
 
     if service.startswith("POP3"):
         pop3_cmds = (
-            "USER", "PASS", "APOP", "AUTH", "STAT", "LIST", "RETR", "DELE", "TOP", "UIDL", "CAPA", "STLS", "QUIT"
+            "USER",
+            "PASS",
+            "APOP",
+            "AUTH",
+            "STAT",
+            "LIST",
+            "RETR",
+            "DELE",
+            "TOP",
+            "UIDL",
+            "CAPA",
+            "STLS",
+            "QUIT",
         )
         for cmd in pop3_cmds:
             if upper.startswith(cmd):
@@ -521,14 +747,47 @@ def _extract_email_command(service: str, first_line: str) -> str | None:
         return None
     upper = first_line.upper()
     if service.startswith("SMTP"):
-        if upper.startswith(("EHLO", "HELO", "MAIL FROM", "RCPT TO", "DATA", "STARTTLS", "AUTH", "QUIT", "NOOP", "RSET", "VRFY", "EXPN")):
+        if upper.startswith(
+            (
+                "EHLO",
+                "HELO",
+                "MAIL FROM",
+                "RCPT TO",
+                "DATA",
+                "STARTTLS",
+                "AUTH",
+                "QUIT",
+                "NOOP",
+                "RSET",
+                "VRFY",
+                "EXPN",
+            )
+        ):
             return first_line
     if service.startswith("IMAP"):
         parts = upper.split()
         if len(parts) >= 2 and parts[1].isalpha():
             return first_line
     if service.startswith("POP3"):
-        if upper.startswith(("USER", "PASS", "APOP", "AUTH", "STAT", "LIST", "RETR", "DELE", "TOP", "UIDL", "CAPA", "STLS", "QUIT", "+OK", "-ERR")):
+        if upper.startswith(
+            (
+                "USER",
+                "PASS",
+                "APOP",
+                "AUTH",
+                "STAT",
+                "LIST",
+                "RETR",
+                "DELE",
+                "TOP",
+                "UIDL",
+                "CAPA",
+                "STLS",
+                "QUIT",
+                "+OK",
+                "-ERR",
+            )
+        ):
             return first_line
     return None
 
@@ -595,8 +854,14 @@ def _extract_winrm_command(payload: bytes | None) -> str | None:
     return match.group(0).strip()[:200]
 
 
-TELNET_COMMAND_RE = re.compile(r"^[#>$]\s*([A-Za-z0-9._:/\\-]+(?:\s+[^\r\n]{0,160})?)$", re.IGNORECASE | re.MULTILINE)
-TELNET_COMMAND_FALLBACK_RE = re.compile(r"^\s*([A-Za-z0-9._:/\\-]{2,}(?:\s+[^\r\n]{0,160})?)\s*$", re.IGNORECASE | re.MULTILINE)
+TELNET_COMMAND_RE = re.compile(
+    r"^[#>$]\s*([A-Za-z0-9._:/\\-]+(?:\s+[^\r\n]{0,160})?)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+TELNET_COMMAND_FALLBACK_RE = re.compile(
+    r"^\s*([A-Za-z0-9._:/\\-]{2,}(?:\s+[^\r\n]{0,160})?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 TELNET_COMMON_COMMANDS = {
     "whoami",
     "id",
@@ -712,7 +977,9 @@ def _snmp_pdu_type(payload: bytes | None) -> str | None:
     }.get(pdu)
 
 
-def _parse_modbus_command(payload: bytes | None) -> tuple[int, str, bool, int | None, str | None] | None:
+def _parse_modbus_command(
+    payload: bytes | None,
+) -> tuple[int, str, bool, int | None, str | None] | None:
     if not payload or len(payload) < 8:
         return None
     try:
@@ -831,7 +1098,9 @@ def _compute_non_ot_activity_bins(
     return bucket, bins
 
 
-def _compute_ot_risk_posture(events: list[TimelineEvent], target_ip: str) -> tuple[int, list[str]]:
+def _compute_ot_risk_posture(
+    events: list[TimelineEvent], target_ip: str
+) -> tuple[int, list[str]]:
     if not events:
         return 0, []
     public_peers: set[str] = set()
@@ -840,8 +1109,19 @@ def _compute_ot_risk_posture(events: list[TimelineEvent], target_ip: str) -> tup
     anomaly_hits = 0
 
     control_tokens = (
-        "write", "control", "setpoint", "start", "stop", "program", "download", "upload", "firmware",
-        "plcstop", "plchotstart", "plccoldstart", "writevar",
+        "write",
+        "control",
+        "setpoint",
+        "start",
+        "stop",
+        "program",
+        "download",
+        "upload",
+        "firmware",
+        "plcstop",
+        "plchotstart",
+        "plccoldstart",
+        "writevar",
     )
     for event in events:
         if event.category not in OT_CATEGORIES:
@@ -849,7 +1129,10 @@ def _compute_ot_risk_posture(events: list[TimelineEvent], target_ip: str) -> tup
         detail = f"{event.summary} {event.details}".lower()
         if any(token in detail for token in control_tokens):
             control_hits += 1
-        if any(token in detail for token in ("download", "upload", "file operation", "program transfer")):
+        if any(
+            token in detail
+            for token in ("download", "upload", "file operation", "program transfer")
+        ):
             transfer_hits += 1
         if "anomaly" in detail or "restart" in detail or "command" in detail:
             if "error" not in detail:
@@ -882,7 +1165,9 @@ def _compute_ot_storyline(
 ) -> list[str]:
     if not ot_protocol_counts:
         return [f"No OT/ICS protocols observed for {target_ip}."]
-    top_protocols = sorted(ot_protocol_counts.items(), key=lambda item: (-item[1], item[0]))
+    top_protocols = sorted(
+        ot_protocol_counts.items(), key=lambda item: (-item[1], item[0])
+    )
     proto_text = ", ".join(f"{name} ({count})" for name, count in top_protocols[:4])
     storyline = [f"OT protocols observed: {proto_text}."]
     if risk_score:
@@ -894,15 +1179,36 @@ def _compute_ot_storyline(
         if event.category not in OT_CATEGORIES:
             continue
         detail = f"{event.summary} {event.details}".lower()
-        if any(token in detail for token in ("write", "control", "setpoint", "start", "stop", "program", "download", "upload", "firmware")):
+        if any(
+            token in detail
+            for token in (
+                "write",
+                "control",
+                "setpoint",
+                "start",
+                "stop",
+                "program",
+                "download",
+                "upload",
+                "firmware",
+            )
+        ):
             control_hits += 1
     if control_hits:
-        storyline.append(f"Control or program-change indications seen ({control_hits}).")
+        storyline.append(
+            f"Control or program-change indications seen ({control_hits})."
+        )
     return storyline
 
 
-def _first_ts_for_category(events: list[TimelineEvent], category: str) -> Optional[float]:
-    timestamps = [event.ts for event in events if event.category == category and event.ts is not None]
+def _first_ts_for_category(
+    events: list[TimelineEvent], category: str
+) -> Optional[float]:
+    timestamps = [
+        event.ts
+        for event in events
+        if event.category == category and event.ts is not None
+    ]
     return min(timestamps) if timestamps else None
 
 
@@ -914,9 +1220,14 @@ def _extract_event_ips(text: str) -> list[str]:
     return found
 
 
-def _extract_event_flow(event: TimelineEvent, target_ip: str) -> tuple[str | None, str | None, int | None]:
+def _extract_event_flow(
+    event: TimelineEvent, target_ip: str
+) -> tuple[str | None, str | None, int | None]:
     details = event.details
-    match = re.search(r"((?:\d{1,3}\.){3}\d{1,3})\s*->\s*((?:\d{1,3}\.){3}\d{1,3})(?::(\d+))?", details)
+    match = re.search(
+        r"((?:\d{1,3}\.){3}\d{1,3})\s*->\s*((?:\d{1,3}\.){3}\d{1,3})(?::(\d+))?",
+        details,
+    )
     if not match:
         return None, None, None
     src, dst, port_text = match.group(1), match.group(2), match.group(3)
@@ -932,17 +1243,69 @@ def _extract_event_flow(event: TimelineEvent, target_ip: str) -> tuple[str | Non
 
 def _classify_timeline_stage(event: TimelineEvent) -> str | None:
     text = f"{event.category} {event.summary} {event.details}".lower()
-    if any(token in text for token in ("scan", "recon", "probe", "icmp", "nbns", "mdns", "potential port scan")):
+    if any(
+        token in text
+        for token in (
+            "scan",
+            "recon",
+            "probe",
+            "icmp",
+            "nbns",
+            "mdns",
+            "potential port scan",
+        )
+    ):
         return "Recon"
-    if any(token in text for token in ("auth", "login", "kerberos", "ntlm", "ldap", "domain service", "credential", "password", "user ")):
+    if any(
+        token in text
+        for token in (
+            "auth",
+            "login",
+            "kerberos",
+            "ntlm",
+            "ldap",
+            "domain service",
+            "credential",
+            "password",
+            "user ",
+        )
+    ):
         return "Access"
-    if any(token in text for token in ("powershell", "wmic", "winrm", "telnet command", "execute", "cmd.exe", "rundll32", "mshta")):
+    if any(
+        token in text
+        for token in (
+            "powershell",
+            "wmic",
+            "winrm",
+            "telnet command",
+            "execute",
+            "cmd.exe",
+            "rundll32",
+            "mshta",
+        )
+    ):
         return "Execution"
     if any(token in text for token in ("beacon", "c2", "command and control")):
         return "C2"
-    if any(token in text for token in ("http post", "stor ", "appe ", "upload", "file artifact", "exfil")):
+    if any(
+        token in text
+        for token in ("http post", "stor ", "appe ", "upload", "file artifact", "exfil")
+    ):
         return "Exfil"
-    if event.category in OT_CATEGORIES and any(token in text for token in ("write", "setpoint", "program", "firmware", "start", "stop", "trip", "shutdown", "operate")):
+    if event.category in OT_CATEGORIES and any(
+        token in text
+        for token in (
+            "write",
+            "setpoint",
+            "program",
+            "firmware",
+            "start",
+            "stop",
+            "trip",
+            "shutdown",
+            "operate",
+        )
+    ):
         return "Impact"
     return None
 
@@ -981,21 +1344,57 @@ def _build_timeline_hunting_context(
         actor, peer, port = _extract_event_flow(event, target_ip)
         text = f"{event.summary} {event.details}".lower()
 
-        if event.packet_index is not None and ("command" in text or "http post" in text or "file artifact" in text or "scan" in text):
-            evidence_anchors.append({
-                "packet": int(event.packet_index),
-                "category": event.category,
-                "summary": event.summary,
-                "source": event.source,
-                "details": event.details,
-            })
+        if event.packet_index is not None and (
+            "command" in text
+            or "http post" in text
+            or "file artifact" in text
+            or "scan" in text
+        ):
+            evidence_anchors.append(
+                {
+                    "packet": int(event.packet_index),
+                    "category": event.category,
+                    "summary": event.summary,
+                    "source": event.source,
+                    "details": event.details,
+                }
+            )
 
-        if actor and peer and any(token in text for token in ("auth", "login", "password", "credential", "ntlm", "kerberos", "user ")):
+        if (
+            actor
+            and peer
+            and any(
+                token in text
+                for token in (
+                    "auth",
+                    "login",
+                    "password",
+                    "credential",
+                    "ntlm",
+                    "kerberos",
+                    "user ",
+                )
+            )
+        ):
             auth_counter[(actor, peer)] += 1
             auth_targets[actor].add(peer)
 
-        if actor and peer and (event.category in {"PowerShell", "WMIC", "WinRM", "RPC", "SMB", "Telnet", "Connection"}):
-            if port in admin_ports or event.category in {"PowerShell", "WMIC", "WinRM", "RPC", "SMB", "Telnet"}:
+        if (
+            actor
+            and peer
+            and (
+                event.category
+                in {"PowerShell", "WMIC", "WinRM", "RPC", "SMB", "Telnet", "Connection"}
+            )
+        ):
+            if port in admin_ports or event.category in {
+                "PowerShell",
+                "WMIC",
+                "WinRM",
+                "RPC",
+                "SMB",
+                "Telnet",
+            }:
                 lateral_peers[actor].add(peer)
                 lateral_admin_hits[actor] += 1
 
@@ -1003,17 +1402,44 @@ def _build_timeline_hunting_context(
             key = (peer, event.category, event.summary)
             beacon_samples[key].append(float(event.ts))
 
-        if any(token in text for token in ("http post", "stor ", "appe ", "upload", "file artifact", "exfil")):
+        if any(
+            token in text
+            for token in (
+                "http post",
+                "stor ",
+                "appe ",
+                "upload",
+                "file artifact",
+                "exfil",
+            )
+        ):
             if actor == target_ip:
-                exfil_signals.append(f"{event.category} {event.summary}: {event.details}")
+                exfil_signals.append(
+                    f"{event.category} {event.summary}: {event.details}"
+                )
 
-        if event.category in OT_CATEGORIES and any(token in text for token in ("write", "setpoint", "program", "firmware", "start", "stop", "trip", "shutdown", "operate")):
-            ot_impact_signals.append({
-                "protocol": event.category,
-                "summary": event.summary,
-                "details": event.details,
-                "ts": event.ts,
-            })
+        if event.category in OT_CATEGORIES and any(
+            token in text
+            for token in (
+                "write",
+                "setpoint",
+                "program",
+                "firmware",
+                "start",
+                "stop",
+                "trip",
+                "shutdown",
+                "operate",
+            )
+        ):
+            ot_impact_signals.append(
+                {
+                    "protocol": event.category,
+                    "summary": event.summary,
+                    "details": event.details,
+                    "ts": event.ts,
+                }
+            )
 
     stage_rows: list[dict[str, object]] = []
     for stage in stage_order:
@@ -1022,14 +1448,16 @@ def _build_timeline_hunting_context(
             continue
         first_ts = values[0]
         last_ts = values[-1]
-        stage_rows.append({
-            "stage": stage,
-            "first_ts": first_ts,
-            "last_ts": last_ts,
-            "count": len(values),
-            "dwell": max(0.0, last_ts - first_ts),
-            "evidence": stage_evidence[stage][:4],
-        })
+        stage_rows.append(
+            {
+                "stage": stage,
+                "first_ts": first_ts,
+                "last_ts": last_ts,
+                "count": len(values),
+                "dwell": max(0.0, last_ts - first_ts),
+                "evidence": stage_evidence[stage][:4],
+            }
+        )
 
     stage_index = {name: idx for idx, name in enumerate(stage_order)}
     present_stages = [item["stage"] for item in stage_rows]
@@ -1040,18 +1468,28 @@ def _build_timeline_hunting_context(
         prev_idx = stage_index.get(str(prev["stage"]), -1)
         cur_idx = stage_index.get(str(current["stage"]), -1)
         if cur_idx < prev_idx:
-            sequence_violations.append(f"Stage order regression: {current['stage']} appears after {prev['stage']}")
+            sequence_violations.append(
+                f"Stage order regression: {current['stage']} appears after {prev['stage']}"
+            )
     if "Execution" in present_stages and "Access" not in present_stages:
-        sequence_violations.append("Execution-like activity observed without a clear access precursor")
+        sequence_violations.append(
+            "Execution-like activity observed without a clear access precursor"
+        )
     if "Exfil" in present_stages and "Execution" not in present_stages:
-        sequence_violations.append("Exfiltration-like activity observed without clear execution stage")
+        sequence_violations.append(
+            "Exfiltration-like activity observed without clear execution stage"
+        )
 
     beacon_candidates: list[dict[str, object]] = []
     for (peer, category, summary), timestamps in beacon_samples.items():
         times = sorted(set(timestamps))
         if len(times) < 4:
             continue
-        intervals = [times[idx] - times[idx - 1] for idx in range(1, len(times)) if times[idx] - times[idx - 1] > 0]
+        intervals = [
+            times[idx] - times[idx - 1]
+            for idx in range(1, len(times))
+            if times[idx] - times[idx - 1] > 0
+        ]
         if len(intervals) < 3:
             continue
         mean_interval = statistics.fmean(intervals)
@@ -1064,58 +1502,72 @@ def _build_timeline_hunting_context(
         if cv > 0.35:
             continue
         confidence = "high" if cv <= 0.15 else "medium"
-        beacon_candidates.append({
-            "peer": peer,
-            "category": category,
-            "summary": summary,
-            "count": len(times),
-            "mean_interval": round(mean_interval, 2),
-            "jitter": round(jitter, 2),
-            "cv": round(cv, 3),
-            "confidence": confidence,
-        })
-    beacon_candidates.sort(key=lambda item: (item.get("cv", 1.0), -int(item.get("count", 0))))
+        beacon_candidates.append(
+            {
+                "peer": peer,
+                "category": category,
+                "summary": summary,
+                "count": len(times),
+                "mean_interval": round(mean_interval, 2),
+                "jitter": round(jitter, 2),
+                "cv": round(cv, 3),
+                "confidence": confidence,
+            }
+        )
+    beacon_candidates.sort(
+        key=lambda item: (item.get("cv", 1.0), -int(item.get("count", 0)))
+    )
 
     auth_abuse_profiles: list[dict[str, object]] = []
     for (src, dst), attempts in auth_counter.most_common(30):
         if attempts < 4:
             continue
-        auth_abuse_profiles.append({
-            "src": src,
-            "dst": dst,
-            "attempts": int(attempts),
-            "target_count": len(auth_targets.get(src, set())),
-            "confidence": "high" if attempts >= 10 else "medium",
-        })
+        auth_abuse_profiles.append(
+            {
+                "src": src,
+                "dst": dst,
+                "attempts": int(attempts),
+                "target_count": len(auth_targets.get(src, set())),
+                "confidence": "high" if attempts >= 10 else "medium",
+            }
+        )
 
     lateral_paths: list[dict[str, object]] = []
-    for src, peers in sorted(lateral_peers.items(), key=lambda item: (-len(item[1]), item[0])):
+    for src, peers in sorted(
+        lateral_peers.items(), key=lambda item: (-len(item[1]), item[0])
+    ):
         if len(peers) < 2 and lateral_admin_hits.get(src, 0) < 6:
             continue
-        lateral_paths.append({
-            "src": src,
-            "peer_count": len(peers),
-            "admin_hits": int(lateral_admin_hits.get(src, 0)),
-            "peers": sorted(peers)[:8],
-            "confidence": "high" if len(peers) >= 4 else "medium",
-        })
+        lateral_paths.append(
+            {
+                "src": src,
+                "peer_count": len(peers),
+                "admin_hits": int(lateral_admin_hits.get(src, 0)),
+                "peers": sorted(peers)[:8],
+                "confidence": "high" if len(peers) >= 4 else "medium",
+            }
+        )
 
     exfiltration_chains: list[dict[str, object]] = []
     for detail in exfil_signals[:20]:
-        exfiltration_chains.append({
-            "signal": detail,
-            "confidence": "medium",
-        })
+        exfiltration_chains.append(
+            {
+                "signal": detail,
+                "confidence": "medium",
+            }
+        )
     for item in file_downloads:
         try:
             dst = ipaddress.ip_address(item.dst_ip)
         except Exception:
             continue
         if item.src_ip == target_ip and dst.is_global:
-            exfiltration_chains.append({
-                "signal": f"Outbound file transfer to public peer: {item.filename} {item.src_ip}->{item.dst_ip}",
-                "confidence": "high",
-            })
+            exfiltration_chains.append(
+                {
+                    "signal": f"Outbound file transfer to public peer: {item.filename} {item.src_ip}->{item.dst_ip}",
+                    "confidence": "high",
+                }
+            )
 
     deterministic_checks: dict[str, list[str]] = {
         "recon_to_access_sequence": [],
@@ -1131,13 +1583,23 @@ def _build_timeline_hunting_context(
     }
 
     if "Recon" in present_stages and "Access" in present_stages:
-        deterministic_checks["recon_to_access_sequence"].append("Recon activity observed before/with access indicators")
+        deterministic_checks["recon_to_access_sequence"].append(
+            "Recon activity observed before/with access indicators"
+        )
     if "Access" in present_stages and "Execution" in present_stages:
-        deterministic_checks["access_to_execution_sequence"].append("Access indicators followed by execution-like commands")
-    if "Execution" in present_stages and ("C2" in present_stages or "Exfil" in present_stages):
-        deterministic_checks["execution_to_c2_or_exfil"].append("Execution activity followed by C2/exfil-like traffic")
+        deterministic_checks["access_to_execution_sequence"].append(
+            "Access indicators followed by execution-like commands"
+        )
+    if "Execution" in present_stages and (
+        "C2" in present_stages or "Exfil" in present_stages
+    ):
+        deterministic_checks["execution_to_c2_or_exfil"].append(
+            "Execution activity followed by C2/exfil-like traffic"
+        )
     if "Recon" in present_stages and ot_impact_signals:
-        deterministic_checks["ot_control_after_discovery"].append("OT control-like actions appear after discovery activity")
+        deterministic_checks["ot_control_after_discovery"].append(
+            "OT control-like actions appear after discovery activity"
+        )
     for item in beacon_candidates[:8]:
         deterministic_checks["beaconing_periodicity"].append(
             f"peer={item['peer']} interval={item['mean_interval']}s jitter={item['jitter']}s cv={item['cv']}"
@@ -1153,9 +1615,13 @@ def _build_timeline_hunting_context(
     for item in exfiltration_chains[:8]:
         deterministic_checks["exfiltration_chain"].append(str(item.get("signal", "")))
     for item in ot_impact_signals[:8]:
-        deterministic_checks["ot_impact_signal"].append(f"{item['protocol']} {item['summary']} :: {item['details']}")
+        deterministic_checks["ot_impact_signal"].append(
+            f"{item['protocol']} {item['summary']} :: {item['details']}"
+        )
     if evidence_anchors:
-        deterministic_checks["evidence_provenance"].append(f"{len(evidence_anchors)} event(s) include packet/source provenance")
+        deterministic_checks["evidence_provenance"].append(
+            f"{len(evidence_anchors)} event(s) include packet/source provenance"
+        )
 
     score = 0
     score += 2 if deterministic_checks["execution_to_c2_or_exfil"] else 0
@@ -1196,23 +1662,33 @@ def _build_timeline_hunting_context(
         verdict = "POSSIBLE - SOME TIMELINE SIGNALS REQUIRE FURTHER VALIDATION"
         confidence = "medium"
     else:
-        verdict = "NO STRONG SIGNAL - TIMELINE HEURISTICS DID NOT CROSS CONFIDENCE THRESHOLD"
+        verdict = (
+            "NO STRONG SIGNAL - TIMELINE HEURISTICS DID NOT CROSS CONFIDENCE THRESHOLD"
+        )
         confidence = "low"
 
     benign_context: list[str] = []
     if not deterministic_checks["authentication_abuse"]:
-        benign_context.append("No strong authentication abuse concentration was observed")
+        benign_context.append(
+            "No strong authentication abuse concentration was observed"
+        )
     if not deterministic_checks["beaconing_periodicity"]:
-        benign_context.append("No high-confidence periodic beaconing pattern was detected")
+        benign_context.append(
+            "No high-confidence periodic beaconing pattern was detected"
+        )
     if not deterministic_checks["ot_impact_signal"] and ot_risk_score < 25:
         benign_context.append("OT activity appears primarily monitoring/flow oriented")
     if not exfiltration_chains:
-        benign_context.append("No convincing exfiltration chain was reconstructed from timeline evidence")
+        benign_context.append(
+            "No convincing exfiltration chain was reconstructed from timeline evidence"
+        )
 
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
-        "analyst_reasons": reasons[:10] if reasons else ["No high-confidence timeline signals identified"],
+        "analyst_reasons": reasons[:10]
+        if reasons
+        else ["No high-confidence timeline signals identified"],
         "deterministic_checks": deterministic_checks,
         "sequence_timeline": stage_rows,
         "sequence_violations": sequence_violations,
@@ -1221,7 +1697,9 @@ def _build_timeline_hunting_context(
         "lateral_movement_paths": lateral_paths[:12],
         "exfiltration_chains": exfiltration_chains[:16],
         "ot_impact_signals": ot_impact_signals[:16],
-        "evidence_anchors": sorted(evidence_anchors, key=lambda item: int(item.get("packet", 0)))[:30],
+        "evidence_anchors": sorted(
+            evidence_anchors, key=lambda item: int(item.get("packet", 0))
+        )[:30],
         "benign_context": benign_context[:8],
     }
 
@@ -1236,7 +1714,7 @@ def _read_ber_length(payload: bytes, offset: int) -> tuple[Optional[int], int]:
     num_bytes = first & 0x7F
     if num_bytes == 0 or offset + num_bytes > len(payload):
         return None, offset
-    length = int.from_bytes(payload[offset:offset + num_bytes], "big")
+    length = int.from_bytes(payload[offset : offset + num_bytes], "big")
     offset += num_bytes
     return length, offset
 
@@ -1303,19 +1781,26 @@ def analyze_timeline(
     timeline_bins: int = 24,
     timeline_storyline_off: bool = False,
     categories: set[str] | None = None,
+    vt_lookup: bool = False,
 ) -> TimelineSummary:
     errors: list[str] = []
     events: list[TimelineEvent] = []
 
     def _busy(desc: str, func, *args, **kwargs):
-        return run_with_busy_status(path, show_status, f"Timeline: {desc}", func, *args, **kwargs)
+        return run_with_busy_status(
+            path, show_status, f"Timeline: {desc}", func, *args, **kwargs
+        )
 
     file_summary = _busy("Files", analyze_files, path, show_status=False)
     artifacts_for_ip = [
-        art for art in file_summary.artifacts
+        art
+        for art in file_summary.artifacts
         if art.src_ip == target_ip or art.dst_ip == target_ip
     ]
-    artifact_indices = {art.packet_index for art in artifacts_for_ip if art.packet_index}
+    artifact_indices = {
+        art.packet_index for art in artifacts_for_ip if art.packet_index
+    }
+    creds_summary = _busy("Credentials", analyze_creds, path, show_status=False)
 
     reader, status, stream, size_bytes, _file_type = get_reader(
         path, show_status=show_status
@@ -1354,15 +1839,21 @@ def analyze_timeline(
     file_downloads: list[FileDownloadDetail] = []
     seen_dns_queries: set[tuple[str, str, int, str, str, Optional[int]]] = set()
     seen_file_downloads: set[tuple[str, str, str, str, str]] = set()
-    tcp_handshakes: dict[tuple[str, str, int, int], list[dict[str, Optional[float]]]] = defaultdict(list)
+    tcp_handshakes: dict[
+        tuple[str, str, int, int], list[dict[str, Optional[float]]]
+    ] = defaultdict(list)
     seen_event_keys: set[tuple] = set()
     seen_tcp_syns: set[tuple[str, str, int, int, int]] = set()
     seen_tcp_synacks: set[tuple[str, str, int, int, int, int]] = set()
 
-    def _new_handshake(syn_ts: Optional[float] = None, synack_ts: Optional[float] = None) -> dict[str, Optional[float]]:
+    def _new_handshake(
+        syn_ts: Optional[float] = None, synack_ts: Optional[float] = None
+    ) -> dict[str, Optional[float]]:
         return {"syn": syn_ts, "synack": synack_ts, "ack": None}
 
-    def _find_handshake_for_synack(items: list[dict[str, Optional[float]]]) -> dict[str, Optional[float]] | None:
+    def _find_handshake_for_synack(
+        items: list[dict[str, Optional[float]]],
+    ) -> dict[str, Optional[float]] | None:
         for handshake in reversed(items):
             if handshake["syn"] is not None and handshake["synack"] is None:
                 return handshake
@@ -1371,7 +1862,9 @@ def analyze_timeline(
                 return handshake
         return None
 
-    def _find_handshake_for_ack(items: list[dict[str, Optional[float]]]) -> dict[str, Optional[float]] | None:
+    def _find_handshake_for_ack(
+        items: list[dict[str, Optional[float]]],
+    ) -> dict[str, Optional[float]] | None:
         for handshake in reversed(items):
             if handshake["synack"] is not None and handshake["ack"] is None:
                 return handshake
@@ -1417,14 +1910,16 @@ def analyze_timeline(
         event_packet = packet_index
         if event_packet is None and idx > 0:
             event_packet = idx
-        events.append(TimelineEvent(
-            ts=ts,
-            category=category,
-            summary=summary,
-            details=details,
-            packet_index=event_packet,
-            source=source,
-        ))
+        events.append(
+            TimelineEvent(
+                ts=ts,
+                category=category,
+                summary=summary,
+                details=details,
+                packet_index=event_packet,
+                source=source,
+            )
+        )
 
     domain_ports = {88, 464, 445, 139, 135, 593, 3268, 3269}
     ldap_ports = {389, 636, 3268, 3269}
@@ -1460,7 +1955,7 @@ def analyze_timeline(
             if not src_ip or not dst_ip:
                 continue
 
-            if (src_ip == target_ip or dst_ip == target_ip):
+            if src_ip == target_ip or dst_ip == target_ip:
                 if ts is not None:
                     if first_seen is None or ts < first_seen:
                         first_seen = ts
@@ -1470,7 +1965,7 @@ def analyze_timeline(
                 if peer_ip:
                     counter_inc(peer_counts, peer_ip)
 
-            if (src_ip == target_ip or dst_ip == target_ip):
+            if src_ip == target_ip or dst_ip == target_ip:
                 label = _icmp_label(pkt)
                 if label:
                     dedupe_key = ("icmp", src_ip, dst_ip, label, _icmp_signature(pkt))
@@ -1493,26 +1988,41 @@ def analyze_timeline(
                             qd = dns_layer.qd  # type: ignore[attr-defined]
                             qname = getattr(qd, "qname", b"")
                             qtype = getattr(qd, "qtype", None)
-                            name = qname.decode("utf-8", errors="ignore").rstrip(".") if isinstance(qname, (bytes, bytearray)) else str(qname)
+                            qtype_label = _dns_qtype_label(qtype)
+                            name = (
+                                qname.decode("utf-8", errors="ignore").rstrip(".")
+                                if isinstance(qname, (bytes, bytearray))
+                                else str(qname)
+                            )
                         except Exception:
                             name = "-"
                             qtype = None
-                        direction = "query" if getattr(dns_layer, "qr", 1) == 0 else "response"
+                            qtype_label = "-"
+                        direction = (
+                            "query" if getattr(dns_layer, "qr", 1) == 0 else "response"
+                        )
                         key = (direction, name, str(qtype))
-                        if key not in seen_mdns_events and (src_ip == target_ip or dst_ip == target_ip):
+                        if key not in seen_mdns_events and (
+                            src_ip == target_ip or dst_ip == target_ip
+                        ):
                             seen_mdns_events.add(key)
                             _emit_event(
                                 ts=ts,
                                 category="mDNS",
                                 summary=f"mDNS {direction}",
-                                details=f"{src_ip} -> {dst_ip} {name} (type {qtype})",
+                                details=f"{src_ip} -> {dst_ip} {name} ({qtype_label})",
                             )
                 if getattr(dns_layer, "qr", 1) == 0 and src_ip == target_ip:
                     try:
                         qd = dns_layer.qd  # type: ignore[attr-defined]
                         qname = getattr(qd, "qname", b"")
                         qtype = getattr(qd, "qtype", None)
-                        name = qname.decode("utf-8", errors="ignore").rstrip(".") if isinstance(qname, (bytes, bytearray)) else str(qname)
+                        qtype_label = _dns_qtype_label(qtype)
+                        name = (
+                            qname.decode("utf-8", errors="ignore").rstrip(".")
+                            if isinstance(qname, (bytes, bytearray))
+                            else str(qname)
+                        )
                         dns_id = int(getattr(dns_layer, "id", 0) or 0)
                         transport = "-"
                         dst_port: Optional[int] = None
@@ -1525,28 +2035,59 @@ def analyze_timeline(
                             dst_port = int(getattr(tcp_layer, "dport", 0) or 0) or None
                             transport = "TCP"
                         qname_lower = name.lower()
-                        dedupe_key = ("dns-query", src_ip, dst_ip, dns_id, qname_lower, qtype)
+                        dedupe_key = (
+                            "dns-query",
+                            src_ip,
+                            dst_ip,
+                            dns_id,
+                            qname_lower,
+                            qtype,
+                        )
                         _emit_event(
                             ts=ts,
                             category="DNS",
                             summary="DNS query",
-                            details=f"{target_ip} queried {name} (type {qtype})",
+                            details=f"{target_ip} queried {name} ({qtype_label})",
                             dedupe_key=dedupe_key,
                         )
-                        query_key = (src_ip, dst_ip, dns_id, qname_lower, str(qtype), dst_port)
+                        query_key = (
+                            src_ip,
+                            dst_ip,
+                            dns_id,
+                            qname_lower,
+                            str(qtype),
+                            dst_port,
+                        )
                         if query_key not in seen_dns_queries:
                             seen_dns_queries.add(query_key)
-                            dns_queries.append(DNSQueryDetail(
-                                ts=ts,
-                                name=name,
-                                qtype=str(qtype) if qtype is not None else None,
-                                src_ip=src_ip,
-                                dst_ip=dst_ip,
-                                protocol=transport,
-                                dst_port=dst_port,
-                            ))
-                        if any(token in qname_lower for token in ("_ldap._tcp", "_kerberos._tcp", "_gc._tcp", "_msdcs")):
-                            dedupe_key = ("domain-discovery", src_ip, dst_ip, dns_id, qname_lower, qtype)
+                            dns_queries.append(
+                                DNSQueryDetail(
+                                    ts=ts,
+                                    name=name,
+                                    qtype=qtype_label if qtype is not None else None,
+                                    src_ip=src_ip,
+                                    dst_ip=dst_ip,
+                                    protocol=transport,
+                                    dst_port=dst_port,
+                                )
+                            )
+                        if any(
+                            token in qname_lower
+                            for token in (
+                                "_ldap._tcp",
+                                "_kerberos._tcp",
+                                "_gc._tcp",
+                                "_msdcs",
+                            )
+                        ):
+                            dedupe_key = (
+                                "domain-discovery",
+                                src_ip,
+                                dst_ip,
+                                dns_id,
+                                qname_lower,
+                                qtype,
+                            )
                             _emit_event(
                                 ts=ts,
                                 category="MS Domain",
@@ -1638,11 +2179,23 @@ def analyze_timeline(
                                 if proto == "Modbus" and port_key == MODBUS_TCP_PORT:
                                     parsed = _parse_modbus_command(payload)
                                     if parsed:
-                                        func_code, func_name, is_exc, unit_id, exc_desc = parsed
+                                        (
+                                            func_code,
+                                            func_name,
+                                            is_exc,
+                                            unit_id,
+                                            exc_desc,
+                                        ) = parsed
                                         label = f"Modbus {func_name}"
                                         if is_exc:
                                             label = f"Modbus exception {func_name}"
-                                        key = (proto, direction, peer_ip, port_key, label)
+                                        key = (
+                                            proto,
+                                            direction,
+                                            peer_ip,
+                                            port_key,
+                                            label,
+                                        )
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
                                             detail = f"{target_ip} -> {peer_ip}:{port_key} unit {unit_id} {func_name}"
@@ -1655,12 +2208,21 @@ def analyze_timeline(
                                                 details=detail,
                                             )
                                             cmd_event_added = True
-                                elif proto in {"ENIP", "CIP"} and port_key in {44818, 2222}:
+                                elif proto in {"ENIP", "CIP"} and port_key in {
+                                    44818,
+                                    2222,
+                                }:
                                     enip = _parse_enip_command(payload)
                                     if enip:
                                         cmd, name = enip
                                         label = name or f"ENIP cmd 0x{cmd:04x}"
-                                        key = (proto, direction, peer_ip, port_key, label)
+                                        key = (
+                                            proto,
+                                            direction,
+                                            peer_ip,
+                                            port_key,
+                                            label,
+                                        )
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
                                             _emit_event(
@@ -1674,7 +2236,13 @@ def analyze_timeline(
                                     msg = _parse_opcua_message(payload)
                                     if msg:
                                         label = f"OPC UA {msg}"
-                                        key = (proto, direction, peer_ip, port_key, label)
+                                        key = (
+                                            proto,
+                                            direction,
+                                            peer_ip,
+                                            port_key,
+                                            label,
+                                        )
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
                                             _emit_event(
@@ -1688,7 +2256,13 @@ def analyze_timeline(
                                     frame = _iec104_frame_type(payload)
                                     if frame:
                                         label = f"IEC-104 {frame}"
-                                        key = (proto, direction, peer_ip, port_key, label)
+                                        key = (
+                                            proto,
+                                            direction,
+                                            peer_ip,
+                                            port_key,
+                                            label,
+                                        )
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
                                             _emit_event(
@@ -1701,7 +2275,13 @@ def analyze_timeline(
                                 elif proto == "DNP3" and port_key == DNP3_PORT:
                                     if _dnp3_frame_seen(payload):
                                         label = "DNP3 frame"
-                                        key = (proto, direction, peer_ip, port_key, label)
+                                        key = (
+                                            proto,
+                                            direction,
+                                            peer_ip,
+                                            port_key,
+                                            label,
+                                        )
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
                                             _emit_event(
@@ -1714,7 +2294,13 @@ def analyze_timeline(
                                 elif proto == "S7" and port_key == S7_PORT:
                                     if _s7comm_seen(payload):
                                         label = "S7comm packet"
-                                        key = (proto, direction, peer_ip, port_key, label)
+                                        key = (
+                                            proto,
+                                            direction,
+                                            peer_ip,
+                                            port_key,
+                                            label,
+                                        )
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
                                             _emit_event(
@@ -1791,8 +2377,13 @@ def analyze_timeline(
                                 summary="WMIC command",
                                 details=f"{target_ip} -> {dst_ip}:{dport} {wmic_cmd}",
                             )
-                    payload_text = decode_payload(payload, encoding="latin-1") if payload else ""
-                    if payload and (dport in WINRM_PORTS or (payload_text and WSMAN_RE.search(payload_text))):
+                    payload_text = (
+                        decode_payload(payload, encoding="latin-1") if payload else ""
+                    )
+                    if payload and (
+                        dport in WINRM_PORTS
+                        or (payload_text and WSMAN_RE.search(payload_text))
+                    ):
                         winrm_cmd = _extract_winrm_command(payload)
                         if winrm_cmd:
                             key = (src_ip, dst_ip, dport, winrm_cmd)
@@ -1830,13 +2421,27 @@ def analyze_timeline(
                                 )
                     if payload and payload.startswith(b"POST "):
                         try:
-                            line = payload.split(b"\r\n", 1)[0].decode("latin-1", errors="ignore")
+                            line = payload.split(b"\r\n", 1)[0].decode(
+                                "latin-1", errors="ignore"
+                            )
                             host = "-"
                             for header in payload.split(b"\r\n"):
                                 if header.lower().startswith(b"host:"):
-                                    host = header.decode("latin-1", errors="ignore").split(":", 1)[1].strip()
+                                    host = (
+                                        header.decode("latin-1", errors="ignore")
+                                        .split(":", 1)[1]
+                                        .strip()
+                                    )
                                     break
-                            dedupe_key = ("http-post", src_ip, dst_ip, dport, seq, line, host)
+                            dedupe_key = (
+                                "http-post",
+                                src_ip,
+                                dst_ip,
+                                dport,
+                                seq,
+                                line,
+                                host,
+                            )
                             _emit_event(
                                 ts=ts,
                                 category="HTTP",
@@ -1867,7 +2472,14 @@ def analyze_timeline(
                         first_line = _decode_payload_line(payload)
                         command = _extract_email_command(service, first_line)
                         if command:
-                            action_key = (dst_ip, dport, "TCP", "outbound", service, command)
+                            action_key = (
+                                dst_ip,
+                                dport,
+                                "TCP",
+                                "outbound",
+                                service,
+                                command,
+                            )
                             if action_key not in seen_email_actions:
                                 seen_email_actions.add(action_key)
                                 _emit_event(
@@ -1910,7 +2522,15 @@ def analyze_timeline(
                             scan_first.setdefault(dst_ip, ts)
                             scan_last[dst_ip] = ts
                     if is_synack and sport:
-                        dedupe_key = ("tcp-synack", src_ip, dst_ip, sport, dport, seq, ack)
+                        dedupe_key = (
+                            "tcp-synack",
+                            src_ip,
+                            dst_ip,
+                            sport,
+                            dport,
+                            seq,
+                            ack,
+                        )
                         _emit_event(
                             ts=ts,
                             category="Connection",
@@ -1939,7 +2559,15 @@ def analyze_timeline(
                             dedupe_key=dedupe_key,
                         )
                     if is_synack and sport:
-                        dedupe_key = ("tcp-synack", src_ip, dst_ip, sport, dport, seq, ack)
+                        dedupe_key = (
+                            "tcp-synack",
+                            src_ip,
+                            dst_ip,
+                            sport,
+                            dport,
+                            seq,
+                            ack,
+                        )
                         _emit_event(
                             ts=ts,
                             category="Connection",
@@ -1992,8 +2620,13 @@ def analyze_timeline(
                                 summary="WMIC command",
                                 details=f"{src_ip} -> {target_ip}:{sport} {wmic_cmd}",
                             )
-                    payload_text = decode_payload(payload, encoding="latin-1") if payload else ""
-                    if payload and (sport in WINRM_PORTS or (payload_text and WSMAN_RE.search(payload_text))):
+                    payload_text = (
+                        decode_payload(payload, encoding="latin-1") if payload else ""
+                    )
+                    if payload and (
+                        sport in WINRM_PORTS
+                        or (payload_text and WSMAN_RE.search(payload_text))
+                    ):
                         winrm_cmd = _extract_winrm_command(payload)
                         if winrm_cmd:
                             key = (src_ip, dst_ip, sport, winrm_cmd)
@@ -2043,7 +2676,14 @@ def analyze_timeline(
                         first_line = _decode_payload_line(payload)
                         command = _extract_email_command(service, first_line)
                         if command:
-                            action_key = (src_ip, sport, "TCP", "inbound", service, command)
+                            action_key = (
+                                src_ip,
+                                sport,
+                                "TCP",
+                                "inbound",
+                                service,
+                                command,
+                            )
                             if action_key not in seen_email_actions:
                                 seen_email_actions.add(action_key)
                                 _emit_event(
@@ -2096,7 +2736,13 @@ def analyze_timeline(
                                 if proto == "DNP3" and port_key == DNP3_PORT:
                                     if _dnp3_frame_seen(payload):
                                         label = "DNP3 frame"
-                                        key = (proto, direction, peer_ip, port_key, label)
+                                        key = (
+                                            proto,
+                                            direction,
+                                            peer_ip,
+                                            port_key,
+                                            label,
+                                        )
                                         if key not in seen_ot_commands:
                                             seen_ot_commands.add(key)
                                             _emit_event(
@@ -2265,22 +2911,71 @@ def analyze_timeline(
             source="files",
         )
         if art.dst_ip == target_ip:
-            file_key = (art.protocol, art.src_ip, art.dst_ip, art.filename, art.file_type)
+            file_key = (
+                art.protocol,
+                art.src_ip,
+                art.dst_ip,
+                art.filename,
+                art.file_type,
+            )
             if file_key not in seen_file_downloads:
                 seen_file_downloads.add(file_key)
-                file_downloads.append(FileDownloadDetail(
-                    ts=ts,
-                    protocol=art.protocol,
-                    src_ip=art.src_ip,
-                    dst_ip=art.dst_ip,
-                    filename=art.filename,
-                    file_type=art.file_type,
-                    size_bytes=art.size_bytes,
-                    hostname=art.hostname,
-                    content_type=art.content_type,
-                    sha256=art.sha256,
-                    md5=art.md5,
-                ))
+                file_downloads.append(
+                    FileDownloadDetail(
+                        ts=ts,
+                        packet_number=art.packet_index,
+                        protocol=art.protocol,
+                        src_ip=art.src_ip,
+                        dst_ip=art.dst_ip,
+                        filename=art.filename,
+                        file_type=art.file_type,
+                        size_bytes=art.size_bytes,
+                        hostname=art.hostname,
+                        content_type=art.content_type,
+                        sha256=art.sha256,
+                        md5=art.md5,
+                    )
+                )
+
+    smtp_cred_seen: set[tuple[int, str, str, str, str, str]] = set()
+    for hit in creds_summary.hits:
+        kind_upper = str(hit.kind or "").upper()
+        if "SMTP" not in kind_upper:
+            continue
+        if hit.src_ip != target_ip and hit.dst_ip != target_ip:
+            continue
+        secret_text = str(hit.secret or "").strip()
+        user_text = str(hit.username or "").strip()
+        evidence_text = str(hit.evidence or "").strip()
+        dedupe_key = (
+            int(hit.packet_number or 0),
+            str(hit.src_ip),
+            str(hit.dst_ip),
+            str(hit.kind),
+            user_text,
+            secret_text,
+        )
+        if dedupe_key in smtp_cred_seen:
+            continue
+        smtp_cred_seen.add(dedupe_key)
+        packet_ts = index_ts.get(int(hit.packet_number or 0))
+        if packet_ts is None:
+            packet_ts = hit.ts
+        details = (
+            f"{hit.src_ip} -> {hit.dst_ip} {hit.protocol} "
+            f"{hit.kind} user={user_text or '-'} secret={secret_text or '-'}"
+        )
+        if evidence_text:
+            details = f"{details} evidence={evidence_text}"
+        _emit_event(
+            ts=packet_ts,
+            category="Email",
+            summary="SMTP credential artifact",
+            details=details,
+            dedupe_key=("smtp-cred",) + dedupe_key,
+            packet_index=hit.packet_number,
+            source="creds",
+        )
 
     for dst_ip, ports in scan_ports.items():
         if len(ports) >= 100:
@@ -2296,7 +2991,12 @@ def analyze_timeline(
                 details=f"{target_ip} -> {dst_ip} touched {len(ports)} ports over {duration}",
             )
 
-    for (client_ip, server_ip, client_port, server_port), handshakes in tcp_handshakes.items():
+    for (
+        client_ip,
+        server_ip,
+        client_port,
+        server_port,
+    ), handshakes in tcp_handshakes.items():
         for handshake in handshakes:
             if handshake["syn"] is None or handshake["synack"] is None:
                 continue
@@ -2381,7 +3081,12 @@ def analyze_timeline(
             for cmd_event in iec_summary.command_events:
                 if cmd_event.src != target_ip and cmd_event.dst != target_ip:
                     continue
-                key = (cmd_event.src, cmd_event.dst, cmd_event.command, int(cmd_event.ts or 0))
+                key = (
+                    cmd_event.src,
+                    cmd_event.dst,
+                    cmd_event.command,
+                    int(cmd_event.ts or 0),
+                )
                 if key in seen_cmds:
                     continue
                 seen_cmds.add(key)
@@ -2421,7 +3126,12 @@ def analyze_timeline(
             for cmd_event in s7_summary.command_events:
                 if cmd_event.src != target_ip and cmd_event.dst != target_ip:
                     continue
-                key = (cmd_event.src, cmd_event.dst, cmd_event.command, int(cmd_event.ts or 0))
+                key = (
+                    cmd_event.src,
+                    cmd_event.dst,
+                    cmd_event.command,
+                    int(cmd_event.ts or 0),
+                )
                 if key in seen_cmds:
                     continue
                 seen_cmds.add(key)
@@ -2436,34 +3146,93 @@ def analyze_timeline(
     if categories is not None:
         events = [event for event in events if event.category in categories]
         if ot_protocol_counts:
-            ot_protocol_counts = Counter({
-                name: count for name, count in ot_protocol_counts.items()
-                if name in categories
-            })
+            ot_protocol_counts = Counter(
+                {
+                    name: count
+                    for name, count in ot_protocol_counts.items()
+                    if name in categories
+                }
+            )
 
     events.sort(key=lambda item: (item.ts is None, item.ts))
     category_counts = Counter(event.category for event in events)
     duration = None
     if first_seen is not None and last_seen is not None:
         duration = max(0.0, last_seen - first_seen)
-    ot_activity_bins, ot_bin_count = _compute_ot_activity_bins(events, first_seen, last_seen, bins=max(4, timeline_bins))
-    non_ot_bins, non_ot_bin_count = _compute_non_ot_activity_bins(events, first_seen, last_seen, bins=max(4, timeline_bins))
-    ot_risk_score, ot_risk_findings = _compute_ot_risk_posture(events, target_ip)
-    ot_storyline = [] if timeline_storyline_off else _compute_ot_storyline(
-        events,
-        target_ip,
-        dict(ot_protocol_counts),
-        ot_risk_score,
-        ot_risk_findings,
+    ot_activity_bins, ot_bin_count = _compute_ot_activity_bins(
+        events, first_seen, last_seen, bins=max(4, timeline_bins)
     )
-    hunt_context = _build_timeline_hunting_context(events, target_ip, file_downloads, ot_risk_score, ot_risk_findings)
+    non_ot_bins, non_ot_bin_count = _compute_non_ot_activity_bins(
+        events, first_seen, last_seen, bins=max(4, timeline_bins)
+    )
+    ot_risk_score, ot_risk_findings = _compute_ot_risk_posture(events, target_ip)
+    ot_storyline = (
+        []
+        if timeline_storyline_off
+        else _compute_ot_storyline(
+            events,
+            target_ip,
+            dict(ot_protocol_counts),
+            ot_risk_score,
+            ot_risk_findings,
+        )
+    )
+    hunt_context = _build_timeline_hunting_context(
+        events, target_ip, file_downloads, ot_risk_score, ot_risk_findings
+    )
+
+    timeline_vt_results: dict[str, dict[str, object]] = {}
+    timeline_vt_errors: list[str] = []
+    if vt_lookup:
+        api_key = os.environ.get("VT_API_KEY")
+        if not api_key:
+            timeline_vt_errors.append(
+                "VT_API_KEY is not set; skipping VirusTotal lookups."
+            )
+        else:
+            lookup_domains: list[str] = []
+            seen_lookup: set[str] = set()
+            for query in dns_queries:
+                raw_name = str(query.name or "").strip(".").lower()
+                if not raw_name:
+                    continue
+                for candidate in (raw_name, _dns_base_domain(raw_name)):
+                    if not candidate or candidate in seen_lookup:
+                        continue
+                    seen_lookup.add(candidate)
+                    lookup_domains.append(candidate)
+            try:
+                with build_statusbar(
+                    path, enabled=show_status, desc="VirusTotal lookups"
+                ) as vt_status:
+                    vt_status.update(0)
+
+                    def _vt_progress(done: int, total: int, _domain: str) -> None:
+                        pct = 100 if total <= 0 else int((done / total) * 100)
+                        vt_status.update(pct)
+
+                    vt_results, vt_errors = _vt_lookup_domains(
+                        lookup_domains, api_key, progress_cb=_vt_progress
+                    )
+                timeline_vt_results = {
+                    str(name).strip().lower(): dict(result)
+                    for name, result in dict(vt_results or {}).items()
+                    if str(name).strip()
+                }
+                timeline_vt_errors = [
+                    str(err) for err in list(vt_errors or []) if str(err).strip()
+                ]
+            except Exception as exc:
+                timeline_vt_errors.append(
+                    f"VirusTotal lookup failed: {type(exc).__name__}: {exc}"
+                )
 
     return TimelineSummary(
         path=path,
         target_ip=target_ip,
         total_packets=total_packets,
         events=events,
-        errors=errors + file_summary.errors,
+        errors=errors + file_summary.errors + creds_summary.errors,
         first_seen=first_seen,
         last_seen=last_seen,
         duration=duration,
@@ -2479,21 +3248,36 @@ def analyze_timeline(
         ot_risk_findings=ot_risk_findings,
         ot_storyline=ot_storyline,
         dns_queries=sorted(dns_queries, key=lambda item: (item.ts is None, item.ts)),
-        file_downloads=sorted(file_downloads, key=lambda item: (item.ts is None, item.ts)),
+        file_downloads=sorted(
+            file_downloads, key=lambda item: (item.ts is None, item.ts)
+        ),
         analyst_verdict=str(hunt_context.get("analyst_verdict", "")),
         analyst_confidence=str(hunt_context.get("analyst_confidence", "low")),
-        analyst_reasons=[str(v) for v in list(hunt_context.get("analyst_reasons", []) or [])],
+        analyst_reasons=[
+            str(v) for v in list(hunt_context.get("analyst_reasons", []) or [])
+        ],
         deterministic_checks={
             str(k): [str(v) for v in list(values or [])]
-            for k, values in dict(hunt_context.get("deterministic_checks", {}) or {}).items()
+            for k, values in dict(
+                hunt_context.get("deterministic_checks", {}) or {}
+            ).items()
         },
         sequence_timeline=list(hunt_context.get("sequence_timeline", []) or []),
-        sequence_violations=[str(v) for v in list(hunt_context.get("sequence_violations", []) or [])],
+        sequence_violations=[
+            str(v) for v in list(hunt_context.get("sequence_violations", []) or [])
+        ],
         beacon_candidates=list(hunt_context.get("beacon_candidates", []) or []),
         auth_abuse_profiles=list(hunt_context.get("auth_abuse_profiles", []) or []),
-        lateral_movement_paths=list(hunt_context.get("lateral_movement_paths", []) or []),
+        lateral_movement_paths=list(
+            hunt_context.get("lateral_movement_paths", []) or []
+        ),
         exfiltration_chains=list(hunt_context.get("exfiltration_chains", []) or []),
         ot_impact_signals=list(hunt_context.get("ot_impact_signals", []) or []),
         evidence_anchors=list(hunt_context.get("evidence_anchors", []) or []),
-        benign_context=[str(v) for v in list(hunt_context.get("benign_context", []) or [])],
+        benign_context=[
+            str(v) for v in list(hunt_context.get("benign_context", []) or [])
+        ],
+        vt_lookup_enabled=bool(vt_lookup),
+        vt_results=timeline_vt_results,
+        vt_errors=timeline_vt_errors,
     )

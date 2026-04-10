@@ -1,25 +1,25 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict, OrderedDict
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional
+import ipaddress
+import json
 import math
 import os
-import json
+import re
 import time
 import urllib.error
 import urllib.request
-import ipaddress
-import re
+from collections import Counter, OrderedDict, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
 
 from .pcap_cache import PcapMeta, get_reader
-
-from .utils import safe_float, decode_payload, counter_inc, set_add_cap, setdict_add
+from .progress import build_statusbar
+from .utils import counter_inc, decode_payload, safe_float, set_add_cap, setdict_add
 
 try:
     from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore
-    from scapy.layers.inet import IP, UDP, TCP  # type: ignore
+    from scapy.layers.inet import IP, TCP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
 except Exception:  # pragma: no cover
     DNS = None  # type: ignore
@@ -115,7 +115,9 @@ OT_KEYWORDS = [
     "omron",
 ]
 
-OT_KEYWORD_RE = re.compile("|".join(re.escape(token) for token in OT_KEYWORDS), re.IGNORECASE)
+OT_KEYWORD_RE = re.compile(
+    "|".join(re.escape(token) for token in OT_KEYWORDS), re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
@@ -183,6 +185,7 @@ class DnsSummary:
     transaction_violations: list[dict[str, object]] = field(default_factory=list)
     amplification_candidates: list[dict[str, object]] = field(default_factory=list)
     timeline: list[dict[str, object]] = field(default_factory=list)
+    periodicity_profiles: list[dict[str, object]] = field(default_factory=list)
     benign_context: list[str] = field(default_factory=list)
 
 
@@ -241,7 +244,9 @@ def _vt_rating(stats: dict[str, object]) -> str:
     return "unknown"
 
 
-def _vt_lookup_domain(domain: str, api_key: str) -> tuple[Optional[dict[str, object]], Optional[str]]:
+def _vt_lookup_domain(
+    domain: str, api_key: str
+) -> tuple[Optional[dict[str, object]], Optional[str]]:
     url = f"https://www.virustotal.com/api/v3/domains/{domain}"
     headers = {"x-apikey": api_key}
     req = urllib.request.Request(url, headers=headers)
@@ -277,7 +282,11 @@ def _vt_lookup_domain(domain: str, api_key: str) -> tuple[Optional[dict[str, obj
     return result, None
 
 
-def _vt_lookup_domains(domains: list[str], api_key: str) -> tuple[dict[str, dict[str, object]], list[str]]:
+def _vt_lookup_domains(
+    domains: list[str],
+    api_key: str,
+    progress_cb: Callable[[int, int, str], None] | None = None,
+) -> tuple[dict[str, dict[str, object]], list[str]]:
     results: dict[str, dict[str, object]] = {}
     errors: list[str] = []
     if not domains:
@@ -287,28 +296,45 @@ def _vt_lookup_domains(domains: list[str], api_key: str) -> tuple[dict[str, dict
     if max_lookups <= 0:
         max_lookups = len(domains)
 
-    for idx, domain in enumerate(domains):
-        if idx >= max_lookups:
-            errors.append(
-                f"VT lookups capped at {max_lookups} domains (set PCAPPER_VT_MAX_LOOKUPS to raise)."
-            )
-            break
-        if not domain or domain in results:
+    ordered_domains: list[str] = []
+    seen_domains: set[str] = set()
+    for domain in domains:
+        domain_text = str(domain or "").strip().lower()
+        if not domain_text or domain_text in seen_domains:
             continue
+        seen_domains.add(domain_text)
+        ordered_domains.append(domain_text)
+
+    if len(ordered_domains) > max_lookups:
+        errors.append(
+            f"VT lookups capped at {max_lookups} domains (set PCAPPER_VT_MAX_LOOKUPS to raise)."
+        )
+        ordered_domains = ordered_domains[:max_lookups]
+
+    total = len(ordered_domains)
+    if total == 0:
+        return results, errors
+
+    for idx, domain in enumerate(ordered_domains, start=1):
         cached = _VT_CACHE.get(domain)
         if cached is not None:
             _VT_CACHE.move_to_end(domain)
             results[domain] = cached
-            continue
-        vt_result, err = _vt_lookup_domain(domain, api_key)
-        if vt_result:
-            results[domain] = vt_result
-            _VT_CACHE[domain] = vt_result
-            if len(_VT_CACHE) > MAX_VT_CACHE:
-                _VT_CACHE.popitem(last=False)
-        if err:
-            errors.append(err)
-        if idx > 0:
+        else:
+            vt_result, err = _vt_lookup_domain(domain, api_key)
+            if vt_result:
+                results[domain] = vt_result
+                _VT_CACHE[domain] = vt_result
+                if len(_VT_CACHE) > MAX_VT_CACHE:
+                    _VT_CACHE.popitem(last=False)
+            if err:
+                errors.append(err)
+        if progress_cb is not None:
+            try:
+                progress_cb(idx, total, domain)
+            except Exception:
+                pass
+        if idx > 1:
             time.sleep(0.05)
     return results, errors
 
@@ -399,13 +425,15 @@ def analyze_dns(
     mdns_error_responses = 0
     mdns_unicast_packets = 0
     udp_multicast_packets = 0
-    multicast_streams: dict[tuple[str, str, int], dict[str, object]] = defaultdict(lambda: {
-        "count": 0,
-        "bytes": 0,
-        "sources": Counter(),
-        "first_seen": None,
-        "last_seen": None,
-    })
+    multicast_streams: dict[tuple[str, str, int], dict[str, object]] = defaultdict(
+        lambda: {
+            "count": 0,
+            "bytes": 0,
+            "sources": Counter(),
+            "first_seen": None,
+            "last_seen": None,
+        }
+    )
     mdns_qname_counts: Counter[str] = Counter()
     mdns_service_counts: Counter[str] = Counter()
     mdns_client_counts: Counter[str] = Counter()
@@ -432,6 +460,8 @@ def analyze_dns(
     txt_query_names: set[str] = set()
     client_unique_qnames: dict[str, set[str]] = defaultdict(set)
     client_entropy_scores: dict[str, list[float]] = defaultdict(list)
+    qname_query_times: dict[str, list[float]] = defaultdict(list)
+    client_qname_times: dict[tuple[str, str], list[float]] = defaultdict(list)
     client_long_queries: Counter[str] = Counter()
     client_txt_queries: Counter[str] = Counter()
     client_nxdomain: Counter[str] = Counter()
@@ -463,6 +493,8 @@ def analyze_dns(
         "resolver_policy_violation": [],
         "dnssec_or_integrity_anomaly": [],
         "amplification_abuse_signal": [],
+        "opcode_or_any_abuse": [],
+        "dns_beaconing_periodicity": [],
         "likely_benign_cdn_rotation": [],
     }
     timeline: list[dict[str, object]] = []
@@ -612,7 +644,10 @@ def analyze_dns(
                         stream["bytes"] = int(stream["bytes"]) + pkt_len
                         counter_inc(stream["sources"], src_ip)  # type: ignore[index]
                         if ts is not None:
-                            if stream["first_seen"] is None or ts < stream["first_seen"]:  # type: ignore[operator]
+                            if (
+                                stream["first_seen"] is None
+                                or ts < stream["first_seen"]
+                            ):  # type: ignore[operator]
                                 stream["first_seen"] = ts
                             if stream["last_seen"] is None or ts > stream["last_seen"]:  # type: ignore[operator]
                                 stream["last_seen"] = ts
@@ -654,7 +689,9 @@ def analyze_dns(
                         continue
                     raw_name = qd.qname
                     name = decode_payload(
-                        raw_name if isinstance(raw_name, (bytes, bytearray)) else str(raw_name).encode("utf-8", errors="ignore"),
+                        raw_name
+                        if isinstance(raw_name, (bytes, bytearray))
+                        else str(raw_name).encode("utf-8", errors="ignore"),
                         encoding="utf-8",
                     )
                     name = name.strip(".")
@@ -675,15 +712,38 @@ def analyze_dns(
                             entropy_val = int(_shannon_entropy(name) * 100)
                             qname_entropy[name] = entropy_val
                             if src_ip:
-                                client_entropy_scores[src_ip].append(entropy_val / 100.0)
+                                client_entropy_scores[src_ip].append(
+                                    entropy_val / 100.0
+                                )
                         if name in qname_lengths or len(qname_lengths) < MAX_DNS_UNIQUE:
                             qname_lengths[name] = len(name)
                         if is_mdns:
                             counter_inc(mdns_qname_counts, name)
                         if src_ip and getattr(dns_layer, "qr", 0) == 0:
-                            setdict_add(client_unique_qnames, src_ip, name, max_values=MAX_DNS_UNIQUE)
+                            setdict_add(
+                                client_unique_qnames,
+                                src_ip,
+                                name,
+                                max_values=MAX_DNS_UNIQUE,
+                            )
                             if len(name) >= 50:
                                 counter_inc(client_long_queries, src_ip)
+                            if ts is not None:
+                                if (
+                                    name in qname_query_times
+                                    or len(qname_query_times) < MAX_DNS_UNIQUE
+                                ):
+                                    q_times = qname_query_times[name]
+                                    if len(q_times) < 512:
+                                        q_times.append(ts)
+                                pair_key = (src_ip, name)
+                                if (
+                                    pair_key in client_qname_times
+                                    or len(client_qname_times) < MAX_DNS_UNIQUE
+                                ):
+                                    cq_times = client_qname_times[pair_key]
+                                    if len(cq_times) < 256:
+                                        cq_times.append(ts)
                     qtype = getattr(qd, "qtype", None)
                     if qtype is not None:
                         counter_inc(qtype_counts, int(qtype))
@@ -691,7 +751,9 @@ def analyze_dns(
                         if is_mdns:
                             counter_inc(mdns_qtype_counts, int(qtype))
                         if int(qtype) in {251, 252} and name:
-                            set_add_cap(zone_transfer_requests, name, max_size=MAX_DNS_UNIQUE)
+                            set_add_cap(
+                                zone_transfer_requests, name, max_size=MAX_DNS_UNIQUE
+                            )
                         if int(qtype) == 16 and name:
                             set_add_cap(txt_query_names, name, max_size=MAX_DNS_UNIQUE)
                             if src_ip:
@@ -718,20 +780,40 @@ def analyze_dns(
                             rrname = getattr(rr, "rrname", None)
                             rdata = getattr(rr, "rdata", None)
                             if rrname is not None and rdata is not None:
-                                rrname_bytes = rrname if isinstance(rrname, (bytes, bytearray)) else str(rrname).encode("utf-8", errors="ignore")
-                                rrname_str = decode_payload(rrname_bytes, encoding="utf-8").strip(".")
-                                setdict_add(answers_by_qname, rrname_str, str(rdata), max_values=MAX_DNS_UNIQUE)
+                                rrname_bytes = (
+                                    rrname
+                                    if isinstance(rrname, (bytes, bytearray))
+                                    else str(rrname).encode("utf-8", errors="ignore")
+                                )
+                                rrname_str = decode_payload(
+                                    rrname_bytes, encoding="utf-8"
+                                ).strip(".")
+                                setdict_add(
+                                    answers_by_qname,
+                                    rrname_str,
+                                    str(rdata),
+                                    max_values=MAX_DNS_UNIQUE,
+                                )
                                 rr_ttl = int(getattr(rr, "ttl", 0) or 0)
                                 if rr_ttl > 0:
                                     qname_ttl_values[rrname_str].append(rr_ttl)
                                 if rrtype in {1, 28}:  # A or AAAA
-                                    setdict_add(base_domain_answers, _base_domain(rrname_str), str(rdata), max_values=MAX_DNS_UNIQUE)
+                                    setdict_add(
+                                        base_domain_answers,
+                                        _base_domain(rrname_str),
+                                        str(rdata),
+                                        max_values=MAX_DNS_UNIQUE,
+                                    )
                                     try:
                                         ip_val = ipaddress.ip_address(str(rdata))
                                         if ip_val.is_private:
-                                            base_domain_priv_pub[_base_domain(rrname_str)].add("private")
+                                            base_domain_priv_pub[
+                                                _base_domain(rrname_str)
+                                            ].add("private")
                                         elif ip_val.is_global:
-                                            base_domain_priv_pub[_base_domain(rrname_str)].add("public")
+                                            base_domain_priv_pub[
+                                                _base_domain(rrname_str)
+                                            ].add("public")
                                     except Exception:
                                         pass
                                 if is_mdns:
@@ -743,14 +825,23 @@ def analyze_dns(
                                     except Exception:
                                         target = str(rdata)
                                     if target:
-                                        set_add_cap(cname_targets[rrname_str], target, max_size=MAX_DNS_UNIQUE)
+                                        set_add_cap(
+                                            cname_targets[rrname_str],
+                                            target,
+                                            max_size=MAX_DNS_UNIQUE,
+                                        )
                                     if rrtype == 12:
                                         try:
                                             service_name = str(rdata).strip(".")
                                         except Exception:
                                             service_name = str(rdata)
-                                        if service_name and ("_tcp" in service_name or "_udp" in service_name):
-                                            counter_inc(mdns_service_counts, service_name)
+                                        if service_name and (
+                                            "_tcp" in service_name
+                                            or "_udp" in service_name
+                                        ):
+                                            counter_inc(
+                                                mdns_service_counts, service_name
+                                            )
                     except Exception:
                         pass
 
@@ -777,7 +868,11 @@ def analyze_dns(
         min_size = min(sizes) if sizes else 0
         max_size = max(sizes) if sizes else 0
         pct = (count / total_packets) * 100 if total_packets else 0.0
-        rate = (count / duration_seconds) if duration_seconds and duration_seconds > 0 else 0.0
+        rate = (
+            (count / duration_seconds)
+            if duration_seconds and duration_seconds > 0
+            else 0.0
+        )
 
         burst_rate = 0.0
         burst_start = None
@@ -792,17 +887,19 @@ def analyze_dns(
                     burst_rate = float(window_count)
                     burst_start = times[left]
 
-        packet_length_stats.append({
-            "bucket": label,
-            "count": count,
-            "avg": avg_size,
-            "min": min_size,
-            "max": max_size,
-            "rate": rate,
-            "pct": pct,
-            "burst_rate": burst_rate,
-            "burst_start": burst_start,
-        })
+        packet_length_stats.append(
+            {
+                "bucket": label,
+                "count": count,
+                "avg": avg_size,
+                "min": min_size,
+                "max": max_size,
+                "rate": rate,
+                "pct": pct,
+                "burst_rate": burst_rate,
+                "burst_start": burst_start,
+            }
+        )
 
     query_size_stats = _size_stats(query_sizes)
     response_size_stats = _size_stats(response_sizes)
@@ -812,74 +909,88 @@ def analyze_dns(
 
     detections: list[dict[str, str | list[tuple[str, int]] | int]] = []
     if total_packets == 0:
-        detections.append({
-            "type": "no_dns",
-            "severity": "info",
-            "summary": "No DNS traffic detected",
-            "details": "DNS not observed in capture.",
-        })
+        detections.append(
+            {
+                "type": "no_dns",
+                "severity": "info",
+                "summary": "No DNS traffic detected",
+                "details": "DNS not observed in capture.",
+            }
+        )
     else:
         if duration_seconds and duration_seconds > 0:
             pps = total_packets / duration_seconds
             if pps > 2000:
-                detections.append({
-                    "type": "dns_flood",
-                    "severity": "warning",
-                    "summary": f"High DNS rate observed ({pps:.1f} pkt/s)",
-                    "details": "Excessive DNS traffic may indicate abuse or misconfiguration.",
-                    "top_clients": client_counts.most_common(3),
-                    "top_servers": server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "dns_flood",
+                        "severity": "warning",
+                        "summary": f"High DNS rate observed ({pps:.1f} pkt/s)",
+                        "details": "Excessive DNS traffic may indicate abuse or misconfiguration.",
+                        "top_clients": client_counts.most_common(3),
+                        "top_servers": server_counts.most_common(3),
+                    }
+                )
 
         nxdomain = rcode_counts.get("3", 0)
         if nxdomain > 100 and total_packets > 0 and (nxdomain / total_packets) > 0.3:
-            detections.append({
-                "type": "dns_nxdomain",
-                "severity": "warning",
-                "summary": f"High NXDOMAIN rate ({nxdomain} responses)",
-                "details": "Potential DGA, misconfiguration, or scanning.",
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_nxdomain",
+                    "severity": "warning",
+                    "summary": f"High NXDOMAIN rate ({nxdomain} responses)",
+                    "details": "Potential DGA, misconfiguration, or scanning.",
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
             deterministic_checks["dga_like_behavior"].append(
                 f"NXDOMAIN ratio high: {nxdomain}/{total_packets}"
             )
 
         servfail = rcode_counts.get("2", 0)
         if servfail > 50 and total_packets > 0 and (servfail / total_packets) > 0.2:
-            detections.append({
-                "type": "dns_servfail",
-                "severity": "warning",
-                "summary": f"High SERVFAIL rate ({servfail} responses)",
-                "details": "Resolver errors or upstream issues observed.",
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_servfail",
+                    "severity": "warning",
+                    "summary": f"High SERVFAIL rate ({servfail} responses)",
+                    "details": "Resolver errors or upstream issues observed.",
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
 
         refused = rcode_counts.get("5", 0)
         if refused > 50 and total_packets > 0 and (refused / total_packets) > 0.2:
-            detections.append({
-                "type": "dns_refused",
-                "severity": "warning",
-                "summary": f"High REFUSED rate ({refused} responses)",
-                "details": "Possible scanning or access control enforcement.",
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_refused",
+                    "severity": "warning",
+                    "summary": f"High REFUSED rate ({refused} responses)",
+                    "details": "Possible scanning or access control enforcement.",
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
 
         suspicious_qnames = [
-            name for name, count in qname_counts.items()
-            if qname_lengths.get(name, 0) > 50 or (qname_entropy.get(name, 0) / 100) > 4.0
+            name
+            for name, count in qname_counts.items()
+            if qname_lengths.get(name, 0) > 50
+            or (qname_entropy.get(name, 0) / 100) > 4.0
         ]
         if len(suspicious_qnames) > 30:
-            detections.append({
-                "type": "dns_tunnel_indicator",
-                "severity": "warning",
-                "summary": "Potential DNS tunneling behavior",
-                "details": "Many long/high-entropy query names detected.",
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_tunnel_indicator",
+                    "severity": "warning",
+                    "summary": "Potential DNS tunneling behavior",
+                    "details": "Many long/high-entropy query names detected.",
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
             deterministic_checks["dns_tunneling_indicators"].append(
                 f"High-entropy/long qnames count={len(suspicious_qnames)}"
             )
@@ -899,158 +1010,216 @@ def analyze_dns(
                     f"{client} unique_ratio={ratio:.2f} entropy={avg_entropy:.2f} long={long_q} nxdomain={nx_count}"
                 )
         if client_suspects:
-            detections.append({
-                "type": "dns_client_dga",
-                "severity": "warning",
-                "summary": "Clients with DGA/tunnel-like DNS patterns",
-                "details": "; ".join(client_suspects[:6]),
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_client_dga",
+                    "severity": "warning",
+                    "summary": "Clients with DGA/tunnel-like DNS patterns",
+                    "details": "; ".join(client_suspects[:6]),
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
             deterministic_checks["dga_like_behavior"].extend(client_suspects[:8])
 
         for base, count in base_domain_counts.items():
             if count > 1000:
-                detections.append({
-                    "type": "dns_domain_concentration",
-                    "severity": "info",
-                    "summary": f"High query volume for {base} ({count} queries)",
-                    "details": "Check for beaconing or resolver issues.",
-                    "top_clients": client_counts.most_common(3),
-                    "top_servers": server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "dns_domain_concentration",
+                        "severity": "info",
+                        "summary": f"High query volume for {base} ({count} queries)",
+                        "details": "Check for beaconing or resolver issues.",
+                        "top_clients": client_counts.most_common(3),
+                        "top_servers": server_counts.most_common(3),
+                    }
+                )
                 break
 
         for qname, answers in answers_by_qname.items():
             if len(answers) >= 6:
-                detections.append({
-                    "type": "dns_poisoning_indicator",
-                    "severity": "warning",
-                    "summary": f"Multiple answers observed for {qname}",
-                    "details": f"Observed {len(answers)} distinct answers; verify expected CDN/rotation.",
-                    "top_clients": client_counts.most_common(3),
-                    "top_servers": server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "dns_poisoning_indicator",
+                        "severity": "warning",
+                        "summary": f"Multiple answers observed for {qname}",
+                        "details": f"Observed {len(answers)} distinct answers; verify expected CDN/rotation.",
+                        "top_clients": client_counts.most_common(3),
+                        "top_servers": server_counts.most_common(3),
+                    }
+                )
                 break
 
         for base, answers in base_domain_answers.items():
             if len(answers) >= 10:
-                detections.append({
-                    "type": "dns_fast_flux",
-                    "severity": "warning",
-                    "summary": f"Fast-flux indicator for {base}",
-                    "details": f"Observed {len(answers)} unique A/AAAA answers.",
-                    "top_clients": client_counts.most_common(3),
-                    "top_servers": server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "dns_fast_flux",
+                        "severity": "warning",
+                        "summary": f"Fast-flux indicator for {base}",
+                        "details": f"Observed {len(answers)} unique A/AAAA answers.",
+                        "top_clients": client_counts.most_common(3),
+                        "top_servers": server_counts.most_common(3),
+                    }
+                )
                 break
 
         rebinding_domains = [
-            base for base, flags in base_domain_priv_pub.items()
+            base
+            for base, flags in base_domain_priv_pub.items()
             if "private" in flags and "public" in flags
         ]
         if rebinding_domains:
             sample = ", ".join(sorted(rebinding_domains)[:5])
-            detections.append({
-                "type": "dns_rebinding",
-                "severity": "warning",
-                "summary": "Potential DNS rebinding behavior",
-                "details": f"Domains with both private and public answers: {sample}",
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_rebinding",
+                    "severity": "warning",
+                    "summary": "Potential DNS rebinding behavior",
+                    "details": f"Domains with both private and public answers: {sample}",
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
             deterministic_checks["fast_flux_or_rebinding"].append(
                 f"Rebinding domains: {sample}"
             )
 
         if zone_transfer_requests:
             sample = ", ".join(sorted(list(zone_transfer_requests))[:5])
-            detections.append({
-                "type": "dns_zone_transfer",
-                "severity": "warning",
-                "summary": "Zone transfer attempt detected",
-                "details": f"AXFR/IXFR requested for: {sample}",
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_zone_transfer",
+                    "severity": "warning",
+                    "summary": "Zone transfer attempt detected",
+                    "details": f"AXFR/IXFR requested for: {sample}",
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
             deterministic_checks["zone_transfer_attempt"].append(sample)
 
         txt_queries = qtype_counts.get(16, 0)
-        if txt_queries > 100 and total_packets > 0 and (txt_queries / total_packets) > 0.2:
+        if (
+            txt_queries > 100
+            and total_packets > 0
+            and (txt_queries / total_packets) > 0.2
+        ):
             txt_sample = ", ".join(sorted(list(txt_query_names))[:5])
-            txt_details = "TXT-heavy traffic can indicate data exfiltration or policy misuse."
+            txt_details = (
+                "TXT-heavy traffic can indicate data exfiltration or policy misuse."
+            )
             if txt_sample:
                 txt_details += f" Sample TXT names: {txt_sample}"
-            detections.append({
-                "type": "dns_txt_exfil",
-                "severity": "warning",
-                "summary": f"High TXT query volume ({txt_queries} queries)",
-                "details": txt_details,
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_txt_exfil",
+                    "severity": "warning",
+                    "summary": f"High TXT query volume ({txt_queries} queries)",
+                    "details": txt_details,
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
             deterministic_checks["dns_tunneling_indicators"].append(
                 f"TXT-heavy ratio: {txt_queries}/{total_packets}"
             )
 
         ptr_queries = qtype_counts.get(12, 0)
-        if ptr_queries > 50 and total_packets > 0 and (ptr_queries / total_packets) > 0.2:
+        if (
+            ptr_queries > 50
+            and total_packets > 0
+            and (ptr_queries / total_packets) > 0.2
+        ):
             ptr_names = [
-                name for name in qname_counts.keys()
+                name
+                for name in qname_counts.keys()
                 if name.endswith("in-addr.arpa") or name.endswith("ip6.arpa")
             ]
             ptr_sample = ", ".join(sorted(ptr_names)[:5])
             details = "High PTR/reverse lookup volume may indicate scanning or asset discovery."
             if ptr_sample:
                 details += f" Sample PTR names: {ptr_sample}"
-            detections.append({
-                "type": "dns_ptr_sweep",
-                "severity": "warning",
-                "summary": f"High PTR query volume ({ptr_queries} queries)",
-                "details": details,
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_ptr_sweep",
+                    "severity": "warning",
+                    "summary": f"High PTR query volume ({ptr_queries} queries)",
+                    "details": details,
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
 
         any_queries = qtype_counts.get(255, 0)
         if any_queries > 20:
-            detections.append({
-                "type": "dns_any_abuse",
-                "severity": "warning",
-                "summary": f"ANY query usage observed ({any_queries})",
-                "details": "ANY queries can indicate reconnaissance or amplification abuse.",
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_any_abuse",
+                    "severity": "warning",
+                    "summary": f"ANY query usage observed ({any_queries})",
+                    "details": "ANY queries can indicate reconnaissance or amplification abuse.",
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
+            deterministic_checks["opcode_or_any_abuse"].append(
+                f"ANY query volume observed count={int(any_queries)}"
+            )
 
         common_qtypes = {1, 2, 5, 6, 12, 15, 16, 28, 33, 41, 255}
-        unusual_qtypes = [(qtype, count) for qtype, count in qtype_counts.items() if qtype not in common_qtypes]
+        unusual_qtypes = [
+            (qtype, count)
+            for qtype, count in qtype_counts.items()
+            if qtype not in common_qtypes
+        ]
         if unusual_qtypes:
             unusual_total = sum(count for _, count in unusual_qtypes)
             if unusual_total >= 20:
                 top_unusual = ", ".join(
-                    f"{qtype}({count})" for qtype, count in sorted(unusual_qtypes, key=lambda x: x[1], reverse=True)[:6]
+                    f"{qtype}({count})"
+                    for qtype, count in sorted(
+                        unusual_qtypes, key=lambda x: x[1], reverse=True
+                    )[:6]
                 )
-                detections.append({
-                    "type": "dns_unusual_qtypes",
-                    "severity": "info",
-                    "summary": "Unusual DNS query record types observed",
-                    "details": f"Uncommon qtypes: {top_unusual}",
-                    "top_clients": client_counts.most_common(3),
-                    "top_servers": server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "dns_unusual_qtypes",
+                        "severity": "info",
+                        "summary": "Unusual DNS query record types observed",
+                        "details": f"Uncommon qtypes: {top_unusual}",
+                        "top_clients": client_counts.most_common(3),
+                        "top_servers": server_counts.most_common(3),
+                    }
+                )
 
         if opcode_counts:
-            non_query = sum(count for opcode, count in opcode_counts.items() if int(opcode) != 0)
+            non_query = sum(
+                count for opcode, count in opcode_counts.items() if int(opcode) != 0
+            )
             if non_query:
-                detections.append({
-                    "type": "dns_opcode",
-                    "severity": "warning",
-                    "summary": "Non-standard DNS opcodes observed",
-                    "details": ", ".join(f"{opcode}({count})" for opcode, count in opcode_counts.items() if int(opcode) != 0),
-                    "top_clients": client_counts.most_common(3),
-                    "top_servers": server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "dns_opcode",
+                        "severity": "warning",
+                        "summary": "Non-standard DNS opcodes observed",
+                        "details": ", ".join(
+                            f"{opcode}({count})"
+                            for opcode, count in opcode_counts.items()
+                            if int(opcode) != 0
+                        ),
+                        "top_clients": client_counts.most_common(3),
+                        "top_servers": server_counts.most_common(3),
+                    }
+                )
+                deterministic_checks["opcode_or_any_abuse"].append(
+                    "Non-standard opcodes observed: "
+                    + ", ".join(
+                        f"{opcode}({count})"
+                        for opcode, count in opcode_counts.items()
+                        if int(opcode) != 0
+                    )
+                )
 
         notify_count = int(opcode_counts.get(4, 0) or 0)
         update_count = int(opcode_counts.get(5, 0) or 0)
@@ -1060,86 +1229,104 @@ def analyze_dns(
                 details.append(f"NOTIFY({notify_count})")
             if update_count:
                 details.append(f"UPDATE({update_count})")
-            detections.append({
-                "type": "dns_dynamic_updates",
-                "severity": "warning",
-                "summary": "DNS zone change opcodes observed",
-                "details": "Dynamic updates/notifications observed: " + ", ".join(details),
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_dynamic_updates",
+                    "severity": "warning",
+                    "summary": "DNS zone change opcodes observed",
+                    "details": "Dynamic updates/notifications observed: "
+                    + ", ".join(details),
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
+            deterministic_checks["opcode_or_any_abuse"].append(
+                "Zone-change opcodes observed: " + ", ".join(details)
+            )
 
         if tcp_packets and total_packets > 0:
             tcp_ratio = tcp_packets / max(total_packets, 1)
             if tcp_ratio >= 0.2 and total_packets >= 200:
-                detections.append({
-                    "type": "dns_tcp_heavy",
-                    "severity": "info",
-                    "summary": "Elevated DNS-over-TCP usage",
-                    "details": f"TCP DNS accounts for {tcp_ratio * 100:.1f}% of packets.",
-                    "top_clients": client_counts.most_common(3),
-                    "top_servers": server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "dns_tcp_heavy",
+                        "severity": "info",
+                        "summary": "Elevated DNS-over-TCP usage",
+                        "details": f"TCP DNS accounts for {tcp_ratio * 100:.1f}% of packets.",
+                        "top_clients": client_counts.most_common(3),
+                        "top_servers": server_counts.most_common(3),
+                    }
+                )
 
         if query_size_stats:
             query_p95 = int(query_size_stats.get("p95", 0) or 0)
             if query_p95 > 300:
-                detections.append({
-                    "type": "dns_large_queries",
-                    "severity": "warning",
-                    "summary": "Large DNS query payloads observed",
-                    "details": f"Query p95 size {query_p95} bytes; max {query_size_stats.get('max')} bytes.",
-                    "top_clients": client_counts.most_common(3),
-                    "top_servers": server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "dns_large_queries",
+                        "severity": "warning",
+                        "summary": "Large DNS query payloads observed",
+                        "details": f"Query p95 size {query_p95} bytes; max {query_size_stats.get('max')} bytes.",
+                        "top_clients": client_counts.most_common(3),
+                        "top_servers": server_counts.most_common(3),
+                    }
+                )
 
         if response_size_stats:
             stats = response_size_stats
             if int(stats.get("p95", 0) or 0) > 1232:
-                detections.append({
-                    "type": "dns_large_responses",
-                    "severity": "warning",
-                    "summary": "Large DNS responses observed",
-                    "details": f"Response p95 size {stats.get('p95')} bytes; max {stats.get('max')} bytes.",
-                    "top_clients": client_counts.most_common(3),
-                    "top_servers": server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "dns_large_responses",
+                        "severity": "warning",
+                        "summary": "Large DNS responses observed",
+                        "details": f"Response p95 size {stats.get('p95')} bytes; max {stats.get('max')} bytes.",
+                        "top_clients": client_counts.most_common(3),
+                        "top_servers": server_counts.most_common(3),
+                    }
+                )
 
         tc_count = int(flag_counts.get("TC", 0) or 0)
         if tc_count > 10 and total_packets > 0 and (tc_count / total_packets) > 0.02:
-            detections.append({
-                "type": "dns_truncation",
-                "severity": "info",
-                "summary": "Truncated DNS responses observed",
-                "details": f"TC flag set in {tc_count} packets; may indicate large responses or fragmentation.",
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_truncation",
+                    "severity": "info",
+                    "summary": "Truncated DNS responses observed",
+                    "details": f"TC flag set in {tc_count} packets; may indicate large responses or fragmentation.",
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
 
         if public_resolver_counts:
             resolver_details = ", ".join(
                 f"{ip}({count})[{PUBLIC_DNS_RESOLVERS.get(ip, '-')}]"
                 for ip, count in public_resolver_counts.most_common(5)
             )
-            detections.append({
-                "type": "dns_public_resolvers",
-                "severity": "warning",
-                "summary": "Public DNS resolvers observed",
-                "details": f"Public resolvers: {resolver_details}. In OT/ICS networks, direct public DNS usage is often a policy violation.",
-                "top_clients": client_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_public_resolvers",
+                    "severity": "warning",
+                    "summary": "Public DNS resolvers observed",
+                    "details": f"Public resolvers: {resolver_details}. In OT/ICS networks, direct public DNS usage is often a policy violation.",
+                    "top_clients": client_counts.most_common(3),
+                }
+            )
             deterministic_checks["resolver_policy_violation"].append(resolver_details)
 
         if local_unicast_qname_counts:
             sample = ", ".join(sorted(list(local_unicast_qname_counts))[:5])
-            detections.append({
-                "type": "dns_local_unicast",
-                "severity": "info",
-                "summary": "Unicast queries for local TLDs observed",
-                "details": f"Local-only TLDs (e.g., .local/.lan) queried via unicast DNS: {sample}",
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_local_unicast",
+                    "severity": "info",
+                    "summary": "Unicast queries for local TLDs observed",
+                    "details": f"Local-only TLDs (e.g., .local/.lan) queried via unicast DNS: {sample}",
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
 
         if ot_qname_counts:
             keyword_text = ", ".join(
@@ -1151,97 +1338,122 @@ def analyze_dns(
                 details += f"; keywords: {keyword_text}"
             if sample:
                 details += f"; sample: {sample}"
-            detections.append({
-                "type": "dns_ot_naming",
-                "severity": "info",
-                "summary": "OT/ICS asset naming detected in DNS",
-                "details": details,
-                "top_clients": client_counts.most_common(3),
-                "top_servers": server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "dns_ot_naming",
+                    "severity": "info",
+                    "summary": "OT/ICS asset naming detected in DNS",
+                    "details": details,
+                    "top_clients": client_counts.most_common(3),
+                    "top_servers": server_counts.most_common(3),
+                }
+            )
 
         if mdns_packets > 0:
-            detections.append({
-                "type": "mdns_present",
-                "severity": "info",
-                "summary": f"mDNS traffic observed ({mdns_packets} packets)",
-                "details": "mDNS/Bonjour discovery seen; in OT/ICS networks this can expand broadcast attack surface.",
-                "top_clients": mdns_client_counts.most_common(3),
-                "top_servers": mdns_server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "mdns_present",
+                    "severity": "info",
+                    "summary": f"mDNS traffic observed ({mdns_packets} packets)",
+                    "details": "mDNS/Bonjour discovery seen; in OT/ICS networks this can expand broadcast attack surface.",
+                    "top_clients": mdns_client_counts.most_common(3),
+                    "top_servers": mdns_server_counts.most_common(3),
+                }
+            )
 
             if mdns_packets > 1000:
-                detections.append({
-                    "type": "mdns_chatty",
-                    "severity": "warning",
-                    "summary": "High mDNS volume",
-                    "details": f"Observed {mdns_packets} mDNS packets; potential chatter or misconfiguration.",
-                    "top_clients": mdns_client_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "mdns_chatty",
+                        "severity": "warning",
+                        "summary": "High mDNS volume",
+                        "details": f"Observed {mdns_packets} mDNS packets; potential chatter or misconfiguration.",
+                        "top_clients": mdns_client_counts.most_common(3),
+                    }
+                )
 
             for name, count in mdns_qname_counts.items():
                 if name.endswith(".local") and count > 200:
-                    detections.append({
-                        "type": "mdns_burst",
-                        "severity": "warning",
-                        "summary": f"High mDNS query volume for {name}",
-                        "details": "Investigate for discovery storms or spoofing.",
-                        "top_clients": mdns_client_counts.most_common(3),
-                    })
+                    detections.append(
+                        {
+                            "type": "mdns_burst",
+                            "severity": "warning",
+                            "summary": f"High mDNS query volume for {name}",
+                            "details": "Investigate for discovery storms or spoofing.",
+                            "top_clients": mdns_client_counts.most_common(3),
+                        }
+                    )
                     break
 
             if mdns_unicast_packets > 0:
-                detections.append({
-                    "type": "mdns_unicast",
-                    "severity": "warning",
-                    "summary": "Unicast mDNS traffic detected",
-                    "details": f"Observed {mdns_unicast_packets} mDNS packets sent via unicast; review for abuse or misconfiguration.",
-                    "top_clients": mdns_client_counts.most_common(3),
-                    "top_servers": mdns_server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "mdns_unicast",
+                        "severity": "warning",
+                        "summary": "Unicast mDNS traffic detected",
+                        "details": f"Observed {mdns_unicast_packets} mDNS packets sent via unicast; review for abuse or misconfiguration.",
+                        "top_clients": mdns_client_counts.most_common(3),
+                        "top_servers": mdns_server_counts.most_common(3),
+                    }
+                )
 
             if udp_multicast_packets > 0:
-                detections.append({
-                    "type": "udp_multicast_streams",
-                    "severity": "warning",
-                    "summary": "UDP multicast streams detected",
-                    "details": f"Observed {udp_multicast_packets} UDP multicast DNS packets; review for discovery abuse.",
-                    "top_clients": client_counts.most_common(3),
-                    "top_servers": server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "udp_multicast_streams",
+                        "severity": "warning",
+                        "summary": "UDP multicast streams detected",
+                        "details": f"Observed {udp_multicast_packets} UDP multicast DNS packets; review for discovery abuse.",
+                        "top_clients": client_counts.most_common(3),
+                        "top_servers": server_counts.most_common(3),
+                    }
+                )
 
             allowed_types = {1, 28, 12, 16, 33}
-            unusual_mdns = [(t, c) for t, c in mdns_qtype_counts.items() if t not in allowed_types]
+            unusual_mdns = [
+                (t, c) for t, c in mdns_qtype_counts.items() if t not in allowed_types
+            ]
             if unusual_mdns:
-                top_unusual = ", ".join(f"{t}({c})" for t, c in sorted(unusual_mdns, key=lambda x: x[1], reverse=True)[:5])
-                detections.append({
-                    "type": "mdns_unusual_qtypes",
-                    "severity": "warning",
-                    "summary": "Unusual mDNS query record types detected",
-                    "details": f"Observed uncommon mDNS qtypes: {top_unusual}",
-                    "top_clients": mdns_client_counts.most_common(3),
-                })
+                top_unusual = ", ".join(
+                    f"{t}({c})"
+                    for t, c in sorted(unusual_mdns, key=lambda x: x[1], reverse=True)[
+                        :5
+                    ]
+                )
+                detections.append(
+                    {
+                        "type": "mdns_unusual_qtypes",
+                        "severity": "warning",
+                        "summary": "Unusual mDNS query record types detected",
+                        "details": f"Observed uncommon mDNS qtypes: {top_unusual}",
+                        "top_clients": mdns_client_counts.most_common(3),
+                    }
+                )
 
             mdns_txt_queries = mdns_qtype_counts.get(16, 0)
             if mdns_txt_queries > 0:
-                detections.append({
-                    "type": "mdns_txt_records",
-                    "severity": "warning",
-                    "summary": "mDNS TXT Record Analysis",
-                    "details": f"Observed {mdns_txt_queries} mDNS TXT queries; review for metadata leakage or abuse.",
-                    "top_clients": mdns_client_counts.most_common(3),
-                    "top_servers": mdns_server_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "mdns_txt_records",
+                        "severity": "warning",
+                        "summary": "mDNS TXT Record Analysis",
+                        "details": f"Observed {mdns_txt_queries} mDNS TXT queries; review for metadata leakage or abuse.",
+                        "top_clients": mdns_client_counts.most_common(3),
+                        "top_servers": mdns_server_counts.most_common(3),
+                    }
+                )
 
         if llmnr_packets > 0:
-            detections.append({
-                "type": "llmnr_present",
-                "severity": "warning",
-                "summary": f"LLMNR traffic observed ({llmnr_packets} packets)",
-                "details": "LLMNR can be abused for spoofing/poisoning; in OT/ICS environments it is a common lateral movement risk.",
-                "top_clients": llmnr_client_counts.most_common(3),
-                "top_servers": llmnr_server_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "llmnr_present",
+                    "severity": "warning",
+                    "summary": f"LLMNR traffic observed ({llmnr_packets} packets)",
+                    "details": "LLMNR can be abused for spoofing/poisoning; in OT/ICS environments it is a common lateral movement risk.",
+                    "top_clients": llmnr_client_counts.most_common(3),
+                    "top_servers": llmnr_server_counts.most_common(3),
+                }
+            )
 
     vt_results: dict[str, dict[str, object]] = {}
     if vt_lookup:
@@ -1261,9 +1473,23 @@ def analyze_dns(
                     continue
                 domain_counts[domain] = domain_counts.get(domain, 0) + count
             ranked_domains = [
-                domain for domain, _count in sorted(domain_counts.items(), key=lambda item: item[1], reverse=True)
+                domain
+                for domain, _count in sorted(
+                    domain_counts.items(), key=lambda item: item[1], reverse=True
+                )
             ]
-            vt_results, vt_errors = _vt_lookup_domains(ranked_domains, api_key)
+            with build_statusbar(
+                path, enabled=show_status, desc="VirusTotal lookups"
+            ) as vt_status:
+                vt_status.update(0)
+
+                def _vt_progress(done: int, total: int, _domain: str) -> None:
+                    pct = 100 if total <= 0 else int((done / total) * 100)
+                    vt_status.update(pct)
+
+                vt_results, vt_errors = _vt_lookup_domains(
+                    ranked_domains, api_key, progress_cb=_vt_progress
+                )
             errors.extend(vt_errors)
             if vt_results:
                 vt_findings = list(vt_results.values())
@@ -1277,16 +1503,23 @@ def analyze_dns(
                     ),
                     reverse=True,
                 )
-                severity = "warning" if any(
-                    int(item.get("malicious", 0) or 0) > 0 or int(item.get("suspicious", 0) or 0) > 0
-                    for item in vt_findings
-                ) else "info"
-                detections.append({
-                    "type": "dns_vt_hits",
-                    "severity": severity,
-                    "summary": "VirusTotal DNS reputation",
-                    "vt_findings": vt_findings,
-                })
+                severity = (
+                    "warning"
+                    if any(
+                        int(item.get("malicious", 0) or 0) > 0
+                        or int(item.get("suspicious", 0) or 0) > 0
+                        for item in vt_findings
+                    )
+                    else "info"
+                )
+                detections.append(
+                    {
+                        "type": "dns_vt_hits",
+                        "severity": severity,
+                        "summary": "VirusTotal DNS reputation",
+                        "vt_findings": vt_findings,
+                    }
+                )
 
     for domain, answers in base_domain_answers.items():
         if len(answers) >= 15:
@@ -1302,14 +1535,19 @@ def analyze_dns(
         min_ttl = min(ttls)
         max_ttl = max(ttls)
         if unique_ttl >= 4 or min_ttl <= 30:
-            ttl_outliers.append({
-                "qname": qname,
-                "samples": len(ttls),
-                "unique_ttl": unique_ttl,
-                "min_ttl": min_ttl,
-                "max_ttl": max_ttl,
-            })
-    ttl_outliers.sort(key=lambda item: (int(item.get("unique_ttl", 0)), int(item.get("samples", 0))), reverse=True)
+            ttl_outliers.append(
+                {
+                    "qname": qname,
+                    "samples": len(ttls),
+                    "unique_ttl": unique_ttl,
+                    "min_ttl": min_ttl,
+                    "max_ttl": max_ttl,
+                }
+            )
+    ttl_outliers.sort(
+        key=lambda item: (int(item.get("unique_ttl", 0)), int(item.get("samples", 0))),
+        reverse=True,
+    )
     for item in ttl_outliers[:20]:
         deterministic_checks["fast_flux_or_rebinding"].append(
             f"TTL outlier {item.get('qname')} unique={item.get('unique_ttl')} min={item.get('min_ttl')} max={item.get('max_ttl')}"
@@ -1318,15 +1556,19 @@ def analyze_dns(
     cname_anomalies: list[dict[str, object]] = []
     for qname, targets in cname_targets.items():
         if len(targets) >= 4:
-            cname_anomalies.append({
-                "qname": qname,
-                "target_count": len(targets),
-                "targets": sorted(targets)[:8],
-            })
+            cname_anomalies.append(
+                {
+                    "qname": qname,
+                    "target_count": len(targets),
+                    "targets": sorted(targets)[:8],
+                }
+            )
             deterministic_checks["dnssec_or_integrity_anomaly"].append(
                 f"CNAME target churn {qname} targets={len(targets)}"
             )
-    cname_anomalies.sort(key=lambda item: int(item.get("target_count", 0)), reverse=True)
+    cname_anomalies.sort(
+        key=lambda item: int(item.get("target_count", 0)), reverse=True
+    )
 
     transaction_violations: list[dict[str, object]] = orphan_responses[:120]
     for item in transaction_violations[:20]:
@@ -1353,7 +1595,9 @@ def analyze_dns(
             deterministic_checks["amplification_abuse_signal"].append(
                 f"{flow[0]}->{flow[1]} amplification ratio={ratio:.2f}"
             )
-    amplification_candidates.sort(key=lambda item: float(item.get("ratio", 0.0) or 0.0), reverse=True)
+    amplification_candidates.sort(
+        key=lambda item: float(item.get("ratio", 0.0) or 0.0), reverse=True
+    )
 
     resolver_drift: list[dict[str, object]] = []
     for client, resolver_counter in client_resolvers.items():
@@ -1384,7 +1628,9 @@ def analyze_dns(
             deterministic_checks["resolver_policy_violation"].append(
                 f"{client} resolver drift count={len(resolvers)} public={has_public} private={has_private}"
             )
-    resolver_drift.sort(key=lambda item: int(item.get("resolver_count", 0)), reverse=True)
+    resolver_drift.sort(
+        key=lambda item: int(item.get("resolver_count", 0)), reverse=True
+    )
 
     client_abuse_profiles: list[dict[str, object]] = []
     for client, total in client_counts.items():
@@ -1405,18 +1651,185 @@ def analyze_dns(
             "long_queries": int(client_long_queries.get(client, 0) or 0),
         }
         client_abuse_profiles.append(profile)
-    client_abuse_profiles.sort(key=lambda item: (float(item.get("unique_ratio", 0.0)), float(item.get("avg_entropy", 0.0))), reverse=True)
+    client_abuse_profiles.sort(
+        key=lambda item: (
+            float(item.get("unique_ratio", 0.0)),
+            float(item.get("avg_entropy", 0.0)),
+        ),
+        reverse=True,
+    )
 
     for name, count in qname_counts.items():
-        if count == 1 and qname_lengths.get(name, 0) >= 36 and (qname_entropy.get(name, 0) / 100.0) >= 4.1:
-            one_off_high_entropy.append((name, qname_lengths.get(name, 0), qname_entropy.get(name, 0)))
+        if (
+            count == 1
+            and qname_lengths.get(name, 0) >= 36
+            and (qname_entropy.get(name, 0) / 100.0) >= 4.1
+        ):
+            one_off_high_entropy.append(
+                (name, qname_lengths.get(name, 0), qname_entropy.get(name, 0))
+            )
     if one_off_high_entropy:
         sample = ", ".join(name for name, _len_v, _ent in one_off_high_entropy[:5])
-        deterministic_checks["dga_like_behavior"].append(f"one-off high-entropy qnames: {sample}")
+        deterministic_checks["dga_like_behavior"].append(
+            f"one-off high-entropy qnames: {sample}"
+        )
 
-    if any(len(answers) <= 4 for answers in base_domain_answers.values()) and base_domain_answers:
-        benign_context.append("Some answer rotation appears low-volume and may reflect normal CDN behavior")
-        deterministic_checks["likely_benign_cdn_rotation"].append("Low-cardinality answer rotation observed")
+    if (
+        any(len(answers) <= 4 for answers in base_domain_answers.values())
+        and base_domain_answers
+    ):
+        benign_context.append(
+            "Some answer rotation appears low-volume and may reflect normal CDN behavior"
+        )
+        deterministic_checks["likely_benign_cdn_rotation"].append(
+            "Low-cardinality answer rotation observed"
+        )
+
+    periodicity_profiles: list[dict[str, object]] = []
+
+    def _periodicity_score(series: list[float]) -> dict[str, object] | None:
+        values = sorted(float(v) for v in series if isinstance(v, (int, float)))
+        if len(values) < 6:
+            return None
+        deltas = [b - a for a, b in zip(values, values[1:]) if (b - a) > 0.0]
+        if len(deltas) < 5:
+            return None
+        mean = sum(deltas) / len(deltas)
+        if mean <= 0.0:
+            return None
+        variance = sum((val - mean) ** 2 for val in deltas) / len(deltas)
+        stddev = variance**0.5
+        cv = stddev / mean if mean > 0.0 else 1.0
+        min_gap = min(deltas)
+        max_gap = max(deltas)
+        sorted_deltas = sorted(deltas)
+        p95_idx = int(0.95 * (len(sorted_deltas) - 1)) if len(sorted_deltas) > 1 else 0
+        p95_gap = sorted_deltas[p95_idx]
+
+        score = 0
+        if 5.0 <= mean <= 600.0:
+            score += 1
+        if cv <= 0.20:
+            score += 2
+        if cv <= 0.10:
+            score += 1
+        if max_gap <= max(mean * 1.8, max(min_gap, 0.001) * 2.5):
+            score += 1
+        if len(values) >= 12:
+            score += 1
+        if p95_gap <= (mean * 1.7):
+            score += 1
+
+        if score >= 6:
+            confidence = "high"
+        elif score >= 4:
+            confidence = "medium"
+        elif score >= 3:
+            confidence = "low"
+        else:
+            return None
+
+        return {
+            "events": len(values),
+            "interval_samples": len(deltas),
+            "mean_interval": round(mean, 2),
+            "stddev_interval": round(stddev, 2),
+            "cv": round(cv, 3),
+            "min_interval": round(min_gap, 2),
+            "max_interval": round(max_gap, 2),
+            "p95_interval": round(p95_gap, 2),
+            "score": score,
+            "confidence": confidence,
+            "first_seen": values[0],
+            "last_seen": values[-1],
+        }
+
+    for qname, series in qname_query_times.items():
+        if qname_counts.get(qname, 0) < 6:
+            continue
+        scored = _periodicity_score(series)
+        if not scored:
+            continue
+        periodicity_profiles.append(
+            {
+                "scope": "qname",
+                "entity": qname,
+                **scored,
+            }
+        )
+
+    for (client, qname), series in client_qname_times.items():
+        if len(series) < 6:
+            continue
+        scored = _periodicity_score(series)
+        if not scored:
+            continue
+        periodicity_profiles.append(
+            {
+                "scope": "client_qname",
+                "entity": f"{client} -> {qname}",
+                "client": client,
+                "qname": qname,
+                **scored,
+            }
+        )
+
+    periodicity_profiles.sort(
+        key=lambda item: (
+            int(item.get("score", 0) or 0),
+            int(item.get("events", 0) or 0),
+            -float(item.get("cv", 1.0) or 1.0),
+        ),
+        reverse=True,
+    )
+    periodicity_profiles = periodicity_profiles[:40]
+
+    high_periodic = [
+        item
+        for item in periodicity_profiles
+        if str(item.get("confidence", "")).lower() == "high"
+    ]
+    medium_periodic = [
+        item
+        for item in periodicity_profiles
+        if str(item.get("confidence", "")).lower() == "medium"
+    ]
+    if high_periodic:
+        evidence = [
+            f"{item.get('entity')} interval={item.get('mean_interval')}s cv={item.get('cv')} events={item.get('events')}"
+            for item in high_periodic[:8]
+        ]
+        deterministic_checks["dns_beaconing_periodicity"].extend(evidence)
+        detections.append(
+            {
+                "type": "dns_beacon_periodicity",
+                "severity": "warning",
+                "summary": "High-confidence periodic DNS check-in behavior",
+                "details": "; ".join(evidence[:4]),
+                "top_clients": client_counts.most_common(3),
+                "top_servers": server_counts.most_common(3),
+            }
+        )
+    elif medium_periodic:
+        evidence = [
+            f"{item.get('entity')} interval={item.get('mean_interval')}s cv={item.get('cv')} events={item.get('events')}"
+            for item in medium_periodic[:8]
+        ]
+        deterministic_checks["dns_beaconing_periodicity"].extend(evidence)
+        detections.append(
+            {
+                "type": "dns_beacon_periodicity",
+                "severity": "info",
+                "summary": "Possible periodic DNS check-in behavior",
+                "details": "; ".join(evidence[:4]),
+                "top_clients": client_counts.most_common(3),
+                "top_servers": server_counts.most_common(3),
+            }
+        )
+    else:
+        benign_context.append(
+            "No high-confidence DNS periodic beaconing pattern was detected"
+        )
 
     for det in detections[:120]:
         timeline.append(
@@ -1496,4 +1909,14 @@ def analyze_dns(
         duration_seconds=duration_seconds,
         detections=detections,
         errors=errors,
+        deterministic_checks=deterministic_checks,
+        resolver_drift=resolver_drift,
+        client_abuse_profiles=client_abuse_profiles,
+        ttl_outliers=ttl_outliers,
+        cname_anomalies=cname_anomalies,
+        transaction_violations=transaction_violations,
+        amplification_candidates=amplification_candidates,
+        timeline=timeline,
+        periodicity_profiles=periodicity_profiles,
+        benign_context=benign_context,
     )

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import ipaddress
+import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import math
-import ipaddress
 
-from .pcap_cache import get_reader
-from .utils import safe_float
 from .certificates import analyze_certificates
+from .pcap_cache import get_reader
 from .progress import run_with_busy_status
+from .utils import safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -76,7 +76,9 @@ class HealthSummary:
     errors: list[str]
 
 
-def merge_health_summaries(summaries: list[HealthSummary] | tuple[HealthSummary, ...] | set[HealthSummary]) -> HealthSummary:
+def merge_health_summaries(
+    summaries: list[HealthSummary] | tuple[HealthSummary, ...] | set[HealthSummary],
+) -> HealthSummary:
     summary_list = list(summaries)
     if not summary_list:
         return HealthSummary(
@@ -92,7 +94,11 @@ def merge_health_summaries(summaries: list[HealthSummary] | tuple[HealthSummary,
             duration_seconds=None,
             endpoint_packets=Counter(),
             endpoint_bytes=Counter(),
-            flow_duration_buckets={"all": Counter(), "tcp": Counter(), "udp": Counter()},
+            flow_duration_buckets={
+                "all": Counter(),
+                "tcp": Counter(),
+                "udp": Counter(),
+            },
             tcp_syn=0,
             tcp_syn_ack=0,
             tcp_rst=0,
@@ -198,15 +204,25 @@ def merge_health_summaries(summaries: list[HealthSummary] | tuple[HealthSummary,
         self_signed_certs += summary.self_signed_certs
 
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         endpoint_packets.update(summary.endpoint_packets)
         endpoint_bytes.update(summary.endpoint_bytes)
 
         for key in ("all", "tcp", "udp"):
-            flow_duration_buckets.setdefault(key, Counter()).update(summary.flow_duration_buckets.get(key, Counter()))
+            flow_duration_buckets.setdefault(key, Counter()).update(
+                summary.flow_duration_buckets.get(key, Counter())
+            )
 
         tcp_syn_sources.update(summary.tcp_syn_sources)
         tcp_rst_sources.update(summary.tcp_rst_sources)
@@ -270,85 +286,133 @@ def merge_health_summaries(summaries: list[HealthSummary] | tuple[HealthSummary,
 
     findings: list[dict[str, object]] = []
     if retransmissions > 50 and retransmission_rate > 0.01:
-        findings.append({
-            "severity": "warning",
-            "summary": "Elevated TCP retransmissions",
-            "details": f"{retransmissions} retransmissions ({retransmission_rate:.2%} of TCP packets).",
-        })
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "Elevated TCP retransmissions",
+                "details": f"{retransmissions} retransmissions ({retransmission_rate:.2%} of TCP packets).",
+            }
+        )
     if tcp_syn:
         syn_only = tcp_syn - tcp_syn_ack
         if syn_only > 50:
-            findings.append({
-                "severity": "warning",
-                "summary": "High SYN without SYN-ACK",
-                "details": f"SYN-only count: {syn_only}.",
-            })
+            findings.append(
+                {
+                    "severity": "warning",
+                    "summary": "High SYN without SYN-ACK",
+                    "details": f"SYN-only count: {syn_only}.",
+                }
+            )
         rst_ratio = tcp_rst / max(tcp_syn, 1)
         if tcp_rst > 50 and rst_ratio >= 0.2:
-            findings.append({
-                "severity": "warning",
-                "summary": "High TCP RST/SYN ratio",
-                "details": f"RST {tcp_rst} vs SYN {tcp_syn} ({rst_ratio:.2%}).",
-            })
+            findings.append(
+                {
+                    "severity": "warning",
+                    "summary": "High TCP RST/SYN ratio",
+                    "details": f"RST {tcp_rst} vs SYN {tcp_syn} ({rst_ratio:.2%}).",
+                }
+            )
     if tcp_zero_window > 20:
-        findings.append({
-            "severity": "warning",
-            "summary": "TCP zero-window events",
-            "details": f"{tcp_zero_window} packets with zero window observed.",
-        })
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "TCP zero-window events",
+                "details": f"{tcp_zero_window} packets with zero window observed.",
+            }
+        )
     if udp_amp_candidates:
-        findings.append({
-            "severity": "warning",
-            "summary": "Potential UDP amplification patterns",
-            "details": ", ".join(udp_amp_candidates[:3]),
-        })
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "Potential UDP amplification patterns",
+                "details": ", ".join(udp_amp_candidates[:3]),
+            }
+        )
     if ttl_expired:
-        findings.append({
-            "severity": "warning",
-            "summary": "Expired TTL/Hop Limit observed",
-            "details": f"{ttl_expired} packets with TTL/Hop Limit <= 1.",
-        })
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "Expired TTL/Hop Limit observed",
+                "details": f"{ttl_expired} packets with TTL/Hop Limit <= 1.",
+            }
+        )
     if ttl_low and ttl_low > ttl_expired:
-        findings.append({
-            "severity": "info",
-            "summary": "Low TTL/Hop Limit values",
-            "details": f"{ttl_low} packets with TTL/Hop Limit <= 5.",
-        })
+        findings.append(
+            {
+                "severity": "info",
+                "summary": "Low TTL/Hop Limit values",
+                "details": f"{ttl_low} packets with TTL/Hop Limit <= 5.",
+            }
+        )
     if expired_certs:
-        findings.append({
-            "severity": "warning",
-            "summary": "Expired certificates detected",
-            "details": f"{expired_certs} expired or invalid certificate(s).",
-        })
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "Expired certificates detected",
+                "details": f"{expired_certs} expired or invalid certificate(s).",
+            }
+        )
     if snmp_packets:
-        findings.append({
-            "severity": "warning",
-            "summary": "SNMP traffic observed",
-            "details": f"{snmp_packets} SNMP packets detected; review community strings and access controls.",
-        })
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "SNMP traffic observed",
+                "details": f"{snmp_packets} SNMP packets detected; review community strings and access controls.",
+            }
+        )
         if any(comm.lower() in {"public", "private"} for comm in snmp_communities):
-            findings.append({
-                "severity": "critical",
-                "summary": "Default SNMP community strings detected",
-                "details": "SNMP community strings include 'public' or 'private'.",
-            })
+            findings.append(
+                {
+                    "severity": "critical",
+                    "summary": "Default SNMP community strings detected",
+                    "details": "SNMP community strings include 'public' or 'private'.",
+                }
+            )
 
     merged_score = 0
-    merged_score += 2 if any(v for v in deterministic_checks.get("udp_reflection_amplification", [])) else 0
-    merged_score += 2 if any(v for v in deterministic_checks.get("snmp_exposure_risk", [])) else 0
-    merged_score += 2 if any(v for v in deterministic_checks.get("ot_cycle_instability", [])) else 0
-    merged_score += 1 if any(v for v in deterministic_checks.get("syn_scan_or_exhaustion", [])) else 0
-    merged_score += 1 if any(v for v in deterministic_checks.get("tcp_reset_storm", [])) else 0
-    merged_score += 1 if any(v for v in deterministic_checks.get("persistent_zero_window", [])) else 0
-    merged_score += 1 if any(v for v in deterministic_checks.get("certificate_hygiene_risk", [])) else 0
+    merged_score += (
+        2
+        if any(v for v in deterministic_checks.get("udp_reflection_amplification", []))
+        else 0
+    )
+    merged_score += (
+        2 if any(v for v in deterministic_checks.get("snmp_exposure_risk", [])) else 0
+    )
+    merged_score += (
+        2 if any(v for v in deterministic_checks.get("ot_cycle_instability", [])) else 0
+    )
+    merged_score += (
+        1
+        if any(v for v in deterministic_checks.get("syn_scan_or_exhaustion", []))
+        else 0
+    )
+    merged_score += (
+        1 if any(v for v in deterministic_checks.get("tcp_reset_storm", [])) else 0
+    )
+    merged_score += (
+        1
+        if any(v for v in deterministic_checks.get("persistent_zero_window", []))
+        else 0
+    )
+    merged_score += (
+        1
+        if any(v for v in deterministic_checks.get("certificate_hygiene_risk", []))
+        else 0
+    )
     if merged_score >= 7:
-        merged_verdict = "YES - high-confidence network health security risk pattern detected"
+        merged_verdict = (
+            "YES - high-confidence network health security risk pattern detected"
+        )
         merged_conf = "high"
     elif merged_score >= 4:
-        merged_verdict = "LIKELY - multiple corroborating network health risk indicators detected"
+        merged_verdict = (
+            "LIKELY - multiple corroborating network health risk indicators detected"
+        )
         merged_conf = "medium"
     elif merged_score >= 2:
-        merged_verdict = "POSSIBLE - suspicious network health indicators require validation"
+        merged_verdict = (
+            "POSSIBLE - suspicious network health indicators require validation"
+        )
         merged_conf = "medium"
     else:
         merged_verdict = "NO STRONG SIGNAL - no convincing high-confidence health risk pattern from current heuristics"
@@ -436,7 +500,9 @@ def _extract_s7_rosctr(payload: bytes) -> Optional[str]:
     return rosctr_map.get(rosctr, f"ROSCTR {rosctr}")
 
 
-def _timing_stats(intervals: dict[str, list[float]], limit: int = 5) -> list[dict[str, object]]:
+def _timing_stats(
+    intervals: dict[str, list[float]], limit: int = 5
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for key, samples in intervals.items():
         if len(samples) < 6:
@@ -446,15 +512,17 @@ def _timing_stats(intervals: dict[str, list[float]], limit: int = 5) -> list[dic
             continue
         variance = sum((val - avg) ** 2 for val in samples) / len(samples)
         std_dev = math.sqrt(variance)
-        rows.append({
-            "session": key,
-            "count": len(samples),
-            "avg": avg,
-            "min": min(samples),
-            "max": max(samples),
-            "std": std_dev,
-            "cv": (std_dev / avg) if avg > 0 else 0.0,
-        })
+        rows.append(
+            {
+                "session": key,
+                "count": len(samples),
+                "avg": avg,
+                "min": min(samples),
+                "max": max(samples),
+                "std": std_dev,
+                "cv": (std_dev / avg) if avg > 0 else 0.0,
+            }
+        )
     rows.sort(key=lambda item: (item["cv"], item["avg"]))
     return rows[:limit]
 
@@ -469,7 +537,7 @@ def _read_ber_length(payload: bytes, offset: int) -> tuple[Optional[int], int]:
     num_bytes = first & 0x7F
     if num_bytes == 0 or offset + num_bytes > len(payload):
         return None, offset
-    length = int.from_bytes(payload[offset:offset + num_bytes], "big")
+    length = int.from_bytes(payload[offset : offset + num_bytes], "big")
     offset += num_bytes
     return length, offset
 
@@ -485,14 +553,14 @@ def _parse_snmp(payload: bytes) -> tuple[Optional[str], Optional[str]]:
     ver_len, idx = _read_ber_length(payload, idx + 1)
     if ver_len is None or idx + ver_len > len(payload):
         return None, None
-    version_val = int.from_bytes(payload[idx:idx + ver_len], "big")
+    version_val = int.from_bytes(payload[idx : idx + ver_len], "big")
     idx += ver_len
     if idx >= len(payload) or payload[idx] != 0x04:
         return None, None
     comm_len, idx = _read_ber_length(payload, idx + 1)
     if comm_len is None or idx + comm_len > len(payload):
         return None, None
-    community = payload[idx:idx + comm_len].decode("latin-1", errors="ignore")
+    community = payload[idx : idx + comm_len].decode("latin-1", errors="ignore")
 
     version_map = {0: "v1", 1: "v2c", 3: "v3"}
     return version_map.get(version_val, f"v{version_val}"), community
@@ -535,7 +603,9 @@ def _parse_snmp_pdu(payload: bytes) -> Optional[str]:
 def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
     errors: list[str] = []
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
 
     total_packets = 0
     total_bytes = 0
@@ -564,9 +634,15 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
     snmp_sources: Counter[str] = Counter()
     snmp_set_sources: Counter[str] = Counter()
 
-    tcp_flows: dict[tuple[str, str, int, int], dict[str, Optional[float]]] = defaultdict(lambda: {"first": None, "last": None})
-    udp_flows: dict[tuple[str, str, int, int], dict[str, Optional[float]]] = defaultdict(lambda: {"first": None, "last": None})
-    amp_flows: dict[tuple[str, str, int], dict[str, int]] = defaultdict(lambda: {"client": 0, "server": 0})
+    tcp_flows: dict[tuple[str, str, int, int], dict[str, Optional[float]]] = (
+        defaultdict(lambda: {"first": None, "last": None})
+    )
+    udp_flows: dict[tuple[str, str, int, int], dict[str, Optional[float]]] = (
+        defaultdict(lambda: {"first": None, "last": None})
+    )
+    amp_flows: dict[tuple[str, str, int], dict[str, int]] = defaultdict(
+        lambda: {"client": 0, "server": 0}
+    )
     profinet_last_ts: dict[str, float] = {}
     profinet_intervals: dict[str, list[float]] = defaultdict(list)
     enip_io_last_ts: dict[str, float] = {}
@@ -587,7 +663,26 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
     minute_metrics: dict[int, Counter[str]] = defaultdict(Counter)
     minute_samples: dict[int, list[str]] = defaultdict(list)
 
-    management_ports = {22, 23, 53, 102, 135, 139, 161, 162, 389, 445, 502, 636, 3389, 5985, 5986, 20000, 3268, 3269}
+    management_ports = {
+        22,
+        23,
+        53,
+        102,
+        135,
+        139,
+        161,
+        162,
+        389,
+        445,
+        502,
+        636,
+        3389,
+        5985,
+        5986,
+        20000,
+        3268,
+        3269,
+    }
 
     try:
         for pkt in reader:
@@ -687,7 +782,9 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
                             retransmissions += 1
                             if ts is not None:
                                 minute_metrics[int(ts // 60)]["retrans"] += 1
-                                minute_samples[int(ts // 60)].append(f"Retrans {src_ip}->{dst_ip}:{dport}")
+                                minute_samples[int(ts // 60)].append(
+                                    f"Retrans {src_ip}->{dst_ip}:{dport}"
+                                )
                         else:
                             seen_seq[key].add(sig)
                         if len(seen_seq[key]) > 20000:
@@ -706,7 +803,9 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
                             host_syn_targets[src_ip].add(dst_ip)
                             if ts is not None:
                                 minute_metrics[int(ts // 60)]["syn"] += 1
-                                minute_samples[int(ts // 60)].append(f"SYN {src_ip}->{dst_ip}:{dport}")
+                                minute_samples[int(ts // 60)].append(
+                                    f"SYN {src_ip}->{dst_ip}:{dport}"
+                                )
                         if flags & 0x12 == 0x12:
                             tcp_syn_ack += 1
                         if flags & 0x04:
@@ -714,13 +813,17 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
                             tcp_rst_sources[src_ip] += 1
                             if ts is not None:
                                 minute_metrics[int(ts // 60)]["rst"] += 1
-                                minute_samples[int(ts // 60)].append(f"RST {src_ip}->{dst_ip}:{dport}")
+                                minute_samples[int(ts // 60)].append(
+                                    f"RST {src_ip}->{dst_ip}:{dport}"
+                                )
                         if window == 0:
                             tcp_zero_window += 1
                             tcp_zero_window_sources[src_ip] += 1
                             if ts is not None:
                                 minute_metrics[int(ts // 60)]["zero_window"] += 1
-                                minute_samples[int(ts // 60)].append(f"ZeroWindow {src_ip}->{dst_ip}:{dport}")
+                                minute_samples[int(ts // 60)].append(
+                                    f"ZeroWindow {src_ip}->{dst_ip}:{dport}"
+                                )
                         elif window < 1024:
                             tcp_small_window += 1
 
@@ -737,7 +840,13 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
                                 if drift not in mgmt_zone_events:
                                     mgmt_zone_events.add(drift)
                                     zone_anomalies.append(drift)
-                                    event_anchors.append({"packet": packet_index, "signal": "zone_policy_drift", "details": drift})
+                                    event_anchors.append(
+                                        {
+                                            "packet": packet_index,
+                                            "signal": "zone_policy_drift",
+                                            "details": drift,
+                                        }
+                                    )
 
                         if sport == 102 or dport == 102:
                             s7_payload = b""
@@ -825,18 +934,22 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
                             snmp_communities[community] += 1
                             if community.lower() in {"public", "private"} and src_ip:
                                 host_snmp_default[src_ip] += 1
-                                event_anchors.append({
-                                    "packet": packet_index,
-                                    "signal": "snmp_exposure_risk",
-                                    "details": f"Default SNMP community '{community}' from {src_ip}",
-                                })
+                                event_anchors.append(
+                                    {
+                                        "packet": packet_index,
+                                        "signal": "snmp_exposure_risk",
+                                        "details": f"Default SNMP community '{community}' from {src_ip}",
+                                    }
+                                )
                         if pdu == "SetRequest" and src_ip:
                             snmp_set_sources[src_ip] += 1
-                            event_anchors.append({
-                                "packet": packet_index,
-                                "signal": "snmp_set_request",
-                                "details": f"SNMP SetRequest from {src_ip} to {dst_ip or '-'}",
-                            })
+                            event_anchors.append(
+                                {
+                                    "packet": packet_index,
+                                    "signal": "snmp_set_request",
+                                    "details": f"SNMP SetRequest from {src_ip} to {dst_ip or '-'}",
+                                }
+                            )
     finally:
         status.finish()
         reader.close()
@@ -846,7 +959,11 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
 
-    flow_duration_buckets: dict[str, Counter[str]] = {"all": Counter(), "tcp": Counter(), "udp": Counter()}
+    flow_duration_buckets: dict[str, Counter[str]] = {
+        "all": Counter(),
+        "tcp": Counter(),
+        "udp": Counter(),
+    }
     for flow_map, label_name in ((tcp_flows, "tcp"), (udp_flows, "udp")):
         for info in flow_map.values():
             start = info.get("first")
@@ -861,14 +978,18 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
     for (client, server, port), volumes in amp_flows.items():
         client_bytes = volumes.get("client", 0)
         server_bytes = volumes.get("server", 0)
-        if server_bytes >= 10000 and (client_bytes == 0 or server_bytes / max(client_bytes, 1) >= 5):
+        if server_bytes >= 10000 and (
+            client_bytes == 0 or server_bytes / max(client_bytes, 1) >= 5
+        ):
             text = f"{client} -> {server}:{port} ({server_bytes}/{client_bytes} bytes)"
             udp_amp_candidates.append(text)
-            event_anchors.append({
-                "packet": None,
-                "signal": "udp_reflection_amplification",
-                "details": f"{client}->{server}:{port} server_bytes={server_bytes} client_bytes={client_bytes}",
-            })
+            event_anchors.append(
+                {
+                    "packet": None,
+                    "signal": "udp_reflection_amplification",
+                    "details": f"{client}->{server}:{port} server_bytes={server_bytes} client_bytes={client_bytes}",
+                }
+            )
 
     ot_timing = {
         "profinet_rt": _timing_stats(profinet_intervals),
@@ -879,7 +1000,14 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
     expired_certs = 0
     self_signed_certs = 0
     try:
-        cert_summary = run_with_busy_status(path, show_status, "Health: Certificates", analyze_certificates, path, show_status=False)
+        cert_summary = run_with_busy_status(
+            path,
+            show_status,
+            "Health: Certificates",
+            analyze_certificates,
+            path,
+            show_status=False,
+        )
         expired_certs = len(cert_summary.expired)
         self_signed_certs = len(cert_summary.self_signed)
         errors.extend(cert_summary.errors)
@@ -888,28 +1016,88 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
 
     findings: list[dict[str, object]] = []
     if retransmissions > 50 and retransmission_rate > 0.01:
-        findings.append({"severity": "warning", "summary": "Elevated TCP retransmissions", "details": f"{retransmissions} retransmissions ({retransmission_rate:.2%} of TCP packets)."})
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "Elevated TCP retransmissions",
+                "details": f"{retransmissions} retransmissions ({retransmission_rate:.2%} of TCP packets).",
+            }
+        )
     if tcp_syn:
         syn_only = tcp_syn - tcp_syn_ack
         if syn_only > 50:
-            findings.append({"severity": "warning", "summary": "High SYN without SYN-ACK", "details": f"SYN-only count: {syn_only}."})
+            findings.append(
+                {
+                    "severity": "warning",
+                    "summary": "High SYN without SYN-ACK",
+                    "details": f"SYN-only count: {syn_only}.",
+                }
+            )
         rst_ratio = tcp_rst / max(tcp_syn, 1)
         if tcp_rst > 50 and rst_ratio >= 0.2:
-            findings.append({"severity": "warning", "summary": "High TCP RST/SYN ratio", "details": f"RST {tcp_rst} vs SYN {tcp_syn} ({rst_ratio:.2%})."})
+            findings.append(
+                {
+                    "severity": "warning",
+                    "summary": "High TCP RST/SYN ratio",
+                    "details": f"RST {tcp_rst} vs SYN {tcp_syn} ({rst_ratio:.2%}).",
+                }
+            )
     if tcp_zero_window > 20:
-        findings.append({"severity": "warning", "summary": "TCP zero-window events", "details": f"{tcp_zero_window} packets with zero window observed."})
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "TCP zero-window events",
+                "details": f"{tcp_zero_window} packets with zero window observed.",
+            }
+        )
     if udp_amp_candidates:
-        findings.append({"severity": "warning", "summary": "Potential UDP amplification patterns", "details": ", ".join(udp_amp_candidates[:3])})
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "Potential UDP amplification patterns",
+                "details": ", ".join(udp_amp_candidates[:3]),
+            }
+        )
     if ttl_expired:
-        findings.append({"severity": "warning", "summary": "Expired TTL/Hop Limit observed", "details": f"{ttl_expired} packets with TTL/Hop Limit <= 1."})
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "Expired TTL/Hop Limit observed",
+                "details": f"{ttl_expired} packets with TTL/Hop Limit <= 1.",
+            }
+        )
     if ttl_low and ttl_low > ttl_expired:
-        findings.append({"severity": "info", "summary": "Low TTL/Hop Limit values", "details": f"{ttl_low} packets with TTL/Hop Limit <= 5."})
+        findings.append(
+            {
+                "severity": "info",
+                "summary": "Low TTL/Hop Limit values",
+                "details": f"{ttl_low} packets with TTL/Hop Limit <= 5.",
+            }
+        )
     if expired_certs:
-        findings.append({"severity": "warning", "summary": "Expired certificates detected", "details": f"{expired_certs} expired or invalid certificate(s)."})
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "Expired certificates detected",
+                "details": f"{expired_certs} expired or invalid certificate(s).",
+            }
+        )
     if snmp_packets:
-        findings.append({"severity": "warning", "summary": "SNMP traffic observed", "details": f"{snmp_packets} SNMP packets detected; review community strings and access controls."})
+        findings.append(
+            {
+                "severity": "warning",
+                "summary": "SNMP traffic observed",
+                "details": f"{snmp_packets} SNMP packets detected; review community strings and access controls.",
+            }
+        )
         if any(comm.lower() in {"public", "private"} for comm in snmp_communities):
-            findings.append({"severity": "critical", "summary": "Default SNMP community strings detected", "details": "SNMP community strings include 'public' or 'private'."})
+            findings.append(
+                {
+                    "severity": "critical",
+                    "summary": "Default SNMP community strings detected",
+                    "details": "SNMP community strings include 'public' or 'private'.",
+                }
+            )
 
     deterministic_checks: dict[str, list[str]] = {
         "syn_scan_or_exhaustion": [],
@@ -928,72 +1116,128 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
     for src, count in tcp_syn_sources.most_common(8):
         target_count = len(host_syn_targets.get(src, set()))
         if count >= 120 or (count >= 60 and target_count >= 10):
-            deterministic_checks["syn_scan_or_exhaustion"].append(f"{src} generated {count} SYN packets across {target_count} targets")
+            deterministic_checks["syn_scan_or_exhaustion"].append(
+                f"{src} generated {count} SYN packets across {target_count} targets"
+            )
             host_scores[src] += 2
             host_reasons[src].append("SYN scan or exhaustion pattern")
 
     for src, count in tcp_rst_sources.most_common(8):
         syn_count = tcp_syn_sources.get(src, 0)
-        rst_ratio = (count / max(syn_count, 1))
+        rst_ratio = count / max(syn_count, 1)
         if count >= 60 and rst_ratio >= 0.25:
-            deterministic_checks["tcp_reset_storm"].append(f"{src} generated {count} RST packets with RST/SYN ratio {rst_ratio:.2f}")
+            deterministic_checks["tcp_reset_storm"].append(
+                f"{src} generated {count} RST packets with RST/SYN ratio {rst_ratio:.2f}"
+            )
             host_scores[src] += 2
             host_reasons[src].append("TCP reset storm behavior")
 
     for src, count in tcp_zero_window_sources.most_common(8):
         if count >= 20:
-            deterministic_checks["persistent_zero_window"].append(f"{src} observed with {count} zero-window packets")
+            deterministic_checks["persistent_zero_window"].append(
+                f"{src} observed with {count} zero-window packets"
+            )
             host_scores[src] += 1
             host_reasons[src].append("Persistent zero-window collapse")
 
     deterministic_checks["udp_reflection_amplification"].extend(udp_amp_candidates[:8])
 
-    suspicious_dscp = [(dscp, count) for dscp, count in dscp_counts.items() if dscp >= 40 and count >= 20]
+    suspicious_dscp = [
+        (dscp, count)
+        for dscp, count in dscp_counts.items()
+        if dscp >= 40 and count >= 20
+    ]
     for dscp, count in sorted(suspicious_dscp, key=lambda v: -v[1])[:6]:
-        deterministic_checks["qos_marking_anomaly"].append(f"DSCP {dscp} appears {count} times")
+        deterministic_checks["qos_marking_anomaly"].append(
+            f"DSCP {dscp} appears {count} times"
+        )
 
     for src, count in host_snmp_default.most_common(8):
-        deterministic_checks["snmp_exposure_risk"].append(f"{src} used default SNMP communities {count} times")
+        deterministic_checks["snmp_exposure_risk"].append(
+            f"{src} used default SNMP communities {count} times"
+        )
         host_scores[src] += 2
         host_reasons[src].append("SNMP default community usage")
     if snmp_versions.get("v1", 0) > 0:
-        deterministic_checks["snmp_exposure_risk"].append(f"SNMP v1 traffic observed ({snmp_versions.get('v1', 0)})")
+        deterministic_checks["snmp_exposure_risk"].append(
+            f"SNMP v1 traffic observed ({snmp_versions.get('v1', 0)})"
+        )
     if sum(snmp_set_sources.values()) > 0:
-        deterministic_checks["snmp_exposure_risk"].append(f"SNMP SetRequest activity observed from {len(snmp_set_sources)} source(s)")
+        deterministic_checks["snmp_exposure_risk"].append(
+            f"SNMP SetRequest activity observed from {len(snmp_set_sources)} source(s)"
+        )
 
     ot_risk_profiles: list[dict[str, object]] = []
-    for family, label_name in (("profinet_rt", "Profinet RT"), ("enip_io", "ENIP IO"), ("s7_rosctr", "S7 ROSCTR")):
+    for family, label_name in (
+        ("profinet_rt", "Profinet RT"),
+        ("enip_io", "ENIP IO"),
+        ("s7_rosctr", "S7 ROSCTR"),
+    ):
         for item in ot_timing.get(family, [])[:10]:
             cv = float(item.get("cv", 0.0) or 0.0)
             if cv >= 0.35:
                 deterministic_checks["ot_cycle_instability"].append(
                     f"{label_name} {item.get('session')} cv={cv:.2f} avg={float(item.get('avg', 0.0)):.3f}s"
                 )
-                ot_risk_profiles.append({
-                    "family": label_name,
-                    "session": str(item.get("session", "-")),
-                    "avg": float(item.get("avg", 0.0) or 0.0),
-                    "std": float(item.get("std", 0.0) or 0.0),
-                    "cv": cv,
-                    "count": int(item.get("count", 0) or 0),
-                    "severity": "high" if cv >= 0.5 else "medium",
-                })
+                ot_risk_profiles.append(
+                    {
+                        "family": label_name,
+                        "session": str(item.get("session", "-")),
+                        "avg": float(item.get("avg", 0.0) or 0.0),
+                        "std": float(item.get("std", 0.0) or 0.0),
+                        "cv": cv,
+                        "count": int(item.get("count", 0) or 0),
+                        "severity": "high" if cv >= 0.5 else "medium",
+                    }
+                )
 
     if expired_certs or self_signed_certs:
-        deterministic_checks["certificate_hygiene_risk"].append(f"expired={expired_certs} self_signed={self_signed_certs}")
+        deterministic_checks["certificate_hygiene_risk"].append(
+            f"expired={expired_certs} self_signed={self_signed_certs}"
+        )
 
     deterministic_checks["zone_policy_drift"].extend(zone_anomalies[:8])
 
     sequence_findings: list[dict[str, object]] = []
-    if deterministic_checks["syn_scan_or_exhaustion"] and deterministic_checks["tcp_reset_storm"]:
-        sequence_findings.append({"sequence": "recon_to_rst_disruption", "confidence": "high", "details": "SYN fan-out was followed by elevated RST activity"})
-        deterministic_checks["sequence_degradation_chain"].append("SYN fan-out followed by RST storm behavior")
+    if (
+        deterministic_checks["syn_scan_or_exhaustion"]
+        and deterministic_checks["tcp_reset_storm"]
+    ):
+        sequence_findings.append(
+            {
+                "sequence": "recon_to_rst_disruption",
+                "confidence": "high",
+                "details": "SYN fan-out was followed by elevated RST activity",
+            }
+        )
+        deterministic_checks["sequence_degradation_chain"].append(
+            "SYN fan-out followed by RST storm behavior"
+        )
     if retransmission_rate >= 0.01 and tcp_zero_window >= 20:
-        sequence_findings.append({"sequence": "load_retrans_zero_window", "confidence": "medium", "details": "Elevated retransmission rate with persistent zero-window events"})
-        deterministic_checks["sequence_degradation_chain"].append("Retransmission pressure followed by zero-window collapse")
-    if deterministic_checks["ot_cycle_instability"] and (deterministic_checks["tcp_reset_storm"] or deterministic_checks["persistent_zero_window"]):
-        sequence_findings.append({"sequence": "ot_jitter_transport_instability", "confidence": "medium", "details": "OT timing instability coincides with transport degradation signals"})
-        deterministic_checks["sequence_degradation_chain"].append("OT timing instability overlaps with transport instability")
+        sequence_findings.append(
+            {
+                "sequence": "load_retrans_zero_window",
+                "confidence": "medium",
+                "details": "Elevated retransmission rate with persistent zero-window events",
+            }
+        )
+        deterministic_checks["sequence_degradation_chain"].append(
+            "Retransmission pressure followed by zero-window collapse"
+        )
+    if deterministic_checks["ot_cycle_instability"] and (
+        deterministic_checks["tcp_reset_storm"]
+        or deterministic_checks["persistent_zero_window"]
+    ):
+        sequence_findings.append(
+            {
+                "sequence": "ot_jitter_transport_instability",
+                "confidence": "medium",
+                "details": "OT timing instability coincides with transport degradation signals",
+            }
+        )
+        deterministic_checks["sequence_degradation_chain"].append(
+            "OT timing instability overlaps with transport instability"
+        )
 
     outlier_windows: list[dict[str, object]] = []
     for metric in ["syn", "rst", "zero_window", "snmp", "retrans"]:
@@ -1008,25 +1252,53 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
             value = int(bucket.get(metric, 0))
             if value < threshold:
                 continue
-            outlier_windows.append({
-                "metric": metric,
-                "window_start": float(minute * 60),
-                "window_end": float(minute * 60 + 59),
-                "value": value,
-                "baseline": round(mean, 2),
-                "threshold": round(threshold, 2),
-                "sample": "; ".join(minute_samples.get(minute, [])[:3]),
-            })
-    outlier_windows.sort(key=lambda item: (-(float(item.get("value", 0.0) or 0.0)), str(item.get("metric", ""))))
+            outlier_windows.append(
+                {
+                    "metric": metric,
+                    "window_start": float(minute * 60),
+                    "window_end": float(minute * 60 + 59),
+                    "value": value,
+                    "baseline": round(mean, 2),
+                    "threshold": round(threshold, 2),
+                    "sample": "; ".join(minute_samples.get(minute, [])[:3]),
+                }
+            )
+    outlier_windows.sort(
+        key=lambda item: (
+            -(float(item.get("value", 0.0) or 0.0)),
+            str(item.get("metric", "")),
+        )
+    )
     outlier_windows = outlier_windows[:12]
 
     snmp_risks: list[dict[str, object]] = []
     if snmp_packets:
-        snmp_risks.append({"risk": "snmp_versions", "details": ", ".join(f"{ver}({count})" for ver, count in snmp_versions.most_common(4))})
+        snmp_risks.append(
+            {
+                "risk": "snmp_versions",
+                "details": ", ".join(
+                    f"{ver}({count})" for ver, count in snmp_versions.most_common(4)
+                ),
+            }
+        )
     if host_snmp_default:
-        snmp_risks.append({"risk": "default_communities", "details": ", ".join(f"{src}({count})" for src, count in host_snmp_default.most_common(6))})
+        snmp_risks.append(
+            {
+                "risk": "default_communities",
+                "details": ", ".join(
+                    f"{src}({count})" for src, count in host_snmp_default.most_common(6)
+                ),
+            }
+        )
     if snmp_set_sources:
-        snmp_risks.append({"risk": "set_requests", "details": ", ".join(f"{src}({count})" for src, count in snmp_set_sources.most_common(6))})
+        snmp_risks.append(
+            {
+                "risk": "set_requests",
+                "details": ", ".join(
+                    f"{src}({count})" for src, count in snmp_set_sources.most_common(6)
+                ),
+            }
+        )
 
     for item in zone_anomalies:
         flow = item.split(":", 1)[-1].strip()
@@ -1056,20 +1328,27 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
         else:
             severity = "low"
             confidence = "low"
-        host_risk_profiles.append({
-            "host": host,
-            "score": int(score),
-            "severity": severity,
-            "confidence": confidence,
-            "syn": int(tcp_syn_sources.get(host, 0)),
-            "rst": int(tcp_rst_sources.get(host, 0)),
-            "zero_window": int(tcp_zero_window_sources.get(host, 0)),
-            "snmp_default": int(host_snmp_default.get(host, 0)),
-            "targets": len(host_syn_targets.get(host, set()) | host_mgmt_targets.get(host, set())),
-            "reasons": reasons[:4],
-        })
+        host_risk_profiles.append(
+            {
+                "host": host,
+                "score": int(score),
+                "severity": severity,
+                "confidence": confidence,
+                "syn": int(tcp_syn_sources.get(host, 0)),
+                "rst": int(tcp_rst_sources.get(host, 0)),
+                "zero_window": int(tcp_zero_window_sources.get(host, 0)),
+                "snmp_default": int(host_snmp_default.get(host, 0)),
+                "targets": len(
+                    host_syn_targets.get(host, set())
+                    | host_mgmt_targets.get(host, set())
+                ),
+                "reasons": reasons[:4],
+            }
+        )
 
-    deterministic_checks["evidence_provenance"].append(f"{len(event_anchors)} anchor event(s) captured with packet provenance")
+    deterministic_checks["evidence_provenance"].append(
+        f"{len(event_anchors)} anchor event(s) captured with packet provenance"
+    )
 
     verdict_score = 0
     verdict_score += 2 if deterministic_checks["udp_reflection_amplification"] else 0
@@ -1085,7 +1364,9 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
     if deterministic_checks["udp_reflection_amplification"]:
         analyst_reasons.append("UDP reflection/amplification profile detected")
     if deterministic_checks["snmp_exposure_risk"]:
-        analyst_reasons.append("SNMP exposure risks detected (version/community/write behavior)")
+        analyst_reasons.append(
+            "SNMP exposure risks detected (version/community/write behavior)"
+        )
     if deterministic_checks["ot_cycle_instability"]:
         analyst_reasons.append("OT cycle-time jitter instability detected")
     if deterministic_checks["syn_scan_or_exhaustion"]:
@@ -1098,27 +1379,39 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
         analyst_reasons.append("Cross-zone management/OT service flows observed")
 
     if verdict_score >= 8:
-        analyst_verdict = "YES - HIGH-CONFIDENCE NETWORK HEALTH SECURITY RISK PATTERN DETECTED"
+        analyst_verdict = (
+            "YES - HIGH-CONFIDENCE NETWORK HEALTH SECURITY RISK PATTERN DETECTED"
+        )
         analyst_confidence = "high"
     elif verdict_score >= 5:
-        analyst_verdict = "LIKELY - MULTIPLE CORROBORATING NETWORK HEALTH RISK INDICATORS"
+        analyst_verdict = (
+            "LIKELY - MULTIPLE CORROBORATING NETWORK HEALTH RISK INDICATORS"
+        )
         analyst_confidence = "medium"
     elif verdict_score >= 3:
         analyst_verdict = "POSSIBLE - SUSPICIOUS HEALTH INDICATORS REQUIRE VALIDATION"
         analyst_confidence = "medium"
     else:
-        analyst_verdict = "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE HEALTH RISK PATTERN"
+        analyst_verdict = (
+            "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE HEALTH RISK PATTERN"
+        )
         analyst_confidence = "low"
 
     benign_context: list[str] = []
     if not deterministic_checks["syn_scan_or_exhaustion"]:
-        benign_context.append("No sustained SYN fan-out behavior exceeded scan/exhaustion thresholds")
+        benign_context.append(
+            "No sustained SYN fan-out behavior exceeded scan/exhaustion thresholds"
+        )
     if not deterministic_checks["udp_reflection_amplification"]:
         benign_context.append("No strong UDP reflection/amplification profile detected")
     if not deterministic_checks["ot_cycle_instability"]:
-        benign_context.append("OT timing jitter remained within expected variability thresholds")
+        benign_context.append(
+            "OT timing jitter remained within expected variability thresholds"
+        )
     if not deterministic_checks["zone_policy_drift"]:
-        benign_context.append("No cross-zone management/OT service placement drift detected")
+        benign_context.append(
+            "No cross-zone management/OT service placement drift detected"
+        )
 
     return HealthSummary(
         path=path,
@@ -1156,7 +1449,9 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
         findings=findings,
         analyst_verdict=analyst_verdict,
         analyst_confidence=analyst_confidence,
-        analyst_reasons=analyst_reasons if analyst_reasons else ["No high-confidence health risk checks crossed threshold"],
+        analyst_reasons=analyst_reasons
+        if analyst_reasons
+        else ["No high-confidence health risk checks crossed threshold"],
         deterministic_checks=deterministic_checks,
         sequence_findings=sequence_findings,
         host_risk_profiles=host_risk_profiles,

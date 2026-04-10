@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
 import ipaddress
+from pathlib import Path
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_port_protocol,
+)
 
 FINS_PORT = 9600
 
@@ -21,7 +25,9 @@ def _parse_commands(payload: bytes) -> list[str]:
     return [label]
 
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     if any("Write" in cmd for cmd in commands):
         anomalies.append(

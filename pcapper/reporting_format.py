@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Iterable
 import re
 import textwrap
+from typing import Iterable
 
 
 def format_table(rows: Iterable[list[str]]) -> str:
@@ -67,7 +67,7 @@ def format_table(rows: Iterable[list[str]]) -> str:
             return [text]
 
         wrapped: list[str] = []
-        for base_line in (text.splitlines() or [text]):
+        for base_line in text.splitlines() or [text]:
             if not base_line:
                 wrapped.append("")
                 continue
@@ -98,7 +98,10 @@ def format_table(rows: Iterable[list[str]]) -> str:
 
     lines: list[str] = []
     for row in rows:
-        wrapped_cells = [_wrap_cell_lines(value, wrapped_widths[idx]) for idx, value in enumerate(row)]
+        wrapped_cells = [
+            _wrap_cell_lines(value, wrapped_widths[idx])
+            for idx, value in enumerate(row)
+        ]
         row_height = max((len(cell_lines) for cell_lines in wrapped_cells), default=1)
 
         for line_idx in range(row_height):

@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional
-from collections import Counter
 import base64
 import binascii
 import ipaddress
 import re
 import urllib.parse
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
 from .pcap_cache import get_reader
 from .utils import safe_float
 
 try:
+    from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
-    from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore
     from scapy.packet import Raw  # type: ignore
 except Exception:  # pragma: no cover
     IP = None  # type: ignore
@@ -51,8 +51,17 @@ SECRETISH_PATTERNS = [
     re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
 ]
 
-HTTP_METHOD_RE = re.compile(r"^(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD|TRACE|CONNECT)\s+([^\s]+)", re.IGNORECASE)
+HTTP_METHOD_RE = re.compile(
+    r"^(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD|TRACE|CONNECT)\s+([^\s]+)", re.IGNORECASE
+)
 GENERIC_TOKEN_RE = re.compile(r"[A-Za-z0-9%+/=_:.-]{10,}")
+HTTP_BASIC_AUTH_RE = re.compile(
+    r"(?im)^authorization:\s*basic\s+([A-Za-z0-9+/=]{8,})\s*$"
+)
+HTTP_CRED_PARAM_RE = re.compile(
+    r"(?i)\b(pass(?:word|wd|phrase)?|psk|wpa(?:2)?passphrase|key)\s*=\s*([^&\s;]{1,160})"
+)
+PLAUSIBLE_CRED_PAIR_RE = re.compile(r"^[A-Za-z0-9_.@\-]{1,64}:[^\s:]{1,96}$")
 
 
 def _pattern_name(pattern: re.Pattern[str]) -> str:
@@ -177,7 +186,10 @@ def _iter_decode_candidates(token: str, max_depth: int = 3) -> list[tuple[str, s
 
         # Base64 decode (std/urlsafe)
         if len(value) >= 8 and re.fullmatch(r"[A-Za-z0-9_+/=-]+", value):
-            for decoder_name, decoder in (("b64", base64.b64decode), ("b64url", base64.urlsafe_b64decode)):
+            for decoder_name, decoder in (
+                ("b64", base64.b64decode),
+                ("b64url", base64.urlsafe_b64decode),
+            ):
                 try:
                     padded = value + ("=" * (-len(value) % 4))
                     dec = decoder(padded).decode("utf-8", errors="ignore")
@@ -201,12 +213,16 @@ def _is_public_ip(value: str) -> bool:
 def _is_secretish_token(value: str) -> bool:
     if any(pattern.search(value) for pattern in SECRETISH_PATTERNS):
         return True
-    if len(value) >= 32 and value.lower().startswith(("ghp_", "glpat-", "xoxb-", "xoxp-", "sk_")):
+    if len(value) >= 32 and value.lower().startswith(
+        ("ghp_", "glpat-", "xoxb-", "xoxp-", "sk_")
+    ):
         return True
     return False
 
 
-def _candidate_score(value: str, chain: str, source: str, external: bool, reassembled: bool) -> tuple[int, str]:
+def _candidate_score(
+    value: str, chain: str, source: str, external: bool, reassembled: bool
+) -> tuple[int, str]:
     score = 0
     lower = value.lower()
 
@@ -223,6 +239,20 @@ def _candidate_score(value: str, chain: str, source: str, external: bool, reasse
         score += 1
     if reassembled:
         score += 1
+    if PLAUSIBLE_CRED_PAIR_RE.fullmatch(value):
+        score += 3
+    if any(
+        marker in lower
+        for marker in (
+            "passphrase=",
+            "password=",
+            "passwd=",
+            "pwd=",
+            "psk=",
+            "wpa2passphrase=",
+        )
+    ):
+        score += 2
     if _is_secretish_token(value) and not matched:
         score -= 2
     if any(prefix in lower for prefix in ("flag{", "ctf{", "htb{", "picoctf{")):
@@ -252,7 +282,9 @@ def _proto_label(pkt) -> str:
 
 
 def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     hits: list[CtfHit] = []
     decoded_hits: list[str] = []
@@ -281,6 +313,8 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
         "external_replay_exfil_behavior": [],
         "challenge_file_hint_correlation": [],
         "likely_secret_not_flag": [],
+        "credential_pattern_present": [],
+        "passphrase_parameter_present": [],
     }
 
     def _record_candidate(
@@ -299,7 +333,9 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
         if not value.strip():
             return
         external = _is_public_ip(dst_ip)
-        score, confidence = _candidate_score(value, decode_chain, source, external, reassembled)
+        score, confidence = _candidate_score(
+            value, decode_chain, source, external, reassembled
+        )
         key = (value[:96], packet_number, src_ip, dst_ip)
         if key in seen_finding_keys:
             return
@@ -330,18 +366,22 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
             "context": context[:180],
         }
         candidate_findings.append(finding)
-        timeline.append({
-            "ts": ts,
-            "event": "candidate",
-            "candidate": value[:80],
-            "confidence": confidence,
-            "src": src_ip,
-            "dst": dst_ip,
-            "protocol": protocol,
-            "packet": packet_number,
-        })
+        timeline.append(
+            {
+                "ts": ts,
+                "event": "candidate",
+                "candidate": value[:80],
+                "confidence": confidence,
+                "src": src_ip,
+                "dst": dst_ip,
+                "protocol": protocol,
+                "packet": packet_number,
+            }
+        )
 
-        if _is_secretish_token(value) and not any(pattern.search(value) for pattern in FLAG_PATTERNS):
+        if _is_secretish_token(value) and not any(
+            pattern.search(value) for pattern in FLAG_PATTERNS
+        ):
             deterministic_checks["likely_secret_not_flag"].append(
                 f"pkt={packet_number} {src_ip}->{dst_ip} token looked secret-like (not CTF wrapper)"
             )
@@ -355,7 +395,14 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
                 continue
             matched_value = m.group(1)
             token_counts[matched_value] += 1
-            hits.append(CtfHit(src_ip=src_ip, dst_ip=dst_ip, protocol=protocol, context=matched_value))
+            hits.append(
+                CtfHit(
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    protocol=protocol,
+                    context=matched_value,
+                )
+            )
             deterministic_checks["flag_wrapper_pattern_present"].append(
                 f"pkt={packet_number} {_pattern_name(pattern)} {src_ip}->{dst_ip}"
             )
@@ -435,6 +482,58 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
                                     dst_ip=dst_ip,
                                     protocol=protocol,
                                 )
+                    # HTTP Basic credentials (e.g., Authorization: Basic YWRtaW46YWRtaW4=).
+                    for match in HTTP_BASIC_AUTH_RE.finditer(text):
+                        token = str(match.group(1) or "").strip()
+                        if not token:
+                            continue
+                        decoded = ""
+                        try:
+                            padded = token + ("=" * (-len(token) % 4))
+                            decoded = (
+                                base64.b64decode(padded, validate=False)
+                                .decode("utf-8", errors="ignore")
+                                .strip()
+                            )
+                        except Exception:
+                            decoded = ""
+                        if decoded and PLAUSIBLE_CRED_PAIR_RE.fullmatch(decoded):
+                            deterministic_checks["credential_pattern_present"].append(
+                                f"pkt={pkt_index} http-basic {src_ip}->{dst_ip} credential-pair observed"
+                            )
+                            _record_candidate(
+                                value=decoded,
+                                decode_chain="http-basic",
+                                source="http",
+                                context="http authorization basic decoded credential",
+                                packet_number=pkt_index,
+                                ts=ts,
+                                src_ip=src_ip,
+                                dst_ip=dst_ip,
+                                protocol=protocol,
+                            )
+
+                    # Passphrase/password style key=value parameters in URI/body.
+                    for match in HTTP_CRED_PARAM_RE.finditer(text):
+                        key = str(match.group(1) or "").strip()
+                        value = str(match.group(2) or "").strip()
+                        if not key or not value:
+                            continue
+                        candidate = f"{key}={value}"
+                        deterministic_checks["passphrase_parameter_present"].append(
+                            f"pkt={pkt_index} {src_ip}->{dst_ip} parameter {key}=<redacted>"
+                        )
+                        _record_candidate(
+                            value=candidate,
+                            decode_chain="http-param",
+                            source="http",
+                            context=f"http credential parameter {key}",
+                            packet_number=pkt_index,
+                            ts=ts,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            protocol=protocol,
+                        )
 
             # Generic token decode pipeline.
             token_budget = 80
@@ -491,7 +590,9 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
                         qname = str(getattr(qd, "qname", b"")).strip("b'").strip("'")
                         if qname:
                             for value, chain in _iter_decode_candidates(qname):
-                                if any(pattern.search(value) for pattern in FLAG_PATTERNS):
+                                if any(
+                                    pattern.search(value) for pattern in FLAG_PATTERNS
+                                ):
                                     _record_candidate(
                                         value=value,
                                         decode_chain=chain,
@@ -563,7 +664,11 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
 
     timeline.sort(key=lambda item: float(item.get("ts", 0.0) or 0.0))
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return CtfSummary(
         path=path,
         total_packets=total_packets,
@@ -577,7 +682,9 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
         duration_seconds=duration,
         confidence_counts=confidence_counts,
         candidate_findings=candidate_findings[:200],
-        deterministic_checks={key: value[:40] for key, value in deterministic_checks.items()},
+        deterministic_checks={
+            key: value[:40] for key, value in deterministic_checks.items()
+        },
         timeline=timeline[:200],
         hunting_pivots=hunting_pivots[:80],
         false_positive_context=false_positive_context[:30],

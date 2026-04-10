@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
 import ipaddress
+from pathlib import Path
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_port_protocol,
+)
 
 MQTT_PORTS = {1883, 8883}
 
@@ -25,7 +29,16 @@ MQTT_TYPES = {
     15: "AUTH",
 }
 
-MQTT_CONTROL_KEYWORDS = ("cmd", "command", "write", "set", "control", "actuate", "stop", "start")
+MQTT_CONTROL_KEYWORDS = (
+    "cmd",
+    "command",
+    "write",
+    "set",
+    "control",
+    "actuate",
+    "stop",
+    "start",
+)
 
 
 def _decode_remaining_length(payload: bytes, idx: int) -> tuple[int | None, int]:
@@ -63,20 +76,33 @@ def _parse_mqtt_packets(payload: bytes) -> list[dict[str, object]]:
             break
         data = payload[msg_start:msg_end]
 
-        entry: dict[str, object] = {"type": msg_type, "flags": flags, "topics": [], "payload": b""}
+        entry: dict[str, object] = {
+            "type": msg_type,
+            "flags": flags,
+            "topics": [],
+            "payload": b"",
+        }
         if msg_type == 1 and len(data) >= 10:
             proto_len = int.from_bytes(data[0:2], "big")
             if len(data) >= 2 + proto_len + 4:
                 client_id_len_offset = 2 + proto_len + 4
                 if client_id_len_offset + 2 <= len(data):
-                    client_len = int.from_bytes(data[client_id_len_offset:client_id_len_offset + 2], "big")
+                    client_len = int.from_bytes(
+                        data[client_id_len_offset : client_id_len_offset + 2], "big"
+                    )
                     client_start = client_id_len_offset + 2
-                    client_id = data[client_start:client_start + client_len].decode("utf-8", errors="ignore")
+                    client_id = data[client_start : client_start + client_len].decode(
+                        "utf-8", errors="ignore"
+                    )
                     if client_id:
                         entry["client_id"] = client_id
         elif msg_type == 3 and len(data) >= 2:
             tlen = int.from_bytes(data[0:2], "big")
-            topic = data[2:2 + tlen].decode("utf-8", errors="ignore") if 2 + tlen <= len(data) else ""
+            topic = (
+                data[2 : 2 + tlen].decode("utf-8", errors="ignore")
+                if 2 + tlen <= len(data)
+                else ""
+            )
             if topic:
                 entry["topics"] = [topic]
             qos = (flags >> 1) & 0x03
@@ -88,11 +114,11 @@ def _parse_mqtt_packets(payload: bytes) -> list[dict[str, object]]:
             pos = 2
             topics = []
             while pos + 2 <= len(data):
-                tlen = int.from_bytes(data[pos:pos + 2], "big")
+                tlen = int.from_bytes(data[pos : pos + 2], "big")
                 pos += 2
                 if pos + tlen > len(data):
                     break
-                topic = data[pos:pos + tlen].decode("utf-8", errors="ignore")
+                topic = data[pos : pos + tlen].decode("utf-8", errors="ignore")
                 pos += tlen
                 if msg_type == 8 and pos < len(data):
                     pos += 1
@@ -157,7 +183,9 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
     return artifacts
 
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     parsed = _parse_mqtt_packets(payload)
     if any(cmd == "CONNECT" for cmd in commands):
@@ -208,7 +236,9 @@ def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, comma
                     )
                 )
                 break
-    if any(cmd.startswith("SUBSCRIBE") or cmd.startswith("UNSUBSCRIBE") for cmd in commands):
+    if any(
+        cmd.startswith("SUBSCRIBE") or cmd.startswith("UNSUBSCRIBE") for cmd in commands
+    ):
         anomalies.append(
             IndustrialAnomaly(
                 severity="MEDIUM",

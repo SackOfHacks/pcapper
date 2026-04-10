@@ -79,8 +79,8 @@ python -m pcapper capture.pcap --timeline -ip 10.0.0.5 --protocols --services
 # 3) ATT&CK + IDS corroboration
 python -m pcapper capture.pcap --mitre --suricata
 
-# 4) Exfiltration, file transfer, and AIM artifact hunt
-python -m pcapper capture.pcap --exfil --files --ftp --http --aim
+# 4) Exfiltration, file transfer, and messaging/email artifact hunt
+python -m pcapper capture.pcap --exfil --files --ftp --http --aim --email
 
 # 5) OT/ICS deep-dive
 python -m pcapper capture.pcap --modbus --dnp3 --iec104 --s7 --ot-commands --safety
@@ -113,9 +113,9 @@ flowchart LR
 | Hunt C2 or beaconing behavior | `--beacon --dns --tls --quic` |
 | Map findings to ATT&CK | `--mitre` |
 | Corroborate with IDS alerts | `--suricata` |
-| Investigate data theft and transferred artifacts | `--exfil --files --ftp --http --aim` |
+| Investigate data theft and transferred artifacts | `--exfil --files --ftp --http --aim --email` |
 | Investigate identity abuse | `--kerberos --ldap --ntlm --domain --creds` |
-| Track lateral movement | `--hosts --services --protocols --tcp --timeline -ip <host>` |
+| Track lateral movement | `--hostnames --services --protocols --tcp --timeline -ip <host>` |
 | Run OT/ICS-specific triage | `--modbus --dnp3 --iec104 --s7 --ot-commands --safety` |
 | Build IR exports and evidence packs | `--json --csv --sqlite --case-dir` |
 
@@ -180,22 +180,18 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
-## Current Release: v1.6.5
+## Current Release: v1.7.0
 
 Latest additions in this release:
-- New AIM forensics workflow (`--aim`) to extract conversations, usernames, passwords/secrets, artifacts, and client/server activity stats.
-- AIM-over-nonstandard-port detection (including tunneled AIM content over TCP/443) for message/credential discovery.
-- `--files` now supports AIM/OFT transferred files (discover, `--view`, and `--extract`) and improved FTP transfer filename recovery.
-- MITRE ATT&CK mapping (`--mitre`) across Enterprise + ICS with technique heat, host chains, and attack-path visualization.
-- Suricata IDS integration (`--suricata`) with rule/config controls and deterministic coverage checks.
-- TCP stream carving (`--carve`) with signature-based extraction.
-- Obfuscation/tunneling heuristics (`--obfuscation`) for high-entropy and encoded payloads.
-- Cross-PCAP correlation (`--correlate`) for repeated hosts/services.
-- Case provenance metadata (`case.json`) with hashes, timestamps, and analyst attribution.
-- Control-loop validation (`--control-loop`) for Modbus/DNP3 value change behavior.
-- Safety PLC/SIS protocol detection (`--safety`) with Triconex/TriStation heuristics.
-- Baseline snapshot and drift comparison (`--baseline-save`, `--baseline-compare`).
-- Rule-pack evaluation (`--rules`) and IOC enrichment (`--ioc-file`).
+- New MAC/IP pivot workflows: `--ip` and `--mac` with clean unique pair summaries, counts, hostname/manufacturer context, and simple filter support.
+- Function-specific help flow: global help via `pcapper -h` plus scoped help like `pcapper --streams -h`.
+- `--streams` follow behavior simplified to `--streams -id <stream-id>` (deprecated follow flags removed).
+- `--files -exe` now reliably surfaces executable/active-content downloads and shows full output regardless of `-v`.
+- Improved HTTP file correlation for extensionless malware-style URI tokens (long random path artifacts are now retained).
+- `--webrequests` now includes packet numbers in one-line and detailed output and provides richer details for filtered views (`-post`, `-ip`, `-search`).
+- `--ips` default host view is streamlined to actionable host details and confirmed listening-service ports.
+- `--tls` default output now includes certificate summaries (subject/issuer/signer/expiry/common issues) and richer medium/high/critical finding detail.
+- Filter independence hardened across `--hostdetails`, `--hostnames`, `--http`, `--tls`, and `--files` for `-ip`, `-name`, `-port`, and `-search`.
 
 ## OT/ICS Command Center
 
@@ -517,15 +513,13 @@ python -m pcapper --help
 - `--decrypt`
 - `--decrypt-limit N`
 - `--decrypt-out DIR`
-- `--extract FILENAME`
-- `--follow FLOW`
-- `--follow-id STREAM_ID`
+- `-extract FILENAME`
+- `-id STREAM_ID`
 - `--ioc-file PATH`
 - `--json PATH`
 - `--list-plugins`
 - `--log-file PATH`
 - `--log-json`
-- `--lookup-stream-id STREAM_ID`
 - `--no-color`
 - `--no-status`
 - `--packet N`
@@ -551,10 +545,11 @@ python -m pcapper --help
 - `-summarize, --summarize`
 - `-v, --verbose`
 - `-vt, --vt`
-- `--view FILENAME`
+- `-view FILENAME`
 
 ### IT/Enterprise functions (alphabetical)
 
+- `--aim`
 - `--arp`
 - `--beacon`
 - `--certificates`
@@ -564,14 +559,14 @@ python -m pcapper --help
 - `--dhcp`
 - `--dns`
 - `--domain`
+- `--email`
 - `--encrypted-dns`
 - `--exfil`
 - `--files`
 - `--ftp`
 - `--health`
 - `--hostdetails`
-- `--hostname`
-- `--hosts`
+- `--hostnames`
 - `--http`
 - `--http2`
 - `--icmp`
@@ -617,7 +612,7 @@ python -m pcapper --help
 - `--winrm`
 - `--wmic`
 
-Count: 60 flags
+Count: 62 flags
 
 ### OT/ICS/Industrial functions (alphabetical)
 

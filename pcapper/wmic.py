@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import ipaddress
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import ipaddress
-import re
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -37,25 +37,36 @@ WMI_CLASS_RE = re.compile(r"\b(?:Win32|CIM|MSFT)_[A-Za-z0-9_]+", re.IGNORECASE)
 
 NODE_RE = re.compile(r"(?:/node:|/NODE:|\\\\)([A-Za-z0-9_.-]{1,64})")
 DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9_.-]{1,64})\b")
-HOST_VALUE_RE = re.compile(r"(?:hostname|computername|name)\s*[:=]\s*([A-Za-z0-9_.-]{2,64})", re.IGNORECASE)
+HOST_VALUE_RE = re.compile(
+    r"(?:hostname|computername|name)\s*[:=]\s*([A-Za-z0-9_.-]{2,64})", re.IGNORECASE
+)
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})\b")
 
 ERROR_PATTERNS = [
     (re.compile(r"access is denied", re.IGNORECASE), "Access denied"),
     (re.compile(r"logon failure|login failed", re.IGNORECASE), "Logon failure"),
-    (re.compile(r"rpc server unavailable|0x800706ba", re.IGNORECASE), "RPC server unavailable"),
+    (
+        re.compile(r"rpc server unavailable|0x800706ba", re.IGNORECASE),
+        "RPC server unavailable",
+    ),
     (re.compile(r"invalid namespace|0x8004100e", re.IGNORECASE), "Invalid namespace"),
     (re.compile(r"invalid class|0x80041010", re.IGNORECASE), "Invalid class"),
     (re.compile(r"denied|not authorized", re.IGNORECASE), "Authorization error"),
 ]
 
 SUSPICIOUS_COMMANDS = [
-    (re.compile(r"process\\s+call\\s+create", re.IGNORECASE), "Remote process creation"),
+    (
+        re.compile(r"process\\s+call\\s+create", re.IGNORECASE),
+        "Remote process creation",
+    ),
     (re.compile(r"cmd\\.exe|powershell", re.IGNORECASE), "Shell execution"),
     (re.compile(r"rundll32|regsvr32", re.IGNORECASE), "DLL execution"),
     (re.compile(r"schtasks|at\\s+", re.IGNORECASE), "Scheduled task creation"),
-    (re.compile(r"net\\s+user|net\\s+localgroup", re.IGNORECASE), "Account manipulation"),
+    (
+        re.compile(r"net\\s+user|net\\s+localgroup", re.IGNORECASE),
+        "Account manipulation",
+    ),
     (re.compile(r"certutil|bitsadmin|curl|wget", re.IGNORECASE), "Download tooling"),
     (re.compile(r"vssadmin|wbadmin|bcdedit", re.IGNORECASE), "System modification"),
     (re.compile(r"\\bbase64\\b|\\b-enc\\b", re.IGNORECASE), "Encoded payloads"),
@@ -72,7 +83,10 @@ SERVICE_HINTS = [
 
 PERSISTENCE_HINTS = [
     re.compile(r"root\\\\subscription", re.IGNORECASE),
-    re.compile(r"__EventFilter|CommandLineEventConsumer|ActiveScriptEventConsumer", re.IGNORECASE),
+    re.compile(
+        r"__EventFilter|CommandLineEventConsumer|ActiveScriptEventConsumer",
+        re.IGNORECASE,
+    ),
 ]
 
 
@@ -132,6 +146,10 @@ class WmicSummary:
     artifacts: list[str]
     conversations: list[WmicConversation]
     errors: list[str]
+    deterministic_checks: dict[str, list[str]]
+    threat_hypotheses: list[dict[str, object]]
+    hunting_pivots: list[dict[str, object]]
+    benign_context: list[str]
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
@@ -192,6 +210,12 @@ class WmicSummary:
                 for conv in self.conversations
             ],
             "errors": list(self.errors),
+            "deterministic_checks": {
+                key: list(value) for key, value in self.deterministic_checks.items()
+            },
+            "threat_hypotheses": list(self.threat_hypotheses),
+            "hunting_pivots": list(self.hunting_pivots),
+            "benign_context": list(self.benign_context),
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "duration_seconds": self.duration_seconds,
@@ -221,7 +245,9 @@ class _SessionState:
             self.hints = Counter()
 
 
-def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
+def _extract_ascii_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
     results: list[str] = []
     if not data:
         return results
@@ -240,7 +266,9 @@ def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) ->
     return results
 
 
-def _extract_utf16le_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
+def _extract_utf16le_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
     results: list[str] = []
     if not data:
         return results
@@ -263,7 +291,9 @@ def _extract_utf16le_strings(data: bytes, min_len: int = 4, max_len: int = 200) 
     return results
 
 
-def _direction(src_ip: str, dst_ip: str, sport: int, dport: int) -> tuple[str, str, int, int]:
+def _direction(
+    src_ip: str, dst_ip: str, sport: int, dport: int
+) -> tuple[str, str, int, int]:
     if dport in WMI_PORTS:
         return src_ip, dst_ip, sport, dport
     if sport in WMI_PORTS:
@@ -286,7 +316,7 @@ def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
     if avg <= 0:
         return None
     variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
+    stddev = variance**0.5
     if avg < 5 or avg > 86400:
         return None
     if stddev > max(5.0, avg * 0.25):
@@ -310,7 +340,9 @@ def analyze_wmic(
 ) -> WmicSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
-        errors.append("Scapy IP/TCP layers unavailable; install scapy for WMIC analysis.")
+        errors.append(
+            "Scapy IP/TCP layers unavailable; install scapy for WMIC analysis."
+        )
         return WmicSummary(
             path=path,
             total_packets=0,
@@ -347,6 +379,10 @@ def analyze_wmic(
             artifacts=[],
             conversations=[],
             errors=errors,
+            deterministic_checks={},
+            threat_hypotheses=[],
+            hunting_pivots=[],
+            benign_context=[],
             first_seen=None,
             last_seen=None,
             duration_seconds=None,
@@ -393,6 +429,10 @@ def analyze_wmic(
             artifacts=[],
             conversations=[],
             errors=[f"Error opening pcap: {exc}"],
+            deterministic_checks={},
+            threat_hypotheses=[],
+            hunting_pivots=[],
+            benign_context=[],
             first_seen=None,
             last_seen=None,
             duration_seconds=None,
@@ -488,7 +528,9 @@ def analyze_wmic(
             if not payload:
                 continue
 
-            strings = _extract_ascii_strings(payload) + _extract_utf16le_strings(payload)
+            strings = _extract_ascii_strings(payload) + _extract_utf16le_strings(
+                payload
+            )
             if not strings:
                 continue
 
@@ -725,7 +767,10 @@ def analyze_wmic(
             }
         )
 
-    if error_counts.get("Access denied", 0) >= 5 or error_counts.get("Logon failure", 0) >= 5:
+    if (
+        error_counts.get("Access denied", 0) >= 5
+        or error_counts.get("Logon failure", 0) >= 5
+    ):
         detections.append(
             {
                 "severity": "warning",
@@ -746,6 +791,143 @@ def analyze_wmic(
 
     if hostnames:
         artifacts.append("Hosts: " + ", ".join(list(hostnames.keys())[:10]))
+
+    deterministic_checks: dict[str, list[str]] = {
+        "wmic_remote_execution_tradecraft": [],
+        "wmic_namespace_persistence_context": [],
+        "wmic_auth_failure_burst": [],
+        "wmic_target_fanout": [],
+        "wmic_node_fanout": [],
+        "wmic_periodic_activity": [],
+        "wmic_data_exfil_asymmetry": [],
+        "wmic_public_endpoint_exposure": [],
+    }
+    threat_hypotheses: list[dict[str, object]] = []
+    hunting_pivots: list[dict[str, object]] = []
+    benign_context: list[str] = []
+
+    def _is_public_ip(value: str) -> bool:
+        try:
+            return ipaddress.ip_address(str(value)).is_global
+        except Exception:
+            return False
+
+    for cmd, count in suspicious_commands.most_common(20):
+        deterministic_checks["wmic_remote_execution_tradecraft"].append(
+            f"{cmd[:120]} hits={int(count)}"
+        )
+    if any(p in wmi_namespaces for p in ("root\\\\subscription",)):
+        deterministic_checks["wmic_namespace_persistence_context"].append(
+            "WMI persistence namespace root\\subscription observed"
+        )
+    if error_counts.get("Access denied", 0) >= 5:
+        deterministic_checks["wmic_auth_failure_burst"].append(
+            f"Access denied errors count={int(error_counts.get('Access denied', 0))}"
+        )
+    if error_counts.get("Logon failure", 0) >= 5:
+        deterministic_checks["wmic_auth_failure_burst"].append(
+            f"Logon failure errors count={int(error_counts.get('Logon failure', 0))}"
+        )
+
+    for client, targets in client_targets.items():
+        if len(targets) >= 8:
+            deterministic_checks["wmic_target_fanout"].append(
+                f"{client} contacted {len(targets)} unique WMI targets"
+            )
+            hunting_pivots.append(
+                {
+                    "pivot": "wmic_target_fanout",
+                    "client": client,
+                    "targets": len(targets),
+                }
+            )
+    for client, nodes in node_targets.items():
+        if len(nodes) >= 6:
+            deterministic_checks["wmic_node_fanout"].append(
+                f"{client} referenced {len(nodes)} /node targets in WMIC content"
+            )
+            hunting_pivots.append(
+                {
+                    "pivot": "wmic_node_fanout",
+                    "client": client,
+                    "nodes": len(nodes),
+                }
+            )
+    for client, times in client_times.items():
+        score = _beaconing_score(times)
+        if score:
+            deterministic_checks["wmic_periodic_activity"].append(
+                f"{client} periodic WMIC cadence avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s"
+            )
+    if server_bytes > 5 * max(1, client_bytes) and server_bytes > 1024 * 1024:
+        deterministic_checks["wmic_data_exfil_asymmetry"].append(
+            f"WMI response-heavy transfer server_bytes={int(server_bytes)} client_bytes={int(client_bytes)}"
+        )
+
+    for server_ip, count in server_counts.items():
+        if _is_public_ip(server_ip):
+            deterministic_checks["wmic_public_endpoint_exposure"].append(
+                f"Public WMI server endpoint {server_ip} count={int(count)}"
+            )
+    for client_ip, count in client_counts.items():
+        if _is_public_ip(client_ip):
+            deterministic_checks["wmic_public_endpoint_exposure"].append(
+                f"Public WMI client endpoint {client_ip} count={int(count)}"
+            )
+
+    if (
+        deterministic_checks["wmic_remote_execution_tradecraft"]
+        and deterministic_checks["wmic_target_fanout"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "WMI-based lateral movement with execution tooling and broad host targeting",
+                "confidence": "high",
+                "evidence": len(
+                    deterministic_checks["wmic_remote_execution_tradecraft"]
+                )
+                + len(deterministic_checks["wmic_target_fanout"]),
+            }
+        )
+    if deterministic_checks["wmic_namespace_persistence_context"]:
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Potential WMI permanent event subscription persistence behavior",
+                "confidence": "high",
+                "evidence": len(
+                    deterministic_checks["wmic_namespace_persistence_context"]
+                ),
+            }
+        )
+    if (
+        deterministic_checks["wmic_auth_failure_burst"]
+        and deterministic_checks["wmic_target_fanout"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "WMI credential brute-force/spray attempts across multiple targets",
+                "confidence": "medium",
+                "evidence": len(deterministic_checks["wmic_auth_failure_burst"])
+                + len(deterministic_checks["wmic_target_fanout"]),
+            }
+        )
+    if deterministic_checks["wmic_public_endpoint_exposure"]:
+        threat_hypotheses.append(
+            {
+                "hypothesis": "WMI management surface exposed to public network path",
+                "confidence": "medium",
+                "evidence": len(deterministic_checks["wmic_public_endpoint_exposure"]),
+            }
+        )
+
+    if not deterministic_checks["wmic_auth_failure_burst"]:
+        benign_context.append(
+            "No substantial WMI access-denied/logon-failure burst observed"
+        )
+    if not deterministic_checks["wmic_target_fanout"]:
+        benign_context.append("No broad WMI target fan-out behavior detected")
+    if not deterministic_checks["wmic_periodic_activity"]:
+        benign_context.append("No strong periodic WMIC cadence observed")
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -787,6 +969,10 @@ def analyze_wmic(
         artifacts=artifacts,
         conversations=conversations,
         errors=errors,
+        deterministic_checks={k: v[:80] for k, v in deterministic_checks.items()},
+        threat_hypotheses=threat_hypotheses[:24],
+        hunting_pivots=hunting_pivots[:150],
+        benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
@@ -834,6 +1020,10 @@ def merge_wmic_summaries(
             artifacts=[],
             conversations=[],
             errors=[],
+            deterministic_checks={},
+            threat_hypotheses=[],
+            hunting_pivots=[],
+            benign_context=[],
             first_seen=None,
             last_seen=None,
             duration_seconds=None,
@@ -876,6 +1066,10 @@ def merge_wmic_summaries(
     artifacts: list[str] = []
     conversations: list[WmicConversation] = []
     errors: list[str] = []
+    deterministic_checks: dict[str, list[str]] = defaultdict(list)
+    threat_hypotheses: list[dict[str, object]] = []
+    hunting_pivots: list[dict[str, object]] = []
+    benign_context: list[str] = []
 
     for summary in summary_list:
         total_packets += summary.total_packets
@@ -888,9 +1082,17 @@ def merge_wmic_summaries(
         total_sessions += summary.total_sessions
 
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         client_counts.update(summary.client_counts)
         server_counts.update(summary.server_counts)
@@ -918,6 +1120,23 @@ def merge_wmic_summaries(
         artifacts.extend(summary.artifacts)
         conversations.extend(summary.conversations)
         errors.extend(summary.errors)
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+        if isinstance(checks, dict):
+            for key, values in checks.items():
+                for value in list(values or []):
+                    text = str(value).strip()
+                    if text and text not in deterministic_checks[key]:
+                        deterministic_checks[key].append(text)
+        for item in list(getattr(summary, "threat_hypotheses", []) or []):
+            if item not in threat_hypotheses:
+                threat_hypotheses.append(item)
+        for item in list(getattr(summary, "hunting_pivots", []) or []):
+            if item not in hunting_pivots:
+                hunting_pivots.append(item)
+        for item in list(getattr(summary, "benign_context", []) or []):
+            text = str(item).strip()
+            if text and text not in benign_context:
+                benign_context.append(text)
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -959,6 +1178,12 @@ def merge_wmic_summaries(
         artifacts=artifacts,
         conversations=conversations,
         errors=errors,
+        deterministic_checks={
+            key: values[:80] for key, values in deterministic_checks.items()
+        },
+        threat_hypotheses=threat_hypotheses[:24],
+        hunting_pivots=hunting_pivots[:150],
+        benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,

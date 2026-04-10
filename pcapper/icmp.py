@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
 import ipaddress
 import math
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -12,16 +12,16 @@ from .pcap_cache import get_reader
 from .utils import safe_float
 
 try:
-    from scapy.layers.inet import IP, ICMP  # type: ignore
+    from scapy.layers.inet import ICMP, IP  # type: ignore
     from scapy.layers.inet6 import (
-        IPv6,
-        ICMPv6Unknown,
-        ICMPv6EchoRequest,
-        ICMPv6EchoReply,
         ICMPv6DestUnreach,
-        ICMPv6TimeExceeded,
-        ICMPv6ParamProblem,
+        ICMPv6EchoReply,
+        ICMPv6EchoRequest,
         ICMPv6PacketTooBig,
+        ICMPv6ParamProblem,
+        ICMPv6TimeExceeded,
+        ICMPv6Unknown,
+        IPv6,
     )  # type: ignore
 except Exception:  # pragma: no cover
     IP = None  # type: ignore
@@ -185,7 +185,9 @@ def _build_icmp_hunting_context(
 
     unreachable = int(type_counts.get("icmpv4:3", 0) + type_counts.get("icmpv6:1", 0))
     redirect = int(type_counts.get("icmpv4:5", 0) + type_counts.get("icmpv6:137", 0))
-    time_exceeded = int(type_counts.get("icmpv4:11", 0) + type_counts.get("icmpv6:3", 0))
+    time_exceeded = int(
+        type_counts.get("icmpv4:11", 0) + type_counts.get("icmpv6:3", 0)
+    )
     pmtu = int(type_counts.get("icmpv6:2", 0))
     frag_needed = sum(
         count for key, count in type_counts.items() if key.startswith("icmpv4:3")
@@ -193,13 +195,23 @@ def _build_icmp_hunting_context(
 
     if redirect >= 20:
         checks["icmp_control_plane_abuse"].append(f"high_redirect_volume={redirect}")
-        control_plane_profiles.append({"type": "redirect", "count": redirect, "confidence": "high"})
+        control_plane_profiles.append(
+            {"type": "redirect", "count": redirect, "confidence": "high"}
+        )
     if unreachable >= 200:
-        checks["icmp_control_plane_abuse"].append(f"high_unreachable_volume={unreachable}")
-        control_plane_profiles.append({"type": "unreachable", "count": unreachable, "confidence": "medium"})
+        checks["icmp_control_plane_abuse"].append(
+            f"high_unreachable_volume={unreachable}"
+        )
+        control_plane_profiles.append(
+            {"type": "unreachable", "count": unreachable, "confidence": "medium"}
+        )
     if time_exceeded >= 100:
-        checks["icmp_control_plane_abuse"].append(f"time_exceeded_volume={time_exceeded}")
-        control_plane_profiles.append({"type": "time_exceeded", "count": time_exceeded, "confidence": "medium"})
+        checks["icmp_control_plane_abuse"].append(
+            f"time_exceeded_volume={time_exceeded}"
+        )
+        control_plane_profiles.append(
+            {"type": "time_exceeded", "count": time_exceeded, "confidence": "medium"}
+        )
 
     if pmtu > 0 or frag_needed >= 50:
         checks["icmp_fragmentation_pmtud_abuse"].append(
@@ -229,9 +241,19 @@ def _build_icmp_hunting_context(
         conv_duration = None
         if isinstance(first_seen, (int, float)) and isinstance(last_seen, (int, float)):
             conv_duration = max(0.0, float(last_seen) - float(first_seen))
-        pps = (float(packets) / conv_duration) if conv_duration and conv_duration > 0 else 0.0
+        pps = (
+            (float(packets) / conv_duration)
+            if conv_duration and conv_duration > 0
+            else 0.0
+        )
         avg_pkt = (float(byte_count) / float(packets)) if packets > 0 else 0.0
-        if conv_duration and conv_duration >= 900 and packets >= 30 and pps <= 0.2 and avg_pkt <= 512:
+        if (
+            conv_duration
+            and conv_duration >= 900
+            and packets >= 30
+            and pps <= 0.2
+            and avg_pkt <= 512
+        ):
             checks["icmp_periodic_cadence"].append(
                 f"{src}->{dst} packets={packets} duration={conv_duration:.1f}s pps={pps:.3f}"
             )
@@ -326,24 +348,36 @@ def _build_icmp_hunting_context(
                 }
             )
 
-    high_detections = sum(1 for item in detections if str(item.get("severity", "")).lower() in {"high", "critical", "warning"})
+    high_detections = sum(
+        1
+        for item in detections
+        if str(item.get("severity", "")).lower() in {"high", "critical", "warning"}
+    )
     if high_detections >= 3:
         checks["cross_signal_corroboration"].append(
             f"multiple ICMP detections observed count={high_detections}"
         )
 
-    for host, score in sorted(host_scores.items(), key=lambda item: item[1], reverse=True):
+    for host, score in sorted(
+        host_scores.items(), key=lambda item: item[1], reverse=True
+    ):
         reasons = list(dict.fromkeys(host_reasons.get(host, [])))
         corroborated_findings.append(
             {
                 "host": host,
                 "score": score,
-                "confidence": "high" if score >= 6 else "medium" if score >= 3 else "low",
+                "confidence": "high"
+                if score >= 6
+                else "medium"
+                if score >= 3
+                else "low",
                 "reasons": reasons[:4],
             }
         )
 
-    for convo in sorted(conversations, key=lambda c: int(c.get("bytes", 0) or 0), reverse=True):
+    for convo in sorted(
+        conversations, key=lambda c: int(c.get("bytes", 0) or 0), reverse=True
+    ):
         src = str(convo.get("src", "-"))
         reasons = host_reasons.get(src, [])
         if not reasons:
@@ -398,48 +432,68 @@ def _build_icmp_hunting_context(
             "category": "ICMP Asymmetry",
             "risk": "Medium" if checks["icmp_request_reply_asymmetry"] else "None",
             "confidence": "Medium" if checks["icmp_request_reply_asymmetry"] else "Low",
-            "evidence": str(len(checks["icmp_request_reply_asymmetry"])) if checks["icmp_request_reply_asymmetry"] else "No matching detections",
+            "evidence": str(len(checks["icmp_request_reply_asymmetry"]))
+            if checks["icmp_request_reply_asymmetry"]
+            else "No matching detections",
         },
         {
             "category": "Recon/Sweep",
             "risk": "High" if checks["icmp_recon_sweep_behavior"] else "None",
             "confidence": "High" if checks["icmp_recon_sweep_behavior"] else "Low",
-            "evidence": str(len(checks["icmp_recon_sweep_behavior"])) if checks["icmp_recon_sweep_behavior"] else "No matching detections",
+            "evidence": str(len(checks["icmp_recon_sweep_behavior"]))
+            if checks["icmp_recon_sweep_behavior"]
+            else "No matching detections",
         },
         {
             "category": "Control Plane Abuse",
             "risk": "Medium" if checks["icmp_control_plane_abuse"] else "None",
             "confidence": "Medium" if checks["icmp_control_plane_abuse"] else "Low",
-            "evidence": str(len(checks["icmp_control_plane_abuse"])) if checks["icmp_control_plane_abuse"] else "No matching detections",
+            "evidence": str(len(checks["icmp_control_plane_abuse"]))
+            if checks["icmp_control_plane_abuse"]
+            else "No matching detections",
         },
         {
             "category": "Tunneling/Covert Channel",
             "risk": "High" if checks["icmp_tunneling_signal"] else "None",
             "confidence": "Medium" if checks["icmp_tunneling_signal"] else "Low",
-            "evidence": str(len(checks["icmp_tunneling_signal"])) if checks["icmp_tunneling_signal"] else "No matching detections",
+            "evidence": str(len(checks["icmp_tunneling_signal"]))
+            if checks["icmp_tunneling_signal"]
+            else "No matching detections",
         },
         {
             "category": "Zone Boundary Exposure",
             "risk": "Medium" if checks["icmp_zone_boundary_exposure"] else "None",
             "confidence": "Medium" if checks["icmp_zone_boundary_exposure"] else "Low",
-            "evidence": str(len(checks["icmp_zone_boundary_exposure"])) if checks["icmp_zone_boundary_exposure"] else "No matching detections",
+            "evidence": str(len(checks["icmp_zone_boundary_exposure"]))
+            if checks["icmp_zone_boundary_exposure"]
+            else "No matching detections",
         },
     ]
 
     false_positive_context: list[str] = []
     if checks["icmp_recon_sweep_behavior"]:
-        false_positive_context.append("Sweep-like ICMP may come from approved monitoring/asset discovery jobs")
+        false_positive_context.append(
+            "Sweep-like ICMP may come from approved monitoring/asset discovery jobs"
+        )
     if checks["icmp_control_plane_abuse"]:
-        false_positive_context.append("ICMP errors can surge during routing changes or transient path instability")
+        false_positive_context.append(
+            "ICMP errors can surge during routing changes or transient path instability"
+        )
     if checks["icmp_periodic_cadence"]:
-        false_positive_context.append("Periodic ICMP can reflect health checks and network diagnostics")
+        false_positive_context.append(
+            "Periodic ICMP can reflect health checks and network diagnostics"
+        )
     if not checks["icmp_tunneling_signal"]:
-        false_positive_context.append("No strong high-entropy ICMP payload pattern crossed tunneling thresholds")
+        false_positive_context.append(
+            "No strong high-entropy ICMP payload pattern crossed tunneling thresholds"
+        )
 
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
-        "analyst_reasons": analyst_reasons if analyst_reasons else ["No high-confidence ICMP threat heuristic crossed threshold"],
+        "analyst_reasons": analyst_reasons
+        if analyst_reasons
+        else ["No high-confidence ICMP threat heuristic crossed threshold"],
         "deterministic_checks": checks,
         "asymmetry_profiles": asymmetry_profiles[:40],
         "recon_profiles": recon_profiles[:40],
@@ -577,7 +631,11 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                         payload_bytes = bytes(icmp_layer.payload)
                         payload_len = len(payload_bytes)
                     else:
-                        payload_bytes = bytes(pkt[IP].payload) if IP is not None and pkt.haslayer(IP) else b""
+                        payload_bytes = (
+                            bytes(pkt[IP].payload)
+                            if IP is not None and pkt.haslayer(IP)
+                            else b""
+                        )
                         payload_len = len(payload_bytes)
                 except Exception:
                     payload_bytes = b""
@@ -615,16 +673,19 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                     icmp_id = getattr(icmp_layer, "id", None)
                     if icmp_id is not None and src and dst:
                         sess_key = (src, dst, int(icmp_id))
-                        sess = sessions.setdefault(sess_key, {
-                            "src": src,
-                            "dst": dst,
-                            "id": int(icmp_id),
-                            "requests": 0,
-                            "replies": 0,
-                            "first_seen": None,
-                            "last_seen": None,
-                            "packets": 0,
-                        })
+                        sess = sessions.setdefault(
+                            sess_key,
+                            {
+                                "src": src,
+                                "dst": dst,
+                                "id": int(icmp_id),
+                                "requests": 0,
+                                "replies": 0,
+                                "first_seen": None,
+                                "last_seen": None,
+                                "packets": 0,
+                            },
+                        )
                         sess["packets"] += 1
                         if icmp_type == 8:
                             sess["requests"] += 1
@@ -638,28 +699,50 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
 
             if is_icmpv6:
                 ipv6_packets += 1
+                icmp6_layer = None
                 if ICMPv6EchoRequest is not None and pkt.haslayer(ICMPv6EchoRequest):
                     icmp6_layer = pkt[ICMPv6EchoRequest]  # type: ignore[index]
                 elif ICMPv6EchoReply is not None and pkt.haslayer(ICMPv6EchoReply):
                     icmp6_layer = pkt[ICMPv6EchoReply]  # type: ignore[index]
                 elif ICMPv6DestUnreach is not None and pkt.haslayer(ICMPv6DestUnreach):
                     icmp6_layer = pkt[ICMPv6DestUnreach]  # type: ignore[index]
-                elif ICMPv6TimeExceeded is not None and pkt.haslayer(ICMPv6TimeExceeded):
+                elif ICMPv6TimeExceeded is not None and pkt.haslayer(
+                    ICMPv6TimeExceeded
+                ):
                     icmp6_layer = pkt[ICMPv6TimeExceeded]  # type: ignore[index]
-                elif ICMPv6ParamProblem is not None and pkt.haslayer(ICMPv6ParamProblem):
+                elif ICMPv6ParamProblem is not None and pkt.haslayer(
+                    ICMPv6ParamProblem
+                ):
                     icmp6_layer = pkt[ICMPv6ParamProblem]  # type: ignore[index]
-                elif ICMPv6PacketTooBig is not None and pkt.haslayer(ICMPv6PacketTooBig):
+                elif ICMPv6PacketTooBig is not None and pkt.haslayer(
+                    ICMPv6PacketTooBig
+                ):
                     icmp6_layer = pkt[ICMPv6PacketTooBig]  # type: ignore[index]
-                else:
+                elif ICMPv6Unknown is not None and pkt.haslayer(ICMPv6Unknown):
                     icmp6_layer = pkt[ICMPv6Unknown]  # type: ignore[index]
                 try:
-                    payload_bytes = bytes(icmp6_layer.payload)
-                    payload_len = len(payload_bytes)
+                    if icmp6_layer is not None:
+                        payload_bytes = bytes(icmp6_layer.payload)
+                        payload_len = len(payload_bytes)
+                    elif IPv6 is not None and pkt.haslayer(IPv6):
+                        payload_bytes = bytes(pkt[IPv6].payload)  # type: ignore[index]
+                        payload_len = len(payload_bytes)
+                    else:
+                        payload_bytes = b""
+                        payload_len = 0
                 except Exception:
                     payload_bytes = b""
                     payload_len = 0
-                icmp6_type = getattr(icmp6_layer, "type", None)
-                icmp6_code = getattr(icmp6_layer, "code", None)
+                icmp6_type = (
+                    getattr(icmp6_layer, "type", None)
+                    if icmp6_layer is not None
+                    else None
+                )
+                icmp6_code = (
+                    getattr(icmp6_layer, "code", None)
+                    if icmp6_layer is not None
+                    else None
+                )
                 if icmp6_type is None and IPv6 is not None and pkt.haslayer(IPv6):
                     try:
                         raw_bytes = bytes(pkt[IPv6].payload)
@@ -693,19 +776,26 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                         dst_ip_counts[dst] += 1
 
                 if icmp6_type in (128, 129):
-                    icmp_id = getattr(icmp6_layer, "id", None)
+                    icmp_id = (
+                        getattr(icmp6_layer, "id", None)
+                        if icmp6_layer is not None
+                        else None
+                    )
                     if icmp_id is not None and src and dst:
                         sess_key = (src, dst, int(icmp_id))
-                        sess = sessions.setdefault(sess_key, {
-                            "src": src,
-                            "dst": dst,
-                            "id": int(icmp_id),
-                            "requests": 0,
-                            "replies": 0,
-                            "first_seen": None,
-                            "last_seen": None,
-                            "packets": 0,
-                        })
+                        sess = sessions.setdefault(
+                            sess_key,
+                            {
+                                "src": src,
+                                "dst": dst,
+                                "id": int(icmp_id),
+                                "requests": 0,
+                                "replies": 0,
+                                "first_seen": None,
+                                "last_seen": None,
+                                "packets": 0,
+                            },
+                        )
                         sess["packets"] += 1
                         if icmp6_type == 128:
                             sess["requests"] += 1
@@ -724,12 +814,15 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
             if payload_len > 0:
                 digest = payload_bytes[:64].hex()
                 payload_counts[digest] += 1
-                entry = payload_meta.setdefault(digest, {
-                    "size": payload_len,
-                    "sources": Counter(),
-                    "destinations": Counter(),
-                    "samples": payload_bytes[:64],
-                })
+                entry = payload_meta.setdefault(
+                    digest,
+                    {
+                        "size": payload_len,
+                        "sources": Counter(),
+                        "destinations": Counter(),
+                        "samples": payload_bytes[:64],
+                    },
+                )
                 if src:
                     entry["sources"][src] += 1  # type: ignore[index]
                 if dst:
@@ -737,13 +830,21 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
 
                 # Artifact extraction
                 try:
-                    text = "".join(chr(b) if 32 <= b <= 126 else " " for b in payload_bytes[:128])
+                    text = "".join(
+                        chr(b) if 32 <= b <= 126 else " " for b in payload_bytes[:128]
+                    )
                     for token in text.split():
                         if len(token) >= 4:
                             artifacts.add(token)
-                            if token.lower().startswith(("user=", "username=", "login=")):
+                            if token.lower().startswith(
+                                ("user=", "username=", "login=")
+                            ):
                                 observed_users[token] += 1
-                    for name in re.findall(r"[\w\-.()\[\] ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|txt|bat|ps1|jpg|jpeg|png|gif|bmp|tiff)", text, re.IGNORECASE):
+                    for name in re.findall(
+                        r"[\w\-.()\[\] ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|txt|bat|ps1|jpg|jpeg|png|gif|bmp|tiff)",
+                        text,
+                        re.IGNORECASE,
+                    ):
                         files_discovered.add(name)
                 except Exception:
                     pass
@@ -756,15 +857,18 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
 
             if src and dst:
                 convo_key = (src, dst, "icmpv4" if is_icmpv4 else "icmpv6")
-                convo = conversations.setdefault(convo_key, {
-                    "src": src,
-                    "dst": dst,
-                    "protocol": "icmpv4" if is_icmpv4 else "icmpv6",
-                    "packets": 0,
-                    "bytes": 0,
-                    "first_seen": None,
-                    "last_seen": None,
-                })
+                convo = conversations.setdefault(
+                    convo_key,
+                    {
+                        "src": src,
+                        "dst": dst,
+                        "protocol": "icmpv4" if is_icmpv4 else "icmpv6",
+                        "packets": 0,
+                        "bytes": 0,
+                        "first_seen": None,
+                        "last_seen": None,
+                    },
+                )
                 convo["packets"] += 1
                 convo["bytes"] += pkt_len
                 if ts is not None:
@@ -790,7 +894,9 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
             return 0.0
         freq = Counter(data)
         total = len(data)
-        return -sum((count / total) * math.log2(count / total) for count in freq.values())
+        return -sum(
+            (count / total) * math.log2(count / total) for count in freq.values()
+        )
 
     def _preview_text(data: bytes) -> str:
         if not data:
@@ -809,184 +915,222 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
         sources = meta.get("sources", Counter())
         destinations = meta.get("destinations", Counter())
         top_src = sources.most_common(3) if isinstance(sources, Counter) else []
-        top_dst = destinations.most_common(3) if isinstance(destinations, Counter) else []
+        top_dst = (
+            destinations.most_common(3) if isinstance(destinations, Counter) else []
+        )
 
-        payload_summaries.append({
-            "payload_hex": bytes(sample_bytes).hex(),
-            "payload_preview": _preview_text(bytes(sample_bytes)[:64]),
-            "count": count,
-            "size": size,
-            "entropy": _entropy(bytes(sample_bytes)),
-            "top_sources": top_src,
-            "top_destinations": top_dst,
-        })
+        payload_summaries.append(
+            {
+                "payload_hex": bytes(sample_bytes).hex(),
+                "payload_preview": _preview_text(bytes(sample_bytes)[:64]),
+                "count": count,
+                "size": size,
+                "entropy": _entropy(bytes(sample_bytes)),
+                "top_sources": top_src,
+                "top_destinations": top_dst,
+            }
+        )
 
     if total_packets == 0:
-        detections.append({
-            "type": "no_icmp",
-            "severity": "info",
-            "summary": "No ICMP traffic detected",
-            "details": "ICMP/ICMPv6 not observed in capture.",
-        })
+        detections.append(
+            {
+                "type": "no_icmp",
+                "severity": "info",
+                "summary": "No ICMP traffic detected",
+                "details": "ICMP/ICMPv6 not observed in capture.",
+            }
+        )
     else:
         if duration_seconds and duration_seconds > 0:
             pps = total_packets / duration_seconds
             if pps > 5000:
-                detections.append({
-                    "type": "icmp_flood",
-                    "severity": "critical",
-                    "summary": f"ICMP flood suspected ({pps:.1f} pkt/s)",
-                    "details": "High ICMP packet rate suggests DoS/DDoS or test traffic.",
-                    "packet_count": total_packets,
-                    "unique_sources": len(src_ip_counts),
-                    "unique_destinations": len(dst_ip_counts),
-                    "top_sources": src_ip_counts.most_common(3),
-                    "top_destinations": dst_ip_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "icmp_flood",
+                        "severity": "critical",
+                        "summary": f"ICMP flood suspected ({pps:.1f} pkt/s)",
+                        "details": "High ICMP packet rate suggests DoS/DDoS or test traffic.",
+                        "packet_count": total_packets,
+                        "unique_sources": len(src_ip_counts),
+                        "unique_destinations": len(dst_ip_counts),
+                        "top_sources": src_ip_counts.most_common(3),
+                        "top_destinations": dst_ip_counts.most_common(3),
+                    }
+                )
             elif pps > 1000:
-                detections.append({
-                    "type": "icmp_high_rate",
-                    "severity": "warning",
-                    "summary": f"High ICMP rate observed ({pps:.1f} pkt/s)",
-                    "details": "Investigate bursty ICMP activity for flooding or scanning.",
-                    "packet_count": total_packets,
-                    "unique_sources": len(src_ip_counts),
-                    "unique_destinations": len(dst_ip_counts),
-                    "top_sources": src_ip_counts.most_common(3),
-                    "top_destinations": dst_ip_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "icmp_high_rate",
+                        "severity": "warning",
+                        "summary": f"High ICMP rate observed ({pps:.1f} pkt/s)",
+                        "details": "Investigate bursty ICMP activity for flooding or scanning.",
+                        "packet_count": total_packets,
+                        "unique_sources": len(src_ip_counts),
+                        "unique_destinations": len(dst_ip_counts),
+                        "top_sources": src_ip_counts.most_common(3),
+                        "top_destinations": dst_ip_counts.most_common(3),
+                    }
+                )
 
         unreachable_count = sum(
-            count for key, count in type_counts.items() if key.endswith(":3") or key.endswith(":1")
+            count
+            for key, count in type_counts.items()
+            if key.endswith(":3") or key.endswith(":1")
         )
         if unreachable_count > 1000:
-            detections.append({
-                "type": "icmp_unreachable_volume",
-                "severity": "warning",
-                "summary": f"High ICMP unreachable volume ({unreachable_count} packets)",
-                "details": "Potential scanning, routing issues, or blocked services.",
-                "packet_count": unreachable_count,
-                "unique_sources": len(src_ip_counts),
-                "unique_destinations": len(dst_ip_counts),
-                "top_sources": src_ip_counts.most_common(3),
-                "top_destinations": dst_ip_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "icmp_unreachable_volume",
+                    "severity": "warning",
+                    "summary": f"High ICMP unreachable volume ({unreachable_count} packets)",
+                    "details": "Potential scanning, routing issues, or blocked services.",
+                    "packet_count": unreachable_count,
+                    "unique_sources": len(src_ip_counts),
+                    "unique_destinations": len(dst_ip_counts),
+                    "top_sources": src_ip_counts.most_common(3),
+                    "top_destinations": dst_ip_counts.most_common(3),
+                }
+            )
 
         echo_request = type_counts.get("icmpv4:8", 0) + type_counts.get("icmpv6:128", 0)
         echo_reply = type_counts.get("icmpv4:0", 0) + type_counts.get("icmpv6:129", 0)
         if echo_request > 0 and echo_reply == 0:
-            detections.append({
-                "type": "icmp_echo_no_reply",
-                "severity": "info",
-                "summary": "ICMP echo requests observed without replies",
-                "details": "Potential filtering or one-way traffic capture.",
-                "packet_count": echo_request,
-                "unique_sources": len(src_ip_counts),
-                "unique_destinations": len(dst_ip_counts),
-                "top_sources": src_ip_counts.most_common(3),
-                "top_destinations": dst_ip_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "icmp_echo_no_reply",
+                    "severity": "info",
+                    "summary": "ICMP echo requests observed without replies",
+                    "details": "Potential filtering or one-way traffic capture.",
+                    "packet_count": echo_request,
+                    "unique_sources": len(src_ip_counts),
+                    "unique_destinations": len(dst_ip_counts),
+                    "top_sources": src_ip_counts.most_common(3),
+                    "top_destinations": dst_ip_counts.most_common(3),
+                }
+            )
 
         if payload_variants > 20 and avg_payload > 100:
-            detections.append({
-                "type": "icmp_tunneling_suspected",
-                "severity": "warning",
-                "summary": "ICMP payload variability suggests tunneling",
-                "details": f"Observed {payload_variants} payload sizes with avg {avg_payload:.1f} bytes.",
-                "packet_count": total_packets,
-                "top_sources": src_ip_counts.most_common(3),
-                "top_destinations": dst_ip_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "icmp_tunneling_suspected",
+                    "severity": "warning",
+                    "summary": "ICMP payload variability suggests tunneling",
+                    "details": f"Observed {payload_variants} payload sizes with avg {avg_payload:.1f} bytes.",
+                    "packet_count": total_packets,
+                    "top_sources": src_ip_counts.most_common(3),
+                    "top_destinations": dst_ip_counts.most_common(3),
+                }
+            )
 
         if payload_max >= 1400:
-            detections.append({
-                "type": "icmp_large_payload",
-                "severity": "warning",
-                "summary": "Large ICMP payloads observed",
-                "details": f"Max payload size {payload_max} bytes.",
-                "packet_count": total_packets,
-                "top_sources": src_ip_counts.most_common(3),
-                "top_destinations": dst_ip_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "icmp_large_payload",
+                    "severity": "warning",
+                    "summary": "Large ICMP payloads observed",
+                    "details": f"Max payload size {payload_max} bytes.",
+                    "packet_count": total_packets,
+                    "top_sources": src_ip_counts.most_common(3),
+                    "top_destinations": dst_ip_counts.most_common(3),
+                }
+            )
 
-        high_entropy_payloads = [p for p in payload_summaries if p.get("entropy", 0) >= 7.0]
+        high_entropy_payloads = [
+            p for p in payload_summaries if p.get("entropy", 0) >= 7.0
+        ]
         if high_entropy_payloads:
-            detections.append({
-                "type": "icmp_high_entropy",
-                "severity": "warning",
-                "summary": "High-entropy ICMP payloads detected",
-                "details": f"{len(high_entropy_payloads)} payload(s) show high entropy (possible covert/exfil).",
-            })
+            detections.append(
+                {
+                    "type": "icmp_high_entropy",
+                    "severity": "warning",
+                    "summary": "High-entropy ICMP payloads detected",
+                    "details": f"{len(high_entropy_payloads)} payload(s) show high entropy (possible covert/exfil).",
+                }
+            )
 
         if echo_request > 200 and avg_payload > 200:
-            detections.append({
-                "type": "icmp_tunnel_indicator",
-                "severity": "warning",
-                "summary": "Possible ICMP tunneling behavior",
-                "details": f"High echo volume with elevated payload size (avg {avg_payload:.1f} bytes).",
-                "packet_count": echo_request,
-                "unique_sources": len(src_ip_counts),
-                "unique_destinations": len(dst_ip_counts),
-                "top_sources": src_ip_counts.most_common(3),
-                "top_destinations": dst_ip_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "icmp_tunnel_indicator",
+                    "severity": "warning",
+                    "summary": "Possible ICMP tunneling behavior",
+                    "details": f"High echo volume with elevated payload size (avg {avg_payload:.1f} bytes).",
+                    "packet_count": echo_request,
+                    "unique_sources": len(src_ip_counts),
+                    "unique_destinations": len(dst_ip_counts),
+                    "top_sources": src_ip_counts.most_common(3),
+                    "top_destinations": dst_ip_counts.most_common(3),
+                }
+            )
 
         if payload_max > 1000 or payload_variants > 60:
-            detections.append({
-                "type": "icmp_payload_anomaly",
-                "severity": "warning",
-                "summary": "ICMP payload anomalies observed",
-                "details": "Large or highly variable payload sizes can indicate covert channels.",
-                "packet_count": total_packets,
-                "unique_sources": len(src_ip_counts),
-                "unique_destinations": len(dst_ip_counts),
-                "top_sources": src_ip_counts.most_common(3),
-                "top_destinations": dst_ip_counts.most_common(3),
-            })
+            detections.append(
+                {
+                    "type": "icmp_payload_anomaly",
+                    "severity": "warning",
+                    "summary": "ICMP payload anomalies observed",
+                    "details": "Large or highly variable payload sizes can indicate covert channels.",
+                    "packet_count": total_packets,
+                    "unique_sources": len(src_ip_counts),
+                    "unique_destinations": len(dst_ip_counts),
+                    "top_sources": src_ip_counts.most_common(3),
+                    "top_destinations": dst_ip_counts.most_common(3),
+                }
+            )
 
         if src_ip_counts:
             top_src, top_src_count = src_ip_counts.most_common(1)[0]
             unique_dsts = len(dst_ip_counts)
             if unique_dsts > 50 and top_src_count > 50:
-                detections.append({
-                    "type": "icmp_sweep",
-                    "severity": "warning",
-                    "summary": "Potential ICMP sweep detected",
-                    "details": f"Source {top_src} contacted {unique_dsts} unique destinations.",
-                    "packet_count": top_src_count,
-                    "unique_sources": len(src_ip_counts),
-                    "unique_destinations": unique_dsts,
-                    "top_sources": src_ip_counts.most_common(3),
-                    "top_destinations": dst_ip_counts.most_common(3),
-                })
+                detections.append(
+                    {
+                        "type": "icmp_sweep",
+                        "severity": "warning",
+                        "summary": "Potential ICMP sweep detected",
+                        "details": f"Source {top_src} contacted {unique_dsts} unique destinations.",
+                        "packet_count": top_src_count,
+                        "unique_sources": len(src_ip_counts),
+                        "unique_destinations": unique_dsts,
+                        "top_sources": src_ip_counts.most_common(3),
+                        "top_destinations": dst_ip_counts.most_common(3),
+                    }
+                )
 
         if dst_ip_counts:
             top_dst, top_dst_count = dst_ip_counts.most_common(1)[0]
-            if total_packets > 0 and (top_dst_count / total_packets) > 0.7 and top_dst_count > 500:
-                detections.append({
-                    "type": "icmp_targeted_flood",
+            if (
+                total_packets > 0
+                and (top_dst_count / total_packets) > 0.7
+                and top_dst_count > 500
+            ):
+                detections.append(
+                    {
+                        "type": "icmp_targeted_flood",
+                        "severity": "warning",
+                        "summary": "ICMP traffic concentrated on a single target",
+                        "details": f"Destination {top_dst} received {top_dst_count} ICMP packets.",
+                        "packet_count": top_dst_count,
+                        "unique_sources": len(src_ip_counts),
+                        "unique_destinations": len(dst_ip_counts),
+                        "top_sources": src_ip_counts.most_common(3),
+                        "top_destinations": dst_ip_counts.most_common(3),
+                    }
+                )
+
+        if avg_payload > 500 and total_packets > 100:
+            detections.append(
+                {
+                    "type": "icmp_exfiltration",
                     "severity": "warning",
-                    "summary": "ICMP traffic concentrated on a single target",
-                    "details": f"Destination {top_dst} received {top_dst_count} ICMP packets.",
-                    "packet_count": top_dst_count,
+                    "summary": "Potential ICMP data exfiltration",
+                    "details": "Large average payload sizes over ICMP traffic.",
+                    "packet_count": total_packets,
                     "unique_sources": len(src_ip_counts),
                     "unique_destinations": len(dst_ip_counts),
                     "top_sources": src_ip_counts.most_common(3),
                     "top_destinations": dst_ip_counts.most_common(3),
-                })
-
-        if avg_payload > 500 and total_packets > 100:
-            detections.append({
-                "type": "icmp_exfiltration",
-                "severity": "warning",
-                "summary": "Potential ICMP data exfiltration",
-                "details": "Large average payload sizes over ICMP traffic.",
-                "packet_count": total_packets,
-                "unique_sources": len(src_ip_counts),
-                "unique_destinations": len(dst_ip_counts),
-                "top_sources": src_ip_counts.most_common(3),
-                "top_destinations": dst_ip_counts.most_common(3),
-            })
+                }
+            )
 
     context = _build_icmp_hunting_context(
         total_packets=total_packets,
@@ -1030,10 +1174,14 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
         errors=errors,
         analyst_verdict=str(context.get("analyst_verdict", "")),
         analyst_confidence=str(context.get("analyst_confidence", "low")),
-        analyst_reasons=[str(v) for v in list(context.get("analyst_reasons", []) or [])],
+        analyst_reasons=[
+            str(v) for v in list(context.get("analyst_reasons", []) or [])
+        ],
         deterministic_checks={
             str(key): [str(v) for v in list(values or [])]
-            for key, values in dict(context.get("deterministic_checks", {}) or {}).items()
+            for key, values in dict(
+                context.get("deterministic_checks", {}) or {}
+            ).items()
         },
         asymmetry_profiles=list(context.get("asymmetry_profiles", []) or []),
         recon_profiles=list(context.get("recon_profiles", []) or []),
@@ -1046,6 +1194,12 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
         role_drift_profiles=list(context.get("role_drift_profiles", []) or []),
         corroborated_findings=list(context.get("corroborated_findings", []) or []),
         investigation_pivots=list(context.get("investigation_pivots", []) or []),
-        risk_matrix=[dict(item) for item in list(context.get("risk_matrix", []) or []) if isinstance(item, dict)],
-        false_positive_context=[str(v) for v in list(context.get("false_positive_context", []) or [])],
+        risk_matrix=[
+            dict(item)
+            for item in list(context.get("risk_matrix", []) or [])
+            if isinstance(item, dict)
+        ],
+        false_positive_context=[
+            str(v) for v in list(context.get("false_positive_context", []) or [])
+        ],
     )

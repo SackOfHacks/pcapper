@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from importlib import metadata
 from typing import Callable, Iterable
 
-
 PluginAnalyze = Callable[..., object]
 PluginRender = Callable[[object], str]
 PluginMerge = Callable[[Iterable[object]], object]
@@ -62,7 +61,9 @@ def load_plugins() -> PluginLoadResult:
         else:
             entries = entry_points.get("pcapper.plugins", [])
     except Exception as exc:
-        return PluginLoadResult(plugins=[], errors=[f"entry_points: {type(exc).__name__}: {exc}"])
+        return PluginLoadResult(
+            plugins=[], errors=[f"entry_points: {type(exc).__name__}: {exc}"]
+        )
 
     for entry in entries:
         try:
@@ -74,17 +75,19 @@ def load_plugins() -> PluginLoadResult:
                 if not spec.flag.startswith("--"):
                     continue
                 group = _normalize_group(spec.group)
-                plugins.append(PluginSpec(
-                    name=spec.name,
-                    flag=spec.flag,
-                    help=spec.help,
-                    group=group,
-                    analyze=spec.analyze,
-                    render=spec.render,
-                    merge=spec.merge,
-                    title=spec.title,
-                    export_key=spec.export_key,
-                ))
+                plugins.append(
+                    PluginSpec(
+                        name=spec.name,
+                        flag=spec.flag,
+                        help=spec.help,
+                        group=group,
+                        analyze=spec.analyze,
+                        render=spec.render,
+                        merge=spec.merge,
+                        title=spec.title,
+                        export_key=spec.export_key,
+                    )
+                )
         except Exception as exc:
             errors.append(f"{entry.name}: {type(exc).__name__}: {exc}")
 

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import ipaddress
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections import Counter
 from typing import Optional
-import ipaddress
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -105,7 +105,9 @@ def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
             errors=["Scapy TCP/UDP unavailable"],
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     hits: list[SafetyHit] = []
     source_counts: Counter[str] = Counter()
@@ -186,13 +188,17 @@ def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
 
     detections: list[dict[str, object]] = []
     if hits:
-        public_hits = [hit for hit in hits if _is_public(hit.src) or _is_public(hit.dst)]
+        public_hits = [
+            hit for hit in hits if _is_public(hit.src) or _is_public(hit.dst)
+        ]
         severity = "high" if public_hits else "warning"
         evidence = [
             f"{hit.protocol} {hit.src}:{hit.src_port}->{hit.dst}:{hit.dst_port} {hit.service}"
             for hit in hits[:8]
         ]
-        details = f"{len(hits)} packet(s) across {len(service_counts)} safety service(s)."
+        details = (
+            f"{len(hits)} packet(s) across {len(service_counts)} safety service(s)."
+        )
         if public_hits:
             details = f"{details} Public endpoints observed."
         detections.append(

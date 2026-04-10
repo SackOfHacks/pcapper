@@ -1,19 +1,21 @@
 from __future__ import annotations
 
+import hashlib
+import ipaddress
+import math
+import os
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-import hashlib
-import math
-import ipaddress
 
-from .pcap_cache import get_reader
-from .utils import safe_float
+from .certificates import CertificateInfo, analyze_certificates
+from .dns import _vt_lookup_domains
 from .http import analyze_http
-from .certificates import analyze_certificates, CertificateInfo
+from .pcap_cache import get_reader
 from .progress import run_with_busy_status
+from .utils import decode_payload, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -24,7 +26,10 @@ except Exception:  # pragma: no cover
     IPv6 = None  # type: ignore
 
 try:
-    from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello  # type: ignore
+    from scapy.layers.tls.handshake import (  # type: ignore
+        TLSClientHello,
+        TLSServerHello,
+    )
     from scapy.layers.tls.record import TLS  # type: ignore
 except Exception:  # pragma: no cover
     TLSClientHello = None  # type: ignore
@@ -37,7 +42,18 @@ SUSPICIOUS_TLDS = {".ru", ".cn", ".top", ".xyz", ".gq", ".tk", ".ml", ".ga"}
 TLS_CONTENT_TYPES = {20, 21, 22, 23}
 WEAK_CIPHER_MARKERS = ("RC4", "3DES", "DES", "NULL", "EXPORT", "MD5", "ANON")
 ECH_EXTENSION_IDS = {0xFE0D}
-COMMON_ALPN_TOKENS = {"h2", "http/1.1", "h3", "doq", "hq", "acme-tls/1", "mqtt", "imap", "pop3", "smtp"}
+COMMON_ALPN_TOKENS = {
+    "h2",
+    "http/1.1",
+    "h3",
+    "doq",
+    "hq",
+    "acme-tls/1",
+    "mqtt",
+    "imap",
+    "pop3",
+    "smtp",
+}
 BRAND_KEYWORDS = (
     "microsoft",
     "google",
@@ -127,6 +143,9 @@ class TlsSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+    vt_lookup_enabled: bool = False
+    vt_results: dict[str, dict[str, object]] = field(default_factory=dict)
+    vt_errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -148,10 +167,18 @@ class TlsSummary:
             "ja3_counts": dict(self.ja3_counts),
             "ja4_counts": dict(self.ja4_counts),
             "ja4s_counts": dict(self.ja4s_counts),
-            "sni_to_ja3": {sni: dict(counter) for sni, counter in self.sni_to_ja3.items()},
-            "sni_to_ja4": {sni: dict(counter) for sni, counter in self.sni_to_ja4.items()},
-            "ja3_to_sni": {ja3: dict(counter) for ja3, counter in self.ja3_to_sni.items()},
-            "ja4_to_sni": {ja4: dict(counter) for ja4, counter in self.ja4_to_sni.items()},
+            "sni_to_ja3": {
+                sni: dict(counter) for sni, counter in self.sni_to_ja3.items()
+            },
+            "sni_to_ja4": {
+                sni: dict(counter) for sni, counter in self.sni_to_ja4.items()
+            },
+            "ja3_to_sni": {
+                ja3: dict(counter) for ja3, counter in self.ja3_to_sni.items()
+            },
+            "ja4_to_sni": {
+                ja4: dict(counter) for ja4, counter in self.ja4_to_sni.items()
+            },
             "client_counts": dict(self.client_counts),
             "server_counts": dict(self.server_counts),
             "server_ports": dict(self.server_ports),
@@ -177,7 +204,8 @@ class TlsSummary:
             "http_files": dict(self.http_files),
             "http_referrers": dict(self.http_referrers),
             "http_referrer_request_hosts": {
-                ref: dict(hosts) for ref, hosts in self.http_referrer_request_hosts.items()
+                ref: dict(hosts)
+                for ref, hosts in self.http_referrer_request_hosts.items()
             },
             "http_referrer_hosts": dict(self.http_referrer_hosts),
             "http_referrer_schemes": dict(self.http_referrer_schemes),
@@ -220,6 +248,9 @@ class TlsSummary:
             "detections": list(self.detections),
             "artifacts": list(self.artifacts),
             "errors": list(self.errors),
+            "vt_lookup_enabled": self.vt_lookup_enabled,
+            "vt_results": dict(self.vt_results),
+            "vt_errors": list(self.vt_errors),
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "duration_seconds": self.duration_seconds,
@@ -227,7 +258,7 @@ class TlsSummary:
 
 
 def _is_grease(value: int) -> bool:
-    return (value & 0x0f0f) == 0x0a0a
+    return (value & 0x0F0F) == 0x0A0A
 
 
 def _coerce_int_list(values: object) -> list[int]:
@@ -282,7 +313,11 @@ def _extract_sni(ext: object) -> Optional[str]:
                     first = names[0]
                 else:
                     first = names
-                candidate = getattr(first, "servername", None) or getattr(first, "name", None) or first
+                candidate = (
+                    getattr(first, "servername", None)
+                    or getattr(first, "name", None)
+                    or first
+                )
                 if isinstance(candidate, bytes):
                     return candidate.decode("utf-8", errors="ignore").strip(".")
                 return str(candidate).strip(".")
@@ -474,7 +509,9 @@ def _ja3_from_client_hello(client_hello) -> Optional[str]:
     return ja3_str
 
 
-def _ja4_from_client_hello(client_hello, sni: Optional[str], alpn: list[str]) -> Optional[str]:
+def _ja4_from_client_hello(
+    client_hello, sni: Optional[str], alpn: list[str]
+) -> Optional[str]:
     version = getattr(client_hello, "version", None)
     if version is None:
         return None
@@ -534,10 +571,17 @@ def analyze_tls(
     show_status: bool = True,
     packets: list[object] | None = None,
     meta: object | None = None,
+    vt_lookup: bool = False,
+    target_ip: str | None = None,
+    hostname_query: str | None = None,
+    port_filter: int | None = None,
+    search_query: str | None = None,
 ) -> TlsSummary:
     errors: list[str] = []
     if TLS is None and TLSClientHello is None and TLSServerHello is None:
-        errors.append("Scapy TLS layers unavailable; install scapy[tls] for TLS handshake parsing.")
+        errors.append(
+            "Scapy TLS layers unavailable; install scapy[tls] for TLS handshake parsing."
+        )
     if IP is None and IPv6 is None:
         errors.append("Scapy IP layers unavailable; install scapy for TLS analysis.")
         return TlsSummary(
@@ -598,6 +642,9 @@ def analyze_tls(
             detections=[],
             artifacts=[],
             errors=errors,
+            vt_lookup_enabled=bool(vt_lookup),
+            vt_results={},
+            vt_errors=[],
             first_seen=None,
             last_seen=None,
             duration_seconds=None,
@@ -632,19 +679,27 @@ def analyze_tls(
     sni_to_alpn: dict[str, Counter[str]] = defaultdict(Counter)
     sni_no_alpn: Counter[str] = Counter()
     server_cipher_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    legacy_version_servers: dict[str, Counter[str]] = defaultdict(Counter)
 
-    conversations: dict[tuple[str, str, int], dict[str, object]] = defaultdict(lambda: {
-        "packets": 0,
-        "bytes": 0,
-        "first_seen": None,
-        "last_seen": None,
-        "sni": None,
-    })
+    conversations: dict[tuple[str, str, int], dict[str, object]] = defaultdict(
+        lambda: {
+            "packets": 0,
+            "bytes": 0,
+            "first_seen": None,
+            "last_seen": None,
+            "sni": None,
+        }
+    )
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
     analysis_notes: list[str] = []
     sni_ip_literals: set[str] = set()
+
+    target_ip_value = str(target_ip or "").strip()
+    hostname_token = str(hostname_query or "").strip().lower()
+    search_token = str(search_query or "").strip().lower()
+    port_filter_value = int(port_filter) if isinstance(port_filter, int) else None
 
     try:
         for pkt in reader:
@@ -684,12 +739,39 @@ def analyze_tls(
             sport = int(getattr(tcp_layer, "sport", 0))
             dport = int(getattr(tcp_layer, "dport", 0))
             payload = bytes(getattr(tcp_layer, "payload", b""))
+            if target_ip_value and target_ip_value not in {src_ip or "", dst_ip or ""}:
+                continue
+            if (
+                isinstance(port_filter_value, int)
+                and port_filter_value > 0
+                and sport != port_filter_value
+                and dport != port_filter_value
+            ):
+                continue
+            payload_text_lc = ""
+            if hostname_token or search_token:
+                payload_text_lc = decode_payload(
+                    payload, encoding="utf-8", limit=4096
+                ).lower()
+                if hostname_token and not (
+                    hostname_token in payload_text_lc
+                    or hostname_token in str(src_ip or "").lower()
+                    or hostname_token in str(dst_ip or "").lower()
+                ):
+                    continue
+                if search_token and not (
+                    search_token in payload_text_lc
+                    or search_token in str(src_ip or "").lower()
+                    or search_token in str(dst_ip or "").lower()
+                    or search_token in str(sport)
+                    or search_token in str(dport)
+                ):
+                    continue
 
             is_tls_layer = TLS is not None and pkt.haslayer(TLS)  # type: ignore[truthy-bool]
             is_tls_handshake = (
-                (TLSClientHello is not None and pkt.haslayer(TLSClientHello))
-                or (TLSServerHello is not None and pkt.haslayer(TLSServerHello))
-            )
+                TLSClientHello is not None and pkt.haslayer(TLSClientHello)
+            ) or (TLSServerHello is not None and pkt.haslayer(TLSServerHello))
             is_tls_like_record = _looks_like_tls_record(payload)
             is_ssl2_like_record = _looks_like_ssl2_record(payload)
             is_tls_like = is_tls_like_record or is_ssl2_like_record
@@ -699,11 +781,6 @@ def analyze_tls(
             tls_like_packets += 1
             if is_tls_layer or is_tls_handshake:
                 tls_packets += 1
-
-            if not is_tls_handshake:
-                record_version = _record_version_label(payload)
-                if record_version:
-                    versions[record_version] += 1
 
             handshake_type = None
             if is_tls_like and not (dport in TLS_PORTS or sport in TLS_PORTS):
@@ -736,6 +813,13 @@ def analyze_tls(
                 server = dst_ip or "-"
                 server_port = dport
 
+            if not is_tls_handshake:
+                record_version = _record_version_label(payload)
+                if record_version:
+                    versions[record_version] += 1
+                    if record_version in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
+                        legacy_version_servers[record_version][server] += 1
+
             client_counts[client] += 1
             server_counts[server] += 1
             server_ports[server_port] += 1
@@ -753,7 +837,10 @@ def analyze_tls(
             if TLSClientHello is not None and pkt.haslayer(TLSClientHello):  # type: ignore[truthy-bool]
                 client_hello = pkt[TLSClientHello]  # type: ignore[index]
                 client_hellos += 1
-                versions[_tls_version_label(getattr(client_hello, "version", "?"))] += 1
+                client_ver = _tls_version_label(getattr(client_hello, "version", "?"))
+                versions[client_ver] += 1
+                if client_ver in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
+                    legacy_version_servers[client_ver][server] += 1
                 sni_val = None
                 alpn_vals: list[str] = []
                 ech_present = False
@@ -783,7 +870,9 @@ def analyze_tls(
 
                 ja3 = _ja3_from_client_hello(client_hello)
                 if ja3:
-                    ja3_hash = hashlib.md5(ja3.encode("utf-8", errors="ignore")).hexdigest()
+                    ja3_hash = hashlib.md5(
+                        ja3.encode("utf-8", errors="ignore")
+                    ).hexdigest()
                     ja3_counts[ja3_hash] += 1
                     if sni_val:
                         sni_to_ja3[sni_val][ja3_hash] += 1
@@ -799,7 +888,10 @@ def analyze_tls(
             if TLSServerHello is not None and pkt.haslayer(TLSServerHello):  # type: ignore[truthy-bool]
                 server_hello = pkt[TLSServerHello]  # type: ignore[index]
                 server_hellos += 1
-                versions[_tls_version_label(getattr(server_hello, "version", "?"))] += 1
+                server_ver = _tls_version_label(getattr(server_hello, "version", "?"))
+                versions[server_ver] += 1
+                if server_ver in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
+                    legacy_version_servers[server_ver][server] += 1
                 cipher = getattr(server_hello, "cipher", None)
                 if cipher is not None:
                     cipher_name = str(cipher)
@@ -825,22 +917,124 @@ def analyze_tls(
 
     conversation_rows: list[TlsConversation] = []
     for (client, server, port), data in conversations.items():
-        conversation_rows.append(TlsConversation(
-            client_ip=client,
-            server_ip=server,
-            server_port=port,
-            packets=int(data["packets"]),
-            bytes=int(data["bytes"]),
-            first_seen=data["first_seen"],
-            last_seen=data["last_seen"],
-            sni=data.get("sni"),
-        ))
+        conversation_rows.append(
+            TlsConversation(
+                client_ip=client,
+                server_ip=server,
+                server_port=port,
+                packets=int(data["packets"]),
+                bytes=int(data["bytes"]),
+                first_seen=data["first_seen"],
+                last_seen=data["last_seen"],
+                sni=data.get("sni"),
+            )
+        )
 
     def _busy(desc: str, func, *args, **kwargs):
-        return run_with_busy_status(path, show_status, f"TLS: {desc}", func, *args, **kwargs)
+        return run_with_busy_status(
+            path, show_status, f"TLS: {desc}", func, *args, **kwargs
+        )
 
-    http_summary = _busy("HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta)
+    http_summary = _busy(
+        "HTTP",
+        analyze_http,
+        path,
+        show_status=False,
+        packets=packets,
+        meta=meta,
+        vt_lookup=vt_lookup,
+        target_ip=target_ip_value or None,
+        hostname_query=hostname_token or None,
+        port_filter=port_filter_value,
+        search_query=search_token or None,
+    )
     cert_summary = _busy("Certificates", analyze_certificates, path, show_status=False)
+    allowed_tls_ips = {
+        ip
+        for conv in conversation_rows
+        for ip in (conv.client_ip, conv.server_ip)
+        if str(ip).strip()
+    }
+
+    def _cert_matches_filters(cert: CertificateInfo) -> bool:
+        if target_ip_value and target_ip_value not in {cert.src_ip, cert.dst_ip}:
+            return False
+        if (
+            isinstance(port_filter_value, int)
+            and port_filter_value > 0
+            and allowed_tls_ips
+            and cert.src_ip not in allowed_tls_ips
+            and cert.dst_ip not in allowed_tls_ips
+        ):
+            return False
+        if hostname_token:
+            host_blob = " ".join(
+                [
+                    str(cert.sni or ""),
+                    str(cert.subject or ""),
+                    str(cert.issuer or ""),
+                    str(cert.san or ""),
+                ]
+            ).lower()
+            if hostname_token not in host_blob:
+                return False
+        if search_token:
+            blob = " ".join(
+                [
+                    str(cert.sni or ""),
+                    str(cert.subject or ""),
+                    str(cert.issuer or ""),
+                    str(cert.san or ""),
+                    str(cert.src_ip or ""),
+                    str(cert.dst_ip or ""),
+                    str(cert.pubkey_type or ""),
+                    str(cert.pubkey_size or ""),
+                    str(cert.not_before or ""),
+                    str(cert.not_after or ""),
+                    str(cert.sig_algo or ""),
+                ]
+            ).lower()
+            if search_token not in blob:
+                return False
+        return True
+
+    filtered_cert_artifacts = [
+        cert for cert in cert_summary.artifacts if _cert_matches_filters(cert)
+    ]
+    cert_subjects: Counter[str] = Counter(cert.subject for cert in filtered_cert_artifacts)
+    cert_issuers: Counter[str] = Counter(cert.issuer for cert in filtered_cert_artifacts)
+    cert_sans: Counter[str] = Counter(cert.san for cert in filtered_cert_artifacts)
+    cert_count = len(filtered_cert_artifacts)
+    weak_certs = sum(
+        1 for cert in filtered_cert_artifacts if int(getattr(cert, "pubkey_size", 0) or 0) < 2048
+    )
+    expired_certs = 0
+    self_signed_certs = 0
+    for cert in filtered_cert_artifacts:
+        if str(cert.subject or "").strip() and str(cert.subject) == str(cert.issuer):
+            self_signed_certs += 1
+        end_dt = _parse_iso_ts(cert.not_after)
+        if end_dt is not None and end_dt < datetime.now(timezone.utc):
+            expired_certs += 1
+
+    def _cert_endpoint_marker(cert: CertificateInfo) -> str:
+        host = str(cert.sni or "").strip() or str(cert.dst_ip or "").strip() or "-"
+        flow = f"{cert.src_ip}->{cert.dst_ip}"
+        return f"{host} [{flow}]"
+
+    weak_cert_endpoints: Counter[str] = Counter()
+    expired_cert_endpoints: Counter[str] = Counter()
+    self_signed_endpoints: Counter[str] = Counter()
+    now_dt = datetime.now(timezone.utc)
+    for cert in filtered_cert_artifacts:
+        marker = _cert_endpoint_marker(cert)
+        if int(getattr(cert, "pubkey_size", 0) or 0) < 2048:
+            weak_cert_endpoints[marker] += 1
+        if str(cert.subject or "").strip() and str(cert.subject) == str(cert.issuer):
+            self_signed_endpoints[marker] += 1
+        end_dt = _parse_iso_ts(cert.not_after)
+        if end_dt is not None and end_dt < now_dt:
+            expired_cert_endpoints[marker] += 1
 
     if tls_like_packets and tls_packets == 0:
         analysis_notes.append(
@@ -851,116 +1045,193 @@ def analyze_tls(
             f"{tls_like_packets - tls_packets} TLS-like packet(s) were detected without full handshake parsing."
         )
     if client_hellos and not server_hellos:
-        analysis_notes.append("Client hellos observed without any server hellos (possible blocked/failed handshakes).")
+        analysis_notes.append(
+            "Client hellos observed without any server hellos (possible blocked/failed handshakes)."
+        )
     if ech_hellos:
-        analysis_notes.append("ECH (Encrypted ClientHello) observed; SNI may be intentionally hidden.")
+        analysis_notes.append(
+            "ECH (Encrypted ClientHello) observed; SNI may be intentionally hidden."
+        )
     if http_summary.total_requests or http_summary.total_responses:
-        analysis_notes.append("HTTP statistics are capture-wide; use --http for full plaintext context.")
+        analysis_notes.append(
+            "HTTP statistics are capture-wide; use --http for full plaintext context."
+        )
 
     detections: list[dict[str, object]] = []
-    legacy_versions = [v for v in ("SSLv2", "SSLv3", "TLS1.0", "TLS1.1") if versions.get(v)]
+    legacy_versions = [
+        v for v in ("SSLv2", "SSLv3", "TLS1.0", "TLS1.1") if versions.get(v)
+    ]
     if legacy_versions:
-        detections.append({
-            "severity": "warning",
-            "summary": "Legacy TLS versions observed",
-            "details": f"Versions: {', '.join(legacy_versions)}",
-        })
+        legacy_hosts: Counter[str] = Counter()
+        for version in legacy_versions:
+            legacy_hosts.update(legacy_version_servers.get(version, Counter()))
+        host_evidence = [
+            (host, count)
+            for host, count in legacy_hosts.most_common(8)
+            if host and host != "-"
+        ]
+        details = f"Versions: {', '.join(legacy_versions)}"
+        if host_evidence:
+            details += " | Service Hosts: " + ", ".join(
+                f"{host}({count})" for host, count in host_evidence[:5]
+            )
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Legacy TLS versions observed",
+                "details": details,
+                "top_destinations": host_evidence,
+            }
+        )
 
     missing_sni_total = client_hellos - sum(sni_counts.values())
     missing_sni_no_ech = max(0, missing_sni_total - ech_sni_missing)
-    if client_hellos >= 20 and missing_sni_no_ech >= 10 and (missing_sni_no_ech / max(client_hellos, 1)) >= 0.35:
-        detections.append({
-            "severity": "warning",
-            "summary": "High rate of TLS handshakes without SNI",
-            "details": f"{missing_sni_no_ech}/{client_hellos} client hello(s) missing SNI (excluding ECH).",
-        })
+    if (
+        client_hellos >= 20
+        and missing_sni_no_ech >= 10
+        and (missing_sni_no_ech / max(client_hellos, 1)) >= 0.35
+    ):
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "High rate of TLS handshakes without SNI",
+                "details": f"{missing_sni_no_ech}/{client_hellos} client hello(s) missing SNI (excluding ECH).",
+            }
+        )
 
     if client_hellos >= 20 and server_hellos < client_hellos:
         failed = client_hellos - server_hellos
         ratio = failed / client_hellos
         if failed >= 10 and ratio >= 0.35:
             severity = "high" if ratio >= 0.65 else "warning"
-            detections.append({
-                "severity": severity,
-                "summary": "TLS handshake failures",
-                "details": f"{failed}/{client_hellos} client hello(s) without server hello response.",
-            })
+            detections.append(
+                {
+                    "severity": severity,
+                    "summary": "TLS handshake failures",
+                    "details": f"{failed}/{client_hellos} client hello(s) without server hello response.",
+                }
+            )
 
     high_entropy_sni = [
-        sni for sni, count in sni_counts.items()
+        sni
+        for sni, count in sni_counts.items()
         if count >= 3 and len(sni) >= 18 and _shannon_entropy(sni) >= 3.85
     ]
     if high_entropy_sni:
-        detections.append({
-            "severity": "warning",
-            "summary": "High-entropy SNI values",
-            "details": ", ".join(high_entropy_sni[:5]),
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "High-entropy SNI values",
+                "details": ", ".join(high_entropy_sni[:5]),
+            }
+        )
 
     suspicious_sni = [
-        sni for sni, count in sni_counts.items()
+        sni
+        for sni, count in sni_counts.items()
         if count >= 2 and any(sni.endswith(tld) for tld in SUSPICIOUS_TLDS)
     ]
     if suspicious_sni:
-        detections.append({
-            "severity": "high",
-            "summary": "Suspicious SNI TLDs observed",
-            "details": ", ".join(suspicious_sni[:5]),
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Suspicious SNI TLDs observed",
+                "details": ", ".join(suspicious_sni[:5]),
+            }
+        )
 
     if len(sni_ip_literals) >= 2:
-        detections.append({
-            "severity": "warning",
-            "summary": "SNI uses IP literal",
-            "details": ", ".join(sorted(sni_ip_literals)[:5]),
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "SNI uses IP literal",
+                "details": ", ".join(sorted(sni_ip_literals)[:5]),
+            }
+        )
 
     non_standard_ports = [
-        (port, count) for port, count in server_ports.items()
+        (port, count)
+        for port, count in server_ports.items()
         if port not in TLS_PORTS and count >= 20
     ]
     if non_standard_ports:
-        ports_text = ", ".join(f"{port}({count})" for port, count in sorted(non_standard_ports)[:8])
-        detections.append({
-            "severity": "warning",
-            "summary": "Significant TLS on non-standard ports",
-            "details": f"Ports: {ports_text}",
-        })
+        ports_text = ", ".join(
+            f"{port}({count})" for port, count in sorted(non_standard_ports)[:8]
+        )
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Significant TLS on non-standard ports",
+                "details": f"Ports: {ports_text}",
+            }
+        )
 
     if weak_ciphers:
         top_weak = ", ".join(name for name, _count in weak_ciphers.most_common(5))
-        detections.append({
-            "severity": "warning",
-            "summary": "Weak TLS cipher suites observed",
-            "details": top_weak,
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Weak TLS cipher suites observed",
+                "details": top_weak,
+            }
+        )
 
-    if cert_summary.self_signed:
-        sev = "warning" if len(cert_summary.self_signed) >= 3 else "info"
-        detections.append({
-            "severity": sev,
-            "summary": "Self-signed TLS certificates observed",
-            "details": f"Count: {len(cert_summary.self_signed)}",
-        })
-    if cert_summary.expired:
-        sev = "high" if len(cert_summary.expired) >= 3 else "warning"
-        detections.append({
-            "severity": sev,
-            "summary": "Expired TLS certificates observed",
-            "details": f"Count: {len(cert_summary.expired)}",
-        })
-    if cert_summary.weak_keys:
-        sev = "high" if len(cert_summary.weak_keys) >= 2 else "warning"
-        detections.append({
-            "severity": sev,
-            "summary": "Weak TLS certificate keys",
-            "details": f"Count: {len(cert_summary.weak_keys)}",
-        })
+    if self_signed_certs:
+        sev = "warning" if self_signed_certs >= 3 else "info"
+        endpoint_rows = self_signed_endpoints.most_common(6)
+        endpoint_text = ", ".join(
+            f"{host}({count})" for host, count in endpoint_rows
+        )
+        detections.append(
+            {
+                "severity": sev,
+                "summary": "Self-signed TLS certificates observed",
+                "details": (
+                    f"Count: {self_signed_certs}"
+                    + (f" | Hosts: {endpoint_text}" if endpoint_text else "")
+                ),
+                "top_destinations": endpoint_rows,
+            }
+        )
+    if expired_certs:
+        sev = "high" if expired_certs >= 3 else "warning"
+        endpoint_rows = expired_cert_endpoints.most_common(6)
+        endpoint_text = ", ".join(
+            f"{host}({count})" for host, count in endpoint_rows
+        )
+        detections.append(
+            {
+                "severity": sev,
+                "summary": "Expired TLS certificates observed",
+                "details": (
+                    f"Count: {expired_certs}"
+                    + (f" | Hosts: {endpoint_text}" if endpoint_text else "")
+                ),
+                "top_destinations": endpoint_rows,
+            }
+        )
+    if weak_certs:
+        sev = "high" if weak_certs >= 2 else "warning"
+        endpoint_rows = weak_cert_endpoints.most_common(6)
+        endpoint_text = ", ".join(
+            f"{host}({count})" for host, count in endpoint_rows
+        )
+        detections.append(
+            {
+                "severity": sev,
+                "summary": "Weak TLS certificate keys",
+                "details": (
+                    f"Count: {weak_certs}"
+                    + (f" | Hosts: {endpoint_text}" if endpoint_text else "")
+                ),
+                "top_destinations": endpoint_rows,
+            }
+        )
 
     rotating_sni: list[tuple[str, int, int]] = []
     certs_by_sni: dict[str, set[str]] = defaultdict(set)
     cert_obs_by_sni: Counter[str] = Counter()
-    for cert in cert_summary.artifacts:
+    for cert in filtered_cert_artifacts:
         if not cert.sni:
             continue
         sni_key = str(cert.sni).lower()
@@ -975,28 +1246,36 @@ def analyze_tls(
             rotating_sni.append((sni_key, len(hashes), obs))
     if rotating_sni:
         rotating_sni.sort(key=lambda row: (row[1], row[2]), reverse=True)
-        details = ", ".join(f"{sni} certs={uniq}/{obs}" for sni, uniq, obs in rotating_sni[:6])
-        detections.append({
-            "severity": "high",
-            "summary": "Certificate pinning drift / rapid cert rotation",
-            "details": details,
-        })
+        details = ", ".join(
+            f"{sni} certs={uniq}/{obs}" for sni, uniq, obs in rotating_sni[:6]
+        )
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Certificate pinning drift / rapid cert rotation",
+                "details": details,
+            }
+        )
 
     rare_ja3 = [fp for fp, count in ja3_counts.items() if int(count) == 1]
     if client_hellos >= 20 and len(rare_ja3) >= 5:
-        detections.append({
-            "severity": "warning",
-            "summary": "JA3 novelty / rarity spike",
-            "details": f"Rare JA3 fingerprints={len(rare_ja3)} of {len(ja3_counts)} total",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "JA3 novelty / rarity spike",
+                "details": f"Rare JA3 fingerprints={len(rare_ja3)} of {len(ja3_counts)} total",
+            }
+        )
 
     rare_ja4 = [fp for fp, count in ja4_counts.items() if int(count) == 1]
     if client_hellos >= 20 and len(rare_ja4) >= 5:
-        detections.append({
-            "severity": "warning",
-            "summary": "JA4 novelty / rarity spike",
-            "details": f"Rare JA4 fingerprints={len(rare_ja4)} of {len(ja4_counts)} total",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "JA4 novelty / rarity spike",
+                "details": f"Rare JA4 fingerprints={len(rare_ja4)} of {len(ja4_counts)} total",
+            }
+        )
 
     ja3_fanout = []
     for fp, sni_counter in ja3_to_sni.items():
@@ -1007,11 +1286,13 @@ def analyze_tls(
     if ja3_fanout:
         ja3_fanout.sort(key=lambda row: (row[1], row[2]), reverse=True)
         details = ", ".join(f"{fp} sni={u} obs={t}" for fp, u, t in ja3_fanout[:5])
-        detections.append({
-            "severity": "high",
-            "summary": "JA3 to SNI cardinality anomaly",
-            "details": details,
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "JA3 to SNI cardinality anomaly",
+                "details": details,
+            }
+        )
 
     sni_fanout = []
     for sni, fp_counter in sni_to_ja3.items():
@@ -1022,11 +1303,13 @@ def analyze_tls(
     if sni_fanout:
         sni_fanout.sort(key=lambda row: (row[1], row[2]), reverse=True)
         details = ", ".join(f"{sni} ja3={u} obs={t}" for sni, u, t in sni_fanout[:5])
-        detections.append({
-            "severity": "warning",
-            "summary": "SNI to JA3 cardinality anomaly",
-            "details": details,
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "SNI to JA3 cardinality anomaly",
+                "details": details,
+            }
+        )
 
     downgrade_servers: list[tuple[str, int, int]] = []
     for server, counter in server_cipher_counts.items():
@@ -1042,22 +1325,33 @@ def analyze_tls(
             downgrade_servers.append((server, weak, modern))
     if downgrade_servers:
         downgrade_servers.sort(key=lambda row: row[1], reverse=True)
-        details = ", ".join(f"{srv} weak={weak} modern={modern}" for srv, weak, modern in downgrade_servers[:6])
-        detections.append({
-            "severity": "high",
-            "summary": "Cipher downgrade inconsistency by endpoint",
-            "details": details,
-        })
+        details = ", ".join(
+            f"{srv} weak={weak} modern={modern}"
+            for srv, weak, modern in downgrade_servers[:6]
+        )
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Cipher downgrade inconsistency by endpoint",
+                "details": details,
+            }
+        )
 
-    unknown_alpn = [(name, count) for name, count in alpn_counts.items() if str(name).lower() not in COMMON_ALPN_TOKENS and int(count) >= 3]
+    unknown_alpn = [
+        (name, count)
+        for name, count in alpn_counts.items()
+        if str(name).lower() not in COMMON_ALPN_TOKENS and int(count) >= 3
+    ]
     if unknown_alpn:
         unknown_alpn.sort(key=lambda row: row[1], reverse=True)
         details = ", ".join(f"{name}({count})" for name, count in unknown_alpn[:8])
-        detections.append({
-            "severity": "warning",
-            "summary": "ALPN mismatch / uncommon protocol tokens",
-            "details": details,
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "ALPN mismatch / uncommon protocol tokens",
+                "details": details,
+            }
+        )
 
     no_alpn_hotspots = []
     for sni, miss in sni_no_alpn.items():
@@ -1066,16 +1360,20 @@ def analyze_tls(
             no_alpn_hotspots.append((sni, miss, total))
     if no_alpn_hotspots:
         no_alpn_hotspots.sort(key=lambda row: row[1], reverse=True)
-        details = ", ".join(f"{sni} no_alpn={miss}/{total}" for sni, miss, total in no_alpn_hotspots[:6])
-        detections.append({
-            "severity": "warning",
-            "summary": "ALPN missing anomaly",
-            "details": details,
-        })
+        details = ", ".join(
+            f"{sni} no_alpn={miss}/{total}" for sni, miss, total in no_alpn_hotspots[:6]
+        )
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "ALPN missing anomaly",
+                "details": details,
+            }
+        )
 
     very_short = 0
     very_long = 0
-    for cert in cert_summary.artifacts:
+    for cert in filtered_cert_artifacts:
         start = _parse_iso_ts(cert.not_before)
         end = _parse_iso_ts(cert.not_after)
         if start is None or end is None:
@@ -1087,30 +1385,38 @@ def analyze_tls(
             very_long += 1
     if very_short or very_long:
         sev = "high" if very_short >= 2 else "warning"
-        detections.append({
-            "severity": sev,
-            "summary": "Certificate validity outliers",
-            "details": f"short_lived={very_short}, long_lived={very_long}",
-        })
+        detections.append(
+            {
+                "severity": sev,
+                "summary": "Certificate validity outliers",
+                "details": f"short_lived={very_short}, long_lived={very_long}",
+            }
+        )
 
     impersonation_hits: list[str] = []
-    for cert in cert_summary.artifacts:
+    for cert in filtered_cert_artifacts:
         blob = f"{cert.subject} {cert.san}".lower()
         if not any(keyword in blob for keyword in BRAND_KEYWORDS):
             continue
-        suspicious = cert.subject == cert.issuer or (cert.pubkey_size and cert.pubkey_size < 2048)
-        if cert.sni and any(str(cert.sni).lower().endswith(tld) for tld in SUSPICIOUS_TLDS):
+        suspicious = cert.subject == cert.issuer or (
+            cert.pubkey_size and cert.pubkey_size < 2048
+        )
+        if cert.sni and any(
+            str(cert.sni).lower().endswith(tld) for tld in SUSPICIOUS_TLDS
+        ):
             suspicious = True
         if suspicious:
             marker = cert.sni or cert.dst_ip or cert.subject
             impersonation_hits.append(str(marker))
     if impersonation_hits:
         unique_hits = sorted(set(impersonation_hits))
-        detections.append({
-            "severity": "high",
-            "summary": "Issuer/SAN brand impersonation heuristics",
-            "details": ", ".join(unique_hits[:8]),
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Issuer/SAN brand impersonation heuristics",
+                "details": ", ".join(unique_hits[:8]),
+            }
+        )
 
     periodic_candidates: list[tuple[str, str, int, float]] = []
     for conv in conversation_rows:
@@ -1123,27 +1429,38 @@ def analyze_tls(
             continue
         avg_gap = duration / max(int(conv.packets) - 1, 1)
         if 5.0 <= avg_gap <= 300.0:
-            periodic_candidates.append((conv.client_ip, conv.server_ip, conv.server_port, avg_gap))
+            periodic_candidates.append(
+                (conv.client_ip, conv.server_ip, conv.server_port, avg_gap)
+            )
     if periodic_candidates:
         periodic_candidates.sort(key=lambda row: row[3])
         details = ", ".join(
-            f"{src}->{dst}:{port} avg={gap:.1f}s" for src, dst, port, gap in periodic_candidates[:6]
+            f"{src}->{dst}:{port} avg={gap:.1f}s"
+            for src, dst, port, gap in periodic_candidates[:6]
         )
-        detections.append({
-            "severity": "warning",
-            "summary": "TLS handshake periodicity proxy",
-            "details": details,
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "TLS handshake periodicity proxy",
+                "details": details,
+            }
+        )
 
     resumed_proxy = False
-    if client_hellos >= 30 and server_hellos >= int(client_hellos * 0.9) and cert_summary.cert_count <= max(3, client_hellos // 20):
+    if (
+        client_hellos >= 30
+        and server_hellos >= int(client_hellos * 0.9)
+        and cert_count <= max(3, client_hellos // 20)
+    ):
         resumed_proxy = True
     if resumed_proxy:
-        detections.append({
-            "severity": "info",
-            "summary": "Potential session resumption-heavy TLS behavior",
-            "details": f"client_hellos={client_hellos}, server_hellos={server_hellos}, certs={cert_summary.cert_count}",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "Potential session resumption-heavy TLS behavior",
+                "details": f"client_hellos={client_hellos}, server_hellos={server_hellos}, certs={cert_count}",
+            }
+        )
 
     artifacts: list[str] = []
     for sni, count in sni_counts.most_common(10):
@@ -1152,6 +1469,49 @@ def analyze_tls(
         artifacts.append(f"ALPN: {alpn} ({count})")
     for ja3, count in ja3_counts.most_common(5):
         artifacts.append(f"JA3: {ja3} ({count})")
+
+    vt_results: dict[str, dict[str, object]] = {}
+    vt_errors: list[str] = []
+    if vt_lookup:
+        api_key = os.environ.get("VT_API_KEY")
+        if not api_key:
+            vt_errors.append("VT_API_KEY is not set; skipping VirusTotal lookups.")
+        else:
+            candidate_domains = [
+                str(name).strip().lower().strip(".")
+                for name, _count in sni_counts.most_common(80)
+                if str(name).strip()
+            ]
+            candidate_domains = [name for name in candidate_domains if "." in name]
+            if candidate_domains:
+                vt_results, vt_errors = _vt_lookup_domains(candidate_domains, api_key)
+                vt_hits = [
+                    info
+                    for info in vt_results.values()
+                    if int(info.get("malicious", 0) or 0) > 0
+                    or int(info.get("suspicious", 0) or 0) > 0
+                ]
+                if vt_hits:
+                    top_hit = sorted(
+                        vt_hits,
+                        key=lambda item: (
+                            int(item.get("malicious", 0) or 0),
+                            int(item.get("suspicious", 0) or 0),
+                        ),
+                        reverse=True,
+                    )[0]
+                    detections.append(
+                        {
+                            "source": "VirusTotal",
+                            "severity": "high"
+                            if int(top_hit.get("malicious", 0) or 0) > 0
+                            else "warning",
+                            "summary": "VirusTotal SNI/domain reputation hit",
+                            "details": (
+                                f"{len(vt_hits)} TLS SNI target(s) flagged by VT enrichment."
+                            ),
+                        }
+                    )
 
     return TlsSummary(
         path=path,
@@ -1200,18 +1560,21 @@ def analyze_tls(
         http_referrer_https_to_http=http_summary.referrer_https_to_http,
         http_clients=http_summary.client_counts,
         http_servers=http_summary.server_counts,
-        cert_subjects=cert_summary.subjects,
-        cert_issuers=cert_summary.issuers,
-        cert_sans=cert_summary.sas,
-        cert_count=cert_summary.cert_count,
-        weak_certs=len(cert_summary.weak_keys),
-        expired_certs=len(cert_summary.expired),
-        self_signed_certs=len(cert_summary.self_signed),
-        cert_artifacts=list(cert_summary.artifacts),
+        cert_subjects=cert_subjects,
+        cert_issuers=cert_issuers,
+        cert_sans=cert_sans,
+        cert_count=cert_count,
+        weak_certs=weak_certs,
+        expired_certs=expired_certs,
+        self_signed_certs=self_signed_certs,
+        cert_artifacts=list(filtered_cert_artifacts),
         analysis_notes=analysis_notes,
         detections=detections,
         artifacts=artifacts,
-        errors=errors + http_summary.errors + cert_summary.errors,
+        errors=errors + http_summary.errors + cert_summary.errors + vt_errors,
+        vt_lookup_enabled=bool(vt_lookup),
+        vt_results=vt_results,
+        vt_errors=vt_errors,
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,

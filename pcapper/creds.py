@@ -3,23 +3,24 @@ from __future__ import annotations
 import base64
 import ipaddress
 import re
-from html import unescape
 from collections import Counter
 from dataclasses import dataclass, field
+from html import unescape
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qsl, unquote_plus, urlsplit
 
 from .pcap_cache import PcapMeta, get_reader
 from .services import COMMON_PORTS
-from .utils import safe_float, decode_payload
+from .utils import decode_payload, safe_float
 
 try:
     from .cip import (
+        CIP_SECURITY_CLASS_IDS,
+        CIP_SECURITY_PORT,
+        CIP_SERVICE_NAMES,
         CIP_TCP_PORT,
         CIP_UDP_PORT,
-        CIP_SECURITY_PORT,
-        CIP_SECURITY_CLASS_IDS,
-        CIP_SERVICE_NAMES,
         ENIP_COMMANDS,
         WRITE_SERVICE_CODES,
         _extract_symbol,
@@ -41,7 +42,7 @@ except Exception:  # pragma: no cover
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
-    from scapy.packet import Raw, Packet  # type: ignore
+    from scapy.packet import Packet, Raw  # type: ignore
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
     Packet = object  # type: ignore
@@ -106,7 +107,9 @@ TOKEN_KEY_PATTERN = (
 
 USER_RE = re.compile(rf"(?i)\b{USER_KEY_PATTERN}\b\s*[:=]\s*([^\s&'\";]+)")
 PASS_RE = re.compile(rf"(?i)\b{PASS_KEY_PATTERN}\b\s*[:=]\s*([^\s&'\";]+)")
-TOKEN_RE = re.compile(rf"(?i)\b{TOKEN_KEY_PATTERN}\b\s*[:=]\s*([A-Za-z0-9._~+/=-]{{6,}})")
+TOKEN_RE = re.compile(
+    rf"(?i)\b{TOKEN_KEY_PATTERN}\b\s*[:=]\s*([A-Za-z0-9._~+/=-]{{6,}})"
+)
 URL_USER_RE = re.compile(rf"(?i)(?:^|[?&]){USER_KEY_PATTERN}=([^&\s]+)")
 URL_PASS_RE = re.compile(rf"(?i)(?:^|[?&]){PASS_KEY_PATTERN}=([^&\s]+)")
 URL_TOKEN_RE = re.compile(rf"(?i)(?:^|[?&]){TOKEN_KEY_PATTERN}=([^&\s]+)")
@@ -114,7 +117,9 @@ JSON_USER_RE = re.compile(rf"(?i)\"{USER_KEY_PATTERN}\"\s*:\s*\"([^\"]{{1,128}})
 JSON_PASS_RE = re.compile(rf"(?i)\"{PASS_KEY_PATTERN}\"\s*:\s*\"([^\"]{{1,128}})\"")
 JSON_TOKEN_RE = re.compile(rf"(?i)\"{TOKEN_KEY_PATTERN}\"\s*:\s*\"([^\"]{{6,256}})\"")
 PROMPT_USER_RE = re.compile(rf"(?i)\b{USER_KEY_PATTERN}\b\s*[:=]\s*([^\s]+)")
-PROMPT_SECRET_RE = re.compile(rf"(?i)\b(?:{PASS_KEY_PATTERN}|{TOKEN_KEY_PATTERN})\b\s*[:=]\s*([^\s]+)")
+PROMPT_SECRET_RE = re.compile(
+    rf"(?i)\b(?:{PASS_KEY_PATTERN}|{TOKEN_KEY_PATTERN})\b\s*[:=]\s*([^\s]+)"
+)
 XML_USER_RE = re.compile(
     rf"(?is)<\s*(?:[\w.-]+:)?({USER_KEY_PATTERN})\b[^>]*>\s*([^<]{{1,1024}}?)\s*<\s*/\s*(?:[\w.-]+:)?(?:{USER_KEY_PATTERN})\s*>"
 )
@@ -123,12 +128,22 @@ XML_SECRET_RE = re.compile(
 )
 
 HTTP_BASIC_RE = re.compile(r"(?i)authorization:\s*basic\s+([A-Za-z0-9+/=]+)")
-HTTP_PROXY_BASIC_RE = re.compile(r"(?i)proxy-authorization:\s*basic\s+([A-Za-z0-9+/=]+)")
+HTTP_PROXY_BASIC_RE = re.compile(
+    r"(?i)proxy-authorization:\s*basic\s+([A-Za-z0-9+/=]+)"
+)
 HTTP_BEARER_RE = re.compile(r"(?i)authorization:\s*bearer\s+([A-Za-z0-9._~+/=-]{6,})")
-HTTP_TOKEN_AUTH_RE = re.compile(r"(?i)authorization:\s*(?:token|api[_-]?key)\s+([A-Za-z0-9._~+/=-]{6,})")
-HTTP_DIGEST_USER_RE = re.compile(r"(?i)authorization:\s*digest[^\r\n]*\busername=\"([^\"]+)\"")
+HTTP_TOKEN_AUTH_RE = re.compile(
+    r"(?i)authorization:\s*(?:token|api[_-]?key)\s+([A-Za-z0-9._~+/=-]{6,})"
+)
+HTTP_DIGEST_USER_RE = re.compile(
+    r"(?i)authorization:\s*digest[^\r\n]*\busername=\"([^\"]+)\""
+)
 HTTP_COOKIE_RE = re.compile(r"(?i)\bcookie:\s*([^\r\n]+)")
 HTTP_NTLM_RE = re.compile(r"(?i)authorization:\s*ntlm\s+([A-Za-z0-9+/=]+)")
+HTTP_REQUEST_LINE_RE = re.compile(
+    r"(?im)^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)\s+([^\s]+)\s+HTTP/\d(?:\.\d+)?$"
+)
+HTTP_HOST_RE = re.compile(r"(?im)^Host:\s*([^\s:\r\n]+)(?::\d+)?\s*$")
 
 FTP_USER_RE = re.compile(r"(?im)^USER\s+([^\r\n]{1,160})\s*$")
 FTP_PASS_RE = re.compile(r"(?im)^PASS\s+([^\r\n]{1,160})\s*$")
@@ -137,8 +152,32 @@ POP_PASS_RE = re.compile(r"(?im)^PASS\s+([^\r\n]{1,160})\s*$")
 IMAP_LOGIN_RE = re.compile(r"(?i)^\w+\s+LOGIN\s+(\"?[^\"\s]+\"?)\s+(\"?[^\"\s]+\"?)")
 SMTP_AUTH_PLAIN_RE = re.compile(r"(?i)^AUTH\s+PLAIN\s+([A-Za-z0-9+/=]+)$")
 SMTP_AUTH_LOGIN_RE = re.compile(r"(?i)^AUTH\s+LOGIN\s*([A-Za-z0-9+/=]+)?$")
-PRIV_USER_RE = re.compile(r"(?i)\b(admin|administrator|root|svc_|service|backup|dbadmin|domain\\admin|krbtgt)\b")
-PLACEHOLDER_SECRETS = {"admin", "password", "test", "123456", "changeme", "default", "qwerty"}
+PRIV_USER_RE = re.compile(
+    r"(?i)\b(admin|administrator|root|svc_|service|backup|dbadmin|domain\\admin|krbtgt)\b"
+)
+PLACEHOLDER_SECRETS = {
+    "admin",
+    "password",
+    "test",
+    "123456",
+    "changeme",
+    "default",
+    "qwerty",
+}
+PROMPT_LABEL_SECRET_NOISE = {
+    "password",
+    "passwd",
+    "passcode",
+    "pass phrase",
+    "passphrase",
+    "token",
+    "secret",
+    "api key",
+    "username",
+    "user name",
+    "user id",
+    "login",
+}
 OT_VALUE_TOKEN_BYTES_RE = re.compile(rb"[A-Za-z0-9._~!$%&*+=:@/-]{3,96}")
 HTTP_METHOD_PREFIXES = (
     "GET ",
@@ -158,7 +197,7 @@ HTTP_PORTS = {80, 8000, 8008, 8080, 8081, 8888, 8443}
 FTP_PORTS = {20, 21, 2121}
 POP3_PORTS = {110}
 IMAP_PORTS = {143}
-SMTP_PORTS = {25, 587}
+SMTP_PORTS = {25, 465, 587, 2525}
 TELNET_PORTS = {23, 2323}
 TFTP_PORTS = {69}
 SMB_PORTS = {445, 139}
@@ -352,6 +391,18 @@ def _decode_base64(token: str) -> Optional[str]:
         return None
 
 
+def _looks_reasonable_credential(value: str, max_len: int = 128) -> bool:
+    token = str(value or "").strip()
+    if not token or len(token) > max_len:
+        return False
+    if any(ch in token for ch in ("\r", "\n", "\t")):
+        return False
+    printable = sum(1 for ch in token if ch.isprintable())
+    if printable < len(token):
+        return False
+    return True
+
+
 def _decode_bytes_variants(decoded: bytes) -> list[str]:
     variants: list[str] = []
     for encoding in ("utf-8", "utf-16le", "latin-1"):
@@ -369,7 +420,11 @@ def _decode_bytes_variants(decoded: bytes) -> list[str]:
 def _extract_bytes_strings(decoded: bytes) -> list[str]:
     values: list[str] = []
     for match in ASCII_STRINGS_RE.finditer(decoded):
-        text = _clean_value(match.group(0).decode("ascii", errors="ignore"), allow_spaces=False, max_len=128)
+        text = _clean_value(
+            match.group(0).decode("ascii", errors="ignore"),
+            allow_spaces=False,
+            max_len=128,
+        )
         if text:
             values.append(text)
     for match in UTF16LE_STRINGS_RE.finditer(decoded):
@@ -394,8 +449,16 @@ def _decode_base64_variants(token: str) -> list[str]:
     return _decode_bytes_variants(decoded)
 
 
-def _clean_value(value: str, *, allow_spaces: bool = False, max_len: int = 256) -> Optional[str]:
+def _clean_value(
+    value: str, *, allow_spaces: bool = False, max_len: int = 256
+) -> Optional[str]:
     candidate = unescape(value).strip().strip("\"'").strip()
+    # Trim common code punctuation wrappers (for example: Password"; or 'abc',).
+    while candidate and candidate[-1] in ";,)]}":
+        candidate = candidate[:-1].strip()
+    while candidate and candidate[:1] in "([{":
+        candidate = candidate[1:].strip()
+    candidate = candidate.strip("\"'").strip()
     if not candidate:
         return None
     if "<" in candidate or ">" in candidate:
@@ -407,6 +470,13 @@ def _clean_value(value: str, *, allow_spaces: bool = False, max_len: int = 256) 
     if len(candidate) > max_len:
         candidate = candidate[:max_len]
     return candidate
+
+
+def _looks_like_prompt_label_secret(value: str) -> bool:
+    normalized = " ".join(str(value or "").strip().strip("\"'").split()).lower()
+    if not normalized:
+        return True
+    return normalized in PROMPT_LABEL_SECRET_NOISE
 
 
 def _is_likely_username(value: str) -> bool:
@@ -485,7 +555,9 @@ def _extract_path_symbols(path_str: str) -> list[str]:
     return values
 
 
-def _parse_cip_string_value(data: bytes, offset: int, string_type: int) -> tuple[Optional[str], int]:
+def _parse_cip_string_value(
+    data: bytes, offset: int, string_type: int
+) -> tuple[Optional[str], int]:
     if offset < 0 or offset >= len(data):
         return None, 0
     if string_type == CIP_SHORT_STRING_TYPE:
@@ -503,7 +575,7 @@ def _parse_cip_string_value(data: bytes, offset: int, string_type: int) -> tuple
     if string_type == CIP_STRING_TYPE:
         if offset + 2 > len(data):
             return None, 0
-        string_len = int.from_bytes(data[offset:offset + 2], "little")
+        string_len = int.from_bytes(data[offset : offset + 2], "little")
         start = offset + 2
         end = start + string_len
         if end > len(data):
@@ -515,7 +587,7 @@ def _parse_cip_string_value(data: bytes, offset: int, string_type: int) -> tuple
     if string_type == CIP_STRING2_TYPE:
         if offset + 2 > len(data):
             return None, 0
-        string_len = int.from_bytes(data[offset:offset + 2], "little") * 2
+        string_len = int.from_bytes(data[offset : offset + 2], "little") * 2
         start = offset + 2
         end = start + string_len
         if end > len(data):
@@ -527,8 +599,8 @@ def _parse_cip_string_value(data: bytes, offset: int, string_type: int) -> tuple
     if string_type == CIP_STRINGN_TYPE:
         if offset + 4 > len(data):
             return None, 0
-        char_size = int.from_bytes(data[offset:offset + 2], "little") * 2
-        char_count = int.from_bytes(data[offset + 2:offset + 4], "little")
+        char_size = int.from_bytes(data[offset : offset + 2], "little") * 2
+        char_count = int.from_bytes(data[offset + 2 : offset + 4], "little")
         if char_size not in {1, 2, 4}:
             return None, 4
         string_len = char_count * char_size
@@ -564,7 +636,7 @@ def _extract_cip_stringi_usernames(data: bytes) -> list[str]:
             if idx + 6 > len(data):
                 valid_layout = False
                 break
-            lang = data[idx:idx + 3]
+            lang = data[idx : idx + 3]
             if any(ch < 0x20 or ch > 0x7E for ch in lang):
                 valid_layout = False
                 break
@@ -593,7 +665,7 @@ def _extract_cip_length_prefixed_usernames(data: bytes) -> list[str]:
     if len(data) >= 2:
         size8 = data[0]
         if 3 <= size8 <= 64 and 1 + size8 <= len(data):
-            raw = data[1:1 + size8]
+            raw = data[1 : 1 + size8]
             for encoding in ("ascii", "utf-8", "utf-16le"):
                 try:
                     text = raw.decode(encoding, errors="ignore")
@@ -605,7 +677,7 @@ def _extract_cip_length_prefixed_usernames(data: bytes) -> list[str]:
     if len(data) >= 4:
         size16 = int.from_bytes(data[0:2], "little")
         if 3 <= size16 <= 64 and 2 + size16 <= len(data):
-            raw = data[2:2 + size16]
+            raw = data[2 : 2 + size16]
             for encoding in ("ascii", "utf-8", "utf-16le"):
                 try:
                     text = raw.decode(encoding, errors="ignore")
@@ -617,7 +689,9 @@ def _extract_cip_length_prefixed_usernames(data: bytes) -> list[str]:
     return sorted(candidates)[:6]
 
 
-def _extract_cip_service_0x37_usernames(path_str: str, cip_data: bytes) -> list[tuple[str, str]]:
+def _extract_cip_service_0x37_usernames(
+    path_str: str, cip_data: bytes
+) -> list[tuple[str, str]]:
     source_rank = {
         "path-symbol": 0,
         "stringi": 1,
@@ -626,7 +700,18 @@ def _extract_cip_service_0x37_usernames(path_str: str, cip_data: bytes) -> list[
         "xml": 4,
         "length-prefixed": 5,
     }
-    language_tags = {"eng", "deu", "fra", "spa", "ita", "jpn", "kor", "zho", "rus", "por"}
+    language_tags = {
+        "eng",
+        "deu",
+        "fra",
+        "spa",
+        "ita",
+        "jpn",
+        "kor",
+        "zho",
+        "rus",
+        "por",
+    }
     candidates: dict[str, set[str]] = {}
 
     def _add(candidate: str, source: str) -> None:
@@ -668,7 +753,9 @@ def _extract_cip_service_0x37_usernames(path_str: str, cip_data: bytes) -> list[
     )
     results: list[tuple[str, str]] = []
     for username, sources in ordered[:6]:
-        source_text = ",".join(sorted(sources, key=lambda src: source_rank.get(src, 99)))
+        source_text = ",".join(
+            sorted(sources, key=lambda src: source_rank.get(src, 99))
+        )
         results.append((username, source_text))
     return results
 
@@ -687,8 +774,8 @@ def _read_ntlm_secbuf(payload: bytes, base: int, field_offset: int) -> bytes:
     start = base + field_offset
     if start + 8 > len(payload):
         return b""
-    length = int.from_bytes(payload[start:start + 2], "little")
-    data_offset = int.from_bytes(payload[start + 4:start + 8], "little")
+    length = int.from_bytes(payload[start : start + 2], "little")
+    data_offset = int.from_bytes(payload[start + 4 : start + 8], "little")
     if length <= 0:
         return b""
     data_start = base + data_offset
@@ -698,7 +785,9 @@ def _read_ntlm_secbuf(payload: bytes, base: int, field_offset: int) -> bytes:
     return payload[data_start:data_end]
 
 
-def _decode_ntlm_text(data: bytes, *, unicode_text: bool, max_len: int = 96) -> Optional[str]:
+def _decode_ntlm_text(
+    data: bytes, *, unicode_text: bool, max_len: int = 96
+) -> Optional[str]:
     if not data:
         return None
     try:
@@ -708,7 +797,9 @@ def _decode_ntlm_text(data: bytes, *, unicode_text: bool, max_len: int = 96) -> 
     return _clean_value(text, allow_spaces=False, max_len=max_len)
 
 
-def _extract_ntlm_credentials(payload: bytes, source: str) -> list[tuple[str, Optional[str], Optional[str], str]]:
+def _extract_ntlm_credentials(
+    payload: bytes, source: str
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
     cursor = 0
     while cursor < len(payload):
@@ -719,7 +810,7 @@ def _extract_ntlm_credentials(payload: bytes, source: str) -> list[tuple[str, Op
         if idx + 12 > len(payload):
             continue
         try:
-            msg_type = int.from_bytes(payload[idx + 8:idx + 12], "little")
+            msg_type = int.from_bytes(payload[idx + 8 : idx + 12], "little")
         except Exception:
             continue
         if msg_type != 3:
@@ -727,7 +818,7 @@ def _extract_ntlm_credentials(payload: bytes, source: str) -> list[tuple[str, Op
 
         flags = 0
         if idx + 64 <= len(payload):
-            flags = int.from_bytes(payload[idx + 60:idx + 64], "little")
+            flags = int.from_bytes(payload[idx + 60 : idx + 64], "little")
         is_unicode = bool(flags & NTLM_UNICODE_FLAG)
 
         lm_resp = _read_ntlm_secbuf(payload, idx, 12)
@@ -740,7 +831,9 @@ def _extract_ntlm_credentials(payload: bytes, source: str) -> list[tuple[str, Op
         if user and not _is_likely_username(user):
             user = None
         domain = _decode_ntlm_text(domain_raw, unicode_text=is_unicode, max_len=96)
-        workstation = _decode_ntlm_text(workstation_raw, unicode_text=is_unicode, max_len=96)
+        workstation = _decode_ntlm_text(
+            workstation_raw, unicode_text=is_unicode, max_len=96
+        )
 
         response_blob = nt_resp or lm_resp
         response_secret = response_blob.hex()[:128] if response_blob else None
@@ -755,7 +848,14 @@ def _extract_ntlm_credentials(payload: bytes, source: str) -> list[tuple[str, Op
         if user:
             hits.append(("NTLM Authenticate User", user, None, evidence))
         if user and response_secret:
-            hits.append(("NTLM Challenge Response", user, response_secret, f"{evidence} response={response_secret[:32]}..."))
+            hits.append(
+                (
+                    "NTLM Challenge Response",
+                    user,
+                    response_secret,
+                    f"{evidence} response={response_secret[:32]}...",
+                )
+            )
     return hits
 
 
@@ -763,7 +863,9 @@ def _ports_match(sport: Optional[int], dport: Optional[int], ports: set[int]) ->
     return (sport in ports) or (dport in ports)
 
 
-def _looks_like_http(text: str, sport: Optional[int], dport: Optional[int], service: str) -> bool:
+def _looks_like_http(
+    text: str, sport: Optional[int], dport: Optional[int], service: str
+) -> bool:
     if service.startswith("HTTP") or _ports_match(sport, dport, HTTP_PORTS):
         return True
     sample = text[:2048].lstrip()
@@ -775,48 +877,77 @@ def _looks_like_http(text: str, sport: Optional[int], dport: Optional[int], serv
     return False
 
 
-def _looks_like_ftp(text: str, sport: Optional[int], dport: Optional[int], service: str) -> bool:
+def _looks_like_ftp(
+    text: str, sport: Optional[int], dport: Optional[int], service: str
+) -> bool:
     if service == "FTP" or _ports_match(sport, dport, FTP_PORTS):
         return True
     lines = [line.strip() for line in text.splitlines() if line.strip()][:12]
-    cmd_hits = sum(1 for line in lines if re.match(r"(?i)^(USER|PASS|ACCT|AUTH|SYST|FEAT|CWD|PWD|TYPE|PASV|PORT|RETR|STOR)\b", line))
+    cmd_hits = sum(
+        1
+        for line in lines
+        if re.match(
+            r"(?i)^(USER|PASS|ACCT|AUTH|SYST|FEAT|CWD|PWD|TYPE|PASV|PORT|RETR|STOR)\b",
+            line,
+        )
+    )
     response_hits = sum(1 for line in lines if re.match(r"^\d{3}[ -]", line))
     return cmd_hits >= 2 or (cmd_hits >= 1 and response_hits >= 1)
 
 
-def _looks_like_pop3(text: str, sport: Optional[int], dport: Optional[int], service: str) -> bool:
+def _looks_like_pop3(
+    text: str, sport: Optional[int], dport: Optional[int], service: str
+) -> bool:
     if service == "POP3" or _ports_match(sport, dport, POP3_PORTS):
         return True
     lines = [line.strip() for line in text.splitlines() if line.strip()][:12]
-    cmd_hits = sum(1 for line in lines if re.match(r"(?i)^(USER|PASS|APOP|AUTH)\b", line))
-    response_hits = sum(1 for line in lines if line.startswith("+OK") or line.startswith("-ERR"))
+    cmd_hits = sum(
+        1 for line in lines if re.match(r"(?i)^(USER|PASS|APOP|AUTH)\b", line)
+    )
+    response_hits = sum(
+        1 for line in lines if line.startswith("+OK") or line.startswith("-ERR")
+    )
     return cmd_hits >= 2 or (cmd_hits >= 1 and response_hits >= 1)
 
 
-def _looks_like_imap(text: str, sport: Optional[int], dport: Optional[int], service: str) -> bool:
+def _looks_like_imap(
+    text: str, sport: Optional[int], dport: Optional[int], service: str
+) -> bool:
     if service == "IMAP" or _ports_match(sport, dport, IMAP_PORTS):
         return True
     lines = [line.strip() for line in text.splitlines() if line.strip()][:12]
     return any(re.match(r"(?i)^\w+\s+LOGIN\s+", line) for line in lines)
 
 
-def _looks_like_smtp(text: str, sport: Optional[int], dport: Optional[int], service: str) -> bool:
+def _looks_like_smtp(
+    text: str, sport: Optional[int], dport: Optional[int], service: str
+) -> bool:
     if service == "SMTP" or _ports_match(sport, dport, SMTP_PORTS):
         return True
     lines = [line.strip() for line in text.splitlines() if line.strip()][:12]
-    cmd_hits = sum(1 for line in lines if re.match(r"(?i)^(EHLO|HELO|AUTH|MAIL FROM|RCPT TO|DATA)\b", line))
+    cmd_hits = sum(
+        1
+        for line in lines
+        if re.match(r"(?i)^(EHLO|HELO|AUTH|MAIL FROM|RCPT TO|DATA)\b", line)
+    )
     response_hits = sum(1 for line in lines if re.match(r"^\d{3}[ -]", line))
     return cmd_hits >= 1 and response_hits >= 1
 
 
-def _looks_like_telnet(text: str, sport: Optional[int], dport: Optional[int], service: str) -> bool:
+def _looks_like_telnet(
+    text: str, sport: Optional[int], dport: Optional[int], service: str
+) -> bool:
     if service == "Telnet" or _ports_match(sport, dport, TELNET_PORTS):
         return True
     lowered = text[:2048].lower()
-    return ("login:" in lowered or "username:" in lowered or "password:" in lowered) and ("telnet" in lowered or "login:" in lowered)
+    return (
+        "login:" in lowered or "username:" in lowered or "password:" in lowered
+    ) and ("telnet" in lowered or "login:" in lowered)
 
 
-def _looks_like_tftp(payload: bytes, sport: Optional[int], dport: Optional[int], service: str) -> bool:
+def _looks_like_tftp(
+    payload: bytes, sport: Optional[int], dport: Optional[int], service: str
+) -> bool:
     if service == "TFTP" or _ports_match(sport, dport, TFTP_PORTS):
         return True
     if len(payload) < 2:
@@ -825,7 +956,9 @@ def _looks_like_tftp(payload: bytes, sport: Optional[int], dport: Optional[int],
     return opcode in {1, 2, 3, 4, 5, 6}
 
 
-def _looks_like_smb_netbios(payload: bytes, sport: Optional[int], dport: Optional[int], service: str) -> bool:
+def _looks_like_smb_netbios(
+    payload: bytes, sport: Optional[int], dport: Optional[int], service: str
+) -> bool:
     if service in {"SMB", "NetBIOS"}:
         return True
     if _ports_match(sport, dport, SMB_PORTS | NETBIOS_PORTS):
@@ -835,7 +968,9 @@ def _looks_like_smb_netbios(payload: bytes, sport: Optional[int], dport: Optiona
     return NTLM_SIGNATURE in payload
 
 
-def _extract_http_basic(text: str) -> list[tuple[str, Optional[str], Optional[str], str]]:
+def _extract_http_basic(
+    text: str,
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
     for regex in (HTTP_BASIC_RE, HTTP_PROXY_BASIC_RE):
         for match in regex.finditer(text):
@@ -877,8 +1012,23 @@ def _extract_http_basic(text: str) -> list[tuple[str, Optional[str], Optional[st
             cleaned = _clean_value(value, allow_spaces=False, max_len=256)
             if not cleaned:
                 continue
-            if key_l in {"user", "username", "userid", "login", "loginid", "email", "account"}:
-                hits.append(("HTTP Cookie Credential", cleaned, None, f"Cookie: {key.strip()}={value.strip()}"))
+            if key_l in {
+                "user",
+                "username",
+                "userid",
+                "login",
+                "loginid",
+                "email",
+                "account",
+            }:
+                hits.append(
+                    (
+                        "HTTP Cookie Credential",
+                        cleaned,
+                        None,
+                        f"Cookie: {key.strip()}={value.strip()}",
+                    )
+                )
             elif key_l in {
                 "token",
                 "usertoken",
@@ -900,11 +1050,127 @@ def _extract_http_basic(text: str) -> list[tuple[str, Optional[str], Optional[st
                 "passcode",
                 "pwd",
             }:
-                hits.append(("HTTP Cookie Credential", None, cleaned, f"Cookie: {key.strip()}={value.strip()}"))
+                hits.append(
+                    (
+                        "HTTP Cookie Credential",
+                        None,
+                        cleaned,
+                        f"Cookie: {key.strip()}={value.strip()}",
+                    )
+                )
     return hits
 
 
-def _extract_kv_creds(text: str, *, kind_prefix: str = "") -> list[tuple[str, Optional[str], Optional[str], str]]:
+def _extract_http_query_creds(
+    text: str,
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
+    hits: list[tuple[str, Optional[str], Optional[str], str]] = []
+    seen: set[tuple[str, Optional[str], Optional[str], str]] = set()
+    user_keys = {
+        "user",
+        "username",
+        "userid",
+        "login",
+        "loginid",
+        "email",
+        "account",
+        "accountname",
+        "ut",
+        "uid",
+        "uname",
+        "user_name",
+    }
+
+    def _add_hit(
+        kind: str, user: Optional[str], secret: Optional[str], evidence: str
+    ) -> None:
+        item = (kind, user, secret, evidence[:220])
+        if item in seen:
+            return
+        seen.add(item)
+        hits.append(item)
+
+    for _method, raw_uri in HTTP_REQUEST_LINE_RE.findall(text):
+        uri = str(raw_uri or "").strip()
+        if not uri:
+            continue
+        query = ""
+        try:
+            if "://" in uri:
+                query = urlsplit(uri).query
+            else:
+                normalized = uri if uri.startswith("/") else f"/{uri}"
+                query = urlsplit(f"http://local{normalized}").query
+        except Exception:
+            query = ""
+        if not query and "?" in uri:
+            query = uri.split("?", 1)[1]
+        if not query:
+            continue
+
+        for key_raw, value_raw in parse_qsl(query, keep_blank_values=False):
+            key = str(key_raw or "").strip()
+            key_n = key.lower().replace("-", "_")
+            value = unquote_plus(str(value_raw or ""))
+            cleaned = _clean_value(value, allow_spaces=False, max_len=256)
+            if not cleaned:
+                continue
+
+            # Common username-style keys in query strings.
+            if key_n in user_keys:
+                candidate = re.split(r"[!,:;|/\\]+", cleaned, maxsplit=1)[0]
+                user = _clean_value(candidate, allow_spaces=False, max_len=96)
+                if user and _is_likely_username(user):
+                    _add_hit("HTTP Query Username", user, None, f"{key}={cleaned}")
+
+            # Privileged account hints embedded in non-standard keys (for example guid=ADMINISTRATOR!HOST!...)
+            for token in re.split(r"[!,:;|/\\]+", cleaned):
+                candidate = _clean_value(token, allow_spaces=False, max_len=96)
+                if not candidate:
+                    continue
+                if PRIV_USER_RE.search(candidate) and _is_likely_username(candidate):
+                    _add_hit(
+                        "HTTP Query Privileged Username",
+                        candidate,
+                        None,
+                        f"{key}={cleaned}",
+                    )
+
+    return hits
+
+
+def _extract_http_query_creds_from_uri(
+    uri: str,
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
+    text = str(uri or "").strip()
+    if not text or "?" not in text:
+        return []
+    synthetic = f"GET {text} HTTP/1.1"
+    return _extract_http_query_creds(synthetic)
+
+
+def _extract_http_request_urls(text: str) -> list[str]:
+    urls: list[str] = []
+    hosts = [str(v).strip() for v in HTTP_HOST_RE.findall(text or "") if str(v).strip()]
+    host = hosts[0] if hosts else ""
+    for _method, raw_uri in HTTP_REQUEST_LINE_RE.findall(text or ""):
+        uri = str(raw_uri or "").strip()
+        if not uri:
+            continue
+        if "://" in uri:
+            urls.append(uri)
+            continue
+        normalized = uri if uri.startswith("/") else f"/{uri}"
+        if host:
+            urls.append(f"http://{host}{normalized}")
+        else:
+            urls.append(normalized)
+    return urls
+
+
+def _extract_kv_creds(
+    text: str, *, kind_prefix: str = ""
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
     for match in USER_RE.finditer(text):
         user = _clean_value(match.group(1), allow_spaces=False, max_len=128)
@@ -913,7 +1179,9 @@ def _extract_kv_creds(text: str, *, kind_prefix: str = "") -> list[tuple[str, Op
     for match in PASS_RE.finditer(text):
         secret = _clean_value(match.group(1), allow_spaces=False, max_len=256)
         if secret:
-            hits.append((f"{kind_prefix}Credential Field", None, secret, match.group(0)))
+            hits.append(
+                (f"{kind_prefix}Credential Field", None, secret, match.group(0))
+            )
     for match in TOKEN_RE.finditer(text):
         token = _clean_value(match.group(1), allow_spaces=False, max_len=512)
         if token:
@@ -947,9 +1215,14 @@ def _extract_kv_creds(text: str, *, kind_prefix: str = "") -> list[tuple[str, Op
     return hits
 
 
-def _extract_mail_auth(lines: list[str]) -> list[tuple[str, Optional[str], Optional[str], str]]:
+def _extract_mail_auth(
+    lines: list[str],
+    state: Optional[dict[str, object]] = None,
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
-    auth_login_seen = False
+    auth_login_seen = bool(state.get("auth_login_seen")) if state else False
+    awaiting_login = str(state.get("awaiting_login") or "") if state else ""
+    pending_login_user = str(state.get("pending_login_user") or "") if state else ""
     for line in lines:
         stripped = line.strip()
         if not stripped:
@@ -962,7 +1235,13 @@ def _extract_mail_auth(lines: list[str]) -> list[tuple[str, Optional[str], Optio
                 if len(parts) >= 3:
                     user = _clean_value(parts[-2], allow_spaces=False, max_len=128)
                     secret = _clean_value(parts[-1], allow_spaces=False, max_len=256)
-                    hits.append(("SMTP AUTH PLAIN", user, secret, stripped))
+                    if (
+                        user
+                        and secret
+                        and _looks_reasonable_credential(user)
+                        and _looks_reasonable_credential(secret)
+                    ):
+                        hits.append(("SMTP AUTH PLAIN", user, secret, stripped))
                 else:
                     hits.append(("SMTP AUTH PLAIN", None, None, stripped))
             else:
@@ -972,20 +1251,86 @@ def _extract_mail_auth(lines: list[str]) -> list[tuple[str, Optional[str], Optio
         match = SMTP_AUTH_LOGIN_RE.match(stripped)
         if match:
             auth_login_seen = True
+            awaiting_login = "username"
+            pending_login_user = ""
             token = match.group(1)
             if token:
                 decoded = _decode_base64(token)
                 cleaned = _clean_value(decoded or "", allow_spaces=False, max_len=256)
-                hits.append(("SMTP AUTH LOGIN", None, cleaned, stripped))
+                if cleaned:
+                    if awaiting_login == "username" and _is_likely_username(cleaned):
+                        pending_login_user = cleaned
+                        awaiting_login = "password"
+                        hits.append(
+                            ("SMTP AUTH LOGIN Username", cleaned, None, stripped)
+                        )
+                    elif awaiting_login == "password" and _looks_reasonable_credential(
+                        cleaned
+                    ):
+                        hits.append(
+                            (
+                                "SMTP AUTH LOGIN Password",
+                                pending_login_user or None,
+                                cleaned,
+                                stripped,
+                            )
+                        )
+                        auth_login_seen = False
+                        pending_login_user = ""
+                        awaiting_login = ""
             continue
 
         if auth_login_seen:
+            if stripped.startswith("334 "):
+                challenge = stripped[4:].strip()
+                decoded_challenge = (_decode_base64(challenge) or "").lower()
+                if "username" in decoded_challenge:
+                    awaiting_login = "username"
+                elif "password" in decoded_challenge:
+                    awaiting_login = "password"
+                continue
+            if re.match(r"^\d{3}\b", stripped):
+                if stripped.startswith(("235", "535", "454", "530")):
+                    auth_login_seen = False
+                    awaiting_login = ""
+                    pending_login_user = ""
+                continue
             token = stripped
-            if re.fullmatch(r"[A-Za-z0-9+/=]{8,}", token):
+            if awaiting_login in {"username", "password"} and re.fullmatch(
+                r"[A-Za-z0-9+/=]{8,}", token
+            ):
                 decoded = _decode_base64(token)
                 cleaned = _clean_value(decoded or "", allow_spaces=False, max_len=256)
                 if cleaned:
-                    hits.append(("SMTP AUTH LOGIN", None, cleaned, stripped))
+                    if awaiting_login == "username" and _is_likely_username(cleaned):
+                        pending_login_user = cleaned
+                        awaiting_login = "password"
+                        hits.append(
+                            ("SMTP AUTH LOGIN Username", cleaned, None, stripped)
+                        )
+                    elif awaiting_login == "password":
+                        if _looks_reasonable_credential(cleaned):
+                            hits.append(
+                                (
+                                    "SMTP AUTH LOGIN Password",
+                                    pending_login_user or None,
+                                    cleaned,
+                                    stripped,
+                                )
+                            )
+                            auth_login_seen = False
+                            pending_login_user = ""
+                            awaiting_login = ""
+            if stripped.upper().startswith(
+                ("MAIL FROM", "RCPT TO", "DATA", "RSET", "QUIT")
+            ):
+                auth_login_seen = False
+                awaiting_login = ""
+                pending_login_user = ""
+    if state is not None:
+        state["auth_login_seen"] = auth_login_seen
+        state["awaiting_login"] = awaiting_login
+        state["pending_login_user"] = pending_login_user
     return hits
 
 
@@ -1021,19 +1366,29 @@ def _extract_line_creds(
             imap_login = IMAP_LOGIN_RE.match(line)
             if not imap_login:
                 continue
-            user = _clean_value(imap_login.group(1).strip("\""), allow_spaces=False, max_len=128)
-            secret = _clean_value(imap_login.group(2).strip("\""), allow_spaces=False, max_len=256)
+            user = _clean_value(
+                imap_login.group(1).strip('"'), allow_spaces=False, max_len=128
+            )
+            secret = _clean_value(
+                imap_login.group(2).strip('"'), allow_spaces=False, max_len=256
+            )
             hits.append(("IMAP LOGIN", user, secret, line))
     return hits
 
 
-def _extract_telnet_creds(text: str) -> list[tuple[str, Optional[str], Optional[str], str]]:
+def _extract_telnet_creds(
+    text: str,
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
-    for match in re.finditer(r"(?im)\b(?:login|username)\s*[:=]\s*([^\r\n]{1,96})", text):
+    for match in re.finditer(
+        r"(?im)\b(?:login|username)\s*[:=]\s*([^\r\n]{1,96})", text
+    ):
         user = _clean_value(match.group(1), allow_spaces=False, max_len=96)
         if user and _is_likely_username(user):
             hits.append(("TELNET Username", user, None, match.group(0).strip()))
-    for match in re.finditer(r"(?im)\b(?:password|passwd|passcode)\s*[:=]\s*([^\r\n]{1,160})", text):
+    for match in re.finditer(
+        r"(?im)\b(?:password|passwd|passcode)\s*[:=]\s*([^\r\n]{1,160})", text
+    ):
         secret = _clean_value(match.group(1), allow_spaces=False, max_len=160)
         if secret:
             hits.append(("TELNET Password", None, secret, match.group(0).strip()))
@@ -1044,7 +1399,9 @@ def _extract_telnet_creds(text: str) -> list[tuple[str, Optional[str], Optional[
     return hits
 
 
-def _extract_tftp_creds(payload: bytes) -> list[tuple[str, Optional[str], Optional[str], str]]:
+def _extract_tftp_creds(
+    payload: bytes,
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
     if len(payload) < 2:
         return hits
@@ -1056,29 +1413,86 @@ def _extract_tftp_creds(payload: bytes) -> list[tuple[str, Optional[str], Option
     parts = data.split(b"\x00")
     if len(parts) < 2:
         return hits
-    filename = _clean_value(parts[0].decode("latin-1", errors="ignore"), allow_spaces=False, max_len=256) or ""
-    mode = _clean_value(parts[1].decode("latin-1", errors="ignore"), allow_spaces=False, max_len=64) or ""
+    filename = (
+        _clean_value(
+            parts[0].decode("latin-1", errors="ignore"), allow_spaces=False, max_len=256
+        )
+        or ""
+    )
+    mode = (
+        _clean_value(
+            parts[1].decode("latin-1", errors="ignore"), allow_spaces=False, max_len=64
+        )
+        or ""
+    )
 
     request_type = "RRQ" if opcode == 1 else "WRQ" if opcode == 2 else "OACK"
     if filename:
         filename_context = f"filename={filename} mode={mode or '-'}"
-        for kind, user, secret, evidence in _extract_kv_creds(filename, kind_prefix="TFTP "):
-            hits.append((kind, user, secret, f"{request_type} {filename_context} {evidence}"))
-        for kind, user, secret, evidence in _extract_prompt_creds(filename, kind_prefix="TFTP "):
-            hits.append((kind, user, secret, f"{request_type} {filename_context} {evidence}"))
+        for kind, user, secret, evidence in _extract_kv_creds(
+            filename, kind_prefix="TFTP "
+        ):
+            hits.append(
+                (kind, user, secret, f"{request_type} {filename_context} {evidence}")
+            )
+        for kind, user, secret, evidence in _extract_prompt_creds(
+            filename, kind_prefix="TFTP "
+        ):
+            hits.append(
+                (kind, user, secret, f"{request_type} {filename_context} {evidence}")
+            )
 
     # Parse options (RFC 2347 style key/value string pairs).
     if len(parts) > 3:
         for idx in range(2, len(parts) - 1, 2):
-            key = _clean_value(parts[idx].decode("latin-1", errors="ignore"), allow_spaces=False, max_len=64)
-            value = _clean_value(parts[idx + 1].decode("latin-1", errors="ignore"), allow_spaces=False, max_len=256)
+            key = _clean_value(
+                parts[idx].decode("latin-1", errors="ignore"),
+                allow_spaces=False,
+                max_len=64,
+            )
+            value = _clean_value(
+                parts[idx + 1].decode("latin-1", errors="ignore"),
+                allow_spaces=False,
+                max_len=256,
+            )
             if not key or not value:
                 continue
             key_n = key.lower().replace("-", "").replace("_", "")
-            if key_n in {"user", "username", "userid", "login", "account", "accountname"} and _is_likely_username(value):
-                hits.append(("TFTP Username Option", value, None, f"{request_type} option {key}={value}"))
-            elif key_n in {"pass", "password", "passwd", "pwd", "token", "secret", "apikey", "accesstoken", "refreshtoken"}:
-                hits.append(("TFTP Secret Option", None, value, f"{request_type} option {key}={value}"))
+            if key_n in {
+                "user",
+                "username",
+                "userid",
+                "login",
+                "account",
+                "accountname",
+            } and _is_likely_username(value):
+                hits.append(
+                    (
+                        "TFTP Username Option",
+                        value,
+                        None,
+                        f"{request_type} option {key}={value}",
+                    )
+                )
+            elif key_n in {
+                "pass",
+                "password",
+                "passwd",
+                "pwd",
+                "token",
+                "secret",
+                "apikey",
+                "accesstoken",
+                "refreshtoken",
+            }:
+                hits.append(
+                    (
+                        "TFTP Secret Option",
+                        None,
+                        value,
+                        f"{request_type} option {key}={value}",
+                    )
+                )
     return hits
 
 
@@ -1090,14 +1504,21 @@ def _extract_smb_netbios_ntlm_creds(
     service: str,
 ) -> list[tuple[str, Optional[str], Optional[str], str]]:
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
-    source = "SMB" if _ports_match(sport, dport, SMB_PORTS) or service == "SMB" else "NetBIOS"
+    source = (
+        "SMB"
+        if _ports_match(sport, dport, SMB_PORTS) or service == "SMB"
+        else "NetBIOS"
+    )
 
     if NTLM_SIGNATURE in payload:
         for item in _extract_ntlm_credentials(payload, f"{source}/NTLM"):
             hits.append(item)
 
     lowered = text.lower()
-    if any(token in lowered for token in ("user=", "username=", "password=", "token=", "ntlmssp")):
+    if any(
+        token in lowered
+        for token in ("user=", "username=", "password=", "token=", "ntlmssp")
+    ):
         for item in _extract_kv_creds(text, kind_prefix=f"{source} "):
             hits.append(item)
         for item in _extract_prompt_creds(text, kind_prefix=f"{source} "):
@@ -1105,34 +1526,62 @@ def _extract_smb_netbios_ntlm_creds(
     return hits
 
 
-def _extract_prompt_creds(text: str, *, kind_prefix: str = "") -> list[tuple[str, Optional[str], Optional[str], str]]:
+def _extract_prompt_creds(
+    text: str, *, kind_prefix: str = ""
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
     for match in PROMPT_USER_RE.finditer(text):
         user = _clean_value(match.group(1), allow_spaces=False, max_len=128)
         if user:
-            hits.append((f"{kind_prefix}Prompt Credential", user, None, _build_context(text, user)))
+            hits.append(
+                (
+                    f"{kind_prefix}Prompt Credential",
+                    user,
+                    None,
+                    _build_context(text, user),
+                )
+            )
     for match in PROMPT_SECRET_RE.finditer(text):
         secret = _clean_value(match.group(1), allow_spaces=False, max_len=256)
         if secret:
-            hits.append((f"{kind_prefix}Prompt Credential", None, secret, _build_context(text, secret)))
+            if _looks_like_prompt_label_secret(secret):
+                continue
+            hits.append(
+                (
+                    f"{kind_prefix}Prompt Credential",
+                    None,
+                    secret,
+                    _build_context(text, secret),
+                )
+            )
     return hits
 
 
-def _extract_xml_creds(text: str, *, kind_prefix: str = "") -> list[tuple[str, Optional[str], Optional[str], str]]:
+def _extract_xml_creds(
+    text: str, *, kind_prefix: str = ""
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
     for match in XML_USER_RE.finditer(text):
         user = _clean_value(match.group(2), allow_spaces=True, max_len=256)
         if user:
-            hits.append((f"{kind_prefix}XML Credential", user, None, match.group(0)[:180]))
+            hits.append(
+                (f"{kind_prefix}XML Credential", user, None, match.group(0)[:180])
+            )
     for match in XML_SECRET_RE.finditer(text):
         secret_raw = _clean_value(match.group(1), allow_spaces=False, max_len=512)
         if not secret_raw:
             continue
-        hits.append((f"{kind_prefix}XML Credential", None, secret_raw, match.group(0)[:180]))
+        hits.append(
+            (f"{kind_prefix}XML Credential", None, secret_raw, match.group(0)[:180])
+        )
         for decoded in _decode_base64_variants(secret_raw):
-            for _kind, user, secret, evidence in _extract_kv_creds(decoded, kind_prefix=kind_prefix):
+            for _kind, user, secret, evidence in _extract_kv_creds(
+                decoded, kind_prefix=kind_prefix
+            ):
                 hits.append((_kind, user, secret, f"decoded-base64: {evidence}"))
-            for _kind, user, secret, evidence in _extract_prompt_creds(decoded, kind_prefix=kind_prefix):
+            for _kind, user, secret, evidence in _extract_prompt_creds(
+                decoded, kind_prefix=kind_prefix
+            ):
                 hits.append((_kind, user, secret, f"decoded-base64: {evidence}"))
     return hits
 
@@ -1252,18 +1701,41 @@ def _extract_cip_credential_hits(
         return []
 
     service_code = service & 0x7F
-    label = service_name or CIP_SERVICE_NAMES.get(service_code) or f"Service 0x{service_code:02x}"
+    label = (
+        service_name
+        or CIP_SERVICE_NAMES.get(service_code)
+        or f"Service 0x{service_code:02x}"
+    )
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
 
     path_is_msg_router = "Class:2" in path_str if path_str else False
-    if bool(is_request) and service_code == 0x37 and (class_id == 0x02 or path_is_msg_router):
-        for username_candidate, source in _extract_cip_service_0x37_usernames(path_str, cip_data):
-            detail_parts = [f"{transport} {label}", f"username={username_candidate}", f"source={source}"]
+    if (
+        bool(is_request)
+        and service_code == 0x37
+        and (class_id == 0x02 or path_is_msg_router)
+    ):
+        for username_candidate, source in _extract_cip_service_0x37_usernames(
+            path_str, cip_data
+        ):
+            detail_parts = [
+                f"{transport} {label}",
+                f"username={username_candidate}",
+                f"source={source}",
+            ]
             if class_id is not None:
                 detail_parts.append(f"class={class_id}")
             if path_str:
-                detail_parts.append(f"path={_normalize_printable(path_str, max_len=120)}")
-            hits.append(("CIP Service 0x37 Username", username_candidate, None, " ".join(detail_parts)))
+                detail_parts.append(
+                    f"path={_normalize_printable(path_str, max_len=120)}"
+                )
+            hits.append(
+                (
+                    "CIP Service 0x37 Username",
+                    username_candidate,
+                    None,
+                    " ".join(detail_parts),
+                )
+            )
 
     tag_name = _extract_symbol(path_str) if _extract_symbol is not None else None
     tag_role = _classify_ot_tag(tag_name or "")
@@ -1297,7 +1769,9 @@ def _extract_cip_credential_hits(
                 secret_hint = value_hint
         if value_hint:
             detail = f"{detail} value={value_hint}"
-        hits.append(("CIP Security Credential Operation", username_hint, secret_hint, detail))
+        hits.append(
+            ("CIP Security Credential Operation", username_hint, secret_hint, detail)
+        )
         for username_candidate in _extract_ot_username_candidates(cip_data):
             hits.append(
                 (
@@ -1312,11 +1786,17 @@ def _extract_cip_credential_hits(
         normalized = _normalize_printable(cip_data)
         if normalized:
             for kind, user, secret, evidence in _extract_kv_creds(normalized):
-                hits.append((f"{transport} {kind}", user, secret, f"{label} {evidence}"))
+                hits.append(
+                    (f"{transport} {kind}", user, secret, f"{label} {evidence}")
+                )
             for kind, user, secret, evidence in _extract_prompt_creds(normalized):
-                hits.append((f"{transport} {kind}", user, secret, f"{label} {evidence}"))
+                hits.append(
+                    (f"{transport} {kind}", user, secret, f"{label} {evidence}")
+                )
             for kind, user, secret, evidence in _extract_xml_creds(normalized):
-                hits.append((f"{transport} {kind}", user, secret, f"{label} {evidence}"))
+                hits.append(
+                    (f"{transport} {kind}", user, secret, f"{label} {evidence}")
+                )
 
     return hits
 
@@ -1342,7 +1822,9 @@ def _extract_ot_protocol_creds(
                 enip_parsed = True
                 cip_payload = enip.get("cip_payload")
                 if isinstance(cip_payload, (bytes, bytearray)):
-                    hits.extend(_extract_cip_credential_hits(bytes(cip_payload), "ENIP/CIP"))
+                    hits.extend(
+                        _extract_cip_credential_hits(bytes(cip_payload), "ENIP/CIP")
+                    )
         except Exception:
             pass
 
@@ -1361,14 +1843,18 @@ def analyze_creds(
     max_hits: int = 200,
 ) -> CredentialSummary:
     if TCP is None and UDP is None and Raw is None:
-        return CredentialSummary(path, 0, 0, [], False, Counter(), Counter(), ["Scapy not available"])
+        return CredentialSummary(
+            path, 0, 0, [], False, Counter(), Counter(), ["Scapy not available"]
+        )
 
     try:
         reader, status, stream, size_bytes, _file_type = get_reader(
             path, packets=packets, meta=meta, show_status=show_status
         )
     except Exception as exc:
-        return CredentialSummary(path, 0, 0, [], False, Counter(), Counter(), [f"Error opening pcap: {exc}"])
+        return CredentialSummary(
+            path, 0, 0, [], False, Counter(), Counter(), [f"Error opening pcap: {exc}"]
+        )
 
     total_packets = 0
     matches = 0
@@ -1377,6 +1863,10 @@ def analyze_creds(
     kind_counts: Counter[str] = Counter()
     user_counts: Counter[str] = Counter()
     confidence_counts: Counter[str] = Counter()
+    smtp_auth_state: dict[tuple[str, str, int, int], dict[str, object]] = {}
+    http_url_observations: dict[
+        str, tuple[int, Optional[float], str, str, Optional[int], Optional[int]]
+    ] = {}
 
     try:
         for pkt in reader:
@@ -1410,10 +1900,35 @@ def analyze_creds(
             looks_smtp = _looks_like_smtp(text, src_port, dst_port, service)
             looks_telnet = _looks_like_telnet(text, src_port, dst_port, service)
             looks_tftp = _looks_like_tftp(payload, src_port, dst_port, service)
-            looks_smb_netbios = _looks_like_smb_netbios(payload, src_port, dst_port, service)
+            looks_smb_netbios = _looks_like_smb_netbios(
+                payload, src_port, dst_port, service
+            )
+            protocol_label = service
+            if looks_smtp:
+                protocol_label = "SMTP"
+            elif looks_imap:
+                protocol_label = "IMAP"
+            elif looks_pop3:
+                protocol_label = "POP3"
+            elif looks_ftp:
+                protocol_label = "FTP"
+            elif looks_http:
+                protocol_label = "HTTP"
 
             if looks_http:
+                for observed_url in _extract_http_request_urls(text):
+                    if observed_url and observed_url not in http_url_observations:
+                        http_url_observations[observed_url] = (
+                            total_packets,
+                            ts,
+                            src_ip,
+                            dst_ip,
+                            src_port,
+                            dst_port,
+                        )
                 for item in _extract_http_basic(text):
+                    seen.add(item)
+                for item in _extract_http_query_creds(text):
                     seen.add(item)
                 for item in _extract_kv_creds(text, kind_prefix="HTTP "):
                     seen.add(item)
@@ -1437,7 +1952,23 @@ def analyze_creds(
             ):
                 seen.add(item)
             if looks_smtp:
-                for item in _extract_mail_auth(lines):
+                s_port = int(src_port or 0)
+                d_port = int(dst_port or 0)
+                side_a = (src_ip, s_port)
+                side_b = (dst_ip, d_port)
+                if side_a <= side_b:
+                    flow_key = (side_a[0], side_b[0], side_a[1], side_b[1])
+                else:
+                    flow_key = (side_b[0], side_a[0], side_b[1], side_a[1])
+                state = smtp_auth_state.setdefault(
+                    flow_key,
+                    {
+                        "auth_login_seen": False,
+                        "awaiting_login": "",
+                        "pending_login_user": "",
+                    },
+                )
+                for item in _extract_mail_auth(lines, state):
                     seen.add(item)
             if looks_telnet:
                 for item in _extract_telnet_creds(text):
@@ -1446,7 +1977,9 @@ def analyze_creds(
                 for item in _extract_tftp_creds(payload):
                     seen.add(item)
             if looks_smb_netbios:
-                for item in _extract_smb_netbios_ntlm_creds(payload, text, src_port, dst_port, service):
+                for item in _extract_smb_netbios_ntlm_creds(
+                    payload, text, src_port, dst_port, service
+                ):
                     seen.add(item)
             for item in _extract_ot_protocol_creds(payload, src_port, dst_port):
                 seen.add(item)
@@ -1465,7 +1998,7 @@ def analyze_creds(
                             dst_ip=dst_ip,
                             src_port=src_port,
                             dst_port=dst_port,
-                            protocol=service,
+                            protocol=protocol_label,
                             kind=kind,
                             username=user,
                             secret=secret,
@@ -1480,6 +2013,65 @@ def analyze_creds(
             reader.close()
         except Exception:
             pass
+
+    # Supplemental HTTP URL mining: recover credentials from reconstructed request URLs
+    # that may not appear contiguously in single packet payloads.
+    try:
+        from .http import analyze_http  # local import to avoid heavyweight import path
+
+        http_summary = analyze_http(path, show_status=False, packets=packets, meta=meta)
+        seen_hit_keys: set[tuple[str, Optional[str], Optional[str], str]] = {
+            (str(hit.kind), hit.username, hit.secret, str(hit.evidence)) for hit in hits
+        }
+        for url, count in (http_summary.url_counts or Counter()).items():
+            if int(count or 0) <= 0:
+                continue
+            observed = http_url_observations.get(str(url))
+            for kind, user, secret, evidence in _extract_http_query_creds_from_uri(
+                str(url)
+            ):
+                enriched_evidence = f"url={url} {evidence}"
+                key = (kind, user, secret, enriched_evidence)
+                if key in seen_hit_keys:
+                    continue
+                seen_hit_keys.add(key)
+                matches += 1
+                kind_counts[kind] += 1
+                if user:
+                    user_counts[user] += 1
+                if len(hits) < max_hits:
+                    packet_number = 0
+                    ts_value: Optional[float] = http_summary.first_seen
+                    src_ip = "-"
+                    dst_ip = "-"
+                    src_port: Optional[int] = None
+                    dst_port: Optional[int] = None
+                    if observed is not None:
+                        (
+                            packet_number,
+                            ts_value,
+                            src_ip,
+                            dst_ip,
+                            src_port,
+                            dst_port,
+                        ) = observed
+                    hits.append(
+                        CredentialHit(
+                            packet_number=packet_number,
+                            ts=ts_value,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            src_port=src_port,
+                            dst_port=dst_port,
+                            protocol="HTTP",
+                            kind=kind,
+                            username=user,
+                            secret=secret,
+                            evidence=enriched_evidence[:240],
+                        )
+                    )
+    except Exception as exc:
+        errors.append(f"HTTP URL credential mining error: {exc}")
 
     truncated = matches > len(hits)
 
@@ -1533,25 +2125,29 @@ def analyze_creds(
         )
 
         if _is_public_ip(hit.dst_ip):
-            external_exposures.append({
-                "src": hit.src_ip,
-                "dst": hit.dst_ip,
-                "kind": hit.kind,
-                "user": hit.username or "-",
-                "pkt": hit.packet_number,
-            })
+            external_exposures.append(
+                {
+                    "src": hit.src_ip,
+                    "dst": hit.dst_ip,
+                    "kind": hit.kind,
+                    "user": hit.username or "-",
+                    "pkt": hit.packet_number,
+                }
+            )
             deterministic_checks["external_destination_exposure"].append(
                 f"{hit.src_ip}->{hit.dst_ip} kind={hit.kind}"
             )
 
         if user and PRIV_USER_RE.search(user):
-            privileged_exposures.append({
-                "src": hit.src_ip,
-                "dst": hit.dst_ip,
-                "user": user,
-                "kind": hit.kind,
-                "pkt": hit.packet_number,
-            })
+            privileged_exposures.append(
+                {
+                    "src": hit.src_ip,
+                    "dst": hit.dst_ip,
+                    "user": user,
+                    "kind": hit.kind,
+                    "pkt": hit.packet_number,
+                }
+            )
             deterministic_checks["privileged_account_exposure"].append(
                 f"{user} exposed via {hit.kind} {hit.src_ip}->{hit.dst_ip}"
             )
@@ -1568,12 +2164,14 @@ def analyze_creds(
         unique_users = {str(item.username).lower() for item in items if item.username}
         unique_dsts = {item.dst_ip for item in items}
         if len(items) >= 8 and (len(unique_users) >= 4 or len(unique_dsts) >= 4):
-            auth_abuse_sequences.append({
-                "src": src_ip,
-                "events": len(items),
-                "users": len(unique_users),
-                "dsts": len(unique_dsts),
-            })
+            auth_abuse_sequences.append(
+                {
+                    "src": src_ip,
+                    "events": len(items),
+                    "users": len(unique_users),
+                    "dsts": len(unique_dsts),
+                }
+            )
             deterministic_checks["auth_abuse_pattern"].append(
                 f"{src_ip} events={len(items)} users={len(unique_users)} dsts={len(unique_dsts)}"
             )
@@ -1589,12 +2187,14 @@ def analyze_creds(
 
     for (rtype, value), dsts in replay_index.items():
         if len(dsts) >= 3:
-            replay_candidates.append({
-                "type": rtype,
-                "value": value[:48],
-                "dst_count": len(dsts),
-                "dsts": sorted(dsts)[:8],
-            })
+            replay_candidates.append(
+                {
+                    "type": rtype,
+                    "value": value[:48],
+                    "dst_count": len(dsts),
+                    "dsts": sorted(dsts)[:8],
+                }
+            )
             deterministic_checks["credential_replay"].append(
                 f"{rtype} reused across {len(dsts)} destinations value={value[:24]}"
             )
@@ -1609,11 +2209,13 @@ def analyze_creds(
         token_index.setdefault(token, set()).add(hit.dst_ip)
     for token, dsts in token_index.items():
         if len(dsts) >= 3:
-            token_fanout.append({
-                "token": token[:24],
-                "dst_count": len(dsts),
-                "dsts": sorted(dsts)[:8],
-            })
+            token_fanout.append(
+                {
+                    "token": token[:24],
+                    "dst_count": len(dsts),
+                    "dsts": sorted(dsts)[:8],
+                }
+            )
             deterministic_checks["token_misuse_fanout"].append(
                 f"token={token[:24]} used across {len(dsts)} destinations"
             )
@@ -1632,6 +2234,153 @@ def analyze_creds(
         token_fanout=token_fanout,
         privileged_exposures=privileged_exposures,
         external_exposures=external_exposures,
-        deterministic_checks={key: values[:40] for key, values in deterministic_checks.items()},
+        deterministic_checks={
+            key: values[:40] for key, values in deterministic_checks.items()
+        },
         errors=errors,
+    )
+
+
+def merge_creds_summaries(
+    summaries: list[CredentialSummary]
+    | tuple[CredentialSummary, ...]
+    | set[CredentialSummary],
+) -> CredentialSummary:
+    summary_list = list(summaries)
+    if not summary_list:
+        return CredentialSummary(
+            path=Path("ALL_PCAPS_0"),
+            total_packets=0,
+            matches=0,
+            hits=[],
+            truncated=False,
+            kind_counts=Counter(),
+            user_counts=Counter(),
+            confidence_counts=Counter(),
+            auth_abuse_sequences=[],
+            replay_candidates=[],
+            token_fanout=[],
+            privileged_exposures=[],
+            external_exposures=[],
+            deterministic_checks={},
+            errors=[],
+        )
+
+    total_packets = sum(
+        int(getattr(item, "total_packets", 0) or 0) for item in summary_list
+    )
+    matches = sum(int(getattr(item, "matches", 0) or 0) for item in summary_list)
+    truncated = any(bool(getattr(item, "truncated", False)) for item in summary_list)
+
+    hits: list[CredentialHit] = []
+    kind_counts: Counter[str] = Counter()
+    user_counts: Counter[str] = Counter()
+    confidence_counts: Counter[str] = Counter()
+    auth_abuse_sequences: list[dict[str, object]] = []
+    replay_candidates: list[dict[str, object]] = []
+    token_fanout: list[dict[str, object]] = []
+    privileged_exposures: list[dict[str, object]] = []
+    external_exposures: list[dict[str, object]] = []
+    deterministic_checks: dict[str, list[str]] = {}
+    errors: set[str] = set()
+
+    seen_hits: set[tuple[object, ...]] = set()
+
+    def _dedup_dict_rows(
+        rows: list[dict[str, object]], limit: int = 200
+    ) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for row in rows:
+            key = repr(sorted((str(k), repr(v)) for k, v in row.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+            if len(out) >= limit:
+                break
+        return out
+
+    for summary in summary_list:
+        kind_counts.update(getattr(summary, "kind_counts", Counter()) or Counter())
+        user_counts.update(getattr(summary, "user_counts", Counter()) or Counter())
+        confidence_counts.update(
+            getattr(summary, "confidence_counts", Counter()) or Counter()
+        )
+        errors.update(
+            str(err)
+            for err in (getattr(summary, "errors", []) or [])
+            if str(err).strip()
+        )
+
+        for hit in getattr(summary, "hits", []) or []:
+            key = (
+                int(getattr(hit, "packet_number", 0) or 0),
+                str(getattr(hit, "src_ip", "") or ""),
+                str(getattr(hit, "dst_ip", "") or ""),
+                int(getattr(hit, "src_port", 0) or 0)
+                if getattr(hit, "src_port", None) is not None
+                else None,
+                int(getattr(hit, "dst_port", 0) or 0)
+                if getattr(hit, "dst_port", None) is not None
+                else None,
+                str(getattr(hit, "protocol", "") or ""),
+                str(getattr(hit, "kind", "") or ""),
+                str(getattr(hit, "username", "") or ""),
+                str(getattr(hit, "secret", "") or ""),
+                str(getattr(hit, "evidence", "") or ""),
+            )
+            if key in seen_hits:
+                continue
+            seen_hits.add(key)
+            hits.append(hit)
+
+        auth_abuse_sequences.extend(
+            list(getattr(summary, "auth_abuse_sequences", []) or [])
+        )
+        replay_candidates.extend(list(getattr(summary, "replay_candidates", []) or []))
+        token_fanout.extend(list(getattr(summary, "token_fanout", []) or []))
+        privileged_exposures.extend(
+            list(getattr(summary, "privileged_exposures", []) or [])
+        )
+        external_exposures.extend(
+            list(getattr(summary, "external_exposures", []) or [])
+        )
+
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+        for key, values in checks.items():
+            bucket = deterministic_checks.setdefault(str(key), [])
+            for value in values or []:
+                text = str(value).strip()
+                if text:
+                    bucket.append(text)
+
+    for key, values in list(deterministic_checks.items()):
+        deterministic_checks[key] = sorted(set(values))[:80]
+
+    hits.sort(
+        key=lambda item: (
+            safe_float(getattr(item, "ts", None))
+            if getattr(item, "ts", None) is not None
+            else float("inf"),
+            int(getattr(item, "packet_number", 0) or 0),
+        )
+    )
+
+    return CredentialSummary(
+        path=Path(f"ALL_PCAPS_{len(summary_list)}"),
+        total_packets=total_packets,
+        matches=matches,
+        hits=hits,
+        truncated=truncated or matches > len(hits),
+        kind_counts=kind_counts,
+        user_counts=user_counts,
+        confidence_counts=confidence_counts,
+        auth_abuse_sequences=_dedup_dict_rows(auth_abuse_sequences, limit=200),
+        replay_candidates=_dedup_dict_rows(replay_candidates, limit=200),
+        token_fanout=_dedup_dict_rows(token_fanout, limit=200),
+        privileged_exposures=_dedup_dict_rows(privileged_exposures, limit=200),
+        external_exposures=_dedup_dict_rows(external_exposures, limit=200),
+        deterministic_checks=deterministic_checks,
+        errors=sorted(errors),
     )

@@ -1,25 +1,30 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict, OrderedDict
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
-from urllib.parse import urlparse
 import base64
 import hashlib
 import ipaddress
 import json
 import math
-import re
 import os
+import re
 import time
 import urllib.error
 import urllib.request
+from collections import Counter, OrderedDict, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
 
+from .device_detection import append_device_fingerprints, device_fingerprints_from_text
 from .pcap_cache import PcapMeta, get_reader
-
-from .utils import safe_float, detect_file_type_bytes, decode_payload, counter_inc, set_add_cap
-from .device_detection import device_fingerprints_from_text, append_device_fingerprints
+from .utils import (
+    counter_inc,
+    decode_payload,
+    detect_file_type_bytes,
+    safe_float,
+    set_add_cap,
+)
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -32,20 +37,78 @@ except Exception:  # pragma: no cover
     Raw = None  # type: ignore
 
 
-HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE", "CONNECT"}
-SUSPICIOUS_UA = ("sqlmap", "nikto", "nmap", "acunetix", "python-requests", "curl", "wget", "masscan")
-SUSPICIOUS_EXT = {".exe", ".dll", ".ps1", ".vbs", ".js", ".jar", ".bat", ".scr", ".zip", ".rar"}
-SUSPICIOUS_UPLOAD_PATH_KEYWORDS = {
-    "upload", "import", "sync", "backup", "dump", "export", "submit", "collect", "exfil", "archive",
+HTTP_METHODS = {
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "HEAD",
+    "OPTIONS",
+    "PATCH",
+    "TRACE",
+    "CONNECT",
 }
-WEB_SHELL_EXTS = {".php", ".jsp", ".jspx", ".asp", ".aspx", ".ashx", ".cfm", ".pl", ".cgi"}
-COMMON_AUTH_SCHEMES = {"BASIC", "BEARER", "DIGEST", "NEGOTIATE", "NTLM", "AWS4-HMAC-SHA256"}
+SUSPICIOUS_UA = (
+    "sqlmap",
+    "nikto",
+    "nmap",
+    "acunetix",
+    "python-requests",
+    "curl",
+    "wget",
+    "masscan",
+)
+SUSPICIOUS_EXT = {
+    ".exe",
+    ".dll",
+    ".ps1",
+    ".vbs",
+    ".js",
+    ".jar",
+    ".bat",
+    ".scr",
+    ".zip",
+    ".rar",
+}
+SUSPICIOUS_UPLOAD_PATH_KEYWORDS = {
+    "upload",
+    "import",
+    "sync",
+    "backup",
+    "dump",
+    "export",
+    "submit",
+    "collect",
+    "exfil",
+    "archive",
+}
+WEB_SHELL_EXTS = {
+    ".php",
+    ".jsp",
+    ".jspx",
+    ".asp",
+    ".aspx",
+    ".ashx",
+    ".cfm",
+    ".pl",
+    ".cgi",
+}
+COMMON_AUTH_SCHEMES = {
+    "BASIC",
+    "BEARER",
+    "DIGEST",
+    "NEGOTIATE",
+    "NTLM",
+    "AWS4-HMAC-SHA256",
+}
 
 MAX_HTTP_UNIQUE = int(os.getenv("PCAPPER_MAX_HTTP_UNIQUE", "50000"))
 MAX_HTTP_CONVERSATIONS = int(os.getenv("PCAPPER_MAX_HTTP_CONVERSATIONS", "50000"))
 MAX_HTTP_PENDING = int(os.getenv("PCAPPER_MAX_HTTP_PENDING", "200"))
 MIN_HTTP_DOWNLOAD_BYTES = int(os.getenv("PCAPPER_MIN_HTTP_DOWNLOAD_BYTES", "512"))
-MAX_HTTP_DETECTION_EVIDENCE = int(os.getenv("PCAPPER_MAX_HTTP_DETECTION_EVIDENCE", "12"))
+MAX_HTTP_DETECTION_EVIDENCE = int(
+    os.getenv("PCAPPER_MAX_HTTP_DETECTION_EVIDENCE", "12")
+)
 MAX_VT_CACHE = int(os.getenv("PCAPPER_VT_CACHE_SIZE", "2048"))
 MAX_VT_LOOKUPS = int(os.getenv("PCAPPER_VT_MAX_LOOKUPS", "500"))
 VT_TIMEOUT = float(os.getenv("PCAPPER_VT_TIMEOUT", "8"))
@@ -139,7 +202,8 @@ class HttpSummary:
             "url_counts": dict(self.url_counts),
             "referrer_counts": dict(self.referrer_counts),
             "referrer_request_host_counts": {
-                ref: dict(hosts) for ref, hosts in self.referrer_request_host_counts.items()
+                ref: dict(hosts)
+                for ref, hosts in self.referrer_request_host_counts.items()
             },
             "referrer_host_counts": dict(self.referrer_host_counts),
             "referrer_scheme_counts": dict(self.referrer_scheme_counts),
@@ -232,6 +296,10 @@ def _extract_filename(headers: dict[str, str], uri: str) -> Optional[str]:
     if "/" in uri:
         name = uri.split("?")[0].rsplit("/", 1)[-1]
         if "." in name:
+            return name
+        # Malware delivery paths are sometimes extensionless random-like tokens.
+        # Keep strict bounds to avoid normal endpoint path noise.
+        if len(name) >= 24 and re.fullmatch(r"[A-Za-z0-9_-]{16,}", name):
             return name
     return None
 
@@ -345,10 +413,16 @@ def _is_internal_host(host: str) -> bool:
 
 
 def _vt_url_id(url: str) -> str:
-    return base64.urlsafe_b64encode(url.encode("utf-8", errors="ignore")).decode("ascii").rstrip("=")
+    return (
+        base64.urlsafe_b64encode(url.encode("utf-8", errors="ignore"))
+        .decode("ascii")
+        .rstrip("=")
+    )
 
 
-def _vt_lookup_domain(domain: str, api_key: str) -> tuple[Optional[dict[str, object]], Optional[str]]:
+def _vt_lookup_domain(
+    domain: str, api_key: str
+) -> tuple[Optional[dict[str, object]], Optional[str]]:
     vt_url = f"https://www.virustotal.com/api/v3/domains/{domain}"
     headers = {"x-apikey": api_key}
     req = urllib.request.Request(vt_url, headers=headers)
@@ -383,7 +457,9 @@ def _vt_lookup_domain(domain: str, api_key: str) -> tuple[Optional[dict[str, obj
     return result, None
 
 
-def _vt_lookup_url(url: str, api_key: str) -> tuple[Optional[dict[str, object]], Optional[str]]:
+def _vt_lookup_url(
+    url: str, api_key: str
+) -> tuple[Optional[dict[str, object]], Optional[str]]:
     url_id = _vt_url_id(url)
     vt_url = f"https://www.virustotal.com/api/v3/urls/{url_id}"
     headers = {"x-apikey": api_key}
@@ -419,7 +495,9 @@ def _vt_lookup_url(url: str, api_key: str) -> tuple[Optional[dict[str, object]],
     return result, None
 
 
-def _vt_lookup_targets(targets: list[tuple[str, str]], api_key: str) -> tuple[list[dict[str, object]], list[str]]:
+def _vt_lookup_targets(
+    targets: list[tuple[str, str]], api_key: str
+) -> tuple[list[dict[str, object]], list[str]]:
     results: list[dict[str, object]] = []
     errors: list[str] = []
     if not targets:
@@ -463,7 +541,9 @@ def _append_evidence(bucket: list[dict[str, object]], item: dict[str, object]) -
     bucket.append(item)
 
 
-def _summarize_evidence(evidence: list[dict[str, object]]) -> tuple[Counter[str], list[int]]:
+def _summarize_evidence(
+    evidence: list[dict[str, object]],
+) -> tuple[Counter[str], list[int]]:
     ip_counts: Counter[str] = Counter()
     packets: list[int] = []
     for item in evidence:
@@ -483,6 +563,10 @@ def analyze_http(
     packets: list[object] | None = None,
     meta: PcapMeta | None = None,
     vt_lookup: bool = False,
+    target_ip: str | None = None,
+    hostname_query: str | None = None,
+    port_filter: int | None = None,
+    search_query: str | None = None,
 ) -> HttpSummary:
     errors: list[str] = []
     if IP is None and IPv6 is None:
@@ -594,8 +678,12 @@ def analyze_http(
     auth_attempts_by_src: Counter[str] = Counter()
     auth_failures_by_client: Counter[str] = Counter()
     upload_profiles: dict[tuple[str, str, str, str, str], dict[str, object]] = {}
-    request_channel_times: dict[tuple[str, str, str, str, str], list[float]] = defaultdict(list)
-    request_channel_sizes: dict[tuple[str, str, str, str, str], list[int]] = defaultdict(list)
+    request_channel_times: dict[tuple[str, str, str, str, str], list[float]] = (
+        defaultdict(list)
+    )
+    request_channel_sizes: dict[tuple[str, str, str, str, str], list[int]] = (
+        defaultdict(list)
+    )
     suspicious_exec_uri_hits: Counter[str] = Counter()
     token_to_sources: dict[str, set[str]] = defaultdict(set)
     source_to_hosts: dict[str, set[str]] = defaultdict(set)
@@ -604,16 +692,20 @@ def analyze_http(
     source_error_responses: Counter[str] = Counter()
     uri_to_targets: dict[str, set[str]] = defaultdict(set)
 
-    conversations: dict[tuple[str, str], dict[str, object]] = defaultdict(lambda: {
-        "requests": 0,
-        "responses": 0,
-        "bytes": 0,
-        "methods": Counter(),
-        "statuses": Counter(),
-        "first_seen": None,
-        "last_seen": None,
-    })
-    pending_requests: dict[tuple[str, int, str, int], list[dict[str, str]]] = defaultdict(list)
+    conversations: dict[tuple[str, str], dict[str, object]] = defaultdict(
+        lambda: {
+            "requests": 0,
+            "responses": 0,
+            "bytes": 0,
+            "methods": Counter(),
+            "statuses": Counter(),
+            "first_seen": None,
+            "last_seen": None,
+        }
+    )
+    pending_requests: dict[tuple[str, int, str, int], list[dict[str, str]]] = (
+        defaultdict(list)
+    )
 
     clients: set[str] = set()
     servers: set[str] = set()
@@ -622,6 +714,11 @@ def analyze_http(
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+
+    target_ip_value = str(target_ip or "").strip()
+    hostname_token = str(hostname_query or "").strip().lower()
+    search_token = str(search_query or "").strip().lower()
+    port_filter_value = int(port_filter) if isinstance(port_filter, int) else None
 
     try:
         for pkt_index, pkt in enumerate(reader, start=1):
@@ -661,6 +758,15 @@ def analyze_http(
 
             if not src_ip or not dst_ip:
                 continue
+            if target_ip_value and target_ip_value not in {src_ip, dst_ip}:
+                continue
+            if (
+                isinstance(port_filter_value, int)
+                and port_filter_value > 0
+                and int(sport) != port_filter_value
+                and int(dport) != port_filter_value
+            ):
+                continue
 
             payload = bytes(pkt[Raw])
             if not payload:
@@ -668,6 +774,15 @@ def analyze_http(
 
             text = decode_payload(payload, encoding="utf-8", limit=8192)
             if not text:
+                continue
+            text_lc = text.lower()
+            if search_token and not (
+                search_token in text_lc
+                or search_token in src_ip.lower()
+                or search_token in dst_ip.lower()
+                or search_token in str(sport)
+                or search_token in str(dport)
+            ):
                 continue
 
             lines = text.split("\r\n")
@@ -695,6 +810,15 @@ def analyze_http(
                     host_norm = host.lower().split(":", 1)[0] if host else ""
                     url = _extract_url(host, uri)
                     uri_lc = uri.lower()
+                    if hostname_token:
+                        ref = headers.get("referer") or headers.get("referrer", "")
+                        name_blob = f"{host_norm} {host} {uri} {url} {ref}".lower()
+                        if (
+                            hostname_token not in name_blob
+                            and hostname_token not in src_ip.lower()
+                            and hostname_token not in dst_ip.lower()
+                        ):
+                            continue
 
                     source_requests[src_ip] += 1
                     if host_norm:
@@ -710,32 +834,46 @@ def analyze_http(
 
                     auth_header = headers.get("authorization", "")
                     if auth_header:
-                        scheme = auth_header.split(" ", 1)[0].strip().upper() if " " in auth_header else auth_header.strip().upper()
+                        scheme = (
+                            auth_header.split(" ", 1)[0].strip().upper()
+                            if " " in auth_header
+                            else auth_header.strip().upper()
+                        )
                         counter_inc(auth_scheme_counts, scheme or "UNKNOWN")
                         auth_attempts_by_src[src_ip] += 1
-                        _append_evidence(auth_evidence, {
-                            "packet": pkt_index,
-                            "src": src_ip,
-                            "dst": dst_ip,
-                            "method": method,
-                            "host": host_norm or host,
-                            "uri": uri,
-                            "scheme": scheme or "UNKNOWN",
-                        })
-                        if scheme and scheme not in COMMON_AUTH_SCHEMES:
-                            _append_evidence(unusual_auth_evidence, {
+                        _append_evidence(
+                            auth_evidence,
+                            {
                                 "packet": pkt_index,
                                 "src": src_ip,
                                 "dst": dst_ip,
                                 "method": method,
                                 "host": host_norm or host,
                                 "uri": uri,
-                                "scheme": scheme,
-                            })
+                                "scheme": scheme or "UNKNOWN",
+                            },
+                        )
+                        if scheme and scheme not in COMMON_AUTH_SCHEMES:
+                            _append_evidence(
+                                unusual_auth_evidence,
+                                {
+                                    "packet": pkt_index,
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "method": method,
+                                    "host": host_norm or host,
+                                    "uri": uri,
+                                    "scheme": scheme,
+                                },
+                            )
 
                     # Track token reuse across multiple client IPs for session replay heuristics.
                     cookie_header = headers.get("cookie", "")
-                    for raw_token in _extract_tokens(uri) + _extract_tokens(cookie_header) + _extract_tokens(auth_header):
+                    for raw_token in (
+                        _extract_tokens(uri)
+                        + _extract_tokens(cookie_header)
+                        + _extract_tokens(auth_header)
+                    ):
                         token_fp = _token_fingerprint(raw_token)
                         token_to_sources[token_fp].add(src_ip)
 
@@ -743,123 +881,170 @@ def analyze_http(
                         try:
                             host_ip = ipaddress.ip_address(host_norm)
                             if host_ip and host_norm != dst_ip:
-                                _append_evidence(host_header_anomaly_evidence, {
-                                    "packet": pkt_index,
-                                    "src": src_ip,
-                                    "dst": dst_ip,
-                                    "host": host_norm,
-                                    "uri": uri,
-                                })
+                                _append_evidence(
+                                    host_header_anomaly_evidence,
+                                    {
+                                        "packet": pkt_index,
+                                        "src": src_ip,
+                                        "dst": dst_ip,
+                                        "host": host_norm,
+                                        "uri": uri,
+                                    },
+                                )
                         except Exception:
                             pass
 
-                    if any(token in uri_lc for token in ("cmd=", "exec", "eval", "powershell", "whoami", "wget", "curl", "/shell", "/webshell")):
+                    if any(
+                        token in uri_lc
+                        for token in (
+                            "cmd=",
+                            "exec",
+                            "eval",
+                            "powershell",
+                            "whoami",
+                            "wget",
+                            "curl",
+                            "/shell",
+                            "/webshell",
+                        )
+                    ):
                         suspicious_exec_uri_hits[uri] += 1
-                        _append_evidence(webshell_evidence, {
-                            "packet": pkt_index,
-                            "src": src_ip,
-                            "dst": dst_ip,
-                            "host": host_norm or host,
-                            "uri": uri,
-                            "method": method,
-                        })
-
-                    for chunk in re.split(r"[/?&=]", uri):
-                        token = chunk.strip()
-                        if len(token) < 24:
-                            continue
-                        if not re.search(r"[A-Za-z]", token) or not re.search(r"\d", token):
-                            continue
-                        entropy = _shannon_entropy(token)
-                        if entropy >= 3.9:
-                            _append_evidence(uri_entropy_evidence, {
+                        _append_evidence(
+                            webshell_evidence,
+                            {
                                 "packet": pkt_index,
                                 "src": src_ip,
                                 "dst": dst_ip,
                                 "host": host_norm or host,
                                 "uri": uri,
-                                "token": token[:48],
-                                "entropy": round(entropy, 2),
-                            })
+                                "method": method,
+                            },
+                        )
+
+                    for chunk in re.split(r"[/?&=]", uri):
+                        token = chunk.strip()
+                        if len(token) < 24:
+                            continue
+                        if not re.search(r"[A-Za-z]", token) or not re.search(
+                            r"\d", token
+                        ):
+                            continue
+                        entropy = _shannon_entropy(token)
+                        if entropy >= 3.9:
+                            _append_evidence(
+                                uri_entropy_evidence,
+                                {
+                                    "packet": pkt_index,
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "host": host_norm or host,
+                                    "uri": uri,
+                                    "token": token[:48],
+                                    "entropy": round(entropy, 2),
+                                },
+                            )
                             break
 
                     if method in ("TRACE", "CONNECT"):
-                        _append_evidence(risky_method_evidence, {
-                            "packet": pkt_index,
-                            "src": src_ip,
-                            "dst": dst_ip,
-                            "method": method,
-                            "host": host_norm or host,
-                            "uri": uri,
-                            "url": url,
-                        })
+                        _append_evidence(
+                            risky_method_evidence,
+                            {
+                                "packet": pkt_index,
+                                "src": src_ip,
+                                "dst": dst_ip,
+                                "method": method,
+                                "host": host_norm or host,
+                                "uri": uri,
+                                "url": url,
+                            },
+                        )
 
                     if len(url) > 200:
-                        _append_evidence(long_url_evidence, {
-                            "packet": pkt_index,
-                            "src": src_ip,
-                            "dst": dst_ip,
-                            "url": url,
-                            "length": len(url),
-                        })
+                        _append_evidence(
+                            long_url_evidence,
+                            {
+                                "packet": pkt_index,
+                                "src": src_ip,
+                                "dst": dst_ip,
+                                "url": url,
+                                "length": len(url),
+                            },
+                        )
 
                     referrer = headers.get("referer") or headers.get("referrer", "")
                     if referrer:
                         referrer_present += 1
                         counter_inc(referrer_counts, referrer)
                         if host_norm:
-                            counter_inc(referrer_request_host_counts[referrer], host_norm)
+                            counter_inc(
+                                referrer_request_host_counts[referrer], host_norm
+                            )
                         scheme, ref_host, ref_path = _parse_referrer(referrer)
                         if scheme:
                             counter_inc(referrer_scheme_counts, scheme)
                         if ref_host:
                             counter_inc(referrer_host_counts, ref_host)
-                            if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ref_host) or ":" in ref_host:
+                            if (
+                                re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ref_host)
+                                or ":" in ref_host
+                            ):
                                 counter_inc(referrer_ip_hosts, ref_host)
-                                _append_evidence(referrer_ip_evidence, {
-                                    "packet": pkt_index,
-                                    "src": src_ip,
-                                    "dst": dst_ip,
-                                    "referrer_host": ref_host,
-                                    "referrer": referrer,
-                                    "host": host_norm or host,
-                                    "uri": uri,
-                                })
+                                _append_evidence(
+                                    referrer_ip_evidence,
+                                    {
+                                        "packet": pkt_index,
+                                        "src": src_ip,
+                                        "dst": dst_ip,
+                                        "referrer_host": ref_host,
+                                        "referrer": referrer,
+                                        "host": host_norm or host,
+                                        "uri": uri,
+                                    },
+                                )
                         if ref_path:
                             counter_inc(referrer_path_counts, ref_path)
                         if host_norm and ref_host and ref_host != host_norm:
                             referrer_cross_host += 1
-                            _append_evidence(referrer_cross_host_evidence, {
-                                "packet": pkt_index,
-                                "src": src_ip,
-                                "dst": dst_ip,
-                                "referrer_host": ref_host,
-                                "host": host_norm or host,
-                                "uri": uri,
-                                "referrer": referrer,
-                            })
+                            _append_evidence(
+                                referrer_cross_host_evidence,
+                                {
+                                    "packet": pkt_index,
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "referrer_host": ref_host,
+                                    "host": host_norm or host,
+                                    "uri": uri,
+                                    "referrer": referrer,
+                                },
+                            )
                         if scheme == "https":
                             referrer_https_to_http += 1
-                            _append_evidence(referrer_https_to_http_evidence, {
-                                "packet": pkt_index,
-                                "src": src_ip,
-                                "dst": dst_ip,
-                                "referrer": referrer,
-                                "host": host_norm or host,
-                                "uri": uri,
-                            })
+                            _append_evidence(
+                                referrer_https_to_http_evidence,
+                                {
+                                    "packet": pkt_index,
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "referrer": referrer,
+                                    "host": host_norm or host,
+                                    "uri": uri,
+                                },
+                            )
                         for token in _extract_tokens(referrer):
                             token_fp = _token_fingerprint(token)
                             counter_inc(referrer_token_counts, token_fp)
-                            _append_evidence(referrer_token_evidence, {
-                                "packet": pkt_index,
-                                "src": src_ip,
-                                "dst": dst_ip,
-                                "token_fp": token_fp,
-                                "referrer": referrer,
-                                "host": host_norm or host,
-                                "uri": uri,
-                            })
+                            _append_evidence(
+                                referrer_token_evidence,
+                                {
+                                    "packet": pkt_index,
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "token_fp": token_fp,
+                                    "referrer": referrer,
+                                    "host": host_norm or host,
+                                    "uri": uri,
+                                },
+                            )
                     else:
                         referrer_missing += 1
 
@@ -877,33 +1062,49 @@ def analyze_http(
                     ua = headers.get("user-agent", "")
                     if ua:
                         counter_inc(user_agents, ua)
-                        append_device_fingerprints(device_fingerprints, device_fingerprints_from_text(ua, source="HTTP User-Agent"))
+                        append_device_fingerprints(
+                            device_fingerprints,
+                            device_fingerprints_from_text(ua, source="HTTP User-Agent"),
+                        )
                         if any(tag in ua.lower() for tag in SUSPICIOUS_UA):
-                            _append_evidence(suspicious_ua_evidence, {
-                                "packet": pkt_index,
-                                "src": src_ip,
-                                "dst": dst_ip,
-                                "user_agent": ua,
-                                "host": host_norm or host,
-                                "uri": uri,
-                            })
+                            _append_evidence(
+                                suspicious_ua_evidence,
+                                {
+                                    "packet": pkt_index,
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "user_agent": ua,
+                                    "host": host_norm or host,
+                                    "uri": uri,
+                                },
+                            )
                         ua_lc = ua.lower()
                         if "mozilla/" in ua_lc:
                             has_accept = bool(headers.get("accept", ""))
                             has_lang = bool(headers.get("accept-language", ""))
-                            has_modern_hint = bool(headers.get("sec-ch-ua", "") or headers.get("sec-fetch-site", ""))
+                            has_modern_hint = bool(
+                                headers.get("sec-ch-ua", "")
+                                or headers.get("sec-fetch-site", "")
+                            )
                             if not has_accept or not has_lang:
-                                _append_evidence(ua_spoof_evidence, {
-                                    "packet": pkt_index,
-                                    "src": src_ip,
-                                    "dst": dst_ip,
-                                    "host": host_norm or host,
-                                    "uri": uri,
-                                    "user_agent": ua,
-                                    "accept": headers.get("accept", "-"),
-                                    "accept_language": headers.get("accept-language", "-"),
-                                    "sec_ch_ua": headers.get("sec-ch-ua", "-") if has_modern_hint else "-",
-                                })
+                                _append_evidence(
+                                    ua_spoof_evidence,
+                                    {
+                                        "packet": pkt_index,
+                                        "src": src_ip,
+                                        "dst": dst_ip,
+                                        "host": host_norm or host,
+                                        "uri": uri,
+                                        "user_agent": ua,
+                                        "accept": headers.get("accept", "-"),
+                                        "accept_language": headers.get(
+                                            "accept-language", "-"
+                                        ),
+                                        "sec_ch_ua": headers.get("sec-ch-ua", "-")
+                                        if has_modern_hint
+                                        else "-",
+                                    },
+                                )
 
                     tokens = _extract_tokens(uri)
                     for token in tokens:
@@ -912,25 +1113,36 @@ def analyze_http(
                     filename = _extract_filename(headers, uri)
                     if filename:
                         counter_inc(file_artifacts, filename)
-                        if any(filename.lower().endswith(ext) for ext in SUSPICIOUS_EXT):
-                            _append_evidence(suspicious_file_evidence, {
-                                "packet": pkt_index,
-                                "src": src_ip,
-                                "dst": dst_ip,
-                                "filename": filename,
-                                "host": host_norm or host,
-                                "uri": uri,
-                            })
+                        if any(
+                            filename.lower().endswith(ext) for ext in SUSPICIOUS_EXT
+                        ):
+                            _append_evidence(
+                                suspicious_file_evidence,
+                                {
+                                    "packet": pkt_index,
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "filename": filename,
+                                    "host": host_norm or host,
+                                    "uri": uri,
+                                },
+                            )
                     pending_key = (src_ip, int(sport), dst_ip, int(dport))
                     if len(pending_requests[pending_key]) < MAX_HTTP_PENDING:
-                        pending_requests[pending_key].append({
-                            "uri": uri,
-                            "filename": filename or "",
-                        })
+                        pending_requests[pending_key].append(
+                            {
+                                "uri": uri,
+                                "filename": filename or "",
+                                "host": host_norm or host.lower(),
+                            }
+                        )
 
                     conv_key = (src_ip, dst_ip)
                     conv = None
-                    if conv_key not in conversations and len(conversations) >= MAX_HTTP_CONVERSATIONS:
+                    if (
+                        conv_key not in conversations
+                        and len(conversations) >= MAX_HTTP_CONVERSATIONS
+                    ):
                         skipped_conversations += 1
                     else:
                         conv = conversations[conv_key]
@@ -938,9 +1150,13 @@ def analyze_http(
                         counter_inc(conv["methods"], method)
                         conv["bytes"] = int(conv["bytes"]) + pkt_len
                     if conv is not None:
-                        if conv["first_seen"] is None or (ts is not None and ts < conv["first_seen"]):
+                        if conv["first_seen"] is None or (
+                            ts is not None and ts < conv["first_seen"]
+                        ):
                             conv["first_seen"] = ts
-                        if conv["last_seen"] is None or (ts is not None and ts > conv["last_seen"]):
+                        if conv["last_seen"] is None or (
+                            ts is not None and ts > conv["last_seen"]
+                        ):
                             conv["last_seen"] = ts
 
                     set_add_cap(clients, src_ip, max_size=MAX_HTTP_UNIQUE)
@@ -956,18 +1172,24 @@ def analyze_http(
                             content_length = headers.get("content-length", "")
                             content_type = headers.get("content-type", "")
                             sample = body[:160]
-                            sample_text = decode_payload(sample, encoding="latin-1").replace("\r", " ").replace("\n", " ")
-                            post_payloads.append({
-                                "src": src_ip,
-                                "dst": dst_ip,
-                                "host": host,
-                                "uri": uri,
-                                "packet": pkt_index,
-                                "bytes": len(body),
-                                "content_type": content_type,
-                                "content_length": content_length,
-                                "sample": sample_text,
-                            })
+                            sample_text = (
+                                decode_payload(sample, encoding="latin-1")
+                                .replace("\r", " ")
+                                .replace("\n", " ")
+                            )
+                            post_payloads.append(
+                                {
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "host": host,
+                                    "uri": uri,
+                                    "packet": pkt_index,
+                                    "bytes": len(body),
+                                    "content_type": content_type,
+                                    "content_length": content_length,
+                                    "sample": sample_text,
+                                }
+                            )
 
                     if method in {"POST", "PUT", "PATCH"}:
                         content_length = _parse_content_length(headers)
@@ -975,59 +1197,107 @@ def analyze_http(
                         body = b""
                         if b"\r\n\r\n" in payload:
                             body = payload.split(b"\r\n\r\n", 1)[1]
-                        req_body_size = int(content_length if content_length is not None else len(body))
+                        req_body_size = int(
+                            content_length if content_length is not None else len(body)
+                        )
 
                         if req_body_size > 0:
-                            profile_key = (src_ip, dst_ip, host_norm or host, uri, method)
-                            profile = upload_profiles.setdefault(profile_key, {
-                                "src": src_ip,
-                                "dst": dst_ip,
-                                "host": host_norm or host,
-                                "uri": uri,
-                                "method": method,
-                                "requests": 0,
-                                "bytes": 0,
-                                "content_types": set(),
-                            })
-                            profile["requests"] = int(profile.get("requests", 0)) + 1
-                            profile["bytes"] = int(profile.get("bytes", 0)) + req_body_size
-                            cset = profile.get("content_types")
-                            if isinstance(cset, set) and content_type:
-                                cset.add(content_type)
-
-                            is_uploadish = any(key in uri_lc for key in SUSPICIOUS_UPLOAD_PATH_KEYWORDS)
-                            if is_uploadish or req_body_size >= 150_000:
-                                _append_evidence(upload_profile_evidence, {
-                                    "packet": pkt_index,
+                            profile_key = (
+                                src_ip,
+                                dst_ip,
+                                host_norm or host,
+                                uri,
+                                method,
+                            )
+                            profile = upload_profiles.setdefault(
+                                profile_key,
+                                {
                                     "src": src_ip,
                                     "dst": dst_ip,
                                     "host": host_norm or host,
                                     "uri": uri,
                                     "method": method,
-                                    "bytes": req_body_size,
-                                    "content_type": content_type or "-",
-                                })
+                                    "requests": 0,
+                                    "bytes": 0,
+                                    "content_types": set(),
+                                },
+                            )
+                            profile["requests"] = int(profile.get("requests", 0)) + 1
+                            profile["bytes"] = (
+                                int(profile.get("bytes", 0)) + req_body_size
+                            )
+                            cset = profile.get("content_types")
+                            if isinstance(cset, set) and content_type:
+                                cset.add(content_type)
+
+                            is_uploadish = any(
+                                key in uri_lc for key in SUSPICIOUS_UPLOAD_PATH_KEYWORDS
+                            )
+                            if is_uploadish or req_body_size >= 150_000:
+                                _append_evidence(
+                                    upload_profile_evidence,
+                                    {
+                                        "packet": pkt_index,
+                                        "src": src_ip,
+                                        "dst": dst_ip,
+                                        "host": host_norm or host,
+                                        "uri": uri,
+                                        "method": method,
+                                        "bytes": req_body_size,
+                                        "content_type": content_type or "-",
+                                    },
+                                )
 
                             if content_type:
                                 ctype_lc = content_type.lower()
-                                if any(tag in ctype_lc for tag in ("application/json", "text/", "xml", "x-www-form-urlencoded")) and body:
-                                    non_printable = sum(1 for b in body[:512] if b < 9 or (13 < b < 32))
+                                if (
+                                    any(
+                                        tag in ctype_lc
+                                        for tag in (
+                                            "application/json",
+                                            "text/",
+                                            "xml",
+                                            "x-www-form-urlencoded",
+                                        )
+                                    )
+                                    and body
+                                ):
+                                    non_printable = sum(
+                                        1 for b in body[:512] if b < 9 or (13 < b < 32)
+                                    )
                                     ratio = non_printable / max(1, min(len(body), 512))
                                     if ratio >= 0.20:
-                                        _append_evidence(content_type_mismatch_evidence, {
-                                            "packet": pkt_index,
-                                            "src": src_ip,
-                                            "dst": dst_ip,
-                                            "host": host_norm or host,
-                                            "uri": uri,
-                                            "content_type": content_type,
-                                            "bytes": req_body_size,
-                                            "ratio": round(ratio, 2),
-                                        })
+                                        _append_evidence(
+                                            content_type_mismatch_evidence,
+                                            {
+                                                "packet": pkt_index,
+                                                "src": src_ip,
+                                                "dst": dst_ip,
+                                                "host": host_norm or host,
+                                                "uri": uri,
+                                                "content_type": content_type,
+                                                "bytes": req_body_size,
+                                                "ratio": round(ratio, 2),
+                                            },
+                                        )
 
             elif start.startswith("HTTP/"):
                 parts = start.split(" ")
                 if len(parts) >= 2 and parts[1].isdigit():
+                    if hostname_token:
+                        pending_key = (dst_ip, int(dport), src_ip, int(sport))
+                        req_preview = (
+                            pending_requests.get(pending_key, [{}])[0]
+                            if pending_requests.get(pending_key)
+                            else {}
+                        )
+                        host_value = str(req_preview.get("host", "") or "")
+                        uri_value = str(req_preview.get("uri", "") or "")
+                        name_blob = (
+                            f"{host_value} {uri_value} {src_ip} {dst_ip}"
+                        ).lower()
+                        if hostname_token not in name_blob:
+                            continue
                     version = parts[0]
                     if version.startswith("HTTP/"):
                         counter_inc(version_counts, version)
@@ -1038,34 +1308,45 @@ def analyze_http(
                     server = headers.get("server", "")
                     if server:
                         counter_inc(server_headers, server)
-                        append_device_fingerprints(device_fingerprints, device_fingerprints_from_text(server, source="HTTP Server"))
+                        append_device_fingerprints(
+                            device_fingerprints,
+                            device_fingerprints_from_text(server, source="HTTP Server"),
+                        )
 
                     content_type = headers.get("content-type", "")
                     if content_type:
                         counter_inc(content_types, content_type)
                     if status_code.startswith("4") or status_code.startswith("5"):
                         source_error_responses[dst_ip] += 1
-                        _append_evidence(error_response_evidence, {
-                            "packet": pkt_index,
-                            "src": src_ip,
-                            "dst": dst_ip,
-                            "status": status_code,
-                            "server": server,
-                            "content_type": content_type,
-                        })
+                        _append_evidence(
+                            error_response_evidence,
+                            {
+                                "packet": pkt_index,
+                                "src": src_ip,
+                                "dst": dst_ip,
+                                "status": status_code,
+                                "server": server,
+                                "content_type": content_type,
+                            },
+                        )
                         if status_code in {"401", "403"}:
                             auth_failures_by_client[dst_ip] += 1
 
                     filename = _extract_filename(headers, "")
                     if filename:
                         counter_inc(file_artifacts, filename)
-                        if any(filename.lower().endswith(ext) for ext in SUSPICIOUS_EXT):
-                            _append_evidence(suspicious_file_evidence, {
-                                "packet": pkt_index,
-                                "src": src_ip,
-                                "dst": dst_ip,
-                                "filename": filename,
-                            })
+                        if any(
+                            filename.lower().endswith(ext) for ext in SUSPICIOUS_EXT
+                        ):
+                            _append_evidence(
+                                suspicious_file_evidence,
+                                {
+                                    "packet": pkt_index,
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "filename": filename,
+                                },
+                            )
 
                     set_cookie = headers.get("set-cookie", "")
                     if set_cookie:
@@ -1077,7 +1358,10 @@ def analyze_http(
 
                     conv_key = (dst_ip, src_ip)
                     conv = None
-                    if conv_key not in conversations and len(conversations) >= MAX_HTTP_CONVERSATIONS:
+                    if (
+                        conv_key not in conversations
+                        and len(conversations) >= MAX_HTTP_CONVERSATIONS
+                    ):
                         skipped_conversations += 1
                     else:
                         conv = conversations[conv_key]
@@ -1085,9 +1369,13 @@ def analyze_http(
                         counter_inc(conv["statuses"], status_code)
                         conv["bytes"] = int(conv["bytes"]) + pkt_len
                     if conv is not None:
-                        if conv["first_seen"] is None or (ts is not None and ts < conv["first_seen"]):
+                        if conv["first_seen"] is None or (
+                            ts is not None and ts < conv["first_seen"]
+                        ):
                             conv["first_seen"] = ts
-                        if conv["last_seen"] is None or (ts is not None and ts > conv["last_seen"]):
+                        if conv["last_seen"] is None or (
+                            ts is not None and ts > conv["last_seen"]
+                        ):
                             conv["last_seen"] = ts
 
                     set_add_cap(servers, src_ip, max_size=MAX_HTTP_UNIQUE)
@@ -1132,21 +1420,25 @@ def analyze_http(
                             and detected_type not in ("BINARY", expected_type)
                         )
                         allow_small = content_length is not None and content_length > 0
-                        if body_complete and (fname or detected_type not in ("BINARY", "HTML")) and (
-                            len(body) >= MIN_HTTP_DOWNLOAD_BYTES or allow_small
+                        if (
+                            body_complete
+                            and (fname or detected_type not in ("BINARY", "HTML"))
+                            and (len(body) >= MIN_HTTP_DOWNLOAD_BYTES or allow_small)
                         ):
-                            downloads.append({
-                                "src": src_ip,
-                                "dst": dst_ip,
-                                "filename": fname or "-",
-                                "detected_type": detected_type,
-                                "expected_type": expected_type or "-",
-                                "bytes": len(body),
-                                "content_type": headers.get("content-type", ""),
-                                "status": status_code,
-                                "mismatch": mismatch,
-                                "packet": pkt_index,
-                            })
+                            downloads.append(
+                                {
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "filename": fname or "-",
+                                    "detected_type": detected_type,
+                                    "expected_type": expected_type or "-",
+                                    "bytes": len(body),
+                                    "content_type": headers.get("content-type", ""),
+                                    "status": status_code,
+                                    "mismatch": mismatch,
+                                    "packet": pkt_index,
+                                }
+                            )
     finally:
         status.finish()
         reader.close()
@@ -1155,21 +1447,25 @@ def analyze_http(
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
     if skipped_conversations:
-        errors.append(f"HTTP conversation cap reached; {skipped_conversations} updates skipped.")
+        errors.append(
+            f"HTTP conversation cap reached; {skipped_conversations} updates skipped."
+        )
 
     conversation_rows: list[HttpConversation] = []
     for (client, server), data in conversations.items():
-        conversation_rows.append(HttpConversation(
-            client_ip=client,
-            server_ip=server,
-            requests=int(data["requests"]),
-            responses=int(data["responses"]),
-            bytes=int(data["bytes"]),
-            methods=data["methods"],
-            statuses=data["statuses"],
-            first_seen=data["first_seen"],
-            last_seen=data["last_seen"],
-        ))
+        conversation_rows.append(
+            HttpConversation(
+                client_ip=client,
+                server_ip=server,
+                requests=int(data["requests"]),
+                responses=int(data["responses"]),
+                bytes=int(data["bytes"]),
+                methods=data["methods"],
+                statuses=data["statuses"],
+                first_seen=data["first_seen"],
+                last_seen=data["last_seen"],
+            )
+        )
 
     # Use dpkt-based file discovery to align with --files parsing
     try:
@@ -1187,32 +1483,43 @@ def analyze_http(
                 continue
             filename = getattr(art, "filename", "") or "-"
             file_artifacts[filename] += 1
-            if filename and any(filename.lower().endswith(ext) for ext in SUSPICIOUS_EXT):
-                _append_evidence(suspicious_file_evidence, {
-                    "packet": getattr(art, "packet_index", None),
-                    "src": getattr(art, "src_ip", "-"),
-                    "dst": getattr(art, "dst_ip", "-"),
-                    "filename": filename,
-                })
+            if filename and any(
+                filename.lower().endswith(ext) for ext in SUSPICIOUS_EXT
+            ):
+                _append_evidence(
+                    suspicious_file_evidence,
+                    {
+                        "packet": getattr(art, "packet_index", None),
+                        "src": getattr(art, "src_ip", "-"),
+                        "dst": getattr(art, "dst_ip", "-"),
+                        "filename": filename,
+                    },
+                )
             detected_type = getattr(art, "file_type", "") or "UNKNOWN"
             content_type = getattr(art, "content_type", "") or ""
             expected_type = _expected_type_from_filename(filename, content_type)
-            mismatch = bool(expected_type and detected_type not in ("BINARY", expected_type))
+            mismatch = bool(
+                expected_type and detected_type not in ("BINARY", expected_type)
+            )
             size_bytes = getattr(art, "size_bytes", None)
-            downloads.append({
-                "src": getattr(art, "src_ip", "-"),
-                "dst": getattr(art, "dst_ip", "-"),
-                "filename": filename,
-                "detected_type": detected_type,
-                "expected_type": expected_type or "-",
-                "bytes": int(size_bytes) if size_bytes is not None else 0,
-                "content_type": content_type,
-                "status": "-",
-                "mismatch": mismatch,
-                "packet": getattr(art, "packet_index", "-"),
-            })
+            downloads.append(
+                {
+                    "src": getattr(art, "src_ip", "-"),
+                    "dst": getattr(art, "dst_ip", "-"),
+                    "filename": filename,
+                    "detected_type": detected_type,
+                    "expected_type": expected_type or "-",
+                    "bytes": int(size_bytes) if size_bytes is not None else 0,
+                    "content_type": content_type,
+                    "status": "-",
+                    "mismatch": mismatch,
+                    "packet": getattr(art, "packet_index", "-"),
+                }
+            )
         if dpkt_summary.errors:
-            errors.extend([f"HTTP file discovery (dpkt): {err}" for err in dpkt_summary.errors])
+            errors.extend(
+                [f"HTTP file discovery (dpkt): {err}" for err in dpkt_summary.errors]
+            )
 
     detections: list[dict[str, object]] = []
 
@@ -1241,9 +1548,19 @@ def analyze_http(
             item["evidence"] = list(evidence)
         detections.append(item)
 
-    error_responses = sum(count for code, count in status_counts.items() if code.startswith("4") or code.startswith("5"))
+    error_responses = sum(
+        count
+        for code, count in status_counts.items()
+        if code.startswith("4") or code.startswith("5")
+    )
     if total_responses and (error_responses / total_responses) > 0.3:
-        error_codes = Counter({code: count for code, count in status_counts.items() if code.startswith("4") or code.startswith("5")})
+        error_codes = Counter(
+            {
+                code: count
+                for code, count in status_counts.items()
+                if code.startswith("4") or code.startswith("5")
+            }
+        )
         top_codes = [f"{code}({count})" for code, count in error_codes.most_common(5)]
         details = f"{error_responses}/{total_responses} responses are 4xx/5xx."
         if top_codes:
@@ -1256,7 +1573,9 @@ def analyze_http(
             artifacts=top_codes or None,
         )
 
-    risky_methods = Counter({m: method_counts[m] for m in method_counts if m in ("TRACE", "CONNECT")})
+    risky_methods = Counter(
+        {m: method_counts[m] for m in method_counts if m in ("TRACE", "CONNECT")}
+    )
     if risky_methods:
         detail_methods = ", ".join(f"{m}({c})" for m, c in risky_methods.most_common())
         _append_detection(
@@ -1267,9 +1586,17 @@ def analyze_http(
             artifacts=[m for m, _ in risky_methods.most_common(5)],
         )
 
-    suspicious_ua_counts = Counter({ua: count for ua, count in user_agents.items() if any(tag in ua.lower() for tag in SUSPICIOUS_UA)})
+    suspicious_ua_counts = Counter(
+        {
+            ua: count
+            for ua, count in user_agents.items()
+            if any(tag in ua.lower() for tag in SUSPICIOUS_UA)
+        }
+    )
     if suspicious_ua_counts:
-        ua_details = ", ".join(f"{ua}({count})" for ua, count in suspicious_ua_counts.most_common(5))
+        ua_details = ", ".join(
+            f"{ua}({count})" for ua, count in suspicious_ua_counts.most_common(5)
+        )
         _append_detection(
             "warning",
             "Suspicious user agents observed",
@@ -1289,7 +1616,11 @@ def analyze_http(
             artifacts=artifacts,
         )
 
-    suspicious_files = [name for name in file_artifacts if any(name.lower().endswith(ext) for ext in SUSPICIOUS_EXT)]
+    suspicious_files = [
+        name
+        for name in file_artifacts
+        if any(name.lower().endswith(ext) for ext in SUSPICIOUS_EXT)
+    ]
     if suspicious_files:
         _append_detection(
             "warning",
@@ -1306,16 +1637,19 @@ def analyze_http(
         for item in mismatch_downloads:
             filename = str(item.get("filename", "-"))
             mismatch_artifacts.append(filename)
-            _append_evidence(mismatch_evidence, {
-                "packet": item.get("packet"),
-                "src": item.get("src"),
-                "dst": item.get("dst"),
-                "filename": filename,
-                "detected_type": item.get("detected_type"),
-                "expected_type": item.get("expected_type"),
-                "bytes": item.get("bytes"),
-                "status": item.get("status"),
-            })
+            _append_evidence(
+                mismatch_evidence,
+                {
+                    "packet": item.get("packet"),
+                    "src": item.get("src"),
+                    "dst": item.get("dst"),
+                    "filename": filename,
+                    "detected_type": item.get("detected_type"),
+                    "expected_type": item.get("expected_type"),
+                    "bytes": item.get("bytes"),
+                    "status": item.get("status"),
+                },
+            )
         _append_detection(
             "critical",
             "HTTP file type discrepancies",
@@ -1327,15 +1661,18 @@ def analyze_http(
     if post_payloads:
         post_evidence: list[dict[str, object]] = []
         for item in post_payloads:
-            _append_evidence(post_evidence, {
-                "packet": item.get("packet"),
-                "src": item.get("src"),
-                "dst": item.get("dst"),
-                "host": item.get("host"),
-                "uri": item.get("uri"),
-                "bytes": item.get("bytes"),
-                "content_type": item.get("content_type"),
-            })
+            _append_evidence(
+                post_evidence,
+                {
+                    "packet": item.get("packet"),
+                    "src": item.get("src"),
+                    "dst": item.get("dst"),
+                    "host": item.get("host"),
+                    "uri": item.get("uri"),
+                    "bytes": item.get("bytes"),
+                    "content_type": item.get("content_type"),
+                },
+            )
         _append_detection(
             "info",
             "HTTP POST payloads observed",
@@ -1352,7 +1689,9 @@ def analyze_http(
                 evidence=referrer_https_to_http_evidence,
             )
         if referrer_token_counts:
-            token_artifacts = [token for token, _ in referrer_token_counts.most_common(8)]
+            token_artifacts = [
+                token for token, _ in referrer_token_counts.most_common(8)
+            ]
             _append_detection(
                 "warning",
                 "Potential tokens in HTTP referrers",
@@ -1381,8 +1720,11 @@ def analyze_http(
 
     # 1) HTTP authentication abuse / spray heuristics.
     auth_bruteforce_sources = [
-        src for src, attempts in auth_attempts_by_src.items()
-        if attempts >= 10 and auth_failures_by_client.get(src, 0) >= 5 and (auth_failures_by_client.get(src, 0) / max(attempts, 1)) >= 0.4
+        src
+        for src, attempts in auth_attempts_by_src.items()
+        if attempts >= 10
+        and auth_failures_by_client.get(src, 0) >= 5
+        and (auth_failures_by_client.get(src, 0) / max(attempts, 1)) >= 0.4
     ]
     if auth_bruteforce_sources:
         _append_detection(
@@ -1396,12 +1738,19 @@ def analyze_http(
             artifacts=auth_bruteforce_sources[:10],
         )
 
-    unusual_auth_schemes = [scheme for scheme, count in auth_scheme_counts.items() if scheme and scheme not in COMMON_AUTH_SCHEMES and count >= 2]
+    unusual_auth_schemes = [
+        scheme
+        for scheme, count in auth_scheme_counts.items()
+        if scheme and scheme not in COMMON_AUTH_SCHEMES and count >= 2
+    ]
     if unusual_auth_schemes:
         _append_detection(
             "warning",
             "Unusual HTTP authorization schemes observed",
-            ", ".join(f"{scheme}({auth_scheme_counts.get(scheme, 0)})" for scheme in unusual_auth_schemes[:8]),
+            ", ".join(
+                f"{scheme}({auth_scheme_counts.get(scheme, 0)})"
+                for scheme in unusual_auth_schemes[:8]
+            ),
             evidence=unusual_auth_evidence,
             artifacts=unusual_auth_schemes[:10],
         )
@@ -1412,9 +1761,18 @@ def analyze_http(
         reqs = int(profile.get("requests", 0) or 0)
         sent = int(profile.get("bytes", 0) or 0)
         uri = str(profile.get("uri", "") or "")
-        if reqs >= 3 and (sent >= 1_000_000 or any(key in uri.lower() for key in SUSPICIOUS_UPLOAD_PATH_KEYWORDS)):
+        if reqs >= 3 and (
+            sent >= 1_000_000
+            or any(key in uri.lower() for key in SUSPICIOUS_UPLOAD_PATH_KEYWORDS)
+        ):
             suspicious_upload_profiles.append(profile)
-    suspicious_upload_profiles.sort(key=lambda item: (int(item.get("bytes", 0) or 0), int(item.get("requests", 0) or 0)), reverse=True)
+    suspicious_upload_profiles.sort(
+        key=lambda item: (
+            int(item.get("bytes", 0) or 0),
+            int(item.get("requests", 0) or 0),
+        ),
+        reverse=True,
+    )
     if suspicious_upload_profiles:
         _append_detection(
             "warning",
@@ -1428,7 +1786,9 @@ def analyze_http(
         )
 
     # 3) Web shell/dropper behavior.
-    webshell_uri_hits = [uri for uri, count in suspicious_exec_uri_hits.items() if count >= 2]
+    webshell_uri_hits = [
+        uri for uri, count in suspicious_exec_uri_hits.items() if count >= 2
+    ]
     if webshell_uri_hits:
         _append_detection(
             "warning",
@@ -1439,7 +1799,8 @@ def analyze_http(
         )
 
     script_downloads = [
-        item for item in downloads
+        item
+        for item in downloads
         if str(item.get("filename", "")).lower().endswith(tuple(WEB_SHELL_EXTS))
     ]
     if script_downloads:
@@ -1472,30 +1833,41 @@ def analyze_http(
         mad = _mad(deltas, med)
         periodicity = 1.0 - min(1.0, mad / med) if med > 0 else 0.0
         if med >= 5 and med <= 900 and periodicity >= 0.80:
-            beacon_channels.append({
-                "src": src,
-                "dst": dst,
-                "host": host,
-                "uri": uri,
-                "method": method,
-                "count": len(ts),
-                "median_interval": round(med, 2),
-                "mad_interval": round(mad, 2),
-                "periodicity": round(periodicity, 2),
-            })
-            _append_evidence(beacon_http_evidence, {
-                "src": src,
-                "dst": dst,
-                "host": host,
-                "uri": uri,
-                "method": method,
-                "count": len(ts),
-                "median_interval": round(med, 2),
-                "mad_interval": round(mad, 2),
-                "periodicity": round(periodicity, 2),
-            })
+            beacon_channels.append(
+                {
+                    "src": src,
+                    "dst": dst,
+                    "host": host,
+                    "uri": uri,
+                    "method": method,
+                    "count": len(ts),
+                    "median_interval": round(med, 2),
+                    "mad_interval": round(mad, 2),
+                    "periodicity": round(periodicity, 2),
+                }
+            )
+            _append_evidence(
+                beacon_http_evidence,
+                {
+                    "src": src,
+                    "dst": dst,
+                    "host": host,
+                    "uri": uri,
+                    "method": method,
+                    "count": len(ts),
+                    "median_interval": round(med, 2),
+                    "mad_interval": round(mad, 2),
+                    "periodicity": round(periodicity, 2),
+                },
+            )
     if beacon_channels:
-        beacon_channels.sort(key=lambda row: (float(row.get("periodicity", 0.0) or 0.0), int(row.get("count", 0) or 0)), reverse=True)
+        beacon_channels.sort(
+            key=lambda row: (
+                float(row.get("periodicity", 0.0) or 0.0),
+                int(row.get("count", 0) or 0),
+            ),
+            reverse=True,
+        )
         _append_detection(
             "warning",
             "Periodic HTTP check-in behavior",
@@ -1504,7 +1876,9 @@ def analyze_http(
                 for row in beacon_channels[:6]
             ),
             evidence=beacon_http_evidence,
-            artifacts=[f"{row.get('host')} {row.get('uri')}" for row in beacon_channels[:10]],
+            artifacts=[
+                f"{row.get('host')} {row.get('uri')}" for row in beacon_channels[:10]
+            ],
         )
 
     # 5) High-entropy URI/cookie/token indicators.
@@ -1521,9 +1895,17 @@ def analyze_http(
     if high_churn_hosts or host_header_anomaly_evidence:
         details_bits: list[str] = []
         if high_churn_hosts:
-            details_bits.append("host-to-IP churn: " + ", ".join(f"{host}({len(host_ip_counts.get(host, {}))} IPs)" for host in high_churn_hosts[:6]))
+            details_bits.append(
+                "host-to-IP churn: "
+                + ", ".join(
+                    f"{host}({len(host_ip_counts.get(host, {}))} IPs)"
+                    for host in high_churn_hosts[:6]
+                )
+            )
         if host_header_anomaly_evidence:
-            details_bits.append(f"host header IP mismatch events={len(host_header_anomaly_evidence)}")
+            details_bits.append(
+                f"host header IP mismatch events={len(host_header_anomaly_evidence)}"
+            )
         _append_detection(
             "warning",
             "Host header / destination anomalies",
@@ -1533,7 +1915,14 @@ def analyze_http(
         )
 
     # 7) Method misuse and tunneling patterns.
-    method_misuse_counts = Counter({m: method_counts[m] for m in method_counts if m in {"PUT", "DELETE", "PROPFIND", "OPTIONS", "PATCH", "TRACE", "CONNECT"}})
+    method_misuse_counts = Counter(
+        {
+            m: method_counts[m]
+            for m in method_counts
+            if m
+            in {"PUT", "DELETE", "PROPFIND", "OPTIONS", "PATCH", "TRACE", "CONNECT"}
+        }
+    )
     method_misuse_total = sum(method_misuse_counts.values())
     if method_misuse_total >= 10:
         _append_detection(
@@ -1554,14 +1943,19 @@ def analyze_http(
         )
 
     # 9) Session hijack/token replay heuristics.
-    replay_tokens = [token for token, sources in token_to_sources.items() if len(sources) >= 2]
+    replay_tokens = [
+        token for token, sources in token_to_sources.items() if len(sources) >= 2
+    ]
     if replay_tokens:
         for token in replay_tokens[:MAX_HTTP_DETECTION_EVIDENCE]:
-            _append_evidence(token_replay_evidence, {
-                "token_fp": token,
-                "src": ",".join(sorted(token_to_sources[token])[:5]),
-                "dst": "-",
-            })
+            _append_evidence(
+                token_replay_evidence,
+                {
+                    "token_fp": token,
+                    "src": ",".join(sorted(token_to_sources[token])[:5]),
+                    "dst": "-",
+                },
+            )
         _append_detection(
             "warning",
             "Potential session token replay",
@@ -1577,16 +1971,21 @@ def analyze_http(
         url_count = len(source_to_urls.get(src, set()))
         err_count = int(source_error_responses.get(src, 0) or 0)
         err_ratio = (err_count / max(req_count, 1)) if req_count else 0.0
-        if req_count >= 100 and (host_count >= 20 or url_count >= 80 or err_ratio >= 0.4):
+        if req_count >= 100 and (
+            host_count >= 20 or url_count >= 80 or err_ratio >= 0.4
+        ):
             fanout_sources.append((src, req_count, host_count, url_count, err_ratio))
-            _append_evidence(burst_fanout_evidence, {
-                "src": src,
-                "dst": "-",
-                "requests": req_count,
-                "hosts": host_count,
-                "urls": url_count,
-                "error_ratio": round(err_ratio, 2),
-            })
+            _append_evidence(
+                burst_fanout_evidence,
+                {
+                    "src": src,
+                    "dst": "-",
+                    "requests": req_count,
+                    "hosts": host_count,
+                    "urls": url_count,
+                    "error_ratio": round(err_ratio, 2),
+                },
+            )
     if fanout_sources:
         fanout_sources.sort(key=lambda row: (row[1], row[2], row[3]), reverse=True)
         _append_detection(
@@ -1600,12 +1999,19 @@ def analyze_http(
             artifacts=[src for src, _req, _hosts, _urls, _err in fanout_sources[:10]],
         )
 
-    wide_uri_targets = [uri for uri, targets in uri_to_targets.items() if len(targets) >= 15 and url_counts.get(uri, 0) >= 30]
+    wide_uri_targets = [
+        uri
+        for uri, targets in uri_to_targets.items()
+        if len(targets) >= 15 and url_counts.get(uri, 0) >= 30
+    ]
     if wide_uri_targets:
         _append_detection(
             "info",
             "Single HTTP URI reached many targets",
-            ", ".join(f"{uri}({len(uri_to_targets.get(uri, set()))} targets)" for uri in wide_uri_targets[:6]),
+            ", ".join(
+                f"{uri}({len(uri_to_targets.get(uri, set()))} targets)"
+                for uri in wide_uri_targets[:6]
+            ),
             artifacts=wide_uri_targets[:10],
         )
 
@@ -1628,7 +2034,9 @@ def analyze_http(
                 host_key = host.lower().split(":", 1)[0]
                 if not host_key or _is_internal_host(host_key):
                     continue
-                target_counts[("domain", host_key)] = target_counts.get(("domain", host_key), 0) + int(count)
+                target_counts[("domain", host_key)] = target_counts.get(
+                    ("domain", host_key), 0
+                ) + int(count)
             for url, count in url_counts.items():
                 if not url:
                     continue
@@ -1638,10 +2046,15 @@ def analyze_http(
                     continue
                 if not parsed.hostname:
                     continue
-                target_counts[("url", url)] = target_counts.get(("url", url), 0) + int(count)
+                target_counts[("url", url)] = target_counts.get(("url", url), 0) + int(
+                    count
+                )
 
             ranked_targets = [
-                target for target, _count in sorted(target_counts.items(), key=lambda item: item[1], reverse=True)
+                target
+                for target, _count in sorted(
+                    target_counts.items(), key=lambda item: item[1], reverse=True
+                )
             ]
             vt_findings, vt_errors = _vt_lookup_targets(ranked_targets, api_key)
             errors.extend(vt_errors)
@@ -1656,15 +2069,22 @@ def analyze_http(
                     ),
                     reverse=True,
                 )
-                severity = "warning" if any(
-                    int(item.get("malicious", 0) or 0) > 0 or int(item.get("suspicious", 0) or 0) > 0
-                    for item in vt_findings
-                ) else "info"
-                detections.append({
-                    "severity": severity,
-                    "summary": "VirusTotal URL/Domain reputation",
-                    "vt_findings": vt_findings,
-                })
+                severity = (
+                    "warning"
+                    if any(
+                        int(item.get("malicious", 0) or 0) > 0
+                        or int(item.get("suspicious", 0) or 0) > 0
+                        for item in vt_findings
+                    )
+                    else "info"
+                )
+                detections.append(
+                    {
+                        "severity": severity,
+                        "summary": "VirusTotal URL/Domain reputation",
+                        "vt_findings": vt_findings,
+                    }
+                )
 
                 malicious_targets = [
                     str(item.get("target", "-"))
@@ -1674,7 +2094,8 @@ def analyze_http(
                 suspicious_targets = [
                     str(item.get("target", "-"))
                     for item in vt_findings
-                    if int(item.get("malicious", 0) or 0) == 0 and int(item.get("suspicious", 0) or 0) > 0
+                    if int(item.get("malicious", 0) or 0) == 0
+                    and int(item.get("suspicious", 0) or 0) > 0
                 ]
                 if malicious_targets:
                     _append_detection(

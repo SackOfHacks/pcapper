@@ -1,26 +1,26 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
 import ipaddress
 import os
-from pathlib import Path
 import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterable, Optional
 
 from .arp import analyze_arp
-from .domain import analyze_domain
 from .dhcp import analyze_dhcp
+from .domain import analyze_domain
 from .hostdetails import _infer_operating_system
 from .hostname import analyze_hostname
 from .ips import analyze_ips
 from .ldap import analyze_ldap
 from .netbios import analyze_netbios
 from .pcap_cache import get_reader
+from .progress import run_with_busy_status
 from .services import ServiceAsset, analyze_services
 from .smb import analyze_smb
-from .progress import run_with_busy_status
 
 try:  # pragma: no cover - guarded for environments without scapy
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -131,8 +131,20 @@ def _build_hosts_hunting_context(hosts: list[HostRecord]) -> dict[str, object]:
         bytes_total = int(host.bytes_sent or 0) + int(host.bytes_recv or 0)
         packets_total = int(host.packets_sent or 0) + int(host.packets_recv or 0)
 
-        admin_port_hits = sorted({int(getattr(port, "port", 0) or 0) for port in open_ports if int(getattr(port, "port", 0) or 0) in mgmt_ports})
-        ot_port_hits = sorted({int(getattr(port, "port", 0) or 0) for port in open_ports if int(getattr(port, "port", 0) or 0) in ot_ports})
+        admin_port_hits = sorted(
+            {
+                int(getattr(port, "port", 0) or 0)
+                for port in open_ports
+                if int(getattr(port, "port", 0) or 0) in mgmt_ports
+            }
+        )
+        ot_port_hits = sorted(
+            {
+                int(getattr(port, "port", 0) or 0)
+                for port in open_ports
+                if int(getattr(port, "port", 0) or 0) in ot_ports
+            }
+        )
         risky_service_hits = sorted(
             {
                 str(getattr(port, "service", "") or "").lower()
@@ -204,7 +216,9 @@ def _build_hosts_hunting_context(hosts: list[HostRecord]) -> dict[str, object]:
                 reasons.append("Hostname reused across multiple hosts")
                 break
 
-        if os_guess.lower().startswith("windows") and any(port in {22, 23} for port in admin_port_hits):
+        if os_guess.lower().startswith("windows") and any(
+            port in {22, 23} for port in admin_port_hits
+        ):
             checks["protocol_consistency_mismatch"].append(
                 f"{ip_text} windows-like fingerprint with atypical admin ports {','.join(str(v) for v in admin_port_hits)}"
             )
@@ -221,14 +235,24 @@ def _build_hosts_hunting_context(hosts: list[HostRecord]) -> dict[str, object]:
         duration = None
         if host.first_seen is not None and host.last_seen is not None:
             duration = max(0.0, float(host.last_seen) - float(host.first_seen))
-        if duration is not None and duration >= 900 and packets_total > 0 and (packets_total / max(duration, 1.0)) <= 0.2 and bytes_total >= 100_000:
+        if (
+            duration is not None
+            and duration >= 900
+            and packets_total > 0
+            and (packets_total / max(duration, 1.0)) <= 0.2
+            and bytes_total >= 100_000
+        ):
             checks["beacon_or_periodic_profile"].append(
                 f"{ip_text} low-and-slow persistence profile packets={packets_total} duration={duration:.1f}s"
             )
             score += 1
             reasons.append("Possible low-and-slow periodic communications")
 
-        if ot_port_hits and (admin_port_hits or "workstation" in " ".join(lower_names) or os_guess.lower().startswith("windows")):
+        if ot_port_hits and (
+            admin_port_hits
+            or "workstation" in " ".join(lower_names)
+            or os_guess.lower().startswith("windows")
+        ):
             checks["ot_it_boundary_crossing"].append(
                 f"{ip_text} mixes OT ports {','.join(str(v) for v in ot_port_hits)} with IT admin traits"
             )
@@ -280,13 +304,23 @@ def _build_hosts_hunting_context(hosts: list[HostRecord]) -> dict[str, object]:
                     "host": ip_text,
                     "hostnames": hostnames[:5],
                     "os": os_guess,
-                    "ports": [f"{int(getattr(port, 'port', 0) or 0)}/{str(getattr(port, 'protocol', '-') or '-')}" for port in open_ports[:8]],
+                    "ports": [
+                        f"{int(getattr(port, 'port', 0) or 0)}/{str(getattr(port, 'protocol', '-') or '-')}"
+                        for port in open_ports[:8]
+                    ],
                     "reasons": reasons[:3],
                 }
             )
 
-    host_risk_profiles.sort(key=lambda item: (-int(item.get("score", 0) or 0), str(item.get("host", ""))))
-    lateral_profiles.sort(key=lambda item: (-int(item.get("admin_port_count", 0) or 0), str(item.get("host", ""))))
+    host_risk_profiles.sort(
+        key=lambda item: (-int(item.get("score", 0) or 0), str(item.get("host", "")))
+    )
+    lateral_profiles.sort(
+        key=lambda item: (
+            -int(item.get("admin_port_count", 0) or 0),
+            str(item.get("host", "")),
+        )
+    )
 
     score = 0
     score += 2 if checks["east_west_lateral_fanout"] else 0
@@ -327,47 +361,69 @@ def _build_hosts_hunting_context(hosts: list[HostRecord]) -> dict[str, object]:
         {
             "category": "Role Drift/Impersonation",
             "risk": "High" if checks["host_role_impersonation_or_drift"] else "None",
-            "confidence": "High" if checks["host_role_impersonation_or_drift"] else "Low",
-            "evidence": str(len(checks["host_role_impersonation_or_drift"])) if checks["host_role_impersonation_or_drift"] else "No matching detections",
+            "confidence": "High"
+            if checks["host_role_impersonation_or_drift"]
+            else "Low",
+            "evidence": str(len(checks["host_role_impersonation_or_drift"]))
+            if checks["host_role_impersonation_or_drift"]
+            else "No matching detections",
         },
         {
             "category": "Lateral Fan-out Surface",
             "risk": "High" if checks["east_west_lateral_fanout"] else "None",
             "confidence": "High" if checks["east_west_lateral_fanout"] else "Low",
-            "evidence": str(len(checks["east_west_lateral_fanout"])) if checks["east_west_lateral_fanout"] else "No matching detections",
+            "evidence": str(len(checks["east_west_lateral_fanout"]))
+            if checks["east_west_lateral_fanout"]
+            else "No matching detections",
         },
         {
             "category": "Identity Drift/Collision",
             "risk": "Medium" if checks["identity_drift_or_collision"] else "None",
             "confidence": "Medium" if checks["identity_drift_or_collision"] else "Low",
-            "evidence": str(len(checks["identity_drift_or_collision"])) if checks["identity_drift_or_collision"] else "No matching detections",
+            "evidence": str(len(checks["identity_drift_or_collision"]))
+            if checks["identity_drift_or_collision"]
+            else "No matching detections",
         },
         {
             "category": "Protocol Consistency Mismatch",
             "risk": "Medium" if checks["protocol_consistency_mismatch"] else "None",
-            "confidence": "Medium" if checks["protocol_consistency_mismatch"] else "Low",
-            "evidence": str(len(checks["protocol_consistency_mismatch"])) if checks["protocol_consistency_mismatch"] else "No matching detections",
+            "confidence": "Medium"
+            if checks["protocol_consistency_mismatch"]
+            else "Low",
+            "evidence": str(len(checks["protocol_consistency_mismatch"]))
+            if checks["protocol_consistency_mismatch"]
+            else "No matching detections",
         },
         {
             "category": "OT/IT Boundary Crossing",
             "risk": "Medium" if checks["ot_it_boundary_crossing"] else "None",
             "confidence": "Medium" if checks["ot_it_boundary_crossing"] else "Low",
-            "evidence": str(len(checks["ot_it_boundary_crossing"])) if checks["ot_it_boundary_crossing"] else "No matching detections",
+            "evidence": str(len(checks["ot_it_boundary_crossing"]))
+            if checks["ot_it_boundary_crossing"]
+            else "No matching detections",
         },
     ]
 
     false_positive_context: list[str] = []
     if not checks["east_west_lateral_fanout"]:
-        false_positive_context.append("No broad lateral/admin port fan-out pattern exceeded thresholds")
+        false_positive_context.append(
+            "No broad lateral/admin port fan-out pattern exceeded thresholds"
+        )
     if not checks["identity_drift_or_collision"]:
-        false_positive_context.append("No strong hostname reuse collision detected across host identities")
+        false_positive_context.append(
+            "No strong hostname reuse collision detected across host identities"
+        )
     if checks["service_exposure_risk"] and not checks["protocol_consistency_mismatch"]:
-        false_positive_context.append("Exposed services may reflect expected server roles without identity inconsistency")
+        false_positive_context.append(
+            "Exposed services may reflect expected server roles without identity inconsistency"
+        )
 
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
-        "analyst_reasons": reasons if reasons else ["No high-confidence host risk heuristic crossed threshold"],
+        "analyst_reasons": reasons
+        if reasons
+        else ["No high-confidence host risk heuristic crossed threshold"],
         "deterministic_checks": checks,
         "host_risk_profiles": host_risk_profiles[:40],
         "lateral_movement_profiles": lateral_profiles[:40],
@@ -482,7 +538,7 @@ def _clean_domain_candidate(value: str) -> str:
     text = value.strip().lower().strip(".")
     for prefix in _DOMAIN_PREFIXES:
         if text.startswith(prefix):
-            text = text[len(prefix):]
+            text = text[len(prefix) :]
     while text.startswith("_"):
         text = text[1:]
     text = text.strip(".")
@@ -550,15 +606,27 @@ def _hostname_weight(finding) -> int:
     return weight
 
 
-def _adjust_weight_for_ip(weight: int, ip_value: str, method: str, protocol: str) -> int:
+def _adjust_weight_for_ip(
+    weight: int, ip_value: str, method: str, protocol: str
+) -> int:
     if weight <= 0 or not ip_value:
         return weight
     method_text = method.lower()
     protocol_text = protocol.lower()
-    local_signal = any(token in method_text for token in ("nbns", "netbios", "ntlm", "workstation", "dhcp"))
-    local_signal = local_signal or any(token in protocol_text for token in ("netbios", "smb", "ldap", "kerberos", "domain"))
-    external_signal = any(token in method_text for token in ("http", "host header", "sni", "certificate"))
-    external_signal = external_signal or any(token in protocol_text for token in ("http", "https", "tls"))
+    local_signal = any(
+        token in method_text
+        for token in ("nbns", "netbios", "ntlm", "workstation", "dhcp")
+    )
+    local_signal = local_signal or any(
+        token in protocol_text
+        for token in ("netbios", "smb", "ldap", "kerberos", "domain")
+    )
+    external_signal = any(
+        token in method_text for token in ("http", "host header", "sni", "certificate")
+    )
+    external_signal = external_signal or any(
+        token in protocol_text for token in ("http", "https", "tls")
+    )
 
     if _is_private_ip(ip_value):
         if local_signal:
@@ -593,7 +661,9 @@ def _add_hostname_score(
     scores[ip_value][normalized] += weight
 
 
-def _build_hostname_scores(hostname_summary, netbios_summary, smb_summary) -> dict[str, Counter[str]]:
+def _build_hostname_scores(
+    hostname_summary, netbios_summary, smb_summary
+) -> dict[str, Counter[str]]:
     scores: dict[str, Counter[str]] = defaultdict(Counter)
 
     for finding in getattr(hostname_summary, "findings", []) or []:
@@ -606,12 +676,19 @@ def _build_hostname_scores(hostname_summary, netbios_summary, smb_summary) -> di
         protocol = str(getattr(finding, "protocol", "") or "")
         weight = base_weight * max(1, int(getattr(finding, "count", 1) or 1))
         if mapped_ip and _valid_ip(mapped_ip):
-            _add_hostname_score(scores, mapped_ip, hostname, weight, method=method, protocol=protocol)
+            _add_hostname_score(
+                scores, mapped_ip, hostname, weight, method=method, protocol=protocol
+            )
             continue
-        for fallback_ip in (getattr(finding, "src_ip", ""), getattr(finding, "dst_ip", "")):
+        for fallback_ip in (
+            getattr(finding, "src_ip", ""),
+            getattr(finding, "dst_ip", ""),
+        ):
             ip_text = str(fallback_ip or "")
             if _valid_ip(ip_text):
-                _add_hostname_score(scores, ip_text, hostname, weight, method=method, protocol=protocol)
+                _add_hostname_score(
+                    scores, ip_text, hostname, weight, method=method, protocol=protocol
+                )
 
     for ip_value, host in getattr(netbios_summary, "hosts", {}).items():
         ip_text = str(ip_value or "")
@@ -636,13 +713,27 @@ def _build_hostname_scores(hostname_summary, netbios_summary, smb_summary) -> di
 
         group_name = str(getattr(host, "group_name", "") or "")
         if group_name:
-            _add_hostname_score(scores, ip_text, group_name, 1, method="NETBIOS group", protocol="NETBIOS")
+            _add_hostname_score(
+                scores,
+                ip_text,
+                group_name,
+                1,
+                method="NETBIOS group",
+                protocol="NETBIOS",
+            )
 
     for session in getattr(smb_summary, "sessions", []) or []:
         workstation = str(getattr(session, "workstation", "") or "")
         client_ip = str(getattr(session, "client_ip", "") or "")
         if workstation:
-            _add_hostname_score(scores, client_ip, workstation, 6, method="SMB workstation", protocol="SMB")
+            _add_hostname_score(
+                scores,
+                client_ip,
+                workstation,
+                6,
+                method="SMB workstation",
+                protocol="SMB",
+            )
 
     return scores
 
@@ -753,7 +844,9 @@ def _fingerprint_os_hint(
     return None, 0
 
 
-def _collect_os_fingerprints(path: Path, show_status: bool) -> tuple[dict[str, Counter[str]], dict[str, list[str]]]:
+def _collect_os_fingerprints(
+    path: Path, show_status: bool
+) -> tuple[dict[str, Counter[str]], dict[str, list[str]]]:
     if IP is None and IPv6 is None or TCP is None:
         return {}, {}
 
@@ -762,7 +855,9 @@ def _collect_os_fingerprints(path: Path, show_status: bool) -> tuple[dict[str, C
     per_host = Counter()
     total_samples = 0
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     try:
         for pkt in reader:
             if stream is not None and size_bytes:
@@ -846,12 +941,18 @@ def _collect_os_fingerprints(path: Path, show_status: bool) -> tuple[dict[str, C
     return hints, evidence
 
 
-def _vendor_classes_for_host(ip_value: str, macs: list[str], dhcp_summary) -> Counter[str]:
+def _vendor_classes_for_host(
+    ip_value: str, macs: list[str], dhcp_summary
+) -> Counter[str]:
     vendor_counter: Counter[str] = Counter()
     for mac in macs:
-        vendor_counter.update(getattr(dhcp_summary, "vendor_classes_by_mac", {}).get(mac, Counter()))
+        vendor_counter.update(
+            getattr(dhcp_summary, "vendor_classes_by_mac", {}).get(mac, Counter())
+        )
     if ip_value:
-        vendor_counter.update(getattr(dhcp_summary, "vendor_classes_by_ip", {}).get(ip_value, Counter()))
+        vendor_counter.update(
+            getattr(dhcp_summary, "vendor_classes_by_ip", {}).get(ip_value, Counter())
+        )
     return vendor_counter
 
 
@@ -888,10 +989,15 @@ def analyze_hosts(path: Path, show_status: bool = True) -> HostSummary:
     errors: list[str] = []
 
     ips_summary = analyze_ips(path, show_status=show_status)
-    def _busy(desc: str, func, *args, **kwargs):
-        return run_with_busy_status(path, show_status, f"Hosts: {desc}", func, *args, **kwargs)
 
-    hostname_summary = _busy("Hostnames", analyze_hostname, path, None, show_status=False)
+    def _busy(desc: str, func, *args, **kwargs):
+        return run_with_busy_status(
+            path, show_status, f"Hosts: {desc}", func, *args, **kwargs
+        )
+
+    hostname_summary = _busy(
+        "Hostnames", analyze_hostname, path, None, show_status=False
+    )
     services_summary = _busy("Services", analyze_services, path, show_status=False)
     arp_summary = _busy("ARP", analyze_arp, path, show_status=False)
     dhcp_summary = _busy("DHCP", analyze_dhcp, path, show_status=False)
@@ -899,7 +1005,9 @@ def analyze_hosts(path: Path, show_status: bool = True) -> HostSummary:
     ldap_summary = _busy("LDAP", analyze_ldap, path, show_status=False)
     netbios_summary = _busy("NetBIOS", analyze_netbios, path, show_status=False)
     smb_summary = _busy("SMB", analyze_smb, path, show_status=False)
-    fp_hints, fp_evidence = _busy("TCP fingerprints", _collect_os_fingerprints, path, show_status=False)
+    fp_hints, fp_evidence = _busy(
+        "TCP fingerprints", _collect_os_fingerprints, path, show_status=False
+    )
 
     errors.extend(getattr(ips_summary, "errors", []) or [])
     errors.extend(getattr(hostname_summary, "errors", []) or [])
@@ -933,7 +1041,10 @@ def analyze_hosts(path: Path, show_status: bool = True) -> HostSummary:
             if _valid_ip(ip_text):
                 host_ips.add(ip_text)
     for session in getattr(dhcp_summary, "sessions", []) or []:
-        for ip_value in (getattr(session, "client_ip", ""), getattr(session, "server_ip", "")):
+        for ip_value in (
+            getattr(session, "client_ip", ""),
+            getattr(session, "server_ip", ""),
+        ):
             ip_text = str(ip_value or "")
             if _valid_ip(ip_text):
                 host_ips.add(ip_text)
@@ -942,14 +1053,25 @@ def analyze_hosts(path: Path, show_status: bool = True) -> HostSummary:
         if _valid_ip(ip_text):
             host_ips.add(ip_text)
     for session in getattr(smb_summary, "sessions", []) or []:
-        for ip_value in (getattr(session, "client_ip", ""), getattr(session, "server_ip", "")):
+        for ip_value in (
+            getattr(session, "client_ip", ""),
+            getattr(session, "server_ip", ""),
+        ):
             ip_text = str(ip_value or "")
             if _valid_ip(ip_text):
                 host_ips.add(ip_text)
 
-    endpoints_by_ip = {str(ep.ip): ep for ep in getattr(ips_summary, "endpoints", []) or [] if _valid_ip(str(ep.ip))}
-    hostname_scores = _build_hostname_scores(hostname_summary, netbios_summary, smb_summary)
-    suffixes = _collect_domain_suffixes(domain_summary, ldap_summary, dhcp_summary, hostname_scores)
+    endpoints_by_ip = {
+        str(ep.ip): ep
+        for ep in getattr(ips_summary, "endpoints", []) or []
+        if _valid_ip(str(ep.ip))
+    }
+    hostname_scores = _build_hostname_scores(
+        hostname_summary, netbios_summary, smb_summary
+    )
+    suffixes = _collect_domain_suffixes(
+        domain_summary, ldap_summary, dhcp_summary, hostname_scores
+    )
     _apply_domain_suffixes(hostname_scores, suffixes)
     services_by_ip = _build_services(services_summary)
     macs_by_ip = _build_macs(ips_summary, arp_summary, dhcp_summary)
@@ -972,7 +1094,10 @@ def analyze_hosts(path: Path, show_status: bool = True) -> HostSummary:
         mac_counts = macs_by_ip.get(ip_value, Counter())
         macs = [mac for mac, _count in mac_counts.most_common()] if mac_counts else []
 
-        raw_names = [name for name, _score in hostname_scores.get(ip_value, Counter()).most_common()]
+        raw_names = [
+            name
+            for name, _score in hostname_scores.get(ip_value, Counter()).most_common()
+        ]
         hostnames: list[str] = []
         for name in raw_names:
             if not _is_reasonable_hostname(name):
@@ -1020,7 +1145,10 @@ def analyze_hosts(path: Path, show_status: bool = True) -> HostSummary:
         )
 
     hosts.sort(
-        key=lambda host: (host.bytes_sent + host.bytes_recv, host.packets_sent + host.packets_recv),
+        key=lambda host: (
+            host.bytes_sent + host.bytes_recv,
+            host.packets_sent + host.packets_recv,
+        ),
         reverse=True,
     )
 
@@ -1032,19 +1160,31 @@ def analyze_hosts(path: Path, show_status: bool = True) -> HostSummary:
         hosts=hosts,
         analyst_verdict=str(context.get("analyst_verdict", "")),
         analyst_confidence=str(context.get("analyst_confidence", "low")),
-        analyst_reasons=[str(v) for v in list(context.get("analyst_reasons", []) or [])],
+        analyst_reasons=[
+            str(v) for v in list(context.get("analyst_reasons", []) or [])
+        ],
         deterministic_checks={
             str(key): [str(v) for v in list(values or [])]
-            for key, values in dict(context.get("deterministic_checks", {}) or {}).items()
+            for key, values in dict(
+                context.get("deterministic_checks", {}) or {}
+            ).items()
         },
         host_risk_profiles=list(context.get("host_risk_profiles", []) or []),
-        lateral_movement_profiles=list(context.get("lateral_movement_profiles", []) or []),
+        lateral_movement_profiles=list(
+            context.get("lateral_movement_profiles", []) or []
+        ),
         role_drift_profiles=list(context.get("role_drift_profiles", []) or []),
         identity_drift_profiles=list(context.get("identity_drift_profiles", []) or []),
         incident_clusters=list(context.get("incident_clusters", []) or []),
         investigation_pivots=list(context.get("investigation_pivots", []) or []),
-        risk_matrix=[dict(item) for item in list(context.get("risk_matrix", []) or []) if isinstance(item, dict)],
-        false_positive_context=[str(v) for v in list(context.get("false_positive_context", []) or [])],
+        risk_matrix=[
+            dict(item)
+            for item in list(context.get("risk_matrix", []) or [])
+            if isinstance(item, dict)
+        ],
+        false_positive_context=[
+            str(v) for v in list(context.get("false_positive_context", []) or [])
+        ],
         errors=sorted({err for err in errors if err}),
     )
 
@@ -1108,7 +1248,9 @@ def merge_hosts_summaries(summaries: Iterable[HostSummary]) -> HostSummary:
     for ip_value, entry in host_map.items():
         os_counts: Counter[str] = entry["os_counts"]
         os_selection = [
-            (name, count) for name, count in os_counts.items() if name and name.lower() != "unknown"
+            (name, count)
+            for name, count in os_counts.items()
+            if name and name.lower() != "unknown"
         ]
         if os_selection:
             os_name = max(os_selection, key=lambda item: item[1])[0]
@@ -1138,7 +1280,10 @@ def merge_hosts_summaries(summaries: Iterable[HostSummary]) -> HostSummary:
         )
 
     merged_hosts.sort(
-        key=lambda host: (host.bytes_sent + host.bytes_recv, host.packets_sent + host.packets_recv),
+        key=lambda host: (
+            host.bytes_sent + host.bytes_recv,
+            host.packets_sent + host.packets_recv,
+        ),
         reverse=True,
     )
 
@@ -1150,18 +1295,30 @@ def merge_hosts_summaries(summaries: Iterable[HostSummary]) -> HostSummary:
         hosts=merged_hosts,
         analyst_verdict=str(context.get("analyst_verdict", "")),
         analyst_confidence=str(context.get("analyst_confidence", "low")),
-        analyst_reasons=[str(v) for v in list(context.get("analyst_reasons", []) or [])],
+        analyst_reasons=[
+            str(v) for v in list(context.get("analyst_reasons", []) or [])
+        ],
         deterministic_checks={
             str(key): [str(v) for v in list(values or [])]
-            for key, values in dict(context.get("deterministic_checks", {}) or {}).items()
+            for key, values in dict(
+                context.get("deterministic_checks", {}) or {}
+            ).items()
         },
         host_risk_profiles=list(context.get("host_risk_profiles", []) or []),
-        lateral_movement_profiles=list(context.get("lateral_movement_profiles", []) or []),
+        lateral_movement_profiles=list(
+            context.get("lateral_movement_profiles", []) or []
+        ),
         role_drift_profiles=list(context.get("role_drift_profiles", []) or []),
         identity_drift_profiles=list(context.get("identity_drift_profiles", []) or []),
         incident_clusters=list(context.get("incident_clusters", []) or []),
         investigation_pivots=list(context.get("investigation_pivots", []) or []),
-        risk_matrix=[dict(item) for item in list(context.get("risk_matrix", []) or []) if isinstance(item, dict)],
-        false_positive_context=[str(v) for v in list(context.get("false_positive_context", []) or [])],
+        risk_matrix=[
+            dict(item)
+            for item in list(context.get("risk_matrix", []) or [])
+            if isinstance(item, dict)
+        ],
+        false_positive_context=[
+            str(v) for v in list(context.get("false_positive_context", []) or [])
+        ],
         errors=sorted(err for err in error_set if err),
     )

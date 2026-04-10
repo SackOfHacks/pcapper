@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
-import hashlib
 
 
 @dataclass(frozen=True)
@@ -63,7 +63,9 @@ def build_case_metadata(
                 {
                     "path": str(item),
                     "size_bytes": int(stat.st_size),
-                    "modified_time": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                    "modified_time": datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).isoformat(),
                     "sha256": _hash_file(item),
                 }
             )

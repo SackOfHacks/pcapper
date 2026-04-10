@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import re
-import base64
-import hashlib
 
+from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
 from .utils import safe_float
-from .device_detection import device_fingerprints_from_text
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -493,9 +493,17 @@ def merge_ssh_summaries(
         total_sessions += summary.total_sessions
 
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         client_counts.update(summary.client_counts)
         server_counts.update(summary.server_counts)
@@ -623,6 +631,7 @@ def merge_ssh_summaries(
         analysis_notes=analysis_notes,
     )
 
+
 @dataclass
 class _SessionState:
     client_ip: str
@@ -659,7 +668,7 @@ def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
     if avg <= 0:
         return None
     variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
+    stddev = variance**0.5
     if avg < 5 or avg > 86400:
         return None
     if stddev > max(5.0, avg * 0.25):
@@ -667,7 +676,9 @@ def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
     return {"avg": avg, "stddev": stddev}
 
 
-def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
+def _extract_ascii_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
     results: list[str] = []
     if not data:
         return results
@@ -702,7 +713,9 @@ def _software_from_version(version: str | None) -> Optional[str]:
     return parts[2]
 
 
-def _direction(src_ip: str, dst_ip: str, sport: int, dport: int) -> tuple[str, str, int, int]:
+def _direction(
+    src_ip: str, dst_ip: str, sport: int, dport: int
+) -> tuple[str, str, int, int]:
     if dport in SSH_PORTS:
         return src_ip, dst_ip, sport, dport
     if sport in SSH_PORTS:
@@ -721,7 +734,7 @@ def _parse_ssh_messages(payload: bytes) -> list[tuple[int, Optional[int], bytes]
     idx = 0
     max_len = len(payload)
     while idx + 6 <= max_len:
-        pkt_len = int.from_bytes(payload[idx:idx + 4], "big")
+        pkt_len = int.from_bytes(payload[idx : idx + 4], "big")
         if pkt_len < 1 or pkt_len > 35000:
             break
         if idx + 4 + pkt_len > max_len:
@@ -736,8 +749,8 @@ def _parse_ssh_messages(payload: bytes) -> list[tuple[int, Optional[int], bytes]
         msg_type = payload[msg_offset]
         reason: Optional[int] = None
         if msg_type == 1 and msg_offset + 5 <= max_len:
-            reason = int.from_bytes(payload[msg_offset + 1:msg_offset + 5], "big")
-        msg_payload = payload[msg_offset:msg_offset + msg_len]
+            reason = int.from_bytes(payload[msg_offset + 1 : msg_offset + 5], "big")
+        msg_payload = payload[msg_offset : msg_offset + msg_len]
         messages.append((msg_type, reason, msg_payload))
         idx += 4 + pkt_len
     return messages
@@ -746,7 +759,7 @@ def _parse_ssh_messages(payload: bytes) -> list[tuple[int, Optional[int], bytes]
 def _read_uint32(data: bytes, offset: int) -> tuple[Optional[int], int]:
     if offset + 4 > len(data):
         return None, offset
-    value = int.from_bytes(data[offset:offset + 4], "big")
+    value = int.from_bytes(data[offset : offset + 4], "big")
     return value, offset + 4
 
 
@@ -756,7 +769,7 @@ def _read_string(data: bytes, offset: int) -> tuple[Optional[bytes], int]:
         return None, offset
     if length < 0 or offset + length > len(data):
         return None, offset
-    return data[offset:offset + length], offset + length
+    return data[offset : offset + length], offset + length
 
 
 def _parse_kexinit(msg_payload: bytes) -> Optional[dict[str, list[str]]]:
@@ -806,7 +819,9 @@ def _hassh_from_kex(kex: dict[str, list[str]], *, server: bool) -> tuple[str, st
     return hassh, hassh_str
 
 
-def _parse_hostkey_fingerprint(msg_payload: bytes) -> tuple[Optional[str], Optional[str]]:
+def _parse_hostkey_fingerprint(
+    msg_payload: bytes,
+) -> tuple[Optional[str], Optional[str]]:
     if not msg_payload or msg_payload[0] != 31:
         return None, None
     offset = 1
@@ -853,7 +868,9 @@ def _parse_channel_data(msg_payload: bytes) -> Optional[bytes]:
     return None
 
 
-def _parse_decrypted_ssh_messages(payload: bytes) -> list[tuple[int, Optional[int], bytes]]:
+def _parse_decrypted_ssh_messages(
+    payload: bytes,
+) -> list[tuple[int, Optional[int], bytes]]:
     messages = _parse_ssh_messages(payload)
     if messages:
         return messages
@@ -907,7 +924,9 @@ def _find_decrypted_payload(
     if isinstance(meta, dict):
         candidate = meta.get("ssh_decrypted") or meta.get("ssh_decrypted_packets")
     else:
-        candidate = getattr(meta, "ssh_decrypted", None) or getattr(meta, "ssh_decrypted_packets", None)
+        candidate = getattr(meta, "ssh_decrypted", None) or getattr(
+            meta, "ssh_decrypted_packets", None
+        )
     if isinstance(candidate, dict):
         payload = _coerce_decrypted_payload(candidate.get(pkt_index))
         if payload:
@@ -918,6 +937,7 @@ def _find_decrypted_payload(
             if payload:
                 return payload, "meta"
     return None, None
+
 
 def _scan_algorithms(text: str, counters: dict[str, Counter[str]]) -> None:
     if not text:
@@ -973,7 +993,9 @@ def analyze_ssh(
 ) -> SshSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
-        errors.append("Scapy IP/TCP layers unavailable; install scapy for SSH analysis.")
+        errors.append(
+            "Scapy IP/TCP layers unavailable; install scapy for SSH analysis."
+        )
         return SshSummary(
             path=path,
             total_packets=0,
@@ -1335,14 +1357,16 @@ def analyze_ssh(
                             )
                             if key not in auth_evidence_seen:
                                 auth_evidence_seen.add(key)
-                                auth_evidence.append({
-                                    "client_ip": client_ip,
-                                    "server_ip": server_ip,
-                                    "client_port": session.client_port,
-                                    "server_port": session.server_port,
-                                    "username": username,
-                                    "method": method or "-",
-                                })
+                                auth_evidence.append(
+                                    {
+                                        "client_ip": client_ip,
+                                        "server_ip": server_ip,
+                                        "client_port": session.client_port,
+                                        "server_port": session.server_port,
+                                        "username": username,
+                                        "method": method or "-",
+                                    }
+                                )
                     if src_ip == client_ip:
                         client_message_types[name] += 1
                         if name in REQUEST_TYPES:
@@ -1360,20 +1384,39 @@ def analyze_ssh(
                     if msg_type == 50 and src_ip == client_ip and decrypted_active:
                         auth_attempts_by_client[client_ip] += 1
                     if msg_type == 1 and reason is not None:
-                        disconnect_reasons[SSH_DISCONNECT_REASONS.get(reason, f"Reason {reason}")] += 1
+                        disconnect_reasons[
+                            SSH_DISCONNECT_REASONS.get(reason, f"Reason {reason}")
+                        ] += 1
                     if msg_type == 21:
                         session.saw_newkeys = True
                         break
 
-            if text and not session.saw_newkeys and (session.saw_banner or session.saw_kexinit) and not kex_parsed:
+            if (
+                text
+                and not session.saw_newkeys
+                and (session.saw_banner or session.saw_kexinit)
+                and not kex_parsed
+            ):
                 _scan_algorithms(text, algo_counters)
             if payload and not session.saw_newkeys and session.saw_banner:
-                _scan_plaintext(payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts)
+                _scan_plaintext(
+                    payload,
+                    plaintext_strings,
+                    suspicious_plaintext,
+                    file_artifacts,
+                    artifacts,
+                )
             if decrypted_active:
                 for msg_type, _reason, msg_payload in parsed_messages:
                     data = _parse_channel_data(msg_payload)
                     if data:
-                        _scan_plaintext(data, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts)
+                        _scan_plaintext(
+                            data,
+                            plaintext_strings,
+                            suspicious_plaintext,
+                            file_artifacts,
+                            artifacts,
+                        )
 
     except Exception as exc:
         errors.append(str(exc))
@@ -1386,16 +1429,24 @@ def analyze_ssh(
         duration_seconds = max(0.0, last_seen - first_seen)
 
     for version, count in client_versions.items():
-        for detail in device_fingerprints_from_text(version, source="SSH client banner"):
+        for detail in device_fingerprints_from_text(
+            version, source="SSH client banner"
+        ):
             device_fingerprints[detail] += count
     for version, count in server_versions.items():
-        for detail in device_fingerprints_from_text(version, source="SSH server banner"):
+        for detail in device_fingerprints_from_text(
+            version, source="SSH server banner"
+        ):
             device_fingerprints[detail] += count
     for software, count in client_software.items():
-        for detail in device_fingerprints_from_text(software, source="SSH client software"):
+        for detail in device_fingerprints_from_text(
+            software, source="SSH client software"
+        ):
             device_fingerprints[detail] += count
     for software, count in server_software.items():
-        for detail in device_fingerprints_from_text(software, source="SSH server software"):
+        for detail in device_fingerprints_from_text(
+            software, source="SSH server software"
+        ):
             device_fingerprints[detail] += count
 
     conversations: list[SshConversation] = []
@@ -1427,83 +1478,109 @@ def analyze_ssh(
             short_session_by_client[session.client_ip] += 1
             short_session_targets[session.client_ip].add(session.server_ip)
         if session.first_seen is not None:
-            pair_first_seen[(session.client_ip, session.server_ip)].append(session.first_seen)
+            pair_first_seen[(session.client_ip, session.server_ip)].append(
+                session.first_seen
+            )
 
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
     non_standard_ports = [port for port in server_ports if port not in SSH_PORTS]
     if non_standard_ports:
-        detections.append({
-            "severity": "info",
-            "summary": "SSH observed on non-standard ports",
-            "details": ", ".join(str(port) for port in sorted(non_standard_ports)),
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "SSH observed on non-standard ports",
+                "details": ", ".join(str(port) for port in sorted(non_standard_ports)),
+            }
+        )
 
     legacy_versions = [
-        v for v in list(client_versions.keys()) + list(server_versions.keys())
+        v
+        for v in list(client_versions.keys()) + list(server_versions.keys())
         if v.startswith("SSH-1.") or v.startswith("SSH-1.99")
     ]
     if legacy_versions:
-        detections.append({
-            "severity": "warning",
-            "summary": "Legacy SSH protocol versions observed",
-            "details": ", ".join(sorted(set(legacy_versions))),
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Legacy SSH protocol versions observed",
+                "details": ", ".join(sorted(set(legacy_versions))),
+            }
+        )
 
     weak_algos = [algo for algo in algo_counters["kex"] if algo in WEAK_ALGOS]
     weak_algos += [algo for algo in algo_counters["cipher"] if algo in WEAK_ALGOS]
     weak_algos += [algo for algo in algo_counters["mac"] if algo in WEAK_ALGOS]
     weak_algos += [algo for algo in algo_counters["hostkey"] if algo in WEAK_ALGOS]
     if weak_algos:
-        detections.append({
-            "severity": "warning",
-            "summary": "Weak SSH algorithms observed",
-            "details": ", ".join(sorted(set(weak_algos))),
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Weak SSH algorithms observed",
+                "details": ", ".join(sorted(set(weak_algos))),
+            }
+        )
 
-    if suspicious_plaintext and (algo_counters["auth"] or auth_usernames or decrypted_sources):
-        detections.append({
-            "severity": "warning",
-            "summary": "Suspicious plaintext strings observed in SSH payloads",
-            "details": "Potential credentials, keys, or tooling references in cleartext.",
-        })
+    if suspicious_plaintext and (
+        algo_counters["auth"] or auth_usernames or decrypted_sources
+    ):
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Suspicious plaintext strings observed in SSH payloads",
+                "details": "Potential credentials, keys, or tooling references in cleartext.",
+            }
+        )
 
     for (client_ip, server_ip), count in short_session_counts.items():
         if count >= 20:
-            anomalies.append({
-                "title": "Potential brute force or scanning",
-                "details": f"{client_ip} -> {server_ip} short sessions: {count}",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential brute force or scanning",
+                    "details": f"{client_ip} -> {server_ip} short sessions: {count}",
+                }
+            )
 
     for client_ip, count in short_session_by_client.items():
         targets = short_session_targets.get(client_ip, set())
         if count >= 30 and len(targets) >= 10:
-            anomalies.append({
-                "title": "Potential SSH scanning",
-                "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential SSH scanning",
+                    "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
+                }
+            )
 
     for client_ip, failures in auth_failures_by_client.items():
         successes = auth_successes_by_client.get(client_ip, 0)
         if failures >= 25 and successes == 0:
-            detections.append({
-                "severity": "warning",
-                "summary": "Possible SSH brute force",
-                "details": f"{client_ip} auth failures: {failures}",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Possible SSH brute force",
+                    "details": f"{client_ip} auth failures: {failures}",
+                }
+            )
         elif failures >= 50 and successes > 0:
-            detections.append({
-                "severity": "warning",
-                "summary": "Possible password spraying",
-                "details": f"{client_ip} auth failures: {failures}, successes: {successes}",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Possible password spraying",
+                    "details": f"{client_ip} auth failures: {failures}, successes: {successes}",
+                }
+            )
 
     if disconnect_reasons:
-        anomalies.append({
-            "title": "SSH disconnects observed",
-            "details": ", ".join(f"{reason}({count})" for reason, count in disconnect_reasons.most_common(5)),
-        })
+        anomalies.append(
+            {
+                "title": "SSH disconnects observed",
+                "details": ", ".join(
+                    f"{reason}({count})"
+                    for reason, count in disconnect_reasons.most_common(5)
+                ),
+            }
+        )
 
     if decrypted_sources:
         source_text = ", ".join(sorted(decrypted_sources))
@@ -1512,29 +1589,38 @@ def analyze_ssh(
     for (client_ip, server_ip), times in pair_first_seen.items():
         score = _beaconing_score(times)
         if score:
-            detections.append({
-                "severity": "info",
-                "summary": "Potential SSH beaconing",
-                "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
-            })
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "Potential SSH beaconing",
+                    "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
+                }
+            )
 
     for session in sessions.values():
-        if session.client_bytes >= 50 * 1024 * 1024 and session.client_bytes > session.server_bytes * 3:
-            detections.append({
-                "severity": "warning",
-                "summary": "Potential SSH data exfiltration",
-                "details": (
-                    f"{session.client_ip} -> {session.server_ip} "
-                    f"outbound {session.client_bytes / (1024 * 1024):.1f} MB"
-                ),
-            })
+        if (
+            session.client_bytes >= 50 * 1024 * 1024
+            and session.client_bytes > session.server_bytes * 3
+        ):
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Potential SSH data exfiltration",
+                    "details": (
+                        f"{session.client_ip} -> {session.server_ip} "
+                        f"outbound {session.client_bytes / (1024 * 1024):.1f} MB"
+                    ),
+                }
+            )
         if session.last_seen is not None and session.first_seen is not None:
             duration = session.last_seen - session.first_seen
             if duration >= 4 * 3600:
-                anomalies.append({
-                    "title": "Long-lived SSH session",
-                    "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
-                })
+                anomalies.append(
+                    {
+                        "title": "Long-lived SSH session",
+                        "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
+                    }
+                )
 
     total_sessions = len(conversations)
 

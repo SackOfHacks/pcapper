@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import ipaddress
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
-from collections import Counter, defaultdict
-import ipaddress
 
 from .hosts import HostSummary
 from .services import ServiceSummary
@@ -73,7 +73,9 @@ def correlate(
     service_counts = Counter({svc: len(pcaps) for svc, pcaps in service_map.items()})
 
     detections: list[dict[str, object]] = []
-    public_reused = [ip for ip, count in host_counts.items() if count >= min_count and _is_public(ip)]
+    public_reused = [
+        ip for ip, count in host_counts.items() if count >= min_count and _is_public(ip)
+    ]
     if public_reused:
         detections.append(
             {
@@ -84,7 +86,9 @@ def correlate(
             }
         )
 
-    repeated_services = [svc for svc, count in service_counts.items() if count >= min_count]
+    repeated_services = [
+        svc for svc, count in service_counts.items() if count >= min_count
+    ]
     if repeated_services:
         detections.append(
             {

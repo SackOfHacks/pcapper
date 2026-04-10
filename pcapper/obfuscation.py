@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import base64
+import math
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import base64
-import math
-import re
 from urllib.parse import urlparse
 
 from .pcap_cache import get_reader
@@ -34,8 +34,19 @@ ENTROPY_HIGH = 7.2
 PRINTABLE_MIN_RATIO = 0.4
 
 ENCRYPTED_PORTS = {
-    22, 443, 465, 853, 993, 995, 1194, 1701, 1723, 3389,
-    8443, 8883, 9443,
+    22,
+    443,
+    465,
+    853,
+    993,
+    995,
+    1194,
+    1701,
+    1723,
+    3389,
+    8443,
+    8883,
+    9443,
 }
 
 DNS_PORTS = {53}
@@ -46,20 +57,57 @@ HEX_RE = re.compile(r"[0-9A-Fa-f]{80,}")
 
 URL_RE = re.compile(r"(?i)\bhttps?://[^\s\"'<>]{6,}")
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-DOMAIN_RE = re.compile(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b")
+DOMAIN_RE = re.compile(
+    r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b"
+)
 EMAIL_RE = re.compile(r"(?i)\b[a-z0-9._%+-]{1,64}@[a-z0-9.-]+\.[a-z]{2,63}\b")
 HASH_RE = re.compile(r"\b[A-Fa-f0-9]{32,64}\b")
 
 ATTACK_MARKERS: list[tuple[re.Pattern[str], str, str]] = [
-    (re.compile(r"(?i)powershell(?:\.exe)?\s+-e(?:n(?:c(?:odedcommand)?)?)?\b|frombase64string"), "T1059.001", "PowerShell Encoded Command"),
-    (re.compile(r"(?i)\bcmd(?:\.exe)?\b|/bin/(?:sh|bash)\b"), "T1059", "Command Shell Invocation"),
-    (re.compile(r"(?i)invoke-webrequest|downloadstring|new-object\s+net\.webclient|curl\s+https?://|wget\s+https?://"), "T1105", "Ingress Tool Transfer"),
-    (re.compile(r"(?i)\b(certutil|bitsadmin|mshta|rundll32|regsvr32|wmic)\b"), "T1218", "Signed Binary Proxy Execution"),
-    (re.compile(r"(?i)\bmimikatz|sekurlsa|lsass\b"), "T1003", "Credential Dumping Indicators"),
-    (re.compile(r"(?i)\bstratum\+tcp://|xmrig|minerd\b"), "T1496", "Resource Hijacking / Mining"),
+    (
+        re.compile(
+            r"(?i)powershell(?:\.exe)?\s+-e(?:n(?:c(?:odedcommand)?)?)?\b|frombase64string"
+        ),
+        "T1059.001",
+        "PowerShell Encoded Command",
+    ),
+    (
+        re.compile(r"(?i)\bcmd(?:\.exe)?\b|/bin/(?:sh|bash)\b"),
+        "T1059",
+        "Command Shell Invocation",
+    ),
+    (
+        re.compile(
+            r"(?i)invoke-webrequest|downloadstring|new-object\s+net\.webclient|curl\s+https?://|wget\s+https?://"
+        ),
+        "T1105",
+        "Ingress Tool Transfer",
+    ),
+    (
+        re.compile(r"(?i)\b(certutil|bitsadmin|mshta|rundll32|regsvr32|wmic)\b"),
+        "T1218",
+        "Signed Binary Proxy Execution",
+    ),
+    (
+        re.compile(r"(?i)\bmimikatz|sekurlsa|lsass\b"),
+        "T1003",
+        "Credential Dumping Indicators",
+    ),
+    (
+        re.compile(r"(?i)\bstratum\+tcp://|xmrig|minerd\b"),
+        "T1496",
+        "Resource Hijacking / Mining",
+    ),
 ]
 
-INTERNAL_DOMAIN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".corp", ".intranet")
+INTERNAL_DOMAIN_SUFFIXES = (
+    ".local",
+    ".lan",
+    ".home",
+    ".internal",
+    ".corp",
+    ".intranet",
+)
 
 
 @dataclass(frozen=True)
@@ -218,7 +266,9 @@ def _service_port(src_port: Optional[int], dst_port: Optional[int]) -> Optional[
     return dst_port or src_port
 
 
-def _flow_id(proto: str, src: str, src_port: Optional[int], dst: str, dst_port: Optional[int]) -> str:
+def _flow_id(
+    proto: str, src: str, src_port: Optional[int], dst: str, dst_port: Optional[int]
+) -> str:
     src_label = f"{src}:{src_port}" if src_port else src
     dst_label = f"{dst}:{dst_port}" if dst_port else dst
     return f"{proto} {src_label} -> {dst_label}"
@@ -597,8 +647,12 @@ def _extract_decoded_artifacts(
         )
 
 
-def _port_attack_signal(src_port: Optional[int], dst_port: Optional[int]) -> tuple[str, str] | None:
-    ports = {int(port) for port in (src_port, dst_port) if isinstance(port, int) and port > 0}
+def _port_attack_signal(
+    src_port: Optional[int], dst_port: Optional[int]
+) -> tuple[str, str] | None:
+    ports = {
+        int(port) for port in (src_port, dst_port) if isinstance(port, int) and port > 0
+    }
     if ports & DNS_PORTS:
         return "T1071.004", "DNS Application Layer Protocol"
     if ports & WEB_TUNNEL_PORTS:
@@ -606,7 +660,9 @@ def _port_attack_signal(src_port: Optional[int], dst_port: Optional[int]) -> tup
     return None
 
 
-def merge_obfuscation_summaries(summaries: list[ObfuscationSummary]) -> ObfuscationSummary:
+def merge_obfuscation_summaries(
+    summaries: list[ObfuscationSummary],
+) -> ObfuscationSummary:
     if not summaries:
         return _empty_summary(Path("ALL_PCAPS"))
 
@@ -640,9 +696,17 @@ def merge_obfuscation_summaries(summaries: list[ObfuscationSummary]) -> Obfuscat
         suspicious_packets += summary.suspicious_packets
         suspicious_payload_bytes += summary.suspicious_payload_bytes
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         high_entropy_hits.extend(summary.high_entropy_hits)
         base64_hits.extend(summary.base64_hits)
@@ -665,19 +729,30 @@ def merge_obfuscation_summaries(summaries: list[ObfuscationSummary]) -> Obfuscat
             packets = existing.packets + session.packets
             payload_bytes = existing.payload_bytes + session.payload_bytes
             suspicious_pkts = existing.suspicious_packets + session.suspicious_packets
-            suspicious_bytes = existing.suspicious_payload_bytes + session.suspicious_payload_bytes
+            suspicious_bytes = (
+                existing.suspicious_payload_bytes + session.suspicious_payload_bytes
+            )
             first_val = existing.first_seen
             if session.first_seen is not None:
-                first_val = session.first_seen if first_val is None else min(first_val, session.first_seen)
+                first_val = (
+                    session.first_seen
+                    if first_val is None
+                    else min(first_val, session.first_seen)
+                )
             last_val = existing.last_seen
             if session.last_seen is not None:
-                last_val = session.last_seen if last_val is None else max(last_val, session.last_seen)
+                last_val = (
+                    session.last_seen
+                    if last_val is None
+                    else max(last_val, session.last_seen)
+                )
             duration = None
             if first_val is not None and last_val is not None:
                 duration = max(0.0, last_val - first_val)
             if packets > 0:
                 avg_entropy = (
-                    (existing.avg_entropy * existing.packets) + (session.avg_entropy * session.packets)
+                    (existing.avg_entropy * existing.packets)
+                    + (session.avg_entropy * session.packets)
                 ) / packets
             else:
                 avg_entropy = max(existing.avg_entropy, session.avg_entropy)
@@ -692,7 +767,8 @@ def merge_obfuscation_summaries(summaries: list[ObfuscationSummary]) -> Obfuscat
                 payload_bytes=payload_bytes,
                 suspicious_packets=suspicious_pkts,
                 suspicious_payload_bytes=suspicious_bytes,
-                high_entropy_hits=existing.high_entropy_hits + session.high_entropy_hits,
+                high_entropy_hits=existing.high_entropy_hits
+                + session.high_entropy_hits,
                 base64_hits=existing.base64_hits + session.base64_hits,
                 hex_hits=existing.hex_hits + session.hex_hits,
                 first_seen=first_val,
@@ -720,10 +796,16 @@ def merge_obfuscation_summaries(summaries: list[ObfuscationSummary]) -> Obfuscat
 
     session_stats = sorted(
         session_map.values(),
-        key=lambda item: (item.suspicious_packets, item.suspicious_payload_bytes, item.max_entropy),
+        key=lambda item: (
+            item.suspicious_packets,
+            item.suspicious_payload_bytes,
+            item.max_entropy,
+        ),
         reverse=True,
     )[:MAX_SESSIONS]
-    suspicious_sessions = sum(1 for session in session_stats if session.suspicious_packets > 0)
+    suspicious_sessions = sum(
+        1 for session in session_stats if session.suspicious_packets > 0
+    )
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
@@ -763,7 +845,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
             **{**summary.__dict__, "errors": ["Scapy TCP/UDP unavailable"]},
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     total_payload_bytes = 0
     suspicious_packets = 0
@@ -1017,7 +1101,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
                 suspicious_packets += 1
                 suspicious_payload_bytes += len(payload)
                 state["suspicious_packets"] = int(state["suspicious_packets"]) + 1
-                state["suspicious_payload_bytes"] = int(state["suspicious_payload_bytes"]) + len(payload)
+                state["suspicious_payload_bytes"] = int(
+                    state["suspicious_payload_bytes"]
+                ) + len(payload)
                 source_counts[src_ip] += 1
                 destination_counts[dst_ip] += 1
                 protocol_counts[proto] += 1
@@ -1035,7 +1121,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
     for state in flow_state.values():
         packets = int(state["packets"])
         entropy_count = int(state["entropy_count"])
-        avg_entropy = (float(state["entropy_sum"]) / entropy_count) if entropy_count else 0.0
+        avg_entropy = (
+            (float(state["entropy_sum"]) / entropy_count) if entropy_count else 0.0
+        )
         first_ts = state["first_seen"]
         last_ts = state["last_seen"]
         duration = None
@@ -1064,17 +1152,25 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
             )
         )
     session_stats.sort(
-        key=lambda item: (item.suspicious_packets, item.suspicious_payload_bytes, item.max_entropy),
+        key=lambda item: (
+            item.suspicious_packets,
+            item.suspicious_payload_bytes,
+            item.max_entropy,
+        ),
         reverse=True,
     )
     session_stats = session_stats[:MAX_SESSIONS]
-    suspicious_sessions = sum(1 for item in session_stats if item.suspicious_packets > 0)
+    suspicious_sessions = sum(
+        1 for item in session_stats if item.suspicious_packets > 0
+    )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
 
-    session_lookup: dict[str, ObfuscationSessionStat] = {item.flow_id: item for item in session_stats}
+    session_lookup: dict[str, ObfuscationSessionStat] = {
+        item.flow_id: item for item in session_stats
+    }
     detections: list[dict[str, object]] = []
 
     def _hit_evidence(hits: list[ObfuscationHit], limit: int = 6) -> list[str]:
@@ -1085,7 +1181,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
             if session:
                 ratio = 0.0
                 if session.payload_bytes:
-                    ratio = (session.suspicious_payload_bytes / session.payload_bytes) * 100.0
+                    ratio = (
+                        session.suspicious_payload_bytes / session.payload_bytes
+                    ) * 100.0
                 session_bits = (
                     f" session={session.suspicious_packets}/{session.packets}pkt "
                     f"susp_bytes={session.suspicious_payload_bytes}/{session.payload_bytes} ({ratio:.1f}%)"
@@ -1159,7 +1257,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
             )
 
     if ioc_counts:
-        ioc_evidence = [f"{name} ({count})" for name, count in ioc_counts.most_common(8)]
+        ioc_evidence = [
+            f"{name} ({count})" for name, count in ioc_counts.most_common(8)
+        ]
         detections.append(
             {
                 "severity": "high",
@@ -1172,7 +1272,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
             }
         )
     if attack_counts:
-        attack_evidence = [f"{name} ({count})" for name, count in attack_counts.most_common(8)]
+        attack_evidence = [
+            f"{name} ({count})" for name, count in attack_counts.most_common(8)
+        ]
         detections.append(
             {
                 "severity": "high",

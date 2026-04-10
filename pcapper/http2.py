@@ -38,9 +38,22 @@ class Http2Summary:
 
 def analyze_http2(path: Path, show_status: bool = True) -> Http2Summary:
     if TCP is None:
-        return Http2Summary(path, 0, 0, Counter(), Counter(), [], ["Scapy TCP unavailable"], None, None, None)
+        return Http2Summary(
+            path,
+            0,
+            0,
+            Counter(),
+            Counter(),
+            [],
+            ["Scapy TCP unavailable"],
+            None,
+            None,
+            None,
+        )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     http2_packets = 0
     client_counts: Counter[str] = Counter()
@@ -83,7 +96,11 @@ def analyze_http2(path: Path, show_status: bool = True) -> Http2Summary:
             if not payload:
                 continue
 
-            if HTTP2_PREFACE not in payload and b"HTTP/2.0" not in payload and b"h2c" not in payload:
+            if (
+                HTTP2_PREFACE not in payload
+                and b"HTTP/2.0" not in payload
+                and b"h2c" not in payload
+            ):
                 continue
 
             src_ip = None
@@ -106,13 +123,19 @@ def analyze_http2(path: Path, show_status: bool = True) -> Http2Summary:
         reader.close()
 
     if http2_packets:
-        detections.append({
-            "severity": "info",
-            "summary": "HTTP/2 cleartext or upgrade indicators observed",
-            "details": "HTTP/2 preface or upgrade markers detected in TCP payloads.",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "HTTP/2 cleartext or upgrade indicators observed",
+                "details": "HTTP/2 preface or upgrade markers detected in TCP payloads.",
+            }
+        )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return Http2Summary(
         path=path,
         total_packets=total_packets,

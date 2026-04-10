@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import base64
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import re
-import base64
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -32,8 +32,14 @@ _BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 SUSPICIOUS_PLAINTEXT = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential indicator"),
     (re.compile(r"user(name)?\s*[:=]", re.IGNORECASE), "User indicator"),
-    (re.compile(r"cmd\.exe|powershell|psexec|wmic", re.IGNORECASE), "Administrative tooling"),
-    (re.compile(r"mimikatz|cobalt|beacon|meterpreter", re.IGNORECASE), "Offensive tooling"),
+    (
+        re.compile(r"cmd\.exe|powershell|psexec|wmic", re.IGNORECASE),
+        "Administrative tooling",
+    ),
+    (
+        re.compile(r"mimikatz|cobalt|beacon|meterpreter", re.IGNORECASE),
+        "Offensive tooling",
+    ),
 ]
 
 FILE_NAME_RE = re.compile(
@@ -181,7 +187,9 @@ class RdpSummary:
         }
 
 
-def merge_rdp_summaries(summaries: list[RdpSummary] | tuple[RdpSummary, ...] | set[RdpSummary]) -> RdpSummary:
+def merge_rdp_summaries(
+    summaries: list[RdpSummary] | tuple[RdpSummary, ...] | set[RdpSummary],
+) -> RdpSummary:
     summary_list = list(summaries)
     if not summary_list:
         return RdpSummary(
@@ -287,9 +295,17 @@ def merge_rdp_summaries(summaries: list[RdpSummary] | tuple[RdpSummary, ...] | s
         tls_handshakes += summary.tls_handshakes
 
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         client_counts.update(summary.client_counts)
         server_counts.update(summary.server_counts)
@@ -405,7 +421,9 @@ class _SessionState:
     tls_detected: bool = False
 
 
-def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
+def _extract_ascii_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
     results: list[str] = []
     if not data:
         return results
@@ -453,14 +471,14 @@ def _scan_plaintext(
 def _read_uint16(data: bytes, offset: int) -> tuple[Optional[int], int]:
     if offset + 2 > len(data):
         return None, offset
-    value = int.from_bytes(data[offset:offset + 2], "little")
+    value = int.from_bytes(data[offset : offset + 2], "little")
     return value, offset + 2
 
 
 def _read_uint32_le(data: bytes, offset: int) -> tuple[Optional[int], int]:
     if offset + 4 > len(data):
         return None, offset
-    value = int.from_bytes(data[offset:offset + 4], "little")
+    value = int.from_bytes(data[offset : offset + 4], "little")
     return value, offset + 4
 
 
@@ -484,7 +502,7 @@ def _parse_rdp_negotiation(payload: bytes) -> tuple[Optional[int], Optional[int]
         return None, None
     if offset + (tpdu_len - 1) > len(payload):
         return None, None
-    offset += (tpdu_len - 1)
+    offset += tpdu_len - 1
     if offset >= len(payload) or payload[offset] != 0xE0:
         return None, None
     offset += 1
@@ -494,7 +512,7 @@ def _parse_rdp_negotiation(payload: bytes) -> tuple[Optional[int], Optional[int]
     requested = None
     selected = None
     while offset + 4 <= total_len:
-        if payload[offset:offset + 4] == b"\x00\x00\x00\x00":
+        if payload[offset : offset + 4] == b"\x00\x00\x00\x00":
             break
         if offset + 4 > total_len:
             break
@@ -505,9 +523,9 @@ def _parse_rdp_negotiation(payload: bytes) -> tuple[Optional[int], Optional[int]
         if offset + length > total_len:
             break
         if typ == 0x01 and length >= 8:
-            requested = int.from_bytes(payload[offset + 4:offset + 8], "little")
+            requested = int.from_bytes(payload[offset + 4 : offset + 8], "little")
         if typ == 0x02 and length >= 8:
-            selected = int.from_bytes(payload[offset + 4:offset + 8], "little")
+            selected = int.from_bytes(payload[offset + 4 : offset + 8], "little")
         offset += length
     return requested, selected
 
@@ -527,7 +545,9 @@ def _rdp_protocol_names(mask: int | None) -> list[str]:
     return names
 
 
-def _parse_rdp_client_core_data(payload: bytes) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _parse_rdp_client_core_data(
+    payload: bytes,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
     if not payload:
         return None, None, None
     marker = b"\x01\xc0\xd8\x00"
@@ -544,7 +564,7 @@ def _parse_rdp_client_core_data(payload: bytes) -> tuple[Optional[str], Optional
         return None, None, None
     if offset + core_len - 4 > len(payload):
         return None, None, None
-    data = payload[offset:offset + core_len - 4]
+    data = payload[offset : offset + core_len - 4]
     if len(data) < 4:
         return None, None, None
     version = int.from_bytes(data[:4], "little")
@@ -563,13 +583,15 @@ def _parse_rdp_client_core_data(payload: bytes) -> tuple[Optional[str], Optional
     offset2 += 4
     if offset2 + 4 > len(data):
         return None, None, str(version)
-    client_build = int.from_bytes(data[offset2:offset2 + 4], "little")
+    client_build = int.from_bytes(data[offset2 : offset2 + 4], "little")
     offset2 += 4
     if offset2 + 32 > len(data):
         return None, str(client_build), str(version)
-    client_name_raw = data[offset2:offset2 + 32]
+    client_name_raw = data[offset2 : offset2 + 32]
     try:
-        client_name = client_name_raw.decode("utf-16-le", errors="ignore").rstrip("\x00")
+        client_name = client_name_raw.decode("utf-16-le", errors="ignore").rstrip(
+            "\x00"
+        )
     except Exception:
         client_name = None
     return client_name or None, str(client_build), str(version)
@@ -613,7 +635,9 @@ def _find_decrypted_payload(
     if isinstance(meta, dict):
         candidate = meta.get("rdp_decrypted") or meta.get("rdp_decrypted_packets")
     else:
-        candidate = getattr(meta, "rdp_decrypted", None) or getattr(meta, "rdp_decrypted_packets", None)
+        candidate = getattr(meta, "rdp_decrypted", None) or getattr(
+            meta, "rdp_decrypted_packets", None
+        )
     if isinstance(candidate, dict):
         payload = _coerce_decrypted_payload(candidate.get(pkt_index))
         if payload:
@@ -626,20 +650,28 @@ def _find_decrypted_payload(
     return None, None
 
 
-def _parse_rdp_decrypted_identity(payload: bytes) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _parse_rdp_decrypted_identity(
+    payload: bytes,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
     if not payload:
         return None, None, None
     text = payload.decode("latin-1", errors="ignore")
     user = None
     domain = None
     host = None
-    match = re.search(r"(?:username|user)\s*[:=]\s*([\\w\\-\\.@]{1,64})", text, re.IGNORECASE)
+    match = re.search(
+        r"(?:username|user)\s*[:=]\s*([\\w\\-\\.@]{1,64})", text, re.IGNORECASE
+    )
     if match:
         user = match.group(1)
     match = re.search(r"(?:domain)\\s*[:=]\\s*([\\w\\-\\.]{1,64})", text, re.IGNORECASE)
     if match:
         domain = match.group(1)
-    match = re.search(r"(?:clientname|client_name|hostname)\\s*[:=]\\s*([\\w\\-\\.]{1,64})", text, re.IGNORECASE)
+    match = re.search(
+        r"(?:clientname|client_name|hostname)\\s*[:=]\\s*([\\w\\-\\.]{1,64})",
+        text,
+        re.IGNORECASE,
+    )
     if match:
         host = match.group(1)
     return user, domain, host
@@ -675,7 +707,7 @@ def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
     if avg <= 0:
         return None
     variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
+    stddev = variance**0.5
     if avg < 5 or avg > 86400:
         return None
     if stddev > max(5.0, avg * 0.25):
@@ -692,7 +724,9 @@ def analyze_rdp(
 ) -> RdpSummary:
     errors: list[str] = []
     if (TCP is None and UDP is None) or (IP is None and IPv6 is None):
-        errors.append("Scapy IP/TCP/UDP layers unavailable; install scapy for RDP analysis.")
+        errors.append(
+            "Scapy IP/TCP/UDP layers unavailable; install scapy for RDP analysis."
+        )
         return RdpSummary(
             path=path,
             total_packets=0,
@@ -857,7 +891,13 @@ def analyze_rdp(
             is_rdp = (
                 (is_tcp and (sport in RDP_TCP_PORTS or dport in RDP_TCP_PORTS))
                 or (is_udp and (sport in RDP_UDP_PORTS or dport in RDP_UDP_PORTS))
-                or (payload_prefix and (b"Cookie: mstshash=" in payload_prefix or b"RDPUDP" in payload_prefix))
+                or (
+                    payload_prefix
+                    and (
+                        b"Cookie: mstshash=" in payload_prefix
+                        or b"RDPUDP" in payload_prefix
+                    )
+                )
             )
             if not is_rdp and not decrypted_payload:
                 continue
@@ -961,13 +1001,23 @@ def analyze_rdp(
                     requested_protocols[item] += 1
                 for item in _rdp_protocol_names(selected_mask):
                     selected_protocols[item] += 1
-                core_client, client_build, _version = _parse_rdp_client_core_data(payload_prefix)
+                core_client, client_build, _version = _parse_rdp_client_core_data(
+                    payload_prefix
+                )
                 if core_client:
                     decrypted_client_name[core_client] += 1
                 if client_build:
                     client_builds[client_build] += 1
-                if (not payload_prefix.startswith(_TLS_PREFIXES) and not payload_prefix.startswith(_DTLS_PREFIXES)):
-                    _scan_plaintext(payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts)
+                if not payload_prefix.startswith(
+                    _TLS_PREFIXES
+                ) and not payload_prefix.startswith(_DTLS_PREFIXES):
+                    _scan_plaintext(
+                        payload,
+                        plaintext_strings,
+                        suspicious_plaintext,
+                        file_artifacts,
+                        artifacts,
+                    )
 
             if payload_prefix.startswith(_TLS_PREFIXES):
                 tls_handshakes += 1
@@ -977,7 +1027,13 @@ def analyze_rdp(
                 session.tls_detected = True
 
             if decrypted_payload:
-                _scan_plaintext(decrypted_payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts)
+                _scan_plaintext(
+                    decrypted_payload,
+                    plaintext_strings,
+                    suspicious_plaintext,
+                    file_artifacts,
+                    artifacts,
+                )
                 user, domain, host = _parse_rdp_decrypted_identity(decrypted_payload)
                 if user:
                     decrypted_username[user] += 1
@@ -997,15 +1053,17 @@ def analyze_rdp(
                     )
                     if key not in auth_evidence_seen:
                         auth_evidence_seen.add(key)
-                        auth_evidence.append({
-                            "client_ip": session.client_ip,
-                            "server_ip": session.server_ip,
-                            "client_port": session.client_port,
-                            "server_port": session.server_port,
-                            "username": user,
-                            "domain": domain or "-",
-                            "client_name": host or "-",
-                        })
+                        auth_evidence.append(
+                            {
+                                "client_ip": session.client_ip,
+                                "server_ip": session.server_ip,
+                                "client_port": session.client_port,
+                                "server_port": session.server_port,
+                                "username": user,
+                                "domain": domain or "-",
+                                "client_name": host or "-",
+                            }
+                        )
 
     except Exception as exc:
         errors.append(str(exc))
@@ -1051,87 +1109,123 @@ def analyze_rdp(
             short_session_by_client[session.client_ip] += 1
             short_session_targets[session.client_ip].add(session.server_ip)
         if session.first_seen is not None:
-            pair_first_seen[(session.client_ip, session.server_ip)].append(session.first_seen)
+            pair_first_seen[(session.client_ip, session.server_ip)].append(
+                session.first_seen
+            )
 
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
-    non_standard_ports = [port for port in server_tcp_ports if port not in RDP_TCP_PORTS]
-    non_standard_ports += [port for port in server_udp_ports if port not in RDP_UDP_PORTS]
+    non_standard_ports = [
+        port for port in server_tcp_ports if port not in RDP_TCP_PORTS
+    ]
+    non_standard_ports += [
+        port for port in server_udp_ports if port not in RDP_UDP_PORTS
+    ]
     if non_standard_ports:
-        detections.append({
-            "severity": "info",
-            "summary": "RDP observed on non-standard ports",
-            "details": ", ".join(str(port) for port in sorted(set(non_standard_ports))),
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "RDP observed on non-standard ports",
+                "details": ", ".join(
+                    str(port) for port in sorted(set(non_standard_ports))
+                ),
+            }
+        )
 
     if server_udp_ports:
-        detections.append({
-            "severity": "info",
-            "summary": "RDP UDP transport observed",
-            "details": ", ".join(str(port) for port in sorted(server_udp_ports.keys())),
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "RDP UDP transport observed",
+                "details": ", ".join(
+                    str(port) for port in sorted(server_udp_ports.keys())
+                ),
+            }
+        )
 
     if suspicious_plaintext and (plaintext_strings or decrypted_sources):
-        detections.append({
-            "severity": "warning",
-            "summary": "Suspicious plaintext strings observed in RDP payloads",
-            "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Suspicious plaintext strings observed in RDP payloads",
+                "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
+            }
+        )
 
     if decrypted_sources:
-        analysis_notes.append(f"Decrypted RDP payloads provided via: {', '.join(sorted(decrypted_sources))}.")
+        analysis_notes.append(
+            f"Decrypted RDP payloads provided via: {', '.join(sorted(decrypted_sources))}."
+        )
 
     for (client_ip, server_ip), count in short_session_counts.items():
         if count >= 20:
-            anomalies.append({
-                "title": "Potential brute force or probing",
-                "details": f"{client_ip} -> {server_ip} short sessions: {count}",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential brute force or probing",
+                    "details": f"{client_ip} -> {server_ip} short sessions: {count}",
+                }
+            )
 
     for client_ip, count in short_session_by_client.items():
         targets = short_session_targets.get(client_ip, set())
         if count >= 30 and len(targets) >= 10:
-            anomalies.append({
-                "title": "Potential RDP scanning",
-                "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential RDP scanning",
+                    "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
+                }
+            )
 
     for (client_ip, server_ip), times in pair_first_seen.items():
         score = _beaconing_score(times)
         if score:
-            detections.append({
-                "severity": "info",
-                "summary": "Potential RDP beaconing",
-                "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
-            })
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "Potential RDP beaconing",
+                    "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
+                }
+            )
 
     for session in sessions.values():
-        if session.client_bytes >= 50 * 1024 * 1024 and session.client_bytes > session.server_bytes * 3:
-            detections.append({
-                "severity": "warning",
-                "summary": "Potential RDP data upload/exfiltration",
-                "details": (
-                    f"{session.client_ip} -> {session.server_ip} "
-                    f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
-                ),
-            })
-        if session.server_bytes >= 200 * 1024 * 1024 and session.server_bytes > session.client_bytes * 3:
-            detections.append({
-                "severity": "info",
-                "summary": "High server->client RDP data volume",
-                "details": (
-                    f"{session.server_ip} -> {session.client_ip} "
-                    f"server->client {session.server_bytes / (1024 * 1024):.1f} MB"
-                ),
-            })
+        if (
+            session.client_bytes >= 50 * 1024 * 1024
+            and session.client_bytes > session.server_bytes * 3
+        ):
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Potential RDP data upload/exfiltration",
+                    "details": (
+                        f"{session.client_ip} -> {session.server_ip} "
+                        f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
+                    ),
+                }
+            )
+        if (
+            session.server_bytes >= 200 * 1024 * 1024
+            and session.server_bytes > session.client_bytes * 3
+        ):
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "High server->client RDP data volume",
+                    "details": (
+                        f"{session.server_ip} -> {session.client_ip} "
+                        f"server->client {session.server_bytes / (1024 * 1024):.1f} MB"
+                    ),
+                }
+            )
         if session.last_seen is not None and session.first_seen is not None:
             duration = session.last_seen - session.first_seen
             if duration >= 4 * 3600:
-                anomalies.append({
-                    "title": "Long-lived RDP session",
-                    "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
-                })
+                anomalies.append(
+                    {
+                        "title": "Long-lived RDP session",
+                        "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
+                    }
+                )
 
     total_sessions = len(conversations)
 

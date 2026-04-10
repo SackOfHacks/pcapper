@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_ethertype_protocol
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_ethertype_protocol,
+)
 
 ETHERCAT_ETHERTYPE = 0x88A4
 
@@ -76,7 +80,7 @@ def _parse_datagrams(payload: bytes) -> list[tuple[str, bytes]]:
         while idx + 10 <= len(payload):
             cmd = payload[idx]
             cmd_name = ETHERCAT_CMDS.get(cmd, f"CMD 0x{cmd:02x}")
-            length = int.from_bytes(payload[idx + 6:idx + 8], "little") & 0x07FF
+            length = int.from_bytes(payload[idx + 6 : idx + 8], "little") & 0x07FF
             data_start = idx + 10
             data_end = data_start + length
             if data_end + 2 > len(payload):
@@ -112,6 +116,7 @@ def _parse_mailbox(data: bytes) -> list[str]:
         commands.append(f"SoE {SOE_OPCODES.get(opcode, f'0x{opcode:02x}')}")
     return commands
 
+
 def _parse_commands(payload: bytes) -> list[str]:
     if not payload:
         return []
@@ -124,7 +129,10 @@ def _parse_commands(payload: bytes) -> list[str]:
         commands.append(ETHERCAT_CMDS.get(cmd, f"CMD 0x{cmd:02x}"))
     return commands
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     if any(cmd in WRITE_COMMANDS for cmd in commands):
         anomalies.append(
@@ -141,7 +149,9 @@ def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, comma
         severity = "HIGH"
         detail = "FoE mailbox activity observed."
         if any("FoE WRQ" in cmd or "FoE DATA" in cmd for cmd in commands):
-            detail = "FoE file transfer/write activity observed (possible firmware update)."
+            detail = (
+                "FoE file transfer/write activity observed (possible firmware update)."
+            )
         anomalies.append(
             IndustrialAnomaly(
                 severity=severity,

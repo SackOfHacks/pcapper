@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import ipaddress
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import ipaddress
-import re
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -76,15 +76,24 @@ SUSPICIOUS_PATTERNS = [
     (re.compile(r"failed\s+password", re.IGNORECASE), "Authentication failure"),
     (re.compile(r"invalid\s+user", re.IGNORECASE), "Invalid user attempts"),
     (re.compile(r"authentication\s+failure", re.IGNORECASE), "Authentication failure"),
-    (re.compile(r"sudo:\s+authentication\s+failure", re.IGNORECASE), "Privileged auth failure"),
-    (re.compile(r"session\s+opened|session\s+closed", re.IGNORECASE), "Auth session activity"),
+    (
+        re.compile(r"sudo:\s+authentication\s+failure", re.IGNORECASE),
+        "Privileged auth failure",
+    ),
+    (
+        re.compile(r"session\s+opened|session\s+closed", re.IGNORECASE),
+        "Auth session activity",
+    ),
     (re.compile(r"accepted\s+password", re.IGNORECASE), "Password login accepted"),
     (re.compile(r"root\s+login|root\s+user", re.IGNORECASE), "Root login activity"),
     (re.compile(r"useradd|usermod|passwd\s+", re.IGNORECASE), "Account management"),
     (re.compile(r"ssh-\d", re.IGNORECASE), "SSH version exposure"),
     (re.compile(r"nmap|masscan|sqlmap", re.IGNORECASE), "Recon tooling"),
     (re.compile(r"wget\s+http|curl\s+http", re.IGNORECASE), "Download tooling"),
-    (re.compile(r"powershell|cmd\.exe|/bin/(sh|bash)", re.IGNORECASE), "Command execution"),
+    (
+        re.compile(r"powershell|cmd\.exe|/bin/(sh|bash)", re.IGNORECASE),
+        "Command execution",
+    ),
     (re.compile(r"ransom|malware|c2|beacon", re.IGNORECASE), "Malware indicator"),
 ]
 
@@ -223,7 +232,9 @@ def _is_public_ip(value: str) -> bool:
         return False
 
 
-def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
+def _extract_ascii_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
     results: list[str] = []
     if not data:
         return results
@@ -245,7 +256,9 @@ def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) ->
 def _parse_syslog(text: str) -> dict[str, Optional[str]]:
     match_5424 = SYSLOG_5424_RE.match(text)
     if match_5424:
-        pri, version, timestamp, hostname, appname, procid, msgid, message = match_5424.groups()
+        pri, version, timestamp, hostname, appname, procid, msgid, message = (
+            match_5424.groups()
+        )
         return {
             "pri": pri,
             "version": version,
@@ -304,7 +317,9 @@ def analyze_syslog(
 ) -> SyslogSummary:
     errors: list[str] = []
     if TCP is None and UDP is None:
-        errors.append("Scapy TCP/UDP layers unavailable; install scapy for syslog analysis.")
+        errors.append(
+            "Scapy TCP/UDP layers unavailable; install scapy for syslog analysis."
+        )
         return SyslogSummary(
             path=path,
             total_packets=0,
@@ -494,7 +509,9 @@ def analyze_syslog(
                     server_port=existing.server_port,
                     packets=existing.packets + 1,
                     bytes=existing.bytes + pkt_len,
-                    first_seen=existing.first_seen if existing.first_seen is not None else ts,
+                    first_seen=existing.first_seen
+                    if existing.first_seen is not None
+                    else ts,
                     last_seen=ts or existing.last_seen,
                 )
 
@@ -536,7 +553,9 @@ def analyze_syslog(
                 for match in FILE_NAME_RE.findall(message):
                     file_artifacts[match] += 1
                     if len(artifacts) < 200:
-                        artifacts.append(SyslogArtifact("file", match, client_ip, server_ip))
+                        artifacts.append(
+                            SyslogArtifact("file", match, client_ip, server_ip)
+                        )
 
                 for pattern, summary in SUSPICIOUS_PATTERNS:
                     if pattern.search(message):
@@ -557,39 +576,53 @@ def analyze_syslog(
         duration_seconds = max(0.0, last_seen - first_seen)
 
     conversation_rows = sorted(
-        conversations.values(), key=lambda item: (item.packets, item.bytes), reverse=True
+        conversations.values(),
+        key=lambda item: (item.packets, item.bytes),
+        reverse=True,
     )
 
     if suspicious_counter:
         for summary, count in suspicious_counter.most_common(10):
-            detections.append({
-                "severity": "warning",
-                "summary": summary,
-                "details": f"Observed {count} occurrences in syslog messages.",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": summary,
+                    "details": f"Observed {count} occurrences in syslog messages.",
+                }
+            )
 
     for server_ip, count in server_counts.most_common(10):
         if _is_public_ip(server_ip) and count > 10:
-            anomalies.append(SyslogAnomaly(
-                title="Syslog to public endpoint",
-                details=f"{server_ip} received {count} syslog messages.",
-                severity="MEDIUM",
-            ))
+            anomalies.append(
+                SyslogAnomaly(
+                    title="Syslog to public endpoint",
+                    details=f"{server_ip} received {count} syslog messages.",
+                    severity="MEDIUM",
+                )
+            )
 
     for client_ip, count in client_counts.most_common(5):
         if count >= 5000:
-            anomalies.append(SyslogAnomaly(
-                title="High-volume syslog source",
-                details=f"{client_ip} sent {count} messages.",
-                severity="LOW",
-            ))
+            anomalies.append(
+                SyslogAnomaly(
+                    title="High-volume syslog source",
+                    details=f"{client_ip} sent {count} messages.",
+                    severity="LOW",
+                )
+            )
 
-    if severity_counts.get("Critical") or severity_counts.get("Alert") or severity_counts.get("Emergency"):
-        anomalies.append(SyslogAnomaly(
-            title="High-severity syslog events",
-            details="Critical/Alert/Emergency severity events observed.",
-            severity="HIGH",
-        ))
+    if (
+        severity_counts.get("Critical")
+        or severity_counts.get("Alert")
+        or severity_counts.get("Emergency")
+    ):
+        anomalies.append(
+            SyslogAnomaly(
+                title="High-severity syslog events",
+                details="Critical/Alert/Emergency severity events observed.",
+                severity="HIGH",
+            )
+        )
 
     for value in list(file_artifacts.keys())[:30]:
         if len(artifacts) >= 200:

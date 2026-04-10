@@ -49,7 +49,11 @@ def analyze_pcapmeta(path: Path, show_status: bool = True) -> PcapMetaSummary:
         for iface in meta.interfaces:
             if isinstance(iface, dict):
                 interfaces.append(dict(iface))
-                name = iface.get("if_name") or iface.get("if_description") or iface.get("name")
+                name = (
+                    iface.get("if_name")
+                    or iface.get("if_description")
+                    or iface.get("name")
+                )
                 if name:
                     interface_names.append(str(name))
                 if iface.get("dropcount") is not None:

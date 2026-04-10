@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
 import os
 import re
 import urllib.parse
@@ -12,12 +13,12 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, get_reader
-from .utils import safe_float, decode_payload
+from .utils import decode_payload, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
-    from scapy.packet import Raw, Packet  # type: ignore
+    from scapy.packet import Packet, Raw  # type: ignore
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
     Packet = object  # type: ignore
@@ -29,19 +30,52 @@ MIN_BASE64_LEN = 16
 MIN_HEX_LEN = 16
 MIN_URLENC_LEN = 12
 try:
-    MAX_DECOMPRESSED_BYTES = int(os.environ.get("PCAPPER_MAX_DECOMPRESSED_BYTES", str(10 * 1024 * 1024)))
+    MAX_DECOMPRESSED_BYTES = int(
+        os.environ.get("PCAPPER_MAX_DECOMPRESSED_BYTES", str(10 * 1024 * 1024))
+    )
 except Exception:
     MAX_DECOMPRESSED_BYTES = 10 * 1024 * 1024
 if MAX_DECOMPRESSED_BYTES < 0:
     MAX_DECOMPRESSED_BYTES = 0
 
 BASE64_RE = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{16,}={0,2}(?![A-Za-z0-9+/=])")
-BASE64URL_RE = re.compile(r"(?<![A-Za-z0-9_\-=])[A-Za-z0-9_\-]{16,}={0,2}(?![A-Za-z0-9_\-=])")
+BASE64URL_RE = re.compile(
+    r"(?<![A-Za-z0-9_\-=])[A-Za-z0-9_\-]{16,}={0,2}(?![A-Za-z0-9_\-=])"
+)
 HEX_RE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{16,}(?![0-9A-Fa-f])")
 URLENC_RE = re.compile(r"(?:%[0-9A-Fa-f]{2}){4,}")
 JWT_RE = re.compile(r"[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}(?:\.[A-Za-z0-9_\-]{8,})?")
 
 PRINTABLE_BYTES = set(range(32, 127)) | {9, 10, 13}
+
+CRED_KV_RE = re.compile(
+    r"\b(?:user(?:name)?|login|account|uid|pass(?:word)?|pwd)\s*[:=]\s*([^\s;&,]{1,128})",
+    re.IGNORECASE,
+)
+TOKEN_RE = re.compile(
+    r"\b(?:bearer|token|apikey|api_key|secret|session(?:id)?)\b", re.IGNORECASE
+)
+PRIVATE_KEY_RE = re.compile(
+    r"BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY", re.IGNORECASE
+)
+LOLBIN_RE = re.compile(
+    r"\b(?:powershell(?:\.exe)?|cmd(?:\.exe)?|wscript(?:\.exe)?|cscript(?:\.exe)?|mshta(?:\.exe)?|rundll32(?:\.exe)?|regsvr32(?:\.exe)?|certutil(?:\.exe)?|bitsadmin(?:\.exe)?)\b",
+    re.IGNORECASE,
+)
+C2_RE = re.compile(
+    r"\b(?:beacon|callback|c2|cnc|reverse[_ -]?shell|meterpreter|implant|stager|dropper)\b",
+    re.IGNORECASE,
+)
+EXFIL_RE = re.compile(
+    r"\b(?:/upload|/exfil|/gate\.php|multipart/form-data|content-disposition:\s*attachment|ftp put|stor\s+)\b",
+    re.IGNORECASE,
+)
+OT_RE = re.compile(
+    r"\b(?:modbus|dnp3|iec[- ]?104|s7(?:comm)?|profinet|ethernet/ip|enip|cip|opc ua|mms|goose|sv|plc|scada|hmi)\b",
+    re.IGNORECASE,
+)
+CTF_RE = re.compile(r"\b(?:flag|ctf|picoctf)\{[^}]{1,220}\}", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -68,6 +102,13 @@ class SecretsSummary:
     hits: list[SecretHit]
     truncated: bool
     kind_counts: Counter[str]
+    top_sources: Counter[str]
+    top_destinations: Counter[str]
+    protocol_counts: Counter[str]
+    deterministic_checks: dict[str, list[str]]
+    threat_hypotheses: list[dict[str, object]]
+    ot_findings: list[str]
+    ctf_indicators: list[str]
     errors: list[str]
 
 
@@ -136,7 +177,9 @@ def _decode_text(data: bytes) -> str:
     return text_latin
 
 
-def _maybe_decompress(data: bytes, max_output: int = MAX_DECOMPRESSED_BYTES) -> Optional[bytes]:
+def _maybe_decompress(
+    data: bytes, max_output: int = MAX_DECOMPRESSED_BYTES
+) -> Optional[bytes]:
     if not data:
         return None
     if max_output <= 0:
@@ -211,6 +254,16 @@ def _decode_urlencoded(token: str) -> Optional[bytes]:
         return None
 
 
+def _is_public_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(str(value))
+        return not (
+            ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+        )
+    except Exception:
+        return False
+
+
 def analyze_secrets(
     path: Path,
     *,
@@ -220,14 +273,44 @@ def analyze_secrets(
     max_hits: int = 200,
 ) -> SecretsSummary:
     if TCP is None and UDP is None and Raw is None:
-        return SecretsSummary(path, 0, 0, [], False, Counter(), ["Scapy not available"])
+        return SecretsSummary(
+            path,
+            0,
+            0,
+            [],
+            False,
+            Counter(),
+            Counter(),
+            Counter(),
+            Counter(),
+            {},
+            [],
+            [],
+            [],
+            ["Scapy not available"],
+        )
 
     try:
         reader, status, stream, size_bytes, _file_type = get_reader(
             path, packets=packets, meta=meta, show_status=show_status
         )
     except Exception as exc:
-        return SecretsSummary(path, 0, 0, [], False, Counter(), [f"Error opening pcap: {exc}"])
+        return SecretsSummary(
+            path,
+            0,
+            0,
+            [],
+            False,
+            Counter(),
+            Counter(),
+            Counter(),
+            Counter(),
+            {},
+            [],
+            [],
+            [],
+            [f"Error opening pcap: {exc}"],
+        )
 
     total_packets = 0
     matches = 0
@@ -286,20 +369,22 @@ def analyze_secrets(
                     if key not in seen:
                         seen.add(key)
                         if len(hits) < max_hits:
-                            hits.append(SecretHit(
-                                packet_number=total_packets,
-                                ts=ts,
-                                src_ip=src_ip,
-                                dst_ip=dst_ip,
-                                src_port=src_port,
-                                dst_port=dst_port,
-                                protocol=protocol,
-                                offset=match.start(),
-                                kind="JWT",
-                                encoded=token,
-                                decoded=" | ".join(decoded_parts),
-                                note="JWT " + "/".join(note_parts),
-                            ))
+                            hits.append(
+                                SecretHit(
+                                    packet_number=total_packets,
+                                    ts=ts,
+                                    src_ip=src_ip,
+                                    dst_ip=dst_ip,
+                                    src_port=src_port,
+                                    dst_port=dst_port,
+                                    protocol=protocol,
+                                    offset=match.start(),
+                                    kind="JWT",
+                                    encoded=token,
+                                    decoded=" | ".join(decoded_parts),
+                                    note="JWT " + "/".join(note_parts),
+                                )
+                            )
                         else:
                             truncated = True
                 jwt_spans.append((match.start(), match.end()))
@@ -339,20 +424,22 @@ def analyze_secrets(
                     continue
                 seen.add(key)
                 if len(hits) < max_hits:
-                    hits.append(SecretHit(
-                        packet_number=total_packets,
-                        ts=ts,
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        src_port=src_port,
-                        dst_port=dst_port,
-                        protocol=protocol,
-                        offset=match.start(),
-                        kind="Base64",
-                        encoded=token,
-                        decoded=decoded_text,
-                        note=note,
-                    ))
+                    hits.append(
+                        SecretHit(
+                            packet_number=total_packets,
+                            ts=ts,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            src_port=src_port,
+                            dst_port=dst_port,
+                            protocol=protocol,
+                            offset=match.start(),
+                            kind="Base64",
+                            encoded=token,
+                            decoded=decoded_text,
+                            note=note,
+                        )
+                    )
                 else:
                     truncated = True
 
@@ -383,20 +470,22 @@ def analyze_secrets(
                     continue
                 seen.add(key)
                 if len(hits) < max_hits:
-                    hits.append(SecretHit(
-                        packet_number=total_packets,
-                        ts=ts,
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        src_port=src_port,
-                        dst_port=dst_port,
-                        protocol=protocol,
-                        offset=match.start(),
-                        kind="Base64URL",
-                        encoded=token,
-                        decoded=decoded_text,
-                        note=note,
-                    ))
+                    hits.append(
+                        SecretHit(
+                            packet_number=total_packets,
+                            ts=ts,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            src_port=src_port,
+                            dst_port=dst_port,
+                            protocol=protocol,
+                            offset=match.start(),
+                            kind="Base64URL",
+                            encoded=token,
+                            decoded=decoded_text,
+                            note=note,
+                        )
+                    )
                 else:
                     truncated = True
 
@@ -421,20 +510,22 @@ def analyze_secrets(
                     continue
                 seen.add(key)
                 if len(hits) < max_hits:
-                    hits.append(SecretHit(
-                        packet_number=total_packets,
-                        ts=ts,
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        src_port=src_port,
-                        dst_port=dst_port,
-                        protocol=protocol,
-                        offset=match.start(),
-                        kind="Hex",
-                        encoded=token,
-                        decoded=decoded_text,
-                        note="hex",
-                    ))
+                    hits.append(
+                        SecretHit(
+                            packet_number=total_packets,
+                            ts=ts,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            src_port=src_port,
+                            dst_port=dst_port,
+                            protocol=protocol,
+                            offset=match.start(),
+                            kind="Hex",
+                            encoded=token,
+                            decoded=decoded_text,
+                            note="hex",
+                        )
+                    )
                 else:
                     truncated = True
 
@@ -457,20 +548,22 @@ def analyze_secrets(
                     continue
                 seen.add(key)
                 if len(hits) < max_hits:
-                    hits.append(SecretHit(
-                        packet_number=total_packets,
-                        ts=ts,
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        src_port=src_port,
-                        dst_port=dst_port,
-                        protocol=protocol,
-                        offset=match.start(),
-                        kind="URL-Encoded",
-                        encoded=token,
-                        decoded=decoded_text,
-                        note="url-decode",
-                    ))
+                    hits.append(
+                        SecretHit(
+                            packet_number=total_packets,
+                            ts=ts,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            src_port=src_port,
+                            dst_port=dst_port,
+                            protocol=protocol,
+                            offset=match.start(),
+                            kind="URL-Encoded",
+                            encoded=token,
+                            decoded=decoded_text,
+                            note="url-decode",
+                        )
+                    )
                 else:
                     truncated = True
 
@@ -483,6 +576,144 @@ def analyze_secrets(
         except Exception:
             pass
 
+    top_sources: Counter[str] = Counter()
+    top_destinations: Counter[str] = Counter()
+    protocol_counts: Counter[str] = Counter()
+    encoded_reuse: Counter[str] = Counter()
+    deterministic_checks: dict[str, list[str]] = {
+        "cleartext_credentials_in_decoded_secrets": [],
+        "token_or_session_material": [],
+        "private_key_or_cryptographic_material": [],
+        "command_execution_or_lolbin_in_secrets": [],
+        "c2_or_exfil_markers_in_decoded_payloads": [],
+        "external_public_secret_flow": [],
+        "ot_ics_secret_transport_or_context": [],
+        "ctf_flag_or_challenge_markers": [],
+        "multi_stage_decoding_chain": [],
+        "high_reuse_or_staging_pattern": [],
+    }
+    threat_hypotheses: list[dict[str, object]] = []
+    ot_findings: list[str] = []
+    ctf_indicators: list[str] = []
+
+    for hit in hits:
+        src = str(hit.src_ip or "-")
+        dst = str(hit.dst_ip or "-")
+        proto = str(hit.protocol or "-")
+        top_sources[src] += 1
+        top_destinations[dst] += 1
+        protocol_counts[proto] += 1
+        encoded_reuse[str(hit.encoded)] += 1
+
+        decoded_blob = f"{hit.decoded}\n{hit.encoded}"
+        lower_blob = decoded_blob.lower()
+        if CRED_KV_RE.search(decoded_blob):
+            deterministic_checks["cleartext_credentials_in_decoded_secrets"].append(
+                f"pkt {hit.packet_number} {src}->{dst} decoded credential-like key/value"
+            )
+        if TOKEN_RE.search(decoded_blob):
+            deterministic_checks["token_or_session_material"].append(
+                f"pkt {hit.packet_number} {src}->{dst} token/session markers in decoded payload"
+            )
+        if PRIVATE_KEY_RE.search(decoded_blob) or "ssh-rsa" in lower_blob:
+            deterministic_checks["private_key_or_cryptographic_material"].append(
+                f"pkt {hit.packet_number} {src}->{dst} private key/crypto material signature"
+            )
+        if LOLBIN_RE.search(decoded_blob):
+            deterministic_checks["command_execution_or_lolbin_in_secrets"].append(
+                f"pkt {hit.packet_number} {src}->{dst} execution/lolbin command string"
+            )
+        if C2_RE.search(decoded_blob) or EXFIL_RE.search(decoded_blob):
+            deterministic_checks["c2_or_exfil_markers_in_decoded_payloads"].append(
+                f"pkt {hit.packet_number} {src}->{dst} C2/exfil marker in decoded payload"
+            )
+        if ("+" in hit.note and "decompress" in hit.note.lower()) or (
+            "+" in hit.note and "decode" in hit.note.lower()
+        ):
+            deterministic_checks["multi_stage_decoding_chain"].append(
+                f"pkt {hit.packet_number} {src}->{dst} multi-stage decoding path ({hit.note})"
+            )
+        if _is_public_ip(dst):
+            deterministic_checks["external_public_secret_flow"].append(
+                f"pkt {hit.packet_number} {src}->{dst} decoded secret material to public destination"
+            )
+        if OT_RE.search(decoded_blob):
+            ot_line = (
+                f"pkt {hit.packet_number} {src}->{dst} OT/ICS marker in decoded content"
+            )
+            deterministic_checks["ot_ics_secret_transport_or_context"].append(ot_line)
+            if ot_line not in ot_findings and len(ot_findings) < 20:
+                ot_findings.append(ot_line)
+        if CTF_RE.search(decoded_blob):
+            ctf_line = f"pkt {hit.packet_number} {src}->{dst} CTF flag-like marker in decoded content"
+            deterministic_checks["ctf_flag_or_challenge_markers"].append(ctf_line)
+            if ctf_line not in ctf_indicators and len(ctf_indicators) < 20:
+                ctf_indicators.append(ctf_line)
+        for url in URL_RE.findall(decoded_blob):
+            try:
+                host = urllib.parse.urlsplit(url).hostname or ""
+            except Exception:
+                host = ""
+            if host and _is_public_ip(host):
+                deterministic_checks["external_public_secret_flow"].append(
+                    f"pkt {hit.packet_number} URL host is public IP ({host}) in decoded secret payload"
+                )
+
+    for encoded_value, count in encoded_reuse.items():
+        if count >= 3:
+            preview = encoded_value[:40] + ("..." if len(encoded_value) > 40 else "")
+            deterministic_checks["high_reuse_or_staging_pattern"].append(
+                f"Encoded token reused {count} times: {preview}"
+            )
+
+    for key, values in list(deterministic_checks.items()):
+        deterministic_checks[key] = list(dict.fromkeys(values))
+
+    if (
+        deterministic_checks["cleartext_credentials_in_decoded_secrets"]
+        and deterministic_checks["c2_or_exfil_markers_in_decoded_payloads"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Credential-bearing decoded payloads with C2/exfil semantics",
+                "confidence": "high",
+                "evidence": len(
+                    deterministic_checks["cleartext_credentials_in_decoded_secrets"]
+                )
+                + len(deterministic_checks["c2_or_exfil_markers_in_decoded_payloads"]),
+            }
+        )
+    if (
+        deterministic_checks["token_or_session_material"]
+        and deterministic_checks["external_public_secret_flow"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Token/session material transmitted toward external/public infrastructure",
+                "confidence": "medium",
+                "evidence": len(deterministic_checks["token_or_session_material"])
+                + len(deterministic_checks["external_public_secret_flow"]),
+            }
+        )
+    if deterministic_checks["ot_ics_secret_transport_or_context"]:
+        threat_hypotheses.append(
+            {
+                "hypothesis": "OT/ICS context appears in decoded secret-bearing payloads",
+                "confidence": "medium",
+                "evidence": len(
+                    deterministic_checks["ot_ics_secret_transport_or_context"]
+                ),
+            }
+        )
+    if deterministic_checks["ctf_flag_or_challenge_markers"]:
+        threat_hypotheses.append(
+            {
+                "hypothesis": "CTF/challenge markers embedded in reversible secret payloads",
+                "confidence": "low",
+                "evidence": len(deterministic_checks["ctf_flag_or_challenge_markers"]),
+            }
+        )
+
     return SecretsSummary(
         path=path,
         total_packets=total_packets,
@@ -490,5 +721,12 @@ def analyze_secrets(
         hits=hits,
         truncated=truncated,
         kind_counts=kind_counts,
+        top_sources=top_sources,
+        top_destinations=top_destinations,
+        protocol_counts=protocol_counts,
+        deterministic_checks=deterministic_checks,
+        threat_hypotheses=threat_hypotheses,
+        ot_findings=ot_findings,
+        ctf_indicators=ctf_indicators,
         errors=errors,
     )

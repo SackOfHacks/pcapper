@@ -1,19 +1,19 @@
 from __future__ import annotations
 
+import ipaddress
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-import ipaddress
 
 try:
-    from scapy.layers.inet import TCP, UDP, IP
+    from scapy.layers.inet import IP, TCP, UDP
     from scapy.packet import Raw
 except ImportError:  # pragma: no cover - scapy optional at runtime
     TCP = UDP = IP = Raw = None
 
 from .equipment import equipment_artifacts
-from .industrial_helpers import IndustrialArtifact, IndustrialAnomaly
+from .industrial_helpers import IndustrialAnomaly, IndustrialArtifact
 from .pcap_cache import get_reader
 from .utils import safe_float
 
@@ -450,7 +450,7 @@ def _parse_cpf_with_meta(data: bytes) -> tuple[Optional[bytes], bool, list[int],
     ptr += 2
     if ptr + 2 > len(data):
         return None, False, [], True
-    item_count = int.from_bytes(data[ptr:ptr + 2], "little")
+    item_count = int.from_bytes(data[ptr : ptr + 2], "little")
     ptr += 2
     cip_payload: Optional[bytes] = None
     is_connected = False
@@ -460,8 +460,8 @@ def _parse_cpf_with_meta(data: bytes) -> tuple[Optional[bytes], bool, list[int],
         if ptr + 4 > len(data):
             malformed = True
             break
-        item_type = int.from_bytes(data[ptr:ptr + 2], "little")
-        item_length = int.from_bytes(data[ptr + 2:ptr + 4], "little")
+        item_type = int.from_bytes(data[ptr : ptr + 2], "little")
+        item_length = int.from_bytes(data[ptr + 2 : ptr + 4], "little")
         ptr += 4
         item_types.append(item_type)
         if ptr + item_length > len(data):
@@ -469,7 +469,7 @@ def _parse_cpf_with_meta(data: bytes) -> tuple[Optional[bytes], bool, list[int],
             item_data = data[ptr:]
             ptr = len(data)
         else:
-            item_data = data[ptr:ptr + item_length]
+            item_data = data[ptr : ptr + item_length]
             ptr += item_length
         if item_type in {0x00B1, 0x00B2, 0x00B4}:
             if cip_payload is None or len(item_data) > len(cip_payload):
@@ -509,7 +509,7 @@ def _parse_enip_details(payload: bytes) -> dict[str, object]:
     status = int.from_bytes(payload[8:12], "little")
     actual_length = max(0, len(payload) - 24)
     read_length = min(length, actual_length)
-    encap_data = payload[24:24 + read_length]
+    encap_data = payload[24 : 24 + read_length]
     is_cip_carrier = command in ENIP_CIP_COMMANDS
 
     info["command"] = command
@@ -528,7 +528,9 @@ def _parse_enip_details(payload: bytes) -> dict[str, object]:
     info["cpf_malformed"] = False
 
     if is_cip_carrier:
-        cip_payload, is_connected, item_types, cpf_malformed = _parse_cpf_with_meta(encap_data)
+        cip_payload, is_connected, item_types, cpf_malformed = _parse_cpf_with_meta(
+            encap_data
+        )
         info["cip_payload"] = cip_payload
         info["is_connected"] = is_connected
         info["cpf_item_types"] = item_types
@@ -536,7 +538,9 @@ def _parse_enip_details(payload: bytes) -> dict[str, object]:
     return info
 
 
-def _parse_enip(payload: bytes) -> tuple[Optional[int], Optional[str], Optional[int], Optional[bytes], bool]:
+def _parse_enip(
+    payload: bytes,
+) -> tuple[Optional[int], Optional[str], Optional[int], Optional[bytes], bool]:
     info = _parse_enip_details(payload)
     return (
         info.get("command"),  # type: ignore[return-value]
@@ -566,7 +570,7 @@ def _bytes_to_path_string(path_bytes: bytes) -> str:
                 if seg_format & 0x80:
                     if idx + 1 >= len(path_bytes):
                         break
-                    value = int.from_bytes(path_bytes[idx:idx + 2], "little")
+                    value = int.from_bytes(path_bytes[idx : idx + 2], "little")
                     idx += 2
                 else:
                     value = seg_format
@@ -580,7 +584,7 @@ def _bytes_to_path_string(path_bytes: bytes) -> str:
                 if seg_format & 0x80:
                     if idx + 1 >= len(path_bytes):
                         break
-                    value = int.from_bytes(path_bytes[idx:idx + 2], "little")
+                    value = int.from_bytes(path_bytes[idx : idx + 2], "little")
                     idx += 2
                 else:
                     value = seg_format
@@ -589,7 +593,7 @@ def _bytes_to_path_string(path_bytes: bytes) -> str:
                 if seg_format & 0x80:
                     if idx + 1 >= len(path_bytes):
                         break
-                    value = int.from_bytes(path_bytes[idx:idx + 2], "little")
+                    value = int.from_bytes(path_bytes[idx : idx + 2], "little")
                     idx += 2
                 else:
                     value = seg_format
@@ -598,7 +602,7 @@ def _bytes_to_path_string(path_bytes: bytes) -> str:
                 if seg_format & 0x80:
                     if idx + 1 >= len(path_bytes):
                         break
-                    value = int.from_bytes(path_bytes[idx:idx + 2], "little")
+                    value = int.from_bytes(path_bytes[idx : idx + 2], "little")
                     idx += 2
                 else:
                     value = seg_format
@@ -607,11 +611,13 @@ def _bytes_to_path_string(path_bytes: bytes) -> str:
                 if seg_format & 0x80:
                     if idx + 1 >= len(path_bytes):
                         break
-                    value = int.from_bytes(path_bytes[idx:idx + 2], "little")
+                    value = int.from_bytes(path_bytes[idx : idx + 2], "little")
                     idx += 2
                 else:
                     value = seg_format
-                attr_name = CIP_ATTRIBUTE_NAMES.get(current_class_id or -1, {}).get(value)
+                attr_name = CIP_ATTRIBUTE_NAMES.get(current_class_id or -1, {}).get(
+                    value
+                )
                 if attr_name:
                     segments.append(f"Attribute:{value}({attr_name})")
                 else:
@@ -622,7 +628,7 @@ def _bytes_to_path_string(path_bytes: bytes) -> str:
             symbol_len = seg_format
             if idx + symbol_len > len(path_bytes):
                 break
-            symbol = path_bytes[idx:idx + symbol_len].decode("ascii", errors="ignore")
+            symbol = path_bytes[idx : idx + symbol_len].decode("ascii", errors="ignore")
             idx += symbol_len
             if symbol_len % 2 and idx < len(path_bytes):
                 idx += 1
@@ -634,7 +640,7 @@ def _bytes_to_path_string(path_bytes: bytes) -> str:
             idx += 1
             if idx + symbol_len > len(path_bytes):
                 break
-            symbol = path_bytes[idx:idx + symbol_len].decode("utf-8", errors="ignore")
+            symbol = path_bytes[idx : idx + symbol_len].decode("utf-8", errors="ignore")
             idx += symbol_len
             if symbol_len % 2 and idx < len(path_bytes):
                 idx += 1
@@ -703,7 +709,7 @@ def _parse_multiple_service_packet(payload: bytes, limit: int = 16) -> list[int]
         return []
     offsets: list[int] = []
     for idx in range(count):
-        offset = int.from_bytes(payload[2 + (idx * 2):4 + (idx * 2)], "little")
+        offset = int.from_bytes(payload[2 + (idx * 2) : 4 + (idx * 2)], "little")
         offsets.append(offset)
     service_codes: list[int] = []
     for offset in offsets[: max(1, limit)]:
@@ -729,11 +735,24 @@ def _flatten_path_words(words: bytes) -> bytes:
         return b""
     result = bytearray()
     for idx in range(0, len(words), 2):
-        result.extend(words[idx:idx + 2])
+        result.extend(words[idx : idx + 2])
     return bytes(result[: len(words)])
 
 
-def _parse_cip_message(payload: bytes) -> tuple[Optional[int], Optional[str], bool, Optional[int], Optional[str], Optional[int], Optional[int], Optional[int], str, bytes]:
+def _parse_cip_message(
+    payload: bytes,
+) -> tuple[
+    Optional[int],
+    Optional[str],
+    bool,
+    Optional[int],
+    Optional[str],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    str,
+    bytes,
+]:
     service = None
     service_name = None
     is_request = True
@@ -745,7 +764,18 @@ def _parse_cip_message(payload: bytes) -> tuple[Optional[int], Optional[str], bo
     path_str = ""
 
     if not payload:
-        return service, service_name, is_request, general_status, general_status_text, class_id, instance_id, attribute_id, path_str, payload
+        return (
+            service,
+            service_name,
+            is_request,
+            general_status,
+            general_status_text,
+            class_id,
+            instance_id,
+            attribute_id,
+            path_str,
+            payload,
+        )
 
     service = payload[0]
     service_name = CIP_SERVICE_NAMES.get(service & 0x7F)
@@ -756,7 +786,7 @@ def _parse_cip_message(payload: bytes) -> tuple[Optional[int], Optional[str], bo
             path_size_words = payload[1]
             path_byte_len = path_size_words * 2
             if len(payload) >= 2 + path_byte_len:
-                path_bytes = payload[2:2 + path_byte_len]
+                path_bytes = payload[2 : 2 + path_byte_len]
                 flattened = _flatten_path_words(path_bytes)
                 path_str = _bytes_to_path_string(flattened)
                 idx = 0
@@ -768,23 +798,33 @@ def _parse_cip_message(payload: bytes) -> tuple[Optional[int], Optional[str], bo
                         segment_type = seg_type & 0x1F
                         if segment_type == 0x00:
                             if seg_format & 0x80 and idx + 1 < len(flattened):
-                                class_id = int.from_bytes(flattened[idx:idx + 2], "little")
+                                class_id = int.from_bytes(
+                                    flattened[idx : idx + 2], "little"
+                                )
                                 idx += 2
                             else:
                                 class_id = seg_format
                         elif segment_type == 0x01:
                             if seg_format & 0x80 and idx + 1 < len(flattened):
-                                instance_id = int.from_bytes(flattened[idx:idx + 2], "little")
+                                instance_id = int.from_bytes(
+                                    flattened[idx : idx + 2], "little"
+                                )
                                 idx += 2
                             else:
                                 instance_id = seg_format
                         elif segment_type == 0x04:
                             if seg_format & 0x80 and idx + 1 < len(flattened):
-                                attribute_id = int.from_bytes(flattened[idx:idx + 2], "little")
+                                attribute_id = int.from_bytes(
+                                    flattened[idx : idx + 2], "little"
+                                )
                                 idx += 2
                             else:
                                 attribute_id = seg_format
-                payload = payload[2 + path_byte_len:] if 2 + path_byte_len < len(payload) else b""
+                payload = (
+                    payload[2 + path_byte_len :]
+                    if 2 + path_byte_len < len(payload)
+                    else b""
+                )
             else:
                 payload = payload[2:] if len(payload) > 2 else b""
     else:
@@ -797,7 +837,18 @@ def _parse_cip_message(payload: bytes) -> tuple[Optional[int], Optional[str], bo
         else:
             payload = b""
 
-    return service, service_name, is_request, general_status, general_status_text, class_id, instance_id, attribute_id, path_str, payload
+    return (
+        service,
+        service_name,
+        is_request,
+        general_status,
+        general_status_text,
+        class_id,
+        instance_id,
+        attribute_id,
+        path_str,
+        payload,
+    )
 
 
 def _bucketize(values: list[int]) -> list[SizeBucket]:
@@ -810,7 +861,11 @@ def _bucketize(values: list[int]) -> list[SizeBucket]:
         min_val = min(entries) if entries else 0
         max_val = max(entries) if entries else 0
         pct = (count / total) * 100 if total else 0.0
-        buckets.append(SizeBucket(label=label, count=count, avg=avg, min=min_val, max=max_val, pct=pct))
+        buckets.append(
+            SizeBucket(
+                label=label, count=count, avg=avg, min=min_val, max=max_val, pct=pct
+            )
+        )
     return buckets
 
 
@@ -874,11 +929,17 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                     start_time = ts
                 last_time = ts
 
-                has_transport, src_ip, dst_ip, sport, dport, payload = _extract_transport(pkt)
+                has_transport, src_ip, dst_ip, sport, dport, payload = (
+                    _extract_transport(pkt)
+                )
                 if not has_transport:
                     continue
 
-                matches_port = sport in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT} or dport in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}
+                matches_port = sport in {
+                    CIP_TCP_PORT,
+                    CIP_UDP_PORT,
+                    CIP_SECURITY_PORT,
+                } or dport in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}
                 matches_signature = False
                 if payload and len(payload) >= 2:
                     cmd_guess = int.from_bytes(payload[0:2], "little")
@@ -912,7 +973,10 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                 ts=ts or 0.0,
                             )
                         )
-                    if sec_key not in security_sessions_seen and len(analysis.anomalies) < max_anomalies:
+                    if (
+                        sec_key not in security_sessions_seen
+                        and len(analysis.anomalies) < max_anomalies
+                    ):
                         security_sessions_seen.add(sec_key)
                         analysis.anomalies.append(
                             IndustrialAnomaly(
@@ -936,12 +1000,12 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                 if ts is not None:
                     session_last_ts[session_key] = ts
 
-                request_like = (dport in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}) and (
-                    sport not in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}
-                )
-                response_like = (sport in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}) and (
-                    dport not in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}
-                )
+                request_like = (
+                    dport in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}
+                ) and (sport not in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT})
+                response_like = (
+                    sport in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}
+                ) and (dport not in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT})
 
                 enip = _parse_enip_details(payload)
                 encap_command = enip.get("command")
@@ -958,7 +1022,9 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
 
                 if encap_command is not None:
                     cmd_label = str(encap_name or f"Encap 0x{int(encap_command):04x}")
-                    actor_ip = src_ip if request_like else dst_ip if response_like else src_ip
+                    actor_ip = (
+                        src_ip if request_like else dst_ip if response_like else src_ip
+                    )
                     analysis.enip_commands[cmd_label] += 1
                     src_enip_commands[actor_ip][cmd_label] += 1
                     src_commands[actor_ip][cmd_label] += 1
@@ -971,7 +1037,9 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         src_unregister_commands[actor_ip] += 1
 
                     if session_handle and len(analysis.artifacts) < 200:
-                        session_key = f"enip_session:{actor_ip}:{session_handle}:{cmd_label}"
+                        session_key = (
+                            f"enip_session:{actor_ip}:{session_handle}:{cmd_label}"
+                        )
                         if session_key not in seen_artifacts:
                             seen_artifacts.add(session_key)
                             analysis.artifacts.append(
@@ -985,9 +1053,14 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                             )
 
                 if encap_status is not None:
-                    status_text = str(enip.get("status_text") or f"0x{int(encap_status):08x}")
+                    status_text = str(
+                        enip.get("status_text") or f"0x{int(encap_status):08x}"
+                    )
                     analysis.status_codes[f"ENIP:{status_text}"] += 1
-                    if int(encap_status) != 0 and len(analysis.anomalies) < max_anomalies:
+                    if (
+                        int(encap_status) != 0
+                        and len(analysis.anomalies) < max_anomalies
+                    ):
                         analysis.anomalies.append(
                             IndustrialAnomaly(
                                 severity="LOW",
@@ -1011,7 +1084,11 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         )
                     )
 
-                if is_cip_carrier and cpf_malformed and len(analysis.anomalies) < max_anomalies:
+                if (
+                    is_cip_carrier
+                    and cpf_malformed
+                    and len(analysis.anomalies) < max_anomalies
+                ):
                     analysis.anomalies.append(
                         IndustrialAnomaly(
                             severity="MEDIUM",
@@ -1023,8 +1100,16 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         )
                     )
 
-                if is_cip_carrier and isinstance(cpf_item_types, list) and cpf_item_types and len(analysis.artifacts) < 200:
-                    item_names = [CPF_ITEM_TYPES.get(int(code), f"0x{int(code):04x}") for code in cpf_item_types[:4]]
+                if (
+                    is_cip_carrier
+                    and isinstance(cpf_item_types, list)
+                    and cpf_item_types
+                    and len(analysis.artifacts) < 200
+                ):
+                    item_names = [
+                        CPF_ITEM_TYPES.get(int(code), f"0x{int(code):04x}")
+                        for code in cpf_item_types[:4]
+                    ]
                     cpf_key = f"cpf_items:{','.join(str(int(code)) for code in cpf_item_types[:6])}"
                     if cpf_key not in seen_artifacts:
                         seen_artifacts.add(cpf_key)
@@ -1046,7 +1131,9 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                 parse_payload = b""
                 if is_cip_carrier and isinstance(cip_payload, (bytes, bytearray)):
                     parse_payload = bytes(cip_payload)
-                elif encap_command is None and isinstance(cip_payload, (bytes, bytearray)):
+                elif encap_command is None and isinstance(
+                    cip_payload, (bytes, bytearray)
+                ):
                     # Non-encapsulated/raw fallback for captures on unusual ports.
                     parse_payload = bytes(cip_payload)
 
@@ -1068,8 +1155,14 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
 
                 service_code = (service & 0x7F) if service is not None else None
                 tag_name = _extract_symbol(path_str)
-                is_request = bool(cip_is_request) if service is not None else (request_like or not response_like)
-                data_type_code, element_count, tag_offset = _parse_tag_payload(service_code, is_request, cip_payload)
+                is_request = (
+                    bool(cip_is_request)
+                    if service is not None
+                    else (request_like or not response_like)
+                )
+                data_type_code, element_count, tag_offset = _parse_tag_payload(
+                    service_code, is_request, cip_payload
+                )
                 data_type_name = _decode_cip_data_type(data_type_code)
 
                 if is_request:
@@ -1087,11 +1180,16 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                     analysis.cip_services[service_name] += 1
                     actor_ip = src_ip if is_request else dst_ip
                     src_commands[actor_ip][service_name] += 1
-                    endpoints = analysis.service_endpoints.setdefault(service_name, Counter())
+                    endpoints = analysis.service_endpoints.setdefault(
+                        service_name, Counter()
+                    )
                     endpoints[f"{src_ip} -> {dst_ip}"] += 1
 
                     if is_request and service_code is not None:
-                        is_write_service = service_code in WRITE_SERVICE_CODES or service_code in HIGH_RISK_SERVICE_CODES
+                        is_write_service = (
+                            service_code in WRITE_SERVICE_CODES
+                            or service_code in HIGH_RISK_SERVICE_CODES
+                        )
                         if service_code in HIGH_RISK_SERVICE_CODES:
                             analysis.high_risk_services[service_name] += 1
                             analysis.source_risky_commands[src_ip] += 1
@@ -1108,12 +1206,18 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         if service_code == 0x0A:
                             sub_codes = _parse_multiple_service_packet(cip_payload)
                             if sub_codes:
-                                sub_names = [CIP_SERVICE_NAMES.get(code, f"Service 0x{code:02x}") for code in sub_codes]
+                                sub_names = [
+                                    CIP_SERVICE_NAMES.get(code, f"Service 0x{code:02x}")
+                                    for code in sub_codes
+                                ]
                                 msp_detail = ", ".join(sub_names[:6])
                                 if len(sub_names) > 6:
                                     msp_detail = f"{msp_detail} (+{len(sub_names) - 6})"
                                 msp_key = f"msp:{src_ip}:{dst_ip}:{msp_detail}"
-                                if msp_key not in seen_artifacts and len(analysis.artifacts) < 200:
+                                if (
+                                    msp_key not in seen_artifacts
+                                    and len(analysis.artifacts) < 200
+                                ):
                                     seen_artifacts.add(msp_key)
                                     analysis.artifacts.append(
                                         IndustrialArtifact(
@@ -1127,22 +1231,37 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                 for sub_code, sub_name in zip(sub_codes, sub_names):
                                     msp_service_name = f"MSP/{sub_name}"
                                     analysis.cip_services[msp_service_name] += 1
-                                    msp_eps = analysis.service_endpoints.setdefault(msp_service_name, Counter())
+                                    msp_eps = analysis.service_endpoints.setdefault(
+                                        msp_service_name, Counter()
+                                    )
                                     msp_eps[f"{src_ip} -> {dst_ip}"] += 1
                                     if sub_code in HIGH_RISK_SERVICE_CODES:
-                                        analysis.high_risk_services[msp_service_name] += 1
+                                        analysis.high_risk_services[
+                                            msp_service_name
+                                        ] += 1
                                         analysis.source_risky_commands[src_ip] += 1
                                     if sub_code in ENUMERATION_SERVICE_CODES:
-                                        analysis.suspicious_services[msp_service_name] += 1
+                                        analysis.suspicious_services[
+                                            msp_service_name
+                                        ] += 1
                                         analysis.source_enum_commands[src_ip] += 1
                                     if sub_code in CONTROL_SERVICE_CODES:
                                         src_control_commands[src_ip] += 1
                                     if sub_code in PROGRAM_SERVICE_CODES:
                                         src_program_commands[src_ip] += 1
-                                    if sub_code in WRITE_SERVICE_CODES or sub_code in HIGH_RISK_SERVICE_CODES:
+                                    if (
+                                        sub_code in WRITE_SERVICE_CODES
+                                        or sub_code in HIGH_RISK_SERVICE_CODES
+                                    ):
                                         src_write_commands[src_ip] += 1
 
-                                if any(code in HIGH_RISK_SERVICE_CODES for code in sub_codes) and len(analysis.anomalies) < max_anomalies:
+                                if (
+                                    any(
+                                        code in HIGH_RISK_SERVICE_CODES
+                                        for code in sub_codes
+                                    )
+                                    and len(analysis.anomalies) < max_anomalies
+                                ):
                                     analysis.anomalies.append(
                                         IndustrialAnomaly(
                                             severity="HIGH",
@@ -1172,9 +1291,15 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                 target_key = "|".join(target_parts)
                                 if target_key not in asset_write_targets[asset_key]:
                                     asset_write_targets[asset_key].add(target_key)
-                                    if asset_write_counts[asset_key] >= WRITE_BASELINE_MIN:
+                                    if (
+                                        asset_write_counts[asset_key]
+                                        >= WRITE_BASELINE_MIN
+                                    ):
                                         anomaly_key = f"{asset_key}:{target_key}"
-                                        if anomaly_key not in write_target_anoms_seen and len(analysis.anomalies) < max_anomalies:
+                                        if (
+                                            anomaly_key not in write_target_anoms_seen
+                                            and len(analysis.anomalies) < max_anomalies
+                                        ):
                                             write_target_anoms_seen.add(anomaly_key)
                                             analysis.anomalies.append(
                                                 IndustrialAnomaly(
@@ -1187,12 +1312,22 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                                 )
                                             )
 
-                        sensitive_token = _match_sensitive_tag(tag_name if is_write_service else None)
+                        sensitive_token = _match_sensitive_tag(
+                            tag_name if is_write_service else None
+                        )
                         if sensitive_token:
                             sensitive_key = f"{src_ip}:{dst_ip}:{tag_name}:{service_name}:{sensitive_token}"
-                            if sensitive_key not in sensitive_write_seen and len(analysis.anomalies) < max_anomalies:
+                            if (
+                                sensitive_key not in sensitive_write_seen
+                                and len(analysis.anomalies) < max_anomalies
+                            ):
                                 sensitive_write_seen.add(sensitive_key)
-                                severity = "HIGH" if sensitive_token in {"safety", "sif", "estop", "trip", "interlock"} else "MEDIUM"
+                                severity = (
+                                    "HIGH"
+                                    if sensitive_token
+                                    in {"safety", "sif", "estop", "trip", "interlock"}
+                                    else "MEDIUM"
+                                )
                                 analysis.anomalies.append(
                                     IndustrialAnomaly(
                                         severity=severity,
@@ -1204,7 +1339,10 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                     )
                                 )
                             artifact_key = f"sensitive_tag_write:{tag_name}:{sensitive_token}:{service_name}"
-                            if artifact_key not in seen_artifacts and len(analysis.artifacts) < 200:
+                            if (
+                                artifact_key not in seen_artifacts
+                                and len(analysis.artifacts) < 200
+                            ):
                                 seen_artifacts.add(artifact_key)
                                 analysis.artifacts.append(
                                     IndustrialArtifact(
@@ -1225,7 +1363,9 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                     if instance_id is not None:
                         detail = f"{detail} Instance {instance_id}"
                     if attribute_id is not None:
-                        attr_name = CIP_ATTRIBUTE_NAMES.get(class_id, {}).get(attribute_id)
+                        attr_name = CIP_ATTRIBUTE_NAMES.get(class_id, {}).get(
+                            attribute_id
+                        )
                         if attr_name:
                             detail = f"{detail} Attribute {attribute_id} ({attr_name})"
                         else:
@@ -1244,7 +1384,10 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         )
                     if class_id in CIP_SAFETY_CLASS_IDS:
                         safety_key = f"cip_safety:{class_id}"
-                        if safety_key not in seen_artifacts and len(analysis.artifacts) < 200:
+                        if (
+                            safety_key not in seen_artifacts
+                            and len(analysis.artifacts) < 200
+                        ):
                             seen_artifacts.add(safety_key)
                             analysis.artifacts.append(
                                 IndustrialArtifact(
@@ -1255,7 +1398,13 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                     ts=ts or 0.0,
                                 )
                             )
-                        if is_request and service_code in WRITE_SERVICE_CODES | CONTROL_SERVICE_CODES | HIGH_RISK_SERVICE_CODES:
+                        if (
+                            is_request
+                            and service_code
+                            in WRITE_SERVICE_CODES
+                            | CONTROL_SERVICE_CODES
+                            | HIGH_RISK_SERVICE_CODES
+                        ):
                             if len(analysis.anomalies) < max_anomalies:
                                 analysis.anomalies.append(
                                     IndustrialAnomaly(
@@ -1269,7 +1418,10 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                 )
                     if class_id in CIP_SECURITY_CLASS_IDS:
                         security_key = f"cip_security:{class_id}"
-                        if security_key not in seen_artifacts and len(analysis.artifacts) < 200:
+                        if (
+                            security_key not in seen_artifacts
+                            and len(analysis.artifacts) < 200
+                        ):
                             seen_artifacts.add(security_key)
                             analysis.artifacts.append(
                                 IndustrialArtifact(
@@ -1280,7 +1432,13 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                     ts=ts or 0.0,
                                 )
                             )
-                        if is_request and service_code in WRITE_SERVICE_CODES | CONTROL_SERVICE_CODES | HIGH_RISK_SERVICE_CODES:
+                        if (
+                            is_request
+                            and service_code
+                            in WRITE_SERVICE_CODES
+                            | CONTROL_SERVICE_CODES
+                            | HIGH_RISK_SERVICE_CODES
+                        ):
                             if len(analysis.anomalies) < max_anomalies:
                                 analysis.anomalies.append(
                                     IndustrialAnomaly(
@@ -1324,7 +1482,10 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                 ts=ts or 0.0,
                             )
                         )
-                    if service_code in {0x4B, 0x4C, 0x4D, 0x4E, 0x4F} and len(analysis.artifacts) < 200:
+                    if (
+                        service_code in {0x4B, 0x4C, 0x4D, 0x4E, 0x4F}
+                        and len(analysis.artifacts) < 200
+                    ):
                         op_parts = [f"tag={tag_name}"]
                         if data_type_name:
                             op_parts.append(f"type={data_type_name}")
@@ -1333,7 +1494,11 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         if tag_offset is not None:
                             op_parts.append(f"offset={tag_offset}")
                         if is_request:
-                            op_kind = "tag_write" if service_code in {0x4C, 0x4E, 0x4F} else "tag_read"
+                            op_kind = (
+                                "tag_write"
+                                if service_code in {0x4C, 0x4E, 0x4F}
+                                else "tag_read"
+                            )
                         else:
                             op_kind = "tag_response"
                         detail = " ".join(op_parts)
@@ -1351,8 +1516,16 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                             )
 
                 if encap_command in {0x0004, 0x0063}:
-                    identity_payload = encap_data if isinstance(encap_data, (bytes, bytearray)) else cip_payload
-                    ascii_text = _format_ascii(bytes(identity_payload), limit=180) if identity_payload else ""
+                    identity_payload = (
+                        encap_data
+                        if isinstance(encap_data, (bytes, bytearray))
+                        else cip_payload
+                    )
+                    ascii_text = (
+                        _format_ascii(bytes(identity_payload), limit=180)
+                        if identity_payload
+                        else ""
+                    )
                     if ascii_text:
                         key = f"identity:{ascii_text}"
                         if key not in seen_artifacts and len(analysis.artifacts) < 200:
@@ -1382,10 +1555,18 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                             )
                         )
 
-                if service is not None and is_request and (service & 0x7F) in SUSPICIOUS_SERVICE_CODES:
-                    severity = "HIGH" if (service & 0x7F) in {0x74, 0x75, 0x05} else "MEDIUM"
+                if (
+                    service is not None
+                    and is_request
+                    and (service & 0x7F) in SUSPICIOUS_SERVICE_CODES
+                ):
+                    severity = (
+                        "HIGH" if (service & 0x7F) in {0x74, 0x75, 0x05} else "MEDIUM"
+                    )
                     title = "Suspicious CIP Service"
-                    description = f"{service_name or f'Service 0x{service:02x}'} observed"
+                    description = (
+                        f"{service_name or f'Service 0x{service:02x}'} observed"
+                    )
                     if tag_name:
                         description = f"{description} tag={tag_name}"
                     elif path_str:
@@ -1475,7 +1656,10 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                     )
                 )
 
-        if req_count >= 50 and any(cmd in {"RegisterSession", "ListIdentity", "ListServices", "ListInterfaces"} for cmd in src_enip_commands.get(src, {})):
+        if req_count >= 50 and any(
+            cmd in {"RegisterSession", "ListIdentity", "ListServices", "ListInterfaces"}
+            for cmd in src_enip_commands.get(src, {})
+        ):
             if len(analysis.anomalies) < max_anomalies:
                 analysis.anomalies.append(
                     IndustrialAnomaly(
@@ -1490,7 +1674,11 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
 
     for src, enum_count in analysis.source_enip_enum_commands.items():
         unique_dsts = len(src_dst_counts.get(src, {}))
-        if enum_count >= 20 and unique_dsts >= 4 and len(analysis.anomalies) < max_anomalies:
+        if (
+            enum_count >= 20
+            and unique_dsts >= 4
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="MEDIUM",
@@ -1550,7 +1738,11 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
 
     for src, recon_count in src_recon_errors.items():
         unique_dsts = len(src_dst_counts.get(src, {}))
-        if recon_count >= 10 and unique_dsts >= 3 and len(analysis.anomalies) < max_anomalies:
+        if (
+            recon_count >= 10
+            and unique_dsts >= 3
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="MEDIUM",
@@ -1600,7 +1792,7 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
         if avg <= 0:
             continue
         variance = sum((x - avg) ** 2 for x in intervals) / len(intervals)
-        cv = (variance ** 0.5) / avg
+        cv = (variance**0.5) / avg
         if cv <= 0.2 and 1.0 <= avg <= 300.0:
             src_part, dst_part = session_key.split(" -> ", 1)
             src_ip = src_part.split(":", 1)[0]
@@ -1657,7 +1849,11 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
     for src, control_count in src_control_commands.items():
         req_count = src_requests.get(src, 0)
         ratio = (control_count / req_count) if req_count else 0.0
-        if control_count >= 5 and ratio >= 0.1 and len(analysis.anomalies) < max_anomalies:
+        if (
+            control_count >= 5
+            and ratio >= 0.1
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="HIGH",
@@ -1685,7 +1881,11 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
     for src, write_count in src_write_commands.items():
         req_count = src_requests.get(src, 0)
         ratio = (write_count / req_count) if req_count else 0.0
-        if write_count >= 20 and ratio >= 0.3 and len(analysis.anomalies) < max_anomalies:
+        if (
+            write_count >= 20
+            and ratio >= 0.3
+            and len(analysis.anomalies) < max_anomalies
+        ):
             analysis.anomalies.append(
                 IndustrialAnomaly(
                     severity="HIGH",

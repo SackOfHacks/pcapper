@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import statistics
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections import Counter, defaultdict
 from typing import Optional
-import statistics
 
-from .utils import safe_float
-from .modbus import analyze_modbus
 from .dnp3 import analyze_dnp3
+from .modbus import analyze_modbus
+from .utils import safe_float
 
 
 @dataclass(frozen=True)
@@ -72,7 +72,7 @@ def _iqr(values: list[float]) -> Optional[float]:
         sorted_vals = sorted(values)
         mid = len(sorted_vals) // 2
         lower = sorted_vals[:mid]
-        upper = sorted_vals[mid + (len(sorted_vals) % 2):]
+        upper = sorted_vals[mid + (len(sorted_vals) % 2) :]
         q1 = statistics.median(lower) if lower else sorted_vals[0]
         q3 = statistics.median(upper) if upper else sorted_vals[-1]
         return float(q3 - q1)
@@ -80,7 +80,9 @@ def _iqr(values: list[float]) -> Optional[float]:
         return None
 
 
-def _normalize_change(protocol: str, item: dict[str, object]) -> dict[str, object] | None:
+def _normalize_change(
+    protocol: str, item: dict[str, object]
+) -> dict[str, object] | None:
     target = str(item.get("target") or "").strip()
     if not target:
         group = item.get("group")
@@ -177,7 +179,9 @@ def build_control_loop_summary(
 
             if delta is not None:
                 abs_delta = abs(float(delta))
-                large_threshold = max(1000.0, median_delta * 10.0) if median_delta else 1000.0
+                large_threshold = (
+                    max(1000.0, median_delta * 10.0) if median_delta else 1000.0
+                )
                 if abs_delta >= large_threshold:
                     findings.append(
                         ControlLoopFinding(
@@ -236,7 +240,11 @@ def build_control_loop_summary(
             last_vals.append((new_val, ts))
             if len(last_vals) >= 3:
                 prev_prev_val, prev_prev_ts = last_vals[-3]
-                if prev_prev_val is not None and new_val is not None and prev_prev_val == new_val:
+                if (
+                    prev_prev_val is not None
+                    and new_val is not None
+                    and prev_prev_val == new_val
+                ):
                     if prev_prev_ts is not None and ts is not None:
                         delta_ts = float(ts) - float(prev_prev_ts)
                         if 0.0 <= delta_ts <= 60.0:
@@ -342,7 +350,9 @@ def analyze_control_loop(path: Path, show_status: bool = True) -> ControlLoopSum
     )
 
 
-def merge_control_loop_summaries(summaries: list[ControlLoopSummary]) -> ControlLoopSummary:
+def merge_control_loop_summaries(
+    summaries: list[ControlLoopSummary],
+) -> ControlLoopSummary:
     if not summaries:
         return ControlLoopSummary(
             path=Path("ALL_PCAPS"),

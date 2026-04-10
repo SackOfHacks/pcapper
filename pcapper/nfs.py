@@ -1,21 +1,20 @@
 from __future__ import annotations
 
+import struct
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-import struct
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
     from scapy.layers.inet6 import IPv6
-    from scapy.packet import Raw, Packet
+    from scapy.packet import Packet, Raw
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
 
 from .pcap_cache import get_reader
-from .utils import safe_float, decode_payload, counter_inc, set_add_cap
-
+from .utils import counter_inc, decode_payload, safe_float, set_add_cap
 
 RPC_CALL = 0
 RPC_REPLY = 1
@@ -213,7 +212,7 @@ def _strip_record_marker(payload: bytes) -> bytes:
     marker = int.from_bytes(payload[:4], "big")
     length = marker & 0x7FFFFFFF
     if length <= len(payload) - 4:
-        return payload[4:4 + length]
+        return payload[4 : 4 + length]
     return payload
 
 
@@ -231,11 +230,11 @@ def _parse_auth_unix(blob: bytes) -> Tuple[Optional[str], Optional[int], Optiona
         offset = 8
         name = None
         if name_len > 0 and offset + name_len <= len(blob):
-            name = decode_payload(blob[offset:offset + name_len], encoding="latin-1")
+            name = decode_payload(blob[offset : offset + name_len], encoding="latin-1")
         offset = _rpc_align(offset + name_len)
         if offset + 8 <= len(blob):
-            uid = struct.unpack(">I", blob[offset:offset + 4])[0]
-            gid = struct.unpack(">I", blob[offset + 4:offset + 8])[0]
+            uid = struct.unpack(">I", blob[offset : offset + 4])[0]
+            gid = struct.unpack(">I", blob[offset + 4 : offset + 8])[0]
             return name, uid, gid
     except Exception:
         pass
@@ -350,8 +349,16 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
 
             total_packets += 1
             if TCP in pkt or UDP in pkt:
-                sport = getattr(pkt[TCP], "sport", None) if TCP in pkt else getattr(pkt[UDP], "sport", None)
-                dport = getattr(pkt[TCP], "dport", None) if TCP in pkt else getattr(pkt[UDP], "dport", None)
+                sport = (
+                    getattr(pkt[TCP], "sport", None)
+                    if TCP in pkt
+                    else getattr(pkt[UDP], "sport", None)
+                )
+                dport = (
+                    getattr(pkt[TCP], "dport", None)
+                    if TCP in pkt
+                    else getattr(pkt[UDP], "dport", None)
+                )
                 if sport != NFS_PORT and dport != NFS_PORT:
                     continue
                 payload = b""
@@ -359,7 +366,11 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
                     payload = bytes(pkt[Raw])
                 else:
                     try:
-                        payload = bytes(pkt[TCP].payload) if TCP in pkt else bytes(pkt[UDP].payload)
+                        payload = (
+                            bytes(pkt[TCP].payload)
+                            if TCP in pkt
+                            else bytes(pkt[UDP].payload)
+                        )
                     except Exception:
                         payload = b""
                 if not payload:
@@ -429,7 +440,11 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
 
                     cred_flavor = struct.unpack(">I", rpc_payload[24:28])[0]
                     cred_len = struct.unpack(">I", rpc_payload[28:32])[0]
-                    cred_blob = rpc_payload[32:32 + cred_len] if cred_len <= len(rpc_payload) else b""
+                    cred_blob = (
+                        rpc_payload[32 : 32 + cred_len]
+                        if cred_len <= len(rpc_payload)
+                        else b""
+                    )
 
                     if cred_flavor == AUTH_UNIX:
                         name, uid, gid = _parse_auth_unix(cred_blob)
@@ -439,21 +454,64 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
                         if uid is not None:
                             set_add_cap(cli.uids, uid)
                             if uid == 0:
-                                anomalies.append(NfsAnomaly("HIGH", "NFS Root UID", f"Root UID used by {client}", total_packets, client, server))
+                                anomalies.append(
+                                    NfsAnomaly(
+                                        "HIGH",
+                                        "NFS Root UID",
+                                        f"Root UID used by {client}",
+                                        total_packets,
+                                        client,
+                                        server,
+                                    )
+                                )
                         if gid is not None:
                             set_add_cap(cli.gids, gid)
                     elif cred_flavor == AUTH_NULL:
-                        anomalies.append(NfsAnomaly("MEDIUM", "NFS NULL Auth", f"Null authentication from {client}", total_packets, client, server))
+                        anomalies.append(
+                            NfsAnomaly(
+                                "MEDIUM",
+                                "NFS NULL Auth",
+                                f"Null authentication from {client}",
+                                total_packets,
+                                client,
+                                server,
+                            )
+                        )
 
-                    sess = NfsSession(client_ip=client, server_ip=server, xid=xid, start_ts=ts, end_ts=None, procedure=proc_name, status=None)
+                    sess = NfsSession(
+                        client_ip=client,
+                        server_ip=server,
+                        xid=xid,
+                        start_ts=ts,
+                        end_ts=None,
+                        procedure=proc_name,
+                        status=None,
+                    )
                     sessions[xid] = sess
 
-                    strings = _extract_strings(rpc_payload[32 + _rpc_align(cred_len):])
+                    strings = _extract_strings(rpc_payload[32 + _rpc_align(cred_len) :])
                     for text in strings:
                         if "/" in text or "." in text:
                             set_add_cap(artifacts, text)
-                            if proc_name in {"LOOKUP", "CREATE", "REMOVE", "MKDIR", "RMDIR", "RENAME", "READ", "WRITE"}:
-                                files.append(NfsFileOp(action=proc_name, name=text, client_ip=client, server_ip=server, ts=ts))
+                            if proc_name in {
+                                "LOOKUP",
+                                "CREATE",
+                                "REMOVE",
+                                "MKDIR",
+                                "RMDIR",
+                                "RENAME",
+                                "READ",
+                                "WRITE",
+                            }:
+                                files.append(
+                                    NfsFileOp(
+                                        action=proc_name,
+                                        name=text,
+                                        client_ip=client,
+                                        server_ip=server,
+                                        ts=ts,
+                                    )
+                                )
 
                 elif msg_type == RPC_REPLY and len(rpc_payload) >= 12:
                     reply_stat = struct.unpack(">I", rpc_payload[8:12])[0]
@@ -461,7 +519,9 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
                         verifier_len = struct.unpack(">I", rpc_payload[16:20])[0]
                         offset = 20 + _rpc_align(verifier_len)
                         if offset + 4 <= len(rpc_payload):
-                            accept_stat = struct.unpack(">I", rpc_payload[offset:offset + 4])[0]
+                            accept_stat = struct.unpack(
+                                ">I", rpc_payload[offset : offset + 4]
+                            )[0]
                             status_text = NFS_STATUS.get(accept_stat, f"{accept_stat}")
                             counter_inc(status_codes, status_text)
                             counter_inc(responses, "REPLY")
@@ -474,9 +534,27 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
                                 sess.status = status_text
 
                             if accept_stat == 13:
-                                anomalies.append(NfsAnomaly("MEDIUM", "NFS Access Denied", f"Access denied from {server}", total_packets, server, client))
+                                anomalies.append(
+                                    NfsAnomaly(
+                                        "MEDIUM",
+                                        "NFS Access Denied",
+                                        f"Access denied from {server}",
+                                        total_packets,
+                                        server,
+                                        client,
+                                    )
+                                )
                             if accept_stat == 30:
-                                anomalies.append(NfsAnomaly("LOW", "NFS Read-only", f"ROFS from {server}", total_packets, server, client))
+                                anomalies.append(
+                                    NfsAnomaly(
+                                        "LOW",
+                                        "NFS Read-only",
+                                        f"ROFS from {server}",
+                                        total_packets,
+                                        server,
+                                        client,
+                                    )
+                                )
 
     except Exception as e:
         errors.append(str(e))

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import struct
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import struct
 
 from .pcap_cache import get_reader
 from .utils import safe_float
@@ -97,7 +97,7 @@ def _read_ber_length(data: bytes, idx: int) -> tuple[Optional[int], int]:
     count = first & 0x7F
     if count == 0 or idx + count > len(data):
         return None, idx
-    length = int.from_bytes(data[idx:idx + count], "big")
+    length = int.from_bytes(data[idx : idx + count], "big")
     idx += count
     return length, idx
 
@@ -112,7 +112,7 @@ def _parse_goose_tlvs(data: bytes, result: dict[str, object], depth: int = 0) ->
         length, idx = _read_ber_length(data, idx)
         if length is None or idx + length > len(data):
             break
-        value = data[idx:idx + length]
+        value = data[idx : idx + length]
         idx += length
 
         tag_name = GOOSE_TAGS.get(tag)
@@ -165,7 +165,9 @@ def _decode_bit_string(value: bytes) -> str:
     return bits
 
 
-def _decode_all_data(data: bytes, depth: int = 0, limit: int = 24) -> list[tuple[str, str]]:
+def _decode_all_data(
+    data: bytes, depth: int = 0, limit: int = 24
+) -> list[tuple[str, str]]:
     if depth > 4 or not data:
         return []
     values: list[tuple[str, str]] = []
@@ -176,7 +178,7 @@ def _decode_all_data(data: bytes, depth: int = 0, limit: int = 24) -> list[tuple
         length, idx = _read_ber_length(data, idx)
         if length is None or idx + length > len(data):
             break
-        value = data[idx:idx + length]
+        value = data[idx : idx + length]
         idx += length
 
         if tag & 0x20:
@@ -268,7 +270,9 @@ def analyze_goose(path: Path, show_status: bool = True) -> GooseSummary:
             None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     goose_packets = 0
     src_macs: Counter[str] = Counter()
@@ -372,50 +376,64 @@ def analyze_goose(path: Path, show_status: bool = True) -> GooseSummary:
                     sample = f"{dtype}={value}"
                     data_value_samples[sample] += 1
 
-            if appid is not None and isinstance(st_num, int) and isinstance(sq_num, int):
+            if (
+                appid is not None
+                and isinstance(st_num, int)
+                and isinstance(sq_num, int)
+            ):
                 key = (src_mac, f"0x{appid:04x}", dataset or gocb_ref or "-")
                 prev = state_map.get(key)
                 if prev:
                     prev_st, prev_sq = prev
                     if st_num < prev_st:
-                        detections.append({
-                            "severity": "warning",
-                            "summary": "GOOSE State Number Decrease",
-                            "details": f"{key[0]} {key[2]} stNum decreased {prev_st}->{st_num}.",
-                        })
+                        detections.append(
+                            {
+                                "severity": "warning",
+                                "summary": "GOOSE State Number Decrease",
+                                "details": f"{key[0]} {key[2]} stNum decreased {prev_st}->{st_num}.",
+                            }
+                        )
                     if st_num == prev_st and sq_num < prev_sq:
-                        detections.append({
-                            "severity": "warning",
-                            "summary": "GOOSE Sequence Reset",
-                            "details": f"{key[0]} {key[2]} sqNum decreased {prev_sq}->{sq_num}.",
-                        })
+                        detections.append(
+                            {
+                                "severity": "warning",
+                                "summary": "GOOSE Sequence Reset",
+                                "details": f"{key[0]} {key[2]} sqNum decreased {prev_sq}->{sq_num}.",
+                            }
+                        )
                 state_map[key] = (st_num, sq_num)
                 if isinstance(conf_rev, int):
                     prev_conf = conf_map.get(key)
                     if prev_conf is not None and conf_rev != prev_conf:
-                        detections.append({
-                            "severity": "warning",
-                            "summary": "GOOSE Config Revision Change",
-                            "details": f"{key[0]} {key[2]} confRev changed {prev_conf}->{conf_rev}.",
-                        })
+                        detections.append(
+                            {
+                                "severity": "warning",
+                                "summary": "GOOSE Config Revision Change",
+                                "details": f"{key[0]} {key[2]} confRev changed {prev_conf}->{conf_rev}.",
+                            }
+                        )
                     conf_map[key] = conf_rev
                 if isinstance(num_entries_val, int):
                     prev_entries = entries_map.get(key)
                     if prev_entries is not None and num_entries_val != prev_entries:
-                        detections.append({
-                            "severity": "warning",
-                            "summary": "GOOSE Dataset Size Change",
-                            "details": f"{key[0]} {key[2]} numDatSetEntries changed {prev_entries}->{num_entries_val}.",
-                        })
+                        detections.append(
+                            {
+                                "severity": "warning",
+                                "summary": "GOOSE Dataset Size Change",
+                                "details": f"{key[0]} {key[2]} numDatSetEntries changed {prev_entries}->{num_entries_val}.",
+                            }
+                        )
                     entries_map[key] = num_entries_val
                 if isinstance(data_len, int):
                     prev_len = data_len_map.get(key)
                     if prev_len is not None and data_len != prev_len:
-                        detections.append({
-                            "severity": "warning",
-                            "summary": "GOOSE Dataset Payload Size Change",
-                            "details": f"{key[0]} {key[2]} allData length changed {prev_len}->{data_len}.",
-                        })
+                        detections.append(
+                            {
+                                "severity": "warning",
+                                "summary": "GOOSE Dataset Payload Size Change",
+                                "details": f"{key[0]} {key[2]} allData length changed {prev_len}->{data_len}.",
+                            }
+                        )
                     data_len_map[key] = data_len
 
     finally:
@@ -423,26 +441,36 @@ def analyze_goose(path: Path, show_status: bool = True) -> GooseSummary:
         reader.close()
 
     if goose_packets:
-        detections.append({
-            "severity": "info",
-            "summary": "IEC 61850 GOOSE traffic observed",
-            "details": f"{goose_packets} GOOSE frames detected at L2.",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "IEC 61850 GOOSE traffic observed",
+                "details": f"{goose_packets} GOOSE frames detected at L2.",
+            }
+        )
     for src_mac, appid_set in src_appids.items():
         if len(appid_set) >= 5:
-            detections.append({
-                "severity": "warning",
-                "summary": "GOOSE Source Uses Many AppIDs",
-                "details": f"{src_mac} advertised {len(appid_set)} AppIDs (possible spoofing or misconfiguration).",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "GOOSE Source Uses Many AppIDs",
+                    "details": f"{src_mac} advertised {len(appid_set)} AppIDs (possible spoofing or misconfiguration).",
+                }
+            )
     if unicast_dsts:
-        detections.append({
-            "severity": "warning",
-            "summary": "GOOSE Unicast Destinations",
-            "details": f"Unicast MAC destinations observed: {', '.join(sorted(unicast_dsts)[:5])}.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "GOOSE Unicast Destinations",
+                "details": f"Unicast MAC destinations observed: {', '.join(sorted(unicast_dsts)[:5])}.",
+            }
+        )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return GooseSummary(
         path=path,
         total_packets=total_packets,

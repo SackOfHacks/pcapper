@@ -1,52 +1,65 @@
 from __future__ import annotations
 
+import json
+import struct
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
-from collections import Counter, defaultdict
-import json
-import struct
 
-from .bacnet import analyze_bacnet, BACNET_PORT, _parse_commands as _parse_bacnet_commands
+from .bacnet import BACNET_PORT, analyze_bacnet
+from .bacnet import _parse_commands as _parse_bacnet_commands
 from .cip import (
-    analyze_cip,
+    CIP_SECURITY_PORT,
     CIP_TCP_PORT,
     CIP_UDP_PORT,
-    CIP_SECURITY_PORT,
-    _parse_enip,
     _parse_cip_message,
+    _parse_enip,
+    analyze_cip,
 )
-from .coap import analyze_coap, COAP_PORTS, _parse_commands as _parse_coap_commands
+from .coap import COAP_PORTS, analyze_coap
+from .coap import _parse_commands as _parse_coap_commands
 from .df1 import analyze_df1
 from .dnp3 import (
-    analyze_dnp3,
-    DNP3_PORT,
-    FUNC_CODES as DNP3_FUNC_CODES,
+    APP_CONTROL_FUNCTIONS,
     CONTROL_FUNCTIONS,
+    DNP3_PORT,
+    FILE_FUNCTIONS,
     FREEZE_FUNCTIONS,
     RESTART_FUNCTIONS,
-    APP_CONTROL_FUNCTIONS,
-    FILE_FUNCTIONS,
     TIME_FUNCTIONS,
+    analyze_dnp3,
 )
-from .ethercat import analyze_ethercat, WRITE_COMMANDS as ETHERCAT_WRITE_COMMANDS
-from .fins import analyze_fins, FINS_PORT, _parse_commands as _parse_fins_commands
-from .iec104 import analyze_iec104, IEC104_PORT, ASDU_TYPES, _parse_commands as _parse_iec104_commands
+from .dnp3 import (
+    FUNC_CODES as DNP3_FUNC_CODES,
+)
+from .ethercat import WRITE_COMMANDS as ETHERCAT_WRITE_COMMANDS
+from .ethercat import analyze_ethercat
+from .fins import FINS_PORT, analyze_fins
+from .fins import _parse_commands as _parse_fins_commands
+from .iec104 import ASDU_TYPES, IEC104_PORT, analyze_iec104
+from .iec104 import _parse_commands as _parse_iec104_commands
 from .industrial_helpers import _extract_transport
-from .melsec import analyze_melsec, MELSEC_TCP_PORT, MELSEC_UDP_PORT, _parse_commands as _parse_melsec_commands
-from .mms import analyze_mms, MMS_PORT, _parse_mms_commands as _parse_mms_commands
-from .modbus import analyze_modbus, MODBUS_TCP_PORT, FUNC_NAMES as MODBUS_FUNC_NAMES
+from .melsec import MELSEC_TCP_PORT, MELSEC_UDP_PORT, analyze_melsec
+from .melsec import _parse_commands as _parse_melsec_commands
+from .mms import MMS_PORT, analyze_mms
+from .mms import _parse_mms_commands as _parse_mms_commands
+from .modbus import FUNC_NAMES as MODBUS_FUNC_NAMES
+from .modbus import MODBUS_TCP_PORT, analyze_modbus
 from .modicon import analyze_modicon
-from .mqtt import analyze_mqtt, MQTT_PORTS, _parse_commands as _parse_mqtt_commands
+from .mqtt import MQTT_PORTS, analyze_mqtt
+from .mqtt import _parse_commands as _parse_mqtt_commands
 from .niagara import analyze_niagara
 from .odesys import analyze_odesys
 from .opc import analyze_opc
-from .pcap_cache import load_filtered_packets, get_cached_packets, has_cached_packets
+from .pcap_cache import get_cached_packets, has_cached_packets, load_filtered_packets
 from .pccc import analyze_pccc
 from .pcworx import analyze_pcworx
 from .prconos import analyze_prconos
-from .profinet import analyze_profinet, PROFINET_PORTS, _parse_commands as _parse_profinet_commands
-from .s7 import analyze_s7, S7_PORT, _parse_commands as _parse_s7_commands
+from .profinet import PROFINET_PORTS, analyze_profinet
+from .profinet import _parse_commands as _parse_profinet_commands
+from .s7 import S7_PORT, analyze_s7
+from .s7 import _parse_commands as _parse_s7_commands
 from .srtp import analyze_srtp
 from .utils import safe_float
 from .yokogawa import analyze_yokogawa
@@ -97,8 +110,18 @@ WRITE_MARKERS = (
 )
 COAP_WRITE_MARKERS = ("put", "post")
 ETHERCAT_WRITE_MARKERS = tuple(marker.lower() for marker in ETHERCAT_WRITE_COMMANDS)
-DNP3_CONTROL_CODES = CONTROL_FUNCTIONS | FREEZE_FUNCTIONS | RESTART_FUNCTIONS | APP_CONTROL_FUNCTIONS | FILE_FUNCTIONS | TIME_FUNCTIONS
-DNP3_CONTROL_NAMES = {DNP3_FUNC_CODES.get(code) for code in DNP3_CONTROL_CODES if code in DNP3_FUNC_CODES}
+DNP3_CONTROL_CODES = (
+    CONTROL_FUNCTIONS
+    | FREEZE_FUNCTIONS
+    | RESTART_FUNCTIONS
+    | APP_CONTROL_FUNCTIONS
+    | FILE_FUNCTIONS
+    | TIME_FUNCTIONS
+)
+DNP3_CONTROL_NAMES = {
+    DNP3_FUNC_CODES.get(code) for code in DNP3_CONTROL_CODES if code in DNP3_FUNC_CODES
+}
+
 
 def _normalize_markers(values: object) -> list[str]:
     if not values:
@@ -167,7 +190,11 @@ def load_ot_control_config(path: Path) -> OtControlConfig:
             except Exception:
                 continue
             names.append(ASDU_TYPES.get(code_int, f"ASDU {code_int}"))
-        names.extend(str(item).strip() for item in (iec_cfg.get("names") or []) if str(item).strip())
+        names.extend(
+            str(item).strip()
+            for item in (iec_cfg.get("names") or [])
+            if str(item).strip()
+        )
         if names:
             proto_key = "IEC-104"
             existing = list(protocol_markers.get(proto_key, ()))
@@ -226,17 +253,23 @@ def _is_write_command(
     base_markers: tuple[str, ...] = WRITE_MARKERS,
 ) -> bool:
     lowered = text.lower()
-    return any(marker in lowered for marker in base_markers) or any(marker in lowered for marker in extra_markers)
+    return any(marker in lowered for marker in base_markers) or any(
+        marker in lowered for marker in extra_markers
+    )
 
 
-def _add_control_target(targets: dict[str, Counter[str]], proto: str, dst: str, detail: str) -> None:
+def _add_control_target(
+    targets: dict[str, Counter[str]], proto: str, dst: str, detail: str
+) -> None:
     clean_detail = detail.strip() if detail else ""
     if not clean_detail:
         clean_detail = "control"
     targets.setdefault(proto, Counter())[f"{dst} :: {clean_detail}"] += 1
 
 
-def _compute_control_intensity(timestamps: list[float], window_seconds: float = 60.0) -> tuple[float | None, int]:
+def _compute_control_intensity(
+    timestamps: list[float], window_seconds: float = 60.0
+) -> tuple[float | None, int]:
     if not timestamps:
         return None, 0
     times = sorted(timestamps)
@@ -307,7 +340,15 @@ def _count_from_events(
             dst = str(getattr(item, "dst", "-"))
             sources[src] += 1
             destinations[dst] += 1
-            _track_session(session_counts, session_times, label, src, dst, getattr(item, "ts", None), control_timestamps)
+            _track_session(
+                session_counts,
+                session_times,
+                label,
+                src,
+                dst,
+                getattr(item, "ts", None),
+                control_timestamps,
+            )
             if control_targets is not None:
                 detail = target_formatter(command) if target_formatter else command
                 _add_control_target(control_targets, label, dst, detail)
@@ -350,7 +391,13 @@ def _count_from_industrial(
     control_targets: dict[str, Counter[str]] | None = None,
     target_formatter: Callable[[str], str] | None = None,
 ) -> None:
-    _count_from_counter(getattr(summary, "commands", Counter()), label, command_counts, extra_markers, base_markers)
+    _count_from_counter(
+        getattr(summary, "commands", Counter()),
+        label,
+        command_counts,
+        extra_markers,
+        base_markers,
+    )
     _count_from_events(
         getattr(summary, "command_events", []) or [],
         sources,
@@ -366,23 +413,25 @@ def _count_from_industrial(
     )
 
 
-FAST_PORTS = sorted({
-    MODBUS_TCP_PORT,
-    DNP3_PORT,
-    IEC104_PORT,
-    BACNET_PORT,
-    FINS_PORT,
-    MELSEC_TCP_PORT,
-    MELSEC_UDP_PORT,
-    MMS_PORT,
-    S7_PORT,
-    CIP_TCP_PORT,
-    CIP_UDP_PORT,
-    CIP_SECURITY_PORT,
-    *COAP_PORTS,
-    *MQTT_PORTS,
-    *PROFINET_PORTS,
-})
+FAST_PORTS = sorted(
+    {
+        MODBUS_TCP_PORT,
+        DNP3_PORT,
+        IEC104_PORT,
+        BACNET_PORT,
+        FINS_PORT,
+        MELSEC_TCP_PORT,
+        MELSEC_UDP_PORT,
+        MMS_PORT,
+        S7_PORT,
+        CIP_TCP_PORT,
+        CIP_UDP_PORT,
+        CIP_SECURITY_PORT,
+        *COAP_PORTS,
+        *MQTT_PORTS,
+        *PROFINET_PORTS,
+    }
+)
 FAST_PORT_SET = set(FAST_PORTS)
 
 
@@ -399,7 +448,9 @@ def _fast_modbus_command(payload: bytes) -> str | None:
     return MODBUS_FUNC_NAMES.get(func, f"Func {func}")
 
 
-def _fast_dnp3_command(payload: bytes, control_names: set[str]) -> tuple[str | None, bool]:
+def _fast_dnp3_command(
+    payload: bytes, control_names: set[str]
+) -> tuple[str | None, bool]:
     idx = payload.find(b"\x05\x64")
     if idx < 0:
         return None, False
@@ -414,14 +465,27 @@ def _fast_dnp3_command(payload: bytes, control_names: set[str]) -> tuple[str | N
 def _fast_cip_commands(payload: bytes) -> list[str]:
     commands: list[str] = []
     try:
-        encap_command, encap_name, _status, cip_payload, _is_connected = _parse_enip(payload)
+        encap_command, encap_name, _status, cip_payload, _is_connected = _parse_enip(
+            payload
+        )
     except Exception:
         return commands
     if encap_name:
         commands.append(encap_name)
     if cip_payload:
         try:
-            _service, service_name, _is_request, _status, _status_text, _class_id, _instance_id, _attribute_id, _path, _payload = _parse_cip_message(cip_payload)
+            (
+                _service,
+                service_name,
+                _is_request,
+                _status,
+                _status_text,
+                _class_id,
+                _instance_id,
+                _attribute_id,
+                _path,
+                _payload,
+            ) = _parse_cip_message(cip_payload)
         except Exception:
             service_name = None
         if service_name:
@@ -439,11 +503,15 @@ def _analyze_ot_commands_fast(
     show_status: bool = True,
     config: OtControlConfig | None = None,
 ) -> OtCommandSummary:
-    base_markers = _merge_markers(WRITE_MARKERS, config.write_markers) if config else WRITE_MARKERS
+    base_markers = (
+        _merge_markers(WRITE_MARKERS, config.write_markers) if config else WRITE_MARKERS
+    )
     protocol_markers = config.protocol_markers if config else {}
     dnp3_control_names = {str(name).lower() for name in DNP3_CONTROL_NAMES if name}
     if config and config.dnp3_control_names:
-        dnp3_control_names.update({str(name).lower() for name in config.dnp3_control_names if name})
+        dnp3_control_names.update(
+            {str(name).lower() for name in config.dnp3_control_names if name}
+        )
 
     command_counts: Counter[str] = Counter()
     sources: Counter[str] = Counter()
@@ -469,7 +537,9 @@ def _analyze_ot_commands_fast(
                 bpf_status=bpf_status,
             )
         if bpf_status.get("error"):
-            fast_notes.append(f"BPF filter unavailable: {bpf_status['error']}. Falling back to full scan.")
+            fast_notes.append(
+                f"BPF filter unavailable: {bpf_status['error']}. Falling back to full scan."
+            )
     except Exception as exc:
         return OtCommandSummary(
             path=path,
@@ -496,7 +566,13 @@ def _analyze_ot_commands_fast(
         has_transport, src_ip, dst_ip, sport, dport, payload = _extract_transport(pkt)
         if not has_transport or not payload:
             continue
-        port = dport if dport in FAST_PORT_SET else sport if sport in FAST_PORT_SET else None
+        port = (
+            dport
+            if dport in FAST_PORT_SET
+            else sport
+            if sport in FAST_PORT_SET
+            else None
+        )
         ts = safe_float(getattr(pkt, "time", None))
 
         proto = None
@@ -570,27 +646,45 @@ def _analyze_ot_commands_fast(
             continue
 
         if proto == "CoAP":
-            proto_extra = _merge_markers(protocol_markers.get(proto.upper(), ()), COAP_WRITE_MARKERS)
+            proto_extra = _merge_markers(
+                protocol_markers.get(proto.upper(), ()), COAP_WRITE_MARKERS
+            )
         else:
             proto_extra = protocol_markers.get(proto.upper(), ())
 
         for cmd in commands:
-            is_control = command_gate(cmd) if command_gate else _is_write_command(cmd, proto_extra, base_markers)
+            is_control = (
+                command_gate(cmd)
+                if command_gate
+                else _is_write_command(cmd, proto_extra, base_markers)
+            )
             if not is_control:
                 continue
             command_counts[f"{proto}:{cmd}"] += 1
             sources[src_ip] += 1
             destinations[dst_ip] += 1
-            _track_session(command_sessions, command_session_times, proto, src_ip, dst_ip, ts, control_timestamps)
+            _track_session(
+                command_sessions,
+                command_session_times,
+                proto,
+                src_ip,
+                dst_ip,
+                ts,
+                control_timestamps,
+            )
             _add_control_target(control_targets, proto, dst_ip, cmd)
 
     detections: list[dict[str, object]] = []
     if command_counts:
-        detections.append({
-            "severity": "warning",
-            "summary": "OT control/write command activity observed (fast scan)",
-            "details": "; ".join(f"{cmd} ({count})" for cmd, count in command_counts.most_common(8)),
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "OT control/write command activity observed (fast scan)",
+                "details": "; ".join(
+                    f"{cmd} ({count})" for cmd, count in command_counts.most_common(8)
+                ),
+            }
+        )
 
     rate, burst = _compute_control_intensity(control_timestamps)
 
@@ -621,11 +715,15 @@ def analyze_ot_commands(
     if fast:
         return _analyze_ot_commands_fast(path, show_status=show_status, config=config)
 
-    base_markers = _merge_markers(WRITE_MARKERS, config.write_markers) if config else WRITE_MARKERS
+    base_markers = (
+        _merge_markers(WRITE_MARKERS, config.write_markers) if config else WRITE_MARKERS
+    )
     protocol_markers = config.protocol_markers if config else {}
     dnp3_control_names = {str(name).lower() for name in DNP3_CONTROL_NAMES if name}
     if config and config.dnp3_control_names:
-        dnp3_control_names.update({str(name).lower() for name in config.dnp3_control_names if name})
+        dnp3_control_names.update(
+            {str(name).lower() for name in config.dnp3_control_names if name}
+        )
 
     command_counts: Counter[str] = Counter()
     sources: Counter[str] = Counter()
@@ -648,41 +746,79 @@ def analyze_ot_commands(
 
     modbus = analyze_modbus(path, show_status=show_status)
     modbus_extra = _protocol_extra("Modbus")
-    _count_from_counter(modbus.func_counts, "Modbus", command_counts, modbus_extra, base_markers)
+    _count_from_counter(
+        modbus.func_counts, "Modbus", command_counts, modbus_extra, base_markers
+    )
     errors.extend(modbus.errors or [])
     for msg in getattr(modbus, "messages", []) or []:
-        if _is_write_command(str(getattr(msg, "func_name", "")), modbus_extra, base_markers):
+        if _is_write_command(
+            str(getattr(msg, "func_name", "")), modbus_extra, base_markers
+        ):
             src = str(getattr(msg, "src_ip", "-"))
             dst = str(getattr(msg, "dst_ip", "-"))
             sources[src] += 1
             destinations[dst] += 1
             detail = str(getattr(msg, "detail", "") or getattr(msg, "func_name", ""))
-            _track_session(command_sessions, command_session_times, "Modbus", src, dst, getattr(msg, "ts", None), control_timestamps)
+            _track_session(
+                command_sessions,
+                command_session_times,
+                "Modbus",
+                src,
+                dst,
+                getattr(msg, "ts", None),
+                control_timestamps,
+            )
             _add_control_target(control_targets, "Modbus", dst, detail)
 
     dnp3 = analyze_dnp3(path, show_status=show_status)
     dnp3_extra = _protocol_extra("DNP3")
     for key, count in dnp3.func_counts.items():
         key_text = str(key)
-        if key_text.lower() in dnp3_control_names or _is_write_command(key_text, dnp3_extra, base_markers):
+        if key_text.lower() in dnp3_control_names or _is_write_command(
+            key_text, dnp3_extra, base_markers
+        ):
             command_counts[f"DNP3:{key}"] += count
     errors.extend(dnp3.errors or [])
     for msg in getattr(dnp3, "messages", []) or []:
         func_name = str(getattr(msg, "func_name", ""))
-        if func_name.lower() in dnp3_control_names or _is_write_command(func_name, dnp3_extra, base_markers):
+        if func_name.lower() in dnp3_control_names or _is_write_command(
+            func_name, dnp3_extra, base_markers
+        ):
             src = str(getattr(msg, "src_ip", "-"))
             dst = str(getattr(msg, "dst_ip", "-"))
             sources[src] += 1
             destinations[dst] += 1
-            detail = str(getattr(msg, "object_summary", "") or getattr(msg, "func_name", ""))
-            _track_session(command_sessions, command_session_times, "DNP3", src, dst, getattr(msg, "ts", None), control_timestamps)
+            detail = str(
+                getattr(msg, "object_summary", "") or getattr(msg, "func_name", "")
+            )
+            _track_session(
+                command_sessions,
+                command_session_times,
+                "DNP3",
+                src,
+                dst,
+                getattr(msg, "ts", None),
+                control_timestamps,
+            )
             _add_control_target(control_targets, "DNP3", dst, detail)
 
     cip = analyze_cip(path, show_status=show_status)
     cip_extra = _protocol_extra("CIP")
     enip_extra = _protocol_extra("ENIP")
-    _count_from_counter(getattr(cip, "cip_services", Counter()), "CIP", command_counts, cip_extra, base_markers)
-    _count_from_counter(getattr(cip, "enip_commands", Counter()), "ENIP", command_counts, enip_extra, base_markers)
+    _count_from_counter(
+        getattr(cip, "cip_services", Counter()),
+        "CIP",
+        command_counts,
+        cip_extra,
+        base_markers,
+    )
+    _count_from_counter(
+        getattr(cip, "enip_commands", Counter()),
+        "ENIP",
+        command_counts,
+        enip_extra,
+        base_markers,
+    )
     errors.extend(getattr(cip, "errors", []) or [])
     _count_from_service_endpoints(
         getattr(cip, "service_endpoints", {}) or {},
@@ -1032,11 +1168,15 @@ def analyze_ot_commands(
 
     detections: list[dict[str, object]] = []
     if command_counts:
-        detections.append({
-            "severity": "warning",
-            "summary": "OT control/write command activity observed",
-            "details": "; ".join(f"{cmd} ({count})" for cmd, count in command_counts.most_common(8)),
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "OT control/write command activity observed",
+                "details": "; ".join(
+                    f"{cmd} ({count})" for cmd, count in command_counts.most_common(8)
+                ),
+            }
+        )
 
     rate, burst = _compute_control_intensity(control_timestamps)
 

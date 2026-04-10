@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import itertools
 import sys
 import threading
 import time
-import itertools
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -47,7 +47,9 @@ def should_show_statusbar() -> bool:
         return False
 
 
-def build_statusbar(path: Path, enabled: bool = True, desc: str | None = None) -> StatusBar:
+def build_statusbar(
+    path: Path, enabled: bool = True, desc: str | None = None
+) -> StatusBar:
     base_label = desc if desc else "Processing"
     label = f"{base_label} {path.name}".strip()
     return StatusBar(label=label, enabled=enabled and should_show_statusbar())
@@ -93,7 +95,9 @@ class BusyStatusBar:
             self._thread.join()
 
 
-def build_busy_statusbar(path: Path, enabled: bool = True, desc: str | None = None) -> BusyStatusBar:
+def build_busy_statusbar(
+    path: Path, enabled: bool = True, desc: str | None = None
+) -> BusyStatusBar:
     base_label = desc if desc else "Processing"
     label = f"{base_label} {path.name}".strip()
     return BusyStatusBar(label=label, enabled=enabled and should_show_statusbar())

@@ -5,12 +5,12 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, get_reader
-from .utils import safe_float, decode_payload
+from .utils import decode_payload, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
-    from scapy.packet import Raw, Packet  # type: ignore
+    from scapy.packet import Packet, Raw  # type: ignore
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
     Packet = object  # type: ignore
@@ -150,7 +150,9 @@ def analyze_search(
             path, packets=packets, meta=meta, show_status=show_status
         )
     except Exception as exc:
-        return SearchSummary(path, query, 0, 0, [], False, [f"Error opening pcap: {exc}"])
+        return SearchSummary(
+            path, query, 0, 0, [], False, [f"Error opening pcap: {exc}"]
+        )
 
     total_packets = 0
     matches = 0

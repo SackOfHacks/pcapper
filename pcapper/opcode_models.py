@@ -48,7 +48,9 @@ class OpcodeModel:
                 op_end = op_start + self.opcode_size
                 if op_start < 0 or op_end > len(payload):
                     continue
-                opcode = int.from_bytes(payload[op_start:op_end], self.opcode_endian, signed=False)
+                opcode = int.from_bytes(
+                    payload[op_start:op_end], self.opcode_endian, signed=False
+                )
                 label = self.opcodes.get(opcode)
                 results.append((opcode, label, op_start))
         return results

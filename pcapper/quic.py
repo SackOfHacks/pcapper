@@ -58,9 +58,24 @@ def _parse_version(payload: bytes) -> Optional[str]:
 
 def analyze_quic(path: Path, show_status: bool = True) -> QuicSummary:
     if UDP is None:
-        return QuicSummary(path, 0, 0, Counter(), Counter(), Counter(), Counter(), [], ["Scapy UDP unavailable"], None, None, None)
+        return QuicSummary(
+            path,
+            0,
+            0,
+            Counter(),
+            Counter(),
+            Counter(),
+            Counter(),
+            [],
+            ["Scapy UDP unavailable"],
+            None,
+            None,
+            None,
+        )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     quic_packets = 0
     clients: Counter[str] = Counter()
@@ -130,13 +145,19 @@ def analyze_quic(path: Path, show_status: bool = True) -> QuicSummary:
         reader.close()
 
     if quic_packets:
-        detections.append({
-            "severity": "info",
-            "summary": "QUIC traffic observed",
-            "details": f"{quic_packets} QUIC-like packets detected; check for HTTP/3 usage.",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "QUIC traffic observed",
+                "details": f"{quic_packets} QUIC-like packets detected; check for HTTP/3 usage.",
+            }
+        )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return QuicSummary(
         path=path,
         total_packets=total_packets,

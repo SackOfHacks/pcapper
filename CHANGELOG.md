@@ -6,6 +6,35 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 1.7.0 — 2026-04-10
+### Added
+- New identity mapping workflows: `--ip` (`-mac`) and `--mac` (`-ip`) for clean MAC↔IP summaries, including unique pair reporting, counts, manufacturer enrichment, and hostnames where available.
+- Function-scoped help behavior for better CLI discoverability (for example `pcapper --streams -h` shows `--streams`-specific guidance).
+- Hostname-targeted lookup support with `--hostnames -name`.
+- TLS reporting now includes a certificate summary section with issuer/signer, subject identifiers, expiry, and common issues.
+
+### Changed
+- `--files -exe` now surfaces executable/active-content artifacts more reliably (including script-delivered payload patterns) and no longer depends on `-v` for full output visibility.
+- HTTP artifact name extraction now handles long extensionless high-entropy paths, improving response correlation for malware-style download URIs.
+- `--streams` follow mode simplified: removed `--follow`/`--follow-id` in favor of `-id` with `--streams`.
+- `--webrequests` output now includes packet numbers consistently across compact and detailed views, with richer filtered output for `-post`, `-ip`, and `-search`.
+- `--ips` default host table now focuses on practical host details (IP/MAC/hostname/services/traffic) and excludes TLS fingerprint noise.
+- `--services` default view now prioritizes confirmed services (full TCP handshake), with broader context behind verbose output.
+- Threat-hunting/timeline pivot wording/styling trimmed to reduce noise and emphasize retrieved suspicious artifacts.
+
+### Fixed
+- Corrected missed file detections where transfer URIs were extensionless tokens and content was present in HTTP responses.
+- Resolved multiple filter interaction issues so `-ip`, `-name`, `-port`, and `-search` operate independently across `--hostdetails`, `--hostnames`, `--http`, `--tls`, and `--files`.
+- Reduced false-positive DF1 security alerts by tightening DF1 traffic gating and correlation checks.
+
+## 1.6.6 — 2026-04-06
+### Added
+- New email forensics analyzer (`--email`) covering SMTP/POP3/IMAP artifacts including email addresses, usernames/passwords/secrets, subjects, attachments/files, and protocol activity.
+- Deterministic email security checks and risk matrix in report output for auth abuse, credential exposure, phishing indicators, suspicious attachments, exfil signals, and mail-server fan-out.
+
+### Changed
+- Release metadata/docs alignment updated for `v1.6.6`.
+
 ## 1.6.5 — 2026-04-06
 ### Added
 - New AIM analyzer (`--aim`) with forensic extraction of conversations, usernames, passwords/secrets, server/client stats, and correlated artifact summaries.
