@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -162,7 +162,6 @@ class RpcSummary:
     errors: list[str]
     deterministic_checks: dict[str, list[str]]
     threat_hypotheses: list[dict[str, object]]
-    hunting_pivots: list[dict[str, object]]
     benign_context: list[str]
     first_seen: Optional[float]
     last_seen: Optional[float]
@@ -221,7 +220,6 @@ class RpcSummary:
                 key: list(value) for key, value in self.deterministic_checks.items()
             },
             "threat_hypotheses": list(self.threat_hypotheses),
-            "hunting_pivots": list(self.hunting_pivots),
             "benign_context": list(self.benign_context),
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
@@ -489,7 +487,6 @@ def analyze_rpc(
             errors=errors,
             deterministic_checks={},
             threat_hypotheses=[],
-            hunting_pivots=[],
             benign_context=[],
             first_seen=None,
             last_seen=None,
@@ -557,16 +554,7 @@ def analyze_rpc(
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if not src_ip or not dst_ip:
                 continue
@@ -875,7 +863,6 @@ def analyze_rpc(
         "rpc_data_asymmetry_exfil": [],
     }
     threat_hypotheses: list[dict[str, object]] = []
-    hunting_pivots: list[dict[str, object]] = []
     benign_context: list[str] = []
 
     def _is_public_ip(value: str) -> bool:
@@ -889,25 +876,11 @@ def analyze_rpc(
             deterministic_checks["rpc_scanning_fanout"].append(
                 f"{src} contacted {len(dsts)} unique RPC endpoints"
             )
-            hunting_pivots.append(
-                {
-                    "pivot": "scanner_source",
-                    "source": src,
-                    "targets": len(dsts),
-                }
-            )
 
     for src, count in bind_failures.items():
         if count >= 5:
             deterministic_checks["rpc_bind_failure_burst"].append(
                 f"{src} received {count} bind_nak responses"
-            )
-            hunting_pivots.append(
-                {
-                    "pivot": "bind_failure_source",
-                    "source": src,
-                    "failures": int(count),
-                }
             )
 
     for server_ip, count in server_counts.items():
@@ -936,15 +909,6 @@ def analyze_rpc(
         deterministic_checks["rpc_samr_enum_activity"].append(
             f"SAMR fullname extraction results={len(samr_fullnames)}"
         )
-    for entry in samr_fullnames[:20]:
-        hunting_pivots.append(
-            {
-                "pivot": "samr_identity",
-                "identity": str(entry.get("full_name", "")),
-                "source": str(entry.get("src_ip", "")),
-                "target": str(entry.get("dst_ip", "")),
-            }
-        )
 
     for share, count in share_counts.most_common(20):
         if str(share).split("\\")[-1].endswith("$"):
@@ -959,13 +923,6 @@ def analyze_rpc(
             deterministic_checks["rpc_admin_share_or_pipe_access"].append(
                 f"Administrative named pipe {pipe} count={int(count)}"
             )
-            hunting_pivots.append(
-                {
-                    "pivot": "named_pipe",
-                    "pipe": str(pipe),
-                    "count": int(count),
-                }
-            )
 
     for flow, times in request_times.items():
         score = _beacon_score(times)
@@ -979,14 +936,6 @@ def analyze_rpc(
         if resp_bytes > 100_000 and resp_bytes > req_bytes * 5:
             deterministic_checks["rpc_data_asymmetry_exfil"].append(
                 f"{flow[0]}->{flow[1]} rpc response_bytes={int(resp_bytes)} request_bytes={int(req_bytes)}"
-            )
-            hunting_pivots.append(
-                {
-                    "pivot": "data_asymmetry_flow",
-                    "flow": f"{flow[0]}->{flow[1]}",
-                    "response_bytes": int(resp_bytes),
-                    "request_bytes": int(req_bytes),
-                }
             )
 
     if (
@@ -1089,7 +1038,6 @@ def analyze_rpc(
         errors=errors,
         deterministic_checks={k: v[:80] for k, v in deterministic_checks.items()},
         threat_hypotheses=threat_hypotheses[:24],
-        hunting_pivots=hunting_pivots[:150],
         benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,
@@ -1130,7 +1078,6 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
             errors=[],
             deterministic_checks={},
             threat_hypotheses=[],
-            hunting_pivots=[],
             benign_context=[],
             first_seen=None,
             last_seen=None,
@@ -1166,7 +1113,6 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
     errors: list[str] = []
     deterministic_checks: dict[str, list[str]] = defaultdict(list)
     threat_hypotheses: list[dict[str, object]] = []
-    hunting_pivots: list[dict[str, object]] = []
     benign_context: list[str] = []
 
     conv_map: dict[tuple[str, str, str, int], dict[str, object]] = {}
@@ -1225,9 +1171,6 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
         for item in list(getattr(summary, "threat_hypotheses", []) or []):
             if item not in threat_hypotheses:
                 threat_hypotheses.append(item)
-        for item in list(getattr(summary, "hunting_pivots", []) or []):
-            if item not in hunting_pivots:
-                hunting_pivots.append(item)
         for item in list(getattr(summary, "benign_context", []) or []):
             text = str(item).strip()
             if text and text not in benign_context:
@@ -1307,7 +1250,6 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
             key: values[:80] for key, values in deterministic_checks.items()
         },
         threat_hypotheses=threat_hypotheses[:24],
-        hunting_pivots=hunting_pivots[:150],
         benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,

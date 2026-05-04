@@ -10,7 +10,7 @@ from typing import Optional
 from .certificates import analyze_certificates
 from .pcap_cache import get_reader
 from .progress import run_with_busy_status
-from .utils import safe_float
+from .utils import extract_packet_endpoints, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -705,12 +705,9 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
 
-            src_ip = None
-            dst_ip = None
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
                 ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
                 ttl_val = int(getattr(ip_layer, "ttl", 0) or 0)
                 if ttl_val <= 1:
                     ttl_expired += 1
@@ -721,8 +718,6 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
                 ecn_counts[tos & 0x03] += 1
             elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
                 ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
                 hlim = int(getattr(ip_layer, "hlim", 0) or 0)
                 if hlim <= 1:
                     ttl_expired += 1

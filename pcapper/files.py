@@ -25,11 +25,16 @@ try:
     import dpkt
 except Exception:  # pragma: no cover
     dpkt = None
+try:
+    import pefile
+except Exception:  # pragma: no cover
+    pefile = None
 
 from .aim import analyze_aim
 from .cip import CIP_SERVICE_NAMES
 from .nfs import analyze_nfs
-from .utils import detect_file_type_bytes, safe_float
+from .pcap_cache import get_reader
+from .utils import detect_file_type_bytes, extract_packet_endpoints, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
@@ -93,6 +98,7 @@ class FileTransferSummary:
     views: List[Any]
     detections: List[Dict[str, str]]
     errors: List[str]
+    hashes: List[Dict[str, str]] = field(default_factory=list)
     deterministic_checks: Dict[str, List[str]] = field(default_factory=dict)
     reconstruction_issues: List[Dict[str, Any]] = field(default_factory=list)
     masquerade_signals: List[Dict[str, Any]] = field(default_factory=list)
@@ -114,6 +120,7 @@ def merge_files_summaries(summaries: List[FileTransferSummary]) -> FileTransferS
     artifacts: List[FileArtifact] = []
     detections: List[Dict[str, str]] = []
     errors: List[str] = []
+    hashes: List[Dict[str, str]] = []
     deterministic_checks: Dict[str, List[str]] = defaultdict(list)
     reconstruction_issues: List[Dict[str, Any]] = []
     masquerade_signals: List[Dict[str, Any]] = []
@@ -130,6 +137,7 @@ def merge_files_summaries(summaries: List[FileTransferSummary]) -> FileTransferS
         artifacts.extend(summary.artifacts)
         detections.extend(summary.detections)
         errors.extend(summary.errors)
+        hashes.extend(list(getattr(summary, "hashes", []) or []))
         checks = getattr(summary, "deterministic_checks", {}) or {}
         for key, values in checks.items():
             for value in values or []:
@@ -165,6 +173,7 @@ def merge_files_summaries(summaries: List[FileTransferSummary]) -> FileTransferS
         views=[],
         detections=detections,
         errors=sorted(set(errors)),
+        hashes=hashes,
         deterministic_checks={
             k: list(dict.fromkeys(v)) for k, v in deterministic_checks.items()
         },
@@ -222,6 +231,7 @@ AIM_FILE_SIGS = (
 FILE_TYPE_EXTENSIONS: dict[str, set[str]] = {
     "EXE/DLL": {".exe", ".dll", ".sys", ".scr", ".cpl", ".ocx"},
     "PDF": {".pdf"},
+    "RTF": {".rtf"},
     "ZIP/Office": {
         ".zip",
         ".docx",
@@ -1040,7 +1050,7 @@ def _scan_filenames(data: bytes) -> List[str]:
     # Extract likely filenames from binary blob
     found = set()
     # Expanded regex to capture more file types and characters (spaces, brackets, parens)
-    pattern = r"[\w\-.()\[\]]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|txt|bat|ps1|mkv|mp4|avi|mov|wmv|flv|webm|jpg|jpeg|png|gif|bmp|tiff|iso|img|tar|gz|7z|rar)"
+    pattern = r"[\w\-.()\[\]]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|txt|rtf|bat|ps1|mkv|mp4|avi|mov|wmv|flv|webm|jpg|jpeg|png|gif|bmp|tiff|iso|img|tar|gz|7z|rar)"
 
     # UTF-16 strings
     try:
@@ -1358,11 +1368,14 @@ def _guess_extension_from_content_type(content_type: str) -> Optional[str]:
     ct = content_type.split(";", 1)[0].strip().lower()
     mapping = {
         "text/plain": "txt",
+        "text/rtf": "rtf",
         "text/html": "html",
         "text/csv": "csv",
         "application/json": "json",
         "application/xml": "xml",
         "application/pdf": "pdf",
+        "application/rtf": "rtf",
+        "application/x-rtf": "rtf",
         "application/zip": "zip",
         "application/x-zip-compressed": "zip",
         "application/gzip": "gz",
@@ -1595,11 +1608,8 @@ class FileExtractor:
 
     def process_packet(self, pkt: Packet, idx: int):
         # IP/IPv6
-        if IP and pkt.haslayer(IP):
-            src, dst = pkt[IP].src, pkt[IP].dst
-        elif IPv6 and pkt.haslayer(IPv6):
-            src, dst = pkt[IPv6].src, pkt[IPv6].dst
-        else:
+        src, dst = extract_packet_endpoints(pkt)
+        if not src or not dst:
             return
 
         proto = "IP"
@@ -2413,6 +2423,74 @@ def _dpkt_ip_to_str(ip_obj: object) -> str:
     return str(ip_obj)
 
 
+def _decode_dpkt_ip_packet(buf: bytes, datalink: Optional[int]) -> Optional[object]:
+    if dpkt is None:
+        return None
+
+    dlt_en10mb = getattr(dpkt.pcap, "DLT_EN10MB", 1)
+    dlt_null = getattr(dpkt.pcap, "DLT_NULL", 0)
+    dlt_loop = getattr(dpkt.pcap, "DLT_LOOP", 108)
+    dlt_raw = getattr(dpkt.pcap, "DLT_RAW", 12)
+    dlt_linux_sll = getattr(dpkt.pcap, "DLT_LINUX_SLL", 113)
+
+    if datalink == dlt_en10mb:
+        try:
+            eth = dpkt.ethernet.Ethernet(buf)
+            if isinstance(eth.data, (dpkt.ip.IP, dpkt.ip6.IP6)):
+                return eth.data
+        except Exception:
+            return None
+
+    if datalink in {dlt_null, dlt_loop}:
+        # BSD loopback encapsulation prepends a 4-byte family value.
+        for candidate in (buf[4:], buf):
+            if not candidate:
+                continue
+            try:
+                return dpkt.ip.IP(candidate)
+            except Exception:
+                pass
+            try:
+                return dpkt.ip6.IP6(candidate)
+            except Exception:
+                pass
+        return None
+
+    if datalink == dlt_raw:
+        try:
+            return dpkt.ip.IP(buf)
+        except Exception:
+            pass
+        try:
+            return dpkt.ip6.IP6(buf)
+        except Exception:
+            return None
+
+    if datalink == dlt_linux_sll:
+        try:
+            sll = dpkt.sll.SLL(buf)
+            if isinstance(sll.data, (dpkt.ip.IP, dpkt.ip6.IP6)):
+                return sll.data
+        except Exception:
+            return None
+
+    # Fallbacks for unknown link types.
+    try:
+        eth = dpkt.ethernet.Ethernet(buf)
+        if isinstance(eth.data, (dpkt.ip.IP, dpkt.ip6.IP6)):
+            return eth.data
+    except Exception:
+        pass
+    try:
+        return dpkt.ip.IP(buf)
+    except Exception:
+        pass
+    try:
+        return dpkt.ip6.IP6(buf)
+    except Exception:
+        return None
+
+
 def _extract_pem_certs(data: bytes) -> List[bytes]:
     certs: List[bytes] = []
     begin = b"-----BEGIN CERTIFICATE-----"
@@ -2482,6 +2560,29 @@ def _normalize_x509_payload(payload: bytes) -> bytes:
     return payload
 
 
+def _compute_imphash(payload: bytes) -> Optional[str]:
+    if not payload or pefile is None:
+        return None
+    try:
+        pe = pefile.PE(data=payload, fast_load=True)
+        pe.parse_data_directories(
+            directories=[
+                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
+                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"],
+            ]
+        )
+        value = pe.get_imphash()
+        try:
+            pe.close()
+        except Exception:
+            pass
+        if value:
+            return str(value).lower()
+    except Exception:
+        return None
+    return None
+
+
 def _export_with_dpkt(
     path: Path,
     extract_name: Optional[str],
@@ -2489,15 +2590,17 @@ def _export_with_dpkt(
     view_name: Optional[str],
     view_raw: bool,
     show_status: bool,
+    hash_name: Optional[str],
     filter_ip: Optional[str] = None,
     packets: Optional[List[Packet]] = None,
 ) -> Optional[FileTransferSummary]:
     artifacts: List[FileArtifact] = []
     extracted_paths: List[Path] = []
     views: List[Any] = []
+    hashes: List[Dict[str, str]] = []
     detections: List[Dict[str, str]] = []
     errors: List[str] = []
-    need_payload = bool(extract_name or view_name)
+    need_payload = bool(extract_name or view_name or hash_name)
     seen_x509: set[str] = set()
     seen_x509_meta: set[tuple[str, str, str, int]] = set()
     enip_buffers: Dict[tuple[str, str, int, int, str, str], Dict[str, object]] = {}
@@ -2531,27 +2634,17 @@ def _export_with_dpkt(
                 except Exception:
                     handle.seek(0)
                     reader = dpkt.pcap.Reader(handle)
+                datalink = None
+                try:
+                    datalink = reader.datalink()
+                except Exception:
+                    datalink = None
                 idx = 0
                 for ts, buf in reader:
                     idx += 1
-                    ip = None
-                    try:
-                        eth = dpkt.ethernet.Ethernet(buf)
-                        if isinstance(eth.data, dpkt.ip.IP) or isinstance(
-                            eth.data, dpkt.ip6.IP6
-                        ):
-                            ip = eth.data
-                    except Exception:
-                        ip = None
-
+                    ip = _decode_dpkt_ip_packet(buf, datalink)
                     if ip is None:
-                        try:
-                            ip = dpkt.ip.IP(buf)
-                        except Exception:
-                            try:
-                                ip = dpkt.ip6.IP6(buf)
-                            except Exception:
-                                continue
+                        continue
 
                     if isinstance(ip, dpkt.ip.IP):
                         src_ip = _dpkt_ip_to_str(ip.src)
@@ -2591,15 +2684,8 @@ def _export_with_dpkt(
         idx = 0
         for pkt in packets:
             idx += 1
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            else:
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
+            if not src_ip or not dst_ip:
                 continue
             if not _in_scope(src_ip, dst_ip):
                 continue
@@ -3331,6 +3417,24 @@ def _export_with_dpkt(
                         }
                     )
 
+        if hash_name:
+            search = hash_name.lower()
+            for art in artifacts:
+                if not art.payload or search not in art.filename.lower():
+                    continue
+                hashes.append(
+                    {
+                        "filename": art.filename,
+                        "protocol": art.protocol,
+                        "src_ip": art.src_ip,
+                        "dst_ip": art.dst_ip,
+                        "packet_index": str(art.packet_index),
+                        "sha256": art.sha256 or hashlib.sha256(art.payload).hexdigest(),
+                        "md5": art.md5 or hashlib.md5(art.payload).hexdigest(),
+                        "imphash": _compute_imphash(art.payload) or "-",
+                    }
+                )
+
         detections.append(
             {
                 "severity": "info",
@@ -3348,6 +3452,7 @@ def _export_with_dpkt(
             views=views,
             detections=detections,
             errors=errors,
+            hashes=hashes,
         )
     return FileTransferSummary(
         path=path,
@@ -3358,6 +3463,126 @@ def _export_with_dpkt(
         views=views,
         detections=detections,
         errors=errors,
+        hashes=hashes,
+    )
+
+
+def _export_with_scapy(
+    path: Path,
+    show_status: bool = False,
+    filter_ip: Optional[str] = None,
+    packets: Optional[List[Packet]] = None,
+    hash_name: Optional[str] = None,
+) -> Optional[FileTransferSummary]:
+    if IP is None and IPv6 is None:
+        return None
+
+    extractor = FileExtractor(path)
+    errors: List[str] = []
+    detections: List[Dict[str, str]] = []
+    hashes: List[Dict[str, str]] = []
+
+    def _packet_in_scope(pkt: Packet) -> bool:
+        if not filter_ip:
+            return True
+        try:
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
+            if src_ip and dst_ip:
+                return filter_ip in {src_ip, dst_ip}
+        except Exception:
+            return False
+        return False
+
+    if packets is not None:
+        try:
+            for idx, pkt in enumerate(packets, start=1):
+                if _packet_in_scope(pkt):
+                    extractor.process_packet(pkt, idx)
+            extractor.finalize()
+        except Exception as exc:
+            errors.append(f"Scapy file extraction failed: {exc}")
+    else:
+        reader = None
+        status = None
+        try:
+            reader, status, _stream, _size_bytes, _file_type = get_reader(
+                path, show_status=show_status
+            )
+            for idx, pkt in enumerate(reader, start=1):
+                if _packet_in_scope(pkt):
+                    extractor.process_packet(pkt, idx)
+            extractor.finalize()
+        except Exception as exc:
+            errors.append(f"Scapy file extraction failed: {exc}")
+        finally:
+            try:
+                if status is not None:
+                    status.finish()
+            except Exception:
+                pass
+            try:
+                if reader is not None:
+                    reader.close()
+            except Exception:
+                pass
+
+    if extractor.artifacts:
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "Files extracted via Scapy fallback",
+                "details": "Fallback stream reconstruction was used to recover additional file artifacts.",
+                "source": "Files",
+            }
+        )
+        if hash_name:
+            search = hash_name.lower()
+            for art in extractor.artifacts:
+                if not art.payload or search not in str(art.filename).lower():
+                    continue
+                hashes.append(
+                    {
+                        "filename": art.filename,
+                        "protocol": art.protocol,
+                        "src_ip": art.src_ip,
+                        "dst_ip": art.dst_ip,
+                        "packet_index": str(art.packet_index),
+                        "sha256": art.sha256 or hashlib.sha256(art.payload).hexdigest(),
+                        "md5": art.md5 or hashlib.md5(art.payload).hexdigest(),
+                        "imphash": _compute_imphash(art.payload) or "-",
+                    }
+                )
+
+    return FileTransferSummary(
+        path=path,
+        total_candidates=len(extractor.candidates),
+        candidates=list(extractor.candidates),
+        artifacts=list(extractor.artifacts),
+        extracted=[],
+        views=[],
+        detections=list(extractor.detections) + detections,
+        errors=list(extractor.errors) + errors,
+        hashes=hashes,
+    )
+
+
+def _merge_export_summaries(
+    primary: FileTransferSummary, secondary: Optional[FileTransferSummary]
+) -> FileTransferSummary:
+    if secondary is None:
+        return primary
+    if not secondary.artifacts and not secondary.candidates and not secondary.detections:
+        return primary
+    return FileTransferSummary(
+        path=primary.path,
+        total_candidates=primary.total_candidates + secondary.total_candidates,
+        candidates=list(primary.candidates) + list(secondary.candidates),
+        artifacts=list(primary.artifacts) + list(secondary.artifacts),
+        extracted=list(primary.extracted) + list(secondary.extracted),
+        views=list(primary.views) + list(secondary.views),
+        detections=list(primary.detections) + list(secondary.detections),
+        errors=list(primary.errors) + list(secondary.errors),
+        hashes=list(primary.hashes) + list(secondary.hashes),
     )
 
 
@@ -3444,256 +3669,24 @@ def _is_public_ip(value: str) -> bool:
         return False
 
 
-def _build_files_hunting_context(
+def _build_files_enrichment(
     artifacts: List[FileArtifact],
     detections: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    checks: Dict[str, List[str]] = {
-        "reconstruction_confidence": [],
-        "multi_signal_masquerade": [],
-        "archive_container_abuse": [],
-        "macro_script_lolbas_staging": [],
-        "exfiltration_file_movement": [],
-        "lateral_copy_propagation": [],
-        "auth_file_correlation": [],
-        "reputation_or_prevalence_outlier": [],
-    }
-
-    reconstruction_issues: List[Dict[str, Any]] = []
-    masquerade_signals: List[Dict[str, Any]] = []
-    archive_abuse_signals: List[Dict[str, Any]] = []
-    exfil_signals: List[Dict[str, Any]] = []
-    lateral_copy_clusters: List[Dict[str, Any]] = []
-    auth_file_correlations: List[Dict[str, Any]] = []
-    lineage_chains: List[Dict[str, Any]] = []
-    incident_clusters: List[Dict[str, Any]] = []
-    campaign_indicators: List[Dict[str, Any]] = []
-    benign_context: List[str] = []
-
-    hash_counter = Counter(art.sha256 for art in artifacts if art.sha256)
-    by_src: Dict[str, List[FileArtifact]] = defaultdict(list)
-    by_sha: Dict[str, List[FileArtifact]] = defaultdict(list)
-    for art in artifacts:
-        by_src[str(art.src_ip)].append(art)
-        if art.sha256:
-            by_sha[art.sha256].append(art)
-
-    for art in artifacts:
-        confidence = 0
-        reasons: List[str] = []
-        if art.payload:
-            confidence += 2
-            reasons.append("payload present")
-        if art.file_type and art.file_type != "UNKNOWN":
-            confidence += 1
-            reasons.append(f"typed as {art.file_type}")
-        if art.size_bytes and art.size_bytes > 0:
-            confidence += 1
-            reasons.append("positive size")
-        if art.sha256:
-            confidence += 1
-            reasons.append("hash available")
-        if confidence <= 2:
-            item = {
-                "filename": art.filename,
-                "src": art.src_ip,
-                "dst": art.dst_ip,
-                "confidence": confidence,
-                "reasons": reasons,
-            }
-            reconstruction_issues.append(item)
-            checks["reconstruction_confidence"].append(
-                f"Low-confidence reconstruction for {art.filename} ({art.src_ip}->{art.dst_ip})"
-            )
-
-    for art in artifacts:
-        expected = _expected_extensions_for_type(art.file_type or "")
-        ext = Path(art.filename or "").suffix.lower()
-        mismatch = bool(expected and ext and ext not in expected)
-        ctype = (art.content_type or "").lower()
-        if mismatch or (art.file_type == "EXE/DLL" and "text" in ctype):
-            signal = {
-                "filename": art.filename,
-                "type": art.file_type,
-                "content_type": art.content_type or "-",
-                "src": art.src_ip,
-                "dst": art.dst_ip,
-            }
-            masquerade_signals.append(signal)
-            checks["multi_signal_masquerade"].append(
-                f"Masquerade signal {art.filename} type={art.file_type} ctype={art.content_type or '-'}"
-            )
-
-    suspicious_stage_exts = {
-        ".js",
-        ".jse",
-        ".vbs",
-        ".vbe",
-        ".ps1",
-        ".cmd",
-        ".bat",
-        ".hta",
-        ".dll",
-        ".exe",
-        ".scr",
-    }
-    archive_exts = {".zip", ".rar", ".7z", ".gz", ".tgz", ".iso", ".img"}
-    for src_ip, src_arts in by_src.items():
-        staged = []
-        archive_hits = []
-        for art in src_arts:
-            ext = Path(art.filename or "").suffix.lower()
-            if ext in archive_exts or (art.file_type or "").upper() in {
-                "ZIP/OFFICE",
-                "GZIP",
-            }:
-                archive_hits.append(art)
-            if ext in suspicious_stage_exts or _is_lolbas_filename(art.filename):
-                staged.append(art)
-        if archive_hits and staged:
-            chain = {
-                "src": src_ip,
-                "archive_count": len(archive_hits),
-                "staging_count": len(staged),
-                "archive_examples": [a.filename for a in archive_hits[:3]],
-                "staging_examples": [a.filename for a in staged[:3]],
-            }
-            archive_abuse_signals.append(chain)
-            lineage_chains.append(
-                {
-                    "src": src_ip,
-                    "steps": [
-                        "archive/container transfer",
-                        "script or lolbas stage file transfer",
-                    ],
-                    "evidence": [a.filename for a in (archive_hits + staged)[:5]],
-                }
-            )
-            checks["archive_container_abuse"].append(
-                f"{src_ip} transferred archives and staged scripts/binaries"
-            )
-            checks["macro_script_lolbas_staging"].append(
-                f"{src_ip} staged possible execution artifacts ({len(staged)})"
-            )
-
-    outbound_counter: Counter[str] = Counter()
-    outbound_bytes: Counter[str] = Counter()
-    for art in artifacts:
-        if _is_public_ip(str(art.dst_ip)):
-            outbound_counter[str(art.src_ip)] += 1
-            outbound_bytes[str(art.src_ip)] += int(art.size_bytes or 0)
-            exfil_signals.append(
-                {
-                    "src": art.src_ip,
-                    "dst": art.dst_ip,
-                    "filename": art.filename,
-                    "size": int(art.size_bytes or 0),
-                    "type": art.file_type,
-                }
-            )
-    for src_ip, count in outbound_counter.items():
-        if count >= 2:
-            checks["exfiltration_file_movement"].append(
-                f"{src_ip} transferred {count} file artifact(s) to public destinations ({outbound_bytes[src_ip]} bytes)"
-            )
-
-    for sha256, grouped in by_sha.items():
-        if len(grouped) < 2:
-            continue
-        src_hosts = sorted({a.src_ip for a in grouped if a.src_ip})
-        dst_hosts = sorted({a.dst_ip for a in grouped if a.dst_ip})
-        if len(dst_hosts) >= 2:
-            cluster = {
-                "sha256": sha256,
-                "count": len(grouped),
-                "src_hosts": src_hosts,
-                "dst_hosts": dst_hosts,
-                "filenames": sorted({a.filename for a in grouped if a.filename})[:6],
-            }
-            lateral_copy_clusters.append(cluster)
-            checks["lateral_copy_propagation"].append(
-                f"Hash {sha256[:12]} propagated to {len(dst_hosts)} destination hosts"
-            )
-            campaign_indicators.append(
-                {
-                    "indicator": "Shared artifact hash across hosts",
-                    "value": sha256,
-                    "hosts": dst_hosts,
-                }
-            )
-
-    auth_blobs = " ".join(
-        f"{str(d.get('summary', ''))} {str(d.get('details', ''))}".lower()
-        for d in detections
-    )
-    auth_markers = ("ntlm", "logon", "kerberos", "authentication")
-    if any(marker in auth_blobs for marker in auth_markers):
-        for src_ip, values in by_src.items():
-            if values:
-                auth_file_correlations.append(
-                    {
-                        "src": src_ip,
-                        "files": len(values),
-                        "marker": "authentication anomaly nearby",
-                    }
-                )
-                checks["auth_file_correlation"].append(
-                    f"{src_ip} file activity correlated with auth anomaly signals"
-                )
-
-    for art in artifacts:
-        if art.sha256 and hash_counter.get(art.sha256, 0) == 1:
-            checks["reputation_or_prevalence_outlier"].append(
-                f"Rare artifact hash observed once: {art.sha256[:12]} filename={art.filename}"
-            )
-
-    for src_ip, src_arts in by_src.items():
-        if not src_arts:
-            continue
-        findings: List[str] = []
-        if any(str(a.file_type).upper() in {"EXE/DLL", "ELF"} for a in src_arts):
-            findings.append("binary payload transfer")
-        if any(_is_public_ip(str(a.dst_ip)) for a in src_arts):
-            findings.append("public destination transfer")
-        if any(_is_lolbas_filename(a.filename) for a in src_arts):
-            findings.append("LOLBAS filename present")
-        if findings:
-            incident_clusters.append(
-                {
-                    "cluster": f"files-{src_ip}",
-                    "src": src_ip,
-                    "artifacts": len(src_arts),
-                    "findings": findings,
-                    "confidence": "high" if len(findings) >= 2 else "medium",
-                }
-            )
-
-    if not checks["lateral_copy_propagation"]:
-        benign_context.append(
-            "No strong hash-based lateral propagation pattern detected"
-        )
-    if not checks["exfiltration_file_movement"]:
-        benign_context.append(
-            "No high-volume public-destination file transfer pattern detected"
-        )
-
+    _ = (artifacts, detections)
     return {
-        "deterministic_checks": checks,
-        "reconstruction_issues": reconstruction_issues,
-        "masquerade_signals": masquerade_signals,
-        "archive_abuse_signals": archive_abuse_signals,
-        "exfil_signals": exfil_signals,
-        "lateral_copy_clusters": lateral_copy_clusters,
-        "auth_file_correlations": auth_file_correlations,
-        "lineage_chains": lineage_chains,
-        "incident_clusters": incident_clusters,
-        "campaign_indicators": campaign_indicators,
-        "benign_context": benign_context,
+        "deterministic_checks": {},
+        "reconstruction_issues": [],
+        "masquerade_signals": [],
+        "archive_abuse_signals": [],
+        "exfil_signals": [],
+        "lateral_copy_clusters": [],
+        "auth_file_correlations": [],
+        "lineage_chains": [],
+        "incident_clusters": [],
+        "campaign_indicators": [],
+        "benign_context": [],
     }
-
-
-# --- Entry Point ---
-
 
 def analyze_files(
     path: Path,
@@ -3708,6 +3701,7 @@ def analyze_files(
     port_filter: Optional[int] = None,
     search_query: Optional[str] = None,
     executable_only: bool = False,
+    hash_name: Optional[str] = None,
     packets: Optional[List[Packet]] = None,
 ) -> FileTransferSummary:
     if dpkt is None:
@@ -3725,11 +3719,22 @@ def analyze_files(
         view_name=view_name,
         view_raw=view_raw,
         show_status=show_status,
+        hash_name=hash_name,
         filter_ip=filter_ip,
         packets=parse_packets,
     )
     if dpkt_summary is None:
         return FileTransferSummary(path, 0, [], [], [], [], [], ["dpkt parsing failed"])
+    scapy_summary: Optional[FileTransferSummary] = None
+    if packets is not None or not dpkt_summary.artifacts:
+        scapy_summary = _export_with_scapy(
+            path,
+            show_status=False,
+            filter_ip=filter_ip,
+            packets=packets,
+            hash_name=hash_name,
+        )
+    dpkt_summary = _merge_export_summaries(dpkt_summary, scapy_summary)
 
     def _append_nfs_context(
         artifacts_in: List[FileArtifact],
@@ -4069,6 +4074,45 @@ def analyze_files(
                 return False
         return True
 
+    def _build_requested_hashes(artifacts_in: List[FileArtifact]) -> List[Dict[str, str]]:
+        if not hash_name:
+            return []
+        requested = str(hash_name).strip().lower()
+        if not requested:
+            return []
+        rows: List[Dict[str, str]] = []
+        seen: set[tuple[str, str, str, str, str]] = set()
+        for art in artifacts_in:
+            if not art.payload:
+                continue
+            if requested not in str(art.filename).lower():
+                continue
+            sha256_val = art.sha256 or hashlib.sha256(art.payload).hexdigest()
+            md5_val = art.md5 or hashlib.md5(art.payload).hexdigest()
+            key = (
+                str(art.filename),
+                str(art.protocol),
+                str(art.packet_index),
+                sha256_val,
+                md5_val,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "filename": art.filename,
+                    "protocol": art.protocol,
+                    "src_ip": art.src_ip,
+                    "dst_ip": art.dst_ip,
+                    "packet_index": str(art.packet_index),
+                    "sha256": sha256_val,
+                    "md5": md5_val,
+                    "imphash": _compute_imphash(art.payload) or "-",
+                }
+            )
+        return rows
+
     if include_x509:
         artifacts, detections, errors = _append_nfs_context(
             _dedupe_artifacts(_dedupe_x509_artifacts(dpkt_summary.artifacts)),
@@ -4084,7 +4128,12 @@ def analyze_files(
             packets_in=parse_packets,
         )
         artifacts = [a for a in artifacts if _artifact_matches_filters(a)]
+        requested_hashes = _build_requested_hashes(artifacts)
         candidates = [c for c in dpkt_summary.candidates if _candidate_matches_filters(c)]
+        if hash_name and not requested_hashes:
+            errors.append(
+                f"No payload-bearing artifacts matched -hash query: {hash_name}"
+            )
         mismatches = _collect_extension_mismatches(artifacts)
         if mismatches:
             examples = "; ".join(
@@ -4121,7 +4170,7 @@ def analyze_files(
                     "tools": tool_counts.most_common(6),
                 }
             )
-        enriched = _build_files_hunting_context(artifacts, detections)
+        enriched = _build_files_enrichment(artifacts, detections)
         return FileTransferSummary(
             path=dpkt_summary.path,
             total_candidates=len(candidates),
@@ -4131,6 +4180,7 @@ def analyze_files(
             views=dpkt_summary.views,
             detections=detections,
             errors=errors,
+            hashes=requested_hashes,
             deterministic_checks=enriched["deterministic_checks"],
             reconstruction_issues=enriched["reconstruction_issues"],
             masquerade_signals=enriched["masquerade_signals"],
@@ -4162,7 +4212,10 @@ def analyze_files(
         packets_in=parse_packets,
     )
     artifacts = [a for a in artifacts if _artifact_matches_filters(a)]
+    requested_hashes = _build_requested_hashes(artifacts)
     candidates = [c for c in dpkt_summary.candidates if _candidate_matches_filters(c)]
+    if hash_name and not requested_hashes:
+        errors.append(f"No payload-bearing artifacts matched -hash query: {hash_name}")
     mismatches = _collect_extension_mismatches(artifacts)
     if mismatches:
         examples = "; ".join(f"{name} -> {ftype}" for name, ftype, _ in mismatches[:5])
@@ -4196,7 +4249,7 @@ def analyze_files(
             }
         )
 
-    enriched = _build_files_hunting_context(artifacts, detections)
+    enriched = _build_files_enrichment(artifacts, detections)
 
     return FileTransferSummary(
         path=dpkt_summary.path,
@@ -4207,6 +4260,7 @@ def analyze_files(
         views=dpkt_summary.views,
         detections=detections,
         errors=errors,
+        hashes=requested_hashes,
         deterministic_checks=enriched["deterministic_checks"],
         reconstruction_issues=enriched["reconstruction_issues"],
         masquerade_signals=enriched["masquerade_signals"],

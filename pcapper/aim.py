@@ -8,7 +8,7 @@ from typing import Iterable, Optional
 from urllib.parse import parse_qsl
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -251,16 +251,7 @@ def analyze_aim(
             sport = int(getattr(tcp_layer, "sport", 0) or 0)
             dport = int(getattr(tcp_layer, "dport", 0) or 0)
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 

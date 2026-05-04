@@ -10,7 +10,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -686,9 +686,70 @@ def merge_obfuscation_summaries(
     detections: list[dict[str, object]] = []
     errors: list[str] = []
 
-    session_map: dict[str, ObfuscationSessionStat] = {}
+    total_sessions = 0
+    suspicious_sessions = 0
+    session_stats: list[ObfuscationSessionStat] = []
     artifacts: list[ObfuscationArtifact] = []
-    artifact_seen: set[tuple[str, str, str, str, str, str, str]] = set()
+
+    def _scoped_flow_id(path: Path, flow_id: str) -> str:
+        label = path.name or str(path)
+        return f"{label}::{flow_id}"
+
+    def _scope_hit(path: Path, hit: ObfuscationHit) -> ObfuscationHit:
+        return ObfuscationHit(
+            kind=hit.kind,
+            proto=hit.proto,
+            flow_id=_scoped_flow_id(path, hit.flow_id),
+            src=hit.src,
+            dst=hit.dst,
+            src_port=hit.src_port,
+            dst_port=hit.dst_port,
+            length=hit.length,
+            entropy=hit.entropy,
+            printable_ratio=hit.printable_ratio,
+            sample=hit.sample,
+            ts=hit.ts,
+            packet_index=hit.packet_index,
+            reasoning=hit.reasoning,
+        )
+
+    def _scope_session(path: Path, session: ObfuscationSessionStat) -> ObfuscationSessionStat:
+        return ObfuscationSessionStat(
+            flow_id=_scoped_flow_id(path, session.flow_id),
+            proto=session.proto,
+            src=session.src,
+            dst=session.dst,
+            src_port=session.src_port,
+            dst_port=session.dst_port,
+            packets=session.packets,
+            payload_bytes=session.payload_bytes,
+            suspicious_packets=session.suspicious_packets,
+            suspicious_payload_bytes=session.suspicious_payload_bytes,
+            high_entropy_hits=session.high_entropy_hits,
+            base64_hits=session.base64_hits,
+            hex_hits=session.hex_hits,
+            first_seen=session.first_seen,
+            last_seen=session.last_seen,
+            duration_seconds=session.duration_seconds,
+            avg_entropy=session.avg_entropy,
+            max_entropy=session.max_entropy,
+        )
+
+    def _scope_artifact(path: Path, artifact: ObfuscationArtifact) -> ObfuscationArtifact:
+        return ObfuscationArtifact(
+            kind=artifact.kind,
+            value=artifact.value,
+            source_kind=artifact.source_kind,
+            src=artifact.src,
+            dst=artifact.dst,
+            src_port=artifact.src_port,
+            dst_port=artifact.dst_port,
+            proto=artifact.proto,
+            flow_id=_scoped_flow_id(path, artifact.flow_id),
+            ts=artifact.ts,
+            confidence=artifact.confidence,
+            reasoning=artifact.reasoning,
+        )
 
     for summary in summaries:
         total_packets += summary.total_packets
@@ -708,9 +769,9 @@ def merge_obfuscation_summaries(
                 else max(last_seen, summary.last_seen)
             )
 
-        high_entropy_hits.extend(summary.high_entropy_hits)
-        base64_hits.extend(summary.base64_hits)
-        hex_hits.extend(summary.hex_hits)
+        high_entropy_hits.extend(_scope_hit(summary.path, hit) for hit in summary.high_entropy_hits)
+        base64_hits.extend(_scope_hit(summary.path, hit) for hit in summary.base64_hits)
+        hex_hits.extend(_scope_hit(summary.path, hit) for hit in summary.hex_hits)
         source_counts.update(summary.source_counts)
         destination_counts.update(summary.destination_counts)
         protocol_counts.update(summary.protocol_counts)
@@ -720,91 +781,19 @@ def merge_obfuscation_summaries(
         attack_counts.update(summary.attack_counts)
         detections.extend(summary.detections)
         errors.extend(summary.errors)
-
-        for session in summary.session_stats:
-            existing = session_map.get(session.flow_id)
-            if existing is None:
-                session_map[session.flow_id] = session
-                continue
-            packets = existing.packets + session.packets
-            payload_bytes = existing.payload_bytes + session.payload_bytes
-            suspicious_pkts = existing.suspicious_packets + session.suspicious_packets
-            suspicious_bytes = (
-                existing.suspicious_payload_bytes + session.suspicious_payload_bytes
-            )
-            first_val = existing.first_seen
-            if session.first_seen is not None:
-                first_val = (
-                    session.first_seen
-                    if first_val is None
-                    else min(first_val, session.first_seen)
-                )
-            last_val = existing.last_seen
-            if session.last_seen is not None:
-                last_val = (
-                    session.last_seen
-                    if last_val is None
-                    else max(last_val, session.last_seen)
-                )
-            duration = None
-            if first_val is not None and last_val is not None:
-                duration = max(0.0, last_val - first_val)
-            if packets > 0:
-                avg_entropy = (
-                    (existing.avg_entropy * existing.packets)
-                    + (session.avg_entropy * session.packets)
-                ) / packets
-            else:
-                avg_entropy = max(existing.avg_entropy, session.avg_entropy)
-            session_map[session.flow_id] = ObfuscationSessionStat(
-                flow_id=session.flow_id,
-                proto=existing.proto,
-                src=existing.src,
-                dst=existing.dst,
-                src_port=existing.src_port,
-                dst_port=existing.dst_port,
-                packets=packets,
-                payload_bytes=payload_bytes,
-                suspicious_packets=suspicious_pkts,
-                suspicious_payload_bytes=suspicious_bytes,
-                high_entropy_hits=existing.high_entropy_hits
-                + session.high_entropy_hits,
-                base64_hits=existing.base64_hits + session.base64_hits,
-                hex_hits=existing.hex_hits + session.hex_hits,
-                first_seen=first_val,
-                last_seen=last_val,
-                duration_seconds=duration,
-                avg_entropy=avg_entropy,
-                max_entropy=max(existing.max_entropy, session.max_entropy),
-            )
-
-        for artifact in summary.artifacts:
-            key = (
-                artifact.kind,
-                artifact.value.lower(),
-                artifact.source_kind,
-                artifact.src,
-                artifact.dst,
-                artifact.proto,
-                artifact.flow_id,
-            )
-            if key in artifact_seen:
-                continue
-            artifact_seen.add(key)
-            if len(artifacts) < MAX_ARTIFACTS:
-                artifacts.append(artifact)
+        total_sessions += summary.total_sessions
+        suspicious_sessions += summary.suspicious_sessions
+        session_stats.extend(_scope_session(summary.path, item) for item in summary.session_stats)
+        artifacts.extend(_scope_artifact(summary.path, item) for item in summary.artifacts)
 
     session_stats = sorted(
-        session_map.values(),
+        session_stats,
         key=lambda item: (
             item.suspicious_packets,
             item.suspicious_payload_bytes,
             item.max_entropy,
         ),
         reverse=True,
-    )[:MAX_SESSIONS]
-    suspicious_sessions = sum(
-        1 for session in session_stats if session.suspicious_packets > 0
     )
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -819,11 +808,11 @@ def merge_obfuscation_summaries(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
-        total_sessions=len(session_stats),
+        total_sessions=total_sessions,
         suspicious_sessions=suspicious_sessions,
-        high_entropy_hits=high_entropy_hits[:MAX_HITS],
-        base64_hits=base64_hits[:MAX_HITS],
-        hex_hits=hex_hits[:MAX_HITS],
+        high_entropy_hits=high_entropy_hits,
+        base64_hits=base64_hits,
+        hex_hits=hex_hits,
         source_counts=source_counts,
         destination_counts=destination_counts,
         protocol_counts=protocol_counts,
@@ -884,14 +873,7 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
 
             total_packets += 1
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IP].src)  # type: ignore[index]
-                dst_ip = str(pkt[IP].dst)  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IPv6].src)  # type: ignore[index]
-                dst_ip = str(pkt[IPv6].dst)  # type: ignore[index]
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 

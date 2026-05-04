@@ -87,7 +87,6 @@ class NtlmAnalysis:
     errors: List[str] = field(default_factory=list)
     deterministic_checks: Dict[str, List[str]] = field(default_factory=dict)
     threat_hypotheses: List[Dict[str, object]] = field(default_factory=list)
-    hunting_pivots: List[Dict[str, object]] = field(default_factory=list)
     benign_context: List[str] = field(default_factory=list)
 
     @property
@@ -739,7 +738,6 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
         "high_volume_ntlm_source": [],
     }
     threat_hypotheses: List[Dict[str, object]] = []
-    hunting_pivots: List[Dict[str, object]] = []
     benign_context: List[str] = []
 
     def _is_public_ip(value: str) -> bool:
@@ -833,33 +831,6 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
             deterministic_checks["high_volume_ntlm_source"].append(
                 f"High-volume NTLM source {src} events={int(count)}"
             )
-            hunting_pivots.append(
-                {
-                    "pivot": "high_volume_source",
-                    "source": src,
-                    "events": int(count),
-                }
-            )
-    for user_key, src_set in sorted(
-        by_user_srcs.items(), key=lambda item: len(item[1]), reverse=True
-    )[:15]:
-        hunting_pivots.append(
-            {
-                "pivot": "credential_reuse",
-                "identity": user_key,
-                "src_hosts": len(src_set),
-                "dst_hosts": len(by_user_dsts.get(user_key, set())),
-            }
-        )
-    for name, count in status_codes.most_common(15):
-        if any(token in str(name).upper() for token in failure_tokens):
-            hunting_pivots.append(
-                {
-                    "pivot": "failure_status",
-                    "status": str(name),
-                    "count": int(count),
-                }
-            )
 
     if (
         deterministic_checks["ntlmv1_legacy_authentication"]
@@ -926,7 +897,6 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
         anomalies=anomalies,
         deterministic_checks={k: v[:60] for k, v in deterministic_checks.items()},
         threat_hypotheses=threat_hypotheses[:20],
-        hunting_pivots=hunting_pivots[:120],
         benign_context=benign_context[:20],
         errors=errors,
     )

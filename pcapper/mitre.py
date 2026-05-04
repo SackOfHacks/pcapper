@@ -148,7 +148,6 @@ class MitreSummary:
     host_attack_paths: dict[str, list[str]] = field(default_factory=dict)
     host_roles: dict[str, list[str]] = field(default_factory=dict)
     technique_heat: list[dict[str, object]] = field(default_factory=list)
-    investigation_pivots: list[dict[str, object]] = field(default_factory=list)
     checks: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -594,7 +593,7 @@ def _host_role_from_hit(hit: MitreHit) -> str:
     if tactic in {"Credential Access"}:
         return "credential"
     if tactic in {"Lateral Movement"}:
-        return "pivot"
+        return "lateral"
     if tactic in {"Command and Control"}:
         return "c2"
     if tactic in {"Exfiltration"}:
@@ -724,7 +723,6 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
     host_attack_paths: dict[str, list[str]] = defaultdict(list)
     host_roles: dict[str, set[str]] = defaultdict(set)
     technique_heat_rows: list[dict[str, object]] = []
-    investigation_pivots: list[dict[str, object]] = []
     merged_checks: dict[str, list[str]] = defaultdict(list)
 
     total_detections = 0
@@ -747,7 +745,6 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
         sequence_issues.extend(summary.sequence_issues)
         alternate_explanations.extend(summary.alternate_explanations)
         technique_heat_rows.extend(summary.technique_heat)
-        investigation_pivots.extend(summary.investigation_pivots)
         for host, chain in summary.host_attack_paths.items():
             host_attack_paths[host].extend(chain)
         for host, roles in summary.host_roles.items():
@@ -825,7 +822,6 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
             for key, value in sorted(host_roles.items(), key=lambda item: item[0])
         },
         technique_heat=technique_heat_rows[:300],
-        investigation_pivots=investigation_pivots[:300],
         checks=dedup_checks,
     )
 
@@ -1137,21 +1133,6 @@ def analyze_mitre(
         reverse=True,
     )
 
-    investigation_pivots: list[dict[str, object]] = []
-    for hit in hits[:200]:
-        investigation_pivots.append(
-            {
-                "technique_id": hit.technique_id,
-                "tactic": hit.tactic,
-                "source": hit.source,
-                "hosts": hit.host_refs[:6],
-                "flows": hit.flow_refs[:4],
-                "packets": hit.packet_refs[:6],
-                "iocs": hit.iocs[:6],
-                "artifacts": hit.artifacts[:6],
-            }
-        )
-
     low_conf_count = sum(1 for hit in hits if hit.confidence == "low")
     single_source_count = sum(1 for hit in hits if hit.corroborating_sources <= 1)
     if low_conf_count >= 3:
@@ -1229,6 +1210,5 @@ def analyze_mitre(
             for key, value in sorted(host_roles.items(), key=lambda item: item[0])
         },
         technique_heat=technique_heat,
-        investigation_pivots=investigation_pivots,
         checks={key: values[:80] for key, values in checks.items()},
     )

@@ -379,3 +379,86 @@ def analyze_ip_lookup(
         ip_hostnames,
         [],
     )
+
+
+def merge_mac_lookup_summaries(summaries: list[MacLookupSummary]) -> MacLookupSummary:
+    if not summaries:
+        return MacLookupSummary(
+            path=Path("ALL_PCAPS"),
+            query_ip="",
+            total_packets=0,
+            matches=0,
+            associations=[],
+            errors=[],
+        )
+
+    query_ip = summaries[0].query_ip
+    total_packets = sum(int(item.total_packets or 0) for item in summaries)
+    counts: dict[tuple[str, str, str], int] = {}
+    errors: list[str] = []
+    for item in summaries:
+        errors.extend(list(item.errors or []))
+        for assoc in list(item.associations or []):
+            key = (str(assoc.ip), str(assoc.mac), str(assoc.discovery_method))
+            counts[key] = counts.get(key, 0) + int(assoc.count or 0)
+    associations = sorted(
+        [
+            IpMacAssociation(ip=ip, mac=mac, discovery_method=method, count=count)
+            for (ip, mac, method), count in counts.items()
+        ],
+        key=lambda item: (-item.count, item.ip, item.mac),
+    )
+    return MacLookupSummary(
+        path=Path("ALL_PCAPS"),
+        query_ip=query_ip,
+        total_packets=total_packets,
+        matches=len(associations),
+        associations=associations,
+        errors=errors,
+    )
+
+
+def merge_ip_lookup_summaries(summaries: list[IpLookupSummary]) -> IpLookupSummary:
+    if not summaries:
+        return IpLookupSummary(
+            path=Path("ALL_PCAPS"),
+            query_mac="",
+            total_packets=0,
+            matches=0,
+            associations=[],
+            ip_hostnames={},
+            errors=[],
+        )
+
+    query_mac = summaries[0].query_mac
+    total_packets = sum(int(item.total_packets or 0) for item in summaries)
+    counts: dict[tuple[str, str, str], int] = {}
+    hostnames_by_ip: dict[str, list[str]] = {}
+    errors: list[str] = []
+    for item in summaries:
+        errors.extend(list(item.errors or []))
+        for assoc in list(item.associations or []):
+            key = (str(assoc.ip), str(assoc.mac), str(assoc.discovery_method))
+            counts[key] = counts.get(key, 0) + int(assoc.count or 0)
+        for ip_value, names in dict(item.ip_hostnames or {}).items():
+            existing = hostnames_by_ip.setdefault(str(ip_value), [])
+            for name in list(names or []):
+                text = str(name or "").strip()
+                if text and text not in existing:
+                    existing.append(text)
+    associations = sorted(
+        [
+            IpMacAssociation(ip=ip, mac=mac, discovery_method=method, count=count)
+            for (ip, mac, method), count in counts.items()
+        ],
+        key=lambda item: (-item.count, item.mac, item.ip),
+    )
+    return IpLookupSummary(
+        path=Path("ALL_PCAPS"),
+        query_mac=query_mac,
+        total_packets=total_packets,
+        matches=len(associations),
+        associations=associations,
+        ip_hostnames=hostnames_by_ip,
+        errors=errors,
+    )

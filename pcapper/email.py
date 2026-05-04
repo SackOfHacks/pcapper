@@ -12,7 +12,7 @@ from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import extract_packet_endpoints, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -1292,16 +1292,7 @@ def analyze_email(
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
 
-            src_ip: str | None = None
-            dst_ip: str | None = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if not src_ip or not dst_ip:
                 continue

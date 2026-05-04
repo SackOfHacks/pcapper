@@ -27,6 +27,7 @@ from .coloring import (
 from .compromised import CompromiseSummary
 from .creds import CredentialSummary
 from .ctf import CtfSummary
+from .decode import DecodeSummary
 from .dhcp import DhcpSummary
 from .dns import PUBLIC_DNS_RESOLVERS, DnsSummary
 from .email import EmailSummary
@@ -53,6 +54,7 @@ from .models import PcapSummary
 from .nfs import NfsSummary
 from .ntp import NtpSummary
 from .opc_classic import OpcClassicSummary
+from .overview import OverviewSummary
 from .ot_commands import OtCommandSummary
 from .pcapmeta import PcapMetaSummary
 from .powershell import PowershellSummary
@@ -623,8 +625,8 @@ def _truncate_text(value: str, max_len: int = 80) -> str:
     return value[: max_len - 1] + "…"
 
 
-def _pivot_packet_number(pivot: object) -> str:
-    if not isinstance(pivot, dict):
+def _packet_number_hint(record: object) -> str:
+    if not isinstance(record, dict):
         return "-"
 
     def _normalize_packet(value: object) -> str | None:
@@ -667,16 +669,16 @@ def _pivot_packet_number(pivot: object) -> str:
         "syn_packet_number",
         "last_packet",
     ):
-        normalized = _normalize_packet(pivot.get(key))
+        normalized = _normalize_packet(record.get(key))
         if normalized:
             return normalized
 
     for key in ("packet_refs", "packet_examples"):
-        normalized = _normalize_packet(pivot.get(key))
+        normalized = _normalize_packet(record.get(key))
         if normalized:
             return normalized
 
-    packets_value = pivot.get("packets")
+    packets_value = record.get("packets")
     if isinstance(packets_value, (list, tuple, set)):
         normalized = _normalize_packet(packets_value)
         if normalized:
@@ -1169,6 +1171,32 @@ def render_vlan_summary(
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
+
+
+def render_decode_summary(summary: DecodeSummary) -> str:
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header("DECODE OVERVIEW"))
+    lines.append(SECTION_BAR)
+    lines.append(_format_kv("Input Length", str(len(str(summary.source or "")))))
+    source_preview = _truncate_text(_redact_in_text(str(summary.source or "")), 220)
+    lines.append(_format_kv("Input Preview", source_preview or "-"))
+    lines.append(SUBSECTION_BAR)
+    results = list(getattr(summary, "results", []) or [])
+    result_count = len(results)
+    lines.append(header(f"Decode Formats ({result_count})"))
+    rows = [["Format", "Status", "Output"]]
+    for item in results:
+        rows.append(
+            [
+                str(getattr(item, "format_name", "-")),
+                "ok" if bool(getattr(item, "success", False)) else "-",
+                _truncate_text(_redact_in_text(str(getattr(item, "value", "-"))), 180),
+            ]
+        )
+    lines.append(_format_table(rows))
+    lines.append(SECTION_BAR)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_vlan_rollup(
@@ -2716,28 +2744,6 @@ def render_icmp_summary(
                     str(finding.get("score", "-")),
                     str(finding.get("confidence", "-")),
                     ", ".join(str(v) for v in list(finding.get("reasons", []) or []))
-                    or "-",
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
-    pivots = list(getattr(summary, "investigation_pivots", []) or [])
-    if pivots:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Hunt Pivots"))
-        rows = [["Flow", "Protocol", "Packet", "Packets", "Bytes", "Reasons"]]
-        for pivot in pivots[:limit]:
-            if not isinstance(pivot, dict):
-                continue
-            rows.append(
-                [
-                    str(pivot.get("flow", "-")),
-                    str(pivot.get("protocol", "-")),
-                    _pivot_packet_number(pivot),
-                    str(pivot.get("packets", "-")),
-                    format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
-                    ", ".join(str(v) for v in list(pivot.get("reasons", []) or []))
                     or "-",
                 ]
             )
@@ -4476,34 +4482,6 @@ def render_ips_summary(
             )
         lines.append(_format_table(rows))
 
-    pivots = list(getattr(summary, "investigation_pivots", []) or [])
-    if pivots and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Hunt Pivots"))
-        rows = [["Flow", "Proto", "Packet", "Packets", "Bytes", "Ports", "Reasons"]]
-        for item in pivots[:limit]:
-            if not isinstance(item, dict):
-                continue
-            ports = ",".join(
-                str(v) for v in list(item.get("ports", []) or [])[: _limit_value(6)]
-            )
-            reasons_text = "; ".join(
-                str(v) for v in list(item.get("reasons", []) or [])[:3]
-            )
-            rows.append(
-                [
-                    str(item.get("flow", "-")),
-                    str(item.get("protocol", "-")),
-                    _pivot_packet_number(item),
-                    str(item.get("packets", "-")),
-                    format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
-                    ports or "-",
-                    reasons_text or "-",
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
     if verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Endpoint Timing"))
@@ -5659,148 +5637,6 @@ def render_webrequests_summary(
                     )
                 )
 
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Hunt Pivots"))
-        pivot_rows = [["Type", "Packet", "Pivot", "Context"]]
-
-        host_ip_counter: Counter[str] = Counter()
-        host_ip_packet: dict[str, str] = {}
-        host_ip_methods: dict[str, set[str]] = defaultdict(set)
-        host_ip_remotes: dict[str, set[str]] = defaultdict(set)
-        executable_target_counter: Counter[str] = Counter()
-        executable_target_packet: dict[str, str] = {}
-        executable_target_context: dict[str, dict[str, object]] = {}
-        high_risk_counter: Counter[str] = Counter()
-        high_risk_packet: dict[str, str] = {}
-        high_risk_context: dict[str, dict[str, object]] = {}
-
-        exe_re = re.compile(r"(?i)\.(exe|elf|dll|sys|msi|scr|jar|apk|bin)(?:$|[?#])")
-        for item in summary.requests:
-            host_value = str(item.host or "").strip()
-            uri_value = str(item.uri or "")
-            location_value = str(item.response_location or "")
-            request_value = f"{host_value}{uri_value}" if host_value else uri_value
-            packet_number = getattr(item, "packet_number", None)
-            packet_text = (
-                str(packet_number)
-                if isinstance(packet_number, int) and packet_number > 0
-                else "-"
-            )
-
-            if host_value and _host_is_ip_literal(host_value):
-                host_ip_counter[host_value] += 1
-                host_ip_methods[host_value].add(str(item.method or "-"))
-                host_ip_remotes[host_value].add(
-                    f"{item.dst_ip}:{item.dst_port or '-'}"
-                )
-                if packet_text != "-" and host_value not in host_ip_packet:
-                    host_ip_packet[host_value] = packet_text
-
-            if exe_re.search(uri_value) or exe_re.search(location_value):
-                pivot_value = _truncate_text(request_value or "-", 80)
-                executable_target_counter[pivot_value] += 1
-                ctx = executable_target_context.setdefault(
-                    pivot_value,
-                    {"methods": set(), "remotes": set(), "statuses": set()},
-                )
-                methods = ctx.get("methods")
-                if isinstance(methods, set):
-                    methods.add(str(item.method or "-"))
-                remotes = ctx.get("remotes")
-                if isinstance(remotes, set):
-                    remotes.add(f"{item.dst_ip}:{item.dst_port or '-'}")
-                statuses = ctx.get("statuses")
-                if isinstance(statuses, set):
-                    status = (
-                        str(item.response_code)
-                        if item.response_code is not None
-                        else "-"
-                    )
-                    statuses.add(status)
-                if packet_text != "-" and pivot_value not in executable_target_packet:
-                    executable_target_packet[pivot_value] = packet_text
-
-            if (
-                str(item.risk_level or "").lower() in {"high", "medium"}
-                or int(item.risk_score or 0) >= 4
-            ):
-                pivot_value = _truncate_text(request_value or "-", 80)
-                high_risk_counter[pivot_value] += 1
-                ctx = high_risk_context.setdefault(
-                    pivot_value,
-                    {"methods": set(), "remotes": set(), "scores": []},
-                )
-                methods = ctx.get("methods")
-                if isinstance(methods, set):
-                    methods.add(str(item.method or "-"))
-                remotes = ctx.get("remotes")
-                if isinstance(remotes, set):
-                    remotes.add(f"{item.dst_ip}:{item.dst_port or '-'}")
-                scores = ctx.get("scores")
-                if isinstance(scores, list):
-                    scores.append(int(item.risk_score or 0))
-                if packet_text != "-" and pivot_value not in high_risk_packet:
-                    high_risk_packet[pivot_value] = packet_text
-
-        for host, count in host_ip_counter.most_common(_limit_value(8)):
-            methods = ",".join(sorted(host_ip_methods.get(host, set()) or {"-"}))
-            remotes = ",".join(
-                sorted(list(host_ip_remotes.get(host, set()) or {"-"}))[:3]
-            )
-            pivot_rows.append(
-                [
-                    "Host Header (IP)",
-                    host_ip_packet.get(host, "-"),
-                    host,
-                    f"requests={count} methods={methods} remotes={_truncate_text(remotes, 56)}",
-                ]
-            )
-
-        for request_value, count in executable_target_counter.most_common(
-            _limit_value(8)
-        ):
-            ctx = executable_target_context.get(request_value, {})
-            methods = ",".join(
-                sorted(v for v in list(ctx.get("methods", set()) or []) if v)[:3]
-            )
-            remotes = ",".join(
-                sorted(v for v in list(ctx.get("remotes", set()) or []) if v)[:3]
-            )
-            statuses = ",".join(
-                sorted(v for v in list(ctx.get("statuses", set()) or []) if v)[:3]
-            )
-            pivot_rows.append(
-                [
-                    "Executable Target",
-                    executable_target_packet.get(request_value, "-"),
-                    request_value,
-                    f"requests={count} methods={methods or '-'} status={statuses or '-'} remotes={_truncate_text(remotes or '-', 44)}",
-                ]
-            )
-
-        for request_value, count in high_risk_counter.most_common(_limit_value(8)):
-            ctx = high_risk_context.get(request_value, {})
-            methods = ",".join(
-                sorted(v for v in list(ctx.get("methods", set()) or []) if v)[:3]
-            )
-            remotes = ",".join(
-                sorted(v for v in list(ctx.get("remotes", set()) or []) if v)[:3]
-            )
-            scores = [int(v) for v in list(ctx.get("scores", []) or []) if int(v) >= 0]
-            max_score = max(scores) if scores else 0
-            pivot_rows.append(
-                [
-                    "High-Risk Request",
-                    high_risk_packet.get(request_value, "-"),
-                    request_value,
-                    f"hits={count} max_risk={max_score} methods={methods or '-'} remotes={_truncate_text(remotes or '-', 44)}",
-                ]
-            )
-
-        if len(pivot_rows) > 1:
-            lines.append(_format_table(pivot_rows))
-        else:
-            lines.append(muted("No strong hunt pivots identified."))
     else:
         lines.append(SUBSECTION_BAR)
         lines.append(muted("No web requests matched current scope."))
@@ -9805,32 +9641,6 @@ def render_tcp_summary(
         if len(rows) > 1:
             lines.append(_format_table(rows))
 
-    pivots = list(getattr(summary, "investigation_pivots", []) or [])
-    if pivots:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Hunt Pivots"))
-        rows = [
-            ["Flow", "Packet", "Packets", "Bytes", "SYN", "SYN-ACK", "RST", "Reasons"]
-        ]
-        for pivot in pivots[:limit]:
-            if not isinstance(pivot, dict):
-                continue
-            rows.append(
-                [
-                    str(pivot.get("flow", "-")),
-                    _pivot_packet_number(pivot),
-                    str(pivot.get("packets", 0)),
-                    format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
-                    str(pivot.get("syn", 0)),
-                    str(pivot.get("syn_ack", 0)),
-                    str(pivot.get("rst", 0)),
-                    ", ".join(str(v) for v in list(pivot.get("reasons", []) or []))
-                    or "-",
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
     false_positive_context = [
         str(v)
         for v in list(getattr(summary, "false_positive_context", []) or [])
@@ -10582,27 +10392,6 @@ def render_udp_summary(
                     str(finding.get("score", "-")),
                     str(finding.get("confidence", "-")),
                     ", ".join(str(v) for v in list(finding.get("reasons", []) or []))
-                    or "-",
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
-    pivots = list(getattr(summary, "investigation_pivots", []) or [])
-    if pivots:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Hunt Pivots"))
-        rows = [["Flow", "Packet", "Packets", "Bytes", "Reasons"]]
-        for pivot in pivots[:limit]:
-            if not isinstance(pivot, dict):
-                continue
-            rows.append(
-                [
-                    str(pivot.get("flow", "-")),
-                    _pivot_packet_number(pivot),
-                    str(pivot.get("packets", 0)),
-                    format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
-                    ", ".join(str(v) for v in list(pivot.get("reasons", []) or []))
                     or "-",
                 ]
             )
@@ -12076,28 +11865,6 @@ def render_beacon_summary(
                 f"{item.src_ip}->{item.dst_ip} [{item.proto}] cadence={cadence} {sparkline(item.timeline)}"
             )
 
-    pivots = list(getattr(summary, "beacon_pivots", []) or [])
-    if pivots:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Actionable Hunting Pivots"))
-        rows = [
-            ["Src", "Dst", "Proto", "Interval", "Score", "URI Hash", "First", "Last"]
-        ]
-        for item in pivots[:limit]:
-            rows.append(
-                [
-                    str(item.get("src", "-")),
-                    str(item.get("dst", "-")),
-                    str(item.get("proto", "-")),
-                    f"{float(item.get('interval', 0.0) or 0.0):.2f}s",
-                    str(item.get("score", "-")),
-                    str(item.get("uri_template_hash", "-")),
-                    format_ts(item.get("first_seen")),
-                    format_ts(item.get("last_seen")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
     explainability = list(getattr(summary, "explainability", []) or [])
     if explainability:
         lines.append(SUBSECTION_BAR)
@@ -12718,7 +12485,7 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
         if len(suppressed):
             lines.append(
                 muted(
-                    "Use `-v` to inspect suppressed low-confidence detections for hunt context."
+                    "Use `-v` to inspect suppressed low-confidence detections for context."
                 )
             )
         lines.append(SECTION_BAR)
@@ -12905,7 +12672,6 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
     if suricata_mode:
         suricata_metadata = getattr(summary, "suricata_metadata", {}) or {}
         suricata_event_counts = getattr(summary, "suricata_event_counts", {}) or {}
-        suricata_pivots = getattr(summary, "suricata_pivots", {}) or {}
         lines.append(SUBSECTION_BAR)
         lines.append(header("Suricata Snapshot" if verbose else "IDS Corroboration"))
         if verbose and suricata_metadata:
@@ -12928,17 +12694,6 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
             event_text = ", ".join(f"{name}({count})" for name, count in top_events)
             if event_text:
                 lines.append(_format_kv("Top Event Types", event_text))
-        if isinstance(suricata_pivots, dict):
-            top_signatures = suricata_pivots.get("top_signatures", []) or []
-            if top_signatures:
-                lines.append(muted("Top Signatures:"))
-                for signature, count in top_signatures[
-                    : _limit_value(10 if verbose else 3)
-                ]:
-                    lines.append(
-                        muted(f"- {_redact_in_text(str(signature))}: {int(count)}")
-                    )
-
     if verbose and suppressed_rollups:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Suppressed / Low-Signal Context"))
@@ -12960,7 +12715,7 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
     if not verbose:
         lines.append(
             muted(
-                "Use `-v` for full threat inventory, low-signal context, actor pivots, OT storyline, and Suricata diagnostics."
+                "Use `-v` for full threat inventory, low-signal context, actor context, OT storyline, and Suricata diagnostics."
             )
         )
 
@@ -13226,46 +12981,6 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
                     str(len(list(getattr(hit, "packet_refs", []) or []))),
                     str(len(list(getattr(hit, "flow_refs", []) or []))),
                     str(len(list(getattr(hit, "host_refs", []) or []))),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    pivots = list(getattr(summary, "investigation_pivots", []) or [])
-    if pivots:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Investigation Pivots"))
-        rows = [["Technique", "Source", "Hosts", "Flows", "Packets", "IOC/Artifact"]]
-        for item in pivots[: _limit_value(18 if verbose else 8)]:
-            hosts = item.get("hosts", [])
-            flows = item.get("flows", [])
-            packets = item.get("packets", [])
-            iocs = item.get("iocs", [])
-            artifacts = item.get("artifacts", [])
-            ioc_art = ", ".join(
-                [str(v) for v in (iocs[:2] if isinstance(iocs, list) else [])]
-                + [
-                    str(v)
-                    for v in (artifacts[:2] if isinstance(artifacts, list) else [])
-                ]
-            )
-            rows.append(
-                [
-                    f"{item.get('technique_id', '-')} {item.get('tactic', '-')}",
-                    str(item.get("source", "-")),
-                    ",".join(
-                        str(v) for v in (hosts[:3] if isinstance(hosts, list) else [])
-                    )
-                    or "-",
-                    ",".join(
-                        str(v) for v in (flows[:2] if isinstance(flows, list) else [])
-                    )
-                    or "-",
-                    ",".join(
-                        str(v)
-                        for v in (packets[:4] if isinstance(packets, list) else [])
-                    )
-                    or "-",
-                    _truncate_text(ioc_art or "-", 120),
                 ]
             )
         lines.append(_format_table(rows))
@@ -13763,6 +13478,27 @@ def render_files_summary(
                 else:
                     lines.append(hexdump(bytes(payload)))
 
+    if getattr(summary, "hashes", None):
+        hash_rows = [
+            ["Filename", "Protocol", "Packet", "SHA256", "MD5", "IMPHASH", "Flow"]
+        ]
+        for item in list(summary.hashes or [])[:effective_limit]:
+            hash_rows.append(
+                [
+                    str(item.get("filename", "-")),
+                    str(item.get("protocol", "-")),
+                    str(item.get("packet_index", "-")),
+                    str(item.get("sha256", "-")),
+                    str(item.get("md5", "-")),
+                    str(item.get("imphash", "-")),
+                    f"{_highlight_public_ips(str(item.get('src_ip', '-')))}->{_highlight_public_ips(str(item.get('dst_ip', '-')))}",
+                ]
+            )
+        if len(hash_rows) > 1:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Requested File Hashes"))
+            lines.append(_format_table(hash_rows))
+
     detections = _filtered_detections(summary, verbose)
     if detections:
         lines.append(SUBSECTION_BAR)
@@ -14032,28 +13768,6 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
                     str(profile.get("protocol_count", 0)),
                     str(profile.get("zone", "-")),
                     str(profile.get("confidence", "-")),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
-    pivots = list(getattr(summary, "investigation_pivots", []) or [])
-    if pivots:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Hunt Pivots"))
-        rows = [["Conversation", "Protocol", "Packet", "Packets", "Bytes", "Reasons"]]
-        for pivot in pivots:
-            if not isinstance(pivot, dict):
-                continue
-            rows.append(
-                [
-                    str(pivot.get("conversation", "-")),
-                    str(pivot.get("protocol", "-")),
-                    _pivot_packet_number(pivot),
-                    str(pivot.get("packets", 0)),
-                    format_bytes_as_mb(int(pivot.get("bytes", 0) or 0)),
-                    ", ".join(str(v) for v in list(pivot.get("reasons", []) or []))
-                    or "-",
                 ]
             )
         if len(rows) > 1:
@@ -14515,28 +14229,6 @@ def render_services_summary(summary: ServiceSummary, verbose: bool = False) -> s
                     ",".join(str(v) for v in list(profile.get("admin_ports", []) or []))
                     or "-",
                     str(profile.get("confidence", "-")),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
-    pivots = list(getattr(summary, "investigation_pivots", []) or [])
-    if pivots and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Hunt Pivots"))
-        rows = [["Asset", "Service", "Packet", "Clients", "Packets", "Reasons"]]
-        for pivot in pivots:
-            if not isinstance(pivot, dict):
-                continue
-            rows.append(
-                [
-                    str(pivot.get("asset", "-")),
-                    str(pivot.get("service", "-")),
-                    _pivot_packet_number(pivot),
-                    str(pivot.get("clients", 0)),
-                    str(pivot.get("packets", 0)),
-                    ", ".join(str(v) for v in list(pivot.get("reasons", []) or []))
-                    or "-",
                 ]
             )
         if len(rows) > 1:
@@ -15431,20 +15123,33 @@ def render_mac_lookup_summary(summary: MacLookupSummary) -> str:
         )
     else:
         if query_all:
-            unique_pairs = sorted({(hit.ip, hit.mac) for hit in summary.associations})
-            lines.append(_format_kv("Unique Pairs", str(len(unique_pairs))))
-            rows = [["IP Address", "MAC Address", "Manufacturer"]]
-            for ip_value, mac_value in unique_pairs:
-                rows.append([ip_value, mac_value, mac_manufacturer(mac_value)])
+            rows = [
+                ["IP Address", "MAC Address", "Manufacturer", "Discovery Method", "Count"]
+            ]
+            for hit in summary.associations:
+                rows.append(
+                    [
+                        str(hit.ip),
+                        str(hit.mac),
+                        mac_manufacturer(hit.mac),
+                        str(hit.discovery_method),
+                        str(hit.count),
+                    ]
+                )
         else:
-            unique_macs = sorted({hit.mac for hit in summary.associations})
-            lines.append(_format_kv("Unique MACs", str(len(unique_macs))))
-            rows = [["MAC Address", "Manufacturer"]]
-            for mac_value in unique_macs:
-                rows.append([mac_value, mac_manufacturer(mac_value)])
+            rows = [["MAC Address", "Manufacturer", "Discovery Method", "Count"]]
+            for hit in summary.associations:
+                rows.append(
+                    [
+                        str(hit.mac),
+                        mac_manufacturer(hit.mac),
+                        str(hit.discovery_method),
+                        str(hit.count),
+                    ]
+                )
         lines.append(_format_table(rows))
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_ip_lookup_summary(summary: IpLookupSummary) -> str:
@@ -15473,24 +15178,35 @@ def render_ip_lookup_summary(summary: IpLookupSummary) -> str:
         )
     else:
         if query_all:
-            unique_pairs = sorted({(hit.mac, hit.ip) for hit in summary.associations})
-            lines.append(_format_kv("Unique Pairs", str(len(unique_pairs))))
-            rows = [["MAC Address", "IP Address", "Hostname"]]
-            for mac_value, ip_value in unique_pairs:
-                hostnames = list((summary.ip_hostnames or {}).get(ip_value, []))
-                hostname_text = ", ".join(hostnames[:2]) if hostnames else "-"
-                rows.append([mac_value, ip_value, _truncate_text(hostname_text, 44)])
+            rows = [["MAC Address", "IP Address", "Hostname", "Discovery Method", "Count"]]
+            for hit in summary.associations:
+                hostnames = list((summary.ip_hostnames or {}).get(str(hit.ip), []))
+                hostname_text = ", ".join(hostnames) if hostnames else "-"
+                rows.append(
+                    [
+                        str(hit.mac),
+                        str(hit.ip),
+                        hostname_text,
+                        str(hit.discovery_method),
+                        str(hit.count),
+                    ]
+                )
         else:
-            unique_ips = sorted({hit.ip for hit in summary.associations})
-            lines.append(_format_kv("Unique IPs", str(len(unique_ips))))
-            rows = [["IP Address", "Hostname"]]
-            for ip_value in unique_ips:
-                hostnames = list((summary.ip_hostnames or {}).get(ip_value, []))
-                hostname_text = ", ".join(hostnames[:2]) if hostnames else "-"
-                rows.append([ip_value, _truncate_text(hostname_text, 44)])
+            rows = [["IP Address", "Hostname", "Discovery Method", "Count"]]
+            for hit in summary.associations:
+                hostnames = list((summary.ip_hostnames or {}).get(str(hit.ip), []))
+                hostname_text = ", ".join(hostnames) if hostnames else "-"
+                rows.append(
+                    [
+                        str(hit.ip),
+                        hostname_text,
+                        str(hit.discovery_method),
+                        str(hit.count),
+                    ]
+                )
         lines.append(_format_table(rows))
     lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_nfs_summary(summary: NfsSummary) -> str:
@@ -16267,7 +15983,7 @@ def render_creds_summary(summary: CredentialSummary) -> str:
     return _finalize_output(lines)
 
 
-def render_secrets_summary(summary: SecretsSummary) -> str:
+def render_secrets_summary(summary: SecretsSummary, *, verbose: bool = False) -> str:
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"SECRET DISCOVERY :: {summary.path.name}"))
@@ -16282,53 +15998,92 @@ def render_secrets_summary(summary: SecretsSummary) -> str:
     lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
     lines.append(_format_kv("Matches", str(summary.matches)))
 
-    if summary.kind_counts:
+    if (
+        summary.kind_counts
+        or summary.top_sources
+        or summary.top_destinations
+        or summary.protocol_counts
+    ):
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Match Types"))
-        rows = [["Type", "Count"]]
-        for kind, count in summary.kind_counts.most_common(_limit_value(12)):
-            rows.append([kind, str(count)])
-        lines.append(_format_table(rows))
+        lines.append(header("Top Aggregated Counters"))
+
+        if summary.kind_counts:
+            lines.append(header("Kind Counts"))
+            rows = [["Item", "Count"]]
+            for item, count in summary.kind_counts.most_common(_limit_value(12)):
+                rows.append([item, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.top_sources:
+            lines.append(header("Top Sources"))
+            rows = [["Item", "Count"]]
+            for item, count in summary.top_sources.most_common(_limit_value(12)):
+                rows.append([item, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.top_destinations:
+            lines.append(header("Top Destinations"))
+            rows = [["Item", "Count"]]
+            for item, count in summary.top_destinations.most_common(_limit_value(12)):
+                rows.append([item, str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.protocol_counts:
+            lines.append(header("Protocol Counts"))
+            rows = [["Item", "Count"]]
+            for item, count in summary.protocol_counts.most_common(_limit_value(12)):
+                rows.append([item, str(count)])
+            lines.append(_format_table(rows))
 
     if summary.truncated:
         lines.append(warn(f"[WARN] Showing first {len(summary.hits)} matches."))
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Findings"))
-    if not summary.hits:
-        lines.append(muted("No reversible obfuscated secrets detected."))
-    else:
-        rows = [
-            ["Type", "Secret", "Cleartext", "Location", "Src", "Dst", "Proto", "Note"]
-        ]
-        for hit in summary.hits:
-            secret_value = hit.encoded
-            clear_value = hit.decoded
-            loc_parts = [f"pkt {hit.packet_number}"]
-            if hit.offset is not None:
-                loc_parts.append(f"@{hit.offset}")
-            if hit.ts is not None:
-                loc_parts.append(format_ts(hit.ts))
-            location = " ".join(loc_parts)
-            src = hit.src_ip
-            dst = hit.dst_ip
-            if hit.src_port is not None:
-                src = f"{src}:{hit.src_port}"
-            if hit.dst_port is not None:
-                dst = f"{dst}:{hit.dst_port}"
-            rows.append(
+    if verbose:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Findings"))
+        if not summary.hits:
+            lines.append(muted("No reversible obfuscated secrets detected."))
+        else:
+            rows = [
                 [
-                    hit.kind,
-                    _truncate_text(secret_value, 48),
-                    _truncate_text(clear_value, 64),
-                    location,
-                    src,
-                    dst,
-                    hit.protocol,
-                    _truncate_text(hit.note or "-", 40),
+                    "Type",
+                    "Secret",
+                    "Cleartext",
+                    "Location",
+                    "Src",
+                    "Dst",
+                    "Proto",
+                    "Note",
                 ]
-            )
-        lines.append(_format_table(rows))
+            ]
+            for hit in summary.hits:
+                secret_value = hit.encoded
+                clear_value = hit.decoded
+                loc_parts = [f"pkt {hit.packet_number}"]
+                if hit.offset is not None:
+                    loc_parts.append(f"@{hit.offset}")
+                if hit.ts is not None:
+                    loc_parts.append(format_ts(hit.ts))
+                location = " ".join(loc_parts)
+                src = hit.src_ip
+                dst = hit.dst_ip
+                if hit.src_port is not None:
+                    src = f"{src}:{hit.src_port}"
+                if hit.dst_port is not None:
+                    dst = f"{dst}:{hit.dst_port}"
+                rows.append(
+                    [
+                        hit.kind,
+                        secret_value,
+                        clear_value,
+                        location,
+                        src,
+                        dst,
+                        hit.protocol,
+                        _truncate_text(hit.note or "-", 40),
+                    ]
+                )
+            lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
@@ -16536,23 +16291,6 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
                     str(item.get("src", "-")),
                     str(item.get("dst", "-")),
                     str(item.get("not_after", "-")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if summary.artifacts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Actionable Hunting Pivots"))
-        rows = [["SHA256", "Serial", "Subject", "Issuer", "SAN", "Flow"]]
-        for cert in summary.artifacts[: _limit_value(12)]:
-            rows.append(
-                [
-                    cert.sha256[:12],
-                    cert.serial,
-                    _truncate_text(cert.subject, 30),
-                    _truncate_text(cert.issuer, 30),
-                    _truncate_text(cert.san, 24),
-                    f"{cert.src_ip}->{cert.dst_ip}",
                 ]
             )
         lines.append(_format_table(rows))
@@ -17799,52 +17537,6 @@ def render_hosts_summary(
             )
         lines.append(_format_table(rows))
 
-    pivots = list(getattr(summary, "investigation_pivots", []) or [])
-    if pivots:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Hunt Pivots"))
-        rows = [["Host", "Packet", "Hostnames", "OS", "Ports", "Why"]]
-        for item in pivots[: _limit_value(limit if verbose else 12)]:
-            hostnames = item.get("hostnames", [])
-            ports = item.get("ports", [])
-            reasons_val = item.get("reasons", [])
-            rows.append(
-                [
-                    str(item.get("host", "-")),
-                    _pivot_packet_number(item),
-                    _truncate_text(
-                        ", ".join(
-                            str(v)
-                            for v in (
-                                hostnames[:3] if isinstance(hostnames, list) else []
-                            )
-                        )
-                        or "-",
-                        60,
-                    ),
-                    _truncate_text(str(item.get("os", "-")), 28),
-                    _truncate_text(
-                        ", ".join(
-                            str(v)
-                            for v in (ports[:6] if isinstance(ports, list) else [])
-                        )
-                        or "-",
-                        80,
-                    ),
-                    _truncate_text(
-                        ", ".join(
-                            str(v)
-                            for v in (
-                                reasons_val[:3] if isinstance(reasons_val, list) else []
-                            )
-                        )
-                        or "-",
-                        90,
-                    ),
-                ]
-            )
-        lines.append(_format_table(rows))
-
     false_positive = [
         str(v)
         for v in list(getattr(summary, "false_positive_context", []) or [])
@@ -18268,51 +17960,6 @@ def render_hostname_summary(
                     )
                 )
 
-        pivots = list(getattr(summary, "investigation_pivots", []) or [])
-        if pivots:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Top Hunt Pivots"))
-            rows = [
-                [
-                    "Hostname",
-                    "Packet",
-                    "Mapped IPs",
-                    "Methods",
-                    "First Packet",
-                    "Last Packet",
-                ]
-            ]
-            for item in pivots[: _limit_value(limit if verbose else 12)]:
-                mapped_ips = item.get("mapped_ips", [])
-                methods = item.get("methods", [])
-                rows.append(
-                    [
-                        str(item.get("hostname", "-")),
-                        _pivot_packet_number(item),
-                        _truncate_text(
-                            ", ".join(
-                                str(v)
-                                for v in (
-                                    mapped_ips[:4] if isinstance(mapped_ips, list) else []
-                                )
-                            )
-                            or "-",
-                            60,
-                        ),
-                        _truncate_text(
-                            ", ".join(
-                                str(v)
-                                for v in (methods[:3] if isinstance(methods, list) else [])
-                            )
-                            or "-",
-                            70,
-                        ),
-                        str(item.get("first_packet", "-")),
-                        str(item.get("last_packet", "-")),
-                    ]
-                )
-            lines.append(_format_table(rows))
-
         false_positive_context = [
             str(v)
             for v in list(getattr(summary, "false_positive_context", []) or [])
@@ -18558,7 +18205,7 @@ def render_hostdetails_summary(
                 lines.append(muted(f"- {_truncate_text(name, 60)} ({count})"))
 
         lines.append(
-            muted("Use -v to expand full rows, timestamps, and detailed pivot tables.")
+            muted("Use -v to expand full rows, timestamps, and detailed context tables.")
         )
         lines.append(SECTION_BAR)
         return _finalize_output(lines, show_truncation_note=False)
@@ -18601,11 +18248,11 @@ def render_hostdetails_summary(
                     "count": 0,
                     "first": item.get("ts"),
                     "last": item.get("ts"),
-                    "first_packet": _pivot_packet_number(item),
+                    "first_packet": _packet_number_hint(item),
                 },
             )
             bucket["count"] = int(bucket.get("count", 0) or 0) + 1
-            packet_text = _pivot_packet_number(item)
+            packet_text = _packet_number_hint(item)
             if bucket.get("first_packet") in {None, "-", ""} and packet_text != "-":
                 bucket["first_packet"] = packet_text
             ts = item.get("ts")
@@ -18680,7 +18327,7 @@ def render_hostdetails_summary(
                     "first_seen": conv.get("first_seen"),
                     "last_seen": conv.get("last_seen"),
                     "service": service_name,
-                    "first_packet": _pivot_packet_number(conv),
+                    "first_packet": _packet_number_hint(conv),
                 },
             )
             row["packets"] = int(row.get("packets", 0) or 0) + int(
@@ -18689,7 +18336,7 @@ def render_hostdetails_summary(
             row["bytes"] = int(row.get("bytes", 0) or 0) + int(
                 conv.get("bytes", 0) or 0
             )
-            packet_text = _pivot_packet_number(conv)
+            packet_text = _packet_number_hint(conv)
             if row.get("first_packet") in {None, "-", ""} and packet_text != "-":
                 row["first_packet"] = packet_text
             first_seen = conv.get("first_seen")
@@ -18760,11 +18407,11 @@ def render_hostdetails_summary(
                     "count": 0,
                     "first": item.get("ts"),
                     "last": item.get("ts"),
-                    "first_packet": _pivot_packet_number(item),
+                    "first_packet": _packet_number_hint(item),
                 },
             )
             row["count"] = int(row.get("count", 0) or 0) + 1
-            packet_text = _pivot_packet_number(item)
+            packet_text = _packet_number_hint(item)
             if row.get("first_packet") in {None, "-", ""} and packet_text != "-":
                 row["first_packet"] = packet_text
             ts = item.get("ts")
@@ -18836,12 +18483,12 @@ def render_hostdetails_summary(
                     "total_bytes": 0,
                     "first": item.get("first_seen"),
                     "last": item.get("last_seen"),
-                    "first_packet": _pivot_packet_number(item),
+                    "first_packet": _packet_number_hint(item),
                 },
             )
             bucket["count"] = int(bucket.get("count", 0) or 0) + 1
             bucket["total_bytes"] = int(bucket.get("total_bytes", 0) or 0) + size_value
-            packet_text = _pivot_packet_number(item)
+            packet_text = _packet_number_hint(item)
             if (
                 bucket.get("first_packet") in {None, "-", ""}
                 and packet_text != "-"
@@ -18900,77 +18547,6 @@ def render_hostdetails_summary(
         lines.append(_format_table(rows))
     else:
         lines.append(muted("No downloaded files attributed to this host."))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Hunt Pivots"))
-    pivot_rows = [["Type", "Packet", "Pivot", "Context"]]
-
-    for (peer, port, proto), data in sorted_rows[: _limit_value(10)]:
-        context = f"service={data.get('service', '-')} bytes={format_bytes_as_mb(int(data.get('bytes', 0) or 0))} packets={data.get('packets', '-')}"
-        pivot_rows.append(
-            [
-                "Remote Service",
-                str(data.get("first_packet", "-")),
-                f"{peer}:{port}/{proto}",
-                context,
-            ]
-        )
-
-    for (name, qtype), data in sorted_dns[: _limit_value(10)]:
-        context = f"count={data.get('count', '-')} first={format_ts(data.get('first'))} last={format_ts(data.get('last'))}"
-        pivot_rows.append(
-            [
-                "DNS Query",
-                str(data.get("first_packet", "-")),
-                f"{name} ({qtype})",
-                context,
-            ]
-        )
-
-    for (
-        method,
-        request_value,
-        dst_ip,
-        dst_port,
-        status_text,
-        _risk_level,
-        _risk_score,
-    ), bucket in ordered_requests[: _limit_value(10)]:
-        context = f"hits={bucket.get('count', '-')} status={status_text} remote={dst_ip}:{dst_port}"
-        pivot_rows.append(
-            [
-                "Web Request",
-                str(bucket.get("first_packet", "-")),
-                f"{method} {_truncate_text(request_value, 60)}",
-                context,
-            ]
-        )
-
-    for (filename, source_text, proto, file_type, hashes), bucket in ordered_downloads[
-        : _limit_value(10)
-    ]:
-        total_size = int(bucket.get("total_bytes", 0) or 0)
-        hash_text = hashes if hashes and hashes != "-" else "no-hash"
-        context = (
-            f"events={bucket.get('count', '-')} total={format_bytes_as_mb(total_size) if total_size else '-'} "
-            f"src={source_text} proto={proto} type={file_type or '-'} {hash_text}"
-        )
-        pivot_rows.append(
-            [
-                "Downloaded File",
-                str(bucket.get("first_packet", "-")),
-                filename,
-                context,
-            ]
-        )
-
-    for peer, count in summary.peer_counts.most_common(_limit_value(10)):
-        pivot_rows.append(["Top Peer", "-", peer, f"packets={count}"])
-
-    if len(pivot_rows) > 1:
-        lines.append(_format_table(pivot_rows))
-    else:
-        lines.append(muted("No host-specific pivots were identified."))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
@@ -19624,7 +19200,6 @@ def render_timeline_summary(
                 "ssh",
                 "rpc",
                 "lateral",
-                "pivot",
             )
         ):
             tags.append("Lateral")
@@ -19897,65 +19472,6 @@ def render_timeline_summary(
         for port, count in port_items:
             svc = COMMON_PORTS.get(port, "-")
             lines.append(muted(f"- {port} ({svc}): {count}"))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Hunt Pivots"))
-    pivot_rows = [["Type", "Packet", "Pivot", "Context"]]
-
-    for item in beacon_rows:
-        pivot_rows.append(
-            [
-                "Beacon",
-                _pivot_packet_number(item),
-                str(item.get("peer", "-")),
-                f"mean={item.get('mean_interval', '-')}s cv={item.get('cv', '-')} count={item.get('count', '-')} conf={str(item.get('confidence', '-')).upper()}",
-            ]
-        )
-
-    for item in auth_rows:
-        src = str(item.get("src", "-"))
-        dst = str(item.get("dst", "-"))
-        pivot_rows.append(
-            [
-                "Auth Abuse",
-                _pivot_packet_number(item),
-                f"{src} -> {dst}",
-                f"attempts={item.get('attempts', '-')} targets={item.get('target_count', '-')} conf={str(item.get('confidence', '-')).upper()}",
-            ]
-        )
-
-    for item in lateral_rows:
-        src = str(item.get("src", "-"))
-        peers = item.get("peers", [])
-        peer_text = (
-            ", ".join(str(v) for v in peers[:6])
-            if isinstance(peers, list)
-            else str(peers)
-        )
-        pivot_rows.append(
-            [
-                "Lateral",
-                _pivot_packet_number(item),
-                src,
-                f"peer_count={item.get('peer_count', '-')} admin_hits={item.get('admin_hits', '-')} peers={_truncate_text(peer_text or '-', 56)}",
-            ]
-        )
-
-    for item in exfil_rows:
-        signal = str(item.get("signal", "-") or "-")
-        pivot_rows.append(
-            [
-                "Exfil",
-                _pivot_packet_number(item),
-                _truncate_text(signal, 56),
-                _truncate_text(_redact_in_text(signal), 96),
-            ]
-        )
-
-    if len(pivot_rows) > 1:
-        lines.append(_format_table(pivot_rows))
-    else:
-        lines.append(muted("No hunt pivots identified in timeline analysis."))
 
     for idx, line in enumerate(lines):
         if line == SECTION_BAR or line == SUBSECTION_BAR:
@@ -23394,8 +22910,47 @@ def render_vpn_summary(summary: VpnSummary) -> str:
     lines = [header("VPN/TUNNEL ANALYSIS")]
     lines.append(_format_kv("VPN Packets", str(summary.vpn_packets)))
     lines.append(_format_kv("Services", _format_counter(summary.service_counts, 6)))
+    if summary.protocol_counts:
+        lines.append(_format_kv("Protocols", _format_counter(summary.protocol_counts, 6)))
+    if summary.server_port_counts:
+        lines.append(
+            _format_kv("Server Ports", _format_counter(summary.server_port_counts, 6))
+        )
+    if summary.handshake_counts:
+        lines.append(_format_kv("Handshakes", _format_counter(summary.handshake_counts, 6)))
+    if summary.certificate_count:
+        lines.append(_format_kv("Certificates", str(summary.certificate_count)))
+        if summary.certificate_subjects:
+            lines.append(
+                _format_kv(
+                    "Cert Subjects",
+                    _format_counter(summary.certificate_subjects, 4, key_max=36),
+                )
+            )
+        if summary.certificate_issuers:
+            lines.append(
+                _format_kv(
+                    "Cert Issuers",
+                    _format_counter(summary.certificate_issuers, 4, key_max=36),
+                )
+            )
+        if summary.self_signed_cert_count:
+            lines.append(
+                _format_kv("Self-Signed Certs", str(summary.self_signed_cert_count))
+            )
+        if summary.weak_cert_count:
+            lines.append(_format_kv("Weak Certs", str(summary.weak_cert_count)))
+    if summary.threat_counts:
+        lines.append(_format_kv("Threats", _format_counter(summary.threat_counts, 5)))
+    if summary.anomaly_counts:
+        lines.append(_format_kv("Anomalies", _format_counter(summary.anomaly_counts, 5)))
     lines.append(_format_kv("Top Clients", _format_counter(summary.client_counts, 5)))
     lines.append(_format_kv("Top Servers", _format_counter(summary.server_counts, 5)))
+    if summary.artifact_correlations:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifact/Client/Server Correlation"))
+        for relation, count in summary.artifact_correlations.most_common(_limit_value(10)):
+            lines.append(muted(f"- {relation} ({count})"))
     return _finalize_output(lines)
 
 
@@ -24486,26 +24041,6 @@ def render_ctf_summary(summary: CtfSummary) -> str:
             )
         lines.append(_format_table(rows))
 
-    pivots = list(getattr(summary, "hunting_pivots", []) or [])
-    if pivots:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Actionable Hunting Pivots"))
-        rows = [["Packet", "Source", "Destination", "Proto", "Candidate", "Decode"]]
-        for item in pivots[: _limit_value(15)]:
-            rows.append(
-                [
-                    str(item.get("packet", "-")),
-                    str(item.get("src", "-")),
-                    str(item.get("dst", "-")),
-                    str(item.get("protocol", "-")),
-                    _truncate_text(
-                        _redact_in_text(str(item.get("candidate", "-"))), 42
-                    ),
-                    str(item.get("decode_chain", "raw")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
     false_context = list(getattr(summary, "false_positive_context", []) or [])
     if false_context:
         lines.append(SUBSECTION_BAR)
@@ -25126,4 +24661,417 @@ def render_iec101_103_summary(summary: Iec101103Summary, verbose: bool = False) 
             lines.append(sev_color(f"[{sev}] {summary_text}"))
             if details:
                 lines.append(muted(f"  {details}"))
+    return _finalize_output(lines)
+
+
+def _overview_metrics_text(metrics: dict[str, object]) -> str:
+    if not metrics:
+        return "-"
+    preferred = [
+        "detections",
+        "high_severity",
+        "packets",
+        "requests",
+        "responses",
+        "commands",
+        "anomalies",
+        "artifacts",
+        "hits",
+        "findings",
+        "pcaps",
+    ]
+    parts: list[str] = []
+    for key in preferred:
+        if key not in metrics:
+            continue
+        value = metrics[key]
+        if value is None:
+            continue
+        parts.append(f"{key}={value}")
+    if not parts:
+        for key, value in metrics.items():
+            if value is None:
+                continue
+            parts.append(f"{key}={value}")
+            if len(parts) >= 5:
+                break
+    return ", ".join(parts) if parts else "-"
+
+
+def _overview_ts(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        ts = float(value)
+    except Exception:
+        return None
+    return ts if ts > 0 else None
+
+
+def _overview_window_text(start: object, end: object) -> str:
+    start_ts = _overview_ts(start)
+    end_ts = _overview_ts(end) or start_ts
+    if start_ts is None and end_ts is None:
+        return "-"
+    if start_ts is None:
+        return format_ts(end_ts)
+    if end_ts is None or end_ts == start_ts:
+        return format_ts(start_ts)
+    return f"{format_ts(start_ts)} -> {format_ts(end_ts)}"
+
+
+def _overview_list_preview(value: object, limit: int = 3) -> str:
+    if isinstance(value, list):
+        items = [str(item).strip() for item in value if str(item).strip()]
+        if not items:
+            return "-"
+        text = ", ".join(items[:limit])
+        if len(items) > limit:
+            text = f"{text} (+{len(items) - limit})"
+        return text
+    return "-"
+
+
+def _overview_activity_text(item: dict[str, object]) -> str:
+    activity = str(item.get("activity", "") or "").strip()
+    if activity and activity != "-":
+        return activity
+    services_hosted = _overview_list_preview(item.get("services_hosted"), limit=2)
+    services_used = _overview_list_preview(item.get("services_used"), limit=2)
+    protocols = _overview_list_preview(
+        item.get("top_protocols", item.get("protocols")), limit=3
+    )
+    parts: list[str] = []
+    if services_hosted != "-":
+        parts.append(f"hosts {services_hosted}")
+    if services_used != "-":
+        parts.append(f"uses {services_used}")
+    if not parts and protocols != "-":
+        parts.append(f"speaks {protocols}")
+    return "; ".join(parts) if parts else "-"
+
+
+def _overview_rate_text(item: dict[str, object]) -> str:
+    bits_per_sec = int(item.get("bits_per_sec", 0) or 0)
+    packets_per_sec = float(item.get("packets_per_sec", 0.0) or 0.0)
+    parts: list[str] = []
+    if bits_per_sec > 0:
+        parts.append(format_speed_bps(bits_per_sec))
+    if packets_per_sec > 0:
+        parts.append(f"{packets_per_sec:.2f} pps")
+    return " / ".join(parts) if parts else "-"
+
+
+def _overview_priority_style(priority: str):
+    if priority == "HIGH":
+        return danger
+    if priority == "MEDIUM":
+        return warn
+    return muted
+
+
+def render_overview_summary(summary: OverviewSummary, verbose: bool = False) -> str:
+    lines = [header("STRATEGIC OVERVIEW")]
+    lines.append(_format_kv("Capture", str(summary.path)))
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+    capture_window = _overview_window_text(
+        getattr(summary, "capture_start", None), getattr(summary, "capture_end", None)
+    )
+    if capture_window != "-":
+        lines.append(_format_kv("Capture Window", capture_window))
+    lines.append(_format_kv("Top Protocols", _format_counter(dict(summary.top_protocols), 8)))
+    lines.append(_format_kv("Top Services", _format_counter(dict(summary.top_services), 8)))
+    ip_activity_rows = list(getattr(summary, "ip_activity", []) or summary.observed_ips or [])
+    if ip_activity_rows:
+        top_talker = ip_activity_rows[0]
+        lines.append(
+            _format_kv(
+                "Top Talker",
+                (
+                    f"{top_talker.get('ip', '-')} "
+                    f"({int(top_talker.get('packets_total', 0) or 0)} pkts, "
+                    f"{format_bytes_as_mb(int(top_talker.get('bytes_total', 0) or 0))})"
+                ),
+            )
+        )
+    detail = dict(getattr(summary, "summary_details", {}) or {})
+    if detail:
+        lines.append(_format_kv("Unique IPs", str(int(detail.get("unique_ips", 0) or 0))))
+        lines.append(
+            _format_kv(
+                "Unique Protocols",
+                str(int(detail.get("unique_protocols", 0) or 0)),
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Unique Services",
+                str(int(detail.get("unique_services", 0) or 0)),
+            )
+        )
+        lines.append(
+            _format_kv("Internal IPs", str(int(detail.get("internal_ips", 0) or 0)))
+        )
+        lines.append(
+            _format_kv("Public IPs", str(int(detail.get("public_ips", 0) or 0)))
+        )
+        lines.append(
+            _format_kv("Observed Flows", str(int(detail.get("flow_count", 0) or 0)))
+        )
+        lines.append(
+            _format_kv(
+                "Cross-Zone Flows",
+                str(int(detail.get("cross_zone_flows", 0) or 0)),
+            )
+        )
+        lines.append(
+            _format_kv("Leads", str(int(detail.get("hunt_leads", 0) or 0)))
+        )
+        capture_span_seconds = int(detail.get("capture_span_seconds", 0) or 0)
+        if capture_span_seconds > 0:
+            lines.append(
+                _format_kv("Capture Span", format_duration(float(capture_span_seconds)))
+            )
+        lines.append(
+            _format_kv(
+                "Deep Dives Run",
+                str(int(detail.get("module_count", len(summary.modules_run)) or 0)),
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Deep Dive Errors",
+                str(int(detail.get("module_errors", 0) or 0)),
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Protocol Anomalies",
+                str(int(detail.get("protocol_anomalies", 0) or 0)),
+            )
+        )
+        lines.append(
+            _format_kv("Service Risks", str(int(detail.get("service_risks", 0) or 0)))
+        )
+    lines.append(
+        _format_kv(
+            "OT/ICS Families",
+            ", ".join(summary.ot_protocols[:10]) if summary.ot_protocols else "-",
+        )
+    )
+
+    if ip_activity_rows:
+        lines.append(header("Observed IPs"))
+        rows = [["IP", "Role", "What", "When", "How Much", "Top Peers"]]
+        for item in ip_activity_rows[: _limit_value(15)]:
+            if not isinstance(item, dict):
+                continue
+            scope = str(item.get("scope", "") or "").strip()
+            role = str(item.get("role", "mixed") or "mixed").strip()
+            role_text = f"{scope}/{role}" if scope else role
+            when_text = _overview_window_text(item.get("first_seen"), item.get("last_seen"))
+            peer_text = _overview_list_preview(item.get("top_peers"), limit=2)
+            peer_count = int(item.get("peer_count", 0) or 0)
+            if peer_count > 0 and peer_text != "-":
+                peer_text = f"{peer_text} (total={peer_count})"
+            elif peer_count > 0:
+                peer_text = f"total={peer_count}"
+            volume = (
+                f"{int(item.get('packets_total', 0) or 0)} pkts / "
+                f"{format_bytes_as_mb(int(item.get('bytes_total', 0) or 0))} "
+                f"(s/r {int(item.get('packets_sent', 0) or 0)}/{int(item.get('packets_recv', 0) or 0)})"
+            )
+            rows.append(
+                [
+                    _truncate_text(str(item.get("ip", "-")), 24),
+                    _truncate_text(role_text, 18),
+                    _truncate_text(_overview_activity_text(item), 54),
+                    _truncate_text(when_text, 54),
+                    _truncate_text(volume, 54),
+                    _truncate_text(peer_text, 50),
+                ]
+            )
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    protocol_activity_rows = list(getattr(summary, "protocol_activity", []) or [])
+    observed_protocols = list(getattr(summary, "observed_protocols", []) or [])
+    if protocol_activity_rows:
+        lines.append(header("Observed Protocols"))
+        rows = [["Protocol", "Pkts", "Bytes", "Flows", "Hosts", "When", "Ports"]]
+        for item in protocol_activity_rows[: _limit_value(15)]:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                [
+                    _truncate_text(str(item.get("protocol", "-")), 26),
+                    str(int(item.get("packets", 0) or 0)),
+                    format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
+                    str(int(item.get("flow_count", 0) or 0)),
+                    str(int(item.get("host_count", 0) or 0)),
+                    _truncate_text(
+                        _overview_window_text(
+                            item.get("first_seen"), item.get("last_seen")
+                        ),
+                        52,
+                    ),
+                    _truncate_text(_overview_list_preview(item.get("top_ports"), 3), 24),
+                ]
+            )
+        lines.append(_format_table(rows))
+    elif observed_protocols:
+        lines.append(header("Observed Protocols"))
+        proto_total = sum(int(count) for _name, count in observed_protocols) or 1
+        rows = [["Protocol", "Packets", "% Traffic"]]
+        for name, count in observed_protocols[: _limit_value(15)]:
+            pct = (int(count) / proto_total) * 100 if proto_total else 0.0
+            rows.append([str(name), str(int(count)), f"{pct:.1f}%"])
+        lines.append(_format_table(rows))
+
+    service_activity_rows = list(getattr(summary, "service_activity", []) or [])
+    observed_services = list(getattr(summary, "observed_services", []) or [])
+    if service_activity_rows:
+        lines.append(header("Observed Services"))
+        rows = [["Service", "Assets", "Hosts/Clients", "When", "Traffic", "Top Hosts"]]
+        for item in service_activity_rows[: _limit_value(15)]:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                [
+                    _truncate_text(str(item.get("service", "-")), 26),
+                    str(int(item.get("asset_count", 0) or 0)),
+                    (
+                        f"{int(item.get('host_count', 0) or 0)}/"
+                        f"{int(item.get('client_count', 0) or 0)}"
+                    ),
+                    _truncate_text(
+                        _overview_window_text(
+                            item.get("first_seen"), item.get("last_seen")
+                        ),
+                        52,
+                    ),
+                    _truncate_text(
+                        (
+                            f"{int(item.get('packets', 0) or 0)} pkts / "
+                            f"{format_bytes_as_mb(int(item.get('bytes', 0) or 0))}"
+                        ),
+                        42,
+                    ),
+                    _truncate_text(_overview_list_preview(item.get("top_hosts"), 2), 44),
+                ]
+            )
+        lines.append(_format_table(rows))
+    elif observed_services:
+        lines.append(header("Observed Services"))
+        svc_total = sum(int(count) for _name, count in observed_services) or 1
+        rows = [["Service", "Count", "% Service Share"]]
+        for name, count in observed_services[: _limit_value(15)]:
+            pct = (int(count) / svc_total) * 100 if svc_total else 0.0
+            rows.append([str(name), str(int(count)), f"{pct:.1f}%"])
+        lines.append(_format_table(rows))
+
+    notable_flows = list(getattr(summary, "notable_flows", []) or [])
+    if notable_flows:
+        lines.append(header("Notable Flows"))
+        rows = [["Flow", "Protocol/Ports", "When", "Packets", "Bytes", "Rate"]]
+        for item in notable_flows[: _limit_value(12)]:
+            if not isinstance(item, dict):
+                continue
+            flow_text = f"{item.get('src', '-')} -> {item.get('dst', '-')}"
+            proto_text = str(item.get("protocol", "-"))
+            scope_pair = str(item.get("scope_pair", "") or "").strip()
+            if scope_pair:
+                proto_text = f"{proto_text} [{scope_pair}]"
+            ports = _overview_list_preview(item.get("ports"), 3)
+            if ports != "-":
+                proto_text = f"{proto_text} {ports}"
+            rows.append(
+                [
+                    _truncate_text(flow_text, 40),
+                    _truncate_text(proto_text, 46),
+                    _truncate_text(
+                        _overview_window_text(item.get("start_ts"), item.get("end_ts")),
+                        52,
+                    ),
+                    str(int(item.get("packets", 0) or 0)),
+                    format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
+                    _truncate_text(_overview_rate_text(item), 32),
+                ]
+            )
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
+
+    hunt_leads = list(getattr(summary, "hunt_leads", []) or [])
+    if hunt_leads:
+        lines.append(header("Immediate Leads"))
+        for lead in hunt_leads[: _limit_value(10)]:
+            if not isinstance(lead, dict):
+                continue
+            priority = str(lead.get("priority", "medium") or "medium").upper()
+            entity = _truncate_text(str(lead.get("entity", "-")), 48)
+            finding = _truncate_text(str(lead.get("finding", "")), 120)
+            evidence = _truncate_text(str(lead.get("evidence", "")), 180)
+            when_text = _overview_window_text(
+                lead.get("first_seen"), lead.get("last_seen")
+            )
+            style = _overview_priority_style(priority)
+            lines.append(style(f"[{priority}] {entity} - {finding}"))
+            if when_text != "-":
+                lines.append(muted(f"  when: {when_text}"))
+            if evidence:
+                lines.append(muted(f"  evidence: {evidence}"))
+
+    if summary.module_results:
+        lines.append(header("Auto-Run Deep Dives"))
+        rows = [["Module", "Reason", "Metrics", "Top Highlight"]]
+        for result in summary.module_results[: _limit_value(14)]:
+            rows.append(
+                [
+                    _truncate_text(result.module, 18),
+                    _truncate_text(result.reason, 56),
+                    _truncate_text(_overview_metrics_text(result.metrics), 42),
+                    _truncate_text(result.highlights[0] if result.highlights else "-", 64),
+                ]
+            )
+        lines.append(_format_table(rows))
+        if verbose:
+            for result in summary.module_results[: _limit_value(8)]:
+                extra = list(result.highlights[1:3])
+                if not extra:
+                    continue
+                lines.append(muted(f"{result.module}:"))
+                for item in extra:
+                    lines.append(muted(f"  - {_truncate_text(item, 140)}"))
+
+    if summary.ot_highlights:
+        lines.append(header("OT/ICS Highlights"))
+        for item in summary.ot_highlights[: _limit_value(8)]:
+            lines.append(f"- {_truncate_text(item, 160)}")
+
+    if summary.hunt_highlights:
+        lines.append(header("Threat Hunt Highlights"))
+        for item in summary.hunt_highlights[: _limit_value(10)]:
+            lines.append(f"- {_truncate_text(item, 160)}")
+
+    if summary.forensics_highlights:
+        lines.append(header("Forensics Highlights"))
+        for item in summary.forensics_highlights[: _limit_value(10)]:
+            lines.append(f"- {_truncate_text(item, 160)}")
+
+    if summary.ctf_highlights:
+        lines.append(header("CTF Highlights"))
+        for item in summary.ctf_highlights[: _limit_value(8)]:
+            lines.append(f"- {_truncate_text(item, 160)}")
+
+    if summary.recommendations:
+        lines.append(header("Suggested Next Steps"))
+        for item in summary.recommendations[: _limit_value(8)]:
+            lines.append(f"- {_truncate_text(item, 180)}")
+
+    if summary.errors:
+        lines.append(header("Errors / Gaps"))
+        for item in summary.errors[: _limit_value(8)]:
+            lines.append(muted(f"- {_truncate_text(item, 180)}"))
+
     return _finalize_output(lines)

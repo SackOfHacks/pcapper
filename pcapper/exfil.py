@@ -13,7 +13,12 @@ from .files import analyze_files
 from .http import analyze_http
 from .pcap_cache import get_reader
 from .progress import run_with_busy_status
-from .utils import format_bytes_as_mb, format_duration, safe_float
+from .utils import (
+    extract_packet_endpoints,
+    format_bytes_as_mb,
+    format_duration,
+    safe_float,
+)
 
 try:
     from scapy.layers.dns import DNS  # type: ignore
@@ -45,7 +50,6 @@ class ExfilSummary:
     protocol_exfil_checks: dict[str, list[str]]
     deterministic_checks: dict[str, list[str]]
     threat_hypotheses: list[dict[str, object]]
-    hunting_pivots: list[dict[str, object]]
     benign_context: list[str]
     risk_matrix: list[dict[str, str]]
     detections: list[dict[str, object]]
@@ -219,7 +223,6 @@ def analyze_exfil(
             },
             deterministic_checks={},
             threat_hypotheses=[],
-            hunting_pivots=[],
             benign_context=[],
             risk_matrix=[],
             detections=[],
@@ -289,19 +292,10 @@ def analyze_exfil(
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
 
-            src_ip = None
-            dst_ip = None
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             proto = "IP"
             src_port: Optional[int] = None
             dst_port: Optional[int] = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
 
             if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 proto = "TCP"
@@ -1389,32 +1383,6 @@ def analyze_exfil(
             }
         )
 
-    hunting_pivots: list[dict[str, object]] = []
-    for flow in outbound_flows[:10]:
-        hunting_pivots.append(
-            {
-                "pivot": "outbound_flow",
-                "entity": f"{flow.get('src')}->{flow.get('dst')}",
-                "value": f"{flow.get('proto')}/{flow.get('dst_port') or '-'} bytes={int(flow.get('bytes', 0) or 0)}",
-            }
-        )
-    for item in http_post_suspects[:8]:
-        hunting_pivots.append(
-            {
-                "pivot": "http_post_channel",
-                "entity": f"{item.get('src')}->{item.get('dst')}",
-                "value": f"host={item.get('host')} uri={item.get('uri')} packets={item.get('packet_examples', item.get('packet', '-'))}",
-            }
-        )
-    for item in dns_tunnel_suspects[:6]:
-        hunting_pivots.append(
-            {
-                "pivot": "dns_tunnel_source",
-                "entity": str(item.get("src", "-")),
-                "value": f"unique={item.get('unique')}/{item.get('total')} entropy={item.get('avg_entropy')} max_label={item.get('max_label')}",
-            }
-        )
-
     benign_context: list[str] = []
     if not deterministic_checks["dns_tunnel_indicators"]:
         benign_context.append(
@@ -1525,7 +1493,6 @@ def analyze_exfil(
         protocol_exfil_checks=protocol_exfil_checks,
         deterministic_checks=deterministic_checks,
         threat_hypotheses=threat_hypotheses,
-        hunting_pivots=hunting_pivots,
         benign_context=benign_context,
         risk_matrix=risk_matrix,
         detections=detections,

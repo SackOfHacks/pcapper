@@ -11,7 +11,7 @@ from .dns import analyze_dns
 from .files import analyze_files
 from .pcap_cache import PcapMeta, get_reader
 from .progress import run_with_busy_status
-from .utils import counter_inc, decode_payload, safe_float, set_add_cap
+from .utils import counter_inc, decode_payload, safe_float, set_add_cap, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -150,7 +150,6 @@ class LdapAnalysis:
     errors: List[str]
     deterministic_checks: Dict[str, List[str]]
     threat_hypotheses: List[Dict[str, object]]
-    hunting_pivots: List[Dict[str, object]]
     benign_context: List[str]
 
 
@@ -381,16 +380,7 @@ def analyze_ldap(
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if not src_ip or not dst_ip:
                 continue
@@ -777,7 +767,6 @@ def analyze_ldap(
         "secret_material_exposure": [],
     }
     threat_hypotheses: List[Dict[str, object]] = []
-    hunting_pivots: List[Dict[str, object]] = []
     benign_context: List[str] = []
 
     total_ldap_packets = max(1, int(cleartext_packets + ldaps_packets))
@@ -921,34 +910,6 @@ def analyze_ldap(
             }
         )
 
-    for client_ip, burst in bind_bursts.most_common(12):
-        hunting_pivots.append(
-            {
-                "pivot": "bind_rate",
-                "client": client_ip,
-                "value": int(burst),
-                "detail": f"Peak binds/min={int(burst)}",
-            }
-        )
-    for attr, count in suspicious_attributes.most_common(12):
-        hunting_pivots.append(
-            {
-                "pivot": "sensitive_attribute",
-                "attribute": attr,
-                "value": int(count),
-                "detail": f"attribute={attr} count={int(count)}",
-            }
-        )
-    for ip, count in public_endpoints.most_common(12):
-        hunting_pivots.append(
-            {
-                "pivot": "public_endpoint",
-                "endpoint": ip,
-                "value": int(count),
-                "detail": f"public LDAP endpoint count={int(count)}",
-            }
-        )
-
     if not deterministic_checks["credential_error_burst"]:
         benign_context.append("No strong LDAP credential-error burst pattern observed")
     if not deterministic_checks["directory_write_activity"]:
@@ -995,6 +956,5 @@ def analyze_ldap(
         errors=errors,
         deterministic_checks=deterministic_checks,
         threat_hypotheses=threat_hypotheses,
-        hunting_pivots=hunting_pivots[:120],
         benign_context=benign_context[:20],
     )

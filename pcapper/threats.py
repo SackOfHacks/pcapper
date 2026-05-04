@@ -81,7 +81,7 @@ from .syslog import analyze_syslog
 from .tcp import analyze_tcp
 from .tls import analyze_tls
 from .udp import analyze_udp
-from .utils import counter_inc, safe_float, setdict_add
+from .utils import counter_inc, safe_float, setdict_add, extract_packet_endpoints
 from .vpn import analyze_vpn
 from .winrm import analyze_winrm
 from .wmic import analyze_wmic
@@ -212,10 +212,8 @@ class ThreatSummary:
     suricata_metadata: dict[str, object] = None  # type: ignore[assignment]
     suricata_checks: dict[str, list[str]] = None  # type: ignore[assignment]
     suricata_event_counts: dict[str, int] = None  # type: ignore[assignment]
-    suricata_pivots: dict[str, list[tuple[str, int]]] = None  # type: ignore[assignment]
     deterministic_checks: dict[str, list[str]] = None  # type: ignore[assignment]
     threat_hypotheses: list[dict[str, object]] = None  # type: ignore[assignment]
-    hunting_pivots: list[dict[str, object]] = None  # type: ignore[assignment]
     benign_context: list[str] = None  # type: ignore[assignment]
     risk_matrix: list[dict[str, str]] = None  # type: ignore[assignment]
 
@@ -240,10 +238,8 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
             suricata_metadata={},
             suricata_checks={},
             suricata_event_counts={},
-            suricata_pivots={},
             deterministic_checks={},
             threat_hypotheses=[],
-            hunting_pivots=[],
             benign_context=[],
             risk_matrix=[],
         )
@@ -268,7 +264,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
     suricata_pcaps_scanned = 0
     deterministic_checks: dict[str, list[str]] = defaultdict(list)
     threat_hypotheses: list[dict[str, object]] = []
-    hunting_pivots: list[dict[str, object]] = []
     benign_context: list[str] = []
     risk_matrix: list[dict[str, str]] = []
     for summary in summaries:
@@ -306,17 +301,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
             for key, values in summary.suricata_checks.items():
                 for value in values:
                     suricata_checks[key].append(value)
-        if summary.suricata_pivots:
-            for ip_value, count in summary.suricata_pivots.get("top_sources", []) or []:
-                suricata_source_counts[str(ip_value)] += int(count)
-            for ip_value, count in (
-                summary.suricata_pivots.get("top_destinations", []) or []
-            ):
-                suricata_destination_counts[str(ip_value)] += int(count)
-            for sig_value, count in (
-                summary.suricata_pivots.get("top_signatures", []) or []
-            ):
-                suricata_signature_counts[str(sig_value)] += int(count)
         if summary.suricata_metadata and summary.suricata_metadata.get("engine"):
             suricata_pcaps_scanned += 1
         if summary.deterministic_checks:
@@ -327,10 +311,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
             for item in summary.threat_hypotheses:
                 if isinstance(item, dict):
                     threat_hypotheses.append(dict(item))
-        if summary.hunting_pivots:
-            for item in summary.hunting_pivots:
-                if isinstance(item, dict):
-                    hunting_pivots.append(dict(item))
         if summary.benign_context:
             benign_context.extend(str(v) for v in summary.benign_context)
         if summary.risk_matrix:
@@ -365,18 +345,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
             "mode": "rollup",
         }
 
-    merged_suricata_pivots: dict[str, list[tuple[str, int]]] = {}
-    if suricata_source_counts:
-        merged_suricata_pivots["top_sources"] = suricata_source_counts.most_common(10)
-    if suricata_destination_counts:
-        merged_suricata_pivots["top_destinations"] = (
-            suricata_destination_counts.most_common(10)
-        )
-    if suricata_signature_counts:
-        merged_suricata_pivots["top_signatures"] = (
-            suricata_signature_counts.most_common(10)
-        )
-
     merged_det_checks: dict[str, list[str]] = {}
     for key, values in deterministic_checks.items():
         deduped = []
@@ -404,22 +372,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
             {"hypothesis": hypo, "confidence": conf, "evidence": ev}
         )
         if len(deduped_hypotheses) >= 20:
-            break
-
-    deduped_pivots: list[dict[str, object]] = []
-    seen_pivots: set[tuple[str, str, str]] = set()
-    for item in hunting_pivots:
-        pivot = str(item.get("pivot", "")).strip()
-        entity = str(item.get("entity", item.get("source", ""))).strip()
-        value = str(item.get("value", item.get("count", ""))).strip()
-        key = (pivot, entity, value)
-        if not pivot or key in seen_pivots:
-            continue
-        seen_pivots.add(key)
-        deduped_pivots.append(
-            {"pivot": pivot, "entity": entity or "-", "value": value or "-"}
-        )
-        if len(deduped_pivots) >= 30:
             break
 
     deduped_benign = _dedupe_evidence(benign_context, limit=10)
@@ -463,10 +415,8 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
         suricata_metadata=merged_suricata_metadata,
         suricata_checks=merged_suricata_checks,
         suricata_event_counts=dict(suricata_event_counts),
-        suricata_pivots=merged_suricata_pivots,
         deterministic_checks=merged_det_checks,
         threat_hypotheses=deduped_hypotheses,
-        hunting_pivots=deduped_pivots,
         benign_context=deduped_benign,
         risk_matrix=deduped_matrix,
     )
@@ -1184,16 +1134,6 @@ def analyze_suricata(
         )
 
     event_counts = stats.get("event_counts", {}) if isinstance(stats, dict) else {}
-    pivots = {
-        "top_sources": stats.get("top_sources", []) if isinstance(stats, dict) else [],
-        "top_destinations": stats.get("top_destinations", [])
-        if isinstance(stats, dict)
-        else [],
-        "top_signatures": stats.get("top_signatures", [])
-        if isinstance(stats, dict)
-        else [],
-    }
-
     return ThreatSummary(
         path=path,
         detections=detections,
@@ -1212,10 +1152,8 @@ def analyze_suricata(
         suricata_metadata=metadata,
         suricata_checks=checks,
         suricata_event_counts=event_counts,
-        suricata_pivots=pivots,
         deterministic_checks={},
         threat_hypotheses=[],
-        hunting_pivots=[],
         benign_context=[],
         risk_matrix=[],
     )
@@ -1865,8 +1803,8 @@ def _threats_storyline(
         prefix = stage_prefixes.get(stage, "Then,")
         storyline.append(f"{prefix} {sentence}")
 
-    # Pivot hint: if host B appears as destination from host A, and B also acts as an active
-    # source in recon/movement/C2/exfil detections, narrate potential host-to-host chaining.
+    # Host-chaining hint: if host B appears as destination from host A, and B also acts as an
+    # active source in recon/movement/C2/exfil detections, narrate potential host-to-host chaining.
     source_activity: dict[str, set[str]] = defaultdict(set)
     source_example: dict[str, str] = {}
     observed_pairs: list[tuple[str, str]] = []
@@ -1878,30 +1816,30 @@ def _threats_storyline(
             source_activity[src_ip].add(stage)
             source_example.setdefault(src_ip, str(item.get("summary", "")).strip())
 
-    pivot_stage_names = {
+    transition_stage_names = {
         "recon": "reconnaissance",
         "movement": "lateral movement",
         "c2": "command-and-control",
         "exfil": "exfiltration",
     }
-    pivot_signal_stages = ("recon", "movement", "c2", "exfil")
-    pivot_sentence = ""
+    transition_signal_stages = ("recon", "movement", "c2", "exfil")
+    transition_sentence = ""
     for src_ip, dst_ip in observed_pairs:
         dst_stages = source_activity.get(dst_ip, set())
         stage_hit = next(
-            (name for name in pivot_signal_stages if name in dst_stages), ""
+            (name for name in transition_signal_stages if name in dst_stages), ""
         )
         if not stage_hit:
             continue
-        stage_label = pivot_stage_names.get(stage_hit, stage_hit)
+        stage_label = transition_stage_names.get(stage_hit, stage_hit)
         dst_example = source_example.get(dst_ip, "follow-on network activity")
-        pivot_sentence = (
-            f"Possible pivot behavior: after traffic from {src_ip} to {dst_ip}, {dst_ip} also "
+        transition_sentence = (
+            f"Possible stage progression: after traffic from {src_ip} to {dst_ip}, {dst_ip} also "
             f"showed {stage_label} signals ({dst_example})."
         )
         break
-    if pivot_sentence:
-        storyline.append(pivot_sentence)
+    if transition_sentence:
+        storyline.append(transition_sentence)
 
     if len(storyline) <= 1:
         top = sorted_dets[:2]
@@ -2900,16 +2838,7 @@ def analyze_threats(
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):
-                ip_layer = pkt[IP]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):
-                ip_layer = pkt[IPv6]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if not src_ip or not dst_ip:
                 continue
@@ -4185,42 +4114,6 @@ def analyze_threats(
             }
         )
 
-    hunting_pivots: list[dict[str, object]] = []
-    for src, count in syn_counts.most_common(8):
-        hunting_pivots.append(
-            {"pivot": "high_syn_source", "entity": src, "value": str(int(count))}
-        )
-    for src, count in suspicious_payload_sources.most_common(8):
-        hunting_pivots.append(
-            {"pivot": "payload_marker_source", "entity": src, "value": str(int(count))}
-        )
-    for src, count in credential_exposure_sources.most_common(8):
-        hunting_pivots.append(
-            {
-                "pivot": "credential_exposure_source",
-                "entity": src,
-                "value": str(int(count)),
-            }
-        )
-    for src, dst, byte_count in sorted(
-        exfil_pairs, key=lambda item: item[2], reverse=True
-    )[:8]:
-        hunting_pivots.append(
-            {
-                "pivot": "public_exfil_pair",
-                "entity": f"{src}->{dst}",
-                "value": f"{byte_count / (1024 * 1024):.1f}MB",
-            }
-        )
-    for proto, src, dst in sorted(public_ot_pairs)[:8]:
-        hunting_pivots.append(
-            {
-                "pivot": "public_ot_pair",
-                "entity": f"{src}->{dst}",
-                "value": proto,
-            }
-        )
-
     benign_context: list[str] = []
     if not deterministic_checks["recon_scan_pressure"]:
         benign_context.append(
@@ -4295,7 +4188,6 @@ def analyze_threats(
         storyline=storyline,
         deterministic_checks=deterministic_checks,
         threat_hypotheses=threat_hypotheses,
-        hunting_pivots=hunting_pivots,
         benign_context=benign_context,
         risk_matrix=risk_matrix,
     )

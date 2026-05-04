@@ -88,7 +88,6 @@ class ProtocolSummary:
     tunneling_profiles: List[Dict[str, object]] = field(default_factory=list)
     beacon_profiles: List[Dict[str, object]] = field(default_factory=list)
     role_inversion_profiles: List[Dict[str, object]] = field(default_factory=list)
-    investigation_pivots: List[Dict[str, object]] = field(default_factory=list)
     risk_matrix: List[Dict[str, str]] = field(default_factory=list)
     false_positive_context: List[str] = field(default_factory=list)
 
@@ -107,7 +106,7 @@ def _ip_zone(value: str) -> str:
     return "other"
 
 
-def _build_protocol_hunting_context(
+def _build_protocol_enrichment(
     *,
     total_packets: int,
     duration: float,
@@ -118,417 +117,17 @@ def _build_protocol_hunting_context(
     port_protocols: List[Tuple[str, int]],
     ethertype_protocols: List[Tuple[str, int]],
 ) -> Dict[str, object]:
-    checks: Dict[str, List[str]] = {
-        "protocol_identity_mismatch": [],
-        "anomalous_protocol_sequence": [],
-        "boundary_cross_zone_protocol": [],
-        "tunneling_or_encapsulation_signal": [],
-        "periodic_beacon_profile": [],
-        "role_inversion_signal": [],
-        "ot_protocol_boundary_crossing": [],
-        "rare_or_low_prevalence_protocol": [],
-        "cross_protocol_corroboration": [],
-        "evidence_provenance": [],
-    }
-
-    corroborated_findings: List[Dict[str, object]] = []
-    sequence_profiles: List[Dict[str, object]] = []
-    zone_profiles: List[Dict[str, object]] = []
-    baseline_drift_profiles: List[Dict[str, object]] = []
-    tunneling_profiles: List[Dict[str, object]] = []
-    beacon_profiles: List[Dict[str, object]] = []
-    role_inversion_profiles: List[Dict[str, object]] = []
-    pivots: List[Dict[str, object]] = []
-
-    suspicious_proto_names = {
-        "DNS",
-        "ICMP",
-        "QUIC",
-        "HTTPS",
-        "HTTP",
-        "SMB",
-        "RDP",
-        "WinRM",
-        "SSH",
-        "Telnet",
-    }
-    admin_protos = {"SMB", "RDP", "WinRM", "SSH", "Telnet", "RPC", "LDAP", "Kerberos"}
-    ot_markers = {
-        "Modbus",
-        "DNP3",
-        "IEC",
-        "CIP",
-        "ENIP",
-        "BACnet",
-        "OPC",
-        "S7",
-        "PROFINET",
-        "EtherCAT",
-        "GOOSE",
-        "SV",
-        "MMS",
-        "ICCP",
-        "PTP",
-        "MQTT",
-        "CoAP",
-        "HART",
-    }
-
-    for name, count in top_protocols:
-        pct = (
-            (float(count) / float(total_packets) * 100.0) if total_packets > 0 else 0.0
-        )
-        if count <= 5 or pct <= 0.2:
-            checks["rare_or_low_prevalence_protocol"].append(
-                f"{name} packets={count} prevalence={pct:.2f}%"
-            )
-            baseline_drift_profiles.append(
-                {
-                    "protocol": str(name),
-                    "baseline_prevalence": "unknown(single-capture)",
-                    "current_prevalence_pct": f"{pct:.2f}",
-                    "status": "rare-or-first-seen-candidate",
-                }
-            )
-
-    anomaly_by_src: Dict[str, List[Anomaly]] = defaultdict(list)
-    for anomaly in anomalies:
-        if anomaly.src:
-            anomaly_by_src[str(anomaly.src)].append(anomaly)
-
-    for src, events in anomaly_by_src.items():
-        event_types = {str(event.type) for event in events}
-        event_severities = {str(event.severity).upper() for event in events}
-        scan_signal = any("Scan" in t for t in event_types)
-        cred_signal = any(
-            t
-            in {"Cleartext Creds", "Credential Leakage", "Basic Auth", "Cleartext Auth"}
-            for t in event_types
-        )
-        frag_signal = any(t == "IP Fragmentation" for t in event_types)
-        if scan_signal and cred_signal:
-            checks["anomalous_protocol_sequence"].append(
-                f"{src} shows scan-like then credential-exposure indicators"
-            )
-            sequence_profiles.append(
-                {
-                    "entity": src,
-                    "sequence": ["scan-signal", "credential-exposure"],
-                    "confidence": "high",
-                    "evidence_count": len(events),
-                }
-            )
-        elif scan_signal and frag_signal:
-            checks["anomalous_protocol_sequence"].append(
-                f"{src} shows scan-like plus fragmentation indicators"
-            )
-            sequence_profiles.append(
-                {
-                    "entity": src,
-                    "sequence": ["scan-signal", "fragmentation"],
-                    "confidence": "medium",
-                    "evidence_count": len(events),
-                }
-            )
-        if len(event_types) >= 3 and (
-            "HIGH" in event_severities or "CRITICAL" in event_severities
-        ):
-            checks["cross_protocol_corroboration"].append(
-                f"{src} has multi-signal anomaly stack types={','.join(sorted(event_types))}"
-            )
-
-    endpoint_map = {str(ep.address): ep for ep in endpoints}
-    host_scores: Dict[str, int] = defaultdict(int)
-    host_reasons: Dict[str, List[str]] = defaultdict(list)
-
-    for conv in conversations:
-        src_zone = _ip_zone(str(conv.src))
-        dst_zone = _ip_zone(str(conv.dst))
-        zone_pair = f"{src_zone}->{dst_zone}"
-        proto_name = str(conv.protocol)
-        duration_s = max(0.0, float(conv.end_ts or 0.0) - float(conv.start_ts or 0.0))
-        pps = (float(conv.packets) / duration_s) if duration_s > 0 else 0.0
-        avg_payload = (
-            (float(conv.bytes) / float(conv.packets)) if conv.packets > 0 else 0.0
-        )
-        ports = sorted(int(p) for p in list(conv.ports))
-
-        checks["evidence_provenance"].append(
-            f"{conv.src}->{conv.dst} proto={proto_name} packets={conv.packets} bytes={conv.bytes} duration={duration_s:.1f}s ports={','.join(str(p) for p in ports[:8]) or '-'}"
-        )
-
-        is_cross_zone = {src_zone, dst_zone} == {"internal", "public"}
-        if is_cross_zone and proto_name in admin_protos:
-            checks["boundary_cross_zone_protocol"].append(
-                f"{conv.src}->{conv.dst} {proto_name} across {zone_pair}"
-            )
-            zone_profiles.append(
-                {
-                    "src": conv.src,
-                    "dst": conv.dst,
-                    "protocol": proto_name,
-                    "zone_pair": zone_pair,
-                    "packets": conv.packets,
-                    "bytes": conv.bytes,
-                    "confidence": "high",
-                }
-            )
-            host_scores[str(conv.src)] += 2
-            host_reasons[str(conv.src)].append("Cross-zone admin protocol exposure")
-
-        ot_hit = any(marker.lower() in proto_name.lower() for marker in ot_markers)
-        if ot_hit and is_cross_zone:
-            checks["ot_protocol_boundary_crossing"].append(
-                f"{conv.src}->{conv.dst} OT protocol {proto_name} across {zone_pair}"
-            )
-            host_scores[str(conv.src)] += 2
-            host_reasons[str(conv.src)].append("OT protocol crossing network boundary")
-
-        if duration_s >= 900 and conv.packets >= 30 and pps <= 0.2:
-            checks["periodic_beacon_profile"].append(
-                f"{conv.src}->{conv.dst} proto={proto_name} packets={conv.packets} duration={duration_s:.1f}s pps={pps:.3f}"
-            )
-            beacon_profiles.append(
-                {
-                    "src": conv.src,
-                    "dst": conv.dst,
-                    "protocol": proto_name,
-                    "packets": conv.packets,
-                    "duration_s": f"{duration_s:.1f}",
-                    "pps": f"{pps:.3f}",
-                }
-            )
-            host_scores[str(conv.src)] += 1
-            host_reasons[str(conv.src)].append("Low-and-slow periodic protocol cadence")
-
-        if proto_name in {"DNS", "ICMP"} and avg_payload >= 200 and conv.packets >= 15:
-            checks["tunneling_or_encapsulation_signal"].append(
-                f"{conv.src}->{conv.dst} proto={proto_name} avg_payload={avg_payload:.1f} bytes packets={conv.packets}"
-            )
-            tunneling_profiles.append(
-                {
-                    "src": conv.src,
-                    "dst": conv.dst,
-                    "protocol": proto_name,
-                    "avg_payload": f"{avg_payload:.1f}",
-                    "packets": conv.packets,
-                    "confidence": "medium",
-                }
-            )
-            host_scores[str(conv.src)] += 1
-            host_reasons[str(conv.src)].append("Potential protocol tunneling signal")
-
-        src_ep = endpoint_map.get(str(conv.src))
-        if src_ep is not None:
-            src_protocols = {str(p) for p in src_ep.protocols}
-            if (
-                proto_name in admin_protos
-                and src_zone == "internal"
-                and len(src_protocols) <= 2
-            ):
-                checks["role_inversion_signal"].append(
-                    f"{conv.src} appears narrowly exposed on admin protocol {proto_name}"
-                )
-                role_inversion_profiles.append(
-                    {
-                        "host": conv.src,
-                        "protocol": proto_name,
-                        "protocol_count": len(src_protocols),
-                        "zone": src_zone,
-                        "confidence": "medium",
-                    }
-                )
-                host_scores[str(conv.src)] += 1
-                host_reasons[str(conv.src)].append("Possible protocol role inversion")
-
-            if len(src_protocols.intersection(suspicious_proto_names)) >= 4:
-                checks["protocol_identity_mismatch"].append(
-                    f"{conv.src} speaks broad risky protocol mix: {','.join(sorted(src_protocols.intersection(suspicious_proto_names)))}"
-                )
-                host_scores[str(conv.src)] += 1
-                host_reasons[str(conv.src)].append(
-                    "Broad risky cross-protocol service mix"
-                )
-
-    for host, score in sorted(
-        host_scores.items(), key=lambda item: item[1], reverse=True
-    ):
-        reasons = list(dict.fromkeys(host_reasons.get(host, [])))
-        confidence = "high" if score >= 5 else "medium" if score >= 3 else "low"
-        corroborated_findings.append(
-            {
-                "host": host,
-                "score": score,
-                "confidence": confidence,
-                "reasons": reasons[:4],
-            }
-        )
-
-    for conv in sorted(conversations, key=lambda c: c.bytes, reverse=True):
-        reasons = host_reasons.get(str(conv.src), []) + host_reasons.get(
-            str(conv.dst), []
-        )
-        if not reasons:
-            continue
-        pivots.append(
-            {
-                "conversation": f"{conv.src}->{conv.dst}",
-                "protocol": conv.protocol,
-                "packets": conv.packets,
-                "bytes": conv.bytes,
-                "duration_s": max(
-                    0.0, float(conv.end_ts or 0.0) - float(conv.start_ts or 0.0)
-                ),
-                "reasons": list(dict.fromkeys(reasons))[:4],
-            }
-        )
-
-    verdict_score = 0
-    verdict_score += 2 if checks["boundary_cross_zone_protocol"] else 0
-    verdict_score += 2 if checks["ot_protocol_boundary_crossing"] else 0
-    verdict_score += 1 if checks["anomalous_protocol_sequence"] else 0
-    verdict_score += 1 if checks["cross_protocol_corroboration"] else 0
-    verdict_score += 1 if checks["tunneling_or_encapsulation_signal"] else 0
-    verdict_score += 1 if checks["periodic_beacon_profile"] else 0
-    verdict_score += 1 if checks["role_inversion_signal"] else 0
-    verdict_score += (
-        1
-        if len(
-            [a for a in anomalies if str(a.severity).upper() in {"HIGH", "CRITICAL"}]
-        )
-        >= 3
-        else 0
+    _ = (
+        total_packets,
+        duration,
+        conversations,
+        endpoints,
+        anomalies,
+        top_protocols,
+        port_protocols,
+        ethertype_protocols,
     )
-
-    analyst_reasons: List[str] = []
-    if checks["boundary_cross_zone_protocol"]:
-        analyst_reasons.append(
-            "Administrative protocols crossed internal/public boundaries"
-        )
-    if checks["ot_protocol_boundary_crossing"]:
-        analyst_reasons.append("OT protocols crossed expected network boundaries")
-    if checks["cross_protocol_corroboration"]:
-        analyst_reasons.append(
-            "Multiple independent protocol anomaly signals corroborate"
-        )
-    if checks["anomalous_protocol_sequence"]:
-        analyst_reasons.append(
-            "Suspicious sequence pattern observed in protocol events"
-        )
-    if checks["tunneling_or_encapsulation_signal"]:
-        analyst_reasons.append(
-            "Potential protocol tunneling/encapsulation signals observed"
-        )
-
-    if verdict_score >= 8:
-        verdict = (
-            "YES - HIGH-CONFIDENCE PROTOCOL ABUSE OR LATERAL-MOVEMENT PATTERN DETECTED"
-        )
-        confidence = "high"
-    elif verdict_score >= 5:
-        verdict = "LIKELY - MULTIPLE CORROBORATING PROTOCOL RISK INDICATORS DETECTED"
-        confidence = "medium"
-    elif verdict_score >= 2:
-        verdict = "POSSIBLE - PROTOCOL RISK SIGNALS REQUIRE VALIDATION"
-        confidence = "medium"
-    else:
-        verdict = (
-            "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE PROTOCOL ABUSE PATTERN"
-        )
-        confidence = "low"
-
-    risk_matrix: List[Dict[str, str]] = [
-        {
-            "category": "Anomalous Sequence",
-            "risk": "High" if checks["anomalous_protocol_sequence"] else "None",
-            "confidence": "High" if checks["anomalous_protocol_sequence"] else "Low",
-            "evidence": str(len(checks["anomalous_protocol_sequence"]))
-            if checks["anomalous_protocol_sequence"]
-            else "No matching detections",
-        },
-        {
-            "category": "Cross-Zone Protocol Exposure",
-            "risk": "High" if checks["boundary_cross_zone_protocol"] else "None",
-            "confidence": "High" if checks["boundary_cross_zone_protocol"] else "Low",
-            "evidence": str(len(checks["boundary_cross_zone_protocol"]))
-            if checks["boundary_cross_zone_protocol"]
-            else "No matching detections",
-        },
-        {
-            "category": "Tunneling/Encapsulation",
-            "risk": "Medium" if checks["tunneling_or_encapsulation_signal"] else "None",
-            "confidence": "Medium"
-            if checks["tunneling_or_encapsulation_signal"]
-            else "Low",
-            "evidence": str(len(checks["tunneling_or_encapsulation_signal"]))
-            if checks["tunneling_or_encapsulation_signal"]
-            else "No matching detections",
-        },
-        {
-            "category": "Periodic Beaconing",
-            "risk": "Medium" if checks["periodic_beacon_profile"] else "None",
-            "confidence": "Medium" if checks["periodic_beacon_profile"] else "Low",
-            "evidence": str(len(checks["periodic_beacon_profile"]))
-            if checks["periodic_beacon_profile"]
-            else "No matching detections",
-        },
-        {
-            "category": "Role Inversion",
-            "risk": "Medium" if checks["role_inversion_signal"] else "None",
-            "confidence": "Medium" if checks["role_inversion_signal"] else "Low",
-            "evidence": str(len(checks["role_inversion_signal"]))
-            if checks["role_inversion_signal"]
-            else "No matching detections",
-        },
-        {
-            "category": "OT Boundary Crossing",
-            "risk": "High" if checks["ot_protocol_boundary_crossing"] else "None",
-            "confidence": "High" if checks["ot_protocol_boundary_crossing"] else "Low",
-            "evidence": str(len(checks["ot_protocol_boundary_crossing"]))
-            if checks["ot_protocol_boundary_crossing"]
-            else "No matching detections",
-        },
-    ]
-
-    false_positive_context: List[str] = []
-    if (
-        checks["boundary_cross_zone_protocol"]
-        and not checks["cross_protocol_corroboration"]
-    ):
-        false_positive_context.append(
-            "Boundary crossings may be expected for approved remote administration or managed gateways"
-        )
-    if checks["periodic_beacon_profile"]:
-        false_positive_context.append(
-            "Periodic behavior can be caused by health checks, backup agents, or telemetry polling"
-        )
-    if not checks["anomalous_protocol_sequence"]:
-        false_positive_context.append(
-            "No strong deterministic protocol-event sequence crossed high-confidence thresholds"
-        )
-    false_positive_context.append(
-        "Baseline drift is estimated from this capture only unless historical baselines are provided"
-    )
-
-    return {
-        "analyst_verdict": verdict,
-        "analyst_confidence": confidence,
-        "analyst_reasons": analyst_reasons
-        if analyst_reasons
-        else ["No high-confidence protocol threat heuristic crossed threshold"],
-        "deterministic_checks": checks,
-        "corroborated_findings": corroborated_findings[:40],
-        "sequence_profiles": sequence_profiles[:40],
-        "zone_protocol_profiles": zone_profiles[:40],
-        "baseline_drift_profiles": baseline_drift_profiles[:40],
-        "tunneling_profiles": tunneling_profiles[:40],
-        "beacon_profiles": beacon_profiles[:40],
-        "role_inversion_profiles": role_inversion_profiles[:40],
-        "investigation_pivots": pivots[:40],
-        "risk_matrix": risk_matrix,
-        "false_positive_context": false_positive_context[:8],
-    }
-
+    return {}
 
 def merge_protocols_summaries(
     summaries: List[ProtocolSummary]
@@ -560,7 +159,6 @@ def merge_protocols_summaries(
             tunneling_profiles=[],
             beacon_profiles=[],
             role_inversion_profiles=[],
-            investigation_pivots=[],
             risk_matrix=[],
             false_positive_context=[],
         )
@@ -621,7 +219,7 @@ def merge_protocols_summaries(
     port_protocols = port_counter.most_common(10)
     ethertype_protocols = eth_counter.most_common(10)
 
-    context = _build_protocol_hunting_context(
+    context = _build_protocol_enrichment(
         total_packets=total_packets,
         duration=duration,
         conversations=conversations,
@@ -662,7 +260,6 @@ def merge_protocols_summaries(
         tunneling_profiles=list(context.get("tunneling_profiles", []) or []),
         beacon_profiles=list(context.get("beacon_profiles", []) or []),
         role_inversion_profiles=list(context.get("role_inversion_profiles", []) or []),
-        investigation_pivots=list(context.get("investigation_pivots", []) or []),
         risk_matrix=[
             dict(item)
             for item in list(context.get("risk_matrix", []) or [])
@@ -1381,7 +978,7 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
     top_protocols = layer_counts.most_common(10)
     port_protocols = port_protocol_counts.most_common(12)
     ethertype_protocols = ethertype_protocol_counts.most_common(12)
-    context = _build_protocol_hunting_context(
+    context = _build_protocol_enrichment(
         total_packets=pkt_idx,
         duration=duration,
         conversations=conversations,
@@ -1422,7 +1019,6 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
         tunneling_profiles=list(context.get("tunneling_profiles", []) or []),
         beacon_profiles=list(context.get("beacon_profiles", []) or []),
         role_inversion_profiles=list(context.get("role_inversion_profiles", []) or []),
-        investigation_pivots=list(context.get("investigation_pivots", []) or []),
         risk_matrix=[
             dict(item)
             for item in list(context.get("risk_matrix", []) or [])

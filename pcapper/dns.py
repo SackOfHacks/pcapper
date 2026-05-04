@@ -15,7 +15,7 @@ from typing import Callable, Optional
 
 from .pcap_cache import PcapMeta, get_reader
 from .progress import build_statusbar
-from .utils import counter_inc, decode_payload, safe_float, set_add_cap, setdict_add
+from .utils import counter_inc, decode_payload, safe_float, set_add_cap, setdict_add, extract_packet_endpoints
 
 try:
     from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore
@@ -571,16 +571,7 @@ def analyze_dns(
             if getattr(dns_layer, "cd", 0):
                 counter_inc(flag_counts, "CD")
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             is_mdns = False
             is_llmnr = False

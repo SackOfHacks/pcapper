@@ -6,6 +6,15 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 1.7.5 — 2026-05-04
+### Changed
+- Release metadata/docs alignment updated for `v1.7.5`.
+
+### Fixed
+- `--scan` now detects host-discovery sweeps (`nmap -sn` style ICMP/ARP probing) instead of relying only on TCP SYN activity.
+- Mixed scan behavior is now reported as separate scanner entries (horizontal and vertical) instead of a single combined row.
+- Scan summary aggregation now preserves per-scan-type entries across merged summaries without recombining them.
+
 ## 1.7.0 — 2026-04-10
 ### Added
 - New identity mapping workflows: `--ip` (`-mac`) and `--mac` (`-ip`) for clean MAC↔IP summaries, including unique pair reporting, counts, manufacturer enrichment, and hostnames where available.

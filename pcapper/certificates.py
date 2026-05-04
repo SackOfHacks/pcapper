@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
+from .utils import extract_packet_endpoints
 
 try:
     from scapy import error as scapy_error  # type: ignore
@@ -622,16 +623,9 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
             if not cert_payloads:
                 continue
 
-            src_ip = "0.0.0.0"
-            dst_ip = "0.0.0.0"
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", "0.0.0.0"))
-                dst_ip = str(getattr(ip_layer, "dst", "0.0.0.0"))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", "::"))
-                dst_ip = str(getattr(ip_layer, "dst", "::"))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
+            src_ip = src_ip or "0.0.0.0"
+            dst_ip = dst_ip or "0.0.0.0"
 
             for payload in cert_payloads:
                 for cert_bytes in _collect_cert_items(payload):

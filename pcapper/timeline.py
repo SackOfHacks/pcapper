@@ -27,7 +27,7 @@ from .profinet import PROFINET_PORTS
 from .progress import build_statusbar, run_with_busy_status
 from .s7 import S7_PORT, analyze_s7
 from .telnet import TELNET_PORTS
-from .utils import counter_inc, decode_payload, safe_float
+from .utils import counter_inc, decode_payload, safe_float, extract_packet_endpoints
 from .winrm import WINRM_PORTS, WSMAN_RE
 from .wmic import WMIC_COMMAND_RE
 
@@ -433,7 +433,7 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
     storyline = _compute_ot_storyline(
         merged.events, target_ip, merged.ot_protocol_counts, risk_score, risk_findings
     )
-    merged_hunt_context = _build_timeline_hunting_context(
+    merged_enrichment = _build_timeline_enrichment(
         merged.events,
         target_ip,
         merged.file_downloads,
@@ -462,55 +462,55 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
         ot_storyline=storyline,
         dns_queries=merged.dns_queries,
         file_downloads=merged.file_downloads,
-        analyst_verdict=str(merged_hunt_context.get("analyst_verdict", "")),
-        analyst_confidence=str(merged_hunt_context.get("analyst_confidence", "low")),
+        analyst_verdict=str(merged_enrichment.get("analyst_verdict", "")),
+        analyst_confidence=str(merged_enrichment.get("analyst_confidence", "low")),
         analyst_reasons=[
             str(v)
             for v in list(
-                merged_hunt_context.get("analyst_reasons", merged_reasons) or []
+                merged_enrichment.get("analyst_reasons", merged_reasons) or []
             )
         ],
         deterministic_checks={
             str(k): [str(v) for v in list(values or [])]
             for k, values in dict(
-                merged_hunt_context.get("deterministic_checks", merged_checks) or {}
+                merged_enrichment.get("deterministic_checks", merged_checks) or {}
             ).items()
         },
         sequence_timeline=list(
-            merged_hunt_context.get("sequence_timeline", merged_sequence_timeline) or []
+            merged_enrichment.get("sequence_timeline", merged_sequence_timeline) or []
         ),
         sequence_violations=[
             str(v)
             for v in list(
-                merged_hunt_context.get(
+                merged_enrichment.get(
                     "sequence_violations", merged_sequence_violations
                 )
                 or []
             )
         ],
         beacon_candidates=list(
-            merged_hunt_context.get("beacon_candidates", merged_beacons) or []
+            merged_enrichment.get("beacon_candidates", merged_beacons) or []
         ),
         auth_abuse_profiles=list(
-            merged_hunt_context.get("auth_abuse_profiles", merged_auth_abuse) or []
+            merged_enrichment.get("auth_abuse_profiles", merged_auth_abuse) or []
         ),
         lateral_movement_paths=list(
-            merged_hunt_context.get("lateral_movement_paths", merged_lateral_paths)
+            merged_enrichment.get("lateral_movement_paths", merged_lateral_paths)
             or []
         ),
         exfiltration_chains=list(
-            merged_hunt_context.get("exfiltration_chains", merged_exfil_chains) or []
+            merged_enrichment.get("exfiltration_chains", merged_exfil_chains) or []
         ),
         ot_impact_signals=list(
-            merged_hunt_context.get("ot_impact_signals", merged_ot_impact) or []
+            merged_enrichment.get("ot_impact_signals", merged_ot_impact) or []
         ),
         evidence_anchors=list(
-            merged_hunt_context.get("evidence_anchors", merged_anchors) or []
+            merged_enrichment.get("evidence_anchors", merged_anchors) or []
         ),
         benign_context=[
             str(v)
             for v in list(
-                merged_hunt_context.get("benign_context", merged_benign) or []
+                merged_enrichment.get("benign_context", merged_benign) or []
             )
         ],
         vt_lookup_enabled=merged_vt_enabled,
@@ -1310,399 +1310,15 @@ def _classify_timeline_stage(event: TimelineEvent) -> str | None:
     return None
 
 
-def _build_timeline_hunting_context(
+def _build_timeline_enrichment(
     events: list[TimelineEvent],
     target_ip: str,
     file_downloads: list[FileDownloadDetail],
     ot_risk_score: int,
     ot_risk_findings: list[str],
 ) -> dict[str, object]:
-    stage_order = ["Recon", "Access", "Execution", "C2", "Exfil", "Impact"]
-    stage_times: dict[str, list[float]] = {name: [] for name in stage_order}
-    stage_evidence: dict[str, list[str]] = {name: [] for name in stage_order}
-
-    auth_counter: Counter[tuple[str, str]] = Counter()
-    auth_targets: dict[str, set[str]] = defaultdict(set)
-    lateral_peers: dict[str, set[str]] = defaultdict(set)
-    lateral_admin_hits: Counter[str] = Counter()
-    beacon_samples: dict[tuple[str, str, str], list[float]] = defaultdict(list)
-    exfil_signals: list[str] = []
-    ot_impact_signals: list[dict[str, object]] = []
-    evidence_anchors: list[dict[str, object]] = []
-
-    admin_ports = {22, 23, 135, 139, 445, 3389, 5985, 5986}
-    suspicious_port = {21, 22, 23, 53, 80, 443, 445, 3389}
-
-    for event in events:
-        stage = _classify_timeline_stage(event)
-        if stage:
-            if event.ts is not None:
-                stage_times[stage].append(float(event.ts))
-            if len(stage_evidence[stage]) < 12:
-                stage_evidence[stage].append(f"{event.category}: {event.summary}")
-
-        actor, peer, port = _extract_event_flow(event, target_ip)
-        text = f"{event.summary} {event.details}".lower()
-
-        if event.packet_index is not None and (
-            "command" in text
-            or "http post" in text
-            or "file artifact" in text
-            or "scan" in text
-        ):
-            evidence_anchors.append(
-                {
-                    "packet": int(event.packet_index),
-                    "category": event.category,
-                    "summary": event.summary,
-                    "source": event.source,
-                    "details": event.details,
-                }
-            )
-
-        if (
-            actor
-            and peer
-            and any(
-                token in text
-                for token in (
-                    "auth",
-                    "login",
-                    "password",
-                    "credential",
-                    "ntlm",
-                    "kerberos",
-                    "user ",
-                )
-            )
-        ):
-            auth_counter[(actor, peer)] += 1
-            auth_targets[actor].add(peer)
-
-        if (
-            actor
-            and peer
-            and (
-                event.category
-                in {"PowerShell", "WMIC", "WinRM", "RPC", "SMB", "Telnet", "Connection"}
-            )
-        ):
-            if port in admin_ports or event.category in {
-                "PowerShell",
-                "WMIC",
-                "WinRM",
-                "RPC",
-                "SMB",
-                "Telnet",
-            }:
-                lateral_peers[actor].add(peer)
-                lateral_admin_hits[actor] += 1
-
-        if actor and peer and port in suspicious_port and event.ts is not None:
-            key = (peer, event.category, event.summary)
-            beacon_samples[key].append(float(event.ts))
-
-        if any(
-            token in text
-            for token in (
-                "http post",
-                "stor ",
-                "appe ",
-                "upload",
-                "file artifact",
-                "exfil",
-            )
-        ):
-            if actor == target_ip:
-                exfil_signals.append(
-                    f"{event.category} {event.summary}: {event.details}"
-                )
-
-        if event.category in OT_CATEGORIES and any(
-            token in text
-            for token in (
-                "write",
-                "setpoint",
-                "program",
-                "firmware",
-                "start",
-                "stop",
-                "trip",
-                "shutdown",
-                "operate",
-            )
-        ):
-            ot_impact_signals.append(
-                {
-                    "protocol": event.category,
-                    "summary": event.summary,
-                    "details": event.details,
-                    "ts": event.ts,
-                }
-            )
-
-    stage_rows: list[dict[str, object]] = []
-    for stage in stage_order:
-        values = sorted(stage_times[stage])
-        if not values:
-            continue
-        first_ts = values[0]
-        last_ts = values[-1]
-        stage_rows.append(
-            {
-                "stage": stage,
-                "first_ts": first_ts,
-                "last_ts": last_ts,
-                "count": len(values),
-                "dwell": max(0.0, last_ts - first_ts),
-                "evidence": stage_evidence[stage][:4],
-            }
-        )
-
-    stage_index = {name: idx for idx, name in enumerate(stage_order)}
-    present_stages = [item["stage"] for item in stage_rows]
-    sequence_violations: list[str] = []
-    for i in range(1, len(stage_rows)):
-        prev = stage_rows[i - 1]
-        current = stage_rows[i]
-        prev_idx = stage_index.get(str(prev["stage"]), -1)
-        cur_idx = stage_index.get(str(current["stage"]), -1)
-        if cur_idx < prev_idx:
-            sequence_violations.append(
-                f"Stage order regression: {current['stage']} appears after {prev['stage']}"
-            )
-    if "Execution" in present_stages and "Access" not in present_stages:
-        sequence_violations.append(
-            "Execution-like activity observed without a clear access precursor"
-        )
-    if "Exfil" in present_stages and "Execution" not in present_stages:
-        sequence_violations.append(
-            "Exfiltration-like activity observed without clear execution stage"
-        )
-
-    beacon_candidates: list[dict[str, object]] = []
-    for (peer, category, summary), timestamps in beacon_samples.items():
-        times = sorted(set(timestamps))
-        if len(times) < 4:
-            continue
-        intervals = [
-            times[idx] - times[idx - 1]
-            for idx in range(1, len(times))
-            if times[idx] - times[idx - 1] > 0
-        ]
-        if len(intervals) < 3:
-            continue
-        mean_interval = statistics.fmean(intervals)
-        if mean_interval <= 0:
-            continue
-        jitter = statistics.pstdev(intervals) if len(intervals) > 1 else 0.0
-        cv = jitter / mean_interval if mean_interval else 0.0
-        if mean_interval < 5 or mean_interval > 3600:
-            continue
-        if cv > 0.35:
-            continue
-        confidence = "high" if cv <= 0.15 else "medium"
-        beacon_candidates.append(
-            {
-                "peer": peer,
-                "category": category,
-                "summary": summary,
-                "count": len(times),
-                "mean_interval": round(mean_interval, 2),
-                "jitter": round(jitter, 2),
-                "cv": round(cv, 3),
-                "confidence": confidence,
-            }
-        )
-    beacon_candidates.sort(
-        key=lambda item: (item.get("cv", 1.0), -int(item.get("count", 0)))
-    )
-
-    auth_abuse_profiles: list[dict[str, object]] = []
-    for (src, dst), attempts in auth_counter.most_common(30):
-        if attempts < 4:
-            continue
-        auth_abuse_profiles.append(
-            {
-                "src": src,
-                "dst": dst,
-                "attempts": int(attempts),
-                "target_count": len(auth_targets.get(src, set())),
-                "confidence": "high" if attempts >= 10 else "medium",
-            }
-        )
-
-    lateral_paths: list[dict[str, object]] = []
-    for src, peers in sorted(
-        lateral_peers.items(), key=lambda item: (-len(item[1]), item[0])
-    ):
-        if len(peers) < 2 and lateral_admin_hits.get(src, 0) < 6:
-            continue
-        lateral_paths.append(
-            {
-                "src": src,
-                "peer_count": len(peers),
-                "admin_hits": int(lateral_admin_hits.get(src, 0)),
-                "peers": sorted(peers)[:8],
-                "confidence": "high" if len(peers) >= 4 else "medium",
-            }
-        )
-
-    exfiltration_chains: list[dict[str, object]] = []
-    for detail in exfil_signals[:20]:
-        exfiltration_chains.append(
-            {
-                "signal": detail,
-                "confidence": "medium",
-            }
-        )
-    for item in file_downloads:
-        try:
-            dst = ipaddress.ip_address(item.dst_ip)
-        except Exception:
-            continue
-        if item.src_ip == target_ip and dst.is_global:
-            exfiltration_chains.append(
-                {
-                    "signal": f"Outbound file transfer to public peer: {item.filename} {item.src_ip}->{item.dst_ip}",
-                    "confidence": "high",
-                }
-            )
-
-    deterministic_checks: dict[str, list[str]] = {
-        "recon_to_access_sequence": [],
-        "access_to_execution_sequence": [],
-        "execution_to_c2_or_exfil": [],
-        "ot_control_after_discovery": [],
-        "beaconing_periodicity": [],
-        "authentication_abuse": [],
-        "lateral_movement_fanout": [],
-        "exfiltration_chain": [],
-        "ot_impact_signal": [],
-        "evidence_provenance": [],
-    }
-
-    if "Recon" in present_stages and "Access" in present_stages:
-        deterministic_checks["recon_to_access_sequence"].append(
-            "Recon activity observed before/with access indicators"
-        )
-    if "Access" in present_stages and "Execution" in present_stages:
-        deterministic_checks["access_to_execution_sequence"].append(
-            "Access indicators followed by execution-like commands"
-        )
-    if "Execution" in present_stages and (
-        "C2" in present_stages or "Exfil" in present_stages
-    ):
-        deterministic_checks["execution_to_c2_or_exfil"].append(
-            "Execution activity followed by C2/exfil-like traffic"
-        )
-    if "Recon" in present_stages and ot_impact_signals:
-        deterministic_checks["ot_control_after_discovery"].append(
-            "OT control-like actions appear after discovery activity"
-        )
-    for item in beacon_candidates[:8]:
-        deterministic_checks["beaconing_periodicity"].append(
-            f"peer={item['peer']} interval={item['mean_interval']}s jitter={item['jitter']}s cv={item['cv']}"
-        )
-    for item in auth_abuse_profiles[:8]:
-        deterministic_checks["authentication_abuse"].append(
-            f"{item['src']}->{item['dst']} attempts={item['attempts']} targets={item['target_count']}"
-        )
-    for item in lateral_paths[:8]:
-        deterministic_checks["lateral_movement_fanout"].append(
-            f"{item['src']} reached {item['peer_count']} admin peers (hits={item['admin_hits']})"
-        )
-    for item in exfiltration_chains[:8]:
-        deterministic_checks["exfiltration_chain"].append(str(item.get("signal", "")))
-    for item in ot_impact_signals[:8]:
-        deterministic_checks["ot_impact_signal"].append(
-            f"{item['protocol']} {item['summary']} :: {item['details']}"
-        )
-    if evidence_anchors:
-        deterministic_checks["evidence_provenance"].append(
-            f"{len(evidence_anchors)} event(s) include packet/source provenance"
-        )
-
-    score = 0
-    score += 2 if deterministic_checks["execution_to_c2_or_exfil"] else 0
-    score += 2 if deterministic_checks["exfiltration_chain"] else 0
-    score += 2 if deterministic_checks["ot_impact_signal"] else 0
-    score += 1 if deterministic_checks["authentication_abuse"] else 0
-    score += 1 if deterministic_checks["lateral_movement_fanout"] else 0
-    score += 1 if deterministic_checks["beaconing_periodicity"] else 0
-    score += 1 if deterministic_checks["recon_to_access_sequence"] else 0
-    score += 1 if deterministic_checks["access_to_execution_sequence"] else 0
-    score += 1 if ot_risk_score >= 60 else 0
-
-    reasons: list[str] = []
-    if deterministic_checks["execution_to_c2_or_exfil"]:
-        reasons.append("Execution followed by C2/exfil behavior")
-    if deterministic_checks["exfiltration_chain"]:
-        reasons.append("Exfiltration chain indicators present")
-    if deterministic_checks["ot_impact_signal"]:
-        reasons.append("OT control-impact signals observed")
-    if deterministic_checks["authentication_abuse"]:
-        reasons.append("Authentication abuse profile observed")
-    if deterministic_checks["lateral_movement_fanout"]:
-        reasons.append("Lateral movement fan-out detected")
-    if deterministic_checks["beaconing_periodicity"]:
-        reasons.append("Periodic beacon-like activity detected")
-    if ot_risk_findings:
-        reasons.extend(ot_risk_findings[:2])
-    if sequence_violations:
-        reasons.extend(sequence_violations[:2])
-
-    if score >= 9:
-        verdict = "YES - STRONG TIMELINE INDICATIONS OF COMPROMISE"
-        confidence = "high"
-    elif score >= 6:
-        verdict = "LIKELY - MULTIPLE CORROBORATED SUSPICIOUS TIMELINE SIGNALS"
-        confidence = "medium"
-    elif score >= 3:
-        verdict = "POSSIBLE - SOME TIMELINE SIGNALS REQUIRE FURTHER VALIDATION"
-        confidence = "medium"
-    else:
-        verdict = (
-            "NO STRONG SIGNAL - TIMELINE HEURISTICS DID NOT CROSS CONFIDENCE THRESHOLD"
-        )
-        confidence = "low"
-
-    benign_context: list[str] = []
-    if not deterministic_checks["authentication_abuse"]:
-        benign_context.append(
-            "No strong authentication abuse concentration was observed"
-        )
-    if not deterministic_checks["beaconing_periodicity"]:
-        benign_context.append(
-            "No high-confidence periodic beaconing pattern was detected"
-        )
-    if not deterministic_checks["ot_impact_signal"] and ot_risk_score < 25:
-        benign_context.append("OT activity appears primarily monitoring/flow oriented")
-    if not exfiltration_chains:
-        benign_context.append(
-            "No convincing exfiltration chain was reconstructed from timeline evidence"
-        )
-
-    return {
-        "analyst_verdict": verdict,
-        "analyst_confidence": confidence,
-        "analyst_reasons": reasons[:10]
-        if reasons
-        else ["No high-confidence timeline signals identified"],
-        "deterministic_checks": deterministic_checks,
-        "sequence_timeline": stage_rows,
-        "sequence_violations": sequence_violations,
-        "beacon_candidates": beacon_candidates[:12],
-        "auth_abuse_profiles": auth_abuse_profiles[:12],
-        "lateral_movement_paths": lateral_paths[:12],
-        "exfiltration_chains": exfiltration_chains[:16],
-        "ot_impact_signals": ot_impact_signals[:16],
-        "evidence_anchors": sorted(
-            evidence_anchors, key=lambda item: int(item.get("packet", 0))
-        )[:30],
-        "benign_context": benign_context[:8],
-    }
-
+    _ = (events, target_ip, file_downloads, ot_risk_score, ot_risk_findings)
+    return {}
 
 def _read_ber_length(payload: bytes, offset: int) -> tuple[Optional[int], int]:
     if offset >= len(payload):
@@ -1938,16 +1554,7 @@ def analyze_timeline(
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", None))
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if idx in artifact_indices and ts is not None:
                 index_ts[idx] = ts
@@ -3177,7 +2784,7 @@ def analyze_timeline(
             ot_risk_findings,
         )
     )
-    hunt_context = _build_timeline_hunting_context(
+    enrichment = _build_timeline_enrichment(
         events, target_ip, file_downloads, ot_risk_score, ot_risk_findings
     )
 
@@ -3251,31 +2858,31 @@ def analyze_timeline(
         file_downloads=sorted(
             file_downloads, key=lambda item: (item.ts is None, item.ts)
         ),
-        analyst_verdict=str(hunt_context.get("analyst_verdict", "")),
-        analyst_confidence=str(hunt_context.get("analyst_confidence", "low")),
+        analyst_verdict=str(enrichment.get("analyst_verdict", "")),
+        analyst_confidence=str(enrichment.get("analyst_confidence", "low")),
         analyst_reasons=[
-            str(v) for v in list(hunt_context.get("analyst_reasons", []) or [])
+            str(v) for v in list(enrichment.get("analyst_reasons", []) or [])
         ],
         deterministic_checks={
             str(k): [str(v) for v in list(values or [])]
             for k, values in dict(
-                hunt_context.get("deterministic_checks", {}) or {}
+                enrichment.get("deterministic_checks", {}) or {}
             ).items()
         },
-        sequence_timeline=list(hunt_context.get("sequence_timeline", []) or []),
+        sequence_timeline=list(enrichment.get("sequence_timeline", []) or []),
         sequence_violations=[
-            str(v) for v in list(hunt_context.get("sequence_violations", []) or [])
+            str(v) for v in list(enrichment.get("sequence_violations", []) or [])
         ],
-        beacon_candidates=list(hunt_context.get("beacon_candidates", []) or []),
-        auth_abuse_profiles=list(hunt_context.get("auth_abuse_profiles", []) or []),
+        beacon_candidates=list(enrichment.get("beacon_candidates", []) or []),
+        auth_abuse_profiles=list(enrichment.get("auth_abuse_profiles", []) or []),
         lateral_movement_paths=list(
-            hunt_context.get("lateral_movement_paths", []) or []
+            enrichment.get("lateral_movement_paths", []) or []
         ),
-        exfiltration_chains=list(hunt_context.get("exfiltration_chains", []) or []),
-        ot_impact_signals=list(hunt_context.get("ot_impact_signals", []) or []),
-        evidence_anchors=list(hunt_context.get("evidence_anchors", []) or []),
+        exfiltration_chains=list(enrichment.get("exfiltration_chains", []) or []),
+        ot_impact_signals=list(enrichment.get("ot_impact_signals", []) or []),
+        evidence_anchors=list(enrichment.get("evidence_anchors", []) or []),
         benign_context=[
-            str(v) for v in list(hunt_context.get("benign_context", []) or [])
+            str(v) for v in list(enrichment.get("benign_context", []) or [])
         ],
         vt_lookup_enabled=bool(vt_lookup),
         vt_results=timeline_vt_results,

@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover - scapy optional at runtime
 from .equipment import equipment_artifacts
 from .industrial_helpers import IndustrialAnomaly, IndustrialArtifact
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import extract_packet_endpoints, safe_float
 
 CIP_TCP_PORT = 44818
 CIP_UDP_PORT = 2222
@@ -417,9 +417,10 @@ def _extract_transport(pkt) -> tuple[bool, str, str, int, int, bytes]:
     else:
         return False, src_ip, dst_ip, sport, dport, payload
 
-    if IP is not None and pkt.haslayer(IP):
-        src_ip = pkt[IP].src
-        dst_ip = pkt[IP].dst
+    src_raw, dst_raw = extract_packet_endpoints(pkt)
+    if src_raw and dst_raw:
+        src_ip = src_raw
+        dst_ip = dst_raw
     else:
         src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
         dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "?"
