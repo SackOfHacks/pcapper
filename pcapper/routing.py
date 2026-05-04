@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import extract_packet_endpoints, safe_float
 
 try:
     from scapy.layers.inet import ICMP, IP, TCP, UDP  # type: ignore
@@ -1101,18 +1101,13 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
 
-            src_ip = None
-            dst_ip = None
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             proto_val = None
             if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
                 ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
                 proto_val = int(getattr(ip_layer, "proto", 0) or 0)
             elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
                 ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
                 proto_val = int(getattr(ip_layer, "nh", 0) or 0)
             src_label = src_ip
             dst_label = dst_ip

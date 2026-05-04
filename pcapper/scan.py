@@ -8,15 +8,15 @@ from typing import Optional
 
 from .pcap_cache import PcapMeta, get_reader
 from .services import COMMON_PORTS
-from .utils import safe_float
+from .utils import safe_float, extract_packet_endpoints
 
 try:
-    from scapy.layers.inet import IP, TCP, UDP
+    from scapy.layers.inet import ICMP, IP, TCP, UDP
     from scapy.layers.inet6 import IPv6
-    from scapy.layers.l2 import Ether
+    from scapy.layers.l2 import ARP, Ether
     from scapy.packet import Raw
 except Exception:  # pragma: no cover
-    IP = TCP = UDP = IPv6 = Ether = Raw = None
+    ICMP = IP = TCP = UDP = IPv6 = ARP = Ether = Raw = None
 
 
 AUTH_PORTS = {21, 22, 23, 25, 110, 143, 389, 445, 587, 993, 995, 3389}
@@ -77,11 +77,8 @@ class ScanSummary:
 
 
 def _extract_ip_pair(pkt) -> tuple[str, str]:
-    if IP is not None and pkt.haslayer(IP):
-        return str(pkt[IP].src), str(pkt[IP].dst)
-    if IPv6 is not None and pkt.haslayer(IPv6):
-        return str(pkt[IPv6].src), str(pkt[IPv6].dst)
-    return "-", "-"
+    src_ip, dst_ip = extract_packet_endpoints(pkt)
+    return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
 
 def _extract_ports(pkt) -> tuple[Optional[int], Optional[int]]:
@@ -444,6 +441,7 @@ def _guess_scanner_tool(
     unique_targets: int,
     unique_ports: int,
     syn_packets: int,
+    probe_packets: int,
     top_ports: list[int],
     markers: Counter[str],
 ) -> str:
@@ -473,6 +471,15 @@ def _guess_scanner_tool(
     top = set(top_ports[:10])
     if scan_type == "vertical" and syn_packets > 300 and unique_ports >= 500:
         return "Heuristic: high-speed scanner (Masscan/ZMap-like)"
+    if scan_type == "horizontal" and probe_packets >= 50 and unique_targets >= 32:
+        return "Nmap (heuristic: -sn host discovery sweep)"
+    if (
+        scan_type == "mixed"
+        and probe_packets >= 50
+        and unique_targets >= 32
+        and unique_ports >= 20
+    ):
+        return "Nmap (heuristic: -sn sweep + port scan)"
     if scan_type == "horizontal" and unique_targets >= 30 and (top & low_common):
         return "Heuristic: Nmap-style service discovery sweep"
     if unique_targets >= 20 and unique_ports >= 100:
@@ -484,11 +491,14 @@ def _is_scanner_source(
     unique_targets: int,
     unique_ports: int,
     syn_packets: int,
+    probe_packets: int,
     max_ports_single_target: int,
 ) -> bool:
     if max_ports_single_target >= 20:
         return True
     if unique_targets >= 10:
+        return True
+    if probe_packets >= 25 and unique_targets >= 8:
         return True
     if unique_ports >= 30:
         return True
@@ -516,6 +526,8 @@ def analyze_scan(
     src_last_seen: dict[str, float] = {}
     src_dst_ports: dict[tuple[str, str], set[int]] = defaultdict(set)
     src_dst_packets: Counter[tuple[str, str]] = Counter()
+    src_probe_targets: dict[str, set[str]] = defaultdict(set)
+    src_probe_packets: Counter[str] = Counter()
     syn_seen: set[tuple[str, str, int, int]] = set()
     syn_ack_seen: set[tuple[str, str, int, int]] = set()
     handshake_complete: set[tuple[str, str, int, int]] = set()
@@ -633,6 +645,29 @@ def analyze_scan(
                     if ts is not None:
                         src_first_seen[src_ip] = min(ts, src_first_seen.get(src_ip, ts))
                         src_last_seen[src_ip] = max(ts, src_last_seen.get(src_ip, ts))
+            elif ICMP is not None and pkt.haslayer(ICMP):
+                try:
+                    icmp_type = int(getattr(pkt[ICMP], "type", -1))
+                except Exception:
+                    icmp_type = -1
+                if icmp_type == 8:
+                    src_probe_targets[src_ip].add(dst_ip)
+                    src_probe_packets[src_ip] += 1
+                    if ts is not None:
+                        src_first_seen[src_ip] = min(ts, src_first_seen.get(src_ip, ts))
+                        src_last_seen[src_ip] = max(ts, src_last_seen.get(src_ip, ts))
+
+            if ARP is not None and pkt.haslayer(ARP):
+                try:
+                    op = int(getattr(pkt[ARP], "op", 0) or 0)
+                except Exception:
+                    op = 0
+                if op == 1:
+                    src_probe_targets[src_ip].add(dst_ip)
+                    src_probe_packets[src_ip] += 1
+                    if ts is not None:
+                        src_first_seen[src_ip] = min(ts, src_first_seen.get(src_ip, ts))
+                        src_last_seen[src_ip] = max(ts, src_last_seen.get(src_ip, ts))
 
             if sport is not None:
                 banner = _extract_banner(payload, sport)
@@ -704,10 +739,16 @@ def analyze_scan(
             pass
 
     results: list[ScanSourceResult] = []
-    for scanner, targets in src_targets.items():
+    included_scanners: set[str] = set()
+    scanner_ips = set(src_targets) | set(src_probe_targets)
+    for scanner in scanner_ips:
+        syn_targets = src_targets.get(scanner, set())
+        probe_targets = src_probe_targets.get(scanner, set())
+        targets = set(syn_targets) | set(probe_targets)
         unique_targets = len(targets)
         unique_ports = len(src_ports.get(scanner, set()))
         syn_packets = int(src_syn.get(scanner, 0))
+        probe_packets = int(src_probe_packets.get(scanner, 0))
         max_ports_single_target = 0
         for target in targets:
             max_ports_single_target = max(
@@ -716,88 +757,123 @@ def analyze_scan(
             )
 
         if not _is_scanner_source(
-            unique_targets, unique_ports, syn_packets, max_ports_single_target
+            unique_targets,
+            unique_ports,
+            syn_packets,
+            probe_packets,
+            max_ports_single_target,
         ):
             continue
 
-        has_vertical = max_ports_single_target >= 20
-        has_horizontal = unique_targets >= 10
-        scan_type = "mixed"
-        if has_vertical and not has_horizontal:
-            scan_type = "vertical"
-        elif has_horizontal and not has_vertical:
-            scan_type = "horizontal"
+        has_vertical = max_ports_single_target >= 20 and syn_packets > 0
+        has_horizontal = len(probe_targets) >= 10 or (
+            unique_targets >= 10 and syn_packets > 0 and not has_vertical
+        )
 
-        target_rows: list[ScanTargetResult] = []
-        for target in sorted(targets):
-            pair = (scanner, target)
-            open_ports = sorted(open_ports_by_pair.get(pair, set()))
-            banners = banner_by_pair.get(pair, [])
-            attempts = int(brute_attempts.get(pair, 0))
-            fails = int(brute_fails.get(pair, 0))
-            success = int(brute_success.get(pair, 0))
-            creds = creds_by_pair.get(pair, [])
-            target_rows.append(
-                ScanTargetResult(
-                    target_ip=target,
-                    open_ports=open_ports[:50],
-                    banner_samples=banners[:8],
-                    brute_force_attempts=attempts,
-                    brute_force_failures=fails,
-                    brute_force_success_hints=success,
-                    credential_samples=creds[:6],
+        common_mac_addresses = [
+            mac
+            for mac, _count in src_mac_counts.get(scanner, Counter()).most_common(4)
+        ]
+        common_os = _guess_os_from_ttl(src_ttl_counts.get(scanner, Counter()))
+        common_hostname_hints = [
+            name
+            for name, _count in src_hostname_hints.get(scanner, Counter()).most_common(6)
+        ]
+
+        def _build_targets(target_set: set[str]) -> list[ScanTargetResult]:
+            rows: list[ScanTargetResult] = []
+            for target in sorted(target_set):
+                pair = (scanner, target)
+                rows.append(
+                    ScanTargetResult(
+                        target_ip=target,
+                        open_ports=sorted(open_ports_by_pair.get(pair, set()))[:50],
+                        banner_samples=banner_by_pair.get(pair, [])[:8],
+                        brute_force_attempts=int(brute_attempts.get(pair, 0)),
+                        brute_force_failures=int(brute_fails.get(pair, 0)),
+                        brute_force_success_hints=int(brute_success.get(pair, 0)),
+                        credential_samples=creds_by_pair.get(pair, [])[:6],
+                    )
                 )
-            )
+            return sorted(rows, key=lambda item: (-(len(item.open_ports)), item.target_ip))
 
-        port_popularity: Counter[int] = Counter()
-        for target in targets:
-            for p in src_dst_ports.get((scanner, target), set()):
-                port_popularity[int(p)] += 1
+        def _build_port_popularity(target_set: set[str]) -> Counter[int]:
+            popularity: Counter[int] = Counter()
+            for target in target_set:
+                for p in src_dst_ports.get((scanner, target), set()):
+                    popularity[int(p)] += 1
+            return popularity
 
-        results.append(
-            ScanSourceResult(
-                scanner_ip=scanner,
-                scan_type=scan_type,
-                unique_targets=unique_targets,
-                unique_ports=unique_ports,
-                syn_packets=syn_packets,
-                first_seen=src_first_seen.get(scanner),
-                last_seen=src_last_seen.get(scanner),
-                mac_addresses=[
-                    mac
-                    for mac, _count in src_mac_counts.get(
-                        scanner, Counter()
-                    ).most_common(4)
-                ],
-                possible_os=_guess_os_from_ttl(src_ttl_counts.get(scanner, Counter())),
-                hostname_hints=[
-                    name
-                    for name, _count in src_hostname_hints.get(
-                        scanner, Counter()
-                    ).most_common(6)
-                ],
-                scanner_software_guess=_guess_scanner_tool(
-                    scan_type=scan_type,
-                    unique_targets=unique_targets,
+        if has_vertical:
+            vertical_targets = set(syn_targets) if syn_targets else set(targets)
+            vertical_ports = _build_port_popularity(vertical_targets)
+            results.append(
+                ScanSourceResult(
+                    scanner_ip=scanner,
+                    scan_type="vertical",
+                    unique_targets=len(vertical_targets),
                     unique_ports=unique_ports,
                     syn_packets=syn_packets,
-                    top_ports=[p for p, _ in port_popularity.most_common(12)],
-                    markers=src_tool_markers.get(scanner, Counter()),
-                ),
-                top_ports=[p for p, _ in port_popularity.most_common(12)],
-                targets=sorted(
-                    target_rows,
-                    key=lambda item: (-(len(item.open_ports)), item.target_ip),
-                ),
+                    first_seen=src_first_seen.get(scanner),
+                    last_seen=src_last_seen.get(scanner),
+                    mac_addresses=common_mac_addresses,
+                    possible_os=common_os,
+                    hostname_hints=common_hostname_hints,
+                    scanner_software_guess=_guess_scanner_tool(
+                        scan_type="vertical",
+                        unique_targets=len(vertical_targets),
+                        unique_ports=unique_ports,
+                        syn_packets=syn_packets,
+                        probe_packets=0,
+                        top_ports=[p for p, _ in vertical_ports.most_common(12)],
+                        markers=src_tool_markers.get(scanner, Counter()),
+                    ),
+                    top_ports=[p for p, _ in vertical_ports.most_common(12)],
+                    targets=_build_targets(vertical_targets),
+                )
             )
-        )
+            included_scanners.add(scanner)
+
+        if has_horizontal:
+            horizontal_targets = set(probe_targets) if probe_targets else set(targets)
+            horizontal_ports = _build_port_popularity(horizontal_targets)
+            horizontal_syn = 0 if probe_targets else syn_packets
+            results.append(
+                ScanSourceResult(
+                    scanner_ip=scanner,
+                    scan_type="horizontal",
+                    unique_targets=len(horizontal_targets),
+                    unique_ports=len(horizontal_ports),
+                    syn_packets=horizontal_syn,
+                    first_seen=src_first_seen.get(scanner),
+                    last_seen=src_last_seen.get(scanner),
+                    mac_addresses=common_mac_addresses,
+                    possible_os=common_os,
+                    hostname_hints=common_hostname_hints,
+                    scanner_software_guess=_guess_scanner_tool(
+                        scan_type="horizontal",
+                        unique_targets=len(horizontal_targets),
+                        unique_ports=len(horizontal_ports),
+                        syn_packets=horizontal_syn,
+                        probe_packets=probe_packets,
+                        top_ports=[p for p, _ in horizontal_ports.most_common(12)],
+                        markers=src_tool_markers.get(scanner, Counter()),
+                    ),
+                    top_ports=[p for p, _ in horizontal_ports.most_common(12)],
+                    targets=_build_targets(horizontal_targets),
+                )
+            )
+            included_scanners.add(scanner)
 
     summary.scan_sources = sorted(
         results,
         key=lambda item: (item.unique_ports, item.unique_targets, item.syn_packets),
         reverse=True,
     )
-    summary.relevant_packets = sum(item.syn_packets for item in summary.scan_sources)
+    summary.relevant_packets = sum(
+        int(src_syn.get(scanner, 0)) + int(src_probe_packets.get(scanner, 0))
+        for scanner in included_scanners
+    )
     return summary
 
 
@@ -811,12 +887,13 @@ def merge_scan_summaries(summaries: list[ScanSummary]) -> ScanSummary:
     for item in summaries:
         merged.errors.extend(item.errors)
 
-    by_scanner: dict[str, ScanSourceResult] = {}
+    by_scanner: dict[tuple[str, str], ScanSourceResult] = {}
     for summary in summaries:
         for src in summary.scan_sources:
-            current = by_scanner.get(src.scanner_ip)
+            key = (src.scanner_ip, src.scan_type)
+            current = by_scanner.get(key)
             if current is None:
-                by_scanner[src.scanner_ip] = ScanSourceResult(
+                by_scanner[key] = ScanSourceResult(
                     scanner_ip=src.scanner_ip,
                     scan_type=src.scan_type,
                     unique_targets=src.unique_targets,

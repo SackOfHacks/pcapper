@@ -8,6 +8,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    from scapy.layers.inet import IP  # type: ignore
+except Exception:  # pragma: no cover
+    IP = None  # type: ignore
+
+try:
+    from scapy.layers.inet6 import IPv6  # type: ignore
+except Exception:  # pragma: no cover
+    IPv6 = None  # type: ignore
+
+try:
+    from scapy.layers.l2 import ARP  # type: ignore
+except Exception:  # pragma: no cover
+    ARP = None  # type: ignore
+
 PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
 
 _DECODE_CACHE: "OrderedDict[tuple[bytes, str, bool], str]" = OrderedDict()
@@ -163,6 +178,8 @@ def detect_file_type_bytes(data: bytes) -> str:
         return "GZIP"
     if data.startswith(b"<!DOCTYPE html") or data.startswith(b"<html"):
         return "HTML"
+    if data.lstrip().startswith(b"{\\rtf"):
+        return "RTF"
     return "BINARY"
 
 
@@ -213,6 +230,45 @@ def safe_float(value: object | None) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def extract_packet_endpoints(
+    pkt: object,
+    *,
+    include_arp: bool = True,
+) -> tuple[Optional[str], Optional[str]]:
+    haslayer = getattr(pkt, "haslayer", None)
+    if not callable(haslayer):
+        return None, None
+
+    try:
+        if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
+            src = str(getattr(pkt[IP], "src", "")).strip()  # type: ignore[index]
+            dst = str(getattr(pkt[IP], "dst", "")).strip()  # type: ignore[index]
+            return (src or None), (dst or None)
+    except Exception:
+        pass
+
+    try:
+        if IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
+            src = str(getattr(pkt[IPv6], "src", "")).strip()  # type: ignore[index]
+            dst = str(getattr(pkt[IPv6], "dst", "")).strip()  # type: ignore[index]
+            return (src or None), (dst or None)
+    except Exception:
+        pass
+
+    if not include_arp:
+        return None, None
+
+    try:
+        if ARP is not None and pkt.haslayer(ARP):  # type: ignore[truthy-bool]
+            src = str(getattr(pkt[ARP], "psrc", "")).strip()  # type: ignore[index]
+            dst = str(getattr(pkt[ARP], "pdst", "")).strip()  # type: ignore[index]
+            return (src or None), (dst or None)
+    except Exception:
+        pass
+
+    return None, None
 
 
 def sparkline(values: list[int]) -> str:

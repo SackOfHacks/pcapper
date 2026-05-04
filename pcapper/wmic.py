@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP
@@ -148,7 +148,6 @@ class WmicSummary:
     errors: list[str]
     deterministic_checks: dict[str, list[str]]
     threat_hypotheses: list[dict[str, object]]
-    hunting_pivots: list[dict[str, object]]
     benign_context: list[str]
     first_seen: Optional[float]
     last_seen: Optional[float]
@@ -214,7 +213,6 @@ class WmicSummary:
                 key: list(value) for key, value in self.deterministic_checks.items()
             },
             "threat_hypotheses": list(self.threat_hypotheses),
-            "hunting_pivots": list(self.hunting_pivots),
             "benign_context": list(self.benign_context),
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
@@ -381,7 +379,6 @@ def analyze_wmic(
             errors=errors,
             deterministic_checks={},
             threat_hypotheses=[],
-            hunting_pivots=[],
             benign_context=[],
             first_seen=None,
             last_seen=None,
@@ -431,7 +428,6 @@ def analyze_wmic(
             errors=[f"Error opening pcap: {exc}"],
             deterministic_checks={},
             threat_hypotheses=[],
-            hunting_pivots=[],
             benign_context=[],
             first_seen=None,
             last_seen=None,
@@ -496,16 +492,7 @@ def analyze_wmic(
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 continue
 
-            ip_layer = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-            if ip_layer is None:
-                continue
-
-            src_ip = str(getattr(ip_layer, "src", ""))
-            dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 
@@ -803,7 +790,6 @@ def analyze_wmic(
         "wmic_public_endpoint_exposure": [],
     }
     threat_hypotheses: list[dict[str, object]] = []
-    hunting_pivots: list[dict[str, object]] = []
     benign_context: list[str] = []
 
     def _is_public_ip(value: str) -> bool:
@@ -834,24 +820,10 @@ def analyze_wmic(
             deterministic_checks["wmic_target_fanout"].append(
                 f"{client} contacted {len(targets)} unique WMI targets"
             )
-            hunting_pivots.append(
-                {
-                    "pivot": "wmic_target_fanout",
-                    "client": client,
-                    "targets": len(targets),
-                }
-            )
     for client, nodes in node_targets.items():
         if len(nodes) >= 6:
             deterministic_checks["wmic_node_fanout"].append(
                 f"{client} referenced {len(nodes)} /node targets in WMIC content"
-            )
-            hunting_pivots.append(
-                {
-                    "pivot": "wmic_node_fanout",
-                    "client": client,
-                    "nodes": len(nodes),
-                }
             )
     for client, times in client_times.items():
         score = _beaconing_score(times)
@@ -971,7 +943,6 @@ def analyze_wmic(
         errors=errors,
         deterministic_checks={k: v[:80] for k, v in deterministic_checks.items()},
         threat_hypotheses=threat_hypotheses[:24],
-        hunting_pivots=hunting_pivots[:150],
         benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,
@@ -1022,7 +993,6 @@ def merge_wmic_summaries(
             errors=[],
             deterministic_checks={},
             threat_hypotheses=[],
-            hunting_pivots=[],
             benign_context=[],
             first_seen=None,
             last_seen=None,
@@ -1068,7 +1038,6 @@ def merge_wmic_summaries(
     errors: list[str] = []
     deterministic_checks: dict[str, list[str]] = defaultdict(list)
     threat_hypotheses: list[dict[str, object]] = []
-    hunting_pivots: list[dict[str, object]] = []
     benign_context: list[str] = []
 
     for summary in summary_list:
@@ -1130,9 +1099,6 @@ def merge_wmic_summaries(
         for item in list(getattr(summary, "threat_hypotheses", []) or []):
             if item not in threat_hypotheses:
                 threat_hypotheses.append(item)
-        for item in list(getattr(summary, "hunting_pivots", []) or []):
-            if item not in hunting_pivots:
-                hunting_pivots.append(item)
         for item in list(getattr(summary, "benign_context", []) or []):
             text = str(item).strip()
             if text and text not in benign_context:
@@ -1182,7 +1148,6 @@ def merge_wmic_summaries(
             key: values[:80] for key, values in deterministic_checks.items()
         },
         threat_hypotheses=threat_hypotheses[:24],
-        hunting_pivots=hunting_pivots[:150],
         benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,

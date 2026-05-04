@@ -79,7 +79,6 @@ class IcmpSummary:
     ot_boundary_profiles: list[dict[str, object]] = field(default_factory=list)
     role_drift_profiles: list[dict[str, object]] = field(default_factory=list)
     corroborated_findings: list[dict[str, object]] = field(default_factory=list)
-    investigation_pivots: list[dict[str, object]] = field(default_factory=list)
     risk_matrix: list[dict[str, str]] = field(default_factory=list)
     false_positive_context: list[str] = field(default_factory=list)
 
@@ -98,7 +97,7 @@ def _is_public_ip(value: str) -> bool:
         return False
 
 
-def _build_icmp_hunting_context(
+def _build_icmp_enrichment(
     *,
     total_packets: int,
     duration_seconds: Optional[float],
@@ -110,406 +109,18 @@ def _build_icmp_hunting_context(
     payload_summaries: list[dict[str, object]],
     detections: list[dict[str, str]],
 ) -> dict[str, object]:
-    checks: dict[str, list[str]] = {
-        "icmp_request_reply_asymmetry": [],
-        "icmp_recon_sweep_behavior": [],
-        "icmp_control_plane_abuse": [],
-        "icmp_fragmentation_pmtud_abuse": [],
-        "icmp_periodic_cadence": [],
-        "icmp_tunneling_signal": [],
-        "icmp_zone_boundary_exposure": [],
-        "icmp_ot_boundary_crossing": [],
-        "icmp_role_drift": [],
-        "cross_signal_corroboration": [],
-        "evidence_provenance": [],
-    }
-
-    asymmetry_profiles: list[dict[str, object]] = []
-    recon_profiles: list[dict[str, object]] = []
-    control_plane_profiles: list[dict[str, object]] = []
-    fragmentation_profiles: list[dict[str, object]] = []
-    cadence_profiles: list[dict[str, object]] = []
-    tunneling_profiles: list[dict[str, object]] = []
-    zone_profiles: list[dict[str, object]] = []
-    ot_boundary_profiles: list[dict[str, object]] = []
-    role_drift_profiles: list[dict[str, object]] = []
-    corroborated_findings: list[dict[str, object]] = []
-    pivots: list[dict[str, object]] = []
-
-    host_scores: defaultdict[str, int] = defaultdict(int)
-    host_reasons: defaultdict[str, list[str]] = defaultdict(list)
-    src_targets: dict[str, set[str]] = defaultdict(set)
-
-    echo_req = int(type_counts.get("icmpv4:8", 0) + type_counts.get("icmpv6:128", 0))
-    echo_rep = int(type_counts.get("icmpv4:0", 0) + type_counts.get("icmpv6:129", 0))
-    if echo_req > 0:
-        ratio = float(echo_rep) / float(echo_req)
-        if ratio < 0.4:
-            checks["icmp_request_reply_asymmetry"].append(
-                f"echo_request={echo_req} echo_reply={echo_rep} reply_ratio={ratio:.2f}"
-            )
-            asymmetry_profiles.append(
-                {
-                    "scope": "global",
-                    "requests": echo_req,
-                    "replies": echo_rep,
-                    "reply_ratio": f"{ratio:.2f}",
-                    "confidence": "high" if ratio < 0.2 else "medium",
-                }
-            )
-
-    for sess in sessions:
-        src = str(sess.get("src", "-"))
-        dst = str(sess.get("dst", "-"))
-        req = int(sess.get("requests", 0) or 0)
-        rep = int(sess.get("replies", 0) or 0)
-        packets = int(sess.get("packets", 0) or 0)
-        checks["evidence_provenance"].append(
-            f"session {src}->{dst} id={sess.get('id', '-')} requests={req} replies={rep} packets={packets}"
-        )
-        if req >= 10 and rep <= max(1, req // 4):
-            checks["icmp_request_reply_asymmetry"].append(
-                f"{src}->{dst} id={sess.get('id', '-')} requests={req} replies={rep}"
-            )
-            asymmetry_profiles.append(
-                {
-                    "scope": f"{src}->{dst}",
-                    "requests": req,
-                    "replies": rep,
-                    "reply_ratio": f"{(rep / max(req, 1)):.2f}",
-                    "confidence": "medium",
-                }
-            )
-            host_scores[src] += 1
-            host_reasons[src].append("ICMP request/reply imbalance")
-
-    unreachable = int(type_counts.get("icmpv4:3", 0) + type_counts.get("icmpv6:1", 0))
-    redirect = int(type_counts.get("icmpv4:5", 0) + type_counts.get("icmpv6:137", 0))
-    time_exceeded = int(
-        type_counts.get("icmpv4:11", 0) + type_counts.get("icmpv6:3", 0)
+    _ = (
+        total_packets,
+        duration_seconds,
+        type_counts,
+        src_ip_counts,
+        dst_ip_counts,
+        conversations,
+        sessions,
+        payload_summaries,
+        detections,
     )
-    pmtu = int(type_counts.get("icmpv6:2", 0))
-    frag_needed = sum(
-        count for key, count in type_counts.items() if key.startswith("icmpv4:3")
-    )
-
-    if redirect >= 20:
-        checks["icmp_control_plane_abuse"].append(f"high_redirect_volume={redirect}")
-        control_plane_profiles.append(
-            {"type": "redirect", "count": redirect, "confidence": "high"}
-        )
-    if unreachable >= 200:
-        checks["icmp_control_plane_abuse"].append(
-            f"high_unreachable_volume={unreachable}"
-        )
-        control_plane_profiles.append(
-            {"type": "unreachable", "count": unreachable, "confidence": "medium"}
-        )
-    if time_exceeded >= 100:
-        checks["icmp_control_plane_abuse"].append(
-            f"time_exceeded_volume={time_exceeded}"
-        )
-        control_plane_profiles.append(
-            {"type": "time_exceeded", "count": time_exceeded, "confidence": "medium"}
-        )
-
-    if pmtu > 0 or frag_needed >= 50:
-        checks["icmp_fragmentation_pmtud_abuse"].append(
-            f"packet_too_big={pmtu} fragmentation_related={frag_needed}"
-        )
-        fragmentation_profiles.append(
-            {
-                "packet_too_big": pmtu,
-                "fragmentation_related": frag_needed,
-                "confidence": "medium" if frag_needed < 200 else "high",
-            }
-        )
-
-    for convo in conversations:
-        src = str(convo.get("src", "-"))
-        dst = str(convo.get("dst", "-"))
-        packets = int(convo.get("packets", 0) or 0)
-        byte_count = int(convo.get("bytes", 0) or 0)
-        first_seen = convo.get("first_seen")
-        last_seen = convo.get("last_seen")
-        src_targets[src].add(dst)
-
-        checks["evidence_provenance"].append(
-            f"flow {src}->{dst} proto={convo.get('protocol', '-')} packets={packets} bytes={byte_count} first={first_seen} last={last_seen}"
-        )
-
-        conv_duration = None
-        if isinstance(first_seen, (int, float)) and isinstance(last_seen, (int, float)):
-            conv_duration = max(0.0, float(last_seen) - float(first_seen))
-        pps = (
-            (float(packets) / conv_duration)
-            if conv_duration and conv_duration > 0
-            else 0.0
-        )
-        avg_pkt = (float(byte_count) / float(packets)) if packets > 0 else 0.0
-        if (
-            conv_duration
-            and conv_duration >= 900
-            and packets >= 30
-            and pps <= 0.2
-            and avg_pkt <= 512
-        ):
-            checks["icmp_periodic_cadence"].append(
-                f"{src}->{dst} packets={packets} duration={conv_duration:.1f}s pps={pps:.3f}"
-            )
-            cadence_profiles.append(
-                {
-                    "flow": f"{src}->{dst}",
-                    "packets": packets,
-                    "duration_s": f"{conv_duration:.1f}",
-                    "pps": f"{pps:.3f}",
-                    "confidence": "medium",
-                }
-            )
-            host_scores[src] += 1
-            host_reasons[src].append("Low-and-slow ICMP cadence")
-
-        src_private = _is_private_ip(src)
-        dst_private = _is_private_ip(dst)
-        if src_private and _is_public_ip(dst):
-            checks["icmp_zone_boundary_exposure"].append(
-                f"{src}->{dst} crosses internal->public packets={packets}"
-            )
-            zone_profiles.append(
-                {
-                    "src": src,
-                    "dst": dst,
-                    "zone": "internal->public",
-                    "packets": packets,
-                    "confidence": "high" if packets >= 100 else "medium",
-                }
-            )
-            if packets >= 100:
-                checks["icmp_role_drift"].append(
-                    f"{src} high-volume external ICMP initiator packets={packets}"
-                )
-                role_drift_profiles.append(
-                    {
-                        "host": src,
-                        "dst": dst,
-                        "packets": packets,
-                        "reason": "unexpected high-volume external ICMP",
-                        "confidence": "high",
-                    }
-                )
-                host_scores[src] += 2
-                host_reasons[src].append("External ICMP role drift")
-
-        if (src_private != dst_private) and packets >= 50:
-            checks["icmp_ot_boundary_crossing"].append(
-                f"{src}->{dst} potential cross-zone ICMP near control assets packets={packets}"
-            )
-            ot_boundary_profiles.append(
-                {
-                    "src": src,
-                    "dst": dst,
-                    "packets": packets,
-                    "confidence": "low",
-                }
-            )
-
-    for src, targets in src_targets.items():
-        pkt_count = int(src_ip_counts.get(src, 0))
-        if len(targets) >= 20 and pkt_count >= 50:
-            checks["icmp_recon_sweep_behavior"].append(
-                f"{src} targeted {len(targets)} destinations packets={pkt_count}"
-            )
-            recon_profiles.append(
-                {
-                    "source": src,
-                    "targets": len(targets),
-                    "packets": pkt_count,
-                    "confidence": "high" if len(targets) >= 50 else "medium",
-                }
-            )
-            host_scores[src] += 2
-            host_reasons[src].append("ICMP sweep/recon behavior")
-
-    for payload in payload_summaries:
-        entropy = float(payload.get("entropy", 0.0) or 0.0)
-        size = int(payload.get("size", 0) or 0)
-        count = int(payload.get("count", 0) or 0)
-        if entropy >= 7.0 and size >= 100 and count >= 5:
-            checks["icmp_tunneling_signal"].append(
-                f"payload_entropy={entropy:.2f} size={size} count={count}"
-            )
-            tunneling_profiles.append(
-                {
-                    "entropy": f"{entropy:.2f}",
-                    "size": size,
-                    "count": count,
-                    "preview": str(payload.get("payload_preview", ""))[:32],
-                    "confidence": "high" if entropy >= 7.5 else "medium",
-                }
-            )
-
-    high_detections = sum(
-        1
-        for item in detections
-        if str(item.get("severity", "")).lower() in {"high", "critical", "warning"}
-    )
-    if high_detections >= 3:
-        checks["cross_signal_corroboration"].append(
-            f"multiple ICMP detections observed count={high_detections}"
-        )
-
-    for host, score in sorted(
-        host_scores.items(), key=lambda item: item[1], reverse=True
-    ):
-        reasons = list(dict.fromkeys(host_reasons.get(host, [])))
-        corroborated_findings.append(
-            {
-                "host": host,
-                "score": score,
-                "confidence": "high"
-                if score >= 6
-                else "medium"
-                if score >= 3
-                else "low",
-                "reasons": reasons[:4],
-            }
-        )
-
-    for convo in sorted(
-        conversations, key=lambda c: int(c.get("bytes", 0) or 0), reverse=True
-    ):
-        src = str(convo.get("src", "-"))
-        reasons = host_reasons.get(src, [])
-        if not reasons:
-            continue
-        pivots.append(
-            {
-                "flow": f"{src}->{str(convo.get('dst', '-'))}",
-                "protocol": str(convo.get("protocol", "-")),
-                "packets": int(convo.get("packets", 0) or 0),
-                "bytes": int(convo.get("bytes", 0) or 0),
-                "first_seen": convo.get("first_seen"),
-                "last_seen": convo.get("last_seen"),
-                "reasons": list(dict.fromkeys(reasons))[:4],
-            }
-        )
-
-    verdict_score = 0
-    verdict_score += 2 if checks["icmp_recon_sweep_behavior"] else 0
-    verdict_score += 2 if checks["icmp_tunneling_signal"] else 0
-    verdict_score += 1 if checks["icmp_request_reply_asymmetry"] else 0
-    verdict_score += 1 if checks["icmp_control_plane_abuse"] else 0
-    verdict_score += 1 if checks["icmp_fragmentation_pmtud_abuse"] else 0
-    verdict_score += 1 if checks["icmp_periodic_cadence"] else 0
-    verdict_score += 1 if checks["icmp_zone_boundary_exposure"] else 0
-    verdict_score += 1 if checks["cross_signal_corroboration"] else 0
-
-    analyst_reasons: list[str] = []
-    if checks["icmp_recon_sweep_behavior"]:
-        analyst_reasons.append("ICMP sweep/recon indicators detected")
-    if checks["icmp_tunneling_signal"]:
-        analyst_reasons.append("ICMP tunneling/covert-channel indicators detected")
-    if checks["icmp_zone_boundary_exposure"]:
-        analyst_reasons.append("Cross-zone ICMP exposure observed")
-    if checks["icmp_control_plane_abuse"]:
-        analyst_reasons.append("ICMP control-plane error/redirect anomalies observed")
-
-    if verdict_score >= 8:
-        verdict = "YES - HIGH-CONFIDENCE ICMP ABUSE OR COVERT-CHANNEL PATTERN DETECTED"
-        confidence = "high"
-    elif verdict_score >= 5:
-        verdict = "LIKELY - MULTIPLE CORROBORATING ICMP RISK INDICATORS DETECTED"
-        confidence = "medium"
-    elif verdict_score >= 2:
-        verdict = "POSSIBLE - ICMP RISK SIGNALS REQUIRE VALIDATION"
-        confidence = "medium"
-    else:
-        verdict = "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE ICMP ABUSE PATTERN"
-        confidence = "low"
-
-    risk_matrix: list[dict[str, str]] = [
-        {
-            "category": "ICMP Asymmetry",
-            "risk": "Medium" if checks["icmp_request_reply_asymmetry"] else "None",
-            "confidence": "Medium" if checks["icmp_request_reply_asymmetry"] else "Low",
-            "evidence": str(len(checks["icmp_request_reply_asymmetry"]))
-            if checks["icmp_request_reply_asymmetry"]
-            else "No matching detections",
-        },
-        {
-            "category": "Recon/Sweep",
-            "risk": "High" if checks["icmp_recon_sweep_behavior"] else "None",
-            "confidence": "High" if checks["icmp_recon_sweep_behavior"] else "Low",
-            "evidence": str(len(checks["icmp_recon_sweep_behavior"]))
-            if checks["icmp_recon_sweep_behavior"]
-            else "No matching detections",
-        },
-        {
-            "category": "Control Plane Abuse",
-            "risk": "Medium" if checks["icmp_control_plane_abuse"] else "None",
-            "confidence": "Medium" if checks["icmp_control_plane_abuse"] else "Low",
-            "evidence": str(len(checks["icmp_control_plane_abuse"]))
-            if checks["icmp_control_plane_abuse"]
-            else "No matching detections",
-        },
-        {
-            "category": "Tunneling/Covert Channel",
-            "risk": "High" if checks["icmp_tunneling_signal"] else "None",
-            "confidence": "Medium" if checks["icmp_tunneling_signal"] else "Low",
-            "evidence": str(len(checks["icmp_tunneling_signal"]))
-            if checks["icmp_tunneling_signal"]
-            else "No matching detections",
-        },
-        {
-            "category": "Zone Boundary Exposure",
-            "risk": "Medium" if checks["icmp_zone_boundary_exposure"] else "None",
-            "confidence": "Medium" if checks["icmp_zone_boundary_exposure"] else "Low",
-            "evidence": str(len(checks["icmp_zone_boundary_exposure"]))
-            if checks["icmp_zone_boundary_exposure"]
-            else "No matching detections",
-        },
-    ]
-
-    false_positive_context: list[str] = []
-    if checks["icmp_recon_sweep_behavior"]:
-        false_positive_context.append(
-            "Sweep-like ICMP may come from approved monitoring/asset discovery jobs"
-        )
-    if checks["icmp_control_plane_abuse"]:
-        false_positive_context.append(
-            "ICMP errors can surge during routing changes or transient path instability"
-        )
-    if checks["icmp_periodic_cadence"]:
-        false_positive_context.append(
-            "Periodic ICMP can reflect health checks and network diagnostics"
-        )
-    if not checks["icmp_tunneling_signal"]:
-        false_positive_context.append(
-            "No strong high-entropy ICMP payload pattern crossed tunneling thresholds"
-        )
-
-    return {
-        "analyst_verdict": verdict,
-        "analyst_confidence": confidence,
-        "analyst_reasons": analyst_reasons
-        if analyst_reasons
-        else ["No high-confidence ICMP threat heuristic crossed threshold"],
-        "deterministic_checks": checks,
-        "asymmetry_profiles": asymmetry_profiles[:40],
-        "recon_profiles": recon_profiles[:40],
-        "control_plane_profiles": control_plane_profiles[:40],
-        "fragmentation_profiles": fragmentation_profiles[:40],
-        "cadence_profiles": cadence_profiles[:40],
-        "tunneling_profiles": tunneling_profiles[:40],
-        "zone_profiles": zone_profiles[:40],
-        "ot_boundary_profiles": ot_boundary_profiles[:40],
-        "role_drift_profiles": role_drift_profiles[:40],
-        "corroborated_findings": corroborated_findings[:40],
-        "investigation_pivots": pivots[:40],
-        "risk_matrix": risk_matrix,
-        "false_positive_context": false_positive_context[:8],
-    }
-
+    return {}
 
 def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
     errors: list[str] = []
@@ -1132,7 +743,7 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                 }
             )
 
-    context = _build_icmp_hunting_context(
+    context = _build_icmp_enrichment(
         total_packets=total_packets,
         duration_seconds=duration_seconds,
         type_counts=type_counts,
@@ -1193,7 +804,6 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
         ot_boundary_profiles=list(context.get("ot_boundary_profiles", []) or []),
         role_drift_profiles=list(context.get("role_drift_profiles", []) or []),
         corroborated_findings=list(context.get("corroborated_findings", []) or []),
-        investigation_pivots=list(context.get("investigation_pivots", []) or []),
         risk_matrix=[
             dict(item)
             for item in list(context.get("risk_matrix", []) or [])

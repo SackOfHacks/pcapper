@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -105,7 +105,6 @@ class WinrmSummary:
     errors: list[str]
     deterministic_checks: dict[str, list[str]]
     threat_hypotheses: list[dict[str, object]]
-    hunting_pivots: list[dict[str, object]]
     benign_context: list[str]
     first_seen: Optional[float]
     last_seen: Optional[float]
@@ -169,7 +168,6 @@ class WinrmSummary:
                 key: list(value) for key, value in self.deterministic_checks.items()
             },
             "threat_hypotheses": list(self.threat_hypotheses),
-            "hunting_pivots": list(self.hunting_pivots),
             "benign_context": list(self.benign_context),
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
@@ -342,7 +340,6 @@ def analyze_winrm(
             errors=errors,
             deterministic_checks={},
             threat_hypotheses=[],
-            hunting_pivots=[],
             benign_context=[],
             first_seen=None,
             last_seen=None,
@@ -402,16 +399,7 @@ def analyze_winrm(
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 continue
 
-            ip_layer = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-            if ip_layer is None:
-                continue
-
-            src_ip = str(getattr(ip_layer, "src", ""))
-            dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 
@@ -693,7 +681,6 @@ def analyze_winrm(
         "winrm_public_endpoint_exposure": [],
     }
     threat_hypotheses: list[dict[str, object]] = []
-    hunting_pivots: list[dict[str, object]] = []
     benign_context: list[str] = []
 
     def _is_public_ip(value: str) -> bool:
@@ -726,26 +713,11 @@ def analyze_winrm(
             deterministic_checks["winrm_scanning_or_bruteforce"].append(
                 f"{client_ip}->{server_ip} short-session burst count={int(count)}"
             )
-            hunting_pivots.append(
-                {
-                    "pivot": "short_session_pair",
-                    "pair": f"{client_ip}->{server_ip}",
-                    "count": int(count),
-                }
-            )
     for client_ip, count in short_session_by_client.items():
         targets = short_session_targets.get(client_ip, set())
         if count >= 30 and len(targets) >= 10:
             deterministic_checks["winrm_scanning_or_bruteforce"].append(
                 f"{client_ip} short-session fan-out count={int(count)} targets={len(targets)}"
-            )
-            hunting_pivots.append(
-                {
-                    "pivot": "scanner_client",
-                    "client": client_ip,
-                    "short_sessions": int(count),
-                    "targets": len(targets),
-                }
             )
     for (client_ip, server_ip), times in pair_first_seen.items():
         score = _beaconing_score(times)
@@ -760,14 +732,6 @@ def analyze_winrm(
         ):
             deterministic_checks["winrm_data_staging_asymmetry"].append(
                 f"{session.client_ip}->{session.server_ip} c2s_bytes={int(session.client_bytes)} s2c_bytes={int(session.server_bytes)}"
-            )
-            hunting_pivots.append(
-                {
-                    "pivot": "high_upload_session",
-                    "flow": f"{session.client_ip}->{session.server_ip}",
-                    "client_bytes": int(session.client_bytes),
-                    "server_bytes": int(session.server_bytes),
-                }
             )
 
     for ip_value, count in server_counts.items():
@@ -859,7 +823,6 @@ def analyze_winrm(
         errors=errors,
         deterministic_checks={k: v[:80] for k, v in deterministic_checks.items()},
         threat_hypotheses=threat_hypotheses[:24],
-        hunting_pivots=hunting_pivots[:150],
         benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,
@@ -906,7 +869,6 @@ def merge_winrm_summaries(
             errors=[],
             deterministic_checks={},
             threat_hypotheses=[],
-            hunting_pivots=[],
             benign_context=[],
             first_seen=None,
             last_seen=None,
@@ -947,7 +909,6 @@ def merge_winrm_summaries(
     errors: list[str] = []
     deterministic_checks: dict[str, list[str]] = defaultdict(list)
     threat_hypotheses: list[dict[str, object]] = []
-    hunting_pivots: list[dict[str, object]] = []
     benign_context: list[str] = []
 
     for summary in summary_list:
@@ -1004,9 +965,6 @@ def merge_winrm_summaries(
         for item in list(getattr(summary, "threat_hypotheses", []) or []):
             if item not in threat_hypotheses:
                 threat_hypotheses.append(item)
-        for item in list(getattr(summary, "hunting_pivots", []) or []):
-            if item not in hunting_pivots:
-                hunting_pivots.append(item)
         for item in list(getattr(summary, "benign_context", []) or []):
             text = str(item).strip()
             if text and text not in benign_context:
@@ -1052,7 +1010,6 @@ def merge_winrm_summaries(
             key: values[:80] for key, values in deterministic_checks.items()
         },
         threat_hypotheses=threat_hypotheses[:24],
-        hunting_pivots=hunting_pivots[:150],
         benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,

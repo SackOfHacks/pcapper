@@ -180,9 +180,12 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
-## Current Release: v1.7.0
+## Current Release: v1.7.5
 
 Latest additions in this release:
+- `--scan` now detects host-discovery sweeps (`nmap -sn` style ICMP/ARP probing) in addition to TCP SYN scan behavior.
+- Mixed scan activity is now split into separate scanner entries (`horizontal` and `vertical`) instead of being combined into one row.
+- Scan summary merge behavior now preserves per-scan-type rows for the same scanner across summarized inputs.
 - New MAC/IP pivot workflows: `--ip` and `--mac` with clean unique pair summaries, counts, hostname/manufacturer context, and simple filter support.
 - Function-specific help flow: global help via `pcapper -h` plus scoped help like `pcapper --streams -h`.
 - `--streams` follow behavior simplified to `--streams -id <stream-id>` (deprecated follow flags removed).
@@ -580,6 +583,7 @@ python -m pcapper --help
 - `--ntlm`
 - `--ntp`
 - `--obfuscation`
+- `--overview`
 - `--opc-classic`
 - `--pcapmeta`
 - `--powershell`
@@ -612,7 +616,7 @@ python -m pcapper --help
 - `--winrm`
 - `--wmic`
 
-Count: 62 flags
+Count: 63 flags
 
 ### OT/ICS/Industrial functions (alphabetical)
 

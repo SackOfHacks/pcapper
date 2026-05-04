@@ -17,7 +17,7 @@ except ImportError:
 from .device_detection import device_fingerprint_from_fields
 from .equipment import equipment_artifacts
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import extract_packet_endpoints, safe_float
 
 # --- Constants ---
 
@@ -657,12 +657,17 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
 
                         is_server_response = sport == MODBUS_TCP_PORT
 
-                        if IP is not None and pkt.haslayer(IP):
-                            src_ip = pkt[IP].src
-                            dst_ip = pkt[IP].dst
+                        src_raw, dst_raw = extract_packet_endpoints(pkt)
+                        if src_raw and dst_raw:
+                            src_ip = src_raw
+                            dst_ip = dst_raw
                         else:
-                            src_ip = pkt[0].src if hasattr(pkt[0], "src") else "0.0.0.0"
-                            dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "0.0.0.0"
+                            src_ip = (
+                                pkt[0].src if hasattr(pkt[0], "src") else "0.0.0.0"
+                            )
+                            dst_ip = (
+                                pkt[0].dst if hasattr(pkt[0], "dst") else "0.0.0.0"
+                            )
 
                         request_detail = None
                         if not is_server_response:

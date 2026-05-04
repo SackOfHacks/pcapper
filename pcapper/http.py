@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from .device_detection import append_device_fingerprints, device_fingerprints_from_text
 from .pcap_cache import PcapMeta, get_reader
 from .utils import (
+    extract_packet_endpoints,
     counter_inc,
     decode_payload,
     detect_file_type_bytes,
@@ -745,16 +746,7 @@ def analyze_http(
             if sport is None or dport is None:
                 continue
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if not src_ip or not dst_ip:
                 continue

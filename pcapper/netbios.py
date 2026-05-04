@@ -23,7 +23,7 @@ except ImportError:
     NBNSQueryRequest = NBNSQueryResponse = NBNSNodeStatusResponse = None
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import extract_packet_endpoints, safe_float
 
 # NetBIOS Suffix Types commonly seen
 SUFFIX_MAP = {
@@ -252,7 +252,6 @@ class NetbiosAnalysis:
     unique_names: Set[str] = field(default_factory=set)
     deterministic_checks: Dict[str, List[str]] = field(default_factory=dict)
     threat_hypotheses: List[Dict[str, object]] = field(default_factory=list)
-    hunting_pivots: List[Dict[str, object]] = field(default_factory=list)
     benign_context: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
@@ -513,14 +512,10 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
 
                 pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
 
-                src_ip = "0.0.0.0"
-                dst_ip = "0.0.0.0"
-                if pkt.haslayer("IP"):
-                    src_ip = str(pkt["IP"].src)
-                    dst_ip = str(pkt["IP"].dst)
-                elif IPv6 is not None and pkt.haslayer(IPv6):
-                    src_ip = str(pkt[IPv6].src)
-                    dst_ip = str(pkt[IPv6].dst)
+                src_ip, dst_ip = extract_packet_endpoints(pkt)
+                if not src_ip or not dst_ip:
+                    src_ip = "0.0.0.0"
+                    dst_ip = "0.0.0.0"
 
                 sport = 0
                 dport = 0
@@ -968,7 +963,6 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
         "public_netbios_exposure": [],
     }
     threat_hypotheses: List[Dict[str, object]] = []
-    hunting_pivots: List[Dict[str, object]] = []
     benign_context: List[str] = []
 
     spoof_hits = int(analysis.threat_summary.get("NBNS Response Spoofing", 0) or 0)
@@ -985,23 +979,9 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
         deterministic_checks["nbns_scan_or_probe_fanout"].append(
             f"NBNS scan-like source {src_ip} queried names={int(count)}"
         )
-        hunting_pivots.append(
-            {
-                "pivot": "nbns_scan_source",
-                "source": src_ip,
-                "count": int(count),
-            }
-        )
     for src_ip, count in analysis.probe_sources.most_common(15):
         deterministic_checks["nbns_scan_or_probe_fanout"].append(
             f"NetBIOS probe sweep source {src_ip} target_count={int(count)}"
-        )
-        hunting_pivots.append(
-            {
-                "pivot": "nbns_probe_source",
-                "source": src_ip,
-                "count": int(count),
-            }
         )
 
     storm_hits = int(analysis.threat_summary.get("Broadcast/Name Storm", 0) or 0)
@@ -1014,24 +994,10 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
         deterministic_checks["smb_auth_abuse_over_netbios"].append(
             f"SMB SessionSetup brute-force indicator source {src_ip} attempts={int(count)}"
         )
-        hunting_pivots.append(
-            {
-                "pivot": "smb_bruteforce_source",
-                "source": src_ip,
-                "attempts": int(count),
-            }
-        )
 
     for src_ip, total_bytes in analysis.exfil_candidates.most_common(15):
         deterministic_checks["smb_write_exfil_over_netbios"].append(
             f"SMB write-heavy flow source {src_ip} bytes={int(total_bytes)}"
-        )
-        hunting_pivots.append(
-            {
-                "pivot": "smb_write_source",
-                "source": src_ip,
-                "bytes": int(total_bytes),
-            }
         )
 
     for flow_key, count in analysis.beacon_candidates.most_common(15):
@@ -1111,7 +1077,6 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
 
     analysis.deterministic_checks = {k: v[:80] for k, v in deterministic_checks.items()}
     analysis.threat_hypotheses = threat_hypotheses[:24]
-    analysis.hunting_pivots = hunting_pivots[:150]
     analysis.benign_context = benign_context[:24]
 
     return analysis

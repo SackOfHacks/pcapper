@@ -12,7 +12,7 @@ from .http import analyze_http
 from .pcap_cache import get_reader
 from .progress import run_with_busy_status
 from .services import analyze_services
-from .utils import safe_float
+from .utils import safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -93,7 +93,6 @@ class TcpSummary:
     role_drift_profiles: list[dict[str, object]] = field(default_factory=list)
     transport_abuse_profiles: list[dict[str, object]] = field(default_factory=list)
     corroborated_findings: list[dict[str, object]] = field(default_factory=list)
-    investigation_pivots: list[dict[str, object]] = field(default_factory=list)
     risk_matrix: list[dict[str, str]] = field(default_factory=list)
     false_positive_context: list[str] = field(default_factory=list)
 
@@ -158,7 +157,7 @@ def _is_public_ip(value: str) -> bool:
         return False
 
 
-def _build_tcp_hunting_context(
+def _build_tcp_enrichment(
     *,
     tcp_packets: int,
     conversations: list[TcpConversation],
@@ -171,411 +170,19 @@ def _build_tcp_hunting_context(
     src_port_dsts: dict[tuple[str, int], set[str]],
     outbound_flow_bytes: Counter[tuple[str, str]],
 ) -> dict[str, object]:
-    checks: dict[str, list[str]] = {
-        "session_state_integrity": [],
-        "handshake_asymmetry_or_recon": [],
-        "rst_teardown_abuse": [],
-        "tcp_periodic_cadence": [],
-        "lateral_movement_surface": [],
-        "egress_exfil_outlier": [],
-        "service_role_drift": [],
-        "transport_window_or_retrans_abuse": [],
-        "cross_signal_corroboration": [],
-        "evidence_provenance": [],
-    }
-
-    session_profiles: list[dict[str, object]] = []
-    recon_profiles: list[dict[str, object]] = []
-    teardown_profiles: list[dict[str, object]] = []
-    cadence_profiles: list[dict[str, object]] = []
-    lateral_profiles: list[dict[str, object]] = []
-    egress_profiles: list[dict[str, object]] = []
-    role_profiles: list[dict[str, object]] = []
-    transport_profiles: list[dict[str, object]] = []
-    corroborated_findings: list[dict[str, object]] = []
-    pivots: list[dict[str, object]] = []
-
-    admin_ports = {22, 23, 135, 139, 445, 3389, 5985, 5986}
-    host_scores: defaultdict[str, int] = defaultdict(int)
-    host_reasons: defaultdict[str, list[str]] = defaultdict(list)
-
-    for convo in conversations:
-        duration = None
-        if convo.first_seen is not None and convo.last_seen is not None:
-            duration = max(0.0, float(convo.last_seen) - float(convo.first_seen))
-        pps = (float(convo.packets) / duration) if duration and duration > 0 else 0.0
-        avg_pkt = (
-            (float(convo.bytes) / float(convo.packets)) if convo.packets > 0 else 0.0
-        )
-
-        checks["evidence_provenance"].append(
-            f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port} packets={convo.packets} bytes={convo.bytes} syn={convo.syn} syn_ack={convo.syn_ack} rst={convo.rst} fin={convo.fin}"
-        )
-
-        if convo.syn > 0 and convo.syn_ack == 0:
-            checks["session_state_integrity"].append(
-                f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port} has SYN without SYN-ACK"
-            )
-            session_profiles.append(
-                {
-                    "flow": f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port}",
-                    "issue": "SYN without SYN-ACK",
-                    "packets": convo.packets,
-                    "confidence": "medium",
-                }
-            )
-            host_scores[convo.src_ip] += 1
-            host_reasons[convo.src_ip].append("Repeated failed handshakes")
-
-        if convo.ack > 0 and (convo.syn + convo.syn_ack) == 0:
-            checks["session_state_integrity"].append(
-                f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port} ACK traffic without observed handshake"
-            )
-            session_profiles.append(
-                {
-                    "flow": f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port}",
-                    "issue": "Mid-stream ACK without handshake",
-                    "packets": convo.packets,
-                    "confidence": "low",
-                }
-            )
-
-        if convo.rst >= max(5, convo.fin * 3):
-            checks["rst_teardown_abuse"].append(
-                f"{convo.src_ip}->{convo.dst_ip} rst={convo.rst} fin={convo.fin}"
-            )
-            teardown_profiles.append(
-                {
-                    "flow": f"{convo.src_ip}->{convo.dst_ip}:{convo.dst_port}",
-                    "rst": convo.rst,
-                    "fin": convo.fin,
-                    "confidence": "medium",
-                }
-            )
-            host_scores[convo.src_ip] += 1
-            host_reasons[convo.src_ip].append("Abnormal connection teardowns")
-
-        if (
-            duration
-            and duration >= 900
-            and convo.packets >= 30
-            and pps <= 0.2
-            and avg_pkt <= 512
-        ):
-            checks["tcp_periodic_cadence"].append(
-                f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port} packets={convo.packets} duration={duration:.1f}s pps={pps:.3f}"
-            )
-            cadence_profiles.append(
-                {
-                    "flow": f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port}",
-                    "packets": convo.packets,
-                    "duration_s": f"{duration:.1f}",
-                    "pps": f"{pps:.3f}",
-                    "avg_packet": f"{avg_pkt:.1f}",
-                }
-            )
-            host_scores[convo.src_ip] += 1
-            host_reasons[convo.src_ip].append("Low-and-slow TCP cadence")
-
-        src_private = _is_private_ip(convo.src_ip)
-        dst_private = _is_private_ip(convo.dst_ip)
-        if src_private and dst_private and convo.dst_port in admin_ports:
-            checks["lateral_movement_surface"].append(
-                f"{convo.src_ip}->{convo.dst_ip}:{convo.dst_port} internal admin flow"
-            )
-            lateral_profiles.append(
-                {
-                    "source": convo.src_ip,
-                    "targets": 1,
-                    "admin_ports": str(convo.dst_port),
-                    "confidence": "medium",
-                }
-            )
-            host_scores[convo.src_ip] += 1
-            host_reasons[convo.src_ip].append(
-                "Internal administrative east-west movement"
-            )
-
-        if (
-            src_private
-            and _is_public_ip(convo.dst_ip)
-            and convo.dst_port in admin_ports
-        ):
-            checks["service_role_drift"].append(
-                f"{convo.src_ip} initiates admin protocol to public {convo.dst_ip}:{convo.dst_port}"
-            )
-            role_profiles.append(
-                {
-                    "host": convo.src_ip,
-                    "dst": convo.dst_ip,
-                    "port": convo.dst_port,
-                    "reason": "internal host using admin protocol toward public edge",
-                    "confidence": "high",
-                }
-            )
-            host_scores[convo.src_ip] += 2
-            host_reasons[convo.src_ip].append("Role drift to public admin service")
-
-    for src_ip, ports in src_to_ports.items():
-        dsts = src_to_dsts.get(src_ip, set())
-        if len(ports) >= 50 and len(dsts) >= 5:
-            checks["handshake_asymmetry_or_recon"].append(
-                f"{src_ip} fan-out ports={len(ports)} destinations={len(dsts)}"
-            )
-            recon_profiles.append(
-                {
-                    "source": src_ip,
-                    "unique_ports": len(ports),
-                    "targets": len(dsts),
-                    "confidence": "high" if len(ports) >= 100 else "medium",
-                }
-            )
-            host_scores[src_ip] += 2
-            host_reasons[src_ip].append("Scan-like fan-out behavior")
-
-    for src_ip, ports in src_to_ports.items():
-        admin_seen = sorted(int(p) for p in ports if int(p) in admin_ports)
-        dsts = src_to_dsts.get(src_ip, set())
-        if admin_seen and len(dsts) >= 3:
-            lateral_profiles.append(
-                {
-                    "source": src_ip,
-                    "targets": len(dsts),
-                    "admin_ports": ",".join(str(p) for p in admin_seen[:8]),
-                    "confidence": "high" if len(dsts) >= 8 else "medium",
-                }
-            )
-
-    for (src_ip, dport), dsts in src_port_dsts.items():
-        if len(dsts) >= 50:
-            checks["handshake_asymmetry_or_recon"].append(
-                f"{src_ip} host sweep on port {dport} targets={len(dsts)}"
-            )
-            recon_profiles.append(
-                {
-                    "source": src_ip,
-                    "port": dport,
-                    "targets": len(dsts),
-                    "confidence": "high" if len(dsts) >= 100 else "medium",
-                }
-            )
-            host_scores[src_ip] += 2
-            host_reasons[src_ip].append("Host sweep behavior")
-
-    for host, count in retrans_counts.items():
-        if count > 100:
-            checks["transport_window_or_retrans_abuse"].append(
-                f"{host} retransmissions={count}"
-            )
-            transport_profiles.append(
-                {
-                    "host": host,
-                    "type": "retransmissions",
-                    "count": count,
-                    "confidence": "medium",
-                }
-            )
-            host_scores[host] += 1
-            host_reasons[host].append("High retransmission volume")
-
-    for host, count in zero_window_counts.items():
-        if count > 20:
-            checks["transport_window_or_retrans_abuse"].append(
-                f"{host} zero_window={count}"
-            )
-            transport_profiles.append(
-                {
-                    "host": host,
-                    "type": "zero_window",
-                    "count": count,
-                    "confidence": "medium",
-                }
-            )
-
-    for host, count in small_window_counts.items():
-        if count > 100:
-            checks["transport_window_or_retrans_abuse"].append(
-                f"{host} small_window={count}"
-            )
-
-    for (src_ip, dst_ip), byte_count in outbound_flow_bytes.items():
-        if byte_count >= 10_000_000:
-            checks["egress_exfil_outlier"].append(
-                f"{src_ip}->{dst_ip} outbound_bytes={byte_count}"
-            )
-            egress_profiles.append(
-                {
-                    "src": src_ip,
-                    "dst": dst_ip,
-                    "bytes": byte_count,
-                    "confidence": "high" if byte_count >= 50_000_000 else "medium",
-                }
-            )
-            host_scores[src_ip] += 2
-            host_reasons[src_ip].append("Large outbound TCP transfer")
-
-    by_severity: Counter[str] = Counter(
-        str(item.get("severity", "info")).lower() for item in detections
+    _ = (
+        tcp_packets,
+        conversations,
+        detections,
+        retrans_counts,
+        zero_window_counts,
+        small_window_counts,
+        src_to_ports,
+        src_to_dsts,
+        src_port_dsts,
+        outbound_flow_bytes,
     )
-    if by_severity.get("high", 0) + by_severity.get("critical", 0) >= 2:
-        checks["cross_signal_corroboration"].append(
-            f"multiple high-severity TCP detections observed={by_severity.get('high', 0) + by_severity.get('critical', 0)}"
-        )
-
-    for host, score in sorted(
-        host_scores.items(), key=lambda item: item[1], reverse=True
-    ):
-        reasons = list(dict.fromkeys(host_reasons.get(host, [])))
-        corroborated_findings.append(
-            {
-                "host": host,
-                "score": score,
-                "confidence": "high"
-                if score >= 6
-                else "medium"
-                if score >= 3
-                else "low",
-                "reasons": reasons[:4],
-            }
-        )
-
-    for convo in sorted(conversations, key=lambda c: c.bytes, reverse=True):
-        reasons = host_reasons.get(convo.src_ip, [])
-        if not reasons:
-            continue
-        pivots.append(
-            {
-                "flow": f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port}",
-                "packets": convo.packets,
-                "bytes": convo.bytes,
-                "syn": convo.syn,
-                "syn_ack": convo.syn_ack,
-                "rst": convo.rst,
-                "first_seen": convo.first_seen,
-                "last_seen": convo.last_seen,
-                "reasons": list(dict.fromkeys(reasons))[:4],
-            }
-        )
-
-    verdict_score = 0
-    verdict_score += 2 if checks["handshake_asymmetry_or_recon"] else 0
-    verdict_score += 2 if checks["lateral_movement_surface"] else 0
-    verdict_score += 2 if checks["egress_exfil_outlier"] else 0
-    verdict_score += 1 if checks["session_state_integrity"] else 0
-    verdict_score += 1 if checks["rst_teardown_abuse"] else 0
-    verdict_score += 1 if checks["transport_window_or_retrans_abuse"] else 0
-    verdict_score += 1 if checks["service_role_drift"] else 0
-    verdict_score += 1 if checks["cross_signal_corroboration"] else 0
-
-    reasons: list[str] = []
-    if checks["handshake_asymmetry_or_recon"]:
-        reasons.append("Handshake asymmetry and recon-like fan-out detected")
-    if checks["lateral_movement_surface"]:
-        reasons.append("East-west administrative TCP movement detected")
-    if checks["egress_exfil_outlier"]:
-        reasons.append("Large egress TCP transfer outlier detected")
-    if checks["service_role_drift"]:
-        reasons.append("TCP role drift toward public administrative services detected")
-    if checks["cross_signal_corroboration"]:
-        reasons.append("Multiple independent TCP detections corroborate risk")
-
-    if verdict_score >= 8:
-        verdict = "YES - HIGH-CONFIDENCE TCP ABUSE OR LATERAL-MOVEMENT PATTERN DETECTED"
-        confidence = "high"
-    elif verdict_score >= 5:
-        verdict = "LIKELY - MULTIPLE CORROBORATING TCP RISK INDICATORS DETECTED"
-        confidence = "medium"
-    elif verdict_score >= 2:
-        verdict = "POSSIBLE - TCP RISK SIGNALS REQUIRE VALIDATION"
-        confidence = "medium"
-    else:
-        verdict = "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE TCP ABUSE PATTERN"
-        confidence = "low"
-
-    risk_matrix: list[dict[str, str]] = [
-        {
-            "category": "Session State Integrity",
-            "risk": "Medium" if checks["session_state_integrity"] else "None",
-            "confidence": "Medium" if checks["session_state_integrity"] else "Low",
-            "evidence": str(len(checks["session_state_integrity"]))
-            if checks["session_state_integrity"]
-            else "No matching detections",
-        },
-        {
-            "category": "Recon / Handshake Asymmetry",
-            "risk": "High" if checks["handshake_asymmetry_or_recon"] else "None",
-            "confidence": "High" if checks["handshake_asymmetry_or_recon"] else "Low",
-            "evidence": str(len(checks["handshake_asymmetry_or_recon"]))
-            if checks["handshake_asymmetry_or_recon"]
-            else "No matching detections",
-        },
-        {
-            "category": "Lateral Movement Surface",
-            "risk": "High" if checks["lateral_movement_surface"] else "None",
-            "confidence": "Medium" if checks["lateral_movement_surface"] else "Low",
-            "evidence": str(len(checks["lateral_movement_surface"]))
-            if checks["lateral_movement_surface"]
-            else "No matching detections",
-        },
-        {
-            "category": "Egress Exfil Outlier",
-            "risk": "High" if checks["egress_exfil_outlier"] else "None",
-            "confidence": "High" if checks["egress_exfil_outlier"] else "Low",
-            "evidence": str(len(checks["egress_exfil_outlier"]))
-            if checks["egress_exfil_outlier"]
-            else "No matching detections",
-        },
-        {
-            "category": "Transport Abuse (Retrans/Window)",
-            "risk": "Medium" if checks["transport_window_or_retrans_abuse"] else "None",
-            "confidence": "Medium"
-            if checks["transport_window_or_retrans_abuse"]
-            else "Low",
-            "evidence": str(len(checks["transport_window_or_retrans_abuse"]))
-            if checks["transport_window_or_retrans_abuse"]
-            else "No matching detections",
-        },
-    ]
-
-    fp_context: list[str] = []
-    if checks["handshake_asymmetry_or_recon"]:
-        fp_context.append(
-            "Scan-like fan-out may reflect approved vulnerability scanning windows"
-        )
-    if checks["egress_exfil_outlier"]:
-        fp_context.append(
-            "Large outbound transfer may reflect backup, replication, or patch distribution"
-        )
-    if checks["tcp_periodic_cadence"]:
-        fp_context.append(
-            "Periodic TCP cadence can be caused by health checks and telemetry agents"
-        )
-    if not checks["session_state_integrity"]:
-        fp_context.append(
-            "No strong deterministic TCP state-integrity violations were observed"
-        )
-
-    return {
-        "analyst_verdict": verdict,
-        "analyst_confidence": confidence,
-        "analyst_reasons": reasons
-        if reasons
-        else ["No high-confidence TCP threat heuristic crossed threshold"],
-        "deterministic_checks": checks,
-        "session_integrity_profiles": session_profiles[:40],
-        "recon_profiles": recon_profiles[:40],
-        "teardown_profiles": teardown_profiles[:40],
-        "cadence_profiles": cadence_profiles[:40],
-        "lateral_movement_profiles": lateral_profiles[:40],
-        "egress_outlier_profiles": egress_profiles[:40],
-        "role_drift_profiles": role_profiles[:40],
-        "transport_abuse_profiles": transport_profiles[:40],
-        "corroborated_findings": corroborated_findings[:40],
-        "investigation_pivots": pivots[:40],
-        "risk_matrix": risk_matrix,
-        "false_positive_context": fp_context[:8],
-    }
-
+    return {}
 
 def analyze_tcp(
     path: Path,
@@ -712,16 +319,7 @@ def analyze_tcp(
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if src_ip and dst_ip and ts is not None:
                 if first_seen is None or ts < first_seen:
@@ -1316,7 +914,7 @@ def analyze_tcp(
             }
         )
 
-    context = _build_tcp_hunting_context(
+    context = _build_tcp_enrichment(
         tcp_packets=tcp_packets,
         conversations=sorted(conversation_rows, key=lambda c: c.packets, reverse=True),
         detections=detections,
@@ -1397,7 +995,6 @@ def analyze_tcp(
             context.get("transport_abuse_profiles", []) or []
         ),
         corroborated_findings=list(context.get("corroborated_findings", []) or []),
-        investigation_pivots=list(context.get("investigation_pivots", []) or []),
         risk_matrix=[
             dict(item)
             for item in list(context.get("risk_matrix", []) or [])

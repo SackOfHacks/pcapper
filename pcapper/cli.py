@@ -34,6 +34,7 @@ from .creds import analyze_creds, merge_creds_summaries
 from .crimson import analyze_crimson
 from .csp import analyze_csp
 from .ctf import analyze_ctf
+from .decode import analyze_decode
 from .decryption import DecryptConfig, DecryptSummary, decrypt_ssh, decrypt_tls
 from .df1 import analyze_df1
 from .dhcp import analyze_dhcp, merge_dhcp_summaries
@@ -63,7 +64,12 @@ from .icmp import analyze_icmp
 from .iec101_103 import analyze_iec101_103
 from .iec104 import analyze_iec104
 from .ioc import analyze_iocs
-from .ipmac import analyze_ip_lookup, analyze_mac_lookup
+from .ipmac import (
+    analyze_ip_lookup,
+    analyze_mac_lookup,
+    merge_ip_lookup_summaries,
+    merge_mac_lookup_summaries,
+)
 from .ips import analyze_ips, merge_ips_summaries
 from .kerberos import analyze_kerberos
 from .ldap import analyze_ldap
@@ -84,6 +90,7 @@ from .obfuscation import analyze_obfuscation, merge_obfuscation_summaries
 from .odesys import analyze_odesys
 from .opc import analyze_opc
 from .opc_classic import analyze_opc_classic
+from .overview import analyze_overview, merge_overview_summaries
 from .ot_commands import OtControlConfig, analyze_ot_commands, load_ot_control_config
 from .pcap_cache import (
     clear_forced_packet_view,
@@ -124,6 +131,7 @@ from .reporting import (
     render_crimson_summary,
     render_csp_summary,
     render_ctf_summary,
+    render_decode_summary,
     render_decrypt_summary,
     render_df1_summary,
     render_dhcp_summary,
@@ -176,6 +184,7 @@ from .reporting import (
     render_odesys_summary,
     render_opc_classic_summary,
     render_opc_summary,
+    render_overview_summary,
     render_ot_commands_summary,
     render_pcapmeta_summary,
     render_pccc_summary,
@@ -242,7 +251,7 @@ from .s7 import analyze_s7
 from .safety import analyze_safety, merge_safety_summaries
 from .scan import analyze_scan, merge_scan_summaries
 from .search import analyze_search
-from .secrets import analyze_secrets
+from .secrets import analyze_secrets, merge_secrets_summaries
 from .services import analyze_services, merge_services_summaries
 from .sizes import analyze_sizes
 from .smb import analyze_smb
@@ -252,7 +261,7 @@ from .srtp import analyze_srtp
 from .ssdp import analyze_ssdp
 from .ssh import analyze_ssh, merge_ssh_summaries
 from .streams import analyze_streams
-from .strings import analyze_strings
+from .strings import analyze_strings, merge_strings_summaries
 from .sv import analyze_sv
 from .syslog import analyze_syslog
 from .tcp import analyze_tcp
@@ -271,7 +280,7 @@ from .udp import analyze_udp
 from .utils import hexdump, parse_time_arg, safe_write_text
 from .vlan import analyze_vlans
 from .vnc import analyze_vnc, merge_vnc_summaries
-from .vpn import analyze_vpn
+from .vpn import analyze_vpn, merge_vpn_summaries
 from .webrequests import analyze_webrequests, merge_webrequests_summaries
 from .winrm import analyze_winrm, merge_winrm_summaries
 from .wlan import analyze_wlan, merge_wlan_summaries
@@ -294,6 +303,7 @@ def _load_plugins_once() -> tuple[list[PluginSpec], list[str]]:
 def _builtin_flag_map() -> dict[str, str]:
     return {
         "--search": "search",
+        "--decode": "decode",
         "--packet": "packet",
         "--creds": "creds",
         "--secrets": "secrets",
@@ -347,6 +357,7 @@ def _builtin_flag_map() -> dict[str, str]:
         "--ctf": "ctf",
         "--ioc": "ioc",
         "--files": "files",
+        "--overview": "overview",
         "--protocols": "protocols",
         "--routing": "routing",
         "--services": "services",
@@ -1079,6 +1090,29 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Search packet payloads for a string (case-insensitive) and list matches.",
     )
     general.add_argument(
+        "--decode",
+        metavar="INPUT",
+        help="Decode a supplied input string across common decoding/decryption formats (40+ built-ins; no target required).",
+    )
+    general.add_argument(
+        "-xor",
+        dest="decode_xor_key",
+        metavar="KEY",
+        help="Optional key for --decode to run repeating-key XOR decode on the supplied input.",
+    )
+    general.add_argument(
+        "-aes",
+        dest="decode_aes_key",
+        metavar="KEY",
+        help="Optional key for --decode to attempt AES decryption (accepts text/hex/base64 key forms).",
+    )
+    general.add_argument(
+        "-rsa",
+        dest="decode_rsa_key",
+        metavar="KEY_OR_@PATH",
+        help="Optional private key for --decode to attempt RSA decryption (PEM/DER text, hex/base64, or @path).",
+    )
+    general.add_argument(
         "--packet",
         metavar="N",
         type=int,
@@ -1119,6 +1153,12 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         "-view",
         metavar="FILENAME",
         help="View extracted file content in ASCII/HEX (use with --files).",
+    )
+    general.add_argument(
+        "-hash",
+        dest="hash_name",
+        metavar="FILENAME",
+        help="Show SHA256/MD5/IMPHASH for discovered file(s) matching FILENAME (use with --files).",
     )
     general.add_argument(
         "-raw",
@@ -1306,6 +1346,10 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         (
             "--obfuscation",
             "Detect high-entropy or encoded payloads (tunneling/obfuscation heuristics).",
+        ),
+        (
+            "--overview",
+            "Generate a strategic OT/ICS + threat-hunting overview by auto-detecting protocols/services and running targeted deep-dive analyzers.",
         ),
         (
             "--arp",
@@ -1734,7 +1778,10 @@ def _print_contextual_function_help(
         description = str(getattr(action, "help", "") or "").strip()
         if description:
             print(f"Description: {description}")
-        print(f"Usage: pcapper <target> {flag} [function options]")
+        if flag == "--decode":
+            print("Usage: pcapper --decode INPUT")
+        else:
+            print(f"Usage: pcapper <target> {flag} [function options]")
         related = _collect_related_help_actions(parser, flag, action)
         if related:
             print("Related options:")
@@ -1835,6 +1882,7 @@ def _analyze_paths(
     suricata_strict: bool,
     show_files: bool,
     files_executable_only: bool,
+    show_overview: bool,
     show_protocols: bool,
     show_routing: bool,
     show_services: bool,
@@ -1893,6 +1941,7 @@ def _analyze_paths(
     extract_name: str | None,
     view_name: str | None,
     view_raw: bool,
+    hash_name: str | None,
     packet_index: int | None,
     show_domain: bool,
     show_ldap: bool,
@@ -2727,6 +2776,7 @@ def _analyze_paths(
                     output_dir=(case_dir / "files") if case_dir else None,
                     view_name=view_name,
                     view_raw=view_raw,
+                    hash_name=hash_name,
                     show_status=step_status,
                     include_x509=bool(verbose or files_executable_only),
                     filter_ip=timeline_ip,
@@ -2746,6 +2796,19 @@ def _analyze_paths(
                         )
                     )
                 export_summaries["files"] = files_summary
+            elif step == "overview" and show_overview:
+                overview_summary = analyze_overview(
+                    path,
+                    show_status=step_status,
+                    vt_lookup=dns_vt,
+                    ot_commands_fast=show_ot_commands_fast,
+                    ot_commands_config=ot_commands_config,
+                )
+                if summarize_rollups:
+                    rollups.setdefault("overview", []).append(overview_summary)
+                else:
+                    print(render_overview_summary(overview_summary, verbose=verbose))
+                export_summaries["overview"] = overview_summary
             elif step == "protocols" and show_protocols:
                 proto_summary = analyze_protocols(path, show_status=step_status)
                 if summarize_rollups:
@@ -2829,7 +2892,7 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("secrets", []).append(secrets_summary)
                 else:
-                    print(render_secrets_summary(secrets_summary))
+                    print(render_secrets_summary(secrets_summary, verbose=verbose))
                 export_summaries["secrets"] = secrets_summary
             elif step == "certificates" and show_certificates:
                 cert_summary = analyze_certificates(path, show_status=step_status)
@@ -3437,6 +3500,8 @@ def _analyze_paths(
                 merge_ips_summaries,
                 lambda s: render_ips_summary(s, verbose=verbose),
             ),
+            "ip_lookup": (merge_ip_lookup_summaries, render_ip_lookup_summary),
+            "mac_lookup": (merge_mac_lookup_summaries, render_mac_lookup_summary),
             "timeline": (
                 merge_timeline_summaries,
                 lambda s: render_timeline_summary(s, verbose=verbose),
@@ -3495,6 +3560,11 @@ def _analyze_paths(
                 merge_services_summaries,
                 lambda s: render_services_summary(s, verbose=verbose),
             ),
+            "overview": (
+                merge_overview_summaries,
+                lambda s: render_overview_summary(s, verbose=verbose),
+            ),
+            "strings": (merge_strings_summaries, render_strings_summary),
             "health": (merge_health_summaries, render_health_summary),
             "rdp": (
                 merge_rdp_summaries,
@@ -3552,6 +3622,7 @@ def _analyze_paths(
                 merge_qos_summaries,
                 lambda s: render_qos_summary(s, verbose=verbose),
             ),
+            "vpn": (merge_vpn_summaries, render_vpn_summary),
             "wlan": (merge_wlan_summaries, render_wlan_summary),
             "snmp": (
                 merge_snmp_summaries,
@@ -3578,6 +3649,10 @@ def _analyze_paths(
             "enip": (merge_enip_summaries, render_enip_summary),
             "cip": (merge_cip_summaries, render_cip_summary),
             "creds": (merge_creds_summaries, render_creds_summary),
+            "secrets": (
+                merge_secrets_summaries,
+                lambda s: render_secrets_summary(s, verbose=verbose),
+            ),
             "files": (
                 merge_files_summaries,
                 lambda s: render_files_summary(
@@ -3634,6 +3709,7 @@ def _analyze_paths(
             "ssdp": "SSDP ANALYSIS",
             "vpn": "VPN/TUNNEL ANALYSIS",
             "files": "FILE TRANSFER ANALYSIS",
+            "overview": "STRATEGIC OVERVIEW",
             "protocols": "PROTOCOL ANALYSIS",
             "routing": "ROUTING ANALYSIS",
             "services": "SERVICE ANALYSIS",
@@ -3878,12 +3954,30 @@ def main() -> int:
     )
     raw_targets = args.target if isinstance(args.target, list) else [args.target]
     if (
+        (
+            getattr(args, "decode_xor_key", None)
+            or getattr(args, "decode_aes_key", None)
+            or getattr(args, "decode_rsa_key", None)
+        )
+        and not getattr(args, "decode", None)
+    ):
+        missing_flags: list[str] = []
+        if getattr(args, "decode_xor_key", None):
+            missing_flags.append("-xor")
+        if getattr(args, "decode_aes_key", None):
+            missing_flags.append("-aes")
+        if getattr(args, "decode_rsa_key", None):
+            missing_flags.append("-rsa")
+        _print_error(f"{'/'.join(missing_flags)} requires --decode.")
+        return 2
+    if (
         not raw_targets
         and not getattr(args, "list_plugins", False)
         and not getattr(args, "self_check", False)
+        and not getattr(args, "decode", None)
     ):
         _print_error(
-            "At least one target is required unless using --self-check or --list-plugins."
+            "At least one target is required unless using --self-check, --list-plugins, or --decode."
         )
         parser.print_usage(sys.stderr)
         return 2
@@ -3911,6 +4005,17 @@ def main() -> int:
         result = _run_self_check(plugins, plugin_errors, config_result.path)
         _log_event(log_config, "self_check", status="ok" if result == 0 else "fail")
         return result
+
+    if getattr(args, "decode", None):
+        decode_summary = analyze_decode(
+            str(getattr(args, "decode", "")),
+            xor_key=getattr(args, "decode_xor_key", None),
+            aes_key=getattr(args, "decode_aes_key", None),
+            rsa_key=getattr(args, "decode_rsa_key", None),
+        )
+        print(render_decode_summary(decode_summary))
+        _log_event(log_config, "decode", status="ok")
+        return 0
 
     ordered_steps = _ordered_steps(sys.argv, plugins)
     builtin_steps = list(dict.fromkeys(_builtin_flag_map().values()))
@@ -4009,6 +4114,9 @@ def main() -> int:
         args, "files", False
     ):
         _print_error("-exe requires --files.")
+        return 2
+    if getattr(args, "hash_name", None) and not getattr(args, "files", False):
+        _print_error("-hash requires --files.")
         return 2
     if getattr(args, "hostname_name", None) and not (
         getattr(args, "hostnames", False)
@@ -4323,6 +4431,7 @@ def main() -> int:
             suricata_strict=bool(getattr(args, "suricata_strict", False)),
             show_files=args.files,
             files_executable_only=bool(getattr(args, "files_executable_only", False)),
+            show_overview=getattr(args, "overview", False),
             show_protocols=args.protocols,
             show_routing=args.routing,
             show_services=args.services,
@@ -4382,6 +4491,7 @@ def main() -> int:
             extract_name=args.extract,
             view_name=args.view,
             view_raw=args.view_raw,
+            hash_name=getattr(args, "hash_name", None),
             packet_index=args.packet,
             show_domain=args.domain,
             show_ldap=args.ldap,

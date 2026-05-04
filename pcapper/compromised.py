@@ -291,9 +291,7 @@ def _classify_stage(summary: str, details: str, source: str) -> str:
         )
     ):
         return "exfil"
-    if any(
-        token in blob for token in ("smb", "rdp", "winrm", "ssh", "lateral", "pivot")
-    ):
+    if any(token in blob for token in ("smb", "rdp", "winrm", "ssh", "lateral")):
         return "lateral"
     if any(token in blob for token in ("secret", "token", "api key")):
         return "secrets"

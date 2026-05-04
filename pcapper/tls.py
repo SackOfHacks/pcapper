@@ -15,7 +15,7 @@ from .dns import _vt_lookup_domains
 from .http import analyze_http
 from .pcap_cache import get_reader
 from .progress import run_with_busy_status
-from .utils import decode_payload, safe_float
+from .utils import decode_payload, safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -715,16 +715,7 @@ def analyze_tls(
             pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
             ts = safe_float(getattr(pkt, "time", None))
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if src_ip and dst_ip and ts is not None:
                 if first_seen is None or ts < first_seen:

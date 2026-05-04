@@ -11,7 +11,7 @@ from .dns import analyze_dns
 from .http import analyze_http
 from .pcap_cache import get_reader
 from .services import COMMON_PORTS
-from .utils import safe_float
+from .utils import extract_packet_endpoints, safe_float
 
 try:
     from scapy.layers.inet import ICMP, IP, TCP, UDP  # type: ignore
@@ -127,33 +127,23 @@ class BeaconSummary:
     protocol_beacon_checks: dict[str, list[str]]
     deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
     threat_hypotheses: list[dict[str, object]] = field(default_factory=list)
-    hunting_pivots: list[dict[str, object]] = field(default_factory=list)
     benign_context: list[str] = field(default_factory=list)
     risk_matrix: list[dict[str, str]] = field(default_factory=list)
     deterministic_category_checks: dict[str, list[str]] = field(default_factory=dict)
     campaign_summaries: list[dict[str, object]] = field(default_factory=list)
     host_rollups: list[dict[str, object]] = field(default_factory=list)
-    beacon_pivots: list[dict[str, object]] = field(default_factory=list)
     explainability: list[str] = field(default_factory=list)
     detections: list[dict[str, object]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
 def _flow_key(pkt) -> Optional[tuple[str, str, str, Optional[int], Optional[int]]]:
-    src_ip = None
-    dst_ip = None
-    if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-        ip = pkt[IP]  # type: ignore[index]
-        src_ip = str(getattr(ip, "src", ""))
-        dst_ip = str(getattr(ip, "dst", ""))
-    elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-        ip = pkt[IPv6]  # type: ignore[index]
-        src_ip = str(getattr(ip, "src", ""))
-        dst_ip = str(getattr(ip, "dst", ""))
-    elif Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-        eth = pkt[Ether]  # type: ignore[index]
-        src_ip = str(getattr(eth, "src", ""))
-        dst_ip = str(getattr(eth, "dst", ""))
+    src_ip, dst_ip = extract_packet_endpoints(pkt)
+    if not src_ip or not dst_ip:
+        if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+            eth = pkt[Ether]  # type: ignore[index]
+            src_ip = str(getattr(eth, "src", ""))
+            dst_ip = str(getattr(eth, "dst", ""))
 
     if not src_ip or not dst_ip:
         return None
@@ -904,7 +894,6 @@ def analyze_beacons(
     detections: list[dict[str, object]] = []
     campaign_summaries: list[dict[str, object]] = []
     host_rollups: list[dict[str, object]] = []
-    beacon_pivots: list[dict[str, object]] = []
     explainability: list[str] = []
     deterministic_checks: dict[str, list[str]] = {
         "external_periodic_beaconing": [],
@@ -916,7 +905,6 @@ def analyze_beacons(
         "high_stability_low_jitter_beacon": [],
     }
     threat_hypotheses: list[dict[str, object]] = []
-    hunting_pivots: list[dict[str, object]] = []
     benign_context: list[str] = []
     risk_matrix: list[dict[str, str]] = []
     if candidates:
@@ -1547,35 +1535,6 @@ def analyze_beacons(
                 }
             )
 
-        for item in candidates[:25]:
-            uri_template = "-"
-            for post in http_post_beacons:
-                if (
-                    str(post.get("src")) == item.src_ip
-                    and str(post.get("dst")) == item.dst_ip
-                ):
-                    uri_template = str(post.get("uri", "-") or "-")
-                    break
-            template_hash = (
-                hashlib.sha1(uri_template.encode("utf-8", errors="ignore")).hexdigest()[
-                    :12
-                ]
-                if uri_template != "-"
-                else "-"
-            )
-            beacon_pivots.append(
-                {
-                    "src": item.src_ip,
-                    "dst": item.dst_ip,
-                    "proto": _proto_label(item),
-                    "interval": round(float(item.mean_interval), 2),
-                    "score": round(float(item.score), 2),
-                    "first_seen": item.first_seen,
-                    "last_seen": item.last_seen,
-                    "uri_template_hash": template_hash,
-                }
-            )
-
         for item in candidates[:15]:
             explainability.append(
                 f"{item.src_ip}->{item.dst_ip} flagged because interval MAD={item.mad_interval:.2f}s, "
@@ -1631,23 +1590,6 @@ def analyze_beacons(
                 "confidence": "medium",
                 "evidence": len(deterministic_checks["dns_beaconing_or_tunnel_pattern"])
                 + len(deterministic_checks["high_stability_low_jitter_beacon"]),
-            }
-        )
-
-    for item in beacon_pivots[:20]:
-        hunting_pivots.append(
-            {
-                "pivot": "beacon_flow",
-                "entity": f"{item.get('src')}->{item.get('dst')}",
-                "value": f"{item.get('proto')} interval={item.get('interval')} score={item.get('score')}",
-            }
-        )
-    for item in http_post_beacons[:10]:
-        hunting_pivots.append(
-            {
-                "pivot": "http_post_template",
-                "entity": f"{item.get('src')}->{item.get('dst')}",
-                "value": f"host={item.get('host')} uri={item.get('uri')} packets={item.get('packet_examples', '-')}",
             }
         )
 
@@ -1724,13 +1666,11 @@ def analyze_beacons(
         protocol_beacon_checks=protocol_beacon_checks,
         deterministic_checks=deterministic_checks,
         threat_hypotheses=threat_hypotheses,
-        hunting_pivots=hunting_pivots,
         benign_context=benign_context,
         risk_matrix=risk_matrix,
         deterministic_category_checks=deterministic_category_checks,
         campaign_summaries=campaign_summaries,
         host_rollups=host_rollups,
-        beacon_pivots=beacon_pivots,
         explainability=explainability,
         detections=detections,
         errors=errors

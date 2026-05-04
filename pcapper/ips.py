@@ -42,8 +42,9 @@ except Exception:  # pragma: no cover
     ICMP = None  # type: ignore
 
 try:
-    from scapy.layers.l2 import Ether  # type: ignore
+    from scapy.layers.l2 import ARP, Ether  # type: ignore
 except Exception:  # pragma: no cover
+    ARP = None  # type: ignore
     Ether = None  # type: ignore
 
 try:
@@ -160,7 +161,6 @@ class IpSummary:
     infrastructure_clusters: list[dict[str, object]] = field(default_factory=list)
     intent_profiles: list[dict[str, object]] = field(default_factory=list)
     corroborated_findings: list[dict[str, object]] = field(default_factory=list)
-    investigation_pivots: list[dict[str, object]] = field(default_factory=list)
     risk_matrix: list[dict[str, str]] = field(default_factory=list)
     false_positive_context: list[str] = field(default_factory=list)
 
@@ -211,7 +211,7 @@ def _tcp_is_final_handshake_ack(flags: object) -> bool:
     )
 
 
-def _build_ips_hunting_context(
+def _build_ips_enrichment(
     *,
     endpoints: list[IpEndpoint],
     conversations: list[IpConversation],
@@ -220,322 +220,15 @@ def _build_ips_hunting_context(
     intel_findings: list[dict[str, object]],
     detections: list[dict[str, object]],
 ) -> dict[str, object]:
-    checks: dict[str, list[str]] = {
-        "indicator_quality_gate": [],
-        "recency_and_persistence": [],
-        "boundary_cross_zone_contact": [],
-        "internal_critical_asset_contact": [],
-        "corroborated_multi_signal_hit": [],
-        "infrastructure_clustering": [],
-        "intent_heuristics": [],
-        "evidence_provenance": [],
-    }
-
-    exposure_profiles: list[dict[str, object]] = []
-    priority_asset_profiles: list[dict[str, object]] = []
-    infrastructure_clusters: list[dict[str, object]] = []
-    intent_profiles: list[dict[str, object]] = []
-    corroborated_findings: list[dict[str, object]] = []
-    pivots: list[dict[str, object]] = []
-
-    score_by_ip: defaultdict[str, int] = defaultdict(int)
-    reasons_by_ip: defaultdict[str, list[str]] = defaultdict(list)
-
-    intel_by_ip: defaultdict[str, list[dict[str, object]]] = defaultdict(list)
-    for finding in intel_findings:
-        ip_value = str(finding.get("ip", "") or "")
-        if ip_value:
-            intel_by_ip[ip_value].append(finding)
-
-    for ip_value, findings in intel_by_ip.items():
-        quality = 0
-        details: list[str] = []
-        for finding in findings:
-            source = str(finding.get("source", ""))
-            if source == "AbuseIPDB":
-                score = int(finding.get("score", 0) or 0)
-                reports = int(finding.get("reports", 0) or 0)
-                if score >= 50:
-                    quality += 2
-                elif score >= 20:
-                    quality += 1
-                details.append(f"AbuseIPDB score={score} reports={reports}")
-            elif source == "OTX":
-                pulses = int(finding.get("pulses", 0) or 0)
-                quality += 2 if pulses >= 5 else 1
-                details.append(f"OTX pulses={pulses}")
-            elif source == "VirusTotal":
-                malicious = int(finding.get("malicious", 0) or 0)
-                suspicious = int(finding.get("suspicious", 0) or 0)
-                quality += 2 if malicious > 0 else 1 if suspicious > 0 else 0
-                details.append(f"VT malicious={malicious} suspicious={suspicious}")
-
-        if quality > 0:
-            checks["indicator_quality_gate"].append(
-                f"{ip_value} quality={quality} {'; '.join(details[:3])}"
-            )
-            score_by_ip[ip_value] += quality
-            reasons_by_ip[ip_value].append("Threat-intel quality score above threshold")
-
-    for conv in conversations:
-        src_private = not _is_public_ip(conv.src)
-        dst_public = _is_public_ip(conv.dst)
-        conv_duration = None
-        if conv.first_seen is not None and conv.last_seen is not None:
-            conv_duration = max(0.0, float(conv.last_seen) - float(conv.first_seen))
-
-        checks["evidence_provenance"].append(
-            f"{conv.src}->{conv.dst} proto={conv.protocol} packets={conv.packets} bytes={conv.bytes} first={conv.first_seen} last={conv.last_seen} ports={','.join(str(p) for p in conv.ports[:8]) or '-'}"
-        )
-
-        if src_private and dst_public:
-            checks["boundary_cross_zone_contact"].append(
-                f"{conv.src}->{conv.dst} {conv.protocol} packets={conv.packets}"
-            )
-            exposure_profiles.append(
-                {
-                    "src": conv.src,
-                    "dst": conv.dst,
-                    "protocol": conv.protocol,
-                    "direction": "outbound",
-                    "packets": conv.packets,
-                    "bytes": conv.bytes,
-                    "confidence": "high" if conv.packets >= 100 else "medium",
-                }
-            )
-            score_by_ip[conv.src] += 1
-            reasons_by_ip[conv.src].append("Cross-zone outbound contact")
-
-        if conv_duration and conv_duration >= 900 and conv.packets >= 20:
-            checks["recency_and_persistence"].append(
-                f"{conv.src}->{conv.dst} persistent window={conv_duration:.1f}s packets={conv.packets}"
-            )
-
-        if any(p in {3389, 445, 5985, 5986, 22, 23, 135, 139} for p in conv.ports):
-            checks["intent_heuristics"].append(
-                f"{conv.src}->{conv.dst} admin ports observed {','.join(str(p) for p in conv.ports[:6])}"
-            )
-            intent_profiles.append(
-                {
-                    "src": conv.src,
-                    "dst": conv.dst,
-                    "protocol": conv.protocol,
-                    "ports": conv.ports[:8],
-                    "intent": "admin-lateral"
-                    if not _is_public_ip(conv.dst)
-                    else "admin-external",
-                    "confidence": "medium",
-                }
-            )
-
-    for item in suspicious_port_profiles:
-        src = str(item.get("src", "-"))
-        checks["intent_heuristics"].append(
-            f"{src} profile={item.get('type', '-')} ports={item.get('unique_ports', '-')}, targets={item.get('unique_dsts', '-')}"
-        )
-        score_by_ip[src] += 1
-        reasons_by_ip[src].append("Suspicious port scanning profile")
-
-    for item in lateral_movement_scores:
-        ip_value = str(item.get("ip", "-"))
-        score = float(item.get("score", 0) or 0)
-        if score >= 3.0:
-            checks["internal_critical_asset_contact"].append(
-                f"{ip_value} lateral_score={score} peers={item.get('peers', '-')} ports={item.get('ports', '-')}"
-            )
-            priority_asset_profiles.append(
-                {
-                    "ip": ip_value,
-                    "score": score,
-                    "peers": item.get("peers", 0),
-                    "ports": item.get("ports", 0),
-                    "packets_sent": item.get("packets_sent", 0),
-                    "confidence": "high" if score >= 5 else "medium",
-                }
-            )
-            score_by_ip[ip_value] += 2
-            reasons_by_ip[ip_value].append("Lateral movement posture score")
-
-    cluster_by_asn: defaultdict[str, list[str]] = defaultdict(list)
-    for ep in endpoints:
-        if ep.asn and _is_public_ip(ep.ip):
-            cluster_by_asn[str(ep.asn)].append(ep.ip)
-    for asn_label, ips in cluster_by_asn.items():
-        if len(ips) >= 2:
-            checks["infrastructure_clustering"].append(
-                f"ASN cluster {asn_label} with {len(ips)} IPs"
-            )
-            infrastructure_clusters.append(
-                {
-                    "cluster": asn_label,
-                    "ip_count": len(ips),
-                    "ips": sorted(ips)[:10],
-                    "confidence": "medium",
-                }
-            )
-
-    high_like = sum(
-        1
-        for det in detections
-        if str(det.get("severity", "")).lower() in {"critical", "high", "warning"}
+    _ = (
+        endpoints,
+        conversations,
+        suspicious_port_profiles,
+        lateral_movement_scores,
+        intel_findings,
+        detections,
     )
-    if high_like >= 3:
-        checks["corroborated_multi_signal_hit"].append(
-            f"multiple IPS detections observed count={high_like}"
-        )
-
-    for ip_value, score in sorted(
-        score_by_ip.items(), key=lambda item: item[1], reverse=True
-    ):
-        reasons = list(dict.fromkeys(reasons_by_ip.get(ip_value, [])))
-        corroborated_findings.append(
-            {
-                "ip": ip_value,
-                "score": score,
-                "confidence": "high"
-                if score >= 6
-                else "medium"
-                if score >= 3
-                else "low",
-                "reasons": reasons[:4],
-            }
-        )
-
-    for conv in sorted(conversations, key=lambda c: c.bytes, reverse=True):
-        reasons = reasons_by_ip.get(conv.src, []) + reasons_by_ip.get(conv.dst, [])
-        if not reasons:
-            continue
-        pivots.append(
-            {
-                "flow": f"{conv.src}->{conv.dst}",
-                "protocol": conv.protocol,
-                "packets": conv.packets,
-                "bytes": conv.bytes,
-                "first_seen": conv.first_seen,
-                "last_seen": conv.last_seen,
-                "ports": conv.ports[:8],
-                "reasons": list(dict.fromkeys(reasons))[:4],
-            }
-        )
-
-    verdict_score = 0
-    verdict_score += 2 if checks["indicator_quality_gate"] else 0
-    verdict_score += 2 if checks["corroborated_multi_signal_hit"] else 0
-    verdict_score += 2 if checks["internal_critical_asset_contact"] else 0
-    verdict_score += 1 if checks["boundary_cross_zone_contact"] else 0
-    verdict_score += 1 if checks["intent_heuristics"] else 0
-    verdict_score += 1 if checks["infrastructure_clustering"] else 0
-
-    analyst_reasons: list[str] = []
-    if checks["indicator_quality_gate"]:
-        analyst_reasons.append("Threat-intel indicators passed quality threshold")
-    if checks["internal_critical_asset_contact"]:
-        analyst_reasons.append("Lateral/critical asset contact indicators detected")
-    if checks["boundary_cross_zone_contact"]:
-        analyst_reasons.append(
-            "Cross-zone IP contact with external infrastructure observed"
-        )
-    if checks["corroborated_multi_signal_hit"]:
-        analyst_reasons.append("Multiple IPS anomaly signals corroborate risk")
-
-    if verdict_score >= 8:
-        verdict = (
-            "YES - HIGH-CONFIDENCE MALICIOUS OR COMPROMISED IP-LEVEL ACTIVITY DETECTED"
-        )
-        confidence = "high"
-    elif verdict_score >= 5:
-        verdict = "LIKELY - MULTIPLE CORROBORATING IP RISK INDICATORS DETECTED"
-        confidence = "medium"
-    elif verdict_score >= 2:
-        verdict = "POSSIBLE - IP RISK SIGNALS REQUIRE VALIDATION"
-        confidence = "medium"
-    else:
-        verdict = "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE IP ABUSE PATTERN"
-        confidence = "low"
-
-    risk_matrix: list[dict[str, str]] = [
-        {
-            "category": "Indicator Quality",
-            "risk": "High" if checks["indicator_quality_gate"] else "None",
-            "confidence": "High" if checks["indicator_quality_gate"] else "Low",
-            "evidence": str(len(checks["indicator_quality_gate"]))
-            if checks["indicator_quality_gate"]
-            else "No matching detections",
-        },
-        {
-            "category": "Boundary Exposure",
-            "risk": "Medium" if checks["boundary_cross_zone_contact"] else "None",
-            "confidence": "Medium" if checks["boundary_cross_zone_contact"] else "Low",
-            "evidence": str(len(checks["boundary_cross_zone_contact"]))
-            if checks["boundary_cross_zone_contact"]
-            else "No matching detections",
-        },
-        {
-            "category": "Critical Asset Contact",
-            "risk": "High" if checks["internal_critical_asset_contact"] else "None",
-            "confidence": "High"
-            if checks["internal_critical_asset_contact"]
-            else "Low",
-            "evidence": str(len(checks["internal_critical_asset_contact"]))
-            if checks["internal_critical_asset_contact"]
-            else "No matching detections",
-        },
-        {
-            "category": "Infrastructure Clustering",
-            "risk": "Medium" if checks["infrastructure_clustering"] else "None",
-            "confidence": "Medium" if checks["infrastructure_clustering"] else "Low",
-            "evidence": str(len(checks["infrastructure_clustering"]))
-            if checks["infrastructure_clustering"]
-            else "No matching detections",
-        },
-        {
-            "category": "Intent Heuristics",
-            "risk": "Medium" if checks["intent_heuristics"] else "None",
-            "confidence": "Medium" if checks["intent_heuristics"] else "Low",
-            "evidence": str(len(checks["intent_heuristics"]))
-            if checks["intent_heuristics"]
-            else "No matching detections",
-        },
-    ]
-
-    false_positive_context: list[str] = []
-    if checks["indicator_quality_gate"]:
-        false_positive_context.append(
-            "Threat-intel indicators can include stale or shared-hosting infrastructure"
-        )
-    if (
-        checks["boundary_cross_zone_contact"]
-        and not checks["corroborated_multi_signal_hit"]
-    ):
-        false_positive_context.append(
-            "Boundary crossings may reflect legitimate external services or updates"
-        )
-    if checks["infrastructure_clustering"]:
-        false_positive_context.append(
-            "ASN clustering can include CDN/ISP concentration rather than adversary control"
-        )
-    if not checks["intent_heuristics"]:
-        false_positive_context.append(
-            "No strong intent heuristics crossed current thresholds"
-        )
-
-    return {
-        "analyst_verdict": verdict,
-        "analyst_confidence": confidence,
-        "analyst_reasons": analyst_reasons
-        if analyst_reasons
-        else ["No high-confidence IPS threat heuristic crossed threshold"],
-        "deterministic_checks": checks,
-        "exposure_profiles": exposure_profiles[:40],
-        "priority_asset_profiles": priority_asset_profiles[:40],
-        "infrastructure_clusters": infrastructure_clusters[:40],
-        "intent_profiles": intent_profiles[:40],
-        "corroborated_findings": corroborated_findings[:40],
-        "investigation_pivots": pivots[:40],
-        "risk_matrix": risk_matrix,
-        "false_positive_context": false_positive_context[:8],
-    }
-
+    return {}
 
 def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     summary_list = list(summaries)
@@ -806,7 +499,7 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
         for (rep_type, fingerprint, label), count in rep_hits.items()
     ]
 
-    hunting_context = _build_ips_hunting_context(
+    enrichment = _build_ips_enrichment(
         endpoints=endpoint_rows,
         conversations=conversation_rows,
         suspicious_port_profiles=suspicious_port_profiles,
@@ -853,31 +546,28 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
             for ip_text, ports in confirmed_tcp_service_ports.items()
             if ports
         },
-        analyst_verdict=str(hunting_context.get("analyst_verdict", "") or ""),
+        analyst_verdict=str(enrichment.get("analyst_verdict", "") or ""),
         analyst_confidence=str(
-            hunting_context.get("analyst_confidence", "low") or "low"
+            enrichment.get("analyst_confidence", "low") or "low"
         ),
-        analyst_reasons=list(hunting_context.get("analyst_reasons", []) or []),
+        analyst_reasons=list(enrichment.get("analyst_reasons", []) or []),
         deterministic_checks=dict(
-            hunting_context.get("deterministic_checks", {}) or {}
+            enrichment.get("deterministic_checks", {}) or {}
         ),
-        exposure_profiles=list(hunting_context.get("exposure_profiles", []) or []),
+        exposure_profiles=list(enrichment.get("exposure_profiles", []) or []),
         priority_asset_profiles=list(
-            hunting_context.get("priority_asset_profiles", []) or []
+            enrichment.get("priority_asset_profiles", []) or []
         ),
         infrastructure_clusters=list(
-            hunting_context.get("infrastructure_clusters", []) or []
+            enrichment.get("infrastructure_clusters", []) or []
         ),
-        intent_profiles=list(hunting_context.get("intent_profiles", []) or []),
+        intent_profiles=list(enrichment.get("intent_profiles", []) or []),
         corroborated_findings=list(
-            hunting_context.get("corroborated_findings", []) or []
+            enrichment.get("corroborated_findings", []) or []
         ),
-        investigation_pivots=list(
-            hunting_context.get("investigation_pivots", []) or []
-        ),
-        risk_matrix=list(hunting_context.get("risk_matrix", []) or []),
+        risk_matrix=list(enrichment.get("risk_matrix", []) or []),
         false_positive_context=list(
-            hunting_context.get("false_positive_context", []) or []
+            enrichment.get("false_positive_context", []) or []
         ),
     )
 
@@ -1369,12 +1059,14 @@ def _infer_protocol(pkt) -> str:
         return "ICMP"
     if ICMPv6 is not None and pkt.haslayer(ICMPv6):  # type: ignore[truthy-bool]
         return "ICMPv6"
+    if ARP is not None and pkt.haslayer(ARP):  # type: ignore[truthy-bool]
+        return "ARP"
     return "OTHER"
 
 
 def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
     errors: list[str] = []
-    if IP is None and IPv6 is None:
+    if IP is None and IPv6 is None and ARP is None:
         errors.append("Scapy IP layers unavailable; install scapy for IP analysis.")
         return IpSummary(
             path=path,
@@ -1516,6 +1208,14 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                     set_add_cap(ipv6_set, src_ip, max_size=MAX_UNIQUE_IPS)
                 if dst_ip:
                     set_add_cap(ipv6_set, dst_ip, max_size=MAX_UNIQUE_IPS)
+            elif ARP is not None and pkt.haslayer(ARP):  # type: ignore[truthy-bool]
+                arp_layer = pkt[ARP]  # type: ignore[index]
+                src_ip = str(getattr(arp_layer, "psrc", ""))
+                dst_ip = str(getattr(arp_layer, "pdst", ""))
+                if src_ip:
+                    set_add_cap(ipv4_set, src_ip, max_size=MAX_UNIQUE_IPS)
+                if dst_ip:
+                    set_add_cap(ipv4_set, dst_ip, max_size=MAX_UNIQUE_IPS)
             else:
                 continue
 
@@ -2125,7 +1825,7 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                         }
                     )
 
-    hunting_context = _build_ips_hunting_context(
+    enrichment = _build_ips_enrichment(
         endpoints=endpoint_rows,
         conversations=conversation_rows,
         suspicious_port_profiles=suspicious_port_profiles,
@@ -2172,30 +1872,27 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
             for ip_text, ports in confirmed_tcp_service_ports.items()
             if ports
         },
-        analyst_verdict=str(hunting_context.get("analyst_verdict", "") or ""),
+        analyst_verdict=str(enrichment.get("analyst_verdict", "") or ""),
         analyst_confidence=str(
-            hunting_context.get("analyst_confidence", "low") or "low"
+            enrichment.get("analyst_confidence", "low") or "low"
         ),
-        analyst_reasons=list(hunting_context.get("analyst_reasons", []) or []),
+        analyst_reasons=list(enrichment.get("analyst_reasons", []) or []),
         deterministic_checks=dict(
-            hunting_context.get("deterministic_checks", {}) or {}
+            enrichment.get("deterministic_checks", {}) or {}
         ),
-        exposure_profiles=list(hunting_context.get("exposure_profiles", []) or []),
+        exposure_profiles=list(enrichment.get("exposure_profiles", []) or []),
         priority_asset_profiles=list(
-            hunting_context.get("priority_asset_profiles", []) or []
+            enrichment.get("priority_asset_profiles", []) or []
         ),
         infrastructure_clusters=list(
-            hunting_context.get("infrastructure_clusters", []) or []
+            enrichment.get("infrastructure_clusters", []) or []
         ),
-        intent_profiles=list(hunting_context.get("intent_profiles", []) or []),
+        intent_profiles=list(enrichment.get("intent_profiles", []) or []),
         corroborated_findings=list(
-            hunting_context.get("corroborated_findings", []) or []
+            enrichment.get("corroborated_findings", []) or []
         ),
-        investigation_pivots=list(
-            hunting_context.get("investigation_pivots", []) or []
-        ),
-        risk_matrix=list(hunting_context.get("risk_matrix", []) or []),
+        risk_matrix=list(enrichment.get("risk_matrix", []) or []),
         false_positive_context=list(
-            hunting_context.get("false_positive_context", []) or []
+            enrichment.get("false_positive_context", []) or []
         ),
     )

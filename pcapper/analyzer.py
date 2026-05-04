@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover
 
 from .models import InterfaceStat, PcapSummary
 from .services import COMMON_PORTS
-from .utils import detect_file_type
+from .utils import detect_file_type, extract_packet_endpoints
 
 IGNORE_LAYERS = {"Raw", "Padding", "NoPayload"}
 
@@ -204,16 +204,7 @@ def analyze_pcap(
                 iface_key = "unknown"
             iface_counts[iface_key] += 1
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if Dot1Q is not None:
                 try:

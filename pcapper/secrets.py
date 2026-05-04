@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, get_reader
-from .utils import decode_payload, safe_float
+from .utils import decode_payload, safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -113,11 +113,8 @@ class SecretsSummary:
 
 
 def _get_ip_pair(pkt: Packet) -> tuple[str, str]:
-    if IP is not None and IP in pkt:
-        return pkt[IP].src, pkt[IP].dst
-    if IPv6 is not None and IPv6 in pkt:
-        return pkt[IPv6].src, pkt[IPv6].dst
-    return "0.0.0.0", "0.0.0.0"
+    src_ip, dst_ip = extract_packet_endpoints(pkt)
+    return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
 
 def _get_ports(pkt: Packet) -> tuple[Optional[int], Optional[int], str]:
@@ -729,4 +726,128 @@ def analyze_secrets(
         ot_findings=ot_findings,
         ctf_indicators=ctf_indicators,
         errors=errors,
+    )
+
+
+def merge_secrets_summaries(
+    summaries: list[SecretsSummary]
+    | tuple[SecretsSummary, ...]
+    | set[SecretsSummary],
+) -> SecretsSummary:
+    summary_list = list(summaries)
+    if not summary_list:
+        return SecretsSummary(
+            path=Path("ALL_PCAPS_0"),
+            total_packets=0,
+            matches=0,
+            hits=[],
+            truncated=False,
+            kind_counts=Counter(),
+            top_sources=Counter(),
+            top_destinations=Counter(),
+            protocol_counts=Counter(),
+            deterministic_checks={},
+            threat_hypotheses=[],
+            ot_findings=[],
+            ctf_indicators=[],
+            errors=[],
+        )
+
+    total_packets = sum(
+        int(getattr(item, "total_packets", 0) or 0) for item in summary_list
+    )
+    matches = sum(int(getattr(item, "matches", 0) or 0) for item in summary_list)
+    truncated = any(bool(getattr(item, "truncated", False)) for item in summary_list)
+
+    hits: list[SecretHit] = []
+    kind_counts: Counter[str] = Counter()
+    top_sources: Counter[str] = Counter()
+    top_destinations: Counter[str] = Counter()
+    protocol_counts: Counter[str] = Counter()
+    deterministic_checks: dict[str, list[str]] = {}
+    threat_hypotheses: list[dict[str, object]] = []
+    ot_findings: list[str] = []
+    ctf_indicators: list[str] = []
+    errors: set[str] = set()
+
+    for summary in summary_list:
+        kind_counts.update(getattr(summary, "kind_counts", Counter()) or Counter())
+        top_sources.update(getattr(summary, "top_sources", Counter()) or Counter())
+        top_destinations.update(
+            getattr(summary, "top_destinations", Counter()) or Counter()
+        )
+        protocol_counts.update(
+            getattr(summary, "protocol_counts", Counter()) or Counter()
+        )
+
+        errors.update(
+            str(err)
+            for err in (getattr(summary, "errors", []) or [])
+            if str(err).strip()
+        )
+
+        for hit in getattr(summary, "hits", []) or []:
+            hits.append(hit)
+
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+        for key, values in checks.items():
+            bucket = deterministic_checks.setdefault(str(key), [])
+            for value in values or []:
+                text = str(value).strip()
+                if text:
+                    bucket.append(text)
+
+        for row in getattr(summary, "threat_hypotheses", []) or []:
+            if isinstance(row, dict):
+                threat_hypotheses.append(dict(row))
+
+        for line in getattr(summary, "ot_findings", []) or []:
+            text = str(line).strip()
+            if text:
+                ot_findings.append(text)
+
+        for line in getattr(summary, "ctf_indicators", []) or []:
+            text = str(line).strip()
+            if text:
+                ctf_indicators.append(text)
+
+    for key, values in list(deterministic_checks.items()):
+        deterministic_checks[key] = list(dict.fromkeys(values))[:100]
+
+    hits.sort(
+        key=lambda item: (
+            safe_float(getattr(item, "ts", None))
+            if getattr(item, "ts", None) is not None
+            else float("inf"),
+            int(getattr(item, "packet_number", 0) or 0),
+        )
+    )
+
+    dedup_hypotheses: list[dict[str, object]] = []
+    seen_hypotheses: set[str] = set()
+    for row in threat_hypotheses:
+        sig = repr(sorted((str(k), repr(v)) for k, v in row.items()))
+        if sig in seen_hypotheses:
+            continue
+        seen_hypotheses.add(sig)
+        dedup_hypotheses.append(row)
+
+    ot_findings = list(dict.fromkeys(ot_findings))[:100]
+    ctf_indicators = list(dict.fromkeys(ctf_indicators))[:100]
+
+    return SecretsSummary(
+        path=Path(f"ALL_PCAPS_{len(summary_list)}"),
+        total_packets=total_packets,
+        matches=matches,
+        hits=hits,
+        truncated=truncated or matches > len(hits),
+        kind_counts=kind_counts,
+        top_sources=top_sources,
+        top_destinations=top_destinations,
+        protocol_counts=protocol_counts,
+        deterministic_checks=deterministic_checks,
+        threat_hypotheses=dedup_hypotheses,
+        ot_findings=ot_findings,
+        ctf_indicators=ctf_indicators,
+        errors=sorted(errors),
     )

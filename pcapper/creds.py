@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, unquote_plus, urlsplit
 
 from .pcap_cache import PcapMeta, get_reader
 from .services import COMMON_PORTS
-from .utils import decode_payload, safe_float
+from .utils import decode_payload, safe_float, extract_packet_endpoints
 
 try:
     from .cip import (
@@ -308,11 +308,8 @@ class CredentialSummary:
 
 
 def _get_ip_pair(pkt: Packet) -> tuple[str, str]:
-    if IP is not None and IP in pkt:
-        return pkt[IP].src, pkt[IP].dst
-    if IPv6 is not None and IPv6 in pkt:
-        return pkt[IPv6].src, pkt[IPv6].dst
-    return "0.0.0.0", "0.0.0.0"
+    src_ip, dst_ip = extract_packet_endpoints(pkt)
+    return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
 
 def _get_ports(pkt: Packet) -> tuple[Optional[int], Optional[int], str]:

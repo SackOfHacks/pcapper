@@ -17,7 +17,7 @@ except ImportError:
     IP = TCP = Raw = None
 
 from .pcap_cache import get_reader
-from .utils import counter_inc, decode_payload, safe_float, set_add_cap, setdict_add
+from .utils import counter_inc, decode_payload, safe_float, set_add_cap, setdict_add, extract_packet_endpoints
 
 MAX_SMB_UNIQUE = int(os.getenv("PCAPPER_MAX_SMB_UNIQUE", "50000"))
 MAX_SMB_CONVERSATIONS = int(os.getenv("PCAPPER_MAX_SMB_CONVERSATIONS", "50000"))
@@ -162,7 +162,6 @@ class SmbSummary:
     analysis_notes: List[str]
     deterministic_checks: Dict[str, List[str]]
     threat_hypotheses: List[Dict[str, object]]
-    hunting_pivots: List[Dict[str, object]]
     benign_context: List[str]
     errors: List[str]
 
@@ -406,13 +405,10 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
         items.append(item)
 
     def _get_ip_pair(pkt: Packet) -> Tuple[str, str]:
-        if IP is not None and IP in pkt:
-            return pkt[IP].src, pkt[IP].dst
-        if IPv6 is not None and IPv6 in pkt:
-            return pkt[IPv6].src, pkt[IPv6].dst
-        return "0.0.0.0", "0.0.0.0"
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
+        return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
-    def _update_time(obj, ts: Optional[float]) -> None:
+    def _update_window(obj: Any, ts: Optional[float]) -> None:
         if ts is None:
             return
         if obj.first_seen is None or ts < obj.first_seen:
@@ -1897,7 +1893,6 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
         "smb_beacon_or_periodicity": [],
     }
     threat_hypotheses: List[Dict[str, object]] = []
-    hunting_pivots: List[Dict[str, object]] = []
     benign_context: List[str] = []
 
     def _is_public_ip(value: str) -> bool:
@@ -1938,13 +1933,6 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
             deterministic_checks["smb_auth_failure_burst"].append(
                 f"Client {client} failed SMB operations count={int(failures)}"
             )
-            hunting_pivots.append(
-                {
-                    "pivot": "auth_failure_client",
-                    "client": client,
-                    "failures": int(failures),
-                }
-            )
 
     for share_name, share_obj in shares.items():
         if getattr(share_obj, "is_admin", False):
@@ -1954,15 +1942,6 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
     for item in lateral_movement[:20]:
         deterministic_checks["smb_admin_share_lateral"].append(
             f"Lateral profile client={item.get('client', '-')} servers={item.get('servers', 0)} admin_shares={item.get('admin_shares', 0)} score={item.get('score', 0)}"
-        )
-        hunting_pivots.append(
-            {
-                "pivot": "lateral_profile",
-                "client": str(item.get("client", "-")),
-                "servers": int(item.get("servers", 0) or 0),
-                "admin_shares": int(item.get("admin_shares", 0) or 0),
-                "score": float(item.get("score", 0.0) or 0.0),
-            }
         )
 
     suspicious_ext = {
@@ -1999,13 +1978,6 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
         if len(servers_seen) >= 8:
             deterministic_checks["smb_scanning_fanout"].append(
                 f"{client} contacted {len(servers_seen)} SMB servers"
-            )
-            hunting_pivots.append(
-                {
-                    "pivot": "fanout_client",
-                    "client": client,
-                    "servers": len(servers_seen),
-                }
             )
 
     for ip_value, count in top_servers.items():
@@ -2099,7 +2071,6 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
         analysis_notes=analysis_notes,
         deterministic_checks={k: v[:80] for k, v in deterministic_checks.items()},
         threat_hypotheses=threat_hypotheses[:24],
-        hunting_pivots=hunting_pivots[:150],
         benign_context=benign_context[:24],
         errors=errors,
     )

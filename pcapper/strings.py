@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
 
 from .pcap_cache import get_reader
+from .utils import extract_packet_endpoints
 
 SUSPICIOUS_PATTERNS = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential exposure"),
@@ -119,11 +120,8 @@ class StringsSummary:
 
 
 def _get_ip_pair(pkt: Packet) -> Tuple[str, str]:
-    if IP is not None and IP in pkt:
-        return pkt[IP].src, pkt[IP].dst
-    if IPv6 is not None and IPv6 in pkt:
-        return pkt[IPv6].src, pkt[IPv6].dst
-    return "0.0.0.0", "0.0.0.0"
+    src_ip, dst_ip = extract_packet_endpoints(pkt)
+    return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
 
 def _extract_ascii_strings(
@@ -541,6 +539,223 @@ def analyze_strings(
         urls=_top_artifacts(url_counter, 15),
         emails=_top_artifacts(email_counter, 15),
         domains=_top_artifacts(domain_counter, 15),
+        client_strings=client_strings,
+        server_strings=server_strings,
+        anomalies=anomalies,
+        deterministic_checks=deterministic_checks,
+        threat_hypotheses=threat_hypotheses,
+        ot_findings=ot_findings,
+        ctf_indicators=ctf_indicators,
+        errors=errors,
+    )
+
+
+def merge_strings_summaries(summaries: List[StringsSummary]) -> StringsSummary:
+    if not summaries:
+        return StringsSummary(
+            path=Path("ALL_PCAPS"),
+            total_packets=0,
+            strings_found=0,
+            unique_strings=0,
+            top_strings=[],
+            bottom_strings=[],
+            suspicious_strings=[],
+            suspicious_details=[],
+            urls=[],
+            emails=[],
+            domains=[],
+            client_strings={},
+            server_strings={},
+            anomalies=[],
+            deterministic_checks={},
+            threat_hypotheses=[],
+            ot_findings=[],
+            ctf_indicators=[],
+            errors=[],
+        )
+
+    def _counter_from_artifacts(items: List[StringArtifact]) -> Counter[str]:
+        counter: Counter[str] = Counter()
+        for item in items:
+            counter[item.value] += int(item.count)
+        return counter
+
+    def _to_artifacts(counter: Counter[str], limit: int) -> List[StringArtifact]:
+        return [StringArtifact(value=k, count=v) for k, v in counter.most_common(limit)]
+
+    total_packets = sum(item.total_packets for item in summaries)
+    strings_found = sum(item.strings_found for item in summaries)
+    unique_strings = sum(item.unique_strings for item in summaries)
+
+    top_counter: Counter[str] = Counter()
+    bottom_counter: Counter[str] = Counter()
+    suspicious_counter: Counter[str] = Counter()
+    url_counter: Counter[str] = Counter()
+    email_counter: Counter[str] = Counter()
+    domain_counter: Counter[str] = Counter()
+    client_counters: Dict[str, Counter[str]] = defaultdict(Counter)
+    server_counters: Dict[str, Counter[str]] = defaultdict(Counter)
+
+    detail_map: Dict[str, Dict[str, object]] = {}
+    anomalies: List[str] = []
+    seen_anomalies: Set[str] = set()
+    deterministic_checks: Dict[str, List[str]] = {}
+    threat_rollup: Dict[str, Dict[str, object]] = {}
+    ot_findings: List[str] = []
+    seen_ot: Set[str] = set()
+    ctf_indicators: List[str] = []
+    seen_ctf: Set[str] = set()
+    errors: List[str] = []
+
+    confidence_rank = {"low": 1, "medium": 2, "high": 3}
+
+    for summary in summaries:
+        top_counter.update(_counter_from_artifacts(summary.top_strings))
+        bottom_counter.update(_counter_from_artifacts(summary.bottom_strings))
+        suspicious_counter.update(_counter_from_artifacts(summary.suspicious_strings))
+        url_counter.update(_counter_from_artifacts(summary.urls))
+        email_counter.update(_counter_from_artifacts(summary.emails))
+        domain_counter.update(_counter_from_artifacts(summary.domains))
+
+        for ip, items in summary.client_strings.items():
+            client_counters[ip].update(_counter_from_artifacts(items))
+        for ip, items in summary.server_strings.items():
+            server_counters[ip].update(_counter_from_artifacts(items))
+
+        for item in summary.suspicious_details:
+            value = str(item.get("value", ""))
+            if not value:
+                continue
+            bucket = detail_map.setdefault(
+                value,
+                {
+                    "value": value,
+                    "count": 0,
+                    "reasons": set(),
+                    "top_sources": Counter(),
+                    "top_destinations": Counter(),
+                },
+            )
+            bucket["count"] = int(bucket.get("count", 0)) + int(item.get("count", 0))
+            reasons = item.get("reasons", []) or []
+            if isinstance(reasons, list):
+                cast_reasons = bucket.get("reasons")
+                if isinstance(cast_reasons, set):
+                    cast_reasons.update(str(r) for r in reasons if str(r).strip())
+
+            src_counter = bucket.get("top_sources")
+            if isinstance(src_counter, Counter):
+                for src, count in item.get("top_sources", []) or []:
+                    src_counter[str(src)] += int(count)
+
+            dst_counter = bucket.get("top_destinations")
+            if isinstance(dst_counter, Counter):
+                for dst, count in item.get("top_destinations", []) or []:
+                    dst_counter[str(dst)] += int(count)
+
+        for text in summary.anomalies:
+            value = str(text)
+            if value not in seen_anomalies:
+                seen_anomalies.add(value)
+                anomalies.append(value)
+
+        for key, evidence_list in summary.deterministic_checks.items():
+            bucket = deterministic_checks.setdefault(key, [])
+            for evidence in evidence_list:
+                if evidence not in bucket:
+                    bucket.append(evidence)
+
+        for hypothesis in summary.threat_hypotheses:
+            name = str(hypothesis.get("hypothesis", "")).strip()
+            if not name:
+                continue
+            existing = threat_rollup.get(name)
+            current_conf = str(hypothesis.get("confidence", "medium")).lower()
+            current_count = int(hypothesis.get("evidence_count", 0) or 0)
+            if existing is None:
+                threat_rollup[name] = {
+                    "hypothesis": name,
+                    "confidence": current_conf,
+                    "evidence_count": current_count,
+                }
+                continue
+            existing["evidence_count"] = int(existing.get("evidence_count", 0)) + current_count
+            prev_conf = str(existing.get("confidence", "medium")).lower()
+            if confidence_rank.get(current_conf, 2) > confidence_rank.get(prev_conf, 2):
+                existing["confidence"] = current_conf
+
+        for finding in summary.ot_findings:
+            value = str(finding)
+            if value and value not in seen_ot and len(ot_findings) < 20:
+                seen_ot.add(value)
+                ot_findings.append(value)
+
+        for indicator in summary.ctf_indicators:
+            value = str(indicator)
+            if value and value not in seen_ctf and len(ctf_indicators) < 20:
+                seen_ctf.add(value)
+                ctf_indicators.append(value)
+
+        errors.extend(summary.errors)
+
+    suspicious_details: List[Dict[str, object]] = []
+    for value, bucket in sorted(
+        detail_map.items(),
+        key=lambda kv: int(kv[1].get("count", 0)),
+        reverse=True,
+    )[:20]:
+        reasons = sorted(str(r) for r in (bucket.get("reasons") or set()))
+        src_counter = bucket.get("top_sources")
+        dst_counter = bucket.get("top_destinations")
+        suspicious_details.append(
+            {
+                "value": value,
+                "count": int(bucket.get("count", 0)),
+                "reasons": reasons,
+                "top_sources": (
+                    src_counter.most_common(3) if isinstance(src_counter, Counter) else []
+                ),
+                "top_destinations": (
+                    dst_counter.most_common(3) if isinstance(dst_counter, Counter) else []
+                ),
+            }
+        )
+
+    client_strings = {
+        ip: _to_artifacts(counter, 8)
+        for ip, counter in sorted(
+            client_counters.items(),
+            key=lambda item: sum(item[1].values()),
+            reverse=True,
+        )[:5]
+    }
+    server_strings = {
+        ip: _to_artifacts(counter, 8)
+        for ip, counter in sorted(
+            server_counters.items(),
+            key=lambda item: sum(item[1].values()),
+            reverse=True,
+        )[:5]
+    }
+
+    threat_hypotheses = sorted(
+        threat_rollup.values(),
+        key=lambda item: int(item.get("evidence_count", 0)),
+        reverse=True,
+    )
+
+    return StringsSummary(
+        path=Path("ALL_PCAPS"),
+        total_packets=total_packets,
+        strings_found=strings_found,
+        unique_strings=unique_strings,
+        top_strings=_to_artifacts(top_counter, 20),
+        bottom_strings=_to_artifacts(bottom_counter, 20),
+        suspicious_strings=_to_artifacts(suspicious_counter, 20),
+        suspicious_details=suspicious_details,
+        urls=_to_artifacts(url_counter, 15),
+        emails=_to_artifacts(email_counter, 15),
+        domains=_to_artifacts(domain_counter, 15),
         client_strings=client_strings,
         server_strings=server_strings,
         anomalies=anomalies,
