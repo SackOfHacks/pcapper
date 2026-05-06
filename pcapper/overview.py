@@ -84,9 +84,9 @@ _OT_PROTOCOL_MATCHERS: list[tuple[str, str, tuple[str, ...]]] = [
     ("enip", "EtherNet/IP", ("ethernet/ip", "enip", "44818")),
     ("cip", "CIP", ("cip", "enip-io", "2222", "cip security")),
     ("profinet", "Profinet", ("profinet", "pnio", "dcp")),
-    ("s7", "Siemens S7", ("s7", "siemens")),
-    ("opc", "OPC UA", ("opc ua", "opc")),
-    ("mms", "IEC 61850 MMS", ("mms", "61850")),
+    ("s7", "Siemens S7", ("s7", "s7comm", "siemens", "cotp", "tpkt")),
+    ("opc", "OPC UA", ("opc ua", "opc", "opc.tcp", "4840")),
+    ("mms", "IEC 61850 MMS", ("mms", "iec 61850 mms", "acse", "61850")),
     ("goose", "IEC 61850 GOOSE", ("goose",)),
     ("sv", "IEC 61850 SV", ("sampled value", "iec 61850 sv")),
     ("lldp", "LLDP/DCP", ("lldp", "profinet dcp")),
@@ -167,6 +167,28 @@ _OT_MODULES = {
     "hart",
     "niagara",
     "odesys",
+}
+
+
+_IOT_PROTOCOL_STEPS = {"mqtt", "coap"}
+
+
+_OT_PORT_HINTS: dict[str, tuple[int, ...]] = {
+    "s7": (102,),
+    "modbus": (502,),
+    "dnp3": (20000,),
+    "iec104": (2404,),
+    "bacnet": (47808,),
+    "enip": (44818, 2222),
+    "cip": (2221, 2222, 44818),
+    "profinet": (34962, 34963, 34964),
+    "opc": (4840,),
+    "ptp": (319, 320),
+    "mqtt": (1883, 8883),
+    "coap": (5683, 5684),
+    "hart": (5094,),
+    "niagara": (1911, 4911),
+    "odesys": (1217, 2455),
 }
 
 
@@ -283,6 +305,87 @@ def _detect_ot_modules(blob: str) -> list[tuple[str, str]]:
         if any(_token_match(blob, token) for token in tokens):
             detected.append((step, label))
     return detected
+
+
+def _collect_observed_ports(protocols, services) -> tuple[Counter[int], set[int]]:
+    port_weights: Counter[int] = Counter()
+    service_ports: set[int] = set()
+
+    for conv in list(getattr(protocols, "conversations", []) or []):
+        packets = int(getattr(conv, "packets", 0) or 0)
+        weight = max(1, packets)
+        for raw in set(getattr(conv, "ports", set()) or set()):
+            try:
+                port = int(raw)
+            except Exception:
+                continue
+            if port <= 0 or port > 65535:
+                continue
+            port_weights[port] += weight
+
+    for asset in list(getattr(services, "assets", []) or []):
+        try:
+            port = int(getattr(asset, "port", 0) or 0)
+        except Exception:
+            continue
+        if port <= 0 or port > 65535:
+            continue
+        service_ports.add(port)
+        weight = max(1, int(getattr(asset, "packets", 0) or 0))
+        port_weights[port] += weight
+
+    return port_weights, service_ports
+
+
+def _detect_ot_modules_from_ports(protocols, services) -> dict[str, list[int]]:
+    port_weights, service_ports = _collect_observed_ports(protocols, services)
+    detected: dict[str, list[int]] = {}
+    for step, ports in _OT_PORT_HINTS.items():
+        matched: list[int] = []
+        for port in ports:
+            score = int(port_weights.get(port, 0) or 0)
+            if score >= 2 or (score >= 1 and port in service_ports):
+                matched.append(port)
+        if matched:
+            detected[step] = sorted(set(matched))
+    return detected
+
+
+def _ot_marker_tokens(steps: list[str], labels: list[str]) -> set[str]:
+    tokens: set[str] = set()
+    for step in steps:
+        step_text = str(step).strip().lower()
+        if step_text:
+            tokens.add(step_text)
+    for label in labels:
+        label_text = str(label).strip().lower()
+        if label_text:
+            tokens.add(label_text)
+    for step, _label, matcher_tokens in _OT_PROTOCOL_MATCHERS:
+        if step not in steps:
+            continue
+        for token in matcher_tokens:
+            text = str(token).strip().lower()
+            if text:
+                tokens.add(text)
+    return tokens
+
+
+def _iot_labels_from_ot_labels(labels: list[str]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for label in labels:
+        text = str(label).strip()
+        lowered = text.lower()
+        if not text:
+            continue
+        if "mqtt" not in lowered and "coap" not in lowered:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        output.append(text)
+    return output
 
 
 def _top_services(services, limit: int = 10) -> list[tuple[str, int]]:
@@ -993,17 +1096,50 @@ def _cross_zone_flow_count(protocols) -> int:
     return count
 
 
+def _cross_zone_ot_iot_flow_count(
+    *,
+    notable_flows: list[dict[str, object]],
+    ot_markers: set[str],
+    ot_ports: set[int],
+) -> int:
+    if not notable_flows:
+        return 0
+    count = 0
+    for flow in notable_flows:
+        if not isinstance(flow, dict):
+            continue
+        scope_pair = str(flow.get("scope_pair", "") or "").strip()
+        if scope_pair not in {"internal->public", "public->internal"}:
+            continue
+        ports: list[int] = []
+        for raw in list(flow.get("ports", []) or []):
+            try:
+                port = int(raw)
+            except Exception:
+                continue
+            if port <= 0:
+                continue
+            ports.append(port)
+        if any(port in ot_ports for port in ports):
+            count += 1
+            continue
+        protocol_blob = f" {str(flow.get('protocol', '') or '').lower()} "
+        if any(_token_match(protocol_blob, token) for token in ot_markers if token):
+            count += 1
+    return count
+
+
 def _build_hunt_leads(
     *,
     ip_activity: list[dict[str, object]],
     notable_flows: list[dict[str, object]],
     module_results: list[OverviewModuleResult],
-    ot_protocols: list[str],
+    ot_markers: list[str],
     limit: int = 12,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
-    ot_tokens = {str(item).lower() for item in ot_protocols if str(item).strip()}
+    ot_tokens = {str(item).strip().lower() for item in ot_markers if str(item).strip()}
 
     def add_lead(
         *,
@@ -1046,12 +1182,18 @@ def _build_hunt_leads(
         top_ports = [int(v) for v in list(item.get("top_ports", []) or [])[:6]]
         services_hosted = list(item.get("services_hosted", []) or [])
         services_used = list(item.get("services_used", []) or [])
-        protocol_blob = " ".join(str(v).lower() for v in list(item.get("top_protocols", []) or []))
-        service_blob = " ".join(
+        protocol_blob = " " + " ".join(
+            str(v).lower() for v in list(item.get("top_protocols", []) or [])
+        ) + " "
+        service_blob = " " + " ".join(
             str(v).lower() for v in services_hosted[:4] + services_used[:4]
-        )
+        ) + " "
         is_ot_related = any(
-            token and (token in protocol_blob or token in service_blob)
+            token
+            and (
+                _token_match(protocol_blob, token)
+                or _token_match(service_blob, token)
+            )
             for token in ot_tokens
         )
         avg_bytes_per_packet = float(bytes_total) / float(max(1, packets_total))
@@ -1178,6 +1320,43 @@ def _build_hunt_leads(
                     entity="scan-analysis",
                     finding=f"Scanner activity observed ({scanner_count} source hosts)",
                     evidence=result.highlights[0] if result.highlights else _module_metric_text(result.metrics),
+                )
+        elif result.module == "ot_commands":
+            command_count = int(result.metrics.get("commands", 0) or 0)
+            burst = int(result.metrics.get("max_burst", 0) or 0)
+            try:
+                control_rate = float(result.metrics.get("control_rate_per_min", 0.0) or 0.0)
+            except Exception:
+                control_rate = 0.0
+            if command_count > 0 and (burst >= 5 or control_rate >= 8.0):
+                add_lead(
+                    score=89,
+                    entity="ot-command-activity",
+                    finding="Burst OT control/write activity observed",
+                    evidence=(
+                        f"commands={command_count} max_burst={burst} "
+                        f"control_rate_per_min={control_rate:.2f}"
+                    ),
+                )
+        elif result.module == "modbus":
+            write_ops = int(result.metrics.get("write_ops", 0) or 0)
+            anomalies = int(result.metrics.get("anomalies", 0) or 0)
+            if write_ops > 0:
+                add_lead(
+                    score=84,
+                    entity="modbus-analysis",
+                    finding="Modbus write operations observed",
+                    evidence=f"write_ops={write_ops} anomalies={anomalies}",
+                )
+        elif result.module == "dnp3":
+            control_ops = int(result.metrics.get("control_ops", 0) or 0)
+            anomalies = int(result.metrics.get("anomalies", 0) or 0)
+            if control_ops > 0:
+                add_lead(
+                    score=84,
+                    entity="dnp3-analysis",
+                    finding="DNP3 control/file operations observed",
+                    evidence=f"control_ops={control_ops} anomalies={anomalies}",
                 )
 
     if not rows:
@@ -1574,8 +1753,49 @@ def analyze_overview(
 
     labels_blob = _build_label_blob(protocol_summary, services_summary)
     detected_ot = _detect_ot_modules(labels_blob)
-    detected_ot_steps = [step for step, _label in detected_ot]
-    detected_ot_labels = [label for _step, label in detected_ot]
+    detected_by_port = _detect_ot_modules_from_ports(protocol_summary, services_summary)
+
+    detected_ot_steps: list[str] = []
+    detected_meta: dict[str, dict[str, object]] = {}
+
+    def _register_detected(
+        step: str,
+        *,
+        label: str,
+        inventory: bool,
+        ports: list[int] | None = None,
+    ) -> None:
+        if step not in detected_meta:
+            detected_meta[step] = {
+                "label": label,
+                "inventory": False,
+                "ports": [],
+            }
+            detected_ot_steps.append(step)
+        meta = detected_meta[step]
+        if inventory:
+            meta["inventory"] = True
+        if ports:
+            existing_ports = [int(v) for v in list(meta.get("ports", []) or [])]
+            existing_ports.extend(int(v) for v in ports)
+            meta["ports"] = sorted(set(existing_ports))
+
+    for step, label in detected_ot:
+        _register_detected(step, label=label, inventory=True)
+    for step, ports in detected_by_port.items():
+        _register_detected(
+            step,
+            label=_MODULE_LABELS.get(step, step.upper()),
+            inventory=False,
+            ports=ports,
+        )
+
+    detected_ot_labels = [
+        str(detected_meta.get(step, {}).get("label") or _MODULE_LABELS.get(step, step))
+        for step in detected_ot_steps
+    ]
+    ot_markers = _ot_marker_tokens(detected_ot_steps, detected_ot_labels)
+    detected_iot_labels = _iot_labels_from_ot_labels(detected_ot_labels)
 
     has_file_hints = any(_token_match(labels_blob, token) for token in _FILE_TRANSFER_HINTS)
 
@@ -1661,7 +1881,17 @@ def analyze_overview(
         if runner is None:
             continue
         label = _MODULE_LABELS.get(step, step.upper())
-        add_module(step, f"Detected {label} in protocol/service inventory.", runner)
+        reason_parts: list[str] = []
+        meta = detected_meta.get(step, {})
+        if bool(meta.get("inventory", False)):
+            reason_parts.append("protocol/service labels")
+        port_hits = [int(v) for v in list(meta.get("ports", []) or [])]
+        if port_hits:
+            reason_parts.append("well-known ports " + ",".join(str(v) for v in port_hits[:4]))
+        reason = f"Detected {label} in protocol/service inventory."
+        if reason_parts:
+            reason = f"Detected {label} via " + " and ".join(reason_parts) + "."
+        add_module(step, reason, runner)
 
     module_results: list[OverviewModuleResult] = []
     modules_run = [module for module, _reason, _runner in plan]
@@ -1698,14 +1928,29 @@ def analyze_overview(
         ip_activity=ip_activity,
         notable_flows=notable_flows,
         module_results=module_results,
-        ot_protocols=detected_ot_labels,
+        ot_markers=sorted(ot_markers),
         limit=14,
+    )
+
+    ot_iot_ports = {
+        int(port)
+        for step in detected_ot_steps
+        for port in _OT_PORT_HINTS.get(step, ())
+    }
+    cross_zone_ot_iot_flows = _cross_zone_ot_iot_flow_count(
+        notable_flows=notable_flows,
+        ot_markers=ot_markers,
+        ot_ports=ot_iot_ports,
     )
 
     ot_highlights: list[str] = []
     if detected_ot_labels:
         ot_highlights.append(
             "Detected OT/ICS protocol families: " + ", ".join(detected_ot_labels[:10])
+        )
+    if detected_iot_labels:
+        ot_highlights.append(
+            "Detected IoT protocol families: " + ", ".join(detected_iot_labels[:6])
         )
     for result in module_results:
         if result.module in _OT_MODULES:
@@ -1761,6 +2006,11 @@ def analyze_overview(
         if high_sev > 0:
             recommendations.append(
                 "Prioritize critical/high detections with `--threats --mitre` and scope hosts using `--hostdetails -ip <host>`.")
+        ot_risk_score = int(threats_result.metrics.get("ot_risk_score", 0) or 0)
+        if ot_risk_score >= 60:
+            recommendations.append(
+                f"OT risk posture is elevated ({ot_risk_score}/100); verify approved engineering actions and map findings to zones/conduits before remediation."
+            )
 
     if files_result:
         artifacts = int(files_result.metrics.get("artifacts", 0) or 0)
@@ -1775,6 +2025,48 @@ def analyze_overview(
             recommendations.append(
                 "CTF candidates found; follow up with `--ctf --strings --decode <token>` for deeper decoding chains."
             )
+
+    ot_commands_result = module_lookup.get("ot_commands")
+    if ot_commands_result:
+        burst = int(ot_commands_result.metrics.get("max_burst", 0) or 0)
+        try:
+            control_rate = float(
+                ot_commands_result.metrics.get("control_rate_per_min", 0.0) or 0.0
+            )
+        except Exception:
+            control_rate = 0.0
+        if burst >= 5 or control_rate >= 8.0:
+            recommendations.append(
+                "Elevated OT control/write cadence detected; validate maintenance windows and authorized engineering workstations with `--ot-commands`."
+            )
+
+    safety_result = module_lookup.get("safety")
+    if safety_result and int(safety_result.metrics.get("hits", 0) or 0) > 0:
+        recommendations.append(
+            "Safety/SIS traffic was observed; confirm strict isolation and one-way monitoring between SIS and process control networks."
+        )
+
+    modbus_result = module_lookup.get("modbus")
+    if modbus_result and int(modbus_result.metrics.get("write_ops", 0) or 0) > 0:
+        recommendations.append(
+            "Modbus write operations were observed; correlate with approved change records and inspect affected controllers with `--modbus`."
+        )
+
+    dnp3_result = module_lookup.get("dnp3")
+    if dnp3_result and int(dnp3_result.metrics.get("control_ops", 0) or 0) > 0:
+        recommendations.append(
+            "DNP3 control/file operations were observed; validate master authorization and outstation control policy using `--dnp3`."
+        )
+
+    if cross_zone_ot_iot_flows > 0:
+        recommendations.append(
+            "OT/IoT protocol traffic crosses internal/public boundaries; validate segmentation, jump-host controls, and boundary ACLs before further action."
+        )
+
+    if detected_iot_labels:
+        recommendations.append(
+            "IoT messaging protocols detected; verify broker/device authentication, topic ACLs, and TLS usage for MQTT/CoAP paths."
+        )
 
     if len(detected_ot_steps) > _AUTO_OT_DEEP_DIVE_LIMIT:
         overflow = detected_ot_steps[_AUTO_OT_DEEP_DIVE_LIMIT :]
@@ -1814,11 +2106,13 @@ def analyze_overview(
         "public_ips": int(scope_counts.get("public", 0)),
         "flow_count": flow_count,
         "cross_zone_flows": cross_zone_flows,
+        "cross_zone_ot_iot_flows": cross_zone_ot_iot_flows,
         "hunt_leads": len(hunt_leads),
         "capture_span_seconds": capture_span_seconds,
         "module_count": len(modules_run),
         "module_errors": module_error_count,
         "ot_family_count": len(detected_ot_labels),
+        "iot_family_count": len(detected_iot_labels),
         "protocol_anomalies": len(list(getattr(protocol_summary, "anomalies", []) or [])),
         "service_risks": len(list(getattr(services_summary, "risks", []) or [])),
     }
@@ -2456,7 +2750,7 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
             ip_activity=merged_ip_activity,
             notable_flows=merged_notable_flows,
             module_results=module_results,
-            ot_protocols=merged_ot_protocols,
+            ot_markers=sorted(_ot_marker_tokens([], merged_ot_protocols)),
             limit=14,
         )
 
@@ -2498,11 +2792,16 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
         "public_ips": int(scope_counts.get("public", 0)),
         "flow_count": flow_count,
         "cross_zone_flows": cross_zone_flows,
+        "cross_zone_ot_iot_flows": sum(
+            int(summary.summary_details.get("cross_zone_ot_iot_flows", 0) or 0)
+            for summary in summaries
+        ),
         "hunt_leads": len(merged_hunt_leads),
         "capture_span_seconds": capture_span_seconds,
         "module_count": len(modules_run),
         "module_errors": module_error_count,
         "ot_family_count": len(merged_ot_protocols),
+        "iot_family_count": len(_iot_labels_from_ot_labels(merged_ot_protocols)),
         "protocol_anomalies": sum(
             int(summary.summary_details.get("protocol_anomalies", 0) or 0)
             for summary in summaries

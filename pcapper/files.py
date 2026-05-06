@@ -333,6 +333,522 @@ ENIP_COMMANDS = {
     0x0070: "SendUnitData",
 }
 
+CIP_FILE_OBJECT_CLASS_ID = 0x37
+CIP_FILE_OBJECT_SERVICE_NAMES = {
+    0x4B: "FileObjectInitiateUpload",
+    0x4C: "FileObjectInitiateDownload",
+    0x4D: "FileObjectUploadTransfer",
+    0x4E: "FileObjectDownloadTransfer",
+    0x4F: "FileObjectClearFile",
+    0x50: "FileObjectGetInstanceAttributeList",
+}
+CIP_FILE_OBJECT_SERVICE_LABELS = set(CIP_FILE_OBJECT_SERVICE_NAMES.values())
+
+S7_PROGRAM_FUNCTIONS = {
+    0x1A: "RequestDownload",
+    0x1B: "DownloadBlock",
+    0x1C: "DownloadEnded",
+    0x1D: "StartUpload",
+    0x1E: "UploadBlock",
+    0x1F: "EndUpload",
+}
+
+S7_DOWNLOAD_FUNCTIONS = {"RequestDownload", "DownloadBlock", "DownloadEnded"}
+S7_UPLOAD_FUNCTIONS = {"StartUpload", "UploadBlock", "EndUpload"}
+
+OT_FIRMWARE_EXTENSIONS = {
+    ".fw",
+    ".hex",
+    ".s19",
+    ".mot",
+    ".rom",
+    ".img",
+    ".pkg",
+    ".upd",
+    ".upg",
+    ".bin",
+}
+
+OT_PLC_PROGRAM_EXTENSIONS = {
+    ".acd",
+    ".l5k",
+    ".l5x",
+    ".s7p",
+    ".ap14",
+    ".ap15",
+    ".ap16",
+    ".ap17",
+    ".zap",
+    ".awl",
+    ".scl",
+    ".stu",
+    ".xef",
+    ".zef",
+    ".xsy",
+    ".gxw",
+    ".gx3",
+    ".gxr",
+    ".cxp",
+    ".smc2",
+    ".mer",
+    ".prg",
+    ".prj",
+}
+
+OT_FIRMWARE_TOKENS = (
+    "firmware",
+    "fw_",
+    "fw-",
+    "bootloader",
+    "firmwareupdate",
+    "fwupdate",
+    "flash",
+)
+
+OT_FIRMWARE_UPDATE_CONTEXT_TOKENS = (
+    "plc",
+    "controller",
+    "rtu",
+    "hmi",
+    "iot",
+    "enip",
+    "cip",
+    "s7",
+    "profinet",
+    "modbus",
+    "dnp3",
+    "melsec",
+    "modicon",
+    "codesys",
+    "ot",
+)
+
+WEB_ASSET_EXTENSIONS = {
+    ".js",
+    ".mjs",
+    ".css",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".ico",
+    ".map",
+    ".json",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".otf",
+}
+
+WEB_ASSET_CONTENT_TOKENS = (
+    "image/",
+    "javascript",
+    "text/css",
+    "font/",
+    "text/html",
+    "application/json",
+)
+
+OT_PROGRAM_TOKENS = (
+    "programdownload",
+    "requestdownload",
+    "downloadblock",
+    "fileobjectinitiatedownload",
+    "fileobjectdownloadtransfer",
+    "program_command",
+    "program download",
+    "plc program",
+    "logic download",
+    "project download",
+    "step7",
+    "tia portal",
+    "studio5000",
+    "rslogix",
+    "unity pro",
+    "ecostruxure",
+    "melsec",
+    "gx works",
+    "cx-programmer",
+    "codesys",
+    "pc worx",
+)
+
+OT_UPLOAD_TOKENS = (
+    "upload",
+    "programupload",
+    "startupload",
+    "uploadblock",
+    "fileobjectinitiateupload",
+    "fileobjectuploadtransfer",
+    "stor",
+)
+
+OT_DOWNLOAD_TOKENS = (
+    "download",
+    "programdownload",
+    "requestdownload",
+    "downloadblock",
+    "fileobjectinitiatedownload",
+    "fileobjectdownloadtransfer",
+    "retr",
+)
+
+CIP_FILE_OBJECT_UPLOAD_TOKENS = (
+    "fileobjectinitiateupload",
+    "fileobjectuploadtransfer",
+)
+
+CIP_FILE_OBJECT_DOWNLOAD_TOKENS = (
+    "fileobjectinitiatedownload",
+    "fileobjectdownloadtransfer",
+)
+
+OT_VENDOR_PROGRAM_SIGNATURES: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "Siemens": {
+        "extensions": (".s7p", ".ap14", ".ap15", ".ap16", ".ap17", ".zap", ".awl", ".scl"),
+        "tokens": ("simatic", "step7", "tia portal"),
+    },
+    "Rockwell/Allen-Bradley": {
+        "extensions": (".acd", ".l5k", ".l5x", ".mer"),
+        "tokens": ("studio5000", "rslogix", "logix5000"),
+    },
+    "Schneider/Modicon": {
+        "extensions": (".stu", ".xef", ".zef", ".xsy"),
+        "tokens": ("unity pro", "ecostruxure", "modicon"),
+    },
+    "Mitsubishi MELSEC": {
+        "extensions": (".gxw", ".gx3", ".gxr"),
+        "tokens": ("melsec", "gx works", "gx developer"),
+    },
+    "Omron": {
+        "extensions": (".cxp", ".smc2"),
+        "tokens": ("cx-programmer", "omron"),
+    },
+    "CODESYS": {
+        "extensions": tuple(),
+        "tokens": ("codesys",),
+    },
+}
+
+
+def _scan_s7_program_transfers(
+    stream: bytes, max_events: int = 24
+) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    offset = 0
+
+    while offset + 7 <= len(stream) and len(events) < max_events:
+        idx = stream.find(b"\x03\x00", offset)
+        if idx == -1 or idx + 4 > len(stream):
+            break
+        total_len = int.from_bytes(stream[idx + 2 : idx + 4], "big")
+        if total_len < 7:
+            offset = idx + 2
+            continue
+        end = idx + total_len
+        if end > len(stream):
+            offset = idx + 2
+            continue
+
+        frame = stream[idx:end]
+        cotp_len = int(frame[4])
+        cotp_end = 5 + cotp_len
+        if cotp_len < 1 or cotp_end >= len(frame):
+            offset = end
+            continue
+        # COTP DT TPDU carries S7 payload in normal sessions.
+        if frame[5] != 0xF0:
+            offset = end
+            continue
+
+        payload = frame[cotp_end:]
+        if len(payload) < 11 or payload[0] != 0x32:
+            offset = end
+            continue
+
+        rosctr = int(payload[1])
+        if rosctr not in {0x01, 0x07}:
+            offset = end
+            continue
+
+        header_len = 10
+        param_len = int.from_bytes(payload[6:8], "big")
+        if header_len + 1 > len(payload):
+            offset = end
+            continue
+        param_end = min(len(payload), header_len + max(param_len, 0))
+        param = payload[header_len:param_end]
+        if not param:
+            offset = end
+            continue
+
+        func_code = int(param[0])
+        func_name = S7_PROGRAM_FUNCTIONS.get(func_code)
+        if func_name:
+            if func_name in S7_DOWNLOAD_FUNCTIONS:
+                direction = "download"
+            elif func_name in S7_UPLOAD_FUNCTIONS:
+                direction = "upload"
+            else:
+                direction = "transfer"
+            events.append(
+                {
+                    "function": func_name,
+                    "direction": direction,
+                    "size_bytes": len(frame),
+                    "payload": frame,
+                }
+            )
+
+        offset = end
+
+    return events
+
+
+def _artifact_text_blob(artifact: FileArtifact) -> str:
+    return " ".join(
+        [
+            str(getattr(artifact, "protocol", "") or ""),
+            str(getattr(artifact, "filename", "") or ""),
+            str(getattr(artifact, "note", "") or ""),
+            str(getattr(artifact, "content_type", "") or ""),
+        ]
+    ).lower()
+
+
+def _is_likely_web_asset_artifact(artifact: FileArtifact) -> bool:
+    ext = Path(str(getattr(artifact, "filename", "") or "")).suffix.lower()
+    if ext in WEB_ASSET_EXTENSIONS:
+        return True
+    content_type = str(getattr(artifact, "content_type", "") or "").lower()
+    if not content_type:
+        return False
+    return any(token in content_type for token in WEB_ASSET_CONTENT_TOKENS)
+
+
+def _is_ot_firmware_artifact(artifact: FileArtifact) -> bool:
+    blob = _artifact_text_blob(artifact)
+    protocol = str(getattr(artifact, "protocol", "") or "").upper()
+    ext = Path(str(getattr(artifact, "filename", "") or "")).suffix.lower()
+    has_firmware_token = any(token in blob for token in OT_FIRMWARE_TOKENS)
+    if not has_firmware_token and "update" in blob:
+        has_firmware_token = any(
+            token in blob for token in OT_FIRMWARE_UPDATE_CONTEXT_TOKENS
+        )
+
+    if protocol in {"HTTP", "HTTP2", "HTTPS/SSL"} and _is_likely_web_asset_artifact(
+        artifact
+    ):
+        return False
+
+    if ext in OT_FIRMWARE_EXTENSIONS:
+        # .bin is noisy; require explicit firmware naming context.
+        if ext == ".bin" and not has_firmware_token:
+            return False
+        return True
+
+    if has_firmware_token and protocol in {
+        "ENIP",
+        "S7",
+        "TFTP",
+        "FTP",
+        "HTTP",
+        "SMB",
+        "NFS",
+    }:
+        return True
+
+    return False
+
+
+def _is_plc_program_download_artifact(artifact: FileArtifact) -> bool:
+    blob = _artifact_text_blob(artifact)
+    ext = Path(str(getattr(artifact, "filename", "") or "")).suffix.lower()
+    if any(token in blob for token in OT_PROGRAM_TOKENS):
+        return True
+    if ext in OT_PLC_PROGRAM_EXTENSIONS and any(
+        token in blob for token in OT_DOWNLOAD_TOKENS
+    ):
+        return True
+    return False
+
+
+def _is_cip_file_object_artifact(artifact: FileArtifact) -> bool:
+    if str(getattr(artifact, "protocol", "") or "").upper() != "ENIP":
+        return False
+    blob = _artifact_text_blob(artifact)
+    return "fileobject" in blob
+
+
+def _classify_cip_file_object_direction(artifact: FileArtifact) -> str:
+    blob = _artifact_text_blob(artifact)
+    if any(token in blob for token in CIP_FILE_OBJECT_UPLOAD_TOKENS):
+        return "upload"
+    if any(token in blob for token in CIP_FILE_OBJECT_DOWNLOAD_TOKENS):
+        return "download"
+    if "fileobjectclearfile" in blob:
+        return "control"
+    return _classify_ot_transfer_direction(artifact)
+
+
+def _detect_vendor_plc_signature(artifact: FileArtifact) -> Optional[str]:
+    blob = _artifact_text_blob(artifact)
+    ext = Path(str(getattr(artifact, "filename", "") or "")).suffix.lower()
+    for vendor, signatures in OT_VENDOR_PROGRAM_SIGNATURES.items():
+        extensions = set(signatures.get("extensions", ()))
+        tokens = signatures.get("tokens", ())
+        if ext and ext in extensions:
+            return vendor
+        if any(token in blob for token in tokens):
+            return vendor
+    return None
+
+
+def _classify_ot_transfer_direction(artifact: FileArtifact) -> str:
+    blob = _artifact_text_blob(artifact)
+    if any(token in blob for token in OT_UPLOAD_TOKENS):
+        return "upload"
+    if any(token in blob for token in OT_DOWNLOAD_TOKENS):
+        return "download"
+    return "unknown"
+
+
+def _append_ot_transfer_detections(
+    artifacts: List[FileArtifact], detections: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    detections_out = list(detections)
+
+    firmware_download_hits: List[FileArtifact] = []
+    firmware_upload_hits: List[FileArtifact] = []
+    plc_program_download_hits: List[FileArtifact] = []
+    cip_file_download_hits: List[FileArtifact] = []
+    cip_file_upload_hits: List[FileArtifact] = []
+    cip_file_control_hits: List[FileArtifact] = []
+    vendor_signature_hits: Dict[str, List[FileArtifact]] = defaultdict(list)
+
+    for artifact in artifacts:
+        if _is_ot_firmware_artifact(artifact):
+            direction = _classify_ot_transfer_direction(artifact)
+            if direction == "upload":
+                firmware_upload_hits.append(artifact)
+            else:
+                firmware_download_hits.append(artifact)
+
+        if _is_plc_program_download_artifact(artifact):
+            plc_program_download_hits.append(artifact)
+
+        if _is_cip_file_object_artifact(artifact):
+            cip_direction = _classify_cip_file_object_direction(artifact)
+            if cip_direction == "upload":
+                cip_file_upload_hits.append(artifact)
+            elif cip_direction == "download":
+                cip_file_download_hits.append(artifact)
+            else:
+                cip_file_control_hits.append(artifact)
+
+        vendor = _detect_vendor_plc_signature(artifact)
+        if vendor:
+            vendor_signature_hits[vendor].append(artifact)
+
+    if firmware_download_hits or firmware_upload_hits:
+        firmware_hits = firmware_download_hits + firmware_upload_hits
+        src_counts = Counter(item.src_ip for item in firmware_hits if item.src_ip)
+        dst_counts = Counter(item.dst_ip for item in firmware_hits if item.dst_ip)
+        evidence = [
+            f"{item.protocol} {item.filename} {item.src_ip}->{item.dst_ip}"
+            for item in firmware_hits[:8]
+        ]
+        detections_out.append(
+            {
+                "severity": "warning",
+                "summary": "OT firmware transfer activity observed",
+                "details": (
+                    f"Firmware downloads={len(firmware_download_hits)} "
+                    f"uploads={len(firmware_upload_hits)}."
+                ),
+                "source": "Files",
+                "top_sources": src_counts.most_common(5),
+                "top_destinations": dst_counts.most_common(5),
+                "evidence": evidence,
+            }
+        )
+
+    if plc_program_download_hits:
+        src_counts = Counter(item.src_ip for item in plc_program_download_hits if item.src_ip)
+        dst_counts = Counter(item.dst_ip for item in plc_program_download_hits if item.dst_ip)
+        evidence = [
+            f"{item.protocol} {item.filename} {item.src_ip}->{item.dst_ip}"
+            for item in plc_program_download_hits[:8]
+        ]
+        detections_out.append(
+            {
+                "severity": "high",
+                "summary": "PLC program download activity observed",
+                "details": (
+                    f"Detected {len(plc_program_download_hits)} PLC program download artifact(s)."
+                ),
+                "source": "Files",
+                "top_sources": src_counts.most_common(5),
+                "top_destinations": dst_counts.most_common(5),
+                "evidence": evidence,
+            }
+        )
+
+    if cip_file_download_hits or cip_file_upload_hits or cip_file_control_hits:
+        cip_hits = cip_file_download_hits + cip_file_upload_hits + cip_file_control_hits
+        src_counts = Counter(item.src_ip for item in cip_hits if item.src_ip)
+        dst_counts = Counter(item.dst_ip for item in cip_hits if item.dst_ip)
+        evidence = [
+            f"{item.protocol} {item.filename} {item.src_ip}->{item.dst_ip}"
+            for item in cip_hits[:8]
+        ]
+        detections_out.append(
+            {
+                "severity": "warning",
+                "summary": "CIP File Object transfer activity observed",
+                "details": (
+                    f"Downloads={len(cip_file_download_hits)} "
+                    f"uploads={len(cip_file_upload_hits)} "
+                    f"control_ops={len(cip_file_control_hits)}."
+                ),
+                "source": "Files",
+                "top_sources": src_counts.most_common(5),
+                "top_destinations": dst_counts.most_common(5),
+                "evidence": evidence,
+            }
+        )
+
+    if vendor_signature_hits:
+        vendor_hits_sorted = sorted(
+            vendor_signature_hits.items(), key=lambda item: len(item[1]), reverse=True
+        )
+        all_hits: List[FileArtifact] = []
+        signature_breakdown: List[str] = []
+        for vendor, hits in vendor_hits_sorted:
+            signature_breakdown.append(f"{vendor}={len(hits)}")
+            all_hits.extend(hits)
+        src_counts = Counter(item.src_ip for item in all_hits if item.src_ip)
+        dst_counts = Counter(item.dst_ip for item in all_hits if item.dst_ip)
+        evidence = [
+            f"{item.protocol} {item.filename} {item.src_ip}->{item.dst_ip}"
+            for item in all_hits[:8]
+        ]
+        detections_out.append(
+            {
+                "severity": "warning",
+                "summary": "Vendor PLC program transfer signatures observed",
+                "details": "Signatures: " + ", ".join(signature_breakdown),
+                "source": "Files",
+                "top_sources": src_counts.most_common(5),
+                "top_destinations": dst_counts.most_common(5),
+                "evidence": evidence,
+            }
+        )
+
+    return detections_out
+
 
 def _flow_protocol(sport: Optional[int], dport: Optional[int]) -> str:
     ports = set(filter(None, [sport, dport]))
@@ -885,6 +1401,63 @@ def _parse_cip_data(payload: bytes) -> tuple[Optional[int], bool, bytes]:
         if data_offset <= len(payload):
             return service, False, payload[data_offset:]
     return service, False, b""
+
+
+def _parse_cip_request_class_id(payload: bytes) -> Optional[int]:
+    if len(payload) < 2:
+        return None
+    path_size_words = int(payload[1])
+    path_len = path_size_words * 2
+    path_start = 2
+    path_end = path_start + path_len
+    if path_len <= 0 or path_end > len(payload):
+        return None
+
+    path = payload[path_start:path_end]
+    idx = 0
+    while idx < len(path):
+        segment = path[idx]
+        if segment == 0x00:
+            idx += 1
+            continue
+        if (segment & 0xE0) != 0x20:
+            break
+
+        logical_type = segment & 0x1C
+        value_fmt = segment & 0x03
+        value_len = {0: 1, 1: 2, 2: 4}.get(value_fmt)
+        if value_len is None or (idx + 1 + value_len) > len(path):
+            break
+
+        value = int.from_bytes(path[idx + 1 : idx + 1 + value_len], "little")
+        if logical_type == 0x00:
+            return value
+
+        step = 1 + value_len
+        if step % 2:
+            step += 1
+        idx += step
+
+    return None
+
+
+def _resolve_cip_service_name(
+    service_code: int,
+    *,
+    class_id: Optional[int],
+    file_service_hint: bool,
+) -> str:
+    if class_id == CIP_FILE_OBJECT_CLASS_ID or file_service_hint:
+        return CIP_FILE_OBJECT_SERVICE_NAMES.get(
+            service_code, f"FileObjectService0x{service_code:02x}"
+        )
+    return CIP_SERVICE_NAMES.get(service_code, f"service_0x{service_code:02x}")
+
+
+def _is_cip_program_or_file_service(service_name: str) -> bool:
+    if service_name in CIP_FILE_OBJECT_SERVICE_LABELS:
+        return True
+    return service_name in {"ProgramDownload", "ProgramUpload", "ProgramCommand"}
 
 
 # --- Protocol Parsers ---
@@ -2606,10 +3179,12 @@ def _export_with_dpkt(
     enip_buffers: Dict[tuple[str, str, int, int, str, str], Dict[str, object]] = {}
     enip_payload_hashes: set[str] = set()
     enip_best: Dict[tuple[str, str, str, str], tuple[int, str]] = {}
-    enip_file_services = {0x73, 0x74, 0x75, 0x55, 0x4C, 0x4E, 0x4D, 0x4F}
+    cip_file_service_context: Dict[tuple[str, str, int, int, int], bool] = {}
+    enip_file_services = {0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x55, 0x73, 0x74, 0x75}
     max_enip_bytes = 50_000_000
     min_enip_bytes = 1024
     min_enip_named_bytes = 2048
+    s7_transfer_events: List[Dict[str, Any]] = []
 
     def _add_artifact(artifact: FileArtifact) -> None:
         artifacts.append(artifact)
@@ -2812,10 +3387,39 @@ def _export_with_dpkt(
                 if service is None:
                     continue
                 service_code = service & 0x7F
-                if service_code not in enip_file_services and len(cip_data) < 1024:
+                class_id = (
+                    _parse_cip_request_class_id(cip_payload) if is_request else None
+                )
+                context_key = (src, dst, sport, dport, service_code)
+                reverse_context_key = (dst, src, dport, sport, service_code)
+                if class_id == CIP_FILE_OBJECT_CLASS_ID:
+                    cip_file_service_context[context_key] = True
+                    cip_file_service_context[reverse_context_key] = True
+                file_service_hint = bool(
+                    cip_file_service_context.get(context_key)
+                    or cip_file_service_context.get(reverse_context_key)
+                )
+                is_file_object_service = (
+                    class_id == CIP_FILE_OBJECT_CLASS_ID or file_service_hint
+                )
+                if (
+                    service_code not in enip_file_services
+                    and not is_file_object_service
+                    and len(cip_data) < 1024
+                ):
                     continue
-                service_name = CIP_SERVICE_NAMES.get(
-                    service_code, f"service_0x{service_code:02x}"
+                service_name = _resolve_cip_service_name(
+                    service_code,
+                    class_id=class_id,
+                    file_service_hint=file_service_hint,
+                )
+                is_program_or_file_service = _is_cip_program_or_file_service(
+                    service_name
+                )
+                cip_buffer_data = (
+                    cip_data
+                    if cip_data
+                    else (cip_payload if is_program_or_file_service else b"")
                 )
                 direction = "request" if is_request else "response"
                 key = (src, dst, sport, dport, service_name, direction)
@@ -2829,11 +3433,49 @@ def _export_with_dpkt(
                         "dst": dst,
                         "sport": sport,
                         "dport": dport,
+                        "is_program_or_file_service": is_program_or_file_service,
                     }
                 buf = enip_buffers[key]["data"]
                 if isinstance(buf, bytearray) and len(buf) < max_enip_bytes:
                     remaining = max_enip_bytes - len(buf)
-                    buf.extend(cip_data[:remaining])
+                    buf.extend(cip_buffer_data[:remaining])
+
+        # S7 transfer command extraction for PLC program upload/download activity.
+        if 102 in (sport, dport):
+            s7_events = _scan_s7_program_transfers(stream)
+            for event_idx, event in enumerate(s7_events, start=1):
+                func_name = str(event.get("function", "S7Transfer"))
+                direction = str(event.get("direction", "transfer"))
+                size_bytes = int(event.get("size_bytes", 0) or 0)
+                s7_transfer_events.append(
+                    {
+                        "src": src,
+                        "dst": dst,
+                        "function": func_name,
+                        "direction": direction,
+                    }
+                )
+                _add_artifact(
+                    FileArtifact(
+                        protocol="S7",
+                        src_ip=src,
+                        dst_ip=dst,
+                        src_port=sport,
+                        dst_port=dport,
+                        filename=(
+                            f"s7_{func_name.lower()}_{direction}_{first_pkt}_{event_idx}.bin"
+                        ),
+                        size_bytes=size_bytes if size_bytes > 0 else None,
+                        packet_index=first_pkt,
+                        note=f"S7 PLC program {direction} command ({func_name})",
+                        file_type="BINARY",
+                        payload=(
+                            bytes(event.get("payload", b"")) if need_payload else None
+                        ),
+                        hostname=None,
+                        content_type=None,
+                    )
+                )
 
         # HTTP/2 (h2/h2c)
         if protocol == "HTTP2":
@@ -3264,10 +3906,37 @@ def _export_with_dpkt(
             if service is None:
                 continue
             service_code = service & 0x7F
-            if service_code not in enip_file_services and len(cip_data) < 1024:
+            class_id = _parse_cip_request_class_id(cip_payload) if is_request else None
+            context_key = (src, dst, sport, dport, service_code)
+            reverse_context_key = (dst, src, dport, sport, service_code)
+            if class_id == CIP_FILE_OBJECT_CLASS_ID:
+                cip_file_service_context[context_key] = True
+                cip_file_service_context[reverse_context_key] = True
+            file_service_hint = bool(
+                cip_file_service_context.get(context_key)
+                or cip_file_service_context.get(reverse_context_key)
+            )
+            is_file_object_service = (
+                class_id == CIP_FILE_OBJECT_CLASS_ID or file_service_hint
+            )
+            if (
+                service_code not in enip_file_services
+                and not is_file_object_service
+                and len(cip_data) < 1024
+            ):
                 continue
-            service_name = CIP_SERVICE_NAMES.get(
-                service_code, f"service_0x{service_code:02x}"
+            service_name = _resolve_cip_service_name(
+                service_code,
+                class_id=class_id,
+                file_service_hint=file_service_hint,
+            )
+            is_program_or_file_service = _is_cip_program_or_file_service(
+                service_name
+            )
+            cip_buffer_data = (
+                cip_data
+                if cip_data
+                else (cip_payload if is_program_or_file_service else b"")
             )
             direction = "request" if is_request else "response"
             key = (src, dst, sport, dport, service_name, direction)
@@ -3281,20 +3950,23 @@ def _export_with_dpkt(
                     "dst": dst,
                     "sport": sport,
                     "dport": dport,
+                    "is_program_or_file_service": is_program_or_file_service,
                 }
             buf = enip_buffers[key]["data"]
             if isinstance(buf, bytearray) and len(buf) < max_enip_bytes:
                 remaining = max_enip_bytes - len(buf)
-                buf.extend(cip_data[:remaining])
+                buf.extend(cip_buffer_data[:remaining])
 
     # ENIP/CIP buffered artifacts
     for key, meta in enip_buffers.items():
         data = meta.get("data")
         if not isinstance(data, bytearray):
             continue
-        if len(data) < min_enip_bytes:
-            continue
         service_name = str(meta.get("service", "cip_data"))
+        is_program_or_file_service = bool(meta.get("is_program_or_file_service", False))
+        min_service_bytes = 32 if is_program_or_file_service else min_enip_bytes
+        if len(data) < min_service_bytes:
+            continue
         direction = str(meta.get("direction", "payload"))
         first_pkt = int(meta.get("first_pkt", 0) or 0)
         src = str(meta.get("src", ""))
@@ -3313,7 +3985,7 @@ def _export_with_dpkt(
         )
         if not candidate_name:
             alt_names = re.findall(
-                r"[A-Za-z0-9_\-]{3,}\.(?:l5x|l5k|acd|bin|hex|fw|zip)",
+                r"[A-Za-z0-9_\-]{3,}\.(?:l5x|l5k|acd|s7p|ap1[4-9]|zap|awl|scl|stu|xef|zef|xsy|gxw|gx3|gxr|cxp|smc2|bin|hex|fw|zip)",
                 payload.decode("latin-1", errors="ignore"),
                 re.IGNORECASE,
             )
@@ -3327,10 +3999,11 @@ def _export_with_dpkt(
             if (
                 file_type in ("UNKNOWN", "BINARY")
                 and len(payload) < min_enip_named_bytes
+                and not is_program_or_file_service
             ):
                 continue
             short_hash = hashlib.sha256(payload).hexdigest()[:10]
-            if service_name in {"ProgramDownload", "ProgramUpload", "ProgramCommand"}:
+            if _is_cip_program_or_file_service(service_name):
                 fname = _normalize_filename(
                     f"enip_{service_name}_{src}_to_{dst}_{direction}_{short_hash}.bin"
                 )
@@ -3367,6 +4040,38 @@ def _export_with_dpkt(
                 hostname=None,
                 content_type=None,
             )
+        )
+
+    if s7_transfer_events:
+        src_counts = Counter(item.get("src", "") for item in s7_transfer_events)
+        dst_counts = Counter(item.get("dst", "") for item in s7_transfer_events)
+        program_downloads = [
+            item
+            for item in s7_transfer_events
+            if str(item.get("direction", "")).lower() == "download"
+        ]
+        program_uploads = [
+            item
+            for item in s7_transfer_events
+            if str(item.get("direction", "")).lower() == "upload"
+        ]
+        evidence = [
+            f"S7 {item.get('function', '-')} {item.get('src', '-')}->{item.get('dst', '-')}"
+            for item in s7_transfer_events[:8]
+        ]
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "S7 PLC program transfer commands observed",
+                "details": (
+                    f"Program downloads={len(program_downloads)} "
+                    f"uploads={len(program_uploads)}."
+                ),
+                "source": "Files",
+                "top_sources": src_counts.most_common(5),
+                "top_destinations": dst_counts.most_common(5),
+                "evidence": evidence,
+            }
         )
 
     if artifacts:
@@ -4170,6 +4875,7 @@ def analyze_files(
                     "tools": tool_counts.most_common(6),
                 }
             )
+        detections = _append_ot_transfer_detections(artifacts, detections)
         enriched = _build_files_enrichment(artifacts, detections)
         return FileTransferSummary(
             path=dpkt_summary.path,
@@ -4248,6 +4954,8 @@ def analyze_files(
                 "tools": tool_counts.most_common(6),
             }
         )
+
+    detections = _append_ot_transfer_detections(artifacts, detections)
 
     enriched = _build_files_enrichment(artifacts, detections)
 

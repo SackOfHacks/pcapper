@@ -491,6 +491,8 @@ def analyze_arp(
     if target_spread <= 0.0:
         target_spread = max(2.0, target_center * 0.25)
     sweep_threshold = max(16, int(math.ceil(target_center + (4.0 * target_spread))))
+    # Keep sweep threshold bounded so single-source scans remain detectable.
+    sweep_threshold = min(sweep_threshold, 128)
     unsolicited_threshold = max(10, int(summary.arp_packets * 0.05))
     gratuitous_threshold = max(10, int(summary.arp_replies * 0.15))
     arp_ratio = (

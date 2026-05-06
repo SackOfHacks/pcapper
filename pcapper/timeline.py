@@ -647,6 +647,28 @@ FTP_COMMANDS = {
 }
 FTP_RESPONSE_RE = re.compile(r"^(\d{3})(?:[ -].*)?$")
 
+TLS_HANDSHAKE_PORTS = {
+    443,
+    465,
+    563,
+    636,
+    853,
+    989,
+    990,
+    992,
+    993,
+    995,
+    8443,
+    9443,
+    5986,
+}
+
+REMOTE_ADMIN_PORT_SUMMARY: dict[int, str] = {
+    22: "SSH connection",
+    3389: "RDP connection",
+    5900: "VNC connection",
+}
+
 
 def _decode_payload_line(payload: bytes | None) -> str:
     if not payload:
@@ -656,6 +678,26 @@ def _decode_payload_line(payload: bytes | None) -> str:
         return ""
     first = text.split("\r\n", 1)[0].split("\n", 1)[0].strip()
     return first[:200]
+
+
+def _tls_handshake_label(payload: bytes | None) -> str | None:
+    if not payload or len(payload) < 6:
+        return None
+    # TLS over TCP starts with record type 0x16 (handshake) and version 0x03xx.
+    if payload[0] != 0x16:
+        return None
+    if payload[1] != 0x03:
+        return None
+    record_len = int.from_bytes(payload[3:5], "big", signed=False)
+    if record_len <= 0:
+        return None
+    hs_type = payload[5]
+    return {
+        0x01: "TLS ClientHello",
+        0x02: "TLS ServerHello",
+        0x0B: "TLS Certificate",
+        0x10: "TLS ClientKeyExchange",
+    }.get(hs_type)
 
 
 def _extract_email_action(service: str, first_line: str) -> str | None:
@@ -1038,6 +1080,53 @@ def _s7comm_seen(payload: bytes | None) -> bool:
     if len(payload) >= 4 and payload[:2] == b"\x03\x00":
         return b"\x32" in payload
     return False
+
+
+def _ts_bucket_ms(ts: float | None) -> int | None:
+    if ts is None:
+        return None
+    try:
+        return int(round(float(ts) * 1000.0))
+    except Exception:
+        return None
+
+
+def _s7_command_canonical(command: str) -> str:
+    text = str(command or "").strip()
+    if not text:
+        return ""
+    if "(" in text:
+        return text.split("(", 1)[0].strip()
+    return text
+
+
+def _is_interesting_s7_command(command: str) -> bool:
+    canonical = _s7_command_canonical(command)
+    if not canonical:
+        return False
+    if canonical in {"TPKT", "COTP:DT", "UserData"}:
+        return False
+    if canonical.startswith("COTP:"):
+        return canonical.startswith(("COTP:CR", "COTP:CC", "COTP:DR", "COTP:DC"))
+    return True
+
+
+def _format_s7_timeline_command(command: str) -> tuple[str, str | None]:
+    text = str(command or "").strip()
+    if not text:
+        return "S7 command", None
+
+    if text.startswith("COTP:"):
+        parts = text.split(":", 2)
+        pdu = parts[1] if len(parts) >= 2 else "?"
+        detail = parts[2] if len(parts) >= 3 else None
+        return f"S7 COTP {pdu}", detail
+
+    if "(" in text and text.endswith(")"):
+        base, rest = text[:-1].split("(", 1)
+        return f"S7 {base.strip()}", rest.strip()
+
+    return f"S7 {text}", None
 
 
 def _extract_ip_candidates(text: str) -> set[str]:
@@ -1461,6 +1550,9 @@ def analyze_timeline(
     seen_event_keys: set[tuple] = set()
     seen_tcp_syns: set[tuple[str, str, int, int, int]] = set()
     seen_tcp_synacks: set[tuple[str, str, int, int, int, int]] = set()
+    seen_remote_admin_flows: set[tuple[str, int, str, str]] = set()
+    seen_smb_flows: set[tuple[str, int, str]] = set()
+    seen_tls_handshakes: set[tuple[str, int, str, str]] = set()
 
     def _new_handshake(
         syn_ts: Optional[float] = None, synack_ts: Optional[float] = None
@@ -1524,7 +1616,7 @@ def analyze_timeline(
             return
         seen_event_keys.add(dedupe_key)
         event_packet = packet_index
-        if event_packet is None and idx > 0:
+        if event_packet is None and source == "timeline" and idx > 0:
             event_packet = idx
         events.append(
             TimelineEvent(
@@ -1899,24 +1991,9 @@ def analyze_timeline(
                                             )
                                             cmd_event_added = True
                                 elif proto == "S7" and port_key == S7_PORT:
-                                    if _s7comm_seen(payload):
-                                        label = "S7comm packet"
-                                        key = (
-                                            proto,
-                                            direction,
-                                            peer_ip,
-                                            port_key,
-                                            label,
-                                        )
-                                        if key not in seen_ot_commands:
-                                            seen_ot_commands.add(key)
-                                            _emit_event(
-                                                ts=ts,
-                                                category="S7",
-                                                summary=label,
-                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            )
-                                            cmd_event_added = True
+                                    # S7 command and COTP detail extraction is handled
+                                    # below via analyze_s7(); keep only flow context here.
+                                    pass
 
                                 if not cmd_event_added:
                                     flow_key = (proto, direction, peer_ip, port_key)
@@ -1937,6 +2014,38 @@ def analyze_timeline(
                                 ts=ts,
                                 category="Telnet",
                                 summary="Telnet connection",
+                                details=f"{target_ip} -> {dst_ip}:{dport}",
+                            )
+                    if dport in REMOTE_ADMIN_PORT_SUMMARY:
+                        service = REMOTE_ADMIN_PORT_SUMMARY[dport]
+                        key = (dst_ip, dport, "outbound", service)
+                        if key not in seen_remote_admin_flows:
+                            seen_remote_admin_flows.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="Connection",
+                                summary=service,
+                                details=f"{target_ip} -> {dst_ip}:{dport}",
+                            )
+                    if dport in {139, 445}:
+                        key = (dst_ip, dport, "outbound")
+                        if key not in seen_smb_flows:
+                            seen_smb_flows.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="SMB",
+                                summary="SMB connection",
+                                details=f"{target_ip} -> {dst_ip}:{dport}",
+                            )
+                    tls_label = _tls_handshake_label(payload)
+                    if tls_label and dport in TLS_HANDSHAKE_PORTS:
+                        key = (dst_ip, dport, "outbound", tls_label)
+                        if key not in seen_tls_handshakes:
+                            seen_tls_handshakes.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="Connection",
+                                summary=tls_label,
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
                             )
                     if dport in {139, 445}:
@@ -2154,6 +2263,38 @@ def analyze_timeline(
                                 ts=ts,
                                 category="Telnet",
                                 summary="Telnet connection",
+                                details=f"{src_ip} -> {target_ip}:{sport}",
+                            )
+                    if sport in REMOTE_ADMIN_PORT_SUMMARY:
+                        service = REMOTE_ADMIN_PORT_SUMMARY[sport]
+                        key = (src_ip, sport, "inbound", service)
+                        if key not in seen_remote_admin_flows:
+                            seen_remote_admin_flows.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="Connection",
+                                summary=service,
+                                details=f"{src_ip} -> {target_ip}:{sport}",
+                            )
+                    if sport in {139, 445}:
+                        key = (src_ip, sport, "inbound")
+                        if key not in seen_smb_flows:
+                            seen_smb_flows.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="SMB",
+                                summary="SMB connection",
+                                details=f"{src_ip} -> {target_ip}:{sport}",
+                            )
+                    tls_label = _tls_handshake_label(payload)
+                    if tls_label and sport in TLS_HANDSHAKE_PORTS:
+                        key = (src_ip, sport, "inbound", tls_label)
+                        if key not in seen_tls_handshakes:
+                            seen_tls_handshakes.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="Connection",
+                                summary=tls_label,
                                 details=f"{src_ip} -> {target_ip}:{sport}",
                             )
                     if is_syn_only and dport:
@@ -2729,24 +2870,33 @@ def analyze_timeline(
                 source="s7",
             )
         if s7_summary.command_events:
-            seen_cmds: set[tuple[str, str, str, int]] = set()
+            seen_cmds: set[tuple[str, str, str, int | None]] = set()
             for cmd_event in s7_summary.command_events:
                 if cmd_event.src != target_ip and cmd_event.dst != target_ip:
                     continue
+                cmd_text = str(cmd_event.command or "").strip()
+                if not _is_interesting_s7_command(cmd_text):
+                    continue
+                ts_bucket = _ts_bucket_ms(cmd_event.ts)
                 key = (
                     cmd_event.src,
                     cmd_event.dst,
-                    cmd_event.command,
-                    int(cmd_event.ts or 0),
+                    cmd_text,
+                    ts_bucket,
                 )
                 if key in seen_cmds:
                     continue
                 seen_cmds.add(key)
+                summary_text, cmd_meta = _format_s7_timeline_command(cmd_text)
+                details = f"{cmd_event.src} -> {cmd_event.dst}"
+                if cmd_meta:
+                    details = f"{details} {cmd_meta}"
                 _emit_event(
                     ts=cmd_event.ts,
                     category="S7",
-                    summary=f"S7 {cmd_event.command}",
-                    details=f"{cmd_event.src} -> {cmd_event.dst}",
+                    summary=summary_text,
+                    details=details,
+                    dedupe_key=("s7-cmd",) + key,
                     source="s7",
                 )
 
