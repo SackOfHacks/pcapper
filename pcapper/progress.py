@@ -84,7 +84,8 @@ class BusyStatusBar:
             sys.stdout.flush()
             self._stop_event.wait(self.interval)
         elapsed = time.monotonic() - self._start_time
-        sys.stdout.write(f"\r{self.label} done {elapsed:5.1f}s\n")
+        clear_width = len(f"{self.label} done {elapsed:5.1f}s")
+        sys.stdout.write("\r" + (" " * clear_width) + "\r")
         sys.stdout.flush()
 
     def finish(self) -> None:

@@ -180,21 +180,14 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
-## Current Release: v1.7.5
+## Current Release: v1.8.0
 
 Latest additions in this release:
-- `--scan` now detects host-discovery sweeps (`nmap -sn` style ICMP/ARP probing) in addition to TCP SYN scan behavior.
-- Mixed scan activity is now split into separate scanner entries (`horizontal` and `vertical`) instead of being combined into one row.
-- Scan summary merge behavior now preserves per-scan-type rows for the same scanner across summarized inputs.
-- New MAC/IP pivot workflows: `--ip` and `--mac` with clean unique pair summaries, counts, hostname/manufacturer context, and simple filter support.
-- Function-specific help flow: global help via `pcapper -h` plus scoped help like `pcapper --streams -h`.
-- `--streams` follow behavior simplified to `--streams -id <stream-id>` (deprecated follow flags removed).
-- `--files -exe` now reliably surfaces executable/active-content downloads and shows full output regardless of `-v`.
-- Improved HTTP file correlation for extensionless malware-style URI tokens (long random path artifacts are now retained).
-- `--webrequests` now includes packet numbers in one-line and detailed output and provides richer details for filtered views (`-post`, `-ip`, `-search`).
-- `--ips` default host view is streamlined to actionable host details and confirmed listening-service ports.
-- `--tls` default output now includes certificate summaries (subject/issuer/signer/expiry/common issues) and richer medium/high/critical finding detail.
-- Filter independence hardened across `--hostdetails`, `--hostnames`, `--http`, `--tls`, and `--files` for `-ip`, `-name`, `-port`, and `-search`.
+- Expanded OT transfer detection in `--files` with CIP File Object services and vendor-specific PLC transfer signatures.
+- `--files` OT/ICS artifacts now retain payload data so `-extract`, `-view`, and `-raw` work consistently for supported industrial transfers.
+- Reduced false-positive OT firmware transfer detections by excluding generic HTTP web assets from OT firmware heuristics.
+- CLI help menus and README flag inventories were synchronized with live parser output.
+- Release hygiene now git-ignores sensitive generated forensic output directories (`carved/`, `decrypted/`, `case/`, `case-*/`).
 
 ## OT/ICS Command Center
 
@@ -513,11 +506,10 @@ python -m pcapper --help
 - `--correlate`
 - `--correlate-min N`
 - `--csv PATH`
+- `--decode INPUT`
 - `--decrypt`
 - `--decrypt-limit N`
 - `--decrypt-out DIR`
-- `-extract FILENAME`
-- `-id STREAM_ID`
 - `--ioc-file PATH`
 - `--json PATH`
 - `--list-plugins`
@@ -539,16 +531,31 @@ python -m pcapper --help
 - `--timeline-bins N`
 - `--timeline-storyline-off`
 - `--tls-keylog PATH`
-- `-categories, --timeline-categories LIST`
+- `-aes KEY`
 - `-case`
+- `-categories, --timeline-categories LIST`
+- `-established`
+- `-exe`
+- `-extract FILENAME`
+- `-hash FILENAME`
+- `-high`
+- `-host`
+- `-id STREAM_ID`
 - `-ip TIMELINE_IP`
-- `-l, --limit-protocols`
+- `-l, --limit-protocols N`
+- `-mac LOOKUP_MAC`
+- `-name HOSTNAME`
+- `-port STREAM_PORT`
+- `-post`
 - `-r, --recursive`
-- `-raw`
+- `-raw` (shows `-view`/`--packet` output as raw text, no ASCII/HEX framing)
+- `-rsa KEY_OR_@PATH`
+- `-search TERM`
 - `-summarize, --summarize`
 - `-v, --verbose`
-- `-vt, --vt`
 - `-view FILENAME`
+- `-vt, --vt`
+- `-xor KEY`
 
 ### IT/Enterprise functions (alphabetical)
 
@@ -556,8 +563,8 @@ python -m pcapper --help
 - `--arp`
 - `--beacon`
 - `--certificates`
-- `--creds`
 - `--compromised`
+- `--creds`
 - `--ctf`
 - `--dhcp`
 - `--dns`
@@ -574,9 +581,12 @@ python -m pcapper --help
 - `--http2`
 - `--icmp`
 - `--ioc`
+- `--ip`
 - `--ips`
 - `--kerberos`
 - `--ldap`
+- `--mac`
+- `--malware`
 - `--mitre`
 - `--netbios`
 - `--nfs`
@@ -588,20 +598,29 @@ python -m pcapper --help
 - `--pcapmeta`
 - `--powershell`
 - `--protocols`
+- `--qos`
 - `--quic`
 - `--rdp`
-- `--rpc`
 - `--routing`
+- `--rpc`
+- `--scan`
 - `--secrets`
 - `--services`
 - `--sizes`
 - `--smb`
 - `--smtp`
 - `--snmp`
+- `--ssdp`
 - `--ssh`
 - `--streams`
 - `--strings`
 - `--suricata`
+- `--suricata-config`
+- `--suricata-eve-types`
+- `--suricata-only-sid`
+- `--suricata-rules`
+- `--suricata-strict`
+- `--suricata-suppress-sid`
 - `--syslog`
 - `--tcp`
 - `--teamviewer`
@@ -609,14 +628,17 @@ python -m pcapper --help
 - `--threats`
 - `--timeline`
 - `--tls`
+- `--tlsm`
 - `--udp`
 - `--vlan`
 - `--vnc`
 - `--vpn`
+- `--webrequests`
 - `--winrm`
+- `--wlan`
 - `--wmic`
 
-Count: 63 flags
+Count: 78 flags
 
 ### OT/ICS/Industrial functions (alphabetical)
 

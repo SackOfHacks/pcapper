@@ -64,6 +64,7 @@ from .pccc import analyze_pccc
 from .pcworx import analyze_pcworx
 from .powershell import analyze_powershell
 from .prconos import analyze_prconos
+from .progress import run_with_busy_status
 from .profinet import analyze_profinet
 from .ptp import analyze_ptp
 from .quic import analyze_quic
@@ -1938,6 +1939,15 @@ _LOW_CONFIDENCE_SUMMARY_TOKENS = (
 )
 
 
+_RECON_SUMMARY_TOKENS = (
+    "sweep",
+    "scan",
+    "recon",
+    "enumeration",
+    "probing",
+)
+
+
 def _dedupe_ranked_pairs(values: object, *, limit: int = 10) -> list[tuple[str, int]]:
     if not isinstance(values, list):
         return []
@@ -2021,6 +2031,11 @@ def _detection_signal_score(item: dict[str, object]) -> int:
         and _parse_detail_count(details) < 5
     ):
         score -= 1
+
+    # Keep volumetric recon signals (scan/sweep patterns) from being over-pruned.
+    if any(token in lowered_summary for token in _RECON_SUMMARY_TOKENS):
+        if _parse_detail_count(details) >= 10 or max_peer_count >= 5:
+            score += 1
 
     return score
 
@@ -2116,6 +2131,13 @@ def _curate_threat_detections(
             or bool(item.get("top_clients"))
             or bool(item.get("top_servers"))
         )
+        recon_signal = any(
+            token in lowered_summary for token in _RECON_SUMMARY_TOKENS
+        ) and (
+            _parse_detail_count(details) >= 10
+            or bool(item.get("top_destinations"))
+            or bool(item.get("top_sources"))
+        )
         high_value = any(
             token in lowered_summary for token in _HIGH_VALUE_SUMMARY_TOKENS
         )
@@ -2126,6 +2148,8 @@ def _curate_threat_detections(
             continue
         if severity == "warning":
             min_signal = 3 if high_value else 4
+            if recon_signal:
+                min_signal = min(min_signal, 3)
             if noisy_summary:
                 min_signal += 1
             if not has_context:
@@ -2243,6 +2267,17 @@ def _file_detection_evidence(
 def analyze_threats(
     path: Path, show_status: bool = True, vt_lookup: bool = False
 ) -> ThreatSummary:
+    if show_status:
+        return run_with_busy_status(
+            path,
+            True,
+            "Threats",
+            analyze_threats,
+            path,
+            show_status=False,
+            vt_lookup=vt_lookup,
+        )
+
     errors: list[str] = []
     detections: list[dict[str, object]] = []
     public_ot_pairs: set[tuple[str, str, str]] = set()

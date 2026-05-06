@@ -6,6 +6,23 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 1.8.0 — 2026-05-06
+### Added
+- Expanded `--files` OT transfer coverage with CIP File Object program/file operations and vendor-specific PLC transfer signatures.
+
+### Changed
+- `--files` artifact handling now preserves OT/ICS transfer payloads so `-extract`, `-view`, and `-raw` work consistently on supported industrial transfers.
+- CLI grouped help text and README flag inventories were synchronized with live parser output.
+- Release metadata/docs alignment updated for `v1.8.0`.
+- Sensitive generated forensic output directories are now git-ignored by default (`carved/`, `decrypted/`, `case/`, `case-*/`).
+
+### Fixed
+- Reduced false-positive OT firmware transfer detections by excluding generic HTTP web assets from OT firmware heuristics.
+
+## 1.7.6 — 2026-05-06
+### Changed
+- Release metadata/docs alignment updated for `v1.7.6`.
+
 ## 1.7.5 — 2026-05-04
 ### Changed
 - Release metadata/docs alignment updated for `v1.7.5`.

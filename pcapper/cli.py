@@ -997,7 +997,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     general.add_argument(
         "-extract",
         metavar="FILENAME",
-        help="Extract a discovered file by name into ./files (use with --files).",
+        help="Extract a discovered file artifact by name into ./files (use with --files; supports IT and OT/ICS transfers).",
     )
     general.add_argument(
         "-ip",
@@ -1152,7 +1152,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     general.add_argument(
         "-view",
         metavar="FILENAME",
-        help="View extracted file content in ASCII/HEX (use with --files).",
+        help="View discovered file artifact content in ASCII/HEX (use with --files; supports IT and OT/ICS transfers).",
     )
     general.add_argument(
         "-hash",
@@ -1164,7 +1164,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         "-raw",
         dest="view_raw",
         action="store_true",
-        help="Show -view output as raw text (no ASCII/HEX).",
+        help="Show -view/--packet output as raw text (no ASCII/HEX framing).",
     )
     general.add_argument(
         "--bpf",
@@ -1378,7 +1378,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--exfil", "Include exfiltration heuristics and anomaly analysis."),
         (
             "--files",
-            "Include file transfer discovery in the output (supports filters: -ip, -name, -port, -search, -exe).",
+            "Include file transfer discovery in the output (supports filters: -ip, -name, -port, -search, -exe and actions: -extract, -view, -hash, -raw).",
         ),
         ("--ftp", "Include FTP analysis (credentials, transfers, threats, anomalies)."),
         (
@@ -2079,7 +2079,11 @@ def _analyze_paths(
         if summary:
             print(summary)
         if raw:
-            print(hexdump(raw))
+            if view_raw:
+                text = raw.decode("latin-1", errors="ignore")
+                print(text if text else "<no printable text>")
+            else:
+                print(hexdump(raw))
         else:
             print("<packet bytes unavailable>")
         print("=" * 72)

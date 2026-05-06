@@ -11929,6 +11929,7 @@ def render_beacon_summary(
 
 
 def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str:
+    verbose = True
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"THREATS OVERVIEW :: {summary.path.name}"))
@@ -12072,16 +12073,28 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
         )
         detail_count = 0
         details = str(item.get("details", "")).strip()
+        summary_text = str(item.get("summary", "")).strip().lower()
         for token in re.findall(r"\b(\d{1,6})\b", details):
             try:
                 detail_count = max(detail_count, int(token))
             except Exception:
                 continue
+        recon_signal = any(
+            token in f"{summary_text} {details.lower()}"
+            for token in ("sweep", "scan", "recon", "enumeration", "probing")
+        )
+        recon_bonus = 0
+        if recon_signal:
+            if detail_count >= 20:
+                recon_bonus = 8
+            elif detail_count >= 10:
+                recon_bonus = 4
         return (
             base
             + min(12, evidence_count * 3)
             + min(12, peer_signal)
             + (2 if detail_count >= 10 else 0)
+            + recon_bonus
         )
 
     def _is_noisy_low_signal(item: dict[str, object], strength: int) -> bool:
@@ -12095,6 +12108,17 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
         source_text = str(item.get("source", "")).strip().lower()
         details_text = str(item.get("details", "")).strip().lower()
         blob = f"{source_text} {summary_text} {details_text}"
+        detail_count = 0
+        for token in re.findall(r"\b(\d{1,6})\b", details_text):
+            try:
+                detail_count = max(detail_count, int(token))
+            except Exception:
+                continue
+        recon_signal = any(
+            token in blob
+            for token in ("sweep", "scan", "recon", "enumeration", "probing")
+        )
+        strong_recon_signal = recon_signal and detail_count >= 20
         noisy_tokens = (
             "telemetry",
             "activity observed",
@@ -12123,8 +12147,10 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
                 break
 
         min_strength = 26
-        if any(token in blob for token in noisy_tokens):
+        if any(token in blob for token in noisy_tokens) and not strong_recon_signal:
             min_strength = 31
+        if strong_recon_signal:
+            min_strength = min(min_strength, 24)
         if not has_context:
             min_strength += 4
         return strength < min_strength
@@ -12482,12 +12508,6 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
     if not filtered:
         lines.append(SUBSECTION_BAR)
         lines.append(ok("No notable high-confidence threats after noise suppression."))
-        if len(suppressed):
-            lines.append(
-                muted(
-                    "Use `-v` to inspect suppressed low-confidence detections for context."
-                )
-            )
         lines.append(SECTION_BAR)
         return _finalize_output(lines, show_truncation_note=False)
 
@@ -12711,13 +12731,6 @@ def render_threats_summary(summary: ThreatSummary, verbose: bool = False) -> str
                 ]
             )
         lines.append(_format_table(rows))
-
-    if not verbose:
-        lines.append(
-            muted(
-                "Use `-v` for full threat inventory, low-signal context, actor context, OT storyline, and Suricata diagnostics."
-            )
-        )
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
@@ -13283,6 +13296,99 @@ def render_files_summary(
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Discovered Files"))
+
+        def _collapse_files_artifacts_for_display() -> list[tuple[Any, int, int]]:
+            if summary.path.name != "ALL_PCAPS":
+                return [
+                    (
+                        item,
+                        1,
+                        int(getattr(item, "packet_index", 0) or 0),
+                    )
+                    for item in summary.artifacts
+                ]
+
+            buckets: dict[
+                tuple[
+                    str,
+                    str,
+                    str,
+                    str,
+                    str,
+                    str,
+                    str,
+                    str,
+                    int | None,
+                    int | None,
+                ],
+                dict[str, Any],
+            ] = {}
+            order: list[
+                tuple[
+                    str,
+                    str,
+                    str,
+                    str,
+                    str,
+                    str,
+                    str,
+                    str,
+                    int | None,
+                    int | None,
+                ]
+            ] = []
+
+            for item in summary.artifacts:
+                key = (
+                    str(getattr(item, "protocol", "") or ""),
+                    str(getattr(item, "filename", "") or ""),
+                    str(getattr(item, "file_type", "") or ""),
+                    str(getattr(item, "src_ip", "") or ""),
+                    str(getattr(item, "dst_ip", "") or ""),
+                    str(getattr(item, "hostname", "") or ""),
+                    str(getattr(item, "content_type", "") or ""),
+                    str(getattr(item, "note", "") or ""),
+                    getattr(item, "src_port", None),
+                    getattr(item, "dst_port", None),
+                )
+                packet_idx = int(getattr(item, "packet_index", 0) or 0)
+                if key not in buckets:
+                    buckets[key] = {
+                        "item": item,
+                        "count": 1,
+                        "packet_index": packet_idx,
+                    }
+                    order.append(key)
+                    continue
+
+                bucket = buckets[key]
+                bucket["count"] = int(bucket.get("count", 1)) + 1
+                current_packet = int(bucket.get("packet_index", 0) or 0)
+                if current_packet <= 0 or (
+                    packet_idx > 0 and packet_idx < current_packet
+                ):
+                    bucket["packet_index"] = packet_idx
+
+            return [
+                (
+                    buckets[key]["item"],
+                    int(buckets[key]["count"]),
+                    int(buckets[key]["packet_index"]),
+                )
+                for key in order
+            ]
+
+        display_artifacts = _collapse_files_artifacts_for_display()
+        if summary.path.name == "ALL_PCAPS" and len(display_artifacts) < len(
+            summary.artifacts
+        ):
+            collapsed = len(summary.artifacts) - len(display_artifacts)
+            lines.append(
+                muted(
+                    f"Summarized view collapsed {collapsed} duplicate artifact row(s); occurrence counts are shown as [xN] in Note."
+                )
+            )
+
         # Define executable types and extension mappings
         executable_types = {"EXE/DLL", "ELF"}
         type_extensions = {
@@ -13325,7 +13431,8 @@ def render_files_summary(
                 "Note",
             ]
         ]
-        for item in summary.artifacts[:effective_limit]:
+        artifact_limit = limit if limit is not None else max(len(display_artifacts), 0)
+        for item, seen_count, display_packet in display_artifacts[:artifact_limit]:
             size = (
                 format_bytes_as_mb(item.size_bytes)
                 if item.size_bytes is not None
@@ -13362,18 +13469,22 @@ def render_files_summary(
                 ):
                     colored_filename = danger(item.filename)
 
+            note_text = item.note or "-"
+            if seen_count > 1:
+                note_text = f"{note_text} [x{seen_count}]"
+
             rows.append(
                 [
                     item.protocol,
                     colored_filename,
                     colored_ftype,
                     size,
-                    str(item.packet_index),
+                    str(display_packet),
                     item.src_ip,
                     item.dst_ip,
                     hostname,
                     getattr(item, "content_type", "-"),
-                    item.note or "-",
+                    note_text,
                 ]
             )
         lines.append(_format_table(rows))
@@ -13507,15 +13618,32 @@ def render_files_summary(
             severity = item.get("severity", "info")
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
+            top_sources = list(item.get("top_sources") or [])
+            top_destinations = list(item.get("top_destinations") or [])
+            evidence = [str(v) for v in list(item.get("evidence") or []) if str(v).strip()]
             if severity == "warning":
                 marker = warn("[WARN]")
             elif severity == "critical":
                 marker = danger("[CRIT]")
+            elif severity == "high":
+                marker = danger("[HIGH]")
             else:
                 marker = ok("[INFO]")
             lines.append(f"{marker} {summary_text}")
             if details:
                 lines.append(muted(f"  {details}"))
+            if top_sources:
+                src_text = ", ".join(f"{ip}({count})" for ip, count in top_sources[:5])
+                lines.append(muted(f"  Top Sources: {src_text}"))
+            if top_destinations:
+                dst_text = ", ".join(
+                    f"{ip}({count})" for ip, count in top_destinations[:5]
+                )
+                lines.append(muted(f"  Top Destinations: {dst_text}"))
+            if evidence:
+                lines.append(muted("  Evidence:"))
+                for ev in evidence[: _limit_value(5)]:
+                    lines.append(muted(f"    - {_redact_in_text(ev)}"))
 
     if getattr(summary, "benign_context", None):
         notes = [str(v) for v in (summary.benign_context or []) if str(v).strip()]
@@ -18921,6 +19049,17 @@ def render_timeline_summary(
                 "setpoint",
                 "program",
                 "firmware",
+                "writevar",
+                "vartabwrite",
+                "plcstop",
+                "plchotstart",
+                "plccoldstart",
+                "requestdownload",
+                "downloadblock",
+                "startupload",
+                "uploadblock",
+                "cpupassword",
+                "setclock",
             )
         ):
             if item.category in {
@@ -19187,7 +19326,15 @@ def render_timeline_summary(
             tags.append("Discovery")
         if any(
             token in text
-            for token in ("auth", "login", "credential", "ntlm", "kerberos", "password")
+            for token in (
+                "auth",
+                "login",
+                "credential",
+                "ntlm",
+                "kerberos",
+                "password",
+                "cpupassword",
+            )
         ):
             tags.append("Credential")
         if any(
@@ -19230,12 +19377,22 @@ def render_timeline_summary(
             token in text
             for token in (
                 "write",
+                "writevar",
+                "vartabwrite",
                 "setpoint",
                 "operate",
                 "trip",
                 "shutdown",
                 "stop",
                 "start",
+                "plcstop",
+                "plchotstart",
+                "plccoldstart",
+                "requestdownload",
+                "downloadblock",
+                "startupload",
+                "uploadblock",
+                "setclock",
             )
         ) and item.category in {
             "Modbus",
@@ -19372,6 +19529,87 @@ def render_timeline_summary(
                 line = f"{line} {meta_text}"
             lines.append(muted(line))
 
+    def _is_high_value_ot_action(item: TimelineEvent) -> bool:
+        if item.category not in {
+            "Modbus",
+            "DNP3",
+            "IEC-104",
+            "S7",
+            "CIP",
+            "ENIP",
+            "BACnet",
+            "OPC UA",
+            "PROFINET",
+            "Triconex/SIS",
+        }:
+            return False
+        text = f"{item.summary} {item.details}".lower()
+        if any(
+            token in text
+            for token in (
+                "write",
+                "writevar",
+                "vartabwrite",
+                "setpoint",
+                "operate",
+                "trip",
+                "shutdown",
+                "plcstop",
+                "plchotstart",
+                "plccoldstart",
+                "requestdownload",
+                "downloadblock",
+                "startupload",
+                "uploadblock",
+                "cpupassword",
+                "setclock",
+                "security",
+                "error response",
+                "failed",
+                "disconnect request",
+            )
+        ):
+            return True
+        if "anomaly" in text:
+            return True
+        return False
+
+    high_value_events: list[TimelineEvent] = []
+    high_seen: set[tuple[object, ...]] = set()
+    for event in summary.events:
+        if not _is_high_value_ot_action(event):
+            continue
+        key = (
+            event.category,
+            event.summary,
+            event.details,
+            int(float(event.ts) * 1000.0) if event.ts is not None else None,
+        )
+        if key in high_seen:
+            continue
+        high_seen.add(key)
+        high_value_events.append(event)
+        if len(high_value_events) >= _limit_value(18 if verbose else 12):
+            break
+
+    if high_value_events:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("High-Value OT Actions"))
+        for event in high_value_events:
+            detail_text = _highlight_ips(_redact_in_text(event.details), summary.target_ip)
+            meta_bits: list[str] = []
+            if event.source and event.source != "timeline":
+                meta_bits.append(f"source={event.source}")
+            if event.packet_index is not None:
+                meta_bits.append(f"pkt={event.packet_index}")
+            if meta_bits:
+                detail_text = f"{detail_text} [{' '.join(meta_bits)}]"
+            lines.append(
+                muted(
+                    f"- {format_ts(event.ts)} {event.category} {event.summary} | {detail_text}"
+                )
+            )
+
     event_limit = min(len(summary.events), int(limit))
     lines.append(SUBSECTION_BAR)
     lines.append(header("Activity Timeline"))
@@ -19421,6 +19659,13 @@ def render_timeline_summary(
                     event.category,
                     event.summary,
                 )
+        meta_bits: list[str] = []
+        if event.source and event.source != "timeline":
+            meta_bits.append(f"source={event.source}")
+        if event.packet_index is not None:
+            meta_bits.append(f"pkt={event.packet_index}")
+        if meta_bits:
+            details_text = f"{details_text} [{' '.join(meta_bits)}]"
         lines.append(
             f"{format_ts(event.ts)} | {event.category} | {summary_text} | {details_text}"
         )
@@ -22291,6 +22536,7 @@ def _render_ot_protocol_summary(
     packet_label: str,
     dangerous_tokens: set[str] | None = None,
     suspicious_tokens: set[str] | None = None,
+    include_detected_devices: bool = False,
 ) -> str:
     if not summary:
         return ""
@@ -22466,6 +22712,84 @@ def _render_ot_protocol_summary(
                 rows.append([detail, str(count), top_eps or "-"])
             lines.append(_format_table(rows))
 
+    if include_detected_devices:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Detected Devices Information"))
+        device_counts: Counter[str] = Counter()
+        device_endpoints: dict[str, Counter[str]] = defaultdict(Counter)
+
+        for artifact in artifacts:
+            kind = str(getattr(artifact, "kind", "")).strip().lower()
+            detail = str(getattr(artifact, "detail", "")).strip()
+            if not detail:
+                continue
+            include_artifact = kind in {
+                "equipment",
+                "device",
+                "software",
+                "firmware",
+                "system",
+                "identity",
+            }
+            if not include_artifact:
+                lowered = detail.lower()
+                include_artifact = any(
+                    token in lowered
+                    for token in (
+                        "vendor=",
+                        "model=",
+                        "product=",
+                        "software=",
+                        "firmware=",
+                        "simatic",
+                        "siemens",
+                        "plc",
+                        "hmi",
+                        "scada",
+                        "dcs",
+                        "rtu",
+                    )
+                )
+            if not include_artifact:
+                continue
+            src = str(getattr(artifact, "src", "?"))
+            dst = str(getattr(artifact, "dst", "?"))
+            device_counts[detail] += 1
+            device_endpoints[detail][f"{src} -> {dst}"] += 1
+
+        for command, count in commands.items():
+            cmd_text = str(command)
+            if "SrcTSAP=" not in cmd_text or "DstTSAP=" not in cmd_text:
+                continue
+            profile = cmd_text.replace("COTP:CR:", "COTP CR ").replace(
+                "COTP:CC:", "COTP CC "
+            )
+            device_counts[profile] += int(count)
+            for endpoint, ep_count in service_endpoints.get(cmd_text, Counter()).items():
+                device_endpoints[profile][endpoint] += int(ep_count)
+
+        if not device_counts:
+            lines.append(
+                muted(
+                    "No device/system/equipment/software details were discovered in S7 communications."
+                )
+            )
+        else:
+            rows = [["Detail", "Count", "Top Endpoints"]]
+            for detail, count in device_counts.most_common(_limit_value(16)):
+                top_eps = ", ".join(
+                    f"{ep} ({cnt})"
+                    for ep, cnt in device_endpoints[detail].most_common(_limit_value(3))
+                )
+                rows.append(
+                    [
+                        _truncate_text(detail, _limit_value(72)),
+                        str(count),
+                        _truncate_text(top_eps or "-", _limit_value(64)),
+                    ]
+                )
+            lines.append(_format_table(rows))
+
     if anomalies:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Anomalies & Threat Indicators"))
@@ -22504,6 +22828,7 @@ def render_s7_summary(summary: "IndustrialAnalysis") -> str:
         packet_label="S7 Packets",
         dangerous_tokens={"write", "stop", "download", "upload", "start", "plc"},
         suspicious_tokens={"read", "setup", "userdata", "block", "diag"},
+        include_detected_devices=True,
     )
 
 
@@ -24770,6 +25095,119 @@ def _overview_priority_style(priority: str):
     return muted
 
 
+_OVERVIEW_OT_SIGNAL_TOKENS = (
+    "modbus",
+    "dnp3",
+    "iec-104",
+    "iec104",
+    "s7",
+    "s7comm",
+    "enip",
+    "cip",
+    "profinet",
+    "bacnet",
+    "opc",
+    "mms",
+    "goose",
+    "sv",
+    "ptp",
+    "hart",
+    "niagara",
+    "odesys",
+)
+
+_OVERVIEW_IOT_SIGNAL_TOKENS = ("mqtt", "coap")
+
+
+def _overview_detected_devices(
+    ip_activity_rows: list[dict[str, object]],
+    limit: int = 12,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    seen_ips: set[str] = set()
+
+    for item in ip_activity_rows:
+        if not isinstance(item, dict):
+            continue
+        ip_text = str(item.get("ip", "") or "").strip()
+        if not ip_text or ip_text in seen_ips:
+            continue
+
+        role = str(item.get("role", "mixed") or "mixed").strip()
+        scope = str(item.get("scope", "unknown") or "unknown").strip()
+        protocols = [str(v).strip() for v in list(item.get("top_protocols", []) or []) if str(v).strip()]
+        services_hosted = [
+            str(v).strip()
+            for v in list(item.get("services_hosted", []) or [])
+            if str(v).strip()
+        ]
+        services_used = [
+            str(v).strip()
+            for v in list(item.get("services_used", []) or [])
+            if str(v).strip()
+        ]
+        ports: list[int] = []
+        for raw in list(item.get("top_ports", []) or [])[:6]:
+            try:
+                ports.append(int(raw))
+            except Exception:
+                continue
+
+        signal_blob = " ".join(protocols + services_hosted + services_used).lower()
+        ot_signals = [
+            token
+            for token in _OVERVIEW_OT_SIGNAL_TOKENS
+            if token in signal_blob
+        ]
+        iot_signals = [
+            token
+            for token in _OVERVIEW_IOT_SIGNAL_TOKENS
+            if token in signal_blob
+        ]
+
+        is_device_candidate = (
+            role in {"service-host", "mixed"}
+            or bool(services_hosted)
+            or bool(ot_signals)
+            or bool(iot_signals)
+        )
+        if not is_device_candidate:
+            continue
+
+        profile = "Network Service Node"
+        if ot_signals:
+            profile = "OT/ICS Device"
+        elif iot_signals:
+            profile = "IoT Endpoint/Gateway"
+        elif role == "service-host":
+            profile = "Service Host"
+
+        role_text = f"{scope}/{role}" if scope else role
+        when_text = _overview_window_text(item.get("first_seen"), item.get("last_seen"))
+        signal_items = protocols[:3] + services_hosted[:2] + services_used[:1]
+        signal_text = _overview_list_preview(list(dict.fromkeys(signal_items)), limit=3)
+        hosted_text = _overview_list_preview(services_hosted, limit=2)
+        if hosted_text == "-":
+            hosted_text = _overview_list_preview(services_used, limit=2)
+
+        rows.append(
+            {
+                "ip": ip_text,
+                "role": role_text,
+                "profile": profile,
+                "signals": signal_text,
+                "services": hosted_text,
+                "ports": ", ".join(str(v) for v in ports[:4]) if ports else "-",
+                "when": when_text,
+            }
+        )
+        seen_ips.add(ip_text)
+        if len(rows) >= limit:
+            break
+
+    return rows
+
+
 def render_overview_summary(summary: OverviewSummary, verbose: bool = False) -> str:
     lines = [header("STRATEGIC OVERVIEW")]
     lines.append(_format_kv("Capture", str(summary.path)))
@@ -24826,6 +25264,12 @@ def render_overview_summary(summary: OverviewSummary, verbose: bool = False) -> 
             )
         )
         lines.append(
+            _format_kv(
+                "Cross-Zone OT/IoT Flows",
+                str(int(detail.get("cross_zone_ot_iot_flows", 0) or 0)),
+            )
+        )
+        lines.append(
             _format_kv("Leads", str(int(detail.get("hunt_leads", 0) or 0)))
         )
         capture_span_seconds = int(detail.get("capture_span_seconds", 0) or 0)
@@ -24858,6 +25302,21 @@ def render_overview_summary(summary: OverviewSummary, verbose: bool = False) -> 
         _format_kv(
             "OT/ICS Families",
             ", ".join(summary.ot_protocols[:10]) if summary.ot_protocols else "-",
+        )
+    )
+    iot_labels = [
+        str(label).strip()
+        for label in summary.ot_protocols
+        if str(label).strip()
+        and (
+            "mqtt" in str(label).lower()
+            or "coap" in str(label).lower()
+        )
+    ]
+    lines.append(
+        _format_kv(
+            "IoT Families",
+            ", ".join(iot_labels[:8]) if iot_labels else "-",
         )
     )
 
@@ -24894,6 +25353,24 @@ def render_overview_summary(summary: OverviewSummary, verbose: bool = False) -> 
             )
         if len(rows) > 1:
             lines.append(_format_table(rows))
+
+        detected_devices = _overview_detected_devices(ip_activity_rows)
+        if detected_devices:
+            lines.append(header("Detected Devices Information"))
+            device_rows = [["Device", "Role", "Likely Type", "Signals", "Services", "Ports", "When"]]
+            for item in detected_devices:
+                device_rows.append(
+                    [
+                        _truncate_text(str(item.get("ip", "-")), 24),
+                        _truncate_text(str(item.get("role", "-")), 22),
+                        _truncate_text(str(item.get("profile", "-")), 24),
+                        _truncate_text(str(item.get("signals", "-")), 44),
+                        _truncate_text(str(item.get("services", "-")), 38),
+                        _truncate_text(str(item.get("ports", "-")), 20),
+                        _truncate_text(str(item.get("when", "-")), 42),
+                    ]
+                )
+            lines.append(_format_table(device_rows))
 
     protocol_activity_rows = list(getattr(summary, "protocol_activity", []) or [])
     observed_protocols = list(getattr(summary, "observed_protocols", []) or [])
