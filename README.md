@@ -180,7 +180,7 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
-## Current Release: v1.8.0
+## Current Release: v1.9.0
 
 Latest additions in this release:
 - Expanded OT transfer detection in `--files` with CIP File Object services and vendor-specific PLC transfer signatures.
@@ -244,8 +244,8 @@ python -m pcapper ~/Downloads/pcaps/MIME11.pcap --ips
 python -m pcapper ~/Downloads/pcaps/ --arp
 python -m pcapper ~/Downloads/pcaps/ --dhcp --no-status
 python -m pcapper ~/Downloads/pcaps/Un* --arp
-python -m pcapper "~/Downloads/pcaps/Un*" --summarize --ips
-python -m pcapper one.pcap two.pcapng ~/Downloads/pcaps/ --summarize --timeline -ip 10.182.207.28
+python -m pcapper "~/Downloads/pcaps/Un*" -summarize --ips
+python -m pcapper one.pcap two.pcapng ~/Downloads/pcaps/ -summarize --timeline -ip 10.182.207.28
 ```
 
 ## Quick Demo
@@ -285,7 +285,7 @@ Use `-v/--verbose` to include additional evidence lines in summaries (for exampl
 
 ## Summarize behavior
 
-Use `--summarize` to aggregate selected analyses across all resolved target pcaps.
+Use `-summarize` (single dash) to aggregate selected analyses across all resolved target pcaps.
 
 - Summarize renders merged rollup output only (no per‑pcap sections).
 - Recursive directory traversal is enabled only with `-r/--recursive`.
@@ -357,7 +357,7 @@ python -m pcapper capture.pcap --files
 Correlate repeated hosts/services across multiple pcaps.
 
 ```bash
-python -m pcapper captures/*.pcap --correlate --summarize
+python -m pcapper captures/*.pcap --correlate -summarize
 ```
 
 ## Case Metadata
@@ -551,7 +551,7 @@ python -m pcapper --help
 - `-raw` (shows `-view`/`--packet` output as raw text, no ASCII/HEX framing)
 - `-rsa KEY_OR_@PATH`
 - `-search TERM`
-- `-summarize, --summarize`
+- `-summarize`
 - `-v, --verbose`
 - `-view FILENAME`
 - `-vt, --vt`

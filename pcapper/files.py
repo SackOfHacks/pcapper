@@ -164,6 +164,8 @@ def merge_files_summaries(summaries: List[FileTransferSummary]) -> FileTransferS
             list(getattr(summary, "campaign_indicators", []) or [])
         )
         benign_context.extend(list(getattr(summary, "benign_context", []) or []))
+    merged_detections = _merge_file_detection_rollups(detections)
+
     return FileTransferSummary(
         path=Path("ALL_PCAPS"),
         total_candidates=total_candidates,
@@ -171,7 +173,7 @@ def merge_files_summaries(summaries: List[FileTransferSummary]) -> FileTransferS
         artifacts=artifacts,
         extracted=[],
         views=[],
-        detections=detections,
+        detections=merged_detections,
         errors=sorted(set(errors)),
         hashes=hashes,
         deterministic_checks={
@@ -191,6 +193,182 @@ def merge_files_summaries(summaries: List[FileTransferSummary]) -> FileTransferS
 
 
 # --- Helper Functions ---
+
+
+def _parse_ranked_pairs(values: Any) -> Counter[str]:
+    counter: Counter[str] = Counter()
+    if not isinstance(values, list):
+        return counter
+    for item in values:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        key = str(item[0]).strip()
+        if not key:
+            continue
+        try:
+            count = int(item[1])
+        except Exception:
+            count = 0
+        if count <= 0:
+            continue
+        counter[key] += count
+    return counter
+
+
+def _merge_ranked_pairs(
+    primary: Any, secondary: Any, limit: int = 10
+) -> list[tuple[str, int]]:
+    merged = _parse_ranked_pairs(primary)
+    merged.update(_parse_ranked_pairs(secondary))
+    return [(str(k), int(v)) for k, v in merged.most_common(limit)]
+
+
+def _merge_detection_evidence(primary: Any, secondary: Any, limit: int = 10) -> list[str]:
+    merged: list[str] = []
+    for value in (primary, secondary):
+        if isinstance(value, list):
+            for item in value:
+                text = str(item).strip()
+                if text:
+                    merged.append(text)
+        elif isinstance(value, str):
+            text = value.strip()
+            if text:
+                merged.append(text)
+    return list(dict.fromkeys(merged))[:limit]
+
+
+def _combine_detection_details(details: list[str]) -> str:
+    cleaned = [str(item).strip() for item in details if str(item).strip()]
+    if not cleaned:
+        return ""
+    if len(set(cleaned)) == 1:
+        return cleaned[0]
+
+    num_re = re.compile(r"\d+")
+    numeric_templates = [num_re.sub("#", value) for value in cleaned]
+    numeric_groups = [[int(v) for v in num_re.findall(value)] for value in cleaned]
+    if (
+        numeric_templates
+        and len(set(numeric_templates)) == 1
+        and numeric_groups
+        and all(len(group) == len(numeric_groups[0]) for group in numeric_groups)
+        and len(numeric_groups[0]) > 0
+    ):
+        summed = [sum(group[i] for group in numeric_groups) for i in range(len(numeric_groups[0]))]
+        next_index = 0
+
+        def _replace_num(_match: re.Match[str]) -> str:
+            nonlocal next_index
+            value = str(summed[next_index])
+            next_index += 1
+            return value
+
+        merged = num_re.sub(_replace_num, cleaned[0])
+        return f"{merged} Aggregated across {len(cleaned)} capture result(s)."
+
+    unique_details = list(dict.fromkeys(cleaned))
+    if len(unique_details) == 2:
+        return f"{unique_details[0]} | {unique_details[1]}"
+    preview = " | ".join(unique_details[:2])
+    return (
+        f"{preview} | +{len(unique_details) - 2} additional detail variant(s) "
+        f"across {len(cleaned)} capture result(s)."
+    )
+
+
+def _merge_file_detection_items(
+    primary: Dict[str, Any], secondary: Dict[str, Any]
+) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(primary)
+
+    merged_count = int(primary.get("_merged_count", 1) or 1) + int(
+        secondary.get("_merged_count", 1) or 1
+    )
+    merged["_merged_count"] = merged_count
+
+    detail_values = list(primary.get("_detail_values", []) or [])
+    detail_values.extend(list(secondary.get("_detail_values", []) or []))
+    if not detail_values:
+        for value in (
+            str(primary.get("details", "")).strip(),
+            str(secondary.get("details", "")).strip(),
+        ):
+            if value:
+                detail_values.append(value)
+    merged["_detail_values"] = detail_values
+    merged["details"] = _combine_detection_details(detail_values)
+
+    for key in ("top_sources", "top_destinations", "top_clients", "top_servers", "tools"):
+        merged_pairs = _merge_ranked_pairs(primary.get(key), secondary.get(key), limit=10)
+        if merged_pairs:
+            merged[key] = merged_pairs
+        else:
+            merged.pop(key, None)
+
+    merged_evidence = _merge_detection_evidence(
+        primary.get("evidence"), secondary.get("evidence"), limit=10
+    )
+    if merged_evidence:
+        merged["evidence"] = merged_evidence
+    else:
+        merged.pop("evidence", None)
+
+    return merged
+
+
+def _merge_file_detection_rollups(
+    detections: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    if not detections:
+        return []
+
+    order: list[tuple[str, str, str]] = []
+    merged_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for raw in detections:
+        if not isinstance(raw, dict):
+            continue
+        summary = str(raw.get("summary", "")).strip()
+        if not summary:
+            continue
+        source = str(raw.get("source", "Files")).strip() or "Files"
+        severity = str(raw.get("severity", "info")).strip().lower() or "info"
+        key = (source, severity, summary)
+
+        normalized: dict[str, Any] = dict(raw)
+        normalized["source"] = source
+        normalized["severity"] = severity
+        normalized["summary"] = summary
+        detail_text = str(raw.get("details", "")).strip()
+        normalized["_detail_values"] = [detail_text] if detail_text else []
+        normalized["_merged_count"] = 1
+
+        existing = merged_by_key.get(key)
+        if existing is None:
+            merged_by_key[key] = normalized
+            order.append(key)
+        else:
+            merged_by_key[key] = _merge_file_detection_items(existing, normalized)
+
+    severity_order = {"critical": 0, "high": 1, "warning": 2, "info": 3}
+    ordered_items = [merged_by_key[key] for key in order if key in merged_by_key]
+    ordered_items.sort(
+        key=lambda item: (
+            severity_order.get(str(item.get("severity", "info")), 99),
+            str(item.get("source", "")),
+            str(item.get("summary", "")),
+        )
+    )
+
+    cleaned: list[dict[str, Any]] = []
+    for item in ordered_items:
+        occurrence_count = int(item.get("_merged_count", 1) or 1)
+        item.pop("_detail_values", None)
+        item.pop("_merged_count", None)
+        if occurrence_count > 1:
+            item["occurrences"] = occurrence_count
+        cleaned.append(item)
+    return cleaned
 
 FILE_TRANSFER_PROTOCOLS = {
     "HTTP",
