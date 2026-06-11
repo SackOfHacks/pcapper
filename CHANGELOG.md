@@ -6,6 +6,21 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 1.9.0 — 2026-06-11
+### Added
+- `--quiet` / `-q` flag: programmatic-friendly output for downstream consumers (e.g. the Claude Code `/threathunt review -pcapper` skill). Suppresses the startup ASCII banner, the trailing `Output is summarized/truncated. Use -v to view all output.` footers, and the scapy module-loading noise on stderr (`cryptography` version mismatch, missing TLS layers, etc.). Implies `--no-color`, `--no-status`, and `--oui`. Data accuracy and truncation thresholds unaffected. Also honoured via `PCAPPER_QUIET=1` env var.
+- `--oui` flag: annotate MAC addresses in "Observed MACs" tables with the OUI vendor name from scapy's `manufdb` — e.g. `70:70:8b:67:c1:f2 (Cisco)`. Useful for OT/ICS asset attestation (Honeywell DCS, Rockwell PLC, VMware-virtualised IT host, etc.). Default off — preserves existing output column format. Implied by `--quiet`.
+- `set_quiet_mode()` / `is_quiet_mode()` / `set_oui_annotation()` / `is_oui_annotation_enabled()` exposed from `pcapper.reporting` for programmatic consumers.
+
+### Changed
+- Default behaviour unchanged when neither `--quiet` nor `--oui` are passed. All existing test fixtures and parsers see identical output.
+- Release metadata/docs alignment updated for `v1.9.0`.
+
+## 1.8.1 — 2026-05-06
+### Changed
+- CLI summarize flag is now single-dash only: `-summarize` (the `--summarize` alias was removed).
+- Release metadata/docs alignment updated for `v1.8.1`.
+
 ## 1.8.0 — 2026-05-06
 ### Added
 - Expanded `--files` OT transfer coverage with CIP File Object program/file operations and vendor-specific PLC transfer signatures.
@@ -174,7 +189,7 @@ This project follows [Semantic Versioning](https://semver.org/).
 ### Added
 - Wildcard target resolution support for quoted glob patterns and mixed target inputs.
 - Multiple positional target support (e.g., shell-expanded wildcards like `Un*` resolving to many files).
-- Merged summarize rendering for timeline analysis (`--summarize --timeline -ip ...`).
+- Merged summarize rendering for timeline analysis (`-summarize --timeline -ip ...`).
 - Parser regression tests for grouped-help completeness, alphabetical IT/ICS flag ordering, and multi-target parsing.
 - New `--dhcp` analyzer with DHCP conversations/sessions, lease/option intelligence, client/server endpoint detail, artifacts, and attack/threat-hunting detections (starvation, rogue DHCP, NAK floods, probing, beaconing, exfil-style option abuse).
 - Beaconing enhancements: severity tiers, fan-out detection, low-and-slow cadence detection, high-frequency check-in detection, and candidate evidence payloads.

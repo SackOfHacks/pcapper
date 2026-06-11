@@ -60,6 +60,16 @@ except Exception:  # pragma: no cover
     ICMPv6ND_NA = None  # type: ignore
 
 try:
+    from scapy.layers.dhcp import BOOTP, DHCP  # type: ignore
+except Exception:  # pragma: no cover
+    BOOTP = DHCP = None  # type: ignore
+
+try:
+    from scapy.layers.l2 import ARP  # type: ignore
+except Exception:  # pragma: no cover
+    ARP = None  # type: ignore
+
+try:
     from scapy.layers.netbios import (  # type: ignore
         NBNS,
         NBNSQueryRequest,
@@ -253,8 +263,6 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
     first_seen = None
     last_seen = None
     category_counts: Counter[str] = Counter()
-    peer_counts: Counter[str] = Counter()
-    port_counts: Counter[int] = Counter()
     ot_protocol_counts: Counter[str] = Counter()
     ot_activity_bins: dict[str, list[int]] = {}
     ot_bin_count = 0
@@ -583,7 +591,9 @@ OT_CATEGORIES = {
 }
 
 NON_OT_CATEGORIES = {
+    "ARP",
     "Connection",
+    "DHCP",
     "DNS",
     "Email",
     "File Transfer",
@@ -669,6 +679,33 @@ REMOTE_ADMIN_PORT_SUMMARY: dict[int, str] = {
     5900: "VNC connection",
 }
 
+_DHCP_MESSAGE_TYPES: dict[int, str] = {
+    1: "DISCOVER",
+    2: "OFFER",
+    3: "REQUEST",
+    4: "DECLINE",
+    5: "ACK",
+    6: "NAK",
+    7: "RELEASE",
+    8: "INFORM",
+}
+
+_DHCP6_MESSAGE_TYPES: dict[int, str] = {
+    1: "SOLICITv6",
+    2: "ADVERTISEv6",
+    3: "REQUESTv6",
+    4: "CONFIRMv6",
+    5: "RENEWv6",
+    6: "REBINDv6",
+    7: "REPLYv6",
+    8: "RELEASEv6",
+    9: "DECLINEv6",
+    10: "RECONFIGUREv6",
+    11: "INFO-REQUESTv6",
+    12: "RELAY-FORWv6",
+    13: "RELAY-REPLv6",
+}
+
 
 def _decode_payload_line(payload: bytes | None) -> str:
     if not payload:
@@ -678,6 +715,43 @@ def _decode_payload_line(payload: bytes | None) -> str:
         return ""
     first = text.split("\r\n", 1)[0].split("\n", 1)[0].strip()
     return first[:200]
+
+
+def _dhcp_message_type_name(value: object) -> str:
+    if isinstance(value, str):
+        text = value.strip().upper()
+        return text or "UNKNOWN"
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+        if len(raw) == 1:
+            return _DHCP_MESSAGE_TYPES.get(int(raw[0]), f"TYPE_{int(raw[0])}")
+        text = decode_payload(raw, encoding="latin-1").strip().upper()
+        return text or "UNKNOWN"
+    try:
+        code = int(value)
+    except Exception:
+        return "UNKNOWN"
+    return _DHCP_MESSAGE_TYPES.get(code, f"TYPE_{code}")
+
+
+def _extract_dhcp_message_type(pkt) -> str | None:
+    if DHCP is None or BOOTP is None:
+        return None
+    if not (pkt.haslayer(DHCP) and pkt.haslayer(BOOTP)):  # type: ignore[truthy-bool]
+        return None
+    try:
+        options = getattr(pkt[DHCP], "options", None)  # type: ignore[index]
+        if not isinstance(options, (list, tuple)):
+            return None
+        for option in options:
+            if not isinstance(option, tuple) or len(option) < 2:
+                continue
+            key = str(option[0]).strip().lower()
+            if key in {"message-type", "dhcp_message_type"}:
+                return _dhcp_message_type_name(option[1])
+    except Exception:
+        return None
+    return None
 
 
 def _tls_handshake_label(payload: bytes | None) -> str | None:
@@ -1486,6 +1560,7 @@ def analyze_timeline(
     timeline_bins: int = 24,
     timeline_storyline_off: bool = False,
     categories: set[str] | None = None,
+    invert_categories: bool = False,
     vt_lookup: bool = False,
 ) -> TimelineSummary:
     errors: list[str] = []
@@ -1516,8 +1591,6 @@ def analyze_timeline(
     index_ts: dict[int, float] = {}
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
-    peer_counts: Counter[str] = Counter()
-    port_counts: Counter[int] = Counter()
     ot_protocol_counts: Counter[str] = Counter()
     seen_ot_flows: set[tuple[str, str, str, int]] = set()
     seen_ot_commands: set[tuple[str, str, str, int, str]] = set()
@@ -1660,10 +1733,6 @@ def analyze_timeline(
                         first_seen = ts
                     if last_seen is None or ts > last_seen:
                         last_seen = ts
-                peer_ip = dst_ip if src_ip == target_ip else src_ip
-                if peer_ip:
-                    counter_inc(peer_counts, peer_ip)
-
             if src_ip == target_ip or dst_ip == target_ip:
                 label = _icmp_label(pkt)
                 if label:
@@ -1675,6 +1744,64 @@ def analyze_timeline(
                         details=f"{src_ip} -> {dst_ip}",
                         dedupe_key=dedupe_key,
                     )
+
+            if ARP is not None and pkt.haslayer(ARP):  # type: ignore[truthy-bool]
+                try:
+                    arp_layer = pkt[ARP]  # type: ignore[index]
+                    op = int(getattr(arp_layer, "op", 0) or 0)
+                    arp_src_ip = str(getattr(arp_layer, "psrc", "") or "").strip()
+                    arp_dst_ip = str(getattr(arp_layer, "pdst", "") or "").strip()
+                    arp_src_mac = str(getattr(arp_layer, "hwsrc", "") or "").strip()
+                    arp_dst_mac = str(getattr(arp_layer, "hwdst", "") or "").strip()
+                    if (
+                        target_ip
+                        and target_ip
+                        not in {src_ip, dst_ip, arp_src_ip, arp_dst_ip}
+                    ):
+                        pass
+                    else:
+                        summary = "ARP traffic"
+                        if op == 1:
+                            if (
+                                arp_src_ip == "0.0.0.0"
+                                and arp_dst_ip
+                                and arp_dst_ip != "0.0.0.0"
+                            ):
+                                summary = "ARP probe"
+                            elif arp_src_ip and arp_src_ip == arp_dst_ip:
+                                summary = "Gratuitous ARP request"
+                            else:
+                                summary = "ARP request"
+                        elif op == 2:
+                            if arp_src_ip and arp_src_ip == arp_dst_ip:
+                                summary = "Gratuitous ARP reply"
+                            else:
+                                summary = "ARP reply"
+                        op_detail = (
+                            {1: "request", 2: "reply"}.get(op) or f"op {op}"
+                        )
+                        detail_parts = [f"{arp_src_ip or src_ip} -> {arp_dst_ip or dst_ip}"]
+                        if arp_src_mac:
+                            detail_parts.append(f"src-mac {arp_src_mac}")
+                        if arp_dst_mac and arp_dst_mac != "00:00:00:00:00:00":
+                            detail_parts.append(f"dst-mac {arp_dst_mac}")
+                        detail_parts.append(f"opcode {op_detail}")
+                        _emit_event(
+                            ts=ts,
+                            category="ARP",
+                            summary=summary,
+                            details=" | ".join(detail_parts),
+                            dedupe_key=(
+                                "arp",
+                                arp_src_ip or src_ip,
+                                arp_dst_ip or dst_ip,
+                                arp_src_mac,
+                                arp_dst_mac,
+                                op,
+                            ),
+                        )
+                except Exception:
+                    pass
 
             if DNS is not None and DNSQR is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
                 dns_layer = pkt[DNS]  # type: ignore[index]
@@ -1867,7 +1994,6 @@ def analyze_timeline(
                 if src_ip == target_ip or dst_ip == target_ip:
                     port_key = dport if src_ip == target_ip else sport
                     if port_key:
-                        counter_inc(port_counts, port_key)
                         proto = OT_PORT_PROTOCOLS.get(port_key)
                         if proto:
                             ot_protocol_counts[proto] += 1
@@ -2470,10 +2596,53 @@ def analyze_timeline(
                     payload = bytes(udp_layer.payload)
                 except Exception:
                     payload = None
+
+                if src_ip == target_ip or dst_ip == target_ip:
+                    dhcp_msg = _extract_dhcp_message_type(pkt)
+                    if dhcp_msg and (
+                        {sport, dport} & {67, 68} or {sport, dport} & {546, 547}
+                    ):
+                        dedupe_key = (
+                            "dhcp",
+                            src_ip,
+                            dst_ip,
+                            sport,
+                            dport,
+                            dhcp_msg,
+                        )
+                        _emit_event(
+                            ts=ts,
+                            category="DHCP",
+                            summary=f"DHCP {dhcp_msg}",
+                            details=f"{src_ip}:{sport} -> {dst_ip}:{dport}",
+                            dedupe_key=dedupe_key,
+                        )
+                    elif payload and ({sport, dport} & {546, 547}):
+                        try:
+                            msg_code = int(payload[0])
+                            msg_name = _DHCP6_MESSAGE_TYPES.get(
+                                msg_code, f"TYPE{msg_code}v6"
+                            )
+                            dedupe_key = (
+                                "dhcp6",
+                                src_ip,
+                                dst_ip,
+                                sport,
+                                dport,
+                                msg_name,
+                            )
+                            _emit_event(
+                                ts=ts,
+                                category="DHCP",
+                                summary=f"DHCP {msg_name}",
+                                details=f"{src_ip}:{sport} -> {dst_ip}:{dport}",
+                                dedupe_key=dedupe_key,
+                            )
+                        except Exception:
+                            pass
                 if src_ip == target_ip or dst_ip == target_ip:
                     port_key = dport if src_ip == target_ip else sport
                     if port_key:
-                        counter_inc(port_counts, port_key)
                         proto = OT_PORT_PROTOCOLS.get(port_key)
                         if proto:
                             ot_protocol_counts[proto] += 1
@@ -2901,15 +3070,26 @@ def analyze_timeline(
                 )
 
     if categories is not None:
-        events = [event for event in events if event.category in categories]
-        if ot_protocol_counts:
-            ot_protocol_counts = Counter(
-                {
-                    name: count
-                    for name, count in ot_protocol_counts.items()
-                    if name in categories
-                }
-            )
+        if invert_categories:
+            events = [event for event in events if event.category not in categories]
+            if ot_protocol_counts:
+                ot_protocol_counts = Counter(
+                    {
+                        name: count
+                        for name, count in ot_protocol_counts.items()
+                        if name not in categories
+                    }
+                )
+        else:
+            events = [event for event in events if event.category in categories]
+            if ot_protocol_counts:
+                ot_protocol_counts = Counter(
+                    {
+                        name: count
+                        for name, count in ot_protocol_counts.items()
+                        if name in categories
+                    }
+                )
 
     events.sort(key=lambda item: (item.ts is None, item.ts))
     category_counts = Counter(event.category for event in events)
@@ -2994,8 +3174,8 @@ def analyze_timeline(
         last_seen=last_seen,
         duration=duration,
         category_counts=dict(category_counts),
-        peer_counts=dict(peer_counts),
-        port_counts=dict(port_counts),
+        peer_counts={},
+        port_counts={},
         ot_protocol_counts=dict(ot_protocol_counts),
         ot_activity_bins=ot_activity_bins,
         ot_activity_bin_count=ot_bin_count,

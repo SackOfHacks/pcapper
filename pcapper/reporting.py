@@ -131,10 +131,62 @@ SUBSECTION_BAR = "-" * 72
 _VERBOSE_OUTPUT = False
 _FULL_OUTPUT_LIMIT = 1_000_000
 
+# Quiet mode — suppresses decoration intended for human readers (the banner
+# is gated in cli.main(); the trailing "Output is summarized…" footer is
+# gated below). Designed for programmatic consumers (e.g. /threathunt review
+# -pcapper) so they don't have to post-process. Independent of --verbose.
+_QUIET_MODE = False
+
 
 def set_verbose_output(enabled: bool) -> None:
     global _VERBOSE_OUTPUT
     _VERBOSE_OUTPUT = enabled
+
+
+def set_quiet_mode(enabled: bool) -> None:
+    """Toggle programmatic-friendly output: suppress trailing summary notes
+    and (caller-side) the startup banner. Does not affect data accuracy or
+    truncation thresholds — those are controlled by set_verbose_output()."""
+    global _QUIET_MODE
+    _QUIET_MODE = enabled
+
+
+def is_quiet_mode() -> bool:
+    return _QUIET_MODE
+
+
+# OUI vendor annotation — when enabled, MAC addresses in "Observed MACs"
+# tables are suffixed with the manufacturer name from scapy's manufdb.
+# Default OFF for backward compatibility (existing test outputs / parsers
+# don't see column shifts). Opt-in via --oui CLI flag.
+_OUI_ANNOTATE = False
+
+
+def set_oui_annotation(enabled: bool) -> None:
+    global _OUI_ANNOTATE
+    _OUI_ANNOTATE = enabled
+
+
+def is_oui_annotation_enabled() -> bool:
+    return _OUI_ANNOTATE
+
+
+def _annotate_macs(macs: list[str] | tuple[str, ...]) -> str:
+    """Render a MAC list as a string. With OUI annotation on, suffix each MAC
+    with its manufacturer (e.g. ``70:70:8b:67:c1:f2 (Honeywell)``) when the
+    scapy manufdb has a known vendor. Returns ``"-"`` for empty input."""
+    if not macs:
+        return "-"
+    if not _OUI_ANNOTATE:
+        return ", ".join(macs) or "-"
+    parts = []
+    for mac in macs:
+        vendor = mac_manufacturer(mac)
+        if vendor and vendor != "-":
+            parts.append(f"{mac} ({vendor})")
+        else:
+            parts.append(mac)
+    return ", ".join(parts) or "-"
 
 
 def _apply_verbose_limit(limit: int | None) -> int | None:
@@ -337,6 +389,174 @@ def _format_table(rows: Iterable[list[str]]) -> str:
     return format_table(rows)
 
 
+def _merge_ranked_detection_pairs(values: list[object], limit: int = 10) -> list[tuple[str, int]]:
+    counts: Counter[str] = Counter()
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            name = str(item[0]).strip()
+            if not name:
+                continue
+            try:
+                count = int(item[1])
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+            counts[name] += count
+    return [(str(name), int(count)) for name, count in counts.most_common(limit)]
+
+
+def _merge_detection_evidence_lines(values: list[object], limit: int = 10) -> list[str]:
+    merged: list[str] = []
+    for value in values:
+        if isinstance(value, list):
+            for item in value:
+                text = str(item).strip()
+                if text:
+                    merged.append(text)
+        elif isinstance(value, str):
+            text = value.strip()
+            if text:
+                merged.append(text)
+    return list(dict.fromkeys(merged))[:limit]
+
+
+def _collapse_detection_details(details: list[str]) -> str:
+    cleaned = [str(item).strip() for item in details if str(item).strip()]
+    if not cleaned:
+        return ""
+    if len(set(cleaned)) == 1:
+        return cleaned[0]
+
+    num_re = re.compile(r"\d+")
+    templates = [num_re.sub("#", item) for item in cleaned]
+    number_groups = [[int(v) for v in num_re.findall(item)] for item in cleaned]
+    if (
+        templates
+        and len(set(templates)) == 1
+        and number_groups
+        and all(len(group) == len(number_groups[0]) for group in number_groups)
+        and len(number_groups[0]) > 0
+    ):
+        summed = [
+            sum(group[idx] for group in number_groups)
+            for idx in range(len(number_groups[0]))
+        ]
+        next_index = 0
+
+        def _replace_num(_match: re.Match[str]) -> str:
+            nonlocal next_index
+            value = str(summed[next_index])
+            next_index += 1
+            return value
+
+        merged = num_re.sub(_replace_num, cleaned[0])
+        return f"{merged} Aggregated across {len(cleaned)} capture result(s)."
+
+    unique = list(dict.fromkeys(cleaned))
+    if len(unique) == 2:
+        return f"{unique[0]} | {unique[1]}"
+    preview = " | ".join(unique[:2])
+    return (
+        f"{preview} | +{len(unique) - 2} additional detail variant(s) "
+        f"across {len(cleaned)} capture result(s)."
+    )
+
+
+def _collapse_rollup_detections(
+    detections: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    if not detections:
+        return []
+    merged_by_key: dict[tuple[str, str, str], dict[str, object]] = {}
+    order: list[tuple[str, str, str]] = []
+
+    for item in detections:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source", "")).strip() or "Unknown"
+        severity = str(item.get("severity", "info")).strip().lower() or "info"
+        summary = str(item.get("summary", "")).strip()
+        if not summary:
+            continue
+        key = (source, severity, summary)
+
+        if key not in merged_by_key:
+            normalized = dict(item)
+            normalized["source"] = source
+            normalized["severity"] = severity
+            normalized["summary"] = summary
+            normalized["_details"] = [str(item.get("details", "")).strip()]
+            try:
+                normalized["occurrences"] = max(1, int(item.get("occurrences", 1) or 1))
+            except Exception:
+                normalized["occurrences"] = 1
+            merged_by_key[key] = normalized
+            order.append(key)
+            continue
+
+        existing = merged_by_key[key]
+        try:
+            existing_count = max(1, int(existing.get("occurrences", 1) or 1))
+        except Exception:
+            existing_count = 1
+        try:
+            incoming_count = max(1, int(item.get("occurrences", 1) or 1))
+        except Exception:
+            incoming_count = 1
+        existing["occurrences"] = existing_count + incoming_count
+        details_list = list(existing.get("_details", []) or [])
+        detail_text = str(item.get("details", "")).strip()
+        if detail_text:
+            details_list.append(detail_text)
+        existing["_details"] = details_list
+
+        for ranked_key in (
+            "top_sources",
+            "top_destinations",
+            "top_clients",
+            "top_servers",
+            "tools",
+        ):
+            merged_pairs = _merge_ranked_detection_pairs(
+                [existing.get(ranked_key), item.get(ranked_key)],
+                limit=10,
+            )
+            if merged_pairs:
+                existing[ranked_key] = merged_pairs
+            else:
+                existing.pop(ranked_key, None)
+
+        merged_evidence = _merge_detection_evidence_lines(
+            [existing.get("evidence"), item.get("evidence")],
+            limit=10,
+        )
+        if merged_evidence:
+            existing["evidence"] = merged_evidence
+        else:
+            existing.pop("evidence", None)
+
+    severity_order = {"critical": 0, "high": 1, "warning": 2, "info": 3}
+    collapsed = [merged_by_key[key] for key in order if key in merged_by_key]
+    collapsed.sort(
+        key=lambda item: (
+            severity_order.get(str(item.get("severity", "info")), 99),
+            str(item.get("source", "")),
+            str(item.get("summary", "")),
+        )
+    )
+    for item in collapsed:
+        item["details"] = _collapse_detection_details(
+            [str(v) for v in list(item.get("_details", []) or []) if str(v).strip()]
+        )
+        item.pop("_details", None)
+    return collapsed
+
+
 def _filtered_detections(summary, verbose: bool) -> list[dict[str, object]]:
     detections = list(getattr(summary, "detections", []) or [])
     if not detections:
@@ -435,6 +655,10 @@ def _filtered_detections(summary, verbose: bool) -> list[dict[str, object]]:
                 continue
             filtered.append(item)
         detections = filtered
+
+    path_obj = getattr(summary, "path", None)
+    if path_obj is not None and getattr(path_obj, "name", "") == "ALL_PCAPS":
+        detections = _collapse_rollup_detections(detections)
     return detections
 
 
@@ -610,7 +834,10 @@ def _highlight_public_ips(text: str) -> str:
 
 
 def _finalize_output(lines: list[str], show_truncation_note: bool = True) -> str:
-    if lines and show_truncation_note and not _VERBOSE_OUTPUT:
+    # Suppress the human-facing "Use -v" footer in quiet mode so programmatic
+    # consumers don't have to grep it out. The truncation still happens; the
+    # caller can pass --verbose if they want the full data.
+    if lines and show_truncation_note and not _VERBOSE_OUTPUT and not _QUIET_MODE:
         lines.append(
             muted("Output is summarized/truncated. Use -v to view all output.")
         )
@@ -3006,6 +3233,82 @@ def render_dns_summary(
             return "-", "-"
         return str(info.get("score", "-")), str(info.get("rating", "-"))
 
+    def _render_mdns_section() -> None:
+        if summary.mdns_packets <= 0:
+            return
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("mDNS Analysis"))
+        mdns_share = (summary.mdns_packets / summary.total_packets * 100.0) if summary.total_packets else 0.0
+        q_resp_ratio = (
+            summary.mdns_query_packets / max(1, summary.mdns_response_packets)
+            if summary.mdns_response_packets
+            else float(summary.mdns_query_packets)
+        )
+        lines.append(_format_kv("mDNS Packets", str(summary.mdns_packets)))
+        lines.append(_format_kv("Traffic Share", f"{mdns_share:.2f}% of DNS packets"))
+        lines.append(_format_kv("mDNS Queries", str(summary.mdns_query_packets)))
+        lines.append(_format_kv("mDNS Responses", str(summary.mdns_response_packets)))
+        lines.append(_format_kv("mDNS Query/Response Ratio", f"{q_resp_ratio:.2f}"))
+        lines.append(_format_kv("mDNS Error Responses", str(summary.mdns_error_responses)))
+        lines.append(_format_kv("Unique mDNS Clients", str(summary.unique_mdns_clients)))
+        lines.append(_format_kv("Unique mDNS Responders", str(summary.unique_mdns_servers)))
+        lines.append(_format_kv("Unique mDNS Names", str(len(summary.mdns_qname_counts))))
+        lines.append(_format_kv("Unique mDNS Services", str(len(summary.mdns_service_counts))))
+
+        if summary.mdns_qtype_counts:
+            rows = [["QType", "Count"]]
+            for qtype, count in summary.mdns_qtype_counts.most_common(limit):
+                rows.append([f"{_dns_type_name(int(qtype))} ({qtype})", str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.mdns_client_counts:
+            rows = [["Top mDNS Client", "Packets"]]
+            for name, count in summary.mdns_client_counts.most_common(limit):
+                rows.append([str(name), str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.mdns_server_counts:
+            rows = [["Top mDNS Responder", "Packets"]]
+            for name, count in summary.mdns_server_counts.most_common(limit):
+                rows.append([str(name), str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.mdns_qname_counts:
+            rows = [["Top mDNS Name", "Count"]]
+            for name, count in summary.mdns_qname_counts.most_common(limit):
+                rows.append([str(name), str(count)])
+            lines.append(_format_table(rows))
+
+        if summary.mdns_service_counts:
+            rows = [["Top mDNS Service", "Count"]]
+            for name, count in summary.mdns_service_counts.most_common(limit):
+                rows.append([str(name), str(count)])
+            lines.append(_format_table(rows))
+
+        suspicious_mdns = []
+        for item in list(getattr(summary, "detections", []) or []):
+            det_type = str(item.get("type", "")).lower()
+            det_summary = str(item.get("summary", ""))
+            det_details = str(item.get("details", ""))
+            blob = f"{det_type} {det_summary} {det_details}".lower()
+            if det_type.startswith("mdns_") or "mdns" in blob:
+                suspicious_mdns.append(item)
+
+        if suspicious_mdns:
+            lines.append(muted("Suspicious/Malicious mDNS Artifacts"))
+            rows = [["Severity", "Artifact", "Details"]]
+            for item in suspicious_mdns[:limit]:
+                rows.append(
+                    [
+                        str(item.get("severity", "info")).upper(),
+                        _truncate_text(str(item.get("summary", "-")), 56),
+                        _truncate_text(str(item.get("details", "-")), 88),
+                    ]
+                )
+            lines.append(_format_table(rows))
+        else:
+            lines.append(ok("No suspicious mDNS artifacts were flagged by current heuristics."))
+
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"DNS ANALYSIS :: {summary.path.name}"))
@@ -3256,6 +3559,8 @@ def render_dns_summary(
                 lines.append(f"{marker} {summary_text}")
                 if details:
                     lines.append(muted(f"  Details: {details}"))
+
+        _render_mdns_section()
 
         if summary.errors:
             lines.append(SUBSECTION_BAR)
@@ -3763,29 +4068,7 @@ def render_dns_summary(
         for name, count in summary.llmnr_server_counts.most_common(limit):
             rows.append([name, str(count)])
         lines.append(_format_table(rows))
-
-    if summary.mdns_qname_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("mDNS Queries"))
-        rows = [["QName", "Count"]]
-        for name, count in summary.mdns_qname_counts.most_common(limit):
-            rows.append([name, str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.mdns_service_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("mDNS Services (SRV)"))
-        rows = [["Service", "Count"]]
-        for name, count in summary.mdns_service_counts.most_common(limit):
-            rows.append([name, str(count)])
-        lines.append(_format_table(rows))
-
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("mDNS Service Announcements"))
-        rows = [["Service", "Announcements"]]
-        for name, count in summary.mdns_service_counts.most_common(limit):
-            rows.append([name, str(count)])
-        lines.append(_format_table(rows))
+    _render_mdns_section()
 
     if summary.packet_length_stats:
         lines.append(SUBSECTION_BAR)
@@ -6922,7 +7205,7 @@ def render_ssh_summary(
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
-            macs = ", ".join(summary.ip_to_macs.get(ip, [])) or "-"
+            macs = _annotate_macs(summary.ip_to_macs.get(ip, []))
             rows.append([ip, _truncate_text(macs, 60)])
         lines.append(_format_table(rows))
 
@@ -7315,7 +7598,7 @@ def render_rdp_summary(
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
-            macs = ", ".join(summary.ip_to_macs.get(ip, [])) or "-"
+            macs = _annotate_macs(summary.ip_to_macs.get(ip, []))
             rows.append([ip, _truncate_text(macs, 60)])
         lines.append(_format_table(rows))
 
@@ -7542,7 +7825,7 @@ def render_telnet_summary(
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
-            macs = ", ".join(summary.ip_to_macs.get(ip, [])) or "-"
+            macs = _annotate_macs(summary.ip_to_macs.get(ip, []))
             rows.append([ip, _truncate_text(macs, 60)])
         lines.append(_format_table(rows))
 
@@ -7716,7 +7999,7 @@ def render_vnc_summary(
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
-            macs = ", ".join(summary.ip_to_macs.get(ip, [])) or "-"
+            macs = _annotate_macs(summary.ip_to_macs.get(ip, []))
             rows.append([ip, _truncate_text(macs, 60)])
         lines.append(_format_table(rows))
 
@@ -7911,7 +8194,7 @@ def render_teamviewer_summary(
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
-            macs = ", ".join(summary.ip_to_macs.get(ip, [])) or "-"
+            macs = _annotate_macs(summary.ip_to_macs.get(ip, []))
             rows.append([ip, _truncate_text(macs, 60)])
         lines.append(_format_table(rows))
 
@@ -8067,7 +8350,7 @@ def render_winrm_summary(
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
-            macs = ", ".join(summary.ip_to_macs.get(ip, [])) or "-"
+            macs = _annotate_macs(summary.ip_to_macs.get(ip, []))
             rows.append([ip, _truncate_text(macs, 60)])
         lines.append(_format_table(rows))
 
@@ -8245,7 +8528,7 @@ def render_wmic_summary(
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
-            macs = ", ".join(summary.ip_to_macs.get(ip, [])) or "-"
+            macs = _annotate_macs(summary.ip_to_macs.get(ip, []))
             rows.append([ip, _truncate_text(macs, 60)])
         lines.append(_format_table(rows))
 
@@ -8493,7 +8776,7 @@ def render_powershell_summary(
             reverse=True,
         )
         for ip in ranked_ips[:limit]:
-            macs = ", ".join(summary.ip_to_macs.get(ip, [])) or "-"
+            macs = _annotate_macs(summary.ip_to_macs.get(ip, []))
             rows.append([ip, _truncate_text(macs, 60)])
         lines.append(_format_table(rows))
 
@@ -13133,6 +13416,13 @@ def render_files_summary(
         detections = list(getattr(summary, "detections", []) or [])
         checks = getattr(summary, "deterministic_checks", {}) or {}
 
+        def _occurrence_weight(item: dict[str, Any]) -> int:
+            try:
+                value = int(item.get("occurrences", 1) or 1)
+            except Exception:
+                value = 1
+            return max(1, value)
+
         def _check_count(key: str) -> int:
             values = checks.get(key, []) if isinstance(checks, dict) else []
             return len([v for v in (values or []) if str(v).strip()])
@@ -13155,12 +13445,14 @@ def render_files_summary(
             reasons.append(f"{key.replace('_', ' ')} evidence ({count})")
 
         high_findings = sum(
-            1
+            _occurrence_weight(d)
             for d in detections
             if str(d.get("severity", "")).lower() in {"high", "critical"}
         )
         warn_findings = sum(
-            1 for d in detections if str(d.get("severity", "")).lower() == "warning"
+            _occurrence_weight(d)
+            for d in detections
+            if str(d.get("severity", "")).lower() == "warning"
         )
         if high_findings:
             score += min(3, high_findings)
@@ -13319,7 +13611,6 @@ def render_files_summary(
                     str,
                     str,
                     int | None,
-                    int | None,
                 ],
                 dict[str, Any],
             ] = {}
@@ -13334,22 +13625,28 @@ def render_files_summary(
                     str,
                     str,
                     int | None,
-                    int | None,
                 ]
             ] = []
 
             for item in summary.artifacts:
+                display_hostname = str(getattr(item, "hostname", None) or "-")
+                display_content_type = str(getattr(item, "content_type", "-") or "-")
+                display_note = str(getattr(item, "note", None) or "-")
+                display_size = (
+                    format_bytes_as_mb(item.size_bytes)
+                    if item.size_bytes is not None
+                    else "-"
+                )
                 key = (
                     str(getattr(item, "protocol", "") or ""),
                     str(getattr(item, "filename", "") or ""),
                     str(getattr(item, "file_type", "") or ""),
                     str(getattr(item, "src_ip", "") or ""),
                     str(getattr(item, "dst_ip", "") or ""),
-                    str(getattr(item, "hostname", "") or ""),
-                    str(getattr(item, "content_type", "") or ""),
-                    str(getattr(item, "note", "") or ""),
-                    getattr(item, "src_port", None),
-                    getattr(item, "dst_port", None),
+                    display_hostname,
+                    display_content_type,
+                    display_note,
+                    display_size,
                 )
                 packet_idx = int(getattr(item, "packet_index", 0) or 0)
                 if key not in buckets:
@@ -13629,7 +13926,14 @@ def render_files_summary(
                 marker = danger("[HIGH]")
             else:
                 marker = ok("[INFO]")
-            lines.append(f"{marker} {summary_text}")
+            occurrence_suffix = ""
+            try:
+                occurrences = int(item.get("occurrences", 1) or 1)
+            except Exception:
+                occurrences = 1
+            if occurrences > 1:
+                occurrence_suffix = f" [x{occurrences}]"
+            lines.append(f"{marker} {summary_text}{occurrence_suffix}")
             if details:
                 lines.append(muted(f"  {details}"))
             if top_sources:
@@ -18703,10 +19007,6 @@ def render_timeline_summary(
         lines.append(_format_kv("Last Seen", format_ts(summary.last_seen)))
     if summary.duration is not None:
         lines.append(_format_kv("Duration", f"{summary.duration:.1f}s"))
-    if summary.peer_counts:
-        lines.append(_format_kv("Unique Peers", str(len(summary.peer_counts))))
-    if summary.port_counts:
-        lines.append(_format_kv("Unique Ports", str(len(summary.port_counts))))
     if summary.ot_risk_score:
         risk_level = "LOW"
         if summary.ot_risk_score >= 60:
@@ -19701,22 +20001,6 @@ def render_timeline_summary(
         ):
             graph = sparkline(bins)
             lines.append(muted(f"- {name}: {graph} ({sum(bins)})"))
-
-    if summary.peer_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Peers"))
-        peer_items = Counter(summary.peer_counts).most_common()
-        for peer, count in peer_items:
-            peer_text = _highlight_ips(peer, summary.target_ip)
-            lines.append(muted(f"- {peer_text}: {count}"))
-
-    if summary.port_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Ports"))
-        port_items = Counter(summary.port_counts).most_common()
-        for port, count in port_items:
-            svc = COMMON_PORTS.get(port, "-")
-            lines.append(muted(f"- {port} ({svc}): {count}"))
 
     for idx, line in enumerate(lines):
         if line == SECTION_BAR or line == SUBSECTION_BAR:
@@ -22558,6 +22842,52 @@ def _render_ot_protocol_summary(
     artifacts = getattr(summary, "artifacts", [])
     anomalies = getattr(summary, "anomalies", [])
     errors = getattr(summary, "errors", [])
+    is_rollup = str(getattr(getattr(summary, "path", None), "name", "")) == "ALL_PCAPS"
+
+    def _collapse_artifacts_for_display(
+        values: list[object],
+    ) -> list[tuple[object, int]]:
+        if not is_rollup:
+            return [(item, 1) for item in values]
+        buckets: dict[tuple[str, str, str, str], tuple[object, int]] = {}
+        order: list[tuple[str, str, str, str]] = []
+        for item in values:
+            key = (
+                str(getattr(item, "kind", "") or ""),
+                str(getattr(item, "detail", "") or ""),
+                str(getattr(item, "src", "") or ""),
+                str(getattr(item, "dst", "") or ""),
+            )
+            existing = buckets.get(key)
+            if existing is None:
+                buckets[key] = (item, 1)
+                order.append(key)
+            else:
+                buckets[key] = (existing[0], existing[1] + 1)
+        return [buckets[key] for key in order]
+
+    def _collapse_anomalies_for_display(
+        values: list[object],
+    ) -> list[tuple[object, int]]:
+        if not is_rollup:
+            return [(item, 1) for item in values]
+        buckets: dict[tuple[str, str, str, str, str], tuple[object, int]] = {}
+        order: list[tuple[str, str, str, str, str]] = []
+        for item in values:
+            key = (
+                str(getattr(item, "severity", "") or ""),
+                str(getattr(item, "title", "") or ""),
+                str(getattr(item, "description", "") or ""),
+                str(getattr(item, "src", "") or ""),
+                str(getattr(item, "dst", "") or ""),
+            )
+            existing = buckets.get(key)
+            if existing is None:
+                buckets[key] = (item, 1)
+                order.append(key)
+            else:
+                buckets[key] = (existing[0], existing[1] + 1)
+        return [buckets[key] for key in order]
 
     def _summarize_buckets(
         buckets: list[_SizeBucketLike],
@@ -22675,11 +23005,21 @@ def _render_ot_protocol_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Artifacts & Observations"))
         rows = [["Type", "Detail", "Src", "Dst"]]
-        for artifact in artifacts[: _limit_value(16)]:
+        collapsed_artifacts = _collapse_artifacts_for_display(list(artifacts))
+        if is_rollup and len(collapsed_artifacts) < len(list(artifacts)):
+            lines.append(
+                muted(
+                    f"Summarized view collapsed {len(list(artifacts)) - len(collapsed_artifacts)} duplicate artifact observation(s)."
+                )
+            )
+        for artifact, seen_count in collapsed_artifacts[: _limit_value(16)]:
+            detail_text = str(getattr(artifact, "detail", ""))[: _limit_value(80)]
+            if seen_count > 1:
+                detail_text = f"{detail_text} [x{seen_count}]"
             rows.append(
                 [
                     str(getattr(artifact, "kind", "artifact")),
-                    str(getattr(artifact, "detail", ""))[: _limit_value(80)],
+                    detail_text,
                     str(getattr(artifact, "src", "?")),
                     str(getattr(artifact, "dst", "?")),
                 ]
@@ -22793,12 +23133,22 @@ def _render_ot_protocol_summary(
     if anomalies:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Anomalies & Threat Indicators"))
-        for anomaly in anomalies[: _limit_value(16)]:
+        collapsed_anomalies = _collapse_anomalies_for_display(list(anomalies))
+        if is_rollup and len(collapsed_anomalies) < len(list(anomalies)):
+            lines.append(
+                muted(
+                    f"Summarized view collapsed {len(list(anomalies)) - len(collapsed_anomalies)} duplicate anomaly signal(s)."
+                )
+            )
+        for anomaly, seen_count in collapsed_anomalies[: _limit_value(16)]:
             sev = getattr(anomaly, "severity", "INFO")
             sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
+            title_text = str(getattr(anomaly, "title", "Event"))
+            if seen_count > 1:
+                title_text = f"{title_text} [x{seen_count}]"
             lines.append(
                 sev_color(
-                    f"[{sev}] {getattr(anomaly, 'title', 'Event')}: {getattr(anomaly, 'description', '')}"
+                    f"[{sev}] {title_text}: {getattr(anomaly, 'description', '')}"
                 )
             )
             lines.append(

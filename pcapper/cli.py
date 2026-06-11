@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import difflib
 import glob
 import inspect
@@ -9,6 +10,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -236,6 +238,8 @@ from .reporting import (
     render_wlan_summary,
     render_wmic_summary,
     render_yokogawa_summary,
+    set_oui_annotation,
+    set_quiet_mode,
     set_verbose_output,
 )
 from .routing import analyze_routing, merge_routing_summaries
@@ -640,6 +644,26 @@ def _collect_argv_options(argv: list[str]) -> set[str]:
         if token.startswith("-"):
             options.add(token.split("=", 1)[0])
     return options
+
+
+def _normalize_timeline_category_argv(argv: list[str]) -> list[str]:
+    normalized = list(argv)
+    category_flags = {"-categories", "--timeline-categories"}
+    idx = 0
+    while idx < len(normalized):
+        token = normalized[idx]
+        if token in category_flags and idx + 2 < len(normalized):
+            if normalized[idx + 1] == "-not":
+                candidate = normalized[idx + 2]
+                if candidate and not candidate.startswith("-"):
+                    normalized[idx + 1], normalized[idx + 2] = (
+                        normalized[idx + 2],
+                        normalized[idx + 1],
+                    )
+                    idx += 3
+                    continue
+        idx += 1
+    return normalized
 
 
 def _coerce_config_value(action: argparse.Action, value: Any) -> Any:
@@ -1075,6 +1099,32 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Disable the processing status bar.",
     )
     general.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help=(
+            "Programmatic-friendly output: suppress the startup ASCII banner, "
+            "the trailing 'Output is summarized/truncated' footers, and the "
+            "scapy module-loading warnings on stderr. Designed for downstream "
+            "consumers (e.g. /threathunt review -pcapper). Implies --no-color, "
+            "--no-status, and --oui. Data accuracy and truncation thresholds "
+            "are unaffected — use --verbose if you also want full untruncated "
+            "data."
+        ),
+    )
+    general.add_argument(
+        "--oui",
+        action="store_true",
+        help=(
+            "Annotate MAC addresses in 'Observed MACs' tables with the OUI "
+            "vendor name from scapy's manufdb (e.g. '70:70:8b:67:c1:f2 "
+            "(Honeywell)'). Useful for OT/ICS asset attestation — distinguishes "
+            "Honeywell DCS hosts from Rockwell PLCs, VMware-virtualised IT "
+            "hosts, etc. Default off (preserves existing output format). "
+            "Implied by --quiet."
+        ),
+    )
+    general.add_argument(
         "--profile",
         action="store_true",
         help="Enable cProfile and print a performance summary to stderr.",
@@ -1132,9 +1182,8 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     )
     general.add_argument(
         "-summarize",
-        "--summarize",
         action="store_true",
-        help="Summarize supported analysis across all pcaps (e.g., --modbus, --dnp3).",
+        help="Summarize supported analysis across all pcaps (e.g., --modbus, --dnp3). Use single-dash -summarize.",
     )
     general.add_argument(
         "-v",
@@ -1188,6 +1237,12 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         dest="timeline_categories",
         metavar="LIST",
         help="Comma-separated timeline event categories to include (use -categories false or empty to list supported categories).",
+    )
+    general.add_argument(
+        "-not",
+        dest="timeline_categories_invert",
+        action="store_true",
+        help="Invert -categories/--timeline-categories selection for --timeline (exclude listed categories).",
     )
     general.add_argument(
         "--time-start",
@@ -1903,6 +1958,7 @@ def _analyze_paths(
     timeline_bins: int,
     timeline_storyline_off: bool,
     timeline_categories: set[str] | None,
+    timeline_categories_invert: bool,
     show_ntlm: bool,
     show_netbios: bool,
     show_arp: bool,
@@ -2002,7 +2058,7 @@ def _analyze_paths(
     if not paths:
         return 1
 
-    # Keep single-pcap behavior identical with/without --summarize.
+    # Keep single-pcap behavior identical with/without -summarize.
     # Rollup rendering is only meaningful when multiple pcaps are supplied.
     summarize_rollups = summarize and len(paths) > 1
     render_base_summary = show_base or len(ordered_steps) == 0
@@ -3060,6 +3116,7 @@ def _analyze_paths(
                     timeline_bins=timeline_bins,
                     timeline_storyline_off=timeline_storyline_off,
                     categories=timeline_categories,
+                    invert_categories=timeline_categories_invert,
                     vt_lookup=dns_vt,
                 )
                 if summarize_rollups:
@@ -3499,6 +3556,162 @@ def _analyze_paths(
             print(render_summary(merged_base, protocol_limit=protocol_limit))
             if rollups or modbus_rollups or dnp3_rollups:
                 print()
+
+        def _dedupe_sequence(values: list[object]) -> list[object]:
+            deduped: list[object] = []
+            seen: set[tuple[str, str]] = set()
+            for value in values:
+                try:
+                    key = ("hash", str(hash(value)))
+                except Exception:
+                    key = ("repr", repr(value))
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(value)
+            return deduped
+
+        def _merge_generic_rollup_value(
+            left: object, right: object, field_name: str | None = None
+        ) -> object:
+            if right is None:
+                return left
+            if left is None:
+                return copy.deepcopy(right)
+
+            if isinstance(left, Counter) and isinstance(right, Counter):
+                merged_counter = Counter(left)
+                merged_counter.update(right)
+                return merged_counter
+
+            if isinstance(left, dict) and isinstance(right, dict):
+                merged_dict = copy.deepcopy(left)
+                for key, value in right.items():
+                    key_str = str(key)
+                    if key in merged_dict:
+                        merged_dict[key] = _merge_generic_rollup_value(
+                            merged_dict[key], value, key_str
+                        )
+                    else:
+                        merged_dict[key] = copy.deepcopy(value)
+                return merged_dict
+
+            if isinstance(left, list) and isinstance(right, list):
+                merged_list = list(left) + list(right)
+                if field_name in {
+                    "errors",
+                    "warnings",
+                    "notes",
+                    "benign_context",
+                    "indicators",
+                }:
+                    return _dedupe_sequence(merged_list)
+                return merged_list
+
+            if isinstance(left, set) and isinstance(right, set):
+                return set(left) | set(right)
+
+            if isinstance(left, bool) and isinstance(right, bool):
+                return bool(left) or bool(right)
+
+            if (
+                isinstance(left, (int, float))
+                and isinstance(right, (int, float))
+                and not isinstance(left, bool)
+                and not isinstance(right, bool)
+            ):
+                return left + right
+
+            if isinstance(left, str) and isinstance(right, str):
+                return left if left else right
+
+            if hasattr(left, "__dict__") and hasattr(right, "__dict__"):
+                merged_object = copy.deepcopy(left)
+                if _merge_generic_rollup_object(merged_object, right):
+                    return merged_object
+                return left
+
+            return left
+
+        def _merge_generic_rollup_object(left_obj: object, right_obj: object) -> bool:
+            if not hasattr(left_obj, "__dict__") or not hasattr(right_obj, "__dict__"):
+                return False
+            try:
+                right_fields = vars(right_obj)
+            except Exception:
+                return False
+            for field_name, right_value in right_fields.items():
+                if field_name == "path":
+                    continue
+                try:
+                    left_value = getattr(left_obj, field_name, None)
+                    merged_value = _merge_generic_rollup_value(
+                        left_value, right_value, field_name
+                    )
+                    setattr(left_obj, field_name, merged_value)
+                except Exception:
+                    continue
+            return True
+
+        def _merge_generic_rollup_summaries(values: list[object]) -> object | None:
+            if not values:
+                return None
+            if len(values) == 1:
+                merged_single = copy.deepcopy(values[0])
+                if hasattr(merged_single, "path"):
+                    try:
+                        setattr(merged_single, "path", Path("ALL_PCAPS"))
+                    except Exception:
+                        pass
+                return merged_single
+            merged = copy.deepcopy(values[0])
+            for item in values[1:]:
+                if not _merge_generic_rollup_object(merged, item):
+                    return None
+            if hasattr(merged, "path"):
+                try:
+                    setattr(merged, "path", Path("ALL_PCAPS"))
+                except Exception:
+                    pass
+            if hasattr(merged, "errors"):
+                try:
+                    errors = list(getattr(merged, "errors", []) or [])
+                    setattr(merged, "errors", _dedupe_sequence(errors))
+                except Exception:
+                    pass
+            if len(values) > 1:
+                merged_path_name = str(getattr(getattr(merged, "path", None), "name", ""))
+                if merged_path_name != "ALL_PCAPS":
+                    return None
+            return merged
+
+        rollup_renderer_aliases = {
+            "lldp": "render_lldp_dcp_summary",
+        }
+
+        def _render_auto_rollup(step_name: str, merged_summary: object) -> str | None:
+            render_fn_name = rollup_renderer_aliases.get(
+                step_name, f"render_{step_name}_summary"
+            )
+            render_fn = globals().get(render_fn_name)
+            if not callable(render_fn):
+                return None
+            try:
+                signature = inspect.signature(render_fn)
+            except Exception:
+                signature = None
+            kwargs: dict[str, object] = {}
+            if signature is not None:
+                if "verbose" in signature.parameters:
+                    kwargs["verbose"] = verbose
+                if "show_timeline" in signature.parameters:
+                    kwargs["show_timeline"] = show_timeline
+            try:
+                return render_fn(merged_summary, **kwargs)
+            except Exception:
+                return None
+
+        fallback_merged_rollups: dict[str, object] = {}
         merge_handlers: dict[str, tuple[callable, callable]] = {
             "ips": (
                 merge_ips_summaries,
@@ -3801,11 +4014,24 @@ def _analyze_paths(
                     merged = merge_fn(rollups[step])
                     print(render_fn(merged))
                 else:
-                    print(
-                        render_generic_rollup(
-                            title_map.get(step, step.upper()), rollups[step]
+                    merged = _merge_generic_rollup_summaries(rollups[step])
+                    if merged is not None:
+                        fallback_merged_rollups[step] = merged
+                        rendered = _render_auto_rollup(step, merged)
+                        if rendered:
+                            print(rendered)
+                        else:
+                            print(
+                                render_generic_rollup(
+                                    title_map.get(step, step.upper()), [merged]
+                                )
+                            )
+                    else:
+                        print(
+                            render_generic_rollup(
+                                title_map.get(step, step.upper()), rollups[step]
+                            )
                         )
-                    )
                 print()
         if rollups.get("vlan"):
             print(render_vlan_rollup(rollups["vlan"], verbose=verbose))
@@ -3824,8 +4050,14 @@ def _analyze_paths(
                 if key in plugin_lookup and plugin_lookup[key].merge:
                     spec = plugin_lookup[key]
                     merged_summaries[spec.export_key or spec.name] = spec.merge(values)
+                elif key in merge_handlers:
+                    merge_fn, _render_fn = merge_handlers[key]
+                    merged_summaries[key] = merge_fn(values)
+                elif key in fallback_merged_rollups:
+                    merged_summaries[key] = fallback_merged_rollups[key]
                 else:
-                    merged_summaries[key] = values
+                    merged = _merge_generic_rollup_summaries(values)
+                    merged_summaries[key] = merged if merged is not None else values
             if rules_rollups:
                 merged_summaries["rules"] = merge_rules_summaries(rules_rollups)
             if correlation_summary:
@@ -3919,19 +4151,20 @@ def _analyze_paths(
 def main() -> int:
     plugins, plugin_errors = _filtered_plugins(_builtin_flag_map())
     parser = build_parser(plugins)
-    if _handle_help_request(parser, plugins, sys.argv[1:]):
+    argv = _normalize_timeline_category_argv(sys.argv[1:])
+    if _handle_help_request(parser, plugins, argv):
         return 0
-    if len(sys.argv) == 1:
+    if len(argv) == 0:
         print(_build_banner())
         print("Usage: pcapper <target> [options]")
         print("Run with -h for full help and options.")
         return 0
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     config_path = find_config(
         getattr(args, "config", None) or os.environ.get("PCAPPER_CONFIG")
     )
     config_result = load_config(config_path)
-    _apply_config_defaults(parser, args, config_result.data, sys.argv[1:])
+    _apply_config_defaults(parser, args, config_result.data, argv)
     baseline_save = getattr(args, "baseline_save", None)
     baseline_compare = getattr(args, "baseline_compare", None)
     baseline_requested = bool(baseline_save or baseline_compare)
@@ -3985,7 +4218,23 @@ def main() -> int:
         )
         parser.print_usage(sys.stderr)
         return 2
-    print(_build_banner())
+    # --quiet wires four things: tell the reporter to skip the trailing
+    # "Output is summarized" footer; skip the startup ASCII banner here;
+    # imply --no-color and --no-status so we don't emit ANSI escapes or a
+    # progress bar into a programmatic consumer's pipe; restore real stderr
+    # (it was redirected to a buffer in __init__.py for the scapy import
+    # chain). Defaults unchanged when --quiet is absent.
+    if getattr(args, "quiet", False):
+        set_quiet_mode(True)
+        args.no_color = True
+        args.no_status = True
+        args.oui = True
+        from . import _restore_stderr_if_suppressed
+        _restore_stderr_if_suppressed()
+    if getattr(args, "oui", False):
+        set_oui_annotation(True)
+    if not getattr(args, "quiet", False):
+        print(_build_banner())
     if rules_errors:
         print("Rule load warnings:")
         for err in rules_errors:
@@ -4050,6 +4299,9 @@ def main() -> int:
         if invalid_text:
             _print_error(f"Unknown timeline categories: {invalid_text}")
         _print_timeline_categories()
+        return 2
+    if getattr(args, "timeline_categories_invert", False) and not timeline_categories:
+        _print_error("-not requires -categories/--timeline-categories with one or more values.")
         return 2
 
     if args.no_color:
@@ -4456,6 +4708,9 @@ def main() -> int:
             timeline_bins=args.timeline_bins,
             timeline_storyline_off=args.timeline_storyline_off,
             timeline_categories=timeline_categories,
+            timeline_categories_invert=bool(
+                getattr(args, "timeline_categories_invert", False)
+            ),
             show_ntlm=args.ntlm,
             show_netbios=args.netbios,
             show_arp=args.arp,
