@@ -22,6 +22,43 @@ except Exception:  # pragma: no cover
     IPv6 = None  # type: ignore
     Raw = None  # type: ignore
 
+try:
+    from scapy.layers.dns import DNS  # type: ignore
+except Exception:  # pragma: no cover
+    DNS = None  # type: ignore
+
+
+def _extract_dns_names(pkt) -> list[str]:
+    """Decoded DNS query/answer names (dotted, lowercased). Needed because DNS
+    on the wire uses length-prefixed labels, so a dotted IOC domain never
+    matches the raw packet bytes via substring search."""
+    if DNS is None:
+        return []
+    try:
+        if not pkt.haslayer(DNS):  # type: ignore[truthy-bool]
+            return []
+        dns = pkt[DNS]  # type: ignore[index]
+    except Exception:
+        return []
+    names: list[str] = []
+    for section in ("qd", "an"):
+        recs = getattr(dns, section, None)
+        if not recs:
+            continue
+        if not isinstance(recs, (list, tuple)):
+            recs = [recs]
+        for rr in recs:
+            try:
+                name = getattr(rr, "qname", None) or getattr(rr, "rrname", None)
+            except Exception:
+                name = None
+            if not name:
+                continue
+            if isinstance(name, (bytes, bytearray)):
+                name = name.decode("latin-1", errors="ignore")
+            names.append(str(name).rstrip(".").lower())
+    return names
+
 
 @dataclass(frozen=True)
 class IocSummary:
@@ -147,9 +184,36 @@ def _extract_payload(pkt) -> bytes:
     return b""
 
 
+def _compile_domain_patterns(domains: set[str]) -> list[tuple[str, "re.Pattern[str]"]]:
+    """Compile label-boundary patterns for IOC domains.
+
+    A bare substring test ("domain in text") matches inside unrelated names —
+    IOC "ic.com" would hit "magic.com". Require that the match is not
+    preceded or followed by a hostname character, so "evil.com" still matches
+    "sub.evil.com" (preceded by ".") but not "evilx.com" or "notevil.community".
+    """
+    patterns: list[tuple[str, "re.Pattern[str]"]] = []
+    for domain in domains:
+        try:
+            patterns.append(
+                (
+                    domain,
+                    re.compile(
+                        r"(?<![a-z0-9-])"
+                        + re.escape(domain)
+                        + r"(?![a-z0-9-])"
+                    ),
+                )
+            )
+        except Exception:
+            continue
+    return patterns
+
+
 def analyze_iocs(path: Path, ioc_path: Path, show_status: bool = True) -> IocSummary:
     errors: list[str] = []
     ips, domains, hashes, meta = _load_iocs(ioc_path, errors=errors)
+    domain_patterns = _compile_domain_patterns(domains)
     ip_hits: Counter[str] = Counter()
     domain_hits: Counter[str] = Counter()
     hash_hits: Counter[str] = Counter()
@@ -195,12 +259,21 @@ def analyze_iocs(path: Path, ioc_path: Path, show_status: bool = True) -> IocSum
             if dst_ip and dst_ip in ips:
                 ip_hits[dst_ip] += 1
 
-            if domains:
+            if domain_patterns:
                 payload = _extract_payload(pkt)
                 if payload:
                     text = payload.decode("latin-1", errors="ignore").lower()
-                    for domain in domains:
-                        if domain in text:
+                    for domain, pattern in domain_patterns:
+                        # Cheap substring pre-filter before the boundary check.
+                        if domain in text and pattern.search(text):
+                            domain_hits[domain] += 1
+                # DNS query/answer names are length-prefix encoded on the wire,
+                # so the raw-payload search above can't see them -- match the
+                # decoded names explicitly (TLS SNI is contiguous and is already
+                # covered by the payload search).
+                for dns_name in _extract_dns_names(pkt):
+                    for domain, _pattern in domain_patterns:
+                        if domain == dns_name or dns_name.endswith("." + domain):
                             domain_hits[domain] += 1
 
     finally:

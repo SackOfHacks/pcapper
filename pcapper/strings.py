@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_public_ip as _is_public_ip, extract_ascii_strings as _extract_ascii_strings
+from .utils import extract_utf16le_strings as _extract_utf16le_strings
 import os
 import re
 from collections import Counter, defaultdict
@@ -124,63 +125,11 @@ def _get_ip_pair(pkt: Packet) -> Tuple[str, str]:
     return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
 
-def _extract_ascii_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> List[str]:
-    results: List[str] = []
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
-def _extract_utf16le_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> List[str]:
-    results: List[str] = []
-    current = bytearray()
-    i = 0
-    while i + 1 < len(data):
-        ch = data[i]
-        if 32 <= ch <= 126 and data[i + 1] == 0x00:
-            current.append(ch)
-            i += 2
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-            i += 2
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
 def _match_suspicious(value: str) -> Optional[str]:
     for pattern, reason in SUSPICIOUS_PATTERNS:
         if pattern.search(value):
             return reason
     return None
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(value)
-        return not (
-            ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
-        )
-    except Exception:
-        return False
 
 
 def _append_check(
@@ -430,7 +379,9 @@ def analyze_strings(
             or "powershell -enc" in lowered
         ):
             _append_check(deterministic_checks, "command_execution_or_lolbin", evidence)
-        if EXFIL_PATTERN.search(text) or "http://" in lowered or "https://" in lowered:
+        # A bare URL is not a stager indicator — every HTML page / Referer /
+        # JSON body contains one. Require an actual download/exfil pattern.
+        if EXFIL_PATTERN.search(text):
             _append_check(deterministic_checks, "download_stager_or_exfil", evidence)
         if C2_PATTERN.search(text):
             _append_check(deterministic_checks, "c2_or_beacon_markers", evidence)

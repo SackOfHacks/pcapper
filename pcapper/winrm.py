@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .utils import is_public_ip as _is_public_ip
+from .utils import beacon_score as _beaconing_score
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -200,27 +202,6 @@ class _SessionState:
             self.hosts = Counter()
 
 
-def _extract_ascii_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> list[str]:
-    results: list[str] = []
-    if not data:
-        return results
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
 def _scan_plaintext(
     payload: bytes,
     plaintext_counter: Counter[str],
@@ -276,25 +257,7 @@ def _direction(
     return src_ip, dst_ip, sport, dport
 
 
-def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance**0.5
-    if avg < 5 or avg > 86400:
-        return None
-    if stddev > max(5.0, avg * 0.25):
-        return None
-    return {"avg": avg, "stddev": stddev}
-
-
+@memoize_analysis
 def analyze_winrm(
     path: Path,
     show_status: bool = True,
@@ -393,7 +356,7 @@ def analyze_winrm(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
@@ -682,12 +645,6 @@ def analyze_winrm(
     }
     threat_hypotheses: list[dict[str, object]] = []
     benign_context: list[str] = []
-
-    def _is_public_ip(value: str) -> bool:
-        try:
-            return ipaddress.ip_address(str(value)).is_global
-        except Exception:
-            return False
 
     if http_sessions > 0:
         deterministic_checks["winrm_plaintext_exposure"].append(

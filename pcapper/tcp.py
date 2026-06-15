@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_private_ip as _is_private_ip
+from .utils import is_public_ip as _is_public_ip
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -12,7 +13,7 @@ from .http import analyze_http
 from .pcap_cache import get_reader
 from .progress import run_with_busy_status
 from .services import analyze_services
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, format_duration, format_ts, memoize_analysis, packet_length, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -143,20 +144,6 @@ def _stats_from_samples(samples: list[int]) -> dict[str, float]:
     }
 
 
-def _is_private_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_private
-    except Exception:
-        return False
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
-
-
 def _build_tcp_enrichment(
     *,
     tcp_packets: int,
@@ -173,17 +160,127 @@ def _build_tcp_enrichment(
     _ = (
         tcp_packets,
         conversations,
-        detections,
         retrans_counts,
         zero_window_counts,
         small_window_counts,
         src_to_ports,
         src_to_dsts,
         src_port_dsts,
-        outbound_flow_bytes,
     )
-    return {}
+    checks: dict[str, list[str]] = defaultdict(list)
 
+    # Map the analyzer's already-thresholded detections to triage categories
+    # (reusing validated detections keeps false positives low).
+    for det in detections:
+        if str(det.get("severity", "info")).lower() == "info":
+            continue
+        summary_text = str(det.get("summary", ""))
+        blob = summary_text.lower()
+        ev = summary_text + (f" — {det.get('details','')}" if det.get("details") else "")
+        if any(
+            t in blob
+            for t in (
+                "port scan",
+                "port sweep",
+                "probing",
+                "without syn-ack",
+                "syn flood",
+                "null scan",
+                "fin scan",
+                "xmas scan",
+                "ack scan",
+                "land attack",
+            )
+        ):
+            checks["handshake_asymmetry_or_recon"].append(ev)
+        if "host sweep" in blob:
+            checks["lateral_movement_surface"].append(ev)
+        if "rst" in blob:
+            checks["rst_teardown_abuse"].append(ev)
+        if any(t in blob for t in ("retransmission", "zero-window", "small-window")):
+            checks["transport_window_or_retrans_abuse"].append(ev)
+        if "beacon" in blob or "periodic" in blob or "cadence" in blob:
+            checks["tcp_periodic_cadence"].append(ev)
+
+    # Egress exfil outlier: a large sustained outbound transfer to a public host.
+    # Conservative threshold so ordinary downloads/uploads don't fire.
+    for (src, dst), nbytes in (outbound_flow_bytes or {}).items():
+        if nbytes >= 100 * 1024 * 1024 and _is_public_ip(str(dst)):
+            checks["egress_exfil_outlier"].append(
+                f"{src} -> {dst}: {nbytes / (1024 * 1024):.0f} MB outbound to public host"
+            )
+
+    score = 0
+    reasons: list[str] = []
+    if checks.get("egress_exfil_outlier"):
+        score += 3
+        reasons.append("Large outbound transfer to a public host (possible exfiltration)")
+    if checks.get("lateral_movement_surface"):
+        score += 2
+        reasons.append("Host-sweep / lateral-movement surface observed")
+    if checks.get("handshake_asymmetry_or_recon"):
+        score += 2
+        reasons.append("TCP reconnaissance (port scan / sweep / SYN probing)")
+    if checks.get("tcp_periodic_cadence"):
+        score += 2
+        reasons.append("Periodic TCP cadence (possible beaconing)")
+    if checks.get("rst_teardown_abuse"):
+        score += 1
+        reasons.append("Elevated RST/teardown activity")
+    high_ct = sum(
+        1
+        for d in detections
+        if str(d.get("severity", "")).lower() in {"high", "critical"}
+    )
+    if high_ct:
+        reasons.append(f"High-severity TCP detections: {high_ct}")
+
+    if score >= 6:
+        verdict = "YES - high-confidence malicious TCP behavior (exfil / scanning / lateral movement) is present."
+        confidence = "high"
+    elif score >= 4:
+        verdict = "LIKELY - suspicious TCP behavior with attack indicators is present."
+        confidence = "medium"
+    elif score >= 2:
+        verdict = "POSSIBLE - notable TCP behavior (recon/teardown) observed; corroboration recommended."
+        confidence = "low"
+    elif score >= 1:
+        verdict = "LOW SIGNAL - minor TCP anomalies present but not strongly corroborated."
+        confidence = "low"
+    else:
+        verdict = ""
+        confidence = "low"
+    if not reasons and verdict:
+        reasons.append("TCP anomaly heuristics crossed threshold")
+
+    _risk_meta = {
+        "egress_exfil_outlier": ("Egress Exfil Outlier", "High"),
+        "lateral_movement_surface": ("Lateral Movement Surface", "High"),
+        "handshake_asymmetry_or_recon": ("Recon / Scan", "Medium"),
+        "tcp_periodic_cadence": ("Periodic Beaconing", "Medium"),
+        "rst_teardown_abuse": ("RST/Teardown Abuse", "Medium"),
+        "transport_window_or_retrans_abuse": ("Retrans/Window Abuse", "Low"),
+    }
+    risk_matrix = [
+        {
+            "category": cat,
+            "risk": risk,
+            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
+            "evidence": f"{len(checks.get(key, []))} signal(s)",
+        }
+        for key, (cat, risk) in _risk_meta.items()
+        if checks.get(key)
+    ]
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons,
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
+        "risk_matrix": risk_matrix,
+    }
+
+@memoize_analysis
 def analyze_tcp(
     path: Path,
     show_status: bool = True,
@@ -315,7 +412,7 @@ def analyze_tcp(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
 
@@ -339,11 +436,37 @@ def analyze_tcp(
             flags_val = int(flags)
             seq = int(getattr(tcp_layer, "seq", 0))
             window = int(getattr(tcp_layer, "window", 0))
+            # Derive the true TCP segment data length from the IP length fields.
+            # bytes(tcp_layer.payload) is wrong for small frames: scapy attaches
+            # Ethernet padding (frames are padded to the 60-byte minimum) as a
+            # Padding layer under TCP, so a data-less scan packet (NULL/FIN/Xmas/
+            # ACK) reports a non-zero payload and the `payload_len == 0` scan
+            # checks silently never fire. IP header math is immune to padding.
             payload_len = 0
             try:
-                payload_len = len(bytes(tcp_layer.payload))
+                ip4 = pkt.getlayer(IP) if IP is not None else None
+                if ip4 is not None and getattr(ip4, "ihl", None):
+                    payload_len = max(
+                        0,
+                        int(getattr(ip4, "len", 0))
+                        - int(ip4.ihl) * 4
+                        - int(getattr(tcp_layer, "dataofs", 5)) * 4,
+                    )
+                else:
+                    ip6 = pkt.getlayer(IPv6) if IPv6 is not None else None
+                    if ip6 is not None and getattr(ip6, "plen", None) is not None:
+                        payload_len = max(
+                            0,
+                            int(ip6.plen)
+                            - int(getattr(tcp_layer, "dataofs", 5)) * 4,
+                        )
+                    else:
+                        payload_len = len(bytes(tcp_layer.payload))
             except Exception:
-                payload_len = 0
+                try:
+                    payload_len = len(bytes(tcp_layer.payload))
+                except Exception:
+                    payload_len = 0
 
             client_key = src_ip or "-"
             server_key = dst_ip or "-"
@@ -636,10 +759,26 @@ def analyze_tcp(
             }
         )
 
+    # A single client opening SYNs to many hosts on the same port is a host
+    # sweep — but on ordinary web ports that pattern is indistinguishable from
+    # normal browsing. The discriminator is handshake completion: browsers
+    # complete the TLS/HTTP handshake (SYN-ACK returned) while a scanner mostly
+    # leaves SYNs unanswered. So for web ports only flag when the established
+    # ratio is low; on non-web ports a 50+ host fanout is suspicious regardless.
+    _WEB_SWEEP_PORTS = {80, 443, 8000, 8080, 8443}
     host_sweeps = []
     for (src_ip, dport), dsts in syn_src_port_dsts.items():
-        if len(dsts) >= 50:
-            host_sweeps.append(f"{src_ip} -> *:{dport} ({len(dsts)} hosts)")
+        if len(dsts) < 50:
+            continue
+        if dport in _WEB_SWEEP_PORTS:
+            established = sum(
+                1
+                for d in dsts
+                if syn_ack_triplet_counts.get((src_ip, d, dport), 0) > 0
+            )
+            if established / max(len(dsts), 1) > 0.5:
+                continue  # most handshakes completed -> normal browsing, not a sweep
+        host_sweeps.append(f"{src_ip} -> *:{dport} ({len(dsts)} hosts)")
     if host_sweeps:
         detections.append(
             {
@@ -649,20 +788,26 @@ def analyze_tcp(
             }
         )
 
-    brute_force = []
+    # High SYN count with almost no SYN-ACK means connections are not
+    # establishing — that is connection probing/half-open scanning (or a dead
+    # service / SYN flood), NOT credential brute-force, which requires
+    # completed handshakes before any login attempt. Labeling it "brute-force"
+    # mischaracterizes the activity (e.g. an OT host sweeping EtherNet/IP
+    # devices on 44818 is recon, not a credential attack).
+    probing = []
     for key, syn_count in syn_triplet_counts.items():
         if syn_count < 50:
             continue
         syn_ack = syn_ack_triplet_counts.get(key, 0)
         if syn_ack / max(syn_count, 1) <= 0.1:
             src_ip, dst_ip, dport = key
-            brute_force.append(f"{src_ip} -> {dst_ip}:{dport} ({syn_count} SYN)")
-    if brute_force:
+            probing.append(f"{src_ip} -> {dst_ip}:{dport} ({syn_count} SYN)")
+    if probing:
         detections.append(
             {
                 "severity": "high",
-                "summary": "Potential TCP brute-force/credential probing",
-                "details": ", ".join(brute_force[:5]),
+                "summary": "Potential TCP connection probing (unanswered SYNs)",
+                "details": ", ".join(probing[:5]),
             }
         )
 
@@ -822,7 +967,8 @@ def analyze_tcp(
                 evidence.append(f"ports={top_ports}")
             if flow_first_seen is not None and flow_last_seen is not None:
                 evidence.append(
-                    f"window={flow_first_seen:.3f}->{flow_last_seen:.3f} duration={flow_duration:.1f}s"
+                    f"window={format_ts(flow_first_seen)}->{format_ts(flow_last_seen)} "
+                    f"duration={format_duration(flow_duration)}"
                 )
 
             http_flow_downloads = [

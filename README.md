@@ -180,14 +180,48 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
-## Current Release: v1.9.0
+## What's New in v2.0.0 🚀
 
-Latest additions in this release:
-- Expanded OT transfer detection in `--files` with CIP File Object services and vendor-specific PLC transfer signatures.
-- `--files` OT/ICS artifacts now retain payload data so `-extract`, `-view`, and `-raw` work consistently for supported industrial transfers.
-- Reduced false-positive OT firmware transfer detections by excluding generic HTTP web assets from OT firmware heuristics.
-- CLI help menus and README flag inventories were synchronized with live parser output.
-- Release hygiene now git-ignores sensitive generated forensic output directories (`carved/`, `decrypted/`, `case/`, `case-*/`).
+**v2.0.0 is the threat-hunt / incident-response release** — pcapper graduated from "PCAP analysis" to a full **threat-hunting, forensics, and IR/triage platform** for IT *and* OT/ICS. Every analyzer was reviewed function-by-function so it now reads like an analyst's notebook: a verdict, the evidence, and the ATT&CK technique — never a raw packet dump.
+
+- 🎯 **IT→OT pivot detection** — the #1 industrial intrusion pattern, caught automatically. A remote login (SSH/RDP/WinRM/…) that lands on a host which then issues an OT command to another device is flagged **CRITICAL** across `--threats`, `--overview`, `--compromised`, and shown inline on the `--timeline`.
+- 🛰️ **"Remote IN" timeline events** — inbound remote-access sessions to your focus host, colored by risk (external = CRITICAL, internal = HIGH), so the foothold shows up *before* the control action it enabled.
+- 🔐 **Encrypted-traffic hunting** — JA3/JA4 malware-fingerprint matching, Cobalt Strike default-cert IOCs, **DoH-over-TLS via resolver SNI**, and crackable **Net-NTLM hash** reconstruction (Hashcat-ready).
+- 🏭 **OT/ICS firepower** — ~15 new/expanded industrial analyzers (Synchrophasor/C37.118, BSAP, Genisys, EtherCAT, Modicon UMAS, MELSEC, …), accurate **ATT&CK-for-ICS** mapping with evidence, and full OT output by default.
+- 🧹 **Big correctness + FP audit** — revived several silently-dead detectors (PsExec admin-share/pipe, WMI persistence, Modicon CPU start/stop) and cut a swath of false positives, all validated against ground-truth captures.
+- ⚡ **Faster & leaner** — sub-analyzer memoization (~13%+ faster on OT captures, byte-identical output) and ~2,000 lines of de-duplication.
+
+> See the full breakdown in [CHANGELOG.md](CHANGELOG.md).
+
+### Preview: catching an IT→OT pivot
+
+```text
+$ python -m pcapper attack.pcap -ip 10.0.0.10 --timeline
+
+Activity Timeline
+Time                        | Category   | Summary
+2023-11-14T22:13:20.200000Z | Remote IN  | [CRITICAL] Inbound SSH remote access (external/public source)
+                            |            |   45.137.21.9 -> 10.0.0.10:22 (SSH) established
+2023-11-14T22:13:25.300000Z | Modbus     | [OT Control] Modbus Write Single Register
+                            |            |   10.0.0.10 -> 10.0.0.20:502 unit 1 Write Single Register
+
+$ python -m pcapper attack.pcap --threats
+
+Most Likely Scenarios
+Sev   Source   Detection                                    Top Source      Top Destination
+CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0.0.20(1)
+  Host 10.0.0.10 accepted inbound SSH remote access from 45.137.21.9 (external/public
+  source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
+```
+
+## Current Release: v2.0.0
+
+Headline additions in this release:
+- **IT→OT pivot detection** and high-risk **"Remote IN"** timeline events (SSH/RDP/WinRM/VNC/Telnet/SMB-PsExec) across `--timeline`, `--threats`, `--overview`, and `--compromised`.
+- **CIP/EtherNet-IP commands on the `--timeline`**, plus **DoH-over-SNI** detection in `--encrypted-dns` and **IEC-101/103 control-command** detection.
+- Every analyzer now ships an **Analyst Verdict + evidence + ATT&CK/ATT&CK-ICS** mapping; OT analyzers show full output by default.
+- Revived dead detectors (PsExec admin-share/pipe, WMI persistence, Modicon UMAS CPU start/stop) and a broad false-positive reduction pass — all validated on ground-truth captures.
+- Performance: sub-analyzer memoization (no 3-4× re-parsing in the aggregate views) and ~2,000 lines of behaviour-preserving de-duplication.
 
 ## OT/ICS Command Center
 
@@ -510,6 +544,7 @@ python -m pcapper --help
 - `--decrypt`
 - `--decrypt-limit N`
 - `--decrypt-out DIR`
+- `--cache-mb MB`
 - `--ioc-file PATH`
 - `--json PATH`
 - `--list-plugins`
@@ -699,6 +734,8 @@ Count: 40 flags
 - Set `PCAPPER_QUOTE` to override the banner quote, or `PCAPPER_QUOTE_SEED` for deterministic rotation.
 - Output ordering is deterministic by default; set `PCAPPER_DETERMINISTIC=0` to restore Python's default Counter tie ordering.
 - Use `--self-check` for a quick dependency and environment check, and `--list-plugins` to inspect loaded plugins.
+- Chained steps (e.g. `--ssh --tls --dns`) parse the capture once and share the packet list across all analyzers. Captures are held in memory when they fit the cache budget (default 256 MB total / 64 MB per file; chained runs raise the per-file limit to the total budget). For larger captures, raise the budget with `--cache-mb` (e.g. `--cache-mb 1024`) so multi-step runs avoid re-parsing the file per step — parsed packets occupy roughly 5–10x the file size in RAM. Env equivalents: `PCAPPER_CACHE_MAX_BYTES`, `PCAPPER_CACHE_FILE_MAX_BYTES`, `PCAPPER_CACHE_ENABLED=0`.
+- Analyzers invoked multiple times in one run (top-level step plus internal fan-out from `--threats`, `--overview`, `--hostdetails`, `--ips`, `--files`) are computed once and replayed from an in-memory result cache. Disable with `PCAPPER_ANALYSIS_MEMO=0`.
 
 ## License
 

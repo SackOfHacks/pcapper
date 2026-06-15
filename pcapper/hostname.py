@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+
+from .utils import shannon_entropy as _shannon_entropy
+from .utils import is_public_ip as _is_public_ip
 import ipaddress
-import math
 import re
 import struct
 from collections import Counter, defaultdict
@@ -11,7 +13,7 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import memoize_analysis, safe_float
 
 try:
     from scapy.layers.dhcp import BOOTP, DHCP
@@ -50,19 +52,9 @@ RDP_PORTS = {3389}
 LLDP_ETHERTYPE = 0x88CC
 CDP_SNAP_HEADER = b"\xaa\xaa\x03\x00\x00\x0c\x20\x00"
 CDP_MULTICAST_MAC = "01:00:0c:cc:cc:cc"
-OT_PORT_PROTOCOLS: dict[int, str] = {
-    502: "Modbus",
-    20000: "DNP3",
-    102: "S7/MMS",
-    47808: "BACnet",
-    34962: "PROFINET",
-    34963: "PROFINET",
-    34964: "PROFINET",
-    44818: "EtherNet/IP",
-    2222: "CIP/ENIP",
-    2221: "CIP Security",
-    4840: "OPC UA",
-}
+# Canonical OT port map shared with timeline.py (closes the prior coverage gap
+# where this map silently omitted MELSEC/CODESYS/FINS/HART/etc.).
+from .ot_ports import OT_PORT_PROTOCOLS
 
 HOSTNAME_TOKEN_RE = re.compile(
     r"\b[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?){0,6}\b",
@@ -77,7 +69,11 @@ KERBEROS_SPN_RE = re.compile(
     r"(?i)\b(?:host|cifs|ldap|http|termsrv|mssqlsvc)/([A-Za-z0-9._-]{2,253})"
 )
 SIP_URI_HOST_RE = re.compile(r"(?i)\bsips?:[^@\s;>]+@([A-Za-z0-9._-]{2,253})")
-RDP_COOKIE_RE = re.compile(r"(?i)\bcookie:\s*mstshash=([A-Za-z0-9._-]{2,253})")
+RDP_COOKIE_RE = re.compile(r"(?i)\bcookie:\s*mstshash=([^\r\n\x00]{1,256})")
+HTTP_REQUEST_LINE_RE = re.compile(
+    r"^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT|TRACE)\s+(\S+)(?:\s+HTTP/[\d.]+)?[ \t]*(?:\r?\n|$)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -123,38 +119,113 @@ class HostnameSummary:
     errors: list[str] = field(default_factory=list)
 
 
-def _shannon_entropy(value: str) -> float:
-    if not value:
-        return 0.0
-    freq = Counter(value)
-    total = len(value)
-    return -sum((count / total) * math.log2(count / total) for count in freq.values())
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        ip_obj = ipaddress.ip_address(value)
-        return not (
-            ip_obj.is_private
-            or ip_obj.is_loopback
-            or ip_obj.is_multicast
-            or ip_obj.is_link_local
-            or ip_obj.is_unspecified
-        )
-    except Exception:
-        return False
-
-
 def _build_hostname_enrichment(
     findings: list[HostnameFinding],
 ) -> dict[str, object]:
-    _ = findings
-    return {}
+    checks: dict[str, list[str]] = defaultdict(list)
+
+    def _is_priv(addr: str) -> bool:
+        try:
+            return ipaddress.ip_address(addr).is_private
+        except Exception:
+            return False
+
+    name_to_ips: dict[str, set[str]] = defaultdict(set)
+    ip_to_names: dict[str, set[str]] = defaultdict(set)
+    for f in findings or []:
+        name = _normalize_hostname(str(getattr(f, "hostname", "")))
+        ip = str(getattr(f, "mapped_ip", "") or "")
+        if not name or not ip or _is_ip_literal(name):
+            continue
+        name_to_ips[name].add(ip)
+        ip_to_names[ip].add(name)
+
+    # Hostname collision/spoofing: one INTERNAL hostname mapped to multiple
+    # distinct IPs (name conflict / spoofing). For public names this is normal
+    # load balancing / CDN, so only flag when an internal (private) IP is
+    # involved.
+    for name, ips in name_to_ips.items():
+        if len(ips) < 2:
+            continue
+        if any(_is_priv(ip) for ip in ips):
+            checks["hostname_collision_or_spoofing"].append(
+                f"{name} -> {len(ips)} IPs ({', '.join(sorted(ips)[:4])})"
+            )
+
+    # IP alias / fronting: a single PRIVATE IP presenting many distinct
+    # hostnames (identity ambiguity). Public IPs hosting many names = shared
+    # hosting/CDN (benign), so restrict to internal IPs and a high count.
+    for ip, names in ip_to_names.items():
+        if _is_priv(ip) and len(names) >= 5:
+            checks["ip_alias_or_fronting_anomaly"].append(
+                f"{ip} presents {len(names)} hostnames ({', '.join(sorted(names)[:4])}...)"
+            )
+
+    provenance = []
+    if findings:
+        provenance.append(f"hostname findings ({len(findings)})")
+    if provenance:
+        checks["evidence_provenance"].append("; ".join(provenance))
+
+    score = 0
+    reasons: list[str] = []
+    if checks.get("hostname_collision_or_spoofing"):
+        score += 2
+        reasons.append("Internal hostname resolves to multiple IPs (possible conflict/spoofing)")
+    if checks.get("ip_alias_or_fronting_anomaly"):
+        score += 1
+        reasons.append("An internal IP presents an unusually large set of hostnames")
+
+    if score >= 4:
+        verdict = "LIKELY - hostname identity anomaly with spoofing/conflict indicators is present."
+        confidence = "medium"
+    elif score >= 2:
+        verdict = "POSSIBLE - hostname identity anomaly observed; verify against DHCP/DNS/ARP."
+        confidence = "low"
+    elif score >= 1:
+        verdict = "LOW SIGNAL - minor hostname identity ambiguity present."
+        confidence = "low"
+    else:
+        verdict = ""
+        confidence = "low"
+    if not reasons and verdict:
+        reasons.append("Hostname identity heuristics crossed threshold")
+
+    _risk_meta = {
+        "hostname_collision_or_spoofing": ("Hostname Collision/Spoofing", "Medium"),
+        "ip_alias_or_fronting_anomaly": ("IP Alias/Fronting", "Low"),
+    }
+    risk_matrix = [
+        {
+            "category": cat,
+            "risk": risk,
+            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
+            "evidence": f"{len(checks.get(key, []))} finding(s)",
+        }
+        for key, (cat, risk) in _risk_meta.items()
+        if checks.get(key)
+    ]
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons,
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
+        "risk_matrix": risk_matrix,
+    }
 
 def _normalize_hostname(value: str) -> str:
     hostname = value.strip().strip(".")
     hostname = re.sub(r"\s+", "", hostname)
     return hostname.lower()
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value.strip())
+    except ValueError:
+        return False
+    return True
 
 
 def _is_valid_hostname(value: str) -> bool:
@@ -165,7 +236,10 @@ def _is_valid_hostname(value: str) -> bool:
     labels = value.split(".")
     if len(labels) < 1:
         return False
-    allowed = re.compile(r"^[a-z0-9-]{1,63}$", re.IGNORECASE)
+    # Underscore is invalid in DNS but common in real machine names
+    # (NetBIOS, SNI values like "nat_hydra"); this is a discovery tool,
+    # so accept it rather than drop genuine host identifiers.
+    allowed = re.compile(r"^[a-z0-9_-]{1,63}$", re.IGNORECASE)
     for label in labels:
         if not label or not allowed.match(label):
             return False
@@ -254,49 +328,49 @@ def _ptr_name_to_ip(ptr_name: str) -> str:
     return ""
 
 
-def _extract_ip_pair(pkt) -> tuple[str, str]:
-    if IP is not None and pkt.haslayer(IP):
-        return str(pkt[IP].src), str(pkt[IP].dst)
-    if IPv6 is not None and pkt.haslayer(IPv6):
-        return str(pkt[IPv6].src), str(pkt[IPv6].dst)
-    if ARP is not None and pkt.haslayer(ARP):
+def _extract_ip_pair(ip_layer, ipv6_layer, arp_layer) -> tuple[str, str]:
+    if ip_layer is not None:
+        return str(ip_layer.src), str(ip_layer.dst)
+    if ipv6_layer is not None:
+        return str(ipv6_layer.src), str(ipv6_layer.dst)
+    if arp_layer is not None:
         try:
-            return str(getattr(pkt[ARP], "psrc", "0.0.0.0") or "0.0.0.0"), str(
-                getattr(pkt[ARP], "pdst", "0.0.0.0") or "0.0.0.0"
+            return str(getattr(arp_layer, "psrc", "0.0.0.0") or "0.0.0.0"), str(
+                getattr(arp_layer, "pdst", "0.0.0.0") or "0.0.0.0"
             )
         except Exception:
             return "0.0.0.0", "0.0.0.0"
     return "0.0.0.0", "0.0.0.0"
 
 
-def _extract_payload(pkt) -> bytes:
-    if Raw is not None and pkt.haslayer(Raw):
+def _extract_payload(raw_layer, tcp_layer, udp_layer) -> bytes:
+    if raw_layer is not None:
         try:
-            return bytes(pkt[Raw].load)
+            return bytes(raw_layer.load)
         except Exception:
             return b""
-    if TCP is not None and pkt.haslayer(TCP):
+    if tcp_layer is not None:
         try:
-            return bytes(pkt[TCP].payload)
+            return bytes(tcp_layer.payload)
         except Exception:
             return b""
-    if UDP is not None and pkt.haslayer(UDP):
+    if udp_layer is not None:
         try:
-            return bytes(pkt[UDP].payload)
+            return bytes(udp_layer.payload)
         except Exception:
             return b""
     return b""
 
 
-def _extract_ports(pkt) -> tuple[Optional[int], Optional[int]]:
-    if TCP is not None and pkt.haslayer(TCP):
+def _extract_ports(tcp_layer, udp_layer) -> tuple[Optional[int], Optional[int]]:
+    if tcp_layer is not None:
         try:
-            return int(pkt[TCP].sport), int(pkt[TCP].dport)
+            return int(tcp_layer.sport), int(tcp_layer.dport)
         except Exception:
             return None, None
-    if UDP is not None and pkt.haslayer(UDP):
+    if udp_layer is not None:
         try:
-            return int(pkt[UDP].sport), int(pkt[UDP].dport)
+            return int(udp_layer.sport), int(udp_layer.dport)
         except Exception:
             return None, None
     return None, None
@@ -367,6 +441,30 @@ def _extract_nbns_hostnames(pkt, payload: bytes) -> list[str]:
     results: list[str] = []
     seen: set[str] = set()
 
+    # A NetBIOS name-QUERY request (opcode 0, QR=0) asks about ANOTHER host, so
+    # its QUESTION_NAME must not be attributed to the sender (caller maps these
+    # to src_ip). Registrations (opcode 5+) and responses name the sender/owner
+    # and are kept. Determine the message type from the dissected NBNS header,
+    # falling back to the raw header flags byte (NBNS byte 2: bit 0x80 = QR,
+    # bits 0x78 = opcode).
+    is_name_query_request = False
+    try:
+        hdr = pkt.getlayer("NBNSHeader") if hasattr(pkt, "getlayer") else None
+    except Exception:
+        hdr = None
+    if hdr is not None:
+        if (
+            int(getattr(hdr, "RESPONSE", 0) or 0) == 0
+            and int(getattr(hdr, "OPCODE", 0) or 0) == 0
+        ):
+            is_name_query_request = True
+    elif payload and len(payload) >= 3:
+        flags = payload[2]
+        if (flags & 0x80) == 0 and ((flags >> 3) & 0x0F) == 0:
+            is_name_query_request = True
+    if is_name_query_request:
+        return results
+
     def _append(name: Optional[str]) -> None:
         if not name:
             return
@@ -379,16 +477,18 @@ def _extract_nbns_hostnames(pkt, payload: bytes) -> list[str]:
         results.append(name)
 
     try:
-        if hasattr(pkt, "haslayer") and pkt.haslayer("NBNSQueryRequest"):
-            layer = pkt["NBNSQueryRequest"]
-            for attr in ("QUESTION_NAME", "qname", "RR_NAME", "rrname"):
-                decoded = _decode_nbns_level1_name(getattr(layer, attr, None))
-                _append(decoded)
-        if hasattr(pkt, "haslayer") and pkt.haslayer("NBNSQueryResponse"):
-            layer = pkt["NBNSQueryResponse"]
-            for attr in ("QUESTION_NAME", "qname", "RR_NAME", "rrname"):
-                decoded = _decode_nbns_level1_name(getattr(layer, attr, None))
-                _append(decoded)
+        if hasattr(pkt, "getlayer"):
+            layer = pkt.getlayer("NBNSQueryRequest")
+            if layer is not None:
+                for attr in ("QUESTION_NAME", "qname", "RR_NAME", "rrname"):
+                    decoded = _decode_nbns_level1_name(getattr(layer, attr, None))
+                    _append(decoded)
+        if hasattr(pkt, "getlayer"):
+            layer = pkt.getlayer("NBNSQueryResponse")
+            if layer is not None:
+                for attr in ("QUESTION_NAME", "qname", "RR_NAME", "rrname"):
+                    decoded = _decode_nbns_level1_name(getattr(layer, attr, None))
+                    _append(decoded)
     except Exception:
         pass
 
@@ -404,51 +504,60 @@ def _extract_nbns_hostnames(pkt, payload: bytes) -> list[str]:
     return results
 
 
-def _parse_http_host(payload: bytes) -> Optional[str]:
+def _clean_authority_host(value: str) -> str:
+    host = value.split("@", 1)[-1].strip()
+    if host.startswith("["):
+        host = host[1:].split("]", 1)[0]
+    else:
+        host = host.split(":", 1)[0]
+    host = _normalize_hostname(host.strip().strip("."))
+    return host if _is_valid_hostname(host) else ""
+
+
+def _parse_http_request(payload: bytes) -> Optional[dict]:
+    """Parse an HTTP/1.x request start-line + Host header.
+
+    Returns {'form', 'authority_host', 'host_header'} where form is:
+    - 'origin'   - "GET /path" sent to the origin server (Host names dst)
+    - 'absolute' - "GET http://host/path" sent to a forward proxy
+    - 'connect'  - "CONNECT host:port" sent to a forward proxy
+    For absolute/connect forms the packet's dst IP is the PROXY, so the
+    named host must not be mapped to dst_ip.
+    """
     if not payload:
         return None
     try:
-        text = payload.decode("latin-1", errors="ignore")
+        text = payload[:2048].decode("latin-1", errors="ignore")
     except Exception:
         return None
-    if not re.match(r"^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT)\s", text):
+    match = HTTP_REQUEST_LINE_RE.match(text)
+    if not match:
         return None
-    for line in text.splitlines():
-        if line.lower().startswith("host:"):
-            host = line.split(":", 1)[1].strip()
-            host = host.split(":", 1)[0].strip()
-            host = _normalize_hostname(host)
-            return host if _is_valid_hostname(host) else None
-    return None
+    method = match.group(1).upper()
+    target = match.group(2)
 
-
-def _parse_http_authority_host(payload: bytes) -> Optional[str]:
-    if not payload:
-        return None
-    try:
-        text = payload.decode("latin-1", errors="ignore")
-    except Exception:
-        return None
-    first_line = text.splitlines()[0].strip() if text.splitlines() else ""
-    if not first_line:
-        return None
-
-    parts = first_line.split()
-    if len(parts) < 2:
-        return None
-    method = parts[0].upper()
-    target = parts[1]
-
+    form = "origin"
+    authority = ""
     if method == "CONNECT":
+        form = "connect"
         authority = target
     elif target.startswith(("http://", "https://")):
+        form = "absolute"
         authority = target.split("//", 1)[1].split("/", 1)[0]
-    else:
-        return None
 
-    host = authority.split("@", 1)[-1].split(":", 1)[0].strip().strip(".")
-    host = _normalize_hostname(host)
-    return host if _is_valid_hostname(host) else None
+    host_header = ""
+    for line in text.splitlines()[1:64]:
+        if not line.strip():
+            break
+        if line.lower().startswith("host:"):
+            host_header = line.split(":", 1)[1].strip()
+            break
+
+    return {
+        "form": form,
+        "authority_host": _clean_authority_host(authority) if authority else "",
+        "host_header": _clean_authority_host(host_header) if host_header else "",
+    }
 
 
 def _parse_http2_authority_host(payload: bytes) -> Optional[str]:
@@ -662,30 +771,33 @@ def _extract_ssh_hostnames(payload: bytes) -> list[tuple[str, str, str, str]]:
         text = payload.decode("latin-1", errors="ignore")
     except Exception:
         return []
-    if "SSH-" not in text and "ssh" not in text.lower():
+
+    # RFC 4253: only the identification string ("SSH-2.0-software comments")
+    # can carry a hostname, in its optional comment field. Binary KEX packets
+    # are full of algorithm names ("3des-cbc", "ssh-ed25519", ...) that look
+    # hostname-like to the tokenizer, so anything past the first line —
+    # or a payload that doesn't START with the identification string — is noise.
+    first_line = text.splitlines()[0].strip() if text else ""
+    if not first_line.startswith("SSH-") or " " not in first_line:
         return []
+    comment = first_line.split(" ", 1)[1]
 
     findings: list[tuple[str, str, str, str]] = []
     seen: set[str] = set()
-    lines = text.splitlines()[:8]
-
-    for line in lines:
-        line_text = line.strip()
-        if not line_text:
+    for token in _extract_textual_hostname_tokens(comment, require_hint=True):
+        if "." not in token:
             continue
-        for token in _extract_textual_hostname_tokens(line_text, require_hint=True):
-            key = f"{token}|{line_text}"
-            if key in seen:
-                continue
-            seen.add(key)
-            findings.append(
-                (
-                    token,
-                    "SSH banner hostname token",
-                    "LOW",
-                    f"SSH line: {line_text[:120]}",
-                )
+        if token in seen:
+            continue
+        seen.add(token)
+        findings.append(
+            (
+                token,
+                "SSH banner hostname token",
+                "LOW",
+                f"SSH identification string: {first_line[:120]}",
             )
+        )
     return findings
 
 
@@ -851,21 +963,34 @@ def _extract_rdp_hostnames(payload: bytes) -> list[tuple[str, str, str, str]]:
         return []
     findings: list[tuple[str, str, str, str]] = []
     seen: set[str] = set()
-    for host in RDP_COOKIE_RE.findall(text):
-        normalized = _normalize_hostname(host)
+    for raw_value in RDP_COOKIE_RE.findall(text):
+        value = raw_value.strip()
+        if not value:
+            continue
+        # MS-RDPBCGR: mstshash carries the client's login identity --
+        # typically "username" or "DOMAIN\username", NOT a hostname.
+        if "\\" in value:
+            token, _, user = value.partition("\\")
+            method = "RDP mstshash cookie domain"
+            detail = (
+                f"RDP negotiation cookie mstshash={value[:64]} "
+                f"(DOMAIN\\username form; domain token of the connecting client)"
+            )
+        else:
+            token = value
+            method = "RDP mstshash cookie"
+            detail = (
+                f"RDP negotiation cookie mstshash={value[:64]} "
+                "(client login identity; typically the username, sometimes the client hostname)"
+            )
+        normalized = _normalize_hostname(token)
         if not _looks_hostname_like(normalized, require_hint=False):
             continue
-        if normalized in seen:
+        dedupe_key = f"{normalized}|{method}"
+        if dedupe_key in seen:
             continue
-        seen.add(normalized)
-        findings.append(
-            (
-                normalized,
-                "RDP mstshash cookie",
-                "LOW",
-                "RDP negotiation cookie contains client host token",
-            )
-        )
+        seen.add(dedupe_key)
+        findings.append((normalized, method, "LOW", detail))
     return findings
 
 
@@ -1161,8 +1286,8 @@ def _extract_dhcp_hostnames(
         if layer_key is None:
             continue
         try:
-            if pkt.haslayer(layer_key):
-                dhcp_layer = pkt[layer_key]
+            dhcp_layer = pkt.getlayer(layer_key)
+            if dhcp_layer is not None:
                 break
         except Exception:
             continue
@@ -1174,8 +1299,8 @@ def _extract_dhcp_hostnames(
         if layer_key is None:
             continue
         try:
-            if pkt.haslayer(layer_key):
-                bootp_layer = pkt[layer_key]
+            bootp_layer = pkt.getlayer(layer_key)
+            if bootp_layer is not None:
                 break
         except Exception:
             continue
@@ -1208,7 +1333,9 @@ def _extract_dhcp_hostnames(
         mapped_candidates.append(requested_ip)
     mapped_candidates.extend([src_ip, dst_ip])
 
-    mapped_ip = src_ip
+    # No usable candidate (e.g. a DISCOVER from 0.0.0.0 to broadcast) leaves
+    # the finding unmapped rather than pinned to 0.0.0.0.
+    mapped_ip = ""
     for candidate in mapped_candidates:
         try:
             ip_obj = ipaddress.ip_address(candidate)
@@ -1388,17 +1515,11 @@ def _extract_ssdp_hostnames(payload: bytes) -> list[tuple[str, str, str, str]]:
 
 
 def _extract_lldp_hostnames(
-    pkt,
+    eth_layer,
     payload: bytes,
     mac_to_ips: dict[str, set[str]],
 ) -> list[tuple[str, str, str, str, str]]:
-    if Ether is None:
-        return []
-    try:
-        if not pkt.haslayer(Ether):
-            return []
-        eth_layer = pkt[Ether]
-    except Exception:
+    if eth_layer is None:
         return []
 
     eth_type = int(getattr(eth_layer, "type", 0) or 0)
@@ -1455,17 +1576,11 @@ def _extract_lldp_hostnames(
 
 
 def _extract_cdp_hostnames(
-    pkt,
+    eth_layer,
     payload: bytes,
     mac_to_ips: dict[str, set[str]],
 ) -> list[tuple[str, str, str, str, str]]:
-    if Ether is None:
-        return []
-    try:
-        if not pkt.haslayer(Ether):
-            return []
-        eth_layer = pkt[Ether]
-    except Exception:
+    if eth_layer is None:
         return []
 
     src_mac = _normalize_mac(getattr(eth_layer, "src", ""))
@@ -1540,8 +1655,8 @@ def _extract_tls_certificate_hostnames(
         if layer_key is None:
             continue
         try:
-            if pkt.haslayer(layer_key):
-                cert_layer = pkt[layer_key]
+            cert_layer = pkt.getlayer(layer_key)
+            if cert_layer is not None:
                 break
         except Exception:
             continue
@@ -1588,22 +1703,15 @@ def _extract_tls_certificate_hostnames(
 
 
 def _extract_arp_hostnames(
-    pkt, payload: bytes, src_ip: str, dst_ip: str
+    arp_layer, payload: bytes, src_ip: str, dst_ip: str
 ) -> list[tuple[str, str, str, str, str]]:
     results: list[tuple[str, str, str, str, str]] = []
-    if ARP is None:
-        return results
-
-    try:
-        if not pkt.haslayer(ARP):
-            return results
-    except Exception:
+    if arp_layer is None:
         return results
 
     arp_psrc = src_ip
     arp_pdst = dst_ip
     try:
-        arp_layer = pkt[ARP]
         arp_psrc = str(getattr(arp_layer, "psrc", src_ip) or src_ip)
         arp_pdst = str(getattr(arp_layer, "pdst", dst_ip) or dst_ip)
     except Exception:
@@ -1655,10 +1763,10 @@ def _extract_arp_hostnames(
 def _extract_sni(pkt) -> Optional[str]:
     if TLSClientHello is None:
         return None
-    if not pkt.haslayer(TLSClientHello):
+    hello = pkt.getlayer(TLSClientHello)
+    if hello is None:
         return None
     try:
-        hello = pkt[TLSClientHello]
         exts = getattr(hello, "ext", None) or []
         for ext in exts:
             names = getattr(ext, "servernames", None) or getattr(
@@ -1673,11 +1781,189 @@ def _extract_sni(pkt) -> Optional[str]:
                     or item
                 )
                 decoded = _normalize_hostname(_decode_name(name))
-                if _is_valid_hostname(decoded):
+                if _is_valid_hostname(decoded) and not _is_ip_literal(decoded):
                     return decoded
     except Exception:
         return None
     return None
+
+
+def _parse_raw_tls_client_hello_sni(payload: bytes) -> Optional[str]:
+    """Extract SNI from a raw TLS ClientHello on ANY port.
+
+    Scapy only dissects TLS on port 443, so SNI inside RDP-on-3389 TLS,
+    8443, or CONNECT-tunneled handshakes is invisible to _extract_sni().
+    """
+    if len(payload) < 46 or payload[0] != 0x16 or payload[1] != 0x03:
+        return None
+    if payload[5] != 0x01:
+        return None
+    try:
+        idx = 9  # record header (5) + handshake type (1) + handshake len (3)
+        idx += 2 + 32  # client_version + random
+        if idx >= len(payload):
+            return None
+        idx += 1 + payload[idx]  # session id
+        if idx + 2 > len(payload):
+            return None
+        idx += 2 + int.from_bytes(payload[idx : idx + 2], "big")  # cipher suites
+        if idx + 1 > len(payload):
+            return None
+        idx += 1 + payload[idx]  # compression methods
+        if idx + 2 > len(payload):
+            return None
+        ext_total = int.from_bytes(payload[idx : idx + 2], "big")
+        idx += 2
+        end = min(len(payload), idx + ext_total)
+        while idx + 4 <= end:
+            ext_type = int.from_bytes(payload[idx : idx + 2], "big")
+            ext_len = int.from_bytes(payload[idx + 2 : idx + 4], "big")
+            idx += 4
+            if ext_type == 0 and idx + 5 <= end:
+                # server_name_list: list_len(2) + type(1)=host_name + len(2)
+                name_len = int.from_bytes(payload[idx + 3 : idx + 5], "big")
+                name = payload[idx + 5 : idx + 5 + name_len].decode(
+                    "latin-1", errors="ignore"
+                )
+                decoded = _normalize_hostname(name)
+                if _is_valid_hostname(decoded) and not _is_ip_literal(decoded):
+                    return decoded
+                return None
+            idx += ext_len
+    except Exception:
+        return None
+    return None
+
+
+_DER_SAN_OID = b"\x06\x03\x55\x1d\x11"  # id-ce-subjectAltName (2.5.29.17)
+_DER_CN_OID = b"\x06\x03\x55\x04\x03"  # id-at-commonName (2.5.4.3)
+_DER_HOST_CHARS_RE = re.compile(rb"[A-Za-z0-9*._-]+")
+
+
+def _extract_der_cert_hostnames(payload: bytes) -> list[tuple[str, str, str]]:
+    """Pull SAN dNSName / subject CN host values out of raw DER certificates.
+
+    Complements the scapy TLSCertificate path, which only fires on port 443
+    (and never inside CONNECT tunnels or RDP-on-3389 TLS). Searches the raw
+    bytes for the SAN/CN OIDs, so it also works when the certificate record
+    starts mid-stream.
+    """
+    if not payload:
+        return []
+    has_san = _DER_SAN_OID in payload
+    has_cn = _DER_CN_OID in payload
+    if not has_san and not has_cn:
+        return []
+
+    results: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _emit(raw: bytes, method: str, confidence: str, require_dot: bool) -> None:
+        try:
+            text = raw.decode("ascii")
+        except Exception:
+            return
+        candidate = _normalize_hostname(text.lstrip("*.").strip())
+        if not _is_valid_hostname(candidate) or _is_ip_literal(candidate):
+            return
+        if require_dot and "." not in candidate:
+            return
+        # Dotless CNs (issuer shorthands like "R3") are too noisy below 4 chars.
+        if "." not in candidate and len(candidate) < 4:
+            return
+        key = (candidate, method)
+        if key in seen:
+            return
+        seen.add(key)
+        results.append((candidate, method, confidence))
+
+    if has_san:
+        idx = 0
+        while len(results) < 24:
+            pos = payload.find(_DER_SAN_OID, idx)
+            if pos == -1:
+                break
+            window = payload[pos + 5 : pos + 5 + 512]
+            j = 0
+            while j + 2 <= len(window):
+                # GeneralName dNSName = context tag [2] + short length + IA5
+                if window[j] == 0x82:
+                    length = window[j + 1]
+                    if 1 <= length <= 64 and j + 2 + length <= len(window):
+                        chunk = window[j + 2 : j + 2 + length]
+                        if _DER_HOST_CHARS_RE.fullmatch(chunk) and b"." in chunk:
+                            _emit(chunk, "TLS certificate SAN", "HIGH", True)
+                            j += 2 + length
+                            continue
+                j += 1
+            idx = pos + 5
+
+    if has_cn:
+        idx = 0
+        while len(results) < 32:
+            pos = payload.find(_DER_CN_OID, idx)
+            if pos == -1:
+                break
+            tag_pos = pos + 5
+            if tag_pos + 2 <= len(payload) and payload[tag_pos] in (0x0C, 0x13, 0x16):
+                length = payload[tag_pos + 1]
+                if 1 <= length <= 64 and tag_pos + 2 + length <= len(payload):
+                    chunk = payload[tag_pos + 2 : tag_pos + 2 + length]
+                    if _DER_HOST_CHARS_RE.fullmatch(chunk):
+                        _emit(chunk, "TLS certificate subject CN", "MEDIUM", False)
+            idx = pos + 5
+
+    return results
+
+
+def _parse_ntlm_type2_targets(payload: bytes) -> list[tuple[str, str, str]]:
+    """Extract server self-identification from an NTLM CHALLENGE (Type 2).
+
+    The TargetInfo AV pairs name the SERVER (NetBIOS/DNS computer name) —
+    the counterpart to the Type 3 workstation field, which names the client.
+    """
+    signature = b"NTLMSSP\x00"
+    idx = payload.find(signature)
+    if idx == -1 or len(payload) < idx + 48:
+        return []
+    try:
+        if int.from_bytes(payload[idx + 8 : idx + 12], "little") != 2:
+            return []
+        ti_len = int.from_bytes(payload[idx + 40 : idx + 42], "little")
+        ti_off = int.from_bytes(payload[idx + 44 : idx + 48], "little")
+        data = payload[idx + ti_off : idx + ti_off + ti_len]
+    except Exception:
+        return []
+
+    av_labels = {
+        1: ("NTLM challenge NetBIOS computer name", "MEDIUM"),
+        3: ("NTLM challenge DNS computer name", "HIGH"),
+    }
+    results: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, int]] = set()
+    j = 0
+    while j + 4 <= len(data):
+        av_id = int.from_bytes(data[j : j + 2], "little")
+        av_len = int.from_bytes(data[j + 2 : j + 4], "little")
+        if av_id == 0:
+            break
+        if av_id in av_labels and av_len and j + 4 + av_len <= len(data):
+            try:
+                value = (
+                    data[j + 4 : j + 4 + av_len]
+                    .decode("utf-16le", errors="ignore")
+                    .strip()
+                )
+            except Exception:
+                value = ""
+            normalized = _normalize_hostname(value)
+            key = (normalized, av_id)
+            if normalized and _is_valid_hostname(normalized) and key not in seen:
+                seen.add(key)
+                method, confidence = av_labels[av_id]
+                results.append((normalized, method, confidence))
+        j += 4 + av_len
+    return results
 
 
 def _parse_ntlm_type3(
@@ -2001,6 +2287,7 @@ def merge_hostname_summaries(summaries: list[HostnameSummary]) -> HostnameSummar
     return merged
 
 
+@memoize_analysis
 def analyze_hostname(
     path: Path,
     target_ip: str | None,
@@ -2036,6 +2323,11 @@ def analyze_hostname(
     findings_map: dict[tuple[str, str, str, str, str, str, str], HostnameFinding] = {}
     ip_to_macs: dict[str, set[str]] = defaultdict(set)
     mac_to_ips: dict[str, set[str]] = defaultdict(set)
+    # Flows where a CONNECT request was seen: everything after it on that
+    # flow is tunneled THROUGH a proxy, so hostnames observed inside (SNI,
+    # certificates) must not be mapped to the proxy's IP. Both orientations
+    # are stored so server->client tunnel bytes are recognized too.
+    proxy_flows: set[tuple[str, int, str, int]] = set()
     reverse_ptr = (
         _target_reverse_ptr(target_ip).lower() if target_filter_enabled else ""
     )
@@ -2059,21 +2351,31 @@ def analyze_hostname(
                     pass
 
             ts = safe_float(getattr(pkt, "time", None))
-            src_ip, dst_ip = _extract_ip_pair(pkt)
-            sport, dport = _extract_ports(pkt)
-            if Ether is not None and pkt.haslayer(Ether):
+            # Dissect each commonly needed layer once per packet and share
+            # the result; every getlayer()/haslayer() call walks the chain.
+            ether_layer = pkt.getlayer(Ether) if Ether is not None else None
+            ip_layer = pkt.getlayer(IP) if IP is not None else None
+            ipv6_layer = (
+                pkt.getlayer(IPv6) if (ip_layer is None and IPv6 is not None) else None
+            )
+            arp_layer = pkt.getlayer(ARP) if ARP is not None else None
+            tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
+            udp_layer = pkt.getlayer(UDP) if UDP is not None else None
+            raw_layer = pkt.getlayer(Raw) if Raw is not None else None
+            src_ip, dst_ip = _extract_ip_pair(ip_layer, ipv6_layer, arp_layer)
+            sport, dport = _extract_ports(tcp_layer, udp_layer)
+            if ether_layer is not None:
                 try:
-                    src_mac = getattr(pkt[Ether], "src", "")
-                    dst_mac = getattr(pkt[Ether], "dst", "")
+                    src_mac = getattr(ether_layer, "src", "")
+                    dst_mac = getattr(ether_layer, "dst", "")
                     _remember_ip_mac(ip_to_macs, src_ip, src_mac)
                     _remember_ip_mac(ip_to_macs, dst_ip, dst_mac)
                     _remember_mac_ip(mac_to_ips, src_mac, src_ip)
                     _remember_mac_ip(mac_to_ips, dst_mac, dst_ip)
                 except Exception:
                     pass
-            if ARP is not None and pkt.haslayer(ARP):
+            if arp_layer is not None:
                 try:
-                    arp_layer = pkt[ARP]
                     psrc = str(getattr(arp_layer, "psrc", "") or "")
                     pdst = str(getattr(arp_layer, "pdst", "") or "")
                     hwsrc = getattr(arp_layer, "hwsrc", "")
@@ -2102,13 +2404,20 @@ def analyze_hostname(
                     packet_relevant=flow_relevant,
                 )
 
+            # DHCP/DHCPv6 layers only ever dissect under UDP, so skip the
+            # helpers entirely (and their layer-chain walks) otherwise.
+            dhcp_results = (
+                _extract_dhcp_hostnames(pkt, src_ip, dst_ip)
+                if udp_layer is not None
+                else []
+            )
             for (
                 host_value,
                 method,
                 confidence,
                 mapped_ip,
                 details,
-            ) in _extract_dhcp_hostnames(pkt, src_ip, dst_ip):
+            ) in dhcp_results:
                 if _match(mapped_ip) and _record_finding(
                     findings_map,
                     hostname=host_value,
@@ -2127,13 +2436,18 @@ def analyze_hostname(
                     summary.protocol_counts["DHCP"] += 1
                     summary.method_counts[method] += 1
 
+            dhcpv6_results = (
+                _extract_dhcpv6_hostnames(pkt, src_ip, dst_ip)
+                if udp_layer is not None
+                else []
+            )
             for (
                 host_value,
                 method,
                 confidence,
                 mapped_ip,
                 details,
-            ) in _extract_dhcpv6_hostnames(pkt, src_ip, dst_ip):
+            ) in dhcpv6_results:
                 if _match(mapped_ip) and _record_finding(
                     findings_map,
                     hostname=host_value,
@@ -2152,9 +2466,11 @@ def analyze_hostname(
                     summary.protocol_counts["DHCPv6"] += 1
                     summary.method_counts[method] += 1
 
-            if DNS is not None and pkt.haslayer(DNS):
+            # DNS only ever dissects under UDP/TCP, so skip the chain walk
+            # for other packets.
+            if DNS is not None and (udp_layer is not None or tcp_layer is not None):
                 try:
-                    dns_layer = pkt[DNS]
+                    dns_layer = pkt.getlayer(DNS)
                 except Exception:
                     dns_layer = None
                 if dns_layer is not None:
@@ -2176,25 +2492,47 @@ def analyze_hostname(
                             packet_relevant = True
 
                     is_response = int(_safe_dns_attr(dns_layer, "qr", 0) or 0) == 1
-                    if dns_protocol in {"mDNS", "LLMNR"} and not is_response and qname:
-                        qname_host = _normalize_hostname(qname)
-                        if _looks_hostname_like(qname_host, require_hint=False):
-                            method = f"{dns_protocol} query name"
-                            if _match(src_ip) and _record_finding(
+                    # A query name describes the host being LOOKED UP, not the
+                    # querier — attributing it to src_ip would mislabel a client
+                    # as the name it asked about (e.g. a host querying mDNS/LLMNR
+                    # for "printer.local" is not itself printer.local). The
+                    # legitimate self-identifying case (mDNS/LLMNR announcements)
+                    # is captured from the *responses* below, where the answer
+                    # record maps the name to the responder's own address.
+                    #
+                    # Query names are still hostname evidence, though — vital in
+                    # one-directional captures that contain no responses at all —
+                    # so record A/AAAA query names WITHOUT an IP mapping.
+                    if not is_response and qname and qtype in {1, 28}:
+                        query_host = _normalize_hostname(qname)
+                        first_label = query_host.split(".", 1)[0]
+                        if (
+                            _is_valid_hostname(query_host)
+                            and not query_host.endswith(".arpa")
+                            and not first_label.startswith("_")
+                            and not _is_ip_literal(query_host)
+                        ):
+                            method = f"{dns_protocol} query name (unresolved)"
+                            if (
+                                not target_filter_enabled or flow_relevant
+                            ) and _record_finding(
                                 findings_map,
-                                hostname=qname_host,
-                                mapped_ip=src_ip,
+                                hostname=query_host,
+                                mapped_ip="",
                                 protocol=dns_protocol,
                                 method=method,
                                 confidence="LOW",
-                                details=f"{dns_protocol} query type={qtype} for {qname_host}",
+                                details=(
+                                    f"{dns_protocol} A/AAAA query observed; no answer "
+                                    "in capture, so no IP mapping (name describes the "
+                                    "lookup target, not the querier)"
+                                ),
                                 src_ip=src_ip,
                                 dst_ip=dst_ip,
                                 ts=ts,
                                 packet_index=packet_index,
                             ):
                                 found_evidence = True
-                                packet_relevant = True
                                 summary.protocol_counts[dns_protocol] += 1
                                 summary.method_counts[method] += 1
 
@@ -2311,14 +2649,14 @@ def analyze_hostname(
                                         summary.protocol_counts[dns_protocol] += 1
                                         summary.method_counts[method] += 1
 
-            payload = _extract_payload(pkt)
+            payload = _extract_payload(raw_layer, tcp_layer, udp_layer)
             for (
                 host_value,
                 method,
                 confidence,
                 mapped_ip,
                 details,
-            ) in _extract_lldp_hostnames(pkt, payload, mac_to_ips):
+            ) in _extract_lldp_hostnames(ether_layer, payload, mac_to_ips):
                 if _match(mapped_ip) and _record_finding(
                     findings_map,
                     hostname=host_value,
@@ -2343,7 +2681,7 @@ def analyze_hostname(
                 confidence,
                 mapped_ip,
                 details,
-            ) in _extract_cdp_hostnames(pkt, payload, mac_to_ips):
+            ) in _extract_cdp_hostnames(ether_layer, payload, mac_to_ips):
                 if _match(mapped_ip) and _record_finding(
                     findings_map,
                     hostname=host_value,
@@ -2368,7 +2706,7 @@ def analyze_hostname(
                 confidence,
                 mapped_ip,
                 details,
-            ) in _extract_arp_hostnames(pkt, payload, src_ip, dst_ip):
+            ) in _extract_arp_hostnames(arp_layer, payload, src_ip, dst_ip):
                 if _match(mapped_ip) and _record_finding(
                     findings_map,
                     hostname=host_value,
@@ -2388,47 +2726,89 @@ def analyze_hostname(
                     summary.method_counts[method] += 1
 
             if payload and (packet_relevant or not target_filter_enabled):
-                host_header = _parse_http_host(payload)
-                if host_header:
-                    method = "HTTP Host header"
-                    protocol = "HTTP"
-                    if _match(dst_ip) and _record_finding(
-                        findings_map,
-                        hostname=host_header,
-                        mapped_ip=dst_ip,
-                        protocol=protocol,
-                        method=method,
-                        confidence="MEDIUM",
-                        details=f"Host header observed for destination {dst_ip}",
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        ts=ts,
-                        packet_index=packet_index,
-                    ):
-                        found_evidence = True
-                        summary.protocol_counts[protocol] += 1
-                        summary.method_counts[method] += 1
+                http_request = _parse_http_request(payload)
+                if http_request:
+                    form = http_request["form"]
+                    authority_host = http_request["authority_host"]
+                    host_header = http_request["host_header"]
+                    if form == "connect":
+                        proxy_flows.add((src_ip, sport or 0, dst_ip, dport or 0))
+                        proxy_flows.add((dst_ip, dport or 0, src_ip, sport or 0))
 
-                authority_host = _parse_http_authority_host(payload)
-                if authority_host:
-                    method = "HTTP absolute/CONNECT authority"
-                    protocol = "HTTP"
-                    if _match(dst_ip) and _record_finding(
-                        findings_map,
-                        hostname=authority_host,
-                        mapped_ip=dst_ip,
-                        protocol=protocol,
-                        method=method,
-                        confidence="MEDIUM",
-                        details=f"HTTP request authority references destination {dst_ip}",
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        ts=ts,
-                        packet_index=packet_index,
-                    ):
-                        found_evidence = True
-                        summary.protocol_counts[protocol] += 1
-                        summary.method_counts[method] += 1
+                    if form == "origin":
+                        # Origin-form request: dst IS the named server.
+                        if host_header:
+                            method = "HTTP Host header"
+                            protocol = "HTTP"
+                            if _match(dst_ip) and _record_finding(
+                                findings_map,
+                                hostname=host_header,
+                                mapped_ip=dst_ip,
+                                protocol=protocol,
+                                method=method,
+                                confidence="MEDIUM",
+                                details=f"Host header observed for destination {dst_ip}",
+                                src_ip=src_ip,
+                                dst_ip=dst_ip,
+                                ts=ts,
+                                packet_index=packet_index,
+                            ):
+                                found_evidence = True
+                                summary.protocol_counts[protocol] += 1
+                                summary.method_counts[method] += 1
+                    else:
+                        # CONNECT / absolute-URI request: dst is a forward
+                        # PROXY; the authority names a remote origin whose
+                        # IP is not present in this packet, so no IP mapping.
+                        protocol = "HTTP"
+                        if authority_host:
+                            method = (
+                                "HTTP CONNECT tunnel target"
+                                if form == "connect"
+                                else "HTTP absolute-URI authority"
+                            )
+                            if (not target_filter_enabled or flow_relevant) and _record_finding(
+                                findings_map,
+                                hostname=authority_host,
+                                mapped_ip="",
+                                protocol=protocol,
+                                method=method,
+                                confidence="MEDIUM",
+                                details=(
+                                    f"Proxy-form request via proxy {dst_ip}:{dport}; "
+                                    "target IP not visible in this packet"
+                                ),
+                                src_ip=src_ip,
+                                dst_ip=dst_ip,
+                                ts=ts,
+                                packet_index=packet_index,
+                            ):
+                                found_evidence = True
+                                summary.protocol_counts[protocol] += 1
+                                summary.method_counts[method] += 1
+                        if host_header and host_header != authority_host:
+                            # Host header disagreeing with the authority on a
+                            # proxy-form request is itself noteworthy.
+                            method = "HTTP Host header (proxy request mismatch)"
+                            if (not target_filter_enabled or flow_relevant) and _record_finding(
+                                findings_map,
+                                hostname=host_header,
+                                mapped_ip="",
+                                protocol=protocol,
+                                method=method,
+                                confidence="LOW",
+                                details=(
+                                    f"Host header differs from request authority "
+                                    f"{authority_host or '-'} on proxy-form request via {dst_ip}"
+                                ),
+                                src_ip=src_ip,
+                                dst_ip=dst_ip,
+                                ts=ts,
+                                packet_index=packet_index,
+                            ):
+                                found_evidence = True
+                                summary.protocol_counts[protocol] += 1
+                                summary.method_counts[method] += 1
 
                 http2_authority = _parse_http2_authority_host(payload)
                 if http2_authority:
@@ -2451,29 +2831,59 @@ def analyze_hostname(
                         summary.protocol_counts[protocol] += 1
                         summary.method_counts[method] += 1
 
-                user, domain, workstation = _parse_ntlm_type3(payload)
-                if workstation:
-                    method = "NTLM workstation field"
-                    protocol = "SMB/NTLM"
-                    detail = (
-                        f"NTLM auth context user={user or '-'} domain={domain or '-'}"
-                    )
-                    if _match(src_ip) and _record_finding(
-                        findings_map,
-                        hostname=workstation,
-                        mapped_ip=src_ip,
-                        protocol=protocol,
-                        method=method,
-                        confidence="LOW",
-                        details=detail,
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        ts=ts,
-                        packet_index=packet_index,
-                    ):
-                        found_evidence = True
-                        summary.protocol_counts[protocol] += 1
-                        summary.method_counts[method] += 1
+                if b"NTLMSSP\x00" in payload:
+                    user, domain, workstation = _parse_ntlm_type3(payload)
+                    if workstation:
+                        # Type 3 AUTHENTICATE is sent BY the client, naming itself.
+                        method = "NTLM workstation field"
+                        protocol = "SMB/NTLM"
+                        detail = (
+                            f"NTLM auth context user={user or '-'} domain={domain or '-'}"
+                        )
+                        if _match(src_ip) and _record_finding(
+                            findings_map,
+                            hostname=workstation,
+                            mapped_ip=src_ip,
+                            protocol=protocol,
+                            method=method,
+                            confidence="LOW",
+                            details=detail,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            ts=ts,
+                            packet_index=packet_index,
+                        ):
+                            found_evidence = True
+                            summary.protocol_counts[protocol] += 1
+                            summary.method_counts[method] += 1
+
+                    # Type 2 CHALLENGE is sent BY the server; its TargetInfo
+                    # AV pairs carry the server's own NetBIOS/DNS computer name.
+                    for (
+                        host_value,
+                        method,
+                        confidence,
+                    ) in _parse_ntlm_type2_targets(payload):
+                        protocol = "SMB/NTLM"
+                        if _match(src_ip) and _record_finding(
+                            findings_map,
+                            hostname=host_value,
+                            mapped_ip=src_ip,
+                            protocol=protocol,
+                            method=method,
+                            confidence=confidence,
+                            details=(
+                                f"NTLM challenge TargetInfo sent by {src_ip} "
+                                f"on ports {sport}->{dport}"
+                            ),
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            ts=ts,
+                            packet_index=packet_index,
+                        ):
+                            found_evidence = True
+                            summary.protocol_counts[protocol] += 1
+                            summary.method_counts[method] += 1
 
                 if (sport in MAIL_SERVER_PORTS) or (dport in MAIL_SERVER_PORTS):
                     for host_value, method, confidence in _extract_mail_hostnames(
@@ -2481,7 +2891,9 @@ def analyze_hostname(
                     ):
                         mapped_ip = src_ip
                         if method == "SMTP HELO/EHLO":
-                            mapped_ip = src_ip
+                            # HELO/EHLO is sent by the CLIENT naming itself;
+                            # the client is the side NOT on the mail port.
+                            mapped_ip = src_ip if dport in MAIL_SERVER_PORTS else dst_ip
                         elif method in {
                             "SMTP server banner",
                             "IMAP server banner",
@@ -2557,7 +2969,9 @@ def analyze_hostname(
                             summary.method_counts[method] += 1
 
                 if (sport in SSH_PORTS) or (dport in SSH_PORTS):
-                    ssh_mapped_ip = src_ip if sport in SSH_PORTS else dst_ip
+                    # Both peers send an identification string; it names
+                    # its SENDER, not whichever side sits on port 22.
+                    ssh_mapped_ip = src_ip
                     for (
                         host_value,
                         method,
@@ -2618,7 +3032,7 @@ def analyze_hostname(
                     or (sport in KERBEROS_PORTS)
                     or (dport in KERBEROS_PORTS)
                 ):
-                    mapped_ip = (
+                    server_ip = (
                         src_ip
                         if ((sport in LDAP_PORTS) or (sport in KERBEROS_PORTS))
                         else dst_ip
@@ -2630,14 +3044,23 @@ def analyze_hostname(
                         confidence,
                         detail,
                     ) in _extract_directory_auth_hostnames(payload):
-                        if _match(mapped_ip) and _record_finding(
+                        # An SPN host component or a dNSHostName attribute
+                        # names a directory OBJECT (often a third host), not
+                        # the KDC/LDAP server on this flow — leave unmapped
+                        # rather than pin it to the wrong IP.
+                        if (
+                            not target_filter_enabled or flow_relevant
+                        ) and _record_finding(
                             findings_map,
                             hostname=host_value,
-                            mapped_ip=mapped_ip,
+                            mapped_ip="",
                             protocol=protocol,
                             method=method,
                             confidence=confidence,
-                            details=f"{detail} on ports {sport}->{dport}",
+                            details=(
+                                f"{detail} on ports {sport}->{dport} "
+                                f"(directory server {server_ip}; named host may be a third party)"
+                            ),
                             src_ip=src_ip,
                             dst_ip=dst_ip,
                             ts=ts,
@@ -2673,7 +3096,10 @@ def analyze_hostname(
                             summary.method_counts[method] += 1
 
                 if (sport in RDP_PORTS) or (dport in RDP_PORTS):
-                    mapped_ip = src_ip
+                    # The mstshash cookie is only ever sent client->server in
+                    # the X.224 Connection Request, so attribute it to the
+                    # side that is NOT on the RDP service port.
+                    mapped_ip = src_ip if dport in RDP_PORTS else dst_ip
                     for (
                         host_value,
                         method,
@@ -2847,18 +3273,43 @@ def analyze_hostname(
                             summary.method_counts[method] += 1
 
             if packet_relevant or not target_filter_enabled:
-                sni = _extract_sni(pkt)
+                # TLS layers only ever dissect over TCP, so skip the chain
+                # walk for non-TCP packets.
+                sni = _extract_sni(pkt) if tcp_layer is not None else None
+                if not sni and tcp_layer is not None and payload:
+                    # Scapy only dissects TLS on 443; the raw parser covers
+                    # RDP-on-3389 TLS, 8443, and CONNECT-tunneled handshakes.
+                    sni = _parse_raw_tls_client_hello_sni(payload)
                 if sni:
                     method = "TLS SNI"
                     protocol = "HTTPS/TLS"
-                    if _match(dst_ip) and _record_finding(
+                    in_proxy_tunnel = (
+                        src_ip,
+                        sport or 0,
+                        dst_ip,
+                        dport or 0,
+                    ) in proxy_flows
+                    # Inside a CONNECT tunnel dst is the PROXY, not the
+                    # server the SNI names — leave the IP mapping empty.
+                    sni_mapped_ip = "" if in_proxy_tunnel else dst_ip
+                    sni_details = (
+                        f"ClientHello SNI inside CONNECT tunnel via proxy {dst_ip}"
+                        if in_proxy_tunnel
+                        else f"ClientHello SNI seen for destination {dst_ip}"
+                    )
+                    sni_allowed = (
+                        (not target_filter_enabled or flow_relevant)
+                        if in_proxy_tunnel
+                        else _match(dst_ip)
+                    )
+                    if sni_allowed and _record_finding(
                         findings_map,
                         hostname=sni,
-                        mapped_ip=dst_ip,
+                        mapped_ip=sni_mapped_ip,
                         protocol=protocol,
                         method=method,
                         confidence="MEDIUM",
-                        details=f"ClientHello SNI seen for destination {dst_ip}",
+                        details=sni_details,
                         src_ip=src_ip,
                         dst_ip=dst_ip,
                         ts=ts,
@@ -2868,18 +3319,43 @@ def analyze_hostname(
                         summary.protocol_counts[protocol] += 1
                         summary.method_counts[method] += 1
 
-            for cert_hostname, method, confidence in _extract_tls_certificate_hostnames(
-                pkt, payload
-            ):
-                mapped_ip = src_ip
-                if _match(mapped_ip) and _record_finding(
+            cert_results = (
+                _extract_tls_certificate_hostnames(pkt, payload)
+                if tcp_layer is not None
+                else []
+            )
+            if not cert_results and tcp_layer is not None and payload:
+                # Raw DER fallback for certificates scapy did not dissect
+                # (non-443 ports, CONNECT tunnels, mid-stream records).
+                cert_results = _extract_der_cert_hostnames(payload)
+            for cert_hostname, method, confidence in cert_results:
+                in_proxy_tunnel = (
+                    src_ip,
+                    sport or 0,
+                    dst_ip,
+                    dport or 0,
+                ) in proxy_flows
+                # The certificate is sent BY the server (src) — except inside
+                # a CONNECT tunnel, where the flow endpoints are the proxy.
+                mapped_ip = "" if in_proxy_tunnel else src_ip
+                cert_details = (
+                    f"{method} observed in certificate inside CONNECT tunnel via {dst_ip}"
+                    if in_proxy_tunnel
+                    else f"{method} observed in certificate sent by {src_ip}"
+                )
+                cert_allowed = (
+                    (not target_filter_enabled or flow_relevant)
+                    if in_proxy_tunnel
+                    else _match(mapped_ip)
+                )
+                if cert_allowed and _record_finding(
                     findings_map,
                     hostname=cert_hostname,
                     mapped_ip=mapped_ip,
                     protocol="HTTPS/TLS",
                     method=method,
                     confidence=confidence,
-                    details=f"{method} observed in certificate sent by {src_ip}",
+                    details=cert_details,
                     src_ip=src_ip,
                     dst_ip=dst_ip,
                     ts=ts,
@@ -2890,8 +3366,8 @@ def analyze_hostname(
                     summary.protocol_counts["HTTPS/TLS"] += 1
                     summary.method_counts[method] += 1
 
-            if UDP is not None and pkt.haslayer(UDP):
-                port_pair = {int(pkt[UDP].sport), int(pkt[UDP].dport)}
+            if udp_layer is not None:
+                port_pair = {int(udp_layer.sport), int(udp_layer.dport)}
                 if 137 in port_pair and payload:
                     for token in _extract_nbns_hostnames(pkt, payload):
                         if _match(src_ip) and _record_finding(

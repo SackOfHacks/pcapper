@@ -245,19 +245,57 @@ _RULES: tuple[_TechniqueRule, ...] = (
     ),
     _TechniqueRule(
         "enterprise",
-        "Resource Development",
-        "TA0042",
-        "Stage Capabilities",
-        "T1587",
-        ("malware", "payload", "tooling"),
-        ("artifact",),
+        "Credential Access",
+        "TA0006",
+        "Adversary-in-the-Middle",
+        "T1557",
+        ("arp spoof", "arp poison", "poisoning", "address impersonation", "mitm"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Credential Access",
+        "TA0006",
+        "OS Credential Dumping",
+        "T1003",
+        ("mimikatz", "sekurlsa", "lsass", "credential dump"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Impact",
+        "TA0040",
+        "Network Denial of Service",
+        "T1498",
+        ("syn flood", "udp flood", "denial of service", "flood"),
+        excluded=("server error",),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Command and Control",
+        "TA0011",
+        "Protocol Tunneling",
+        "T1572",
+        ("protocol tunneling", "tunnel", "vpn tunnel"),
+        ("dns", "icmp", "covert"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Command and Control",
+        "TA0011",
+        "Ingress Tool Transfer",
+        "T1105",
+        ("malicious file", "file download", "suspicious file", "malware", "payload"),
+        ("artifact", "executable", "download"),
         min_score=3,
     ),
     _TechniqueRule(
         "ics",
         "Discovery",
         "TA0102",
-        "Network Service Discovery",
+        "Remote System Discovery",
         "T0846",
         ("ot reconnaissance", "enip session", "identity request", "plc", "scada"),
         ("discovery",),
@@ -267,7 +305,7 @@ _RULES: tuple[_TechniqueRule, ...] = (
         "ics",
         "Lateral Movement",
         "TA0109",
-        "Remote Services",
+        "Exploitation of Remote Services",
         "T0866",
         ("engineering workstation", "ot protocol traffic"),
         ("remote services",),
@@ -276,9 +314,9 @@ _RULES: tuple[_TechniqueRule, ...] = (
     _TechniqueRule(
         "ics",
         "Command and Control",
-        "TA0108",
+        "TA0101",
         "Standard Application Layer Protocol",
-        "T0885",
+        "T0869",
         (
             "modbus",
             "dnp3",
@@ -288,8 +326,10 @@ _RULES: tuple[_TechniqueRule, ...] = (
             "bacnet",
             "cip",
             "enip",
+            "ethernet/ip",
             "mms",
             "profinet",
+            "goose",
         ),
         min_score=3,
     ),
@@ -305,14 +345,44 @@ _RULES: tuple[_TechniqueRule, ...] = (
     ),
     _TechniqueRule(
         "ics",
+        "Impair Process Control",
+        "TA0106",
+        "Program Download",
+        "T0843",
+        ("program download", "firmware", "logic download", "engineering command"),
+        ("program", "download"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "ics",
         "Inhibit Response Function",
         "TA0107",
-        "Denial of Control",
-        "T0813",
+        "Device Restart/Shutdown",
+        "T0816",
+        ("plc stop", "device restart", "shutdown", "change program state", "cpu stop"),
+        ("stop", "restart", "reset"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "ics",
+        "Inhibit Response Function",
+        "TA0107",
+        "Denial of Service",
+        "T0814",
         ("safety plc", "sis", "server error response surge"),
         ("flood", "impact", "dos"),
         min_score=3,
     ),
+)
+
+
+# Crown-jewel ICS techniques (Industroyer/FrostyGoop/Stuxnet-grade process and
+# safety impact). Mapping a low-severity, generic "OT control activity" warning
+# to these over-claims, so they require a high/critical source detection — a
+# real unauthorized command / program download / device stop is emitted at
+# high/critical by the OT analyzers, not as a 2-command warning.
+_HIGH_SEVERITY_REQUIRED_TECHNIQUES: frozenset[str] = frozenset(
+    {"T0855", "T0843", "T0816", "T0814", "T0857", "T0889"}
 )
 
 
@@ -328,6 +398,7 @@ _ICS_STRONG_TOKENS: tuple[str, ...] = (
     "bacnet",
     "cip",
     "enip",
+    "ethernet/ip",
     "profinet",
     "mms",
     "goose",
@@ -408,11 +479,24 @@ def _parse_ip(value: str) -> Optional[str]:
         return None
 
 
+# File extensions and other suffixes that look domain-shaped in free text
+# (e.g. "forum.php", "beacon.dll") but are not network IOCs.
+_NON_DOMAIN_TLDS = {
+    "php", "html", "htm", "asp", "aspx", "jsp", "js", "css", "json", "xml",
+    "exe", "dll", "sys", "scr", "bat", "ps1", "vbs", "bin", "dat", "tmp",
+    "zip", "rar", "7z", "gz", "tar", "docm", "xlsm", "csv", "pcap", "log",
+    "py", "sh", "txt", "png", "jpg", "gif", "local", "arpa", "lan",
+}
+
+
 def _looks_like_domain(value: str) -> bool:
     text = str(value or "").strip().lower().rstrip(".")
     if not text or len(text) > 253:
         return False
-    if text.startswith("ta") or text.startswith("t"):
+    # Reject bare ATT&CK identifiers (T1234, TA0001, T1059.001) that appear in
+    # the mapped text, without discarding real domains that happen to start
+    # with 't' (teamviewer.com, twitter.com, target.com, ...).
+    if re.fullmatch(r"ta?\d{3,4}(?:\.\d{3})?", text):
         return False
     labels = [part for part in text.split(".") if part]
     if len(labels) < 2:
@@ -421,7 +505,12 @@ def _looks_like_domain(value: str) -> bool:
         return False
     if any(part.startswith("-") or part.endswith("-") for part in labels):
         return False
-    if not any(ch.isalpha() for ch in labels[-1]):
+    tld = labels[-1]
+    if not any(ch.isalpha() for ch in tld):
+        return False
+    # A real TLD is at least two characters and alphabetic; reject file
+    # extensions and known non-routable suffixes.
+    if tld in _NON_DOMAIN_TLDS or not re.fullmatch(r"[a-z]{2,}", tld):
         return False
     return True
 
@@ -619,6 +708,21 @@ def _confidence_text(rank: int) -> str:
     return "low"
 
 
+# Tactics that represent post-compromise / objective-stage adversary behavior.
+# Their presence matters far more for an intrusion verdict than how many raw
+# detections happened to map (the prior "mapping coverage %" rewarded noisy
+# captures and under-called a single decisive C2/Impact finding).
+_HIGH_IMPACT_TACTICS = {
+    "Lateral Movement",
+    "Command and Control",
+    "Exfiltration",
+    "Impact",
+    "Impair Process Control",
+    "Inhibit Response Function",
+}
+_OT_IMPACT_TACTICS = {"Impair Process Control", "Inhibit Response Function", "Impact"}
+
+
 def _executive_assessment(
     total_detections: int,
     hits: list[MitreHit],
@@ -627,15 +731,34 @@ def _executive_assessment(
     reasons: list[str] = []
     score = 0
 
-    mapped_ratio = len(hits) / max(total_detections, 1)
-    if mapped_ratio >= 0.6:
-        score += 2
-        reasons.append(f"High ATT&CK mapping coverage ({mapped_ratio * 100.0:.1f}%)")
-    elif mapped_ratio >= 0.3:
-        score += 1
-        reasons.append(
-            f"Moderate ATT&CK mapping coverage ({mapped_ratio * 100.0:.1f}%)"
+    if not hits:
+        return (
+            "NO MAPPED TTPs",
+            "low",
+            ["No detections mapped to ATT&CK techniques in this capture"],
         )
+
+    distinct_tactics = {hit.tactic for hit in hits}
+    high_impact = distinct_tactics & _HIGH_IMPACT_TACTICS
+    ot_impact = distinct_tactics & _OT_IMPACT_TACTICS
+
+    # Objective-stage tactics are the strongest intrusion signal.
+    if len(high_impact) >= 2:
+        score += 3
+        reasons.append(
+            f"Multiple objective-stage tactics: {', '.join(sorted(high_impact))}"
+        )
+    elif high_impact:
+        score += 2
+        reasons.append(f"Objective-stage tactic present: {', '.join(high_impact)}")
+
+    # Kill-chain breadth (distinct tactics observed) indicates progression.
+    if len(distinct_tactics) >= 4:
+        score += 2
+        reasons.append(f"Broad kill-chain coverage ({len(distinct_tactics)} tactics)")
+    elif len(distinct_tactics) >= 2:
+        score += 1
+        reasons.append(f"Multiple kill-chain tactics ({len(distinct_tactics)})")
 
     high_conf_hits = sum(1 for hit in hits if hit.confidence == "high")
     if high_conf_hits >= 3:
@@ -653,11 +776,18 @@ def _executive_assessment(
         score += 1
         reasons.append("Limited cross-source corroboration present")
 
+    if ot_impact:
+        score += 1
+        reasons.append(
+            f"OT process/safety-impact tactic(s) present: {', '.join(sorted(ot_impact))} "
+            "(validate with process telemetry)"
+        )
+
     if sequence_issues:
         score -= 1
         reasons.append(f"Sequence plausibility issues present ({len(sequence_issues)})")
 
-    if score >= 5:
+    if score >= 6:
         return "LIKELY INTRUSION", "high", reasons
     if score >= 3:
         return "POSSIBLE INTRUSION", "medium", reasons
@@ -677,12 +807,12 @@ def _fallback_from_explicit_ids(
     if not tactic_ids and not technique_ids:
         return None
     tactic_id = (
-        tactic_ids[0] if tactic_ids else ("TA0108" if framework == "ics" else "TA0007")
+        tactic_ids[0] if tactic_ids else ("TA0101" if framework == "ics" else "TA0007")
     )
     technique_id = (
         technique_ids[0]
         if technique_ids
-        else ("T0885" if framework == "ics" else "T1046")
+        else ("T0869" if framework == "ics" else "T1046")
     )
     tactic = "Mapped Tactic"
     technique = "Mapped Technique"
@@ -913,6 +1043,22 @@ def analyze_mitre(
         if not allowed:
             checks["sequence_plausibility"].append(
                 f"Detection {idx} left unmapped: {gate_reason}"
+            )
+            continue
+
+        # Crown-jewel ICS process/safety-impact techniques require a high or
+        # critical source detection. A low-severity, generic "OT control
+        # activity" warning (which can fire on port collisions in IT captures)
+        # must not be mapped to Industroyer/FrostyGoop-grade techniques.
+        detection_severity = str(item.get("severity", "info") or "info").lower()
+        if (
+            technique_id in _HIGH_SEVERITY_REQUIRED_TECHNIQUES
+            and detection_severity not in {"high", "critical"}
+            and not (tactic_ids or technique_ids)
+        ):
+            checks["sequence_plausibility"].append(
+                f"Detection {idx} not mapped to {technique_id}: high-impact ICS "
+                f"technique requires high/critical severity (was {detection_severity})"
             )
             continue
         gate_reason_by_occurrence[idx] = gate_reason

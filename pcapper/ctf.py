@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+
+from .utils import is_public_ip as _is_public_ip
 import base64
 import binascii
-import ipaddress
 import re
 import urllib.parse
 from collections import Counter
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore
@@ -37,12 +38,12 @@ FLAG_PATTERNS = [
 ]
 
 FILE_HINT_PATTERNS = [
-    re.compile(r"(flag\\.txt)$", re.IGNORECASE),
-    re.compile(r"(root\\.txt)$", re.IGNORECASE),
-    re.compile(r"(user\\.txt)$", re.IGNORECASE),
-    re.compile(r"(proof\\.txt)$", re.IGNORECASE),
-    re.compile(r"(flag\\b)", re.IGNORECASE),
-    re.compile(r"(ctf\\b)", re.IGNORECASE),
+    re.compile(r"(flag\.txt)$", re.IGNORECASE),
+    re.compile(r"(root\.txt)$", re.IGNORECASE),
+    re.compile(r"(user\.txt)$", re.IGNORECASE),
+    re.compile(r"(proof\.txt)$", re.IGNORECASE),
+    re.compile(r"(\bflag\b)", re.IGNORECASE),
+    re.compile(r"(\bctf\b)", re.IGNORECASE),
 ]
 
 SECRETISH_PATTERNS = [
@@ -123,36 +124,6 @@ def _extract_payload(pkt) -> bytes:
     return b""
 
 
-def _decode_candidates(text: str) -> list[str]:
-    results: list[str] = []
-    text = text.strip()
-    if not text:
-        return results
-
-    try:
-        decoded = urllib.parse.unquote_to_bytes(text)
-        if decoded and decoded != text.encode("utf-8", errors="ignore"):
-            results.append(decoded.decode("utf-8", errors="ignore"))
-    except Exception:
-        pass
-
-    try:
-        if len(text) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", text):
-            raw = binascii.unhexlify(text)
-            results.append(raw.decode("utf-8", errors="ignore"))
-    except Exception:
-        pass
-
-    try:
-        if len(text) >= 12 and re.fullmatch(r"[A-Za-z0-9+/=]+", text):
-            raw = base64.b64decode(text + "===")
-            results.append(raw.decode("utf-8", errors="ignore"))
-    except Exception:
-        pass
-
-    return results
-
-
 def _iter_decode_candidates(token: str, max_depth: int = 3) -> list[tuple[str, str]]:
     queue: list[tuple[str, str, int]] = [(token, "raw", 0)]
     seen: set[str] = {token}
@@ -200,13 +171,6 @@ def _iter_decode_candidates(token: str, max_depth: int = 3) -> list[tuple[str, s
 
     # Bound returned candidates to avoid pathological payloads.
     return out[:24]
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
 
 
 def _is_secretish_token(value: str) -> bool:
@@ -280,6 +244,7 @@ def _proto_label(pkt) -> str:
     return "OTHER"
 
 
+@memoize_analysis
 def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
     reader, status, stream, size_bytes, _file_type = get_reader(
         path, show_status=show_status
@@ -513,7 +478,7 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
                             continue
                         candidate = f"{key}={value}"
                         deterministic_checks["passphrase_parameter_present"].append(
-                            f"pkt={pkt_index} {src_ip}->{dst_ip} parameter {key}=<redacted>"
+                            f"pkt={pkt_index} {src_ip}->{dst_ip} parameter {key}={value}"
                         )
                         _record_candidate(
                             value=candidate,
@@ -579,7 +544,12 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
                     dns_layer = pkt[DNS]  # type: ignore[index]
                     qd = getattr(dns_layer, "qd", None)
                     if qd is not None and hasattr(qd, "qname"):
-                        qname = str(getattr(qd, "qname", b"")).strip("b'").strip("'")
+                        qname_raw = getattr(qd, "qname", b"")
+                        qname = (
+                            qname_raw.decode("latin-1", errors="ignore")
+                            if isinstance(qname_raw, (bytes, bytearray))
+                            else str(qname_raw)
+                        ).rstrip(".")
                         if qname:
                             for value, chain in _iter_decode_candidates(qname):
                                 if any(

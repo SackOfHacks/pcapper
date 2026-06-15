@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -23,6 +23,33 @@ except Exception:  # pragma: no cover
 DOT_PORT = 853
 DOQ_PORT = 853
 DOH_PATH_MARKERS = (b"/dns-query", b"/dns-query?", b"/resolve")
+
+# Public DoH resolvers. Real DoH rides TLS/443 so the cleartext /dns-query path
+# never appears -- the network-visible signal is the TLS SNI of a known DoH
+# endpoint. DoH to one of these bypasses DNS monitoring (a common C2/exfil
+# evasion), so surface it as a hunt lead.
+DOH_PROVIDER_HOSTS = (
+    "cloudflare-dns.com",
+    "mozilla.cloudflare-dns.com",
+    "dns.google",
+    "dns.google.com",
+    "dns.quad9.net",
+    "doh.opendns.com",
+    "doh.cleanbrowsing.org",
+    "dns.adguard.com",
+    "dns.adguard-dns.com",
+    "dns.nextdns.io",
+    "doh.dns.sb",
+    "dns.cloudflare.com",
+    "chrome.cloudflare-dns.com",
+    "doh.pub",
+    "dns.alidns.com",
+)
+
+
+def _is_doh_provider_sni(sni: str) -> bool:
+    low = sni.lower().strip(".")
+    return any(low == h or low.endswith("." + h) for h in DOH_PROVIDER_HOSTS)
 
 
 @dataclass(frozen=True)
@@ -41,6 +68,7 @@ class EncryptedDnsSummary:
     duration_seconds: Optional[float]
 
 
+@memoize_analysis
 def analyze_encrypted_dns(path: Path, show_status: bool = True) -> EncryptedDnsSummary:
     reader, status, stream, size_bytes, _file_type = get_reader(
         path, show_status=show_status
@@ -135,6 +163,39 @@ def analyze_encrypted_dns(path: Path, show_status: bool = True) -> EncryptedDnsS
                 "details": f"{doq_packets} packets on UDP/853",
             }
         )
+
+    # DoH-over-TLS detection via SNI of a known public DoH resolver (the real
+    # DoH case -- the /dns-query path above only catches cleartext DoH proxies).
+    try:
+        from .tls import analyze_tls
+
+        tls_summary = analyze_tls(path, show_status=False)
+        doh_snis = {
+            sni: int(count)
+            for sni, count in getattr(tls_summary, "sni_counts", {}).items()
+            if _is_doh_provider_sni(str(sni))
+        }
+        if doh_snis:
+            evidence = [
+                f"{sni} ({count} TLS session(s))"
+                for sni, count in sorted(
+                    doh_snis.items(), key=lambda kv: kv[1], reverse=True
+                )[:8]
+            ]
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "DNS over HTTPS to public resolver (TLS SNI)",
+                    "details": (
+                        "Encrypted DoH to known public resolver(s) observed via TLS "
+                        "SNI; DoH bypasses local DNS monitoring and is a common "
+                        "C2/exfil evasion channel. Confirm it is sanctioned."
+                    ),
+                    "evidence": evidence,
+                }
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        errors.append(f"DoH SNI check unavailable: {type(exc).__name__}: {exc}")
 
     duration = (
         (last_seen - first_seen)

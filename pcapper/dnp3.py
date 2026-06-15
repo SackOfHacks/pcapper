@@ -6,7 +6,7 @@ import struct
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 try:
     from scapy.layers.inet import TCP, UDP
@@ -15,7 +15,7 @@ except ImportError:
     TCP = UDP = Raw = None
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import extract_packet_endpoints, safe_float, memoize_analysis
 
 # --- Constants ---
 
@@ -59,6 +59,7 @@ FUNC_CODES = {
     32: "Authenticate Req",
     33: "Authenticate Err",
     129: "Response",
+    130: "Unsolicited Response",
 }
 
 CONTROL_FUNCTIONS = {2, 4, 5, 6}
@@ -68,6 +69,43 @@ APP_CONTROL_FUNCTIONS = {15, 16, 17, 18, 19, 31}
 UNSOLICITED_FUNCTIONS = {20, 21}
 TIME_FUNCTIONS = {23, 24}
 FILE_FUNCTIONS = {25, 26, 27, 28, 29, 30}
+SAV5_FUNCTIONS = {32, 33}  # DNP3 Secure Authentication v5 (IEEE 1815-2012)
+RESPONSE_FUNCTIONS = {129, 130}
+
+# DNP3 Internal Indications (IIN) bits — present in outstation responses. The
+# forensically interesting ones confirm device state (restart, trouble, local
+# control) and request outcome (object unknown, parameter error, buffer overflow).
+IIN1_BITS = {
+    0x01: "Broadcast msg received",
+    0x02: "Class 1 events available",
+    0x04: "Class 2 events available",
+    0x08: "Class 3 events available",
+    0x10: "Need Time",
+    0x20: "Local Control",
+    0x40: "Device Trouble",
+    0x80: "Device Restart",
+}
+IIN2_BITS = {
+    0x01: "Function code not supported",
+    0x02: "Object unknown",
+    0x04: "Parameter error",
+    0x08: "Event buffer overflow",
+    0x10: "Operation already executing",
+    0x20: "Configuration corrupt",
+}
+# IIN flags that are notable for triage (state/abuse signals, not routine
+# class-data-available bits).
+IIN_NOTABLE = {
+    "Device Restart",
+    "Device Trouble",
+    "Local Control",
+    "Configuration corrupt",
+    "Event buffer overflow",
+    "Operation already executing",
+    "Function code not supported",
+    "Parameter error",
+    "Object unknown",
+}
 
 OBJECT_GROUPS = {
     1: "Binary Input",
@@ -207,7 +245,11 @@ PACKED_DOUBLE_VARIATIONS = {(3, 1)}
 
 
 def _crc16_dnp(data: bytes) -> int:
-    crc = 0xFFFF
+    # DNP3 (IEEE 1815) link-layer CRC: poly 0x3D65 (0xA6BC reflected), initial
+    # value 0x0000, reflected in/out, final one's-complement. The initial value
+    # was 0xFFFF, which made *every* CRC wrong and raised a "CRC Mismatch" on
+    # every valid DNP3 frame (hundreds of false LOW findings per capture).
+    crc = 0x0000
     for byte in data:
         crc ^= byte
         for _ in range(8):
@@ -256,7 +298,18 @@ def _parse_dnp3_frames(payload: bytes) -> list[tuple[int, int, int, bytes, bool]
         if start + 3 > len(payload):
             break
         length = payload[start + 2]
-        frame_end = start + 3 + length
+        # DNP3 LENGTH counts control+dst+src+user-data (= 5 + N), excluding the
+        # start/length octets AND every CRC. The full frame on the wire is
+        # 10 (header+header-CRC) + N user-data bytes + a 2-byte CRC per 16-byte
+        # data block. The previous `start + 3 + length` stopped at the end of the
+        # user data, truncating the data-block CRCs, so the data CRC check failed
+        # on every valid multi-byte frame ("CRC Mismatch" flood).
+        n_userdata = length - 5
+        if n_userdata < 0:
+            idx = start + 2
+            continue
+        n_blocks = (n_userdata + 15) // 16 if n_userdata > 0 else 0
+        frame_end = start + 10 + n_userdata + 2 * n_blocks
         if frame_end > len(payload):
             break
         frame = payload[start:frame_end]
@@ -504,6 +557,8 @@ class Dnp3Anomaly:
     src: str
     dst: str
     ts: float
+    attack: str = ""  # ATT&CK for ICS technique id(s), e.g. "T0855"
+    evidence: str = ""
 
 
 @dataclass
@@ -521,6 +576,29 @@ class Dnp3Analysis:
         default_factory=Counter
     )  # IP addresses participating
 
+    # Protocol statistics (request/response/control breakdown)
+    requests: int = 0
+    responses: int = 0
+    unsolicited_responses: int = 0
+    control_count: int = 0
+    src_requests: Counter[str] = field(default_factory=Counter)
+    src_responses: Counter[str] = field(default_factory=Counter)
+    # Master/outstation role inference (a master issues requests; an outstation
+    # answers with responses). IP -> count.
+    master_ips: Counter[str] = field(default_factory=Counter)
+    outstation_ips: Counter[str] = field(default_factory=Counter)
+    # IP -> set of DNP3 data-link addresses seen for that IP.
+    ip_dnp3_addrs: dict[str, set] = field(default_factory=dict)
+    # Conversations: (master_ip, outstation_ip) -> Counter of function names.
+    conversations: dict = field(default_factory=dict)
+    # IIN (Internal Indication) flags observed in outstation responses.
+    iin_flags: Counter[str] = field(default_factory=Counter)
+    # Secure Authentication v5 (IEEE 1815-2012) seen on the wire?
+    sav5_present: bool = False
+    # Individual control commands (Operate / Direct Operate / Select / Write to
+    # an output) with evidence — the highest-value forensic artifact.
+    control_commands: List[dict[str, object]] = field(default_factory=list)
+
     # Activity
     messages: List[Dnp3Message] = field(default_factory=list)
     object_counts: Counter[str] = field(default_factory=Counter)
@@ -534,6 +612,7 @@ class Dnp3Analysis:
         return len(set(list(self.src_addrs.keys()) + list(self.dst_addrs.keys())))
 
 
+@memoize_analysis
 def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
     if TCP is None:
         return Dnp3Analysis(
@@ -572,12 +651,6 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
             [],
             [f"Error: {e}"],
         )
-    # Attempt to find file handle for progress
-    # for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-    #    candidate = getattr(reader, attr, None)
-    #    if candidate is not None:
-    #        stream = candidate
-    #        break
 
     total_packets = 0
     dnp3_packets = 0
@@ -605,9 +678,22 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
     src_restart_counts: Counter[str] = Counter()
     src_app_control_counts: Counter[str] = Counter()
     src_file_counts: Counter[str] = Counter()
+    # Role / conversation / IIN / control-evidence accumulators (surfaced for IR).
+    master_ips: Counter[str] = Counter()
+    outstation_ips: Counter[str] = Counter()
+    ip_dnp3_addrs: Dict[str, Set[int]] = defaultdict(set)
+    conversations: Dict[tuple, Counter] = defaultdict(Counter)
+    iin_flags: Counter[str] = Counter()
+    control_commands: List[dict[str, object]] = []
+    control_cmd_seen: Set[tuple] = set()
+    sav5_present = False
+    unsolicited_responses = 0
     src_time_counts: Counter[str] = Counter()
     nonstandard_port_counts: Counter[str] = Counter()
     reassembly_buffers: dict[tuple[str, str, int, int], bytearray] = {}
+    selected_pairs: Set[Tuple[str, int]] = set()
+    op_no_select_flagged: Set[Tuple[str, int]] = set()
+    broadcast_flagged: Set[Tuple[str, int]] = set()
 
     start_time = None
     last_time = None
@@ -674,7 +760,6 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                     has_transport = True
                     sport = int(pkt[TCP].sport)
                     dport = int(pkt[TCP].dport)
-                    # print(f"DEBUG DNP3: TCP {sport}->{dport}")
                     payload_obj = pkt[TCP].payload
                     payload = bytes(payload_obj) if payload_obj else b""
                     if not payload and Raw is not None and pkt.haslayer(Raw):
@@ -745,40 +830,60 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                     continue
 
                 frames = _parse_dnp3_frames(payload) if payload else []
+                on_dnp3_port = sport == DNP3_PORT or dport == DNP3_PORT
 
-                is_dnp3 = bool(frames)
-                if not is_dnp3:
-                    if sport == DNP3_PORT or dport == DNP3_PORT:
-                        is_dnp3 = True
+                # Off the standard DNP3 port, only a CRC-VALID frame counts as
+                # real DNP3: a chance 0x05 0x64 match in IT/malware traffic
+                # parses into a "frame" but fails CRC, and previously still
+                # triggered "DNP3 on Non-Standard Port"/"Exposure" false
+                # positives. On-port, accept frames even with CRC errors (real
+                # DNP3 corruption/tampering is itself worth surfacing).
+                has_valid_frame = any(f[4] for f in frames)
+                is_dnp3 = on_dnp3_port or has_valid_frame
                 if not is_dnp3:
                     continue
 
-                if frames and sport != DNP3_PORT and dport != DNP3_PORT:
+                if has_valid_frame and not on_dnp3_port:
                     nonstandard_port_counts[f"{sport}->{dport}"] += 1
 
                 dnp3_packets += 1
 
-                for dl_src, dl_dst, dl_ctrl, user_data, crc_ok in frames:
+                # Network-layer addresses (DNP3 runs over TCP/UDP) — not the
+                # Ethernet MACs that pkt[0].src would yield.
+                src_ip, dst_ip = extract_packet_endpoints(pkt)
+                if not src_ip:
                     src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
+                if not dst_ip:
                     dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "?"
 
+                for dl_src, dl_dst, dl_ctrl, user_data, crc_ok in frames:
                     ip_endpoints[src_ip] += 1
                     ip_endpoints[dst_ip] += 1
 
                     src_addrs[dl_src] += 1
                     dst_addrs[dl_dst] += 1
 
-                    if not crc_ok and len(anomalies) < max_anomalies:
-                        anomalies.append(
-                            Dnp3Anomaly(
-                                "LOW",
-                                "DNP3 CRC Mismatch",
-                                "DNP3 frame CRC mismatch detected (possible corruption or tampering).",
-                                src_ip,
-                                dst_ip,
-                                ts,
+                    # A CRC-failed frame is not a trustworthy DNP3 frame: its
+                    # "user data" is garbage, so parsing it as DNP3 application
+                    # layer manufactures phantom File-Op/Write findings. This is
+                    # also how a chance 0x05 0x64 match in non-DNP3 (IT/malware)
+                    # traffic produced false DNP3 detections. Only flag the CRC
+                    # mismatch as corruption on the actual DNP3 port (where the
+                    # traffic really is DNP3), and never parse its app layer.
+                    if not crc_ok:
+                        on_dnp3_port = sport == DNP3_PORT or dport == DNP3_PORT
+                        if on_dnp3_port and len(anomalies) < max_anomalies:
+                            anomalies.append(
+                                Dnp3Anomaly(
+                                    "LOW",
+                                    "DNP3 CRC Mismatch",
+                                    "DNP3 frame CRC mismatch detected (possible corruption or tampering).",
+                                    src_ip,
+                                    dst_ip,
+                                    ts,
+                                )
                             )
-                        )
+                        continue
 
                     if not user_data or len(user_data) < 2:
                         continue
@@ -804,16 +909,81 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                     func_name = FUNC_CODES.get(func_code, f"Unknown ({func_code})")
                     func_counts[func_name] += 1
 
-                    is_response = func_code == 129
+                    is_response = func_code in RESPONSE_FUNCTIONS
+                    ip_dnp3_addrs[src_ip].add(dl_src)
+                    ip_dnp3_addrs[dst_ip].add(dl_dst)
+                    if func_code in SAV5_FUNCTIONS:
+                        sav5_present = True
                     if is_response:
                         src_responses[src_ip] += 1
+                        # The responder is the OUTSTATION (RTU/IED); its peer is
+                        # the master.
+                        outstation_ips[src_ip] += 1
+                        conversations[(dst_ip, src_ip)][func_name] += 1
+                        if func_code == 130:
+                            unsolicited_responses += 1
+                        # Parse IIN (the 2 bytes after the function code).
+                        if len(app_data) >= 4:
+                            iin1, iin2 = app_data[2], app_data[3]
+                            for bit, name in IIN1_BITS.items():
+                                if iin1 & bit:
+                                    iin_flags[name] += 1
+                            for bit, name in IIN2_BITS.items():
+                                if iin2 & bit:
+                                    iin_flags[name] += 1
                     else:
                         src_requests[src_ip] += 1
                         src_dst_counts[src_ip][dst_ip] += 1
                         src_dst_addrs[src_ip].add(dl_dst)
+                        # The requester is the MASTER (issues commands/polls).
+                        master_ips[src_ip] += 1
+                        conversations[(src_ip, dst_ip)][func_name] += 1
 
                     if func_code in CONTROL_FUNCTIONS:
                         src_control_counts[src_ip] += 1
+                        # Record each control command with evidence (deduped per
+                        # src->dst+func+outstation-addr). This is the load-bearing
+                        # forensic artifact: an Operate/Direct Operate/Write to an
+                        # output is an actuation/setpoint change (ATT&CK T0855
+                        # Unauthorized Command Message / T0831 Manipulation of
+                        # Control). A single one is worth surfacing.
+                        _cc_key = (src_ip, dst_ip, func_code, dl_dst)
+                        if _cc_key not in control_cmd_seen:
+                            control_cmd_seen.add(_cc_key)
+                            control_commands.append(
+                                {
+                                    "ts": ts,
+                                    "src_ip": src_ip,
+                                    "dst_ip": dst_ip,
+                                    "src_addr": dl_src,
+                                    "dst_addr": dl_dst,
+                                    "func": func_name,
+                                    "func_code": func_code,
+                                }
+                            )
+                            # Operate / Direct Operate drive an output (relay/
+                            # setpoint). Surface each distinct one — even a single
+                            # command matters in OT.
+                            if (
+                                func_code in {4, 5, 6}
+                                and len(anomalies) < max_anomalies
+                            ):
+                                anomalies.append(
+                                    Dnp3Anomaly(
+                                        "HIGH",
+                                        "DNP3 Outstation Control Command",
+                                        f"{func_name} issued to outstation Addr "
+                                        f"{dl_dst} ({dst_ip}) — drives a control "
+                                        "output (relay/analog setpoint). Confirm the "
+                                        "source is the authorized master and within "
+                                        "a change window.",
+                                        src_ip,
+                                        dst_ip,
+                                        ts,
+                                        attack="T0855 Unauthorized Command Message; T0831 Manipulation of Control",
+                                        evidence=f"master {src_ip} (Addr {dl_src}) -> outstation {dst_ip} (Addr {dl_dst}) func={func_name}",
+                                    )
+                                )
                     if func_code in UNSOLICITED_FUNCTIONS:
                         src_unsolicited_counts[src_ip] += 1
                     if func_code in RESTART_FUNCTIONS:
@@ -833,10 +1003,14 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                             Dnp3Anomaly(
                                 "HIGH",
                                 "DNP3 Restart",
-                                f"System restart command ({func_name}) detected",
+                                f"System restart command ({func_name}) issued to "
+                                f"outstation Addr {dl_dst} ({dst_ip}) — forces the "
+                                "RTU/IED offline (loss of monitoring & control).",
                                 src_ip,
                                 dst_ip,
                                 ts,
+                                attack="T0816 Device Restart/Shutdown",
+                                evidence=f"{src_ip} (Addr {dl_src}) -> {dst_ip} (Addr {dl_dst}) func={func_name}",
                             )
                         )
 
@@ -846,6 +1020,52 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                                 "MEDIUM",
                                 "DNP3 Write",
                                 f"Write command detected to {dst_ip} (Addr {dl_dst})",
+                                src_ip,
+                                dst_ip,
+                                ts,
+                            )
+                        )
+
+                    # Select-before-Operate state tracking. Select (3) arms a
+                    # control point; Operate (4) should follow a prior Select.
+                    # DirectOperate (5/6) is one-step by design, so only a bare
+                    # Operate-4 with no observed Select is the SBO-bypass signal.
+                    if func_code == 3:
+                        selected_pairs.add((src_ip, dl_dst))
+                    elif func_code == 4 and (src_ip, dl_dst) not in selected_pairs:
+                        if (
+                            (src_ip, dl_dst) not in op_no_select_flagged
+                            and len(anomalies) < max_anomalies
+                        ):
+                            op_no_select_flagged.add((src_ip, dl_dst))
+                            anomalies.append(
+                                Dnp3Anomaly(
+                                    "MEDIUM",
+                                    "DNP3 Operate Without Select",
+                                    f"Operate to Addr {dl_dst} with no preceding Select "
+                                    "(single-stage control / possible SBO bypass; "
+                                    "may also be a capture gap).",
+                                    src_ip,
+                                    dst_ip,
+                                    ts,
+                                )
+                            )
+
+                    # Broadcast control: a command to a DNP3 broadcast link
+                    # address (0xFFFD-0xFFFF) actuates every outstation at once.
+                    if (
+                        dl_dst in (0xFFFD, 0xFFFE, 0xFFFF)
+                        and func_code in (2, 3, 4, 5, 6, 13, 14)
+                        and (src_ip, dl_dst) not in broadcast_flagged
+                        and len(anomalies) < max_anomalies
+                    ):
+                        broadcast_flagged.add((src_ip, dl_dst))
+                        anomalies.append(
+                            Dnp3Anomaly(
+                                "HIGH",
+                                "DNP3 Broadcast Control",
+                                f"Control/write ({func_name}) sent to broadcast address "
+                                f"0x{dl_dst:04X}; affects all outstations.",
                                 src_ip,
                                 dst_ip,
                                 ts,
@@ -1148,6 +1368,24 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
             )
         )
 
+    # Collapse identical repeated findings (same title/src/dst/detail) to one —
+    # DNP3 emits an anomaly per control-object/CRC/write packet, so a busy or
+    # merged capture floods with duplicates and buries the distinct findings.
+    _seen: set[tuple[str, str, str, str]] = set()
+    _deduped: list[Dnp3Anomaly] = []
+    for _a in anomalies:
+        _k = (
+            str(getattr(_a, "title", "")),
+            str(getattr(_a, "src", "")),
+            str(getattr(_a, "dst", "")),
+            str(getattr(_a, "description", "")),
+        )
+        if _k in _seen:
+            continue
+        _seen.add(_k)
+        _deduped.append(_a)
+    anomalies = _deduped
+
     return Dnp3Analysis(
         path=path,
         duration=duration,
@@ -1157,6 +1395,19 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
         src_addrs=src_addrs,
         dst_addrs=dst_addrs,
         ip_endpoints=ip_endpoints,
+        requests=sum(src_requests.values()),
+        responses=sum(src_responses.values()),
+        unsolicited_responses=unsolicited_responses,
+        control_count=sum(src_control_counts.values()),
+        src_requests=src_requests,
+        src_responses=src_responses,
+        master_ips=master_ips,
+        outstation_ips=outstation_ips,
+        ip_dnp3_addrs={k: set(v) for k, v in ip_dnp3_addrs.items()},
+        conversations={k: dict(v) for k, v in conversations.items()},
+        iin_flags=iin_flags,
+        sav5_present=sav5_present,
+        control_commands=control_commands,
         messages=messages,
         object_counts=object_counts,
         object_group_counts=object_group_counts,

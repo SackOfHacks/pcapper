@@ -4,12 +4,18 @@ import ipaddress
 from pathlib import Path
 
 from .industrial_helpers import (
+    append_public_exposure_anomaly,
     IndustrialAnalysis,
     IndustrialAnomaly,
     analyze_port_protocol,
 )
 
-HONEYWELL_SIGNATURES = (b"CDA", b"Honeywell", b"HONEYWELL")
+# NOTE: the 3-byte token b"CDA" was removed -- with no port constraint this
+# matcher scans every payload, and "CDA" occurs constantly in unrelated traffic
+# ("CDATA" in XML, base64, random binary), producing rampant false "Honeywell
+# CDA" detections (and public-IP-exposure anomalies) on non-OT captures. Only
+# the unambiguous vendor strings are kept.
+HONEYWELL_SIGNATURES = (b"Honeywell", b"HONEYWELL")
 
 
 def _match_signature(payload: bytes) -> bool:
@@ -24,22 +30,5 @@ def analyze_honeywell(path: Path, show_status: bool = True) -> IndustrialAnalysi
         enable_enrichment=True,
         show_status=show_status,
     )
-    public_endpoints = []
-    for ip_value in set(analysis.src_ips) | set(analysis.dst_ips):
-        try:
-            if ipaddress.ip_address(ip_value).is_global:
-                public_endpoints.append(ip_value)
-        except Exception:
-            continue
-    if public_endpoints and len(analysis.anomalies) < 200:
-        analysis.anomalies.append(
-            IndustrialAnomaly(
-                severity="HIGH",
-                title="Honeywell CDA Exposure to Public IP",
-                description=f"Honeywell CDA traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-                src="*",
-                dst="*",
-                ts=0.0,
-            )
-        )
+    append_public_exposure_anomaly(analysis, "Honeywell CDA")
     return analysis

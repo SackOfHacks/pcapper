@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, UDP  # type: ignore
@@ -40,11 +40,23 @@ def _looks_like_quic(payload: bytes) -> bool:
     if not payload:
         return False
     first = payload[0]
-    # QUIC long header has 0x80 bit set
-    if first & 0x80:
-        return True
-    # short header has 0x40 bit set and fixed bit 0x40; check for 0x40 or 0x50+ variants
-    return (first & 0x40) == 0x40
+    # Long header: Header-Form (0x80) AND Fixed (0x40) bits set, plus a
+    # recognized 32-bit version. Requiring the fixed bit + version rejects STUN/
+    # DTLS/other UDP on the same port whose first byte merely had 0x80 set.
+    if (first & 0xC0) == 0xC0:
+        if len(payload) < 5:
+            return False
+        version = int.from_bytes(payload[1:5], "big")
+        return (
+            version == 0x00000000  # Version Negotiation
+            or version == 0x00000001  # QUIC v1 (RFC 9000)
+            or version == 0x6B3343CF  # QUIC v2 (RFC 9369)
+            or (version >> 16) == 0xFF00  # IETF drafts ff0000xx
+            or (version & 0x0F0F0F0F) == 0x0A0A0A0A  # forced version negotiation
+        )
+    # Short header: Header-Form bit clear, Fixed bit set. Can't validate further
+    # statelessly; already gated to QUIC ports by the caller.
+    return (first & 0xC0) == 0x40
 
 
 def _parse_version(payload: bytes) -> Optional[str]:
@@ -56,6 +68,7 @@ def _parse_version(payload: bytes) -> Optional[str]:
     return f"0x{version:08x}"
 
 
+@memoize_analysis
 def analyze_quic(path: Path, show_status: bool = True) -> QuicSummary:
     if UDP is None:
         return QuicSummary(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_valid_ip as _valid_ip
+from .utils import is_public_ip as _is_public_ip
+from .utils import is_private_ip as _is_private_ip
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -13,7 +15,7 @@ from .exfil import analyze_exfil
 from .hosts import analyze_hosts
 from .progress import run_with_busy_status
 from .secrets import analyze_secrets
-from .threats import analyze_threats
+from .threats import OT_PORTS, analyze_threats
 from .utils import format_bytes_as_mb
 
 IOC_DOMAIN_RE = re.compile(
@@ -31,8 +33,11 @@ IOC_URL_RE = re.compile(r"https?://[^\s)\]]+", re.IGNORECASE)
 IOC_MD5_RE = re.compile(r"\b[a-f0-9]{32}\b", re.IGNORECASE)
 IOC_SHA1_RE = re.compile(r"\b[a-f0-9]{40}\b", re.IGNORECASE)
 IOC_SHA256_RE = re.compile(r"\b[a-f0-9]{64}\b", re.IGNORECASE)
+# The name part must not contain spaces, otherwise the (greedy) match swallows
+# the preceding words of a free-text detail string (e.g. "beacon to 1.2.3.4
+# host evil.com file update.exe" was captured whole as one "filename").
 IOC_FILENAME_RE = re.compile(
-    r"\b[\w\-.()\[\] ]+\.(?:exe|dll|sys|scr|cpl|ocx|bat|ps1|vbs|js|jar|zip|rar|7z|gz|iso|img|pdf|doc|docx|xls|xlsx|ppt|pptx)\b",
+    r"\b[\w\-.()\[\]]{1,64}\.(?:exe|dll|sys|scr|cpl|ocx|bat|ps1|vbs|js|jar|zip|rar|7z|gz|iso|img|pdf|doc|docx|xls|xlsx|ppt|pptx)\b",
     re.IGNORECASE,
 )
 
@@ -68,26 +73,6 @@ class CompromiseSummary:
     deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
     benign_context: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
-
-
-def _valid_ip(value: str) -> bool:
-    if not value:
-        return False
-    try:
-        ip_obj = ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    if ip_obj.is_unspecified or ip_obj.is_multicast:
-        return False
-    return True
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        ip_obj = ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    return ip_obj.is_global
 
 
 def _pick_hostname(ip_value: str, candidates: list[str]) -> str:
@@ -266,7 +251,8 @@ def _score_weight(severity: str) -> int:
 def _classify_stage(summary: str, details: str, source: str) -> str:
     blob = f"{summary} {details} {source}".lower()
     if any(
-        token in blob for token in ("scan", "recon", "sweep", "probe", "enumeration")
+        token in blob
+        for token in ("scan", "recon", "sweep", "probe", "probing", "enumeration")
     ):
         return "recon"
     if any(
@@ -487,8 +473,34 @@ def analyze_compromised(
         dst_ip = str(getattr(candidate, "dst_ip", "") or "")
         if not _valid_ip(src_ip):
             continue
-        severity = "high" if score >= 0.90 else "warning"
-        summary = "Beaconing behavior detected"
+        # Internal-only periodic flow on an OT service port is the OT baseline
+        # (HMI/PLC cyclic polling), not C2. Record it as benign-automation
+        # context at info severity so it does not push an OT host over the
+        # compromise threshold; genuine C2 (a private->public beacon) is
+        # unaffected.
+        dst_port = 0
+        try:
+            dst_port = int(getattr(candidate, "dst_port", 0) or 0)
+        except Exception:
+            dst_port = 0
+        internal_ot_cyclic = (
+            _is_private_ip(src_ip)
+            and dst_ip
+            and _is_private_ip(dst_ip)
+            and dst_port in OT_PORTS
+        )
+        if internal_ot_cyclic:
+            severity = "info"
+            summary = "Periodic OT control-channel (likely baseline polling)"
+            message = (
+                f"{src_ip}->{dst_ip} {getattr(candidate, 'proto', '-')}/{dst_port} "
+                f"interval≈{getattr(candidate, 'median_interval', 0.0):.1f}s "
+                "(internal OT cyclic; verify against process baseline)"
+            )
+            deterministic_checks["benign_automation_likely"].append(message)
+        else:
+            severity = "high" if score >= 0.90 else "warning"
+            summary = "Beaconing behavior detected"
         details = (
             f"{src_ip} -> {dst_ip} {getattr(candidate, 'proto', '-')}/"
             f"{getattr(candidate, 'dst_port', '-')}"
@@ -527,10 +539,11 @@ def analyze_compromised(
             }
         )
         detection_by_host[src_ip].append(detections[-1])
-        host_stages[src_ip].add("c2")
-        deterministic_checks["beacon_c2"].append(
-            f"{src_ip} beacon score={score:.2f} to {dst_ip}"
-        )
+        if not internal_ot_cyclic:
+            host_stages[src_ip].add("c2")
+            deterministic_checks["beacon_c2"].append(
+                f"{src_ip} beacon score={score:.2f} to {dst_ip}"
+            )
 
     # 3) Exfiltration suspects
     exfil_first = getattr(exfil_summary, "first_seen", None)
@@ -883,10 +896,32 @@ def analyze_compromised(
                 }
             )
 
+    def _is_strong_campaign_ioc(value: str) -> bool:
+        # Campaign correlation groups hosts by a shared indicator, so the
+        # indicator must be specific enough that sharing it is meaningful. URLs,
+        # file hashes, and public IPs qualify. Bare filenames (e.g. "update.exe")
+        # and bare internal/benign domains recur across unrelated hosts and
+        # would manufacture phantom campaigns, so they are excluded here while
+        # remaining visible in each host's IOC list.
+        text = str(value or "").strip().lower()
+        if not text:
+            return False
+        if text.startswith(("http://", "https://")):
+            return True
+        if re.fullmatch(r"[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}", text):
+            return True
+        if _valid_ip(text):
+            return _is_public_ip(text)
+        # A domain qualifies only if it is public-routable (has a real TLD and
+        # is not an internal/.local/.arpa name).
+        if "." in text and not text.endswith((".local", ".arpa", ".lan", ".internal")):
+            return bool(IOC_DOMAIN_RE.fullmatch(text))
+        return False
+
     ioc_to_hosts: dict[str, set[str]] = defaultdict(set)
     for host in compromised_hosts:
         for ioc in host.iocs[:20]:
-            if ioc:
+            if ioc and _is_strong_campaign_ioc(str(ioc)):
                 ioc_to_hosts[str(ioc)].add(host.ip)
 
     campaigns: list[dict[str, object]] = []
@@ -912,9 +947,11 @@ def analyze_compromised(
     for ip_value in sorted(host_state.keys()):
         stages = host_stages.get(ip_value, set())
         if stages == {"c2"} and len(detection_by_host.get(ip_value, [])) <= 1:
-            benign_context.append(
+            message = (
                 f"{ip_value} only single C2-like signal without corroboration"
             )
+            benign_context.append(message)
+            deterministic_checks["benign_automation_likely"].append(message)
         record = host_record_by_ip.get(ip_value)
         if record is not None:
             ports = {
@@ -922,9 +959,11 @@ def analyze_compromised(
                 for item in getattr(record, "open_ports", []) or []
             }
             if 123 in ports and stages <= {"c2", "other"}:
-                benign_context.append(
+                message = (
                     f"{ip_value} periodic behavior may align with NTP/service checks"
                 )
+                benign_context.append(message)
+                deterministic_checks["benign_automation_likely"].append(message)
 
     host_priority.sort(
         key=lambda item: (

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_public_ip as _is_public_ip, packet_length, memoize_analysis
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -42,13 +42,15 @@ from .cip import (
 )
 from .device_detection import device_fingerprint_from_fields
 from .equipment import equipment_artifacts
-from .industrial_helpers import IndustrialAnomaly, IndustrialArtifact
+from .industrial_helpers import IndustrialAnomaly, IndustrialArtifact, _extract_transport
 from .pcap_cache import get_reader
 from .utils import extract_packet_endpoints, safe_float, safe_read_text
 
 ENIP_TCP_PORT = 44818
 ENIP_UDP_PORT = 2222
 ENIP_SECURITY_PORT = CIP_SECURITY_PORT
+# Hoisted out of the per-packet loop (was rebuilt for every packet).
+_ENIP_PORTS = frozenset({ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT})
 
 ENIP_COMMANDS = {
     0x0001: "NOP",
@@ -66,6 +68,19 @@ ENIP_COMMANDS = {
     0x006D: "WriteObjectInstanceAttributes",
     0x006F: "SendRRData",
     0x0070: "SendUnitData",
+}
+
+# Defined ENIP encapsulation status codes (CIP Vol 2). Used to validate a
+# non-standard-port signature match so arbitrary binary content isn't misread as
+# ENIP. Requests always carry status 0; responses use one of these.
+_ENIP_ENCAP_STATUSES = {
+    0x00000000,  # Success
+    0x00000001,  # Invalid/unsupported command
+    0x00000002,  # Insufficient memory
+    0x00000003,  # Incorrect data
+    0x00000064,  # Invalid session handle
+    0x00000065,  # Invalid length
+    0x00000069,  # Unsupported protocol revision
 }
 
 SUSPICIOUS_ENIP_COMMANDS = {
@@ -277,71 +292,12 @@ def merge_enip_summaries(summaries: list[ENIPAnalysis]) -> ENIPAnalysis:
     return merged
 
 
-def _extract_transport(pkt) -> tuple[bool, str, str, int, int, bytes]:
-    src_ip = "?"
-    dst_ip = "?"
-    sport = 0
-    dport = 0
-    payload = b""
-
-    if TCP is not None and pkt.haslayer(TCP):
-        sport = int(pkt[TCP].sport)
-        dport = int(pkt[TCP].dport)
-        payload_obj = pkt[TCP].payload
-        payload = bytes(payload_obj) if payload_obj else b""
-        if not payload and Raw is not None and pkt.haslayer(Raw):
-            try:
-                payload = bytes(pkt[Raw].load)
-            except Exception:
-                pass
-    elif UDP is not None and pkt.haslayer(UDP):
-        sport = int(pkt[UDP].sport)
-        dport = int(pkt[UDP].dport)
-        payload_obj = pkt[UDP].payload
-        payload = bytes(payload_obj) if payload_obj else b""
-        if not payload and Raw is not None and pkt.haslayer(Raw):
-            try:
-                payload = bytes(pkt[Raw].load)
-            except Exception:
-                pass
-    else:
-        return False, src_ip, dst_ip, sport, dport, payload
-
-    src_raw, dst_raw = extract_packet_endpoints(pkt)
-    if src_raw and dst_raw:
-        src_ip = src_raw
-        dst_ip = dst_raw
-    else:
-        src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
-        dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "?"
-
-    return True, src_ip, dst_ip, sport, dport, payload
-
-
 def _format_ascii(payload: bytes, limit: int = 200) -> str:
     if not payload:
         return ""
     text = payload[:limit].decode("utf-8", errors="ignore")
     cleaned = "".join(ch if ch.isprintable() else " " for ch in text)
     return " ".join(cleaned.split())
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
-
-
-def _parse_cpf(data: bytes) -> tuple[Optional[bytes], bool]:
-    info = _parse_enip_details_base(
-        b"\x6f\x00" + len(data).to_bytes(2, "little") + b"\x00" * 20 + data
-    )
-    payload = info.get("cip_payload")
-    return (
-        payload if isinstance(payload, (bytes, bytearray)) else None,
-        bool(info.get("is_connected", False)),
-    )
 
 
 def _parse_enip(
@@ -534,25 +490,6 @@ def _scan_identity_items(payload: bytes, src_ip: str) -> list[IdentityInfo]:
     return identities
 
 
-def _parse_cip_service(
-    payload: bytes,
-) -> tuple[Optional[int], Optional[str], bool, Optional[int], Optional[str]]:
-    if not payload:
-        return None, None, True, None, None
-    service = payload[0]
-    service_name = CIP_SERVICE_NAMES.get(service & 0x7F)
-    is_request = (service & 0x80) == 0
-    if is_request:
-        return service, service_name, True, None, None
-    if len(payload) >= 4:
-        general_status = payload[2]
-        status_text = CIP_GENERAL_STATUS.get(general_status)
-    else:
-        general_status = None
-        status_text = None
-    return service, service_name, False, general_status, status_text
-
-
 def _bucketize(values: list[int]) -> list[SizeBucket]:
     buckets: list[SizeBucket] = []
     total = len(values)
@@ -571,6 +508,7 @@ def _bucketize(values: list[int]) -> list[SizeBucket]:
     return buckets
 
 
+@memoize_analysis
 def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
     if TCP is None and UDP is None:
         return ENIPAnalysis(path=path, errors=["Scapy unavailable (TCP/UDP missing)"])
@@ -614,6 +552,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
     write_target_anoms_seen: set[str] = set()
     security_sessions_seen: set[str] = set()
     sensitive_write_seen: set[str] = set()
+    # Dedup the per-packet ENIP-layer anomalies (error status / malformed length /
+    # malformed CPF) so a busy Logix flow doesn't flood the 200-cap and bury real
+    # CIP findings.
+    enip_layer_anom_seen: set[str] = set()
+    msp_bundle_seen: set[str] = set()
 
     try:
         with status as pbar:
@@ -629,7 +572,7 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         pass
 
                 analysis.total_packets += 1
-                pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+                pkt_len = packet_length(pkt)
                 analysis.total_bytes += pkt_len
                 ts = safe_float(getattr(pkt, "time", 0))
                 if start_time is None:
@@ -642,15 +585,33 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                 if not has_transport:
                     continue
 
-                matches_port = sport in {
-                    ENIP_TCP_PORT,
-                    ENIP_UDP_PORT,
-                    ENIP_SECURITY_PORT,
-                } or dport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
+                # Treat the ENIP port as the SERVER side only: the destination,
+                # or the source paired with an ephemeral destination (a server
+                # response). ENIP's 44818 sits in the ephemeral range, so a bare
+                # "sport or dport == 44818" match misclassifies unrelated flows
+                # whose ephemeral source port happens to equal 44818 (e.g. a DNS
+                # query to 8.8.8.8). Real ENIP on a nonstandard port is still
+                # caught by the command-signature path below.
+                matches_port = dport in _ENIP_PORTS or (
+                    sport in _ENIP_PORTS and dport >= 32768
+                )
+                # Signature match for ENIP on a non-standard port must validate
+                # the full 24-byte encapsulation header, not just the 2-byte
+                # command — otherwise arbitrary binary/HTTP content whose first
+                # two bytes happen to equal a command code (small LE values like
+                # 04 00 / 65 00) is misread as ENIP. A real header's length field
+                # accounts for exactly the trailing data and the status is one of
+                # the defined encapsulation statuses.
                 matches_signature = False
-                if payload and len(payload) >= 2:
+                if payload and len(payload) >= 24:
                     cmd_guess = int.from_bytes(payload[0:2], "little")
-                    matches_signature = cmd_guess in ENIP_COMMANDS
+                    declared_len = int.from_bytes(payload[2:4], "little")
+                    enc_status = int.from_bytes(payload[8:12], "little")
+                    matches_signature = (
+                        cmd_guess in ENIP_COMMANDS
+                        and 24 + declared_len == len(payload)
+                        and enc_status in _ENIP_ENCAP_STATUSES
+                    )
 
                 if not matches_port and not matches_signature:
                     continue
@@ -779,10 +740,13 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         enip.get("status_text") or f"0x{int(encap_status):08x}"
                     )
                     analysis.status_codes[f"ENIP:{status_text}"] += 1
+                    _es_key = f"ENIP Error Status|{src_ip}|{dst_ip}|{status_text}"
                     if (
                         int(encap_status) != 0
+                        and _es_key not in enip_layer_anom_seen
                         and len(analysis.anomalies) < max_anomalies
                     ):
+                        enip_layer_anom_seen.add(_es_key)
                         analysis.anomalies.append(
                             IndustrialAnomaly(
                                 severity="LOW",
@@ -794,7 +758,13 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                             )
                         )
 
-                if length_mismatch and len(analysis.anomalies) < max_anomalies:
+                _ml_key = f"Malformed ENIP Length|{src_ip}|{dst_ip}"
+                if (
+                    length_mismatch
+                    and _ml_key not in enip_layer_anom_seen
+                    and len(analysis.anomalies) < max_anomalies
+                ):
+                    enip_layer_anom_seen.add(_ml_key)
                     analysis.anomalies.append(
                         IndustrialAnomaly(
                             severity="MEDIUM",
@@ -806,11 +776,14 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         )
                     )
 
+                _cpf_key = f"Malformed ENIP CPF|{src_ip}|{dst_ip}"
                 if (
                     is_cip_carrier
                     and cpf_malformed
+                    and _cpf_key not in enip_layer_anom_seen
                     and len(analysis.anomalies) < max_anomalies
                 ):
+                    enip_layer_anom_seen.add(_cpf_key)
                     analysis.anomalies.append(
                         IndustrialAnomaly(
                             severity="MEDIUM",
@@ -857,6 +830,13 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                     cip_payload, (bytes, bytearray)
                 ):
                     parse_payload = bytes(cip_payload)
+
+                # Connected (Class 1) CIP messages prefix a 2-byte CIP sequence
+                # count on the 0x00B1 data item before the service byte; strip it
+                # so the service code isn't read from the sequence count (which
+                # misidentifies every connected CIP message — the dominant form).
+                if is_connected and len(parse_payload) >= 2:
+                    parse_payload = parse_payload[2:]
 
                 if encap_data:
                     identities = []
@@ -1040,18 +1020,33 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                     ):
                                         src_write_commands[src_ip] += 1
 
-                                if (
-                                    any(
-                                        code in HIGH_RISK_SERVICE_CODES
+                                high_risk_subs = sorted(
+                                    {
+                                        CIP_SERVICE_NAMES.get(code, f"0x{code:02x}")
                                         for code in sub_codes
-                                    )
+                                        if code in HIGH_RISK_SERVICE_CODES
+                                    }
+                                )
+                                # Aggregate per (src, dst, high-risk service set)
+                                # so a Logix MSP repeated thousands of times yields
+                                # one finding instead of flooding the 200-cap.
+                                msp_bundle_key = (
+                                    f"{src_ip}->{dst_ip}:{','.join(high_risk_subs)}"
+                                )
+                                if (
+                                    high_risk_subs
+                                    and msp_bundle_key not in msp_bundle_seen
                                     and len(analysis.anomalies) < max_anomalies
                                 ):
+                                    msp_bundle_seen.add(msp_bundle_key)
                                     analysis.anomalies.append(
                                         IndustrialAnomaly(
                                             severity="HIGH",
                                             title="CIP Multi-Service High-Risk Bundle",
-                                            description=f"Multiple_Service_Packet includes high-risk operation(s): {msp_detail}",
+                                            description=(
+                                                "Multiple_Service_Packet includes "
+                                                f"high-risk operation(s): {', '.join(high_risk_subs)}"
+                                            ),
                                             src=src_ip,
                                             dst=dst_ip,
                                             ts=ts or 0.0,
@@ -1247,20 +1242,30 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         or f"0x{general_status:02x}"
                     )
                     analysis.status_codes[f"CIP:{cip_status_text}"] += 1
-                    if (
-                        general_status != 0x00
-                        and len(analysis.anomalies) < max_anomalies
-                    ):
-                        analysis.anomalies.append(
-                            IndustrialAnomaly(
-                                severity="LOW",
-                                title="CIP Error Response",
-                                description=f"General status {cip_status_text}.",
-                                src=src_ip,
-                                dst=dst_ip,
-                                ts=ts or 0.0,
+                    if general_status != 0x00:
+                        # Emit the LOW anomaly once per distinct status — one
+                        # anomaly per error *packet* flooded the list (e.g. 173
+                        # "CIP Error Response" LOWs on a normal capture, burying
+                        # real findings). The full per-status counts remain in
+                        # analysis.status_codes. The error tracking below is no
+                        # longer gated on the anomaly cap, so it stays accurate.
+                        if (
+                            analysis.status_codes[f"CIP:{cip_status_text}"] == 1
+                            and len(analysis.anomalies) < max_anomalies
+                        ):
+                            analysis.anomalies.append(
+                                IndustrialAnomaly(
+                                    severity="LOW",
+                                    title="CIP Error Response",
+                                    description=(
+                                        f"General status {cip_status_text} "
+                                        "(see CIP status code distribution for full counts)."
+                                    ),
+                                    src=src_ip,
+                                    dst=dst_ip,
+                                    ts=ts or 0.0,
+                                )
                             )
-                        )
                         if service_name:
                             analysis.service_error_counts[service_name] += 1
                         if not is_request:
@@ -1294,9 +1299,13 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                             op_parts.append(f"elements={element_count}")
                         if tag_offset is not None:
                             op_parts.append(f"offset={tag_offset}")
+                        # 0x4C=Read_Tag / 0x4D=Write_Tag / 0x4E=Read_Modify_Write /
+                        # 0x53=Write_Tag_Fragmented. The previous {0x4C,0x4E,0x4F}
+                        # set was inverted (labeled the Read_Tag as a write and
+                        # missed the real Write_Tag 0x4D).
                         op_kind = (
                             "tag_write"
-                            if is_request and service_code in {0x4C, 0x4E, 0x4F}
+                            if is_request and service_code in {0x4D, 0x4E, 0x53}
                             else "tag_read"
                         )
                         if not is_request:

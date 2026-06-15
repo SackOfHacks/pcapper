@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_private_ip as _is_private_ip, packet_length
+from .utils import is_public_ip as _is_public_ip
 import math
 import re
 from collections import Counter, defaultdict
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import ICMP, IP  # type: ignore
@@ -83,20 +84,6 @@ class IcmpSummary:
     false_positive_context: list[str] = field(default_factory=list)
 
 
-def _is_private_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_private
-    except Exception:
-        return False
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
-
-
 def _build_icmp_enrichment(
     *,
     total_packets: int,
@@ -109,19 +96,105 @@ def _build_icmp_enrichment(
     payload_summaries: list[dict[str, object]],
     detections: list[dict[str, str]],
 ) -> dict[str, object]:
-    _ = (
-        total_packets,
-        duration_seconds,
-        type_counts,
-        src_ip_counts,
-        dst_ip_counts,
-        conversations,
-        sessions,
-        payload_summaries,
-        detections,
-    )
-    return {}
+    """Derive ICMP triage signals (deterministic checks + analyst verdict) from
+    the detections. Drives the verdict-first output and risk matrix so an ICMP
+    sweep / tunnel / flood is surfaced as a triage call, not just a raw stat dump.
+    """
+    _ = (total_packets, type_counts, src_ip_counts, conversations, payload_summaries)
+    checks: dict[str, list[str]] = defaultdict(list)
+    risk_matrix: list[dict[str, object]] = []
 
+    # Map each detection to a deterministic-check category by intent.
+    for det in detections:
+        sev = str(det.get("severity", "info")).lower()
+        if sev == "info":
+            continue
+        summary_text = str(det.get("summary", ""))
+        dtype = str(det.get("type", "")).lower()
+        blob = f"{dtype} {summary_text}".lower()
+        evidence = summary_text or dtype
+        if "sweep" in blob or "without replies" in blob or "unreachable volume" in blob:
+            checks["icmp_recon_sweep_behavior"].append(evidence)
+        if any(
+            tok in blob
+            for tok in ("tunnel", "covert", "high-entropy", "large icmp", "payload variab", "payload anomal", "large icmp payload")
+        ):
+            checks["icmp_tunneling_signal"].append(evidence)
+        if "redirect" in blob or "router advert" in blob or "control-plane" in blob:
+            checks["icmp_control_plane_abuse"].append(evidence)
+        if "flood" in blob or "high icmp rate" in blob:
+            checks["icmp_recon_sweep_behavior"].append(evidence)
+
+    # Verdict: synthesize the categories into a triage call. Covert-channel /
+    # exfil (tunneling) and control-plane abuse (ICMP redirect = MITM) are the
+    # high-consequence findings; recon sweeps are leads; floods are availability.
+    score = 0
+    reasons: list[str] = []
+    for det in detections:
+        sev = str(det.get("severity", "info")).lower()
+        score += {"critical": 3, "high": 2, "warning": 1}.get(sev, 0)
+    if checks.get("icmp_tunneling_signal"):
+        score += 2
+        reasons.append(
+            "ICMP covert-channel / tunneling indicators (possible C2 or exfiltration over ICMP)"
+        )
+    if checks.get("icmp_control_plane_abuse"):
+        score += 2
+        reasons.append("ICMP control-plane abuse (e.g. Redirect — possible MITM)")
+    if checks.get("icmp_recon_sweep_behavior"):
+        score += 1
+        reasons.append("ICMP reconnaissance / host-discovery sweep observed")
+    high_ct = sum(
+        1 for d in detections if str(d.get("severity", "")).lower() in {"high", "critical"}
+    )
+    if high_ct:
+        reasons.append(f"High-severity ICMP detections: {high_ct}")
+
+    if score >= 6:
+        verdict = "YES - high-confidence malicious ICMP activity (covert channel / control-plane abuse) is present."
+        confidence = "high"
+    elif score >= 4:
+        verdict = "LIKELY - suspicious ICMP activity with covert-channel or abuse indicators is present."
+        confidence = "medium"
+    elif score >= 2:
+        verdict = "POSSIBLE - notable ICMP behavior (recon/large-payload) observed; corroboration recommended."
+        confidence = "low"
+    elif score >= 1:
+        verdict = "LOW SIGNAL - minor ICMP anomalies present but not strongly corroborated."
+        confidence = "low"
+    else:
+        verdict = ""
+        confidence = "low"
+    if not reasons and verdict:
+        reasons.append("ICMP anomaly heuristics crossed threshold")
+
+    # Build the risk matrix from the populated checks.
+    _risk_meta = {
+        "icmp_tunneling_signal": ("ICMP Tunneling/Covert Channel", "High"),
+        "icmp_control_plane_abuse": ("ICMP Control-Plane Abuse", "High"),
+        "icmp_recon_sweep_behavior": ("ICMP Recon/Sweep", "Medium"),
+    }
+    for key, (cat, risk) in _risk_meta.items():
+        vals = checks.get(key, [])
+        if vals:
+            risk_matrix.append(
+                {
+                    "category": cat,
+                    "risk": risk,
+                    "confidence": "High" if len(vals) >= 2 else "Medium",
+                    "evidence": f"{len(vals)} signal(s)",
+                }
+            )
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons,
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
+        "risk_matrix": risk_matrix,
+    }
+
+@memoize_analysis
 def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
     errors: list[str] = []
     if ICMP is None and ICMPv6Unknown is None:
@@ -198,54 +271,95 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                 except Exception:
                     pass
 
-            is_icmpv4 = ICMP is not None and pkt.haslayer(ICMP)  # type: ignore[truthy-bool]
+            # Resolve each scapy layer class at most once per packet via
+            # getlayer (haslayer + pkt[X] would walk the layer chain twice).
+            icmp_layer = pkt.getlayer(ICMP) if ICMP is not None else None  # type: ignore[arg-type]
+            is_icmpv4 = icmp_layer is not None
+            ip_layer = None
+            ip_layer_resolved = False
+            ip6_layer = None
+            ip6_layer_resolved = False
+            icmp6_unknown = None
+            icmp6_echo_request = None
+            icmp6_echo_reply = None
+            icmp6_dest_unreach = None
+            icmp6_time_exceeded = None
+            icmp6_param_problem = None
+            icmp6_packet_too_big = None
             is_icmpv6 = False
-            if ICMPv6Unknown is not None and pkt.haslayer(ICMPv6Unknown):
+            if (
+                ICMPv6Unknown is not None
+                and (icmp6_unknown := pkt.getlayer(ICMPv6Unknown)) is not None
+            ):
                 is_icmpv6 = True
-            elif ICMPv6EchoRequest is not None and pkt.haslayer(ICMPv6EchoRequest):
+            elif (
+                ICMPv6EchoRequest is not None
+                and (icmp6_echo_request := pkt.getlayer(ICMPv6EchoRequest)) is not None
+            ):
                 is_icmpv6 = True
-            elif ICMPv6EchoReply is not None and pkt.haslayer(ICMPv6EchoReply):
+            elif (
+                ICMPv6EchoReply is not None
+                and (icmp6_echo_reply := pkt.getlayer(ICMPv6EchoReply)) is not None
+            ):
                 is_icmpv6 = True
-            elif ICMPv6DestUnreach is not None and pkt.haslayer(ICMPv6DestUnreach):
+            elif (
+                ICMPv6DestUnreach is not None
+                and (icmp6_dest_unreach := pkt.getlayer(ICMPv6DestUnreach)) is not None
+            ):
                 is_icmpv6 = True
-            elif ICMPv6TimeExceeded is not None and pkt.haslayer(ICMPv6TimeExceeded):
+            elif (
+                ICMPv6TimeExceeded is not None
+                and (icmp6_time_exceeded := pkt.getlayer(ICMPv6TimeExceeded))
+                is not None
+            ):
                 is_icmpv6 = True
-            elif ICMPv6ParamProblem is not None and pkt.haslayer(ICMPv6ParamProblem):
+            elif (
+                ICMPv6ParamProblem is not None
+                and (icmp6_param_problem := pkt.getlayer(ICMPv6ParamProblem))
+                is not None
+            ):
                 is_icmpv6 = True
-            elif ICMPv6PacketTooBig is not None and pkt.haslayer(ICMPv6PacketTooBig):
+            elif (
+                ICMPv6PacketTooBig is not None
+                and (icmp6_packet_too_big := pkt.getlayer(ICMPv6PacketTooBig))
+                is not None
+            ):
                 is_icmpv6 = True
             # Fallback: detect ICMP by IP protocol/next-header if layers are missing
             if not is_icmpv4 and not is_icmpv6:
-                if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                    ip_layer = pkt[IP]  # type: ignore[index]
+                if IP is not None:
+                    ip_layer = pkt.getlayer(IP)  # type: ignore[arg-type]
+                ip_layer_resolved = True
+                if ip_layer is not None:
                     if getattr(ip_layer, "proto", None) == 1:
                         is_icmpv4 = True
-                if not is_icmpv4 and IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                    ip6_layer = pkt[IPv6]  # type: ignore[index]
-                    if getattr(ip6_layer, "nh", None) == 58:
+                if not is_icmpv4:
+                    if IPv6 is not None:
+                        ip6_layer = pkt.getlayer(IPv6)  # type: ignore[arg-type]
+                    ip6_layer_resolved = True
+                    if ip6_layer is not None and getattr(ip6_layer, "nh", None) == 58:
                         is_icmpv6 = True
             if not is_icmpv4 and not is_icmpv6:
                 continue
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             if is_icmpv4:
                 ipv4_packets += 1
-                if ICMP is not None and pkt.haslayer(ICMP):  # type: ignore[truthy-bool]
-                    icmp_layer = pkt[ICMP]  # type: ignore[index]
-                else:
-                    icmp_layer = None
                 try:
                     if icmp_layer is not None:
                         payload_bytes = bytes(icmp_layer.payload)
                         payload_len = len(payload_bytes)
                     else:
+                        if not ip_layer_resolved:
+                            ip_layer = (
+                                pkt.getlayer(IP) if IP is not None else None  # type: ignore[arg-type]
+                            )
+                            ip_layer_resolved = True
                         payload_bytes = (
-                            bytes(pkt[IP].payload)
-                            if IP is not None and pkt.haslayer(IP)
-                            else b""
+                            bytes(ip_layer.payload) if ip_layer is not None else b""
                         )
                         payload_len = len(payload_bytes)
                 except Exception:
@@ -269,8 +383,10 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                         response_counts["ICMPv4 Time Exceeded"] += 1
                 if icmp_code is not None:
                     code_counts[f"icmpv4:{icmp_type}:{icmp_code}"] += 1
-                if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                    ip_layer = pkt[IP]  # type: ignore[index]
+                if not ip_layer_resolved:
+                    ip_layer = pkt.getlayer(IP) if IP is not None else None  # type: ignore[arg-type]
+                    ip_layer_resolved = True
+                if ip_layer is not None:
                     if getattr(ip_layer, "src", None):
                         src = str(ip_layer.src)
                         src_ips.add(src)
@@ -311,36 +427,79 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
             if is_icmpv6:
                 ipv6_packets += 1
                 icmp6_layer = None
-                if ICMPv6EchoRequest is not None and pkt.haslayer(ICMPv6EchoRequest):
-                    icmp6_layer = pkt[ICMPv6EchoRequest]  # type: ignore[index]
-                elif ICMPv6EchoReply is not None and pkt.haslayer(ICMPv6EchoReply):
-                    icmp6_layer = pkt[ICMPv6EchoReply]  # type: ignore[index]
-                elif ICMPv6DestUnreach is not None and pkt.haslayer(ICMPv6DestUnreach):
-                    icmp6_layer = pkt[ICMPv6DestUnreach]  # type: ignore[index]
-                elif ICMPv6TimeExceeded is not None and pkt.haslayer(
-                    ICMPv6TimeExceeded
-                ):
-                    icmp6_layer = pkt[ICMPv6TimeExceeded]  # type: ignore[index]
-                elif ICMPv6ParamProblem is not None and pkt.haslayer(
-                    ICMPv6ParamProblem
-                ):
-                    icmp6_layer = pkt[ICMPv6ParamProblem]  # type: ignore[index]
-                elif ICMPv6PacketTooBig is not None and pkt.haslayer(
-                    ICMPv6PacketTooBig
-                ):
-                    icmp6_layer = pkt[ICMPv6PacketTooBig]  # type: ignore[index]
-                elif ICMPv6Unknown is not None and pkt.haslayer(ICMPv6Unknown):
-                    icmp6_layer = pkt[ICMPv6Unknown]  # type: ignore[index]
+                if icmp6_unknown is None:
+                    # Detection above resolved (to None) every class earlier in
+                    # this extraction order than its match, so reuse the locals.
+                    if icmp6_echo_request is not None:
+                        icmp6_layer = icmp6_echo_request
+                    elif icmp6_echo_reply is not None:
+                        icmp6_layer = icmp6_echo_reply
+                    elif icmp6_dest_unreach is not None:
+                        icmp6_layer = icmp6_dest_unreach
+                    elif icmp6_time_exceeded is not None:
+                        icmp6_layer = icmp6_time_exceeded
+                    elif icmp6_param_problem is not None:
+                        icmp6_layer = icmp6_param_problem
+                    elif icmp6_packet_too_big is not None:
+                        icmp6_layer = icmp6_packet_too_big
+                else:
+                    # Detection short-circuited at ICMPv6Unknown, so the other
+                    # classes are still unresolved; check them in extraction
+                    # order before falling back to the unknown layer.
+                    if (
+                        ICMPv6EchoRequest is not None
+                        and (icmp6_echo_request := pkt.getlayer(ICMPv6EchoRequest))
+                        is not None
+                    ):
+                        icmp6_layer = icmp6_echo_request
+                    elif (
+                        ICMPv6EchoReply is not None
+                        and (icmp6_echo_reply := pkt.getlayer(ICMPv6EchoReply))
+                        is not None
+                    ):
+                        icmp6_layer = icmp6_echo_reply
+                    elif (
+                        ICMPv6DestUnreach is not None
+                        and (icmp6_dest_unreach := pkt.getlayer(ICMPv6DestUnreach))
+                        is not None
+                    ):
+                        icmp6_layer = icmp6_dest_unreach
+                    elif (
+                        ICMPv6TimeExceeded is not None
+                        and (icmp6_time_exceeded := pkt.getlayer(ICMPv6TimeExceeded))
+                        is not None
+                    ):
+                        icmp6_layer = icmp6_time_exceeded
+                    elif (
+                        ICMPv6ParamProblem is not None
+                        and (icmp6_param_problem := pkt.getlayer(ICMPv6ParamProblem))
+                        is not None
+                    ):
+                        icmp6_layer = icmp6_param_problem
+                    elif (
+                        ICMPv6PacketTooBig is not None
+                        and (icmp6_packet_too_big := pkt.getlayer(ICMPv6PacketTooBig))
+                        is not None
+                    ):
+                        icmp6_layer = icmp6_packet_too_big
+                    else:
+                        icmp6_layer = icmp6_unknown
                 try:
                     if icmp6_layer is not None:
                         payload_bytes = bytes(icmp6_layer.payload)
                         payload_len = len(payload_bytes)
-                    elif IPv6 is not None and pkt.haslayer(IPv6):
-                        payload_bytes = bytes(pkt[IPv6].payload)  # type: ignore[index]
-                        payload_len = len(payload_bytes)
                     else:
-                        payload_bytes = b""
-                        payload_len = 0
+                        if not ip6_layer_resolved:
+                            ip6_layer = (
+                                pkt.getlayer(IPv6) if IPv6 is not None else None  # type: ignore[arg-type]
+                            )
+                            ip6_layer_resolved = True
+                        if ip6_layer is not None:
+                            payload_bytes = bytes(ip6_layer.payload)
+                            payload_len = len(payload_bytes)
+                        else:
+                            payload_bytes = b""
+                            payload_len = 0
                 except Exception:
                     payload_bytes = b""
                     payload_len = 0
@@ -354,15 +513,19 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                     if icmp6_layer is not None
                     else None
                 )
-                if icmp6_type is None and IPv6 is not None and pkt.haslayer(IPv6):
-                    try:
-                        raw_bytes = bytes(pkt[IPv6].payload)
-                        icmp6_type = raw_bytes[0] if len(raw_bytes) >= 1 else None
-                        icmp6_code = raw_bytes[1] if len(raw_bytes) >= 2 else None
-                        payload_bytes = raw_bytes
-                        payload_len = len(raw_bytes)
-                    except Exception:
-                        pass
+                if icmp6_type is None:
+                    if not ip6_layer_resolved:
+                        ip6_layer = pkt.getlayer(IPv6) if IPv6 is not None else None  # type: ignore[arg-type]
+                        ip6_layer_resolved = True
+                    if ip6_layer is not None:
+                        try:
+                            raw_bytes = bytes(ip6_layer.payload)
+                            icmp6_type = raw_bytes[0] if len(raw_bytes) >= 1 else None
+                            icmp6_code = raw_bytes[1] if len(raw_bytes) >= 2 else None
+                            payload_bytes = raw_bytes
+                            payload_len = len(raw_bytes)
+                        except Exception:
+                            pass
                 if icmp6_type is not None:
                     type_counts[f"icmpv6:{icmp6_type}"] += 1
                     if icmp6_type == 128:
@@ -375,8 +538,10 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                         response_counts["ICMPv6 Time Exceeded"] += 1
                 if icmp6_code is not None:
                     code_counts[f"icmpv6:{icmp6_type}:{icmp6_code}"] += 1
-                if IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                    ip6_layer = pkt[IPv6]  # type: ignore[index]
+                if not ip6_layer_resolved:
+                    ip6_layer = pkt.getlayer(IPv6) if IPv6 is not None else None  # type: ignore[arg-type]
+                    ip6_layer_resolved = True
+                if ip6_layer is not None:
                     if getattr(ip6_layer, "src", None):
                         src = str(ip6_layer.src)
                         src_ips.add(src)
@@ -552,7 +717,9 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
             }
         )
     else:
-        if duration_seconds and duration_seconds > 0:
+        # A flood is a *sustained* high rate; guard against tiny/short captures
+        # where dividing by a near-zero duration yields a meaningless pkt/s.
+        if duration_seconds and duration_seconds >= 1.0 and total_packets >= 500:
             pps = total_packets / duration_seconds
             if pps > 5000:
                 detections.append(
@@ -583,10 +750,11 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                     }
                 )
 
-        unreachable_count = sum(
-            count
-            for key, count in type_counts.items()
-            if key.endswith(":3") or key.endswith(":1")
+        # Destination Unreachable is type 3 in ICMPv4 and type 1 in ICMPv6.
+        # Match exact keys -- a suffix test on ":3"/":1" wrongly folds in
+        # ICMPv6 Time Exceeded (type 3) and any other protocol code 1/3.
+        unreachable_count = type_counts.get("icmpv4:3", 0) + type_counts.get(
+            "icmpv6:1", 0
         )
         if unreachable_count > 1000:
             detections.append(

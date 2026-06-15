@@ -8,6 +8,7 @@ from typing import Iterable
 
 from .hosts import HostSummary
 from .services import ServiceSummary
+from .utils import is_public_ip as _is_public
 
 
 @dataclass(frozen=True)
@@ -22,11 +23,6 @@ class CorrelationSummary:
     errors: list[str]
 
 
-def _is_public(ip: str) -> bool:
-    try:
-        return ipaddress.ip_address(ip).is_global
-    except Exception:
-        return False
 
 
 def correlate(

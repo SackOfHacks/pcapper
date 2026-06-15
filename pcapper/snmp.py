@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import read_ber_length as _read_ber_length, packet_length
+from .utils import beacon_score
+from .utils import is_public_ip as _is_public_ip
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -9,7 +11,7 @@ from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -59,7 +61,8 @@ SUSPICIOUS_PATTERNS = [
         "Malware tooling",
     ),
     (
-        re.compile(r"rundll32|regsvr32|schtasks|at\s+", re.IGNORECASE),
+        # `at\s+` matched the English word "at "; restrict to `at \\host`.
+        re.compile(r"rundll32|regsvr32|schtasks|\bat\s+\\\\", re.IGNORECASE),
         "Execution/persistence tooling",
     ),
     (re.compile(r"nmap|masscan|sqlmap", re.IGNORECASE), "Recon tooling"),
@@ -170,28 +173,6 @@ class SnmpSummary:
         }
 
 
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
-
-
-def _read_ber_length(payload: bytes, offset: int) -> tuple[Optional[int], int]:
-    if offset >= len(payload):
-        return None, offset
-    first = payload[offset]
-    offset += 1
-    if first < 0x80:
-        return first, offset
-    num_bytes = first & 0x7F
-    if num_bytes == 0 or offset + num_bytes > len(payload):
-        return None, offset
-    length = int.from_bytes(payload[offset : offset + num_bytes], "big")
-    offset += num_bytes
-    return length, offset
-
-
 def _read_tlv(
     payload: bytes, offset: int
 ) -> tuple[Optional[int], Optional[bytes], int]:
@@ -250,6 +231,39 @@ def _parse_snmp_message(payload: bytes) -> Optional[dict[str, object]]:
         return None
     version_val = int.from_bytes(ver_val, "big", signed=False)
     version = {0: "v1", 1: "v2c", 3: "v3"}.get(version_val, f"v{version_val}")
+
+    # SNMPv3 has a different layout: after the version INTEGER comes
+    # msgGlobalData (SEQUENCE) then msgSecurityParameters (OCTET STRING wrapping
+    # the USM SEQUENCE), NOT a community OCTET STRING. The old code assumed v1/v2c
+    # layout and returned None for every v3 message, so the entire v3/USM layer
+    # was invisible. Parse it separately so v3 is at least counted, with the USM
+    # username/engineID surfaced for triage.
+    if version_val == 3:
+        username = ""
+        engine_id = ""
+        glob_tag, _glob_val, idx = _read_tlv(value, idx)  # msgGlobalData SEQUENCE
+        sec_tag, sec_val, _ = _read_tlv(value, idx)  # msgSecurityParameters
+        if sec_tag == 0x04 and sec_val:
+            usm_tag, usm_val, _ = _read_tlv(sec_val, 0)
+            if usm_tag == 0x30 and usm_val:
+                u = 0
+                eng_tag, eng_v, u = _read_tlv(usm_val, u)  # engineID
+                if eng_tag == 0x04 and eng_v is not None:
+                    engine_id = eng_v.hex()
+                _b_tag, _b, u = _read_tlv(usm_val, u)  # engineBoots
+                _t_tag, _t, u = _read_tlv(usm_val, u)  # engineTime
+                name_tag, name_v, u = _read_tlv(usm_val, u)  # msgUserName
+                if name_tag == 0x04 and name_v is not None:
+                    username = name_v.decode("latin-1", errors="ignore")
+        return {
+            "version": version,
+            "community": "",
+            "pdu": "v3 (USM)",
+            "varbinds": [],
+            "username": username,
+            "engine_id": engine_id,
+        }
+
     comm_tag, comm_val, idx = _read_tlv(value, idx)
     if comm_tag != 0x04 or comm_val is None:
         return None
@@ -303,25 +317,13 @@ def _format_mac(value: str) -> Optional[str]:
     return None
 
 
-def _beacon_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance**0.5
-    if avg < 1 or avg > 3600:
-        return None
-    if stddev / avg > 0.15:
-        return None
-    return {"avg": avg, "stddev": stddev}
+def _beacon_score(times: list[float]):
+    return beacon_score(
+        times, min_interval=1.0, max_interval=3600.0, rel_jitter=0.15, abs_jitter_floor=0.0
+    )
 
 
+@memoize_analysis
 def analyze_snmp(
     path: Path,
     show_status: bool = True,
@@ -410,7 +412,7 @@ def analyze_snmp(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:

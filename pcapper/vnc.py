@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import safe_float, extract_packet_endpoints, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .utils import beacon_score as _beaconing_score
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -28,7 +29,7 @@ VNC_AUTH_RE = re.compile(r"VNC Authentication|None|Tight|Ultra|RealVNC", re.IGNO
 
 SUSPICIOUS_PLAINTEXT = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential indicator"),
-    (re.compile(r"user(name)?\s*[:=]", re.IGNORECASE), "User indicator"),
+    (re.compile(r"(?<![\w-])user(name)?\s*[:=]\s*\S", re.IGNORECASE), "User indicator"),
     (re.compile(r"vncpasswd|x11vnc|tigervnc", re.IGNORECASE), "VNC tooling"),
     (re.compile(r"wget\s+|curl\s+|tftp\s+", re.IGNORECASE), "File transfer tooling"),
 ]
@@ -169,27 +170,6 @@ class _SessionState:
     server_banner: Optional[str] = None
 
 
-def _extract_ascii_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> list[str]:
-    results: list[str] = []
-    if not data:
-        return results
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
 def _scan_plaintext(
     payload: bytes,
     plaintext_counter: Counter[str],
@@ -228,25 +208,6 @@ def _direction(
     if sport < 1024 and dport >= 1024:
         return dst_ip, src_ip, dport, sport
     return src_ip, dst_ip, sport, dport
-
-
-def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance**0.5
-    if avg < 5 or avg > 86400:
-        return None
-    if stddev > max(5.0, avg * 0.25):
-        return None
-    return {"avg": avg, "stddev": stddev}
 
 
 def analyze_vnc(
@@ -340,7 +301,7 @@ def analyze_vnc(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
@@ -518,9 +479,7 @@ def analyze_vnc(
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
-    non_standard_ports = [
-        port for port in server_ports if port not in {5900, 5901, 5800}
-    ]
+    non_standard_ports = [port for port in server_ports if port not in VNC_PORTS]
     if non_standard_ports:
         detections.append(
             {

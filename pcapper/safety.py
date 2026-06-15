@@ -20,7 +20,9 @@ except Exception:  # pragma: no cover
 
 
 SAFETY_PORTS: dict[int, str] = {
-    1502: "Triconex/TriStation",
+    1500: "Triconex TSAA",        # Triconex System Access Application
+    1501: "Triconex TSAA",
+    1502: "Triconex/TriStation",  # the engineering protocol Triton/TRISIS abused
 }
 
 
@@ -185,12 +187,22 @@ def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
             hit for hit in hits if _is_public(hit.src) or _is_public(hit.dst)
         ]
         severity = "high" if public_hits else "warning"
+        # When public endpoints drive the high-severity escalation, show them
+        # first in the evidence sample — otherwise hits[:8] can omit the very
+        # hosts the "Public endpoints observed" claim is about.
+        ordered_hits = public_hits + [
+            hit for hit in hits if not (_is_public(hit.src) or _is_public(hit.dst))
+        ]
         evidence = [
             f"{hit.protocol} {hit.src}:{hit.src_port}->{hit.dst}:{hit.dst_port} {hit.service}"
-            for hit in hits[:8]
+            for hit in ordered_hits[:8]
         ]
         details = (
-            f"{len(hits)} packet(s) across {len(service_counts)} safety service(s)."
+            f"{len(hits)} packet(s) across {len(service_counts)} safety service(s). "
+            "Safety Instrumented Systems are the highest-consequence OT target "
+            "(Triton/TRISIS) — any TriStation/SIS engineering traffic from a "
+            "non-engineering host, or program-download activity, warrants "
+            "investigation (ATT&CK ICS T0843 Program Download to a SIS)."
         )
         if public_hits:
             details = f"{details} Public endpoints observed."

@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .utils import beacon_score as _beaconing_score
+from .utils import is_public_ip as _is_public_ip
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -31,7 +33,7 @@ _BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 
 SUSPICIOUS_PLAINTEXT = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential indicator"),
-    (re.compile(r"user(name)?\s*[:=]", re.IGNORECASE), "User indicator"),
+    (re.compile(r"(?<![\w-])user(name)?\s*[:=]\s*\S", re.IGNORECASE), "User indicator"),
     (
         re.compile(r"cmd\.exe|powershell|psexec|wmic", re.IGNORECASE),
         "Administrative tooling",
@@ -421,27 +423,6 @@ class _SessionState:
     tls_detected: bool = False
 
 
-def _extract_ascii_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> list[str]:
-    results: list[str] = []
-    if not data:
-        return results
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
 def _scan_plaintext(
     payload: bytes,
     plaintext_counter: Counter[str],
@@ -475,58 +456,38 @@ def _read_uint16(data: bytes, offset: int) -> tuple[Optional[int], int]:
     return value, offset + 2
 
 
-def _read_uint32_le(data: bytes, offset: int) -> tuple[Optional[int], int]:
-    if offset + 4 > len(data):
-        return None, offset
-    value = int.from_bytes(data[offset : offset + 4], "little")
-    return value, offset + 4
-
-
 def _parse_rdp_negotiation(payload: bytes) -> tuple[Optional[int], Optional[int]]:
-    if not payload or payload[0] != 0x03:
+    """Recover RDP_NEG_REQ/RSP requested/selected protocols from an X.224 CR/CC.
+
+    The connection request/confirm wraps the negotiation in TPKT + X.224 headers
+    whose lengths vary (and the CR is preceded by a variable "Cookie: mstshash="
+    line), so rather than assume fixed offsets we locate the 8-byte negotiation
+    TLV by its signature: type (0x01 REQ / 0x02 RSP), flags, length 0x0008 (LE),
+    then the 4-byte protocol mask (LE). The previous code tested a wrong fixed
+    byte and returned None for essentially all real RDP.
+    """
+    if len(payload) < 11 or payload[0] != 0x03 or payload[1] != 0x00:
         return None, None
-    if len(payload) < 7:
+    tpkt_len = int.from_bytes(payload[2:4], "big")
+    if tpkt_len < 11 or tpkt_len > len(payload):
+        tpkt_len = len(payload)
+    # X.224 TPDU code: 0xE0 = Connection Request, 0xD0 = Connection Confirm.
+    if payload[5] not in (0xE0, 0xD0):
         return None, None
-    if payload[1] != 0x00:
-        return None, None
-    total_len = int.from_bytes(payload[2:4], "big")
-    if total_len <= 0 or total_len > len(payload):
-        total_len = len(payload)
-    offset = 4
-    if payload[offset] != 0x02:
-        return None, None
-    offset += 1
-    tpdu_len = payload[offset]
-    offset += 1
-    if tpdu_len < 6:
-        return None, None
-    if offset + (tpdu_len - 1) > len(payload):
-        return None, None
-    offset += tpdu_len - 1
-    if offset >= len(payload) or payload[offset] != 0xE0:
-        return None, None
-    offset += 1
-    offset += 6
-    if offset > total_len:
-        return None, None
-    requested = None
-    selected = None
-    while offset + 4 <= total_len:
-        if payload[offset : offset + 4] == b"\x00\x00\x00\x00":
-            break
-        if offset + 4 > total_len:
-            break
-        typ = payload[offset]
-        length = payload[offset + 1]
-        if length < 4:
-            break
-        if offset + length > total_len:
-            break
-        if typ == 0x01 and length >= 8:
-            requested = int.from_bytes(payload[offset + 4 : offset + 8], "little")
-        if typ == 0x02 and length >= 8:
-            selected = int.from_bytes(payload[offset + 4 : offset + 8], "little")
-        offset += length
+    requested: Optional[int] = None
+    selected: Optional[int] = None
+    i = 6
+    while i + 8 <= tpkt_len:
+        typ = payload[i]
+        if typ in (0x01, 0x02) and payload[i + 2 : i + 4] == b"\x08\x00":
+            val = int.from_bytes(payload[i + 4 : i + 8], "little")
+            if typ == 0x01:
+                requested = val
+            else:
+                selected = val
+            i += 8
+            continue
+        i += 1
     return requested, selected
 
 
@@ -660,15 +621,15 @@ def _parse_rdp_decrypted_identity(
     domain = None
     host = None
     match = re.search(
-        r"(?:username|user)\s*[:=]\s*([\\w\\-\\.@]{1,64})", text, re.IGNORECASE
+        r"(?:username|user)\s*[:=]\s*([\w\-.@]{1,64})", text, re.IGNORECASE
     )
     if match:
         user = match.group(1)
-    match = re.search(r"(?:domain)\\s*[:=]\\s*([\\w\\-\\.]{1,64})", text, re.IGNORECASE)
+    match = re.search(r"(?:domain)\s*[:=]\s*([\w\-.]{1,64})", text, re.IGNORECASE)
     if match:
         domain = match.group(1)
     match = re.search(
-        r"(?:clientname|client_name|hostname)\\s*[:=]\\s*([\\w\\-\\.]{1,64})",
+        r"(?:clientname|client_name|hostname)\s*[:=]\s*([\w\-.]{1,64})",
         text,
         re.IGNORECASE,
     )
@@ -696,25 +657,7 @@ def _direction(
     return src_ip, dst_ip, sport, dport
 
 
-def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance**0.5
-    if avg < 5 or avg > 86400:
-        return None
-    if stddev > max(5.0, avg * 0.25):
-        return None
-    return {"avg": avg, "stddev": stddev}
-
-
+@memoize_analysis
 def analyze_rdp(
     path: Path,
     show_status: bool = True,
@@ -800,6 +743,10 @@ def analyze_rdp(
     dtls_handshakes = 0
     requested_protocols: Counter[str] = Counter()
     selected_protocols: Counter[str] = Counter()
+    # Servers that explicitly negotiated legacy Standard RDP Security, so the
+    # rdp_weak_security finding can name the actual weak endpoints rather than
+    # the capture-wide top RDP servers by packet volume.
+    weak_security_servers: Counter[str] = Counter()
     client_builds: Counter[str] = Counter()
     certificates: Counter[str] = Counter()
     decrypted_username: Counter[str] = Counter()
@@ -837,7 +784,7 @@ def analyze_rdp(
 
             pkt_index += 1
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
@@ -992,6 +939,12 @@ def analyze_rdp(
                     requested_protocols[item] += 1
                 for item in _rdp_protocol_names(selected_mask):
                     selected_protocols[item] += 1
+                # selected_mask == 0 is an *explicit* PROTOCOL_RDP selection, i.e.
+                # legacy Standard RDP Security (no TLS, no NLA). _rdp_protocol_names
+                # maps 0 to an empty list, so record it explicitly as the weak case.
+                if selected_mask == 0:
+                    selected_protocols["Standard RDP Security"] += 1
+                    weak_security_servers[server_ip] += 1
                 core_client, client_build, _version = _parse_rdp_client_core_data(
                     payload_prefix
                 )
@@ -1107,6 +1060,32 @@ def analyze_rdp(
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
+    # Internet-exposed RDP is the single most common ransomware entry vector.
+    # Flag any session where one side of an RDP server is a public IP — an RDP
+    # server reachable from (or a client reaching out to) the internet.
+    exposed_pairs: set[tuple[str, str]] = set()
+    for session in sessions.values():
+        server_ip = session.server_ip
+        client_ip = session.client_ip
+        if _is_public_ip(server_ip) or _is_public_ip(client_ip):
+            exposed_pairs.add((client_ip, server_ip))
+    if exposed_pairs:
+        sample = ", ".join(
+            f"{c} -> {s}" for c, s in sorted(exposed_pairs)[:5]
+        )
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "RDP exposed to a public network",
+                "details": (
+                    f"{len(exposed_pairs)} RDP session(s) involve a public IP "
+                    f"(e.g. {sample}). Internet-facing RDP is the leading "
+                    "ransomware/initial-access vector — restrict to VPN/jump host "
+                    "and review for brute-force and successful logons."
+                ),
+            }
+        )
+
     non_standard_ports = [
         port for port in server_tcp_ports if port not in RDP_TCP_PORTS
     ]
@@ -1121,6 +1100,22 @@ def analyze_rdp(
                 "details": ", ".join(
                     str(port) for port in sorted(set(non_standard_ports))
                 ),
+            }
+        )
+
+    std_rdp = selected_protocols.get("Standard RDP Security", 0)
+    if std_rdp:
+        detections.append(
+            {
+                "type": "rdp_weak_security",
+                "severity": "warning",
+                "summary": "Legacy Standard RDP Security negotiated (no TLS/NLA)",
+                "details": (
+                    f"{std_rdp} session(s) negotiated Standard RDP Security instead of "
+                    "TLS/CredSSP(NLA): no server authentication, susceptible to MITM and "
+                    "credential capture, and indicative of NLA-disabled hosts (BlueKeep-class exposure)."
+                ),
+                "top_servers": weak_security_servers.most_common(3),
             }
         )
 

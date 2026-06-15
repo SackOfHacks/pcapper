@@ -17,7 +17,8 @@ except ImportError:
     IP = TCP = Raw = None
 
 from .pcap_cache import get_reader
-from .utils import counter_inc, decode_payload, safe_float, set_add_cap, setdict_add, extract_packet_endpoints
+from .utils import counter_inc, decode_payload, extract_packet_endpoints, memoize_analysis, safe_float, set_add_cap, setdict_add
+from .utils import is_public_ip as _is_public_ip
 
 MAX_SMB_UNIQUE = int(os.getenv("PCAPPER_MAX_SMB_UNIQUE", "50000"))
 MAX_SMB_CONVERSATIONS = int(os.getenv("PCAPPER_MAX_SMB_CONVERSATIONS", "50000"))
@@ -224,6 +225,28 @@ SMB1_COM_OPEN_ANDX = 0x2D
 SMB1_COM_READ_ANDX = 0x2E
 SMB1_COM_WRITE_ANDX = 0x2F
 
+# Full SMB1/CIFS command-code table so commands render with names instead of
+# raw hex. The Transaction (0x25), Transaction2 (0x32) and NT_Transact (0xA0)
+# families in particular are the SMB1 exploit vectors (EternalBlue/WannaCry),
+# so naming them makes exploitation visible in the command breakdown.
+SMB1_COMMAND_NAMES = {
+    0x00: "Create Directory", 0x01: "Delete Directory", 0x02: "Open",
+    0x03: "Create", 0x04: "Close", 0x05: "Flush", 0x06: "Delete",
+    0x07: "Rename", 0x08: "Query Information", 0x09: "Set Information",
+    0x0A: "Read", 0x0B: "Write", 0x0C: "Lock Byte Range",
+    0x0D: "Unlock Byte Range", 0x10: "Check Directory", 0x11: "Process Exit",
+    0x12: "Seek", 0x24: "Locking AndX", 0x25: "Transaction",
+    0x26: "Transaction Secondary", 0x27: "Ioctl", 0x29: "Copy", 0x2A: "Move",
+    0x2B: "Echo", 0x2C: "Write And Close", 0x2D: "Open AndX",
+    0x2E: "Read AndX", 0x2F: "Write AndX", 0x32: "Transaction2",
+    0x33: "Transaction2 Secondary", 0x34: "Find Close2", 0x70: "Tree Connect",
+    0x71: "Tree Disconnect", 0x72: "Negotiate", 0x73: "Session Setup AndX",
+    0x74: "Logoff AndX", 0x75: "Tree Connect AndX", 0x80: "Query Info Disk",
+    0x81: "Search", 0x82: "Find", 0xA0: "NT Transact",
+    0xA1: "NT Transact Secondary", 0xA2: "NT Create AndX", 0xA4: "NT Cancel",
+    0xA5: "NT Rename", 0xD0: "Send Single Block",
+}
+
 # Critical NT Status codes
 STATUS_SUCCESS = 0x00000000
 STATUS_ACCESS_DENIED = 0xC0000022
@@ -253,7 +276,12 @@ SMB2_DIALECT_MAP = {
 
 SMB2_SIGNING_REQUIRED = 0x0002
 SMB2_FLAGS_SIGNED = 0x00000008
-SMB2_SESSION_FLAG_ENCRYPT_DATA = 0x0001
+# MS-SMB2 SESSION_SETUP Response SessionFlags (the 0x0001 value was wrongly
+# mapped to ENCRYPT_DATA, so guest logons were tagged "encrypted" and real
+# encryption/guest/null sessions were never recognised).
+SMB2_SESSION_FLAG_IS_GUEST = 0x0001
+SMB2_SESSION_FLAG_IS_NULL = 0x0002
+SMB2_SESSION_FLAG_ENCRYPT_DATA = 0x0004
 SMB1_FLAGS_RESPONSE = 0x80
 SMB1_FLAGS2_SIGNED = 0x0004
 
@@ -270,6 +298,21 @@ SMB2_CAPABILITIES = {
 # --- Analysis Functions ---
 
 
+def _is_disk_admin_share(share_path: str) -> bool:
+    """True for disk administrative shares (ADMIN$, C$, D$, ...), NOT IPC$.
+
+    IPC$ is the named-pipe share negotiated in nearly every benign SMB session
+    (RPC, share enumeration, browsing), so treating IPC$ access as an
+    "Administrative Share Access" finding fires on normal traffic. Only disk
+    admin shares (ADMIN$ and drive-letter shares) indicate lateral movement.
+    """
+    leaf = share_path.replace("/", "\\").rstrip("\\").rsplit("\\", 1)[-1].upper()
+    if leaf == "ADMIN$":
+        return True
+    return len(leaf) == 2 and leaf[1] == "$" and leaf[0].isalpha()
+
+
+@memoize_analysis
 def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
     if TCP is None:
         return SmbSummary(
@@ -343,8 +386,6 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
             [f"Error opening pcap: {exc}"],
         )
 
-    size_bytes = size_bytes
-
     total_packets = 0
     smb_packets = 0
     smb_ports: Counter[int] = Counter()
@@ -379,6 +420,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
     client_to_servers: Dict[str, Set[str]] = defaultdict(set)
     client_admin_shares: Counter[str] = Counter()
     client_failures: Counter[str] = Counter()
+    netbios_smb_seen: Set[Tuple[str, str]] = set()
     pending_creates: Dict[Tuple[str, str, int, int], Dict[str, object]] = {}
     pending_io: Dict[Tuple[str, str, int, int, int], Dict[str, object]] = {}
     pending_auth: Dict[Tuple[str, str, int], Dict[str, object]] = {}
@@ -438,7 +480,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
             conversations[key] = convo
         convo.packets += 1
         convo.bytes += length
-        _update_time(convo, ts)
+        _update_window(convo, ts)
         if is_request:
             convo.requests += 1
         else:
@@ -1018,6 +1060,11 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
                         session_flags = struct.unpack("<H", data[2:4])[0]
                         if session_flags & SMB2_SESSION_FLAG_ENCRYPT_DATA:
                             sess.encryption_required = True
+                        if session_flags & SMB2_SESSION_FLAG_IS_GUEST:
+                            sess.is_guest = True
+                            _set_auth_type(sess, "Guest")
+                        if session_flags & SMB2_SESSION_FLAG_IS_NULL:
+                            _set_auth_type(sess, "Anonymous")
 
             # --- Tree Connect (Share Access) ---
             # Request: 0x03
@@ -1042,11 +1089,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
                                 )
                                 share_key = ""
                             else:
-                                is_admin = (
-                                    "IPC$" in share_path
-                                    or "ADMIN$" in share_path
-                                    or "C$" in share_path
-                                )
+                                is_admin = _is_disk_admin_share(share_path)
                                 shares[share_key] = SmbShare(
                                     share_path, server, is_admin=is_admin
                                 )
@@ -1310,21 +1353,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
         # Command is at offset 4
         cmd = payload[4]
 
-        cmd_name = f"0x{cmd:02X}"
-        if cmd == SMB1_COM_NEGOTIATE:
-            cmd_name = "Negotiate"
-        elif cmd == SMB1_COM_SESSION_SETUP_ANDX:
-            cmd_name = "Session Setup"
-        elif cmd == SMB1_COM_TREE_CONNECT_ANDX:
-            cmd_name = "Tree Connect"
-        elif cmd == SMB1_COM_NT_CREATE_ANDX:
-            cmd_name = "NT Create"
-        elif cmd == SMB1_COM_OPEN_ANDX:
-            cmd_name = "Open"
-        elif cmd == SMB1_COM_READ_ANDX:
-            cmd_name = "Read"
-        elif cmd == SMB1_COM_WRITE_ANDX:
-            cmd_name = "Write"
+        cmd_name = SMB1_COMMAND_NAMES.get(cmd, f"0x{cmd:02X}")
 
         full_cmd = f"SMB1:{cmd_name}"
         counter_inc(commands, full_cmd)
@@ -1449,11 +1478,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
                             )
                             share_key = ""
                         else:
-                            is_admin = (
-                                "IPC$" in share_path
-                                or "ADMIN$" in share_path
-                                or "C$" in share_path
-                            )
+                            is_admin = _is_disk_admin_share(share_path)
                             shares[share_key] = SmbShare(
                                 share_path, server, is_admin=is_admin
                             )
@@ -1545,7 +1570,6 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
             except Exception:
                 length_bytes = 0
             share = smb1_tree_map.get((client, server, int(tid)))
-            filename = None
             strings = _extract_strings(payload)
             filename = _pick_smb1_filename(strings)
             if filename and not share:
@@ -1625,8 +1649,8 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
         cli.bytes += length
         srv.packets += 1
         srv.bytes += length
-        _update_time(cli, ts)
-        _update_time(srv, ts)
+        _update_window(cli, ts)
+        _update_window(srv, ts)
 
     def _handle_smb3_transform(
         payload: bytes,
@@ -1765,9 +1789,9 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
                         _append_capped(
                             anomalies,
                             SmbAnomaly(
-                                "CRITICAL",
+                                "HIGH",
                                 "SMBv1 Detected",
-                                "Legacy, insecure SMBv1 protocol in use.",
+                                "Legacy, insecure SMBv1 protocol in use (EternalBlue/WannaCry-class exposure); common in OT/legacy environments.",
                                 total_packets,
                                 packet_client,
                                 packet_server,
@@ -1776,7 +1800,11 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
                             "anomalies",
                             f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
                         )
-                    if src_port == 139 or dst_port == 139:
+                    netbios_pair = (packet_client, packet_server)
+                    if (
+                        src_port == 139 or dst_port == 139
+                    ) and netbios_pair not in netbios_smb_seen:
+                        netbios_smb_seen.add(netbios_pair)
                         _append_capped(
                             anomalies,
                             SmbAnomaly(
@@ -1894,12 +1922,6 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
     }
     threat_hypotheses: List[Dict[str, object]] = []
     benign_context: List[str] = []
-
-    def _is_public_ip(value: str) -> bool:
-        try:
-            return ipaddress.ip_address(str(value)).is_global
-        except Exception:
-            return False
 
     smb1_count = int(versions.get("SMB1", 0))
     if smb1_count > 0:
@@ -2036,6 +2058,37 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
         benign_context.append("No broad SMB server fan-out scan pattern detected")
     if not deterministic_checks["smb_public_endpoint_exposure"]:
         benign_context.append("No public Internet SMB endpoint exposure observed")
+
+    # Server-confirmed guest/anonymous logons (SESSION_SETUP SessionFlags).
+    # This is a stronger signal than the username-string heuristic above
+    # because the server itself reported the session was downgraded.
+    _seen_guest_pairs: set[tuple[str, str]] = set()
+    for sess in sessions.values():
+        auth = (sess.auth_type or "")
+        is_anon = "Anonymous" in auth
+        if not (sess.is_guest or is_anon):
+            continue
+        pair = (sess.client_ip, sess.server_ip)
+        if pair in _seen_guest_pairs:
+            continue
+        _seen_guest_pairs.add(pair)
+        kind = "anonymous (null)" if is_anon else "guest"
+        _append_capped(
+            anomalies,
+            SmbAnomaly(
+                "MEDIUM",
+                "Server-Confirmed Guest/Anonymous SMB Logon",
+                f"Server {sess.server_ip} granted a {kind} session to "
+                f"{sess.client_ip} (SessionFlags). Unauthenticated SMB access "
+                "enables share enumeration and credential-free reconnaissance.",
+                total_packets,
+                sess.client_ip,
+                sess.server_ip,
+            ),
+            MAX_SMB_ANOMALIES,
+            "anomalies",
+            f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
+        )
 
     server_values = (
         list(servers.values()) if isinstance(servers, dict) else list(servers)

@@ -34,6 +34,8 @@ from .control_loop import analyze_control_loop, merge_control_loop_summaries
 from .correlation import correlate
 from .creds import analyze_creds, merge_creds_summaries
 from .crimson import analyze_crimson
+from .bsap import analyze_bsap
+from .genisys import analyze_genisys
 from .csp import analyze_csp
 from .ctf import analyze_ctf
 from .decode import analyze_decode
@@ -113,6 +115,7 @@ from .profinet import analyze_profinet
 from .protocols import analyze_protocols, merge_protocols_summaries
 from .provenance import build_case_metadata
 from .ptp import analyze_ptp
+from .synchrophasor import analyze_synchrophasor
 from .qos import analyze_qos, merge_qos_summaries
 from .quic import analyze_quic
 from .rdp import analyze_rdp, merge_rdp_summaries
@@ -131,6 +134,8 @@ from .reporting import (
     render_correlation_summary,
     render_creds_summary,
     render_crimson_summary,
+    render_bsap_summary,
+    render_genisys_summary,
     render_csp_summary,
     render_ctf_summary,
     render_decode_summary,
@@ -196,6 +201,7 @@ from .reporting import (
     render_profinet_summary,
     render_protocols_summary,
     render_ptp_summary,
+    render_synchrophasor_summary,
     render_qos_summary,
     render_quic_summary,
     render_rdp_summary,
@@ -414,6 +420,9 @@ def _builtin_flag_map() -> dict[str, str]:
         "--sv": "sv",
         "--lldp": "lldp",
         "--ptp": "ptp",
+        "--synchrophasor": "synchrophasor",
+        "--bsap": "bsap",
+        "--genisys": "genisys",
         "--pcapmeta": "pcapmeta",
         "--ot-commands": "ot_commands",
         "--ot-commands-fast": "ot_commands",
@@ -1125,6 +1134,20 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ),
     )
     general.add_argument(
+        "--cache-mb",
+        type=int,
+        metavar="MB",
+        help=(
+            "In-memory packet cache budget in megabytes (per run). Raises both "
+            "the total cache size and the per-file limit so large pcaps are "
+            "parsed once and shared across chained analysis steps instead of "
+            "being re-read per step. Defaults: 256 total / 64 per file "
+            "(override via PCAPPER_CACHE_MAX_BYTES / "
+            "PCAPPER_CACHE_FILE_MAX_BYTES; PCAPPER_CACHE_ENABLED=0 disables). "
+            "Use 0 to disable caching."
+        ),
+    )
+    general.add_argument(
         "--profile",
         action="store_true",
         help="Enable cProfile and print a performance summary to stderr.",
@@ -1704,6 +1727,9 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--sv", "Include IEC 61850 Sampled Values analysis (L2)."),
         ("--lldp", "Include LLDP/Profinet DCP asset discovery analysis."),
         ("--ptp", "Include IEEE 1588 PTP time-sync analysis."),
+        ("--synchrophasor", "Include IEEE C37.118 synchrophasor (PMU/PDC) analysis."),
+        ("--bsap", "Include BSAP-IP analysis (Bristol/Emerson gas/oil SCADA)."),
+        ("--genisys", "Include Genisys analysis (rail/substation SCADA)."),
         ("--ot-commands", "Include normalized OT control/write command analysis."),
         (
             "--ot-commands-fast",
@@ -2017,6 +2043,9 @@ def _analyze_paths(
     show_sv: bool = False,
     show_lldp: bool = False,
     show_ptp: bool = False,
+    show_synchrophasor: bool = False,
+    show_bsap: bool = False,
+    show_genisys: bool = False,
     show_opc_classic: bool = False,
     show_streams: bool = False,
     stream_id: str | None = None,
@@ -2072,8 +2101,14 @@ def _analyze_paths(
     correlate_service_summaries: list[object] = []
     rules_rollups: list[object] = []
     decrypt_rollups: list[object] = []
-    use_packets = len(ordered_steps) > 1 or (
-        render_base_summary and len(ordered_steps) > 0
+    # Steps that internally fan out into many other analyzers; preloading the
+    # packet list once avoids dozens of redundant pcap re-reads even when only
+    # a single such step is requested.
+    fan_out_steps = {"overview", "hostdetails", "files", "ctf"}
+    use_packets = (
+        len(ordered_steps) > 1
+        or (render_base_summary and len(ordered_steps) > 0)
+        or any(step in fan_out_steps for step in ordered_steps)
     )
     multi_export = len(paths) > 1 and not summarize
     plugin_lookup = plugin_map(plugins or [])
@@ -2205,10 +2240,11 @@ def _analyze_paths(
                     candidates.add(mapped)
 
         if has_port:
+            # Note: analyze_ips only accepts (path, show_status); passing
+            # other kwargs raises TypeError.
             ips_summary = analyze_ips(
                 pcap_path,
                 show_status=False,
-                include_threat_hunting=False,
             )
             for conv in getattr(ips_summary, "conversations", []) or []:
                 ports = set(getattr(conv, "ports", []) or [])
@@ -2357,8 +2393,20 @@ def _analyze_paths(
             if packets is not None:
                 step_status = show_status
 
+        forced_view_for_path = False
         if ip_scope_enabled_for_path and packets is not None:
             set_forced_packet_view(path, packets, meta)
+            forced_view_for_path = True
+        elif packets is not None and not _has_packet_filters(
+            effective_bpf, time_start, time_end
+        ):
+            # Share the preloaded, unfiltered packet list with every analyzer
+            # via the forced-view hook in get_reader(). This covers analyzers
+            # that do not accept packets=/meta= kwargs as well as nested
+            # analyzer calls (overview, hostdetails, files, industrial
+            # helpers), so chained steps never re-read the pcap from disk.
+            set_forced_packet_view(path, packets, meta)
+            forced_view_for_path = True
 
         if render_base_summary:
             summary = analyze_pcap(
@@ -3426,6 +3474,27 @@ def _analyze_paths(
                 else:
                     print(render_ptp_summary(summary, verbose=verbose))
                 export_summaries["ptp"] = summary
+            elif step == "synchrophasor" and show_synchrophasor:
+                summary = analyze_synchrophasor(path, show_status=step_status)
+                if summarize_rollups:
+                    rollups.setdefault("synchrophasor", []).append(summary)
+                else:
+                    print(render_synchrophasor_summary(summary, verbose=verbose))
+                export_summaries["synchrophasor"] = summary
+            elif step == "bsap" and show_bsap:
+                summary = analyze_bsap(path, show_status=step_status)
+                if summarize_rollups:
+                    rollups.setdefault("bsap", []).append(summary)
+                else:
+                    print(render_bsap_summary(summary))
+                export_summaries["bsap"] = summary
+            elif step == "genisys" and show_genisys:
+                summary = analyze_genisys(path, show_status=step_status)
+                if summarize_rollups:
+                    rollups.setdefault("genisys", []).append(summary)
+                else:
+                    print(render_genisys_summary(summary))
+                export_summaries["genisys"] = summary
             elif step == "ot_commands" and show_ot_commands:
                 summary = analyze_ot_commands(
                     path,
@@ -3534,7 +3603,7 @@ def _analyze_paths(
             total=len(paths),
             summaries=sorted(export_summaries.keys()),
         )
-        if ip_scope_enabled_for_path:
+        if forced_view_for_path:
             clear_forced_packet_view(path)
         if idx < len(paths):
             print()
@@ -3979,6 +4048,9 @@ def _analyze_paths(
             "sv": "SV ANALYSIS",
             "lldp": "LLDP/DCP ANALYSIS",
             "ptp": "PTP ANALYSIS",
+            "synchrophasor": "SYNCHROPHASOR ANALYSIS",
+            "bsap": "BSAP-IP ANALYSIS",
+            "genisys": "GENISYS ANALYSIS",
             "opc_classic": "OPC CLASSIC ANALYSIS",
             "streams": "STREAM ANALYSIS",
             "ctf": "CTF ANALYSIS",
@@ -4165,6 +4237,14 @@ def main() -> int:
     )
     config_result = load_config(config_path)
     _apply_config_defaults(parser, args, config_result.data, argv)
+    cache_mb = getattr(args, "cache_mb", None)
+    if cache_mb is not None:
+        if cache_mb <= 0:
+            os.environ["PCAPPER_CACHE_ENABLED"] = "0"
+        else:
+            cache_bytes = str(int(cache_mb) * 1024 * 1024)
+            os.environ["PCAPPER_CACHE_MAX_BYTES"] = cache_bytes
+            os.environ["PCAPPER_CACHE_FILE_MAX_BYTES"] = cache_bytes
     baseline_save = getattr(args, "baseline_save", None)
     baseline_compare = getattr(args, "baseline_compare", None)
     baseline_requested = bool(baseline_save or baseline_compare)
@@ -4769,6 +4849,9 @@ def main() -> int:
             show_sv=getattr(args, "sv", False),
             show_lldp=getattr(args, "lldp", False),
             show_ptp=getattr(args, "ptp", False),
+            show_synchrophasor=getattr(args, "synchrophasor", False),
+            show_bsap=getattr(args, "bsap", False),
+            show_genisys=getattr(args, "genisys", False),
             show_opc_classic=getattr(args, "opc_classic", False),
             show_streams=getattr(args, "streams", False),
             stream_id=getattr(args, "stream_id", None),

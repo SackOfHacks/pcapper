@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, get_reader
-from .utils import decode_payload, safe_float, extract_packet_endpoints
+from .utils import decode_payload, safe_float, extract_packet_endpoints, get_packet_ports as _get_ports
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -43,20 +43,6 @@ class SearchSummary:
 def _get_ip_pair(pkt: Packet) -> tuple[str, str]:
     src_ip, dst_ip = extract_packet_endpoints(pkt)
     return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
-
-
-def _get_ports(pkt: Packet) -> tuple[Optional[int], Optional[int], str]:
-    if TCP is not None and TCP in pkt:
-        try:
-            return int(pkt[TCP].sport), int(pkt[TCP].dport), "TCP"
-        except Exception:
-            return None, None, "TCP"
-    if UDP is not None and UDP in pkt:
-        try:
-            return int(pkt[UDP].sport), int(pkt[UDP].dport), "UDP"
-        except Exception:
-            return None, None, "UDP"
-    return None, None, "OTHER"
 
 
 def _extract_payload(pkt: Packet) -> bytes:

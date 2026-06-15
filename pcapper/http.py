@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from .utils import shannon_entropy as _shannon_entropy, packet_length
+from .utils import memoize_analysis
+
 import base64
-import hashlib
 import ipaddress
 import json
-import math
 import os
 import re
 import time
@@ -19,10 +20,11 @@ from urllib.parse import urlparse
 from .device_detection import append_device_fingerprints, device_fingerprints_from_text
 from .pcap_cache import PcapMeta, get_reader
 from .utils import (
-    extract_packet_endpoints,
     counter_inc,
     decode_payload,
     detect_file_type_bytes,
+    extract_packet_endpoints,
+    memoize_analysis,
     safe_float,
     set_add_cap,
 )
@@ -59,18 +61,35 @@ SUSPICIOUS_UA = (
     "wget",
     "masscan",
 )
+# Extensions worth surfacing as "suspicious file artifacts" when served over
+# HTTP. `.js` is deliberately excluded: JavaScript is ubiquitous in normal web
+# traffic (jquery, plugins, etc.) and flagging every script resource buries the
+# real executable/dropper downloads. Malicious script delivery still surfaces
+# via high-entropy URI, content-type mismatch, and the file-carving module.
 SUSPICIOUS_EXT = {
     ".exe",
     ".dll",
     ".ps1",
     ".vbs",
-    ".js",
     ".jar",
     ".bat",
     ".scr",
     ".zip",
     ".rar",
 }
+# Content types that are executable code. A download whose magic bytes resolve
+# to one of these while the filename/Content-Type claims a non-executable type
+# is the high-confidence "masquerading" case (e.g. an EXE served as image.gif).
+EXECUTABLE_FILE_TYPES = {"EXE/DLL", "ELF"}
+
+# Webshell / command-injection URI markers. Tokens are bounded by non-alnum so
+# "exec" doesn't fire on "/execute", "eval" on "/evaluation", "curl" on "curly",
+# etc. (the old `token in uri` substring test produced heavy false positives).
+SUSPICIOUS_URI_RE = re.compile(
+    r"(?<![a-z0-9])(?:cmd=|exec|eval|powershell|whoami|wget|curl|nc -|/bin/sh|/bin/bash)"
+    r"(?![a-z0-9])|/(?:shell|webshell|c99|r57|wso|b374k)(?![a-z0-9])",
+    re.IGNORECASE,
+)
 SUSPICIOUS_UPLOAD_PATH_KEYWORDS = {
     "upload",
     "import",
@@ -357,16 +376,10 @@ def _extract_tokens(text: str) -> list[str]:
 
 
 def _token_fingerprint(token: str) -> str:
-    digest = hashlib.sha256(token.encode("utf-8", errors="ignore")).hexdigest()
-    return f"sha256:{digest[:16]}"
-
-
-def _shannon_entropy(text: str) -> float:
-    if not text:
-        return 0.0
-    freq = Counter(text)
-    total = len(text)
-    return -sum((count / total) * math.log2(count / total) for count in freq.values())
+    # Token redaction intentionally disabled: session/auth tokens are shown in
+    # full by default (this is a forensic tool). The value is still used as the
+    # grouping key for replay/reuse detection, so behavior is unchanged.
+    return token
 
 
 def _median(values: list[float]) -> float:
@@ -558,6 +571,7 @@ def _summarize_evidence(
     return ip_counts, packets
 
 
+@memoize_analysis
 def analyze_http(
     path: Path,
     show_status: bool = True,
@@ -688,6 +702,7 @@ def analyze_http(
     suspicious_exec_uri_hits: Counter[str] = Counter()
     token_to_sources: dict[str, set[str]] = defaultdict(set)
     source_to_hosts: dict[str, set[str]] = defaultdict(set)
+    client_user_agents: dict[str, set[str]] = defaultdict(set)
     source_to_urls: dict[str, set[str]] = defaultdict(set)
     source_requests: Counter[str] = Counter()
     source_error_responses: Counter[str] = Counter()
@@ -732,7 +747,7 @@ def analyze_http(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             if TCP is None or Raw is None:
@@ -886,20 +901,7 @@ def analyze_http(
                         except Exception:
                             pass
 
-                    if any(
-                        token in uri_lc
-                        for token in (
-                            "cmd=",
-                            "exec",
-                            "eval",
-                            "powershell",
-                            "whoami",
-                            "wget",
-                            "curl",
-                            "/shell",
-                            "/webshell",
-                        )
-                    ):
+                    if SUSPICIOUS_URI_RE.search(uri_lc):
                         suspicious_exec_uri_hits[uri] += 1
                         _append_evidence(
                             webshell_evidence,
@@ -1054,6 +1056,7 @@ def analyze_http(
                     ua = headers.get("user-agent", "")
                     if ua:
                         counter_inc(user_agents, ua)
+                        set_add_cap(client_user_agents[src_ip], ua, max_size=50)
                         append_device_fingerprints(
                             device_fingerprints,
                             device_fingerprints_from_text(ua, source="HTTP User-Agent"),
@@ -1406,10 +1409,15 @@ def analyze_http(
                             fname,
                             headers.get("content-type", ""),
                         )
+                        # Only executable content disguised as a non-executable
+                        # type is masquerading. Image<->image (gif named, png
+                        # bytes) and Office docs (which are ZIP/Office by magic)
+                        # are benign and must not raise a CRITICAL.
                         mismatch = bool(
                             body_complete
                             and expected_type
-                            and detected_type not in ("BINARY", expected_type)
+                            and detected_type in EXECUTABLE_FILE_TYPES
+                            and expected_type not in EXECUTABLE_FILE_TYPES
                         )
                         allow_small = content_length is not None and content_length > 0
                         if (
@@ -1490,8 +1498,12 @@ def analyze_http(
             detected_type = getattr(art, "file_type", "") or "UNKNOWN"
             content_type = getattr(art, "content_type", "") or ""
             expected_type = _expected_type_from_filename(filename, content_type)
+            # Masquerading = executable content claiming a non-executable type;
+            # image<->image and Office(=ZIP) differences are benign (see above).
             mismatch = bool(
-                expected_type and detected_type not in ("BINARY", expected_type)
+                expected_type
+                and detected_type in EXECUTABLE_FILE_TYPES
+                and expected_type not in EXECUTABLE_FILE_TYPES
             )
             size_bytes = getattr(art, "size_bytes", None)
             downloads.append(
@@ -1932,6 +1944,36 @@ def analyze_http(
             "Potential browser UA impersonation",
             f"{len(ua_spoof_evidence)} request(s) used browser-like UA strings but missing expected companion headers.",
             evidence=ua_spoof_evidence,
+        )
+
+    # 8b) Multiple distinct User-Agents from a single client. A normal host
+    # presents one (or a couple of) UA(s); several different browser UA strings
+    # from one source is a strong malware/C2 indicator (different modules use
+    # different hardcoded UAs, or the UA is rotated to evade fingerprinting).
+    multi_ua_clients = [
+        (client, sorted(uas))
+        for client, uas in client_user_agents.items()
+        if len(uas) >= 3
+    ]
+    if multi_ua_clients:
+        multi_ua_clients.sort(key=lambda row: len(row[1]), reverse=True)
+        multi_ua_evidence: list[dict[str, object]] = []
+        for client, uas in multi_ua_clients[:MAX_HTTP_DETECTION_EVIDENCE]:
+            _append_evidence(
+                multi_ua_evidence,
+                {"src": client, "ua_count": len(uas), "user_agents": uas[:6]},
+            )
+        top = multi_ua_clients[0]
+        _append_detection(
+            "warning",
+            "Multiple User-Agents from a single host",
+            (
+                f"{top[0]} presented {len(top[1])} distinct User-Agents. A single host "
+                "using several browser UA strings is a common malware/C2 indicator "
+                "(per-module UAs or UA rotation)."
+            ),
+            evidence=multi_ua_evidence,
+            artifacts=[c for c, _ in multi_ua_clients[:10]],
         )
 
     # 9) Session hijack/token replay heuristics.

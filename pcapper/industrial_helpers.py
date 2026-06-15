@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .utils import is_public_ip as _is_public_ip, packet_length
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,7 +14,7 @@ except ImportError:  # pragma: no cover - scapy optional at runtime
     TCP = UDP = IP = Raw = Ether = None
 
 from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, safe_float
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 DEFAULT_KEYWORDS = {
     "user",
@@ -57,6 +58,47 @@ class IndustrialAnomaly:
     src: str
     dst: str
     ts: float
+    # Optional ATT&CK-for-ICS technique id (e.g. "T0855") and supporting
+    # evidence strings. Defaulted so existing positional constructors keep
+    # working; analyzers populate them to enrich the IR/triage output.
+    attack: str = ""
+    evidence: list[str] = field(default_factory=list)
+
+
+def append_public_exposure_anomaly(
+    analysis: "IndustrialAnalysis",
+    protocol_name: str,
+    *,
+    max_anomalies: int = 200,
+) -> None:
+    """Flag an OT protocol observed talking to a public/Internet endpoint.
+
+    Shared by the OT protocol analyzers (was a byte-identical ~12-line block
+    copy-pasted across ~25 modules). Carries the ATT&CK-for-ICS technique and
+    evidence so every OT protocol reports the exposure consistently.
+    """
+    public_endpoints = [
+        ip
+        for ip in set(analysis.src_ips) | set(analysis.dst_ips)
+        if _is_public_ip(ip)
+    ]
+    if public_endpoints and len(analysis.anomalies) < max_anomalies:
+        shown = ", ".join(sorted(public_endpoints)[:5])
+        analysis.anomalies.append(
+            IndustrialAnomaly(
+                severity="HIGH",
+                title=f"{protocol_name} Exposure to Public IP",
+                description=(
+                    f"{protocol_name} traffic observed with public endpoint(s): "
+                    f"{shown}."
+                ),
+                src="*",
+                dst="*",
+                ts=0.0,
+                attack="T0883 Internet Accessible Device",
+                evidence=[f"public endpoint(s): {', '.join(sorted(public_endpoints)[:8])}"],
+            )
+        )
 
 
 @dataclass
@@ -110,6 +152,13 @@ AnomalyDetector = Callable[
 ]
 SignatureMatcher = Callable[[bytes], bool]
 
+# Ephemeral/dynamic source-port floor (Linux 32768+, Windows 49152+). A flow is
+# treated as OT-protocol traffic only when the OT port is the server side: the
+# destination, or the source paired with an ephemeral destination (a response).
+# This prevents an ephemeral source port that merely equals an OT port number
+# from misclassifying unrelated traffic as OT.
+_PORT_SERVER_EPHEMERAL_MIN = 32768
+
 
 def _format_ascii(payload: bytes, limit: int = 200) -> str:
     if not payload:
@@ -137,15 +186,6 @@ def _default_artifacts(payload: bytes) -> list[tuple[str, str]]:
 
 def default_artifacts(payload: bytes) -> list[tuple[str, str]]:
     return _default_artifacts(payload)
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        import ipaddress
-
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
 
 
 def _bucketize(values: list[int]) -> list[SizeBucket]:
@@ -275,6 +315,7 @@ def _extract_ethertype(pkt) -> Optional[int]:
     return None
 
 
+@memoize_analysis
 def analyze_port_protocol(
     path: Path,
     protocol_name: str,
@@ -304,6 +345,12 @@ def analyze_port_protocol(
         return IndustrialAnalysis(path=path, errors=[f"Error: {exc}"])
 
     analysis = IndustrialAnalysis(path=path)
+    # Collapse identical per-packet detector findings (same title/src/dst/detail)
+    # to one — OT detectors that emit an anomaly per packet otherwise flood the
+    # 200-cap with thousands of identical entries (e.g. one "Control Object
+    # Operation" per DNP3 packet) and bury the distinct findings. Detectors that
+    # already aggregate (distinct descriptions per sub-event) are unaffected.
+    _seen_anoms: set[tuple[str, str, str, str]] = set()
     start_time = None
     last_time = None
     seen_artifacts: set[str] = set()
@@ -329,7 +376,7 @@ def analyze_port_protocol(
                         pass
 
                 analysis.total_packets += 1
-                pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+                pkt_len = packet_length(pkt)
                 analysis.total_bytes += pkt_len
                 ts = safe_float(getattr(pkt, "time", 0))
                 if start_time is None:
@@ -342,11 +389,21 @@ def analyze_port_protocol(
                 if not has_transport:
                     continue
 
+                # Classify by port only when the OT port is the *server* side:
+                # the destination (client -> server) or the source with an
+                # ephemeral destination (server -> client response). A bare
+                # "sport or dport in ports" test misclassifies any flow whose
+                # ephemeral source port happens to equal an OT port number —
+                # e.g. a TCP DNS query to 8.8.8.8:53 whose ephemeral source port
+                # is 44818 would otherwise be reported as EtherNet/IP/CSP/PCCC
+                # traffic to a public IP. Signature matches are always honored.
                 matches_port = (
-                    sport in tcp_ports
-                    or dport in tcp_ports
-                    or sport in udp_ports
+                    dport in tcp_ports
                     or dport in udp_ports
+                    or (
+                        (sport in tcp_ports or sport in udp_ports)
+                        and dport >= _PORT_SERVER_EPHEMERAL_MIN
+                    )
                 )
                 matches_sig = (
                     signature_matcher(payload)
@@ -434,6 +491,15 @@ def analyze_port_protocol(
 
                 detector = anomaly_detector or _default_anomalies
                 for anomaly in detector(payload, src_ip, dst_ip, ts, commands):
+                    _akey = (
+                        str(getattr(anomaly, "title", "")),
+                        str(getattr(anomaly, "src", "")),
+                        str(getattr(anomaly, "dst", "")),
+                        str(getattr(anomaly, "description", "")),
+                    )
+                    if _akey in _seen_anoms:
+                        continue
+                    _seen_anoms.add(_akey)
                     if len(analysis.anomalies) < 200:
                         analysis.anomalies.append(anomaly)
 
@@ -462,6 +528,12 @@ def analyze_port_protocol(
                 and req_count > resp_count * 2
                 and len(analysis.anomalies) < max_anomalies
             ):
+                sample_dsts = ", ".join(
+                    str(d)
+                    for d, _b in sorted(
+                        dsts.items(), key=lambda kv: kv[1], reverse=True
+                    )[:6]
+                )
                 analysis.anomalies.append(
                     IndustrialAnomaly(
                         severity="MEDIUM",
@@ -470,6 +542,12 @@ def analyze_port_protocol(
                         src=src,
                         dst="*",
                         ts=0.0,
+                        attack="T0846 Remote System Discovery",
+                        evidence=[
+                            f"{unique_dsts} unique destinations",
+                            f"requests={req_count} responses={resp_count}",
+                            f"top dst: {sample_dsts}",
+                        ],
                     )
                 )
 
@@ -485,6 +563,10 @@ def analyze_port_protocol(
                 src_part, dst_part = session_key.split(" -> ", 1)
                 src_ip = src_part.split(":", 1)[0]
                 dst_ip = dst_part.split(":", 1)[0]
+                # Low-jitter regular intervals are normal SCADA polling; only an
+                # EXTERNAL destination makes periodic OT traffic a beacon/C2 lead.
+                if not _is_public_ip(dst_ip):
+                    continue
                 if len(analysis.anomalies) < max_anomalies:
                     analysis.anomalies.append(
                         IndustrialAnomaly(
@@ -494,6 +576,11 @@ def analyze_port_protocol(
                             src=src_ip,
                             dst=dst_ip,
                             ts=0.0,
+                            attack="T0869 Standard Application Layer Protocol",
+                            evidence=[
+                                f"mean interval ~{avg:.2f}s (CV={cv:.2f}, n={len(intervals)})",
+                                f"external destination {dst_ip}",
+                            ],
                         )
                     )
 
@@ -512,12 +599,17 @@ def analyze_port_protocol(
                             src=src,
                             dst=dst,
                             ts=0.0,
+                            attack="T0883 Internet Accessible Device",
+                            evidence=[
+                                f"{byte_count:,} bytes to public IP {dst}",
+                            ],
                         )
                     )
 
     return analysis
 
 
+@memoize_analysis
 def analyze_ethertype_protocol(
     path: Path,
     protocol_name: str,
@@ -542,6 +634,12 @@ def analyze_ethertype_protocol(
         return IndustrialAnalysis(path=path, errors=[f"Error: {exc}"])
 
     analysis = IndustrialAnalysis(path=path)
+    # Collapse identical per-packet detector findings (same title/src/dst/detail)
+    # to one — OT detectors that emit an anomaly per packet otherwise flood the
+    # 200-cap with thousands of identical entries (e.g. one "Control Object
+    # Operation" per DNP3 packet) and bury the distinct findings. Detectors that
+    # already aggregate (distinct descriptions per sub-event) are unaffected.
+    _seen_anoms: set[tuple[str, str, str, str]] = set()
     start_time = None
     last_time = None
     seen_artifacts: set[str] = set()
@@ -565,7 +663,7 @@ def analyze_ethertype_protocol(
                         pass
 
                 analysis.total_packets += 1
-                pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+                pkt_len = packet_length(pkt)
                 analysis.total_bytes += pkt_len
                 ts = safe_float(getattr(pkt, "time", 0))
                 if start_time is None:
@@ -643,6 +741,15 @@ def analyze_ethertype_protocol(
 
                 detector = anomaly_detector or _default_anomalies
                 for anomaly in detector(payload, src_ip, dst_ip, ts, commands):
+                    _akey = (
+                        str(getattr(anomaly, "title", "")),
+                        str(getattr(anomaly, "src", "")),
+                        str(getattr(anomaly, "dst", "")),
+                        str(getattr(anomaly, "description", "")),
+                    )
+                    if _akey in _seen_anoms:
+                        continue
+                    _seen_anoms.add(_akey)
                     if len(analysis.anomalies) < 200:
                         analysis.anomalies.append(anomaly)
 
@@ -672,6 +779,10 @@ def analyze_ethertype_protocol(
             cv = (variance**0.5) / avg
             if cv <= 0.2 and 1.0 <= avg <= 300.0:
                 src_ip, dst_ip = session_key.split(" -> ", 1)
+                # Only external destinations make periodic OT traffic a beacon
+                # lead; internal cyclic polling is normal SCADA baseline.
+                if not _is_public_ip(dst_ip.split(":", 1)[0]):
+                    continue
                 if len(analysis.anomalies) < max_anomalies:
                     analysis.anomalies.append(
                         IndustrialAnomaly(
@@ -681,6 +792,11 @@ def analyze_ethertype_protocol(
                             src=src_ip,
                             dst=dst_ip,
                             ts=0.0,
+                            attack="T0869 Standard Application Layer Protocol",
+                            evidence=[
+                                f"mean interval ~{avg:.2f}s (CV={cv:.2f}, n={len(intervals)})",
+                                f"external destination {dst_ip}",
+                            ],
                         )
                     )
 
@@ -699,6 +815,10 @@ def analyze_ethertype_protocol(
                             src=src,
                             dst=dst,
                             ts=0.0,
+                            attack="T0883 Internet Accessible Device",
+                            evidence=[
+                                f"{byte_count:,} bytes to public IP {dst}",
+                            ],
                         )
                     )
 

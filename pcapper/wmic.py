@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from .utils import is_valid_ip as _valid_ip, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .utils import is_public_ip as _is_public_ip
+from .utils import beacon_score as _beaconing_score
 import ipaddress
 import re
 from collections import Counter, defaultdict
@@ -8,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP
@@ -57,24 +60,24 @@ ERROR_PATTERNS = [
 
 SUSPICIOUS_COMMANDS = [
     (
-        re.compile(r"process\\s+call\\s+create", re.IGNORECASE),
+        re.compile(r"process\s+call\s+create", re.IGNORECASE),
         "Remote process creation",
     ),
-    (re.compile(r"cmd\\.exe|powershell", re.IGNORECASE), "Shell execution"),
+    (re.compile(r"cmd\.exe|powershell", re.IGNORECASE), "Shell execution"),
     (re.compile(r"rundll32|regsvr32", re.IGNORECASE), "DLL execution"),
-    (re.compile(r"schtasks|at\\s+", re.IGNORECASE), "Scheduled task creation"),
+    (re.compile(r"schtasks|\bat\s+\\\\", re.IGNORECASE), "Scheduled task creation"),
     (
-        re.compile(r"net\\s+user|net\\s+localgroup", re.IGNORECASE),
+        re.compile(r"net\s+user|net\s+localgroup", re.IGNORECASE),
         "Account manipulation",
     ),
     (re.compile(r"certutil|bitsadmin|curl|wget", re.IGNORECASE), "Download tooling"),
     (re.compile(r"vssadmin|wbadmin|bcdedit", re.IGNORECASE), "System modification"),
-    (re.compile(r"\\bbase64\\b|\\b-enc\\b", re.IGNORECASE), "Encoded payloads"),
+    (re.compile(r"\bbase64\b|\b-enc\b", re.IGNORECASE), "Encoded payloads"),
 ]
 
 SERVICE_HINTS = [
     (re.compile(r"Win32_Service", re.IGNORECASE), "Service enumeration"),
-    (re.compile(r"service\\s+get", re.IGNORECASE), "Service enumeration"),
+    (re.compile(r"service\s+get", re.IGNORECASE), "Service enumeration"),
     (re.compile(r"Win32_Process", re.IGNORECASE), "Process inventory"),
     (re.compile(r"Win32_OperatingSystem", re.IGNORECASE), "OS inventory"),
     (re.compile(r"Win32_ComputerSystem", re.IGNORECASE), "Computer system inventory"),
@@ -82,7 +85,7 @@ SERVICE_HINTS = [
 ]
 
 PERSISTENCE_HINTS = [
-    re.compile(r"root\\\\subscription", re.IGNORECASE),
+    re.compile(r"root\\subscription", re.IGNORECASE),
     re.compile(
         r"__EventFilter|CommandLineEventConsumer|ActiveScriptEventConsumer",
         re.IGNORECASE,
@@ -243,27 +246,6 @@ class _SessionState:
             self.hints = Counter()
 
 
-def _extract_ascii_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> list[str]:
-    results: list[str] = []
-    if not data:
-        return results
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
 def _extract_utf16le_strings(
     data: bytes, min_len: int = 4, max_len: int = 200
 ) -> list[str]:
@@ -303,33 +285,7 @@ def _direction(
     return src_ip, dst_ip, sport, dport
 
 
-def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance**0.5
-    if avg < 5 or avg > 86400:
-        return None
-    if stddev > max(5.0, avg * 0.25):
-        return None
-    return {"avg": avg, "stddev": stddev}
-
-
-def _valid_ip(value: str) -> bool:
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except Exception:
-        return False
-
-
+@memoize_analysis
 def analyze_wmic(
     path: Path,
     show_status: bool = True,
@@ -471,7 +427,9 @@ def analyze_wmic(
     anomalies: list[dict[str, object]] = []
     errors = []
 
-    client_times: dict[str, list[float]] = defaultdict(list)
+    # Keyed per (client, server) flow, not per client, so a host talking to
+    # several servers does not merge into one series and look "periodic".
+    client_times: dict[tuple[str, str], list[float]] = defaultdict(list)
     client_targets: dict[str, set[str]] = defaultdict(set)
     node_targets: dict[str, set[str]] = defaultdict(set)
 
@@ -486,7 +444,7 @@ def analyze_wmic(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
@@ -592,7 +550,7 @@ def analyze_wmic(
                 server_bytes += pkt_len
 
             if ts is not None:
-                client_times[client_ip].append(ts)
+                client_times[(client_ip, server_ip)].append(ts)
             client_targets[client_ip].add(server_ip)
 
             for value in strings:
@@ -716,14 +674,14 @@ def analyze_wmic(
                 }
             )
 
-    for client, times in client_times.items():
+    for (client, server), times in client_times.items():
         score = _beaconing_score(times)
         if score:
             detections.append(
                 {
                     "severity": "warning",
                     "summary": "Possible WMIC beaconing",
-                    "details": f"{client} interval avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s",
+                    "details": f"{client} -> {server} interval avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s",
                 }
             )
 
@@ -736,7 +694,7 @@ def analyze_wmic(
             }
         )
 
-    if any(p in wmi_namespaces for p in ("root\\\\subscription",)):
+    if any(p in wmi_namespaces for p in ("root\\subscription",)):
         detections.append(
             {
                 "severity": "high",
@@ -792,17 +750,11 @@ def analyze_wmic(
     threat_hypotheses: list[dict[str, object]] = []
     benign_context: list[str] = []
 
-    def _is_public_ip(value: str) -> bool:
-        try:
-            return ipaddress.ip_address(str(value)).is_global
-        except Exception:
-            return False
-
     for cmd, count in suspicious_commands.most_common(20):
         deterministic_checks["wmic_remote_execution_tradecraft"].append(
             f"{cmd[:120]} hits={int(count)}"
         )
-    if any(p in wmi_namespaces for p in ("root\\\\subscription",)):
+    if any(p in wmi_namespaces for p in ("root\\subscription",)):
         deterministic_checks["wmic_namespace_persistence_context"].append(
             "WMI persistence namespace root\\subscription observed"
         )
@@ -825,11 +777,11 @@ def analyze_wmic(
             deterministic_checks["wmic_node_fanout"].append(
                 f"{client} referenced {len(nodes)} /node targets in WMIC content"
             )
-    for client, times in client_times.items():
+    for (client, server), times in client_times.items():
         score = _beaconing_score(times)
         if score:
             deterministic_checks["wmic_periodic_activity"].append(
-                f"{client} periodic WMIC cadence avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s"
+                f"{client} -> {server} periodic WMIC cadence avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s"
             )
     if server_bytes > 5 * max(1, client_bytes) and server_bytes > 1024 * 1024:
         deterministic_checks["wmic_data_exfil_asymmetry"].append(

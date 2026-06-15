@@ -43,6 +43,45 @@ except Exception:  # pragma: no cover
     hashes = None  # type: ignore
 
 
+def is_weak_pubkey(pubkey_type: str, pubkey_size: int) -> bool:
+    """True only for cryptographically weak public keys.
+
+    `pubkey_size` is the key's `key_size`, whose meaning depends on the algorithm:
+    RSA/DSA/DH report modulus bits (weak < 2048) while elliptic-curve keys report
+    the curve bits (P-256 = 256, which is strong). A flat `< 2048` test wrongly
+    flags every modern ECDSA/EdDSA certificate — and modern TLS is overwhelmingly
+    ECDSA P-256 — so weakness must be judged per key family.
+    """
+    size = int(pubkey_size or 0)
+    if size <= 0:
+        return False
+    t = (pubkey_type or "").upper()
+    if "ED25519" in t or "ED448" in t:
+        return False  # modern EdDSA, always strong
+    if "ELLIPTIC" in t or "ECPUBLIC" in t or "ECDSA" in t:
+        return size < 256  # weak curves only (e.g. P-192)
+    if "RSA" in t or "DSA" in t or "DH" in t:
+        return size < 2048  # finite-field crypto
+    # Unknown key family: only flag clearly tiny keys to avoid false positives.
+    return size < 1024
+
+
+# Known-malicious X.509 certificates (default/leaked C2 framework certs). These
+# are very high-confidence IOCs: a lazy operator who ships the default cert.
+# Keyed by SHA-256 fingerprint and (separately) by the well-known serial number.
+# Sources: abuse.ch, Elastic/Te-k Cobalt Strike research.
+_KNOWN_BAD_CERT_SHA256: dict[str, str] = {
+    "87f2085c32b6a2cc709b365f55873e207a9caa10bffecf2fd16d3cf9d94d390c": (
+        "Cobalt Strike default Team Server certificate"
+    ),
+}
+# Default serial numbers shipped by C2 frameworks (operators rarely change them).
+_KNOWN_BAD_CERT_SERIALS: dict[str, str] = {
+    "0x8bb00ee": "Cobalt Strike default certificate (serial 146473198)",
+    "146473198": "Cobalt Strike default certificate",
+}
+
+
 @dataclass(frozen=True)
 class CertificateInfo:
     subject: str
@@ -59,6 +98,7 @@ class CertificateInfo:
     src_ip: str
     dst_ip: str
     sni: Optional[str]
+    is_ca: bool = False
 
 
 @dataclass(frozen=True)
@@ -86,6 +126,7 @@ class CertificateSummary:
     chain_gaps: list[dict[str, object]] = field(default_factory=list)
     endpoint_profiles: list[dict[str, object]] = field(default_factory=list)
     timeline: list[dict[str, object]] = field(default_factory=list)
+    known_bad_certs: list[dict[str, object]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -162,6 +203,7 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
     weak_keys: list[dict[str, object]] = []
     expired: list[dict[str, object]] = []
     self_signed: list[dict[str, object]] = []
+    known_bad_certs: list[dict[str, object]] = []
     seen_fingerprints: set[str] = set()
     fingerprint_contexts: dict[str, set[str]] = {}
     serial_contexts: dict[str, set[str]] = {}
@@ -314,6 +356,23 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
         context_key = f"{src_ip}->{dst_ip}"
         serial_contexts.setdefault(serial, set()).add(context_key)
         fingerprint_contexts.setdefault(sha256, set()).add(context_key)
+
+        # Known-malicious certificate IOC match (default C2 framework certs).
+        bad_label = _KNOWN_BAD_CERT_SHA256.get(
+            sha256.lower()
+        ) or _KNOWN_BAD_CERT_SERIALS.get(str(serial).lower())
+        if bad_label:
+            known_bad_certs.append(
+                {
+                    "label": bad_label,
+                    "sha256": sha256,
+                    "serial": serial,
+                    "subject": subject,
+                    "issuer": issuer,
+                    "src": src_ip,
+                    "dst": dst_ip,
+                }
+            )
         if sha256 in seen_fingerprints:
             timeline.append(
                 {
@@ -334,7 +393,7 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
         for name in san_list:
             sas[name] += 1
 
-        if pubkey_size and pubkey_size < 2048:
+        if is_weak_pubkey(pubkey_type, pubkey_size):
             weak_keys.append(
                 {"subject": subject, "size": pubkey_size, "src": src_ip, "dst": dst_ip}
             )
@@ -405,6 +464,18 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
                 }
             )
 
+        # CA / intermediate certs legitimately omit the serverAuth EKU, the TLS
+        # leaf key-usage bits and SANs. Compute CA status up-front so the
+        # leaf-only sanity checks below don't fire on every chain cert.
+        is_ca_cert = False
+        try:
+            _bc_early = cert.extensions.get_extension_for_class(
+                x509.BasicConstraints
+            ).value
+            is_ca_cert = bool(getattr(_bc_early, "ca", False))
+        except Exception:
+            is_ca_cert = False
+
         try:
             eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
             oid_names = [getattr(oid, "_name", str(oid)) for oid in eku]
@@ -412,6 +483,7 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
             if (
                 "serverauth" not in joined
                 and "tls web server authentication" not in joined
+                and not is_ca_cert
             ):
                 eku_mismatches.append(
                     {
@@ -423,18 +495,19 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
                     }
                 )
         except Exception:
-            eku_mismatches.append(
-                {
-                    "subject": subject,
-                    "reason": "missing_eku",
-                    "src": src_ip,
-                    "dst": dst_ip,
-                }
-            )
+            if not is_ca_cert:
+                eku_mismatches.append(
+                    {
+                        "subject": subject,
+                        "reason": "missing_eku",
+                        "src": src_ip,
+                        "dst": dst_ip,
+                    }
+                )
 
         try:
             ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
-            if not bool(
+            if not is_ca_cert and not bool(
                 getattr(ku, "digital_signature", False)
                 or getattr(ku, "key_encipherment", False)
                 or getattr(ku, "key_agreement", False)
@@ -448,31 +521,24 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
                     }
                 )
         except Exception:
-            key_usage_issues.append(
-                {
-                    "subject": subject,
-                    "reason": "missing_key_usage",
-                    "src": src_ip,
-                    "dst": dst_ip,
-                }
-            )
-
-        try:
-            bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
-            if bool(getattr(bc, "ca", False)):
-                chain_gaps.append(
+            if not is_ca_cert:
+                key_usage_issues.append(
                     {
                         "subject": subject,
-                        "reason": "leaf_marked_as_ca",
+                        "reason": "missing_key_usage",
                         "src": src_ip,
                         "dst": dst_ip,
                     }
                 )
-        except Exception:
+
+        # A CA bit on a cert that also carries server SANs is the anomaly worth
+        # flagging (an end-entity cert masquerading as a CA). A plain CA /
+        # intermediate in the chain legitimately sets ca=True, so don't flag it.
+        if is_ca_cert and san_list:
             chain_gaps.append(
                 {
                     "subject": subject,
-                    "reason": "missing_basic_constraints",
+                    "reason": "leaf_marked_as_ca",
                     "src": src_ip,
                     "dst": dst_ip,
                 }
@@ -492,7 +558,7 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
                     )
                 except Exception:
                     pass
-        else:
+        elif not is_ca_cert:
             name_mismatches.append(
                 {
                     "subject": subject,
@@ -505,11 +571,14 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
         lower_blob = f"{subject} {san_text}".lower()
         if any(marker in lower_blob for marker in brand_markers):
             suspicious = False
-            if subject == issuer:
+            # A self-signed CA (root/intermediate) legitimately has subject==issuer
+            # and often carries the brand name (e.g. "Google Trust Services" root).
+            # Only a self-signed *leaf* cert is impersonation.
+            if subject == issuer and not is_ca_cert:
                 suspicious = True
             if any(name.lower().endswith(suspicious_tlds) for name in san_list):
                 suspicious = True
-            if pubkey_size and pubkey_size < 2048:
+            if is_weak_pubkey(pubkey_type, pubkey_size):
                 suspicious = True
             if suspicious:
                 issuer_impersonation.append(
@@ -581,6 +650,7 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
                 src_ip=src_ip,
                 dst_ip=dst_ip,
                 sni=None,
+                is_ca=is_ca_cert,
             )
         )
 
@@ -812,5 +882,6 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
         chain_gaps=chain_gaps,
         endpoint_profiles=endpoint_profiles,
         timeline=timeline_sorted[:200],
+        known_bad_certs=known_bad_certs,
         errors=errors,
     )

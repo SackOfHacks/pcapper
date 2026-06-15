@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from .utils import is_valid_ip as _valid_ip
+from .utils import is_public_ip as _is_public_ip
 import ipaddress
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,10 +16,58 @@ from .files import analyze_files
 from .hostname import analyze_hostname
 from .ips import analyze_ips
 from .netbios import analyze_netbios
+from .kerberos import analyze_kerberos
 from .progress import run_with_busy_status
 from .services import analyze_services
+from .threats import analyze_threats
 from .timeline import analyze_timeline
 from .webrequests import analyze_webrequests
+
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_SEVERITY_WEIGHT = {"critical": 8, "high": 5, "warning": 3, "medium": 3, "info": 1}
+
+
+def _detection_pair_ips(detection: dict[str, object], field: str) -> list[str]:
+    out: list[str] = []
+    for pair in detection.get(field, []) or []:
+        if isinstance(pair, (list, tuple)) and pair:
+            out.append(str(pair[0]))
+    return out
+
+
+def _detection_role_for_host(
+    detection: dict[str, object], target_ip: str
+) -> Optional[str]:
+    """Return the target host's role in a threat detection: 'actor' (the source
+    of the activity), 'target' (the destination/victim), 'involved' (named in
+    evidence/details), or None when the host is not referenced. Source vs target
+    is the key triage distinction (is this host the scanner or the scanned?)."""
+    sources = _detection_pair_ips(detection, "top_sources")
+    destinations = _detection_pair_ips(detection, "top_destinations")
+    src = str(detection.get("src", "") or "")
+    dst = str(detection.get("dst", "") or "")
+    if target_ip in sources or target_ip == src:
+        return "actor"
+    if target_ip in destinations or target_ip == dst:
+        return "target"
+    blob = str(detection.get("details", "") or "")
+    evidence = detection.get("evidence")
+    if isinstance(evidence, list):
+        blob += " " + " ".join(str(v) for v in evidence)
+    elif isinstance(evidence, str):
+        blob += " " + evidence
+    # Word-boundary IP match so 10.0.0.1 doesn't match 10.0.0.10.
+    if target_ip and re.search(rf"(?<![\d.]){re.escape(target_ip)}(?![\d.])", blob):
+        # Determine side from "src->dst" ordering in the text when possible.
+        for s, d in re.findall(
+            r"(\d{1,3}(?:\.\d{1,3}){3})\s*->\s*(\d{1,3}(?:\.\d{1,3}){3})", blob
+        ):
+            if s == target_ip:
+                return "actor"
+            if d == target_ip:
+                return "target"
+        return "involved"
+    return None
 
 
 @dataclass(frozen=True)
@@ -63,14 +114,6 @@ class HostDetailsSummary:
     host_verdict_score: int
     host_verdict_reasons: list[str]
     errors: list[str]
-
-
-def _valid_ip(value: str) -> bool:
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except Exception:
-        return False
 
 
 def _canonical_ip(value: str | None) -> str | None:
@@ -944,6 +987,7 @@ def analyze_hostdetails(
         else _busy("Services", analyze_services, path, show_status=False)
     )
     netbios_summary = _busy("NetBIOS", analyze_netbios, path, show_status=False)
+    kerberos_summary = _busy("Kerberos", analyze_kerberos, path, show_status=False)
     webrequests_summary = _busy(
         "Web requests",
         analyze_webrequests,
@@ -1157,6 +1201,12 @@ def analyze_hostdetails(
                 "bytes": asset.bytes,
                 "peers": peer_hint,
                 "software": asset.software or "-",
+                "handshake_confirmed": bool(
+                    getattr(asset, "handshake_confirmed", False)
+                ),
+                "discovery_method": str(
+                    getattr(asset, "discovery_method", "observed") or "observed"
+                ),
             }
         )
         protocol_counts[asset.protocol] += asset.packets
@@ -1353,10 +1403,180 @@ def analyze_hostdetails(
     attack_path_steps: list[str] = []
     peer_risk: Counter[str] = Counter()
     evidence_anchors: list[dict[str, object]] = []
-    host_verdict = "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE HOST ABUSE PATTERN"
-    host_confidence = "low"
+
+    # --- Host-attributed detections + verdict -----------------------------
+    # The whole point of scoping a single host is "what did this host do / have
+    # done to it, and is it a threat?". Pull the cross-protocol threat detections
+    # and attribute the ones that reference this host, separating where the host
+    # is the ACTOR (source) from where it is the TARGET (victim).
+    if threats_summary is None:
+        threats_summary = _busy(
+            "Threat correlation", analyze_threats, path, show_status=False
+        )
+    errors.extend(getattr(threats_summary, "errors", []) or [])
+
+    actor_detections: list[dict[str, object]] = []
+    target_detections: list[dict[str, object]] = []
+    for det in getattr(threats_summary, "detections", []) or []:
+        if not isinstance(det, dict):
+            continue
+        role = _detection_role_for_host(det, target_ip)
+        if role is None:
+            continue
+        severity = str(det.get("severity", "info") or "info").lower()
+        enriched = dict(det)
+        enriched["host_role"] = role
+        detections.append(enriched)
+        attack_categories[str(det.get("source", "threats") or "threats")] += 1
+        if role == "actor":
+            actor_detections.append(enriched)
+        elif role == "target":
+            target_detections.append(enriched)
+
+    # Peer risk: how many distinct public vs private peers this host talked to.
+    public_peers = sorted(
+        {peer for peer in peer_counts if _is_public_ip(str(peer))}
+    )
+    for peer in public_peers:
+        peer_risk[peer] = int(peer_counts.get(peer, 0) or 0)
+
+    # User/identity evidence from NetBIOS logged-on-user (<03>) name records.
+    if target_netbios_host is not None:
+        for nb_name in getattr(target_netbios_host, "names", []) or []:
+            if int(getattr(nb_name, "suffix", -1) or -1) == 0x03:
+                uname = str(getattr(nb_name, "name", "") or "").strip()
+                if uname:
+                    user_evidence.append(
+                        {
+                            "username": uname,
+                            "domain": str(getattr(nb_name, "scope", "") or ""),
+                            "full_name": "",
+                            "method": "NetBIOS <03> logged-on user",
+                            "location": target_ip,
+                        }
+                    )
+
+    # Kerberos client principal = the AD user logged on to this host (the most
+    # reliable identity source in a domain; this is how the "Windows user
+    # account name" answer is found). Attribute principals whose AS/TGS exchange
+    # involves the target IP.
+    _krb_user_realm: dict[str, str] = {}
+    _service_prefixes = (
+        "host",
+        "http",
+        "ldap",
+        "cifs",
+        "gc",
+        "krbtgt",
+        "rpcss",
+        "termsrv",
+        "dns",
+        "restrictedkrbhost",
+        "wsman",
+    )
+    for item in getattr(kerberos_summary, "principal_evidence", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("kind", "")) != "CNameString":
+            continue
+        if target_ip not in (str(item.get("src_ip", "")), str(item.get("dst_ip", ""))):
+            continue
+        principal = str(item.get("principal", "") or "").strip()
+        if not principal:
+            continue
+        user_part, _, realm = principal.partition("@")
+        user_part = user_part.strip()
+        low = user_part.lower()
+        # Skip machine ($) / service-principal (SPN) names — those identify the
+        # host or a service, not the human user. A user sAMAccountName is not an
+        # FQDN, so reject names with >=2 dots or a service-class prefix.
+        if (
+            not user_part
+            or "$" in user_part
+            or "/" in user_part
+            or user_part.count(".") >= 2
+            or low.startswith(_service_prefixes)
+        ):
+            continue
+        _krb_user_realm[user_part] = realm
+    # Collapse the Kerberos trailing-digit extraction artifact (e.g.
+    # "momia.juanita0" alongside "momia.juanita") — drop the digit variant when
+    # the base name is also present.
+    for user_part in sorted(_krb_user_realm, key=len):
+        if (
+            user_part[-1:].isdigit()
+            and user_part[:-1] in _krb_user_realm
+        ):
+            continue
+        user_evidence.append(
+            {
+                "username": user_part,
+                "domain": _krb_user_realm[user_part],
+                "full_name": "",
+                "method": "Kerberos CNameString (logged-on AD user)",
+                "location": target_ip,
+            }
+        )
+
+    # --- Host verdict -----------------------------------------------------
+    sev_counts: Counter[str] = Counter(
+        str(d.get("severity", "info") or "info").lower() for d in detections
+    )
     host_verdict_score = 0
-    host_verdict_reasons: list[str] = []
+    host_verdict_reasons = []
+    crit = int(sev_counts.get("critical", 0))
+    high = int(sev_counts.get("high", 0))
+    warn_ct = int(sev_counts.get("warning", 0)) + int(sev_counts.get("medium", 0))
+    if crit:
+        host_verdict_score += min(6, crit * 3)
+        host_verdict_reasons.append(f"{crit} critical detection(s) involving this host")
+    if high:
+        host_verdict_score += min(6, high * 2)
+        host_verdict_reasons.append(f"{high} high-severity detection(s)")
+    if warn_ct >= 3:
+        host_verdict_score += 1
+        host_verdict_reasons.append(f"{warn_ct} warning-level detection(s)")
+    if actor_detections:
+        actor_sev = [
+            str(d.get("severity", "info") or "info").lower() for d in actor_detections
+        ]
+        if any(s in {"critical", "high"} for s in actor_sev):
+            host_verdict_score += 2
+            host_verdict_reasons.append(
+                f"Host is the ACTOR/source in {len(actor_detections)} detection(s)"
+            )
+    if public_peers and (crit or high):
+        host_verdict_reasons.append(
+            f"Communicates with {len(public_peers)} public peer(s)"
+        )
+
+    if host_verdict_score >= 8 and actor_detections and (crit or high):
+        host_verdict = "LIKELY COMPROMISED / HOSTILE - high-confidence malicious activity attributed to this host"
+        host_confidence = "high"
+    elif host_verdict_score >= 8:
+        host_verdict = "HIGH RISK - this host is central to high-severity detections (verify actor vs victim)"
+        host_confidence = "high"
+    elif host_verdict_score >= 4:
+        host_verdict = "SUSPICIOUS - notable detections involve this host; corroborate before escalating"
+        host_confidence = "medium"
+    elif host_verdict_score >= 1:
+        host_verdict = "LOW SIGNAL - minor/uncorroborated detections involve this host"
+        host_confidence = "low"
+    else:
+        host_verdict = (
+            "NO STRONG SIGNAL - no threat detections attributed to this host"
+        )
+        host_confidence = "low"
+    if not host_verdict_reasons:
+        host_verdict_reasons.append("No host-attributed threat detections crossed threshold")
+
+    # Order detections most-severe first for triage.
+    detections.sort(
+        key=lambda d: _SEVERITY_WEIGHT.get(
+            str(d.get("severity", "info") or "info").lower(), 0
+        ),
+        reverse=True,
+    )
 
     return HostDetailsSummary(
         path=path,

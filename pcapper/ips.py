@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+
+from .utils import shannon_entropy as _shannon_entropy, tcp_flags_int as _tcp_flags_int
+from .utils import is_public_ip as _is_public_ip
 import hashlib
 import ipaddress
 import json
-import math
 import os
 import urllib.error
 import urllib.request
@@ -14,7 +16,17 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .pcap_cache import get_reader
-from .utils import counter_inc, safe_float, safe_read_text, set_add_cap, setdict_add
+from .tls_fingerprints import (
+    _coerce_int_list,
+    _extract_alpn,
+    _extract_sni,
+    _iter_tls_extensions,
+    _ja3_from_client_hello,
+    _ja4_from_client_hello,
+    _ja4s_from_server_hello,
+    _tls_extension_type,
+)
+from .utils import counter_inc, memoize_analysis, packet_length, safe_float, safe_read_text, set_add_cap, setdict_add
 
 MAX_ENDPOINTS = int(os.getenv("PCAPPER_MAX_ENDPOINTS", "20000"))
 MAX_CONVERSATIONS = int(os.getenv("PCAPPER_MAX_CONVERSATIONS", "50000"))
@@ -165,32 +177,6 @@ class IpSummary:
     false_positive_context: list[str] = field(default_factory=list)
 
 
-def _tcp_flags_int(flags: object) -> int:
-    try:
-        if isinstance(flags, str):
-            value = 0
-            if "F" in flags:
-                value |= 0x01
-            if "S" in flags:
-                value |= 0x02
-            if "R" in flags:
-                value |= 0x04
-            if "P" in flags:
-                value |= 0x08
-            if "A" in flags:
-                value |= 0x10
-            if "U" in flags:
-                value |= 0x20
-            if "E" in flags:
-                value |= 0x40
-            if "C" in flags:
-                value |= 0x80
-            return value
-        return int(flags)
-    except Exception:
-        return 0
-
-
 def _tcp_is_syn(flags: object) -> bool:
     value = _tcp_flags_int(flags)
     return bool(value & 0x02) and not bool(value & 0x10)
@@ -220,15 +206,183 @@ def _build_ips_enrichment(
     intel_findings: list[dict[str, object]],
     detections: list[dict[str, object]],
 ) -> dict[str, object]:
-    _ = (
-        endpoints,
-        conversations,
-        suspicious_port_profiles,
-        lateral_movement_scores,
-        intel_findings,
-        detections,
+    _ = (endpoints,)
+    checks: dict[str, list[str]] = defaultdict(list)
+
+    # Indicator quality gate: external IOC hits (AbuseIPDB/OTX/VT) and TLS
+    # reputation/cert IOC matches are high-quality, low-FP signals.
+    for finding in intel_findings or []:
+        ip = str(finding.get("ip", "?"))
+        bits = []
+        if finding.get("score"):
+            bits.append(f"AbuseIPDB score {finding.get('score')}")
+        if finding.get("pulses"):
+            bits.append(f"OTX pulses {finding.get('pulses')}")
+        if finding.get("malicious") or finding.get("suspicious"):
+            bits.append(
+                f"VT malicious={finding.get('malicious', 0)}/suspicious={finding.get('suspicious', 0)}"
+            )
+        checks["indicator_quality_gate"].append(
+            f"{ip}: {', '.join(bits) if bits else 'threat-intel hit'}"
+        )
+
+    # Intent heuristics from the analyzer's already-thresholded detections.
+    for det in detections or []:
+        sev = str(det.get("severity", "info")).lower()
+        summary_text = str(det.get("summary", ""))
+        blob = summary_text.lower()
+        ev = summary_text + (f" — {det.get('details','')}" if det.get("details") else "")
+        if any(
+            t in blob
+            for t in ("port scanning", "scan", "sweep", "lateral movement", "fan-out", "fan-in")
+        ):
+            if sev != "info":
+                checks["intent_heuristics"].append(ev)
+        if any(t in blob for t in ("reputation", "certificate risk", "fingerprint reputation")):
+            checks["indicator_quality_gate"].append(ev)
+
+    # Corroborated multi-signal hit: an IP that appears in two or more
+    # independent signal sources (scan profile / lateral movement / intel).
+    signal_sources: dict[str, set[str]] = defaultdict(set)
+    for prof in suspicious_port_profiles or []:
+        src = str(prof.get("src", ""))
+        if src:
+            signal_sources[src].add("port-scan")
+    for lm in lateral_movement_scores or []:
+        ip = str(lm.get("ip", ""))
+        if ip:
+            signal_sources[ip].add("lateral-movement")
+    for finding in intel_findings or []:
+        ip = str(finding.get("ip", ""))
+        if ip:
+            signal_sources[ip].add("threat-intel")
+    for ip, sources in signal_sources.items():
+        if len(sources) >= 2:
+            checks["corroborated_multi_signal_hit"].append(
+                f"{ip}: {', '.join(sorted(sources))}"
+            )
+
+    if suspicious_port_profiles:
+        for prof in suspicious_port_profiles[:5]:
+            checks["intent_heuristics"].append(
+                f"{prof.get('src','?')}: {prof.get('type','scan')} "
+                f"({prof.get('unique_ports',0)} ports / {prof.get('unique_dsts',0)} hosts)"
+            )
+
+    # Boundary cross-zone contact, but only for IPs already flagged by another
+    # signal — private<->public contact alone is normal internet traffic and
+    # would fire on every capture, so it is reported as corroborating context.
+    def _is_priv(addr: str) -> bool:
+        try:
+            return ipaddress.ip_address(addr).is_private
+        except Exception:
+            return False
+
+    def _is_global_unicast(addr: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(addr)
+            return ip.is_global and not ip.is_multicast
+        except Exception:
+            return False
+
+    flagged_ips = set(signal_sources.keys())
+    if flagged_ips:
+        boundary_seen: set[frozenset[str]] = set()
+        for conv in conversations or []:
+            s, d = str(conv.src), str(conv.dst)
+            if not (s in flagged_ips or d in flagged_ips):
+                continue
+            if not (
+                (_is_priv(s) and _is_global_unicast(d))
+                or (_is_priv(d) and _is_global_unicast(s))
+            ):
+                continue
+            pair = frozenset((s, d))
+            if pair in boundary_seen:
+                continue
+            boundary_seen.add(pair)
+            checks["boundary_cross_zone_contact"].append(
+                f"{s} <-> {d} ({conv.protocol})"
+            )
+
+    provenance = []
+    if intel_findings:
+        provenance.append(f"external threat-intel ({len(intel_findings)})")
+    if suspicious_port_profiles:
+        provenance.append(f"port-scan profiles ({len(suspicious_port_profiles)})")
+    if lateral_movement_scores:
+        provenance.append(f"lateral-movement scoring ({len(lateral_movement_scores)})")
+    if detections:
+        provenance.append(f"IP detections ({len(detections)})")
+    if provenance:
+        checks["evidence_provenance"].append("; ".join(provenance))
+
+    score = 0
+    reasons: list[str] = []
+    if checks.get("indicator_quality_gate"):
+        score += 3
+        reasons.append("High-quality threat indicator (external IOC / TLS reputation / cert IOC)")
+    if checks.get("corroborated_multi_signal_hit"):
+        score += 3
+        reasons.append("An IP is implicated by multiple independent signals")
+    if suspicious_port_profiles:
+        score += 2
+        reasons.append("Port-scanning profile(s) observed")
+    # Broad internal fan-out alone is too often benign infrastructure (a DNS/AD
+    # server, a monitoring poller, OT discovery such as BACnet Who-Is) to drive
+    # a verdict on its own — `peers` counts inbound contacts too. It only scores
+    # when corroborated by another signal (handled by corroborated_multi_signal_hit);
+    # standalone it is shown as context under intent_heuristics.
+    if lateral_movement_scores:
+        reasons.append("Broad internal fan-out observed (context; verify against --tcp/--smb)")
+    high_ct = sum(
+        1 for d in (detections or []) if str(d.get("severity", "")).lower() in {"high", "critical"}
     )
-    return {}
+    if high_ct:
+        reasons.append(f"High-severity IP detections: {high_ct}")
+
+    if score >= 6:
+        verdict = "YES - high-confidence malicious IP activity (corroborated intel / scanning / lateral movement) is present."
+        confidence = "high"
+    elif score >= 4:
+        verdict = "LIKELY - suspicious IP activity with attack indicators is present."
+        confidence = "medium"
+    elif score >= 2:
+        verdict = "POSSIBLE - notable IP activity (recon / lateral movement) observed; corroboration recommended."
+        confidence = "low"
+    elif score >= 1:
+        verdict = "LOW SIGNAL - minor IP anomalies present but not strongly corroborated."
+        confidence = "low"
+    else:
+        verdict = ""
+        confidence = "low"
+    if not reasons and verdict:
+        reasons.append("IP intelligence heuristics crossed threshold")
+
+    _risk_meta = {
+        "indicator_quality_gate": ("Threat Indicator", "High"),
+        "corroborated_multi_signal_hit": ("Corroborated Hit", "High"),
+        "intent_heuristics": ("Recon / Lateral Movement", "Medium"),
+        "boundary_cross_zone_contact": ("Zone Boundary Contact", "Low"),
+    }
+    risk_matrix = [
+        {
+            "category": cat,
+            "risk": risk,
+            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
+            "evidence": f"{len(checks.get(key, []))} signal(s)",
+        }
+        for key, (cat, risk) in _risk_meta.items()
+        if checks.get(key)
+    ]
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons,
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
+        "risk_matrix": risk_matrix,
+    }
 
 def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     summary_list = list(summaries)
@@ -602,204 +756,12 @@ def _classify_ip(ip_text: str) -> list[str]:
     return categories
 
 
-def _shannon_entropy(value: str) -> float:
-    if not value:
-        return 0.0
-    freq = Counter(value)
-    total = len(value)
-    return -sum((count / total) * math.log2(count / total) for count in freq.values())
 
 
-def _is_grease(value: int) -> bool:
-    return (value & 0x0F0F) == 0x0A0A
 
 
-def _coerce_int_list(values: object) -> list[int]:
-    if values is None:
-        return []
-    if isinstance(values, (list, tuple, set)):
-        out = []
-        for item in values:
-            try:
-                out.append(int(item))
-            except Exception:
-                continue
-        return out
-    try:
-        return [int(values)]
-    except Exception:
-        return []
 
-
-def _iter_tls_extensions(client_hello) -> list[object]:
-    exts = getattr(client_hello, "ext", None)
-    if exts is None:
-        exts = getattr(client_hello, "extensions", None)
-    if exts is None:
-        return []
-    try:
-        return list(exts)
-    except Exception:
-        return []
-
-
-def _tls_extension_type(ext: object) -> Optional[int]:
-    for attr in ("type", "ext_type", "etype", "extension_type"):
-        value = getattr(ext, attr, None)
-        if value is not None:
-            try:
-                return int(value)
-            except Exception:
-                continue
-    return None
-
-
-def _extract_sni(ext: object) -> Optional[str]:
-    name = ext.__class__.__name__
-    if "ServerName" not in name and "SNI" not in name:
-        return None
-    for attr in ("servernames", "server_names", "server_name", "names"):
-        names = getattr(ext, attr, None)
-        if names:
-            try:
-                if isinstance(names, (list, tuple)):
-                    first = names[0]
-                else:
-                    first = names
-                candidate = (
-                    getattr(first, "servername", None)
-                    or getattr(first, "name", None)
-                    or first
-                )
-                if isinstance(candidate, bytes):
-                    return candidate.decode("utf-8", errors="ignore").strip(".")
-                return str(candidate).strip(".")
-            except Exception:
-                return None
-    return None
-
-
-def _extract_alpn(ext: object) -> list[str]:
-    name = ext.__class__.__name__
-    if "ALPN" not in name and "ApplicationLayerProtocol" not in name:
-        return []
-    for attr in ("protocols", "alpn_protocols"):
-        protocols = getattr(ext, attr, None)
-        if protocols:
-            out: list[str] = []
-            for proto in protocols:
-                if isinstance(proto, bytes):
-                    out.append(proto.decode("utf-8", errors="ignore"))
-                else:
-                    out.append(str(proto))
-            return out
-    return []
-
-
-def _ja3_from_client_hello(client_hello) -> Optional[str]:
-    version = getattr(client_hello, "version", None)
-    if version is None:
-        return None
-    try:
-        version_val = int(version)
-    except Exception:
-        return None
-
-    ciphers = []
-    for attr in ("ciphers", "cipher_suites", "ciphersuites"):
-        ciphers = _coerce_int_list(getattr(client_hello, attr, None))
-        if ciphers:
-            break
-    ciphers = [c for c in ciphers if not _is_grease(c)]
-
-    exts = _iter_tls_extensions(client_hello)
-    ext_types = []
-    curves = []
-    ec_points = []
-    for ext in exts:
-        ext_type = _tls_extension_type(ext)
-        if ext_type is not None and not _is_grease(ext_type):
-            ext_types.append(ext_type)
-
-        for attr in ("groups", "supported_groups", "elliptic_curves"):
-            groups = _coerce_int_list(getattr(ext, attr, None))
-            if groups:
-                curves.extend(groups)
-                break
-
-        for attr in ("ecpl", "ec_point_formats", "formats", "ec_points"):
-            points = _coerce_int_list(getattr(ext, attr, None))
-            if points:
-                ec_points.extend(points)
-                break
-
-    curves = [c for c in curves if not _is_grease(c)]
-    ec_points = [p for p in ec_points if not _is_grease(p)]
-
-    def _join(values: list[int]) -> str:
-        return "-".join(str(v) for v in values)
-
-    ja3_str = f"{version_val},{_join(ciphers)},{_join(ext_types)},{_join(curves)},{_join(ec_points)}"
-    return ja3_str
-
-
-def _ja4_from_client_hello(
-    client_hello, sni: Optional[str], alpn: list[str]
-) -> Optional[str]:
-    version = getattr(client_hello, "version", None)
-    if version is None:
-        return None
-    try:
-        version_val = int(version)
-    except Exception:
-        return None
-
-    ciphers = []
-    for attr in ("ciphers", "cipher_suites", "ciphersuites"):
-        ciphers = _coerce_int_list(getattr(client_hello, attr, None))
-        if ciphers:
-            break
-    ciphers = [c for c in ciphers if not _is_grease(c)]
-    first_cipher = str(ciphers[0]) if ciphers else "0"
-
-    ext_types = []
-    for ext in _iter_tls_extensions(client_hello):
-        ext_type = _tls_extension_type(ext)
-        if ext_type is not None and not _is_grease(ext_type):
-            ext_types.append(ext_type)
-    ext_str = "-".join(str(v) for v in ext_types)
-    ext_hash = hashlib.sha256(ext_str.encode("utf-8", errors="ignore")).hexdigest()[:8]
-
-    alpn_token = alpn[0] if alpn else "na"
-    sni_flag = "s" if sni else "n"
-    return f"t{version_val}{sni_flag}-{alpn_token}-{first_cipher}-{ext_hash}"
-
-
-def _ja4s_from_server_hello(server_hello) -> Optional[str]:
-    version = getattr(server_hello, "version", None)
-    if version is None:
-        return None
-    try:
-        version_val = int(version)
-    except Exception:
-        return None
-
-    cipher = getattr(server_hello, "cipher", None)
-    try:
-        cipher_val = int(cipher) if cipher is not None else 0
-    except Exception:
-        cipher_val = 0
-
-    ext_types = []
-    for ext in _iter_tls_extensions(server_hello):
-        ext_type = _tls_extension_type(ext)
-        if ext_type is not None and not _is_grease(ext_type):
-            ext_types.append(ext_type)
-    ext_str = "-".join(str(v) for v in ext_types)
-    ext_hash = hashlib.sha256(ext_str.encode("utf-8", errors="ignore")).hexdigest()[:8]
-    return f"s{version_val}-{cipher_val}-{ext_hash}"
-
-
+# JA3/JA4/JA4S construction lives in tls_fingerprints (shared with tls.py).
 def _load_reputation_list(path_value: Optional[str]) -> dict[str, str]:
     if not path_value:
         return {}
@@ -902,14 +864,6 @@ def _tls_cert_risks_from_payload(cert_payload: object) -> list[dict[str, object]
             pass
 
     return risks
-
-
-def _is_public_ip(ip_text: str) -> bool:
-    try:
-        addr = ipaddress.ip_address(ip_text)
-        return addr.is_global
-    except ValueError:
-        return False
 
 
 def _load_geoip_readers() -> tuple[object | None, object | None, list[str]]:
@@ -1064,6 +1018,7 @@ def _infer_protocol(pkt) -> str:
     return "OTHER"
 
 
+@memoize_analysis
 def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
     errors: list[str] = []
     if IP is None and IPv6 is None and ARP is None:
@@ -1228,10 +1183,23 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 _record_mac(dst_ip, str(getattr(eth_layer, "dst", "")))
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
-            protocol = _infer_protocol(pkt)
+            # Dissect TCP/UDP once per packet; reused for protocol inference,
+            # conversation tracking, and the per-endpoint loop below.
+            tcp_layer = pkt.getlayer(TCP) if TCP is not None else None  # type: ignore[arg-type]
+            udp_layer = (
+                pkt.getlayer(UDP)  # type: ignore[arg-type]
+                if UDP is not None and tcp_layer is None
+                else None
+            )
+            if tcp_layer is not None:
+                protocol = "TCP"
+            elif udp_layer is not None:
+                protocol = "UDP"
+            else:
+                protocol = _infer_protocol(pkt)
             counter_inc(protocol_counts, protocol)
 
             set_add_cap(unique_ips, src_ip, max_size=MAX_UNIQUE_IPS)
@@ -1273,8 +1241,7 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 if conv["last_seen"] is None or ts > conv["last_seen"]:  # type: ignore[operator]
                     conv["last_seen"] = ts
 
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                tcp_layer = pkt[TCP]  # type: ignore[index]
+            if tcp_layer is not None:
                 sport = getattr(tcp_layer, "sport", None)
                 dport = getattr(tcp_layer, "dport", None)
                 flags = getattr(tcp_layer, "flags", 0)
@@ -1307,8 +1274,7 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                         dst_to_ports, dst_ip, int(dport), max_values=MAX_SET_VALUES
                     )
                     setdict_add(dst_to_srcs, dst_ip, src_ip, max_values=MAX_SET_VALUES)
-            elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                udp_layer = pkt[UDP]  # type: ignore[index]
+            elif udp_layer is not None:
                 sport = getattr(udp_layer, "sport", None)
                 dport = getattr(udp_layer, "dport", None)
                 if conv is not None and sport is not None:
@@ -1341,15 +1307,13 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 peer = dst_ip if ip_text == src_ip else src_ip
                 set_add_cap(entry["peers"], peer, max_size=MAX_SET_VALUES)
 
-                if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                    tcp_layer = pkt[TCP]  # type: ignore[index]
+                if tcp_layer is not None:
                     port = getattr(
                         tcp_layer, "sport" if ip_text == src_ip else "dport", None
                     )
                     if port is not None:
                         set_add_cap(entry["ports"], int(port), max_size=MAX_SET_VALUES)
-                elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                    udp_layer = pkt[UDP]  # type: ignore[index]
+                elif udp_layer is not None:
                     port = getattr(
                         udp_layer, "sport" if ip_text == src_ip else "dport", None
                     )
@@ -1391,7 +1355,11 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
 
             if TLSServerHello is not None and pkt.haslayer(TLSServerHello):  # type: ignore[truthy-bool]
                 server_hello = pkt[TLSServerHello]  # type: ignore[index]
-                ja4s = _ja4s_from_server_hello(server_hello)
+                server_alpn: list[str] = []
+                for ext in _iter_tls_extensions(server_hello):
+                    if not server_alpn:
+                        server_alpn = _extract_alpn(ext)
+                ja4s = _ja4s_from_server_hello(server_hello, server_alpn)
                 if ja4s:
                     ja4s_counts[ja4s] += 1
 
@@ -1461,11 +1429,47 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
             )
         )
 
+    def _is_scan_target(addr: str) -> bool:
+        # A real scan/sweep targets unicast hosts. Broadcast/multicast/link-local
+        # destinations are service-discovery chatter (mDNS/SSDP/NAT-PMP), not
+        # scan targets, and must not count toward the destination breadth.
+        try:
+            ip = ipaddress.ip_address(addr)
+        except Exception:
+            return False
+        if ip.is_multicast or ip.is_link_local or ip.is_loopback or ip.is_unspecified:
+            return False
+        if str(addr).endswith(".255") or str(addr).endswith(".0"):
+            return False
+        return True
+
+    def _dst_is_internal(addr: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(addr)
+            return ip.is_private and not (
+                ip.is_link_local or ip.is_multicast or ip.is_loopback
+            )
+        except Exception:
+            return False
+
     suspicious_port_profiles: list[dict[str, object]] = []
     for src_ip, ports in src_to_ports.items():
         unique_ports = len(ports)
-        unique_dsts = len(src_to_dsts.get(src_ip, set()))
+        dsts = {d for d in src_to_dsts.get(src_ip, set()) if _is_scan_target(str(d))}
+        unique_dsts = len(dsts)
         high_ports = sum(1 for p in ports if p >= 1024)
+        # Distinguish internal-network reconnaissance from ordinary outbound
+        # client egress: a host connecting to many PUBLIC hosts on high ports
+        # (P2P, CDN, app traffic) is not scanning. Flag only when destinations
+        # are substantially internal, or it is a vertical scan (many ports per
+        # host = port enumeration), which is suspicious against any target.
+        internal_dsts = sum(1 for d in dsts if _dst_is_internal(str(d)))
+        internal_frac = internal_dsts / max(unique_dsts, 1)
+        ports_per_dst = unique_ports / max(unique_dsts, 1)
+        is_internal_recon = internal_frac >= 0.5
+        is_vertical_scan = ports_per_dst >= 10
+        if not (is_internal_recon or is_vertical_scan):
+            continue
         if unique_ports >= 100 and unique_dsts >= 10:
             suspicious_port_profiles.append(
                 {
@@ -1491,22 +1495,61 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 }
             )
 
+    # Lateral movement is INTERNAL host-to-host spread. Scoring on ALL peers
+    # (the old behavior) made any workstation browsing many public HTTPS sites
+    # look like lateral movement; only private<->private reach counts, gated on
+    # contacting several distinct internal hosts.
+    def _is_real_internal_host(addr: str, self_ip: str) -> bool:
+        # A genuine lateral-movement target: an RFC1918 unicast host that is not
+        # the endpoint itself, the broadcast/network address, link-local
+        # (169.254), loopback, multicast, or the unspecified address. Counting
+        # those inflated the score with gateways/broadcast/self and produced
+        # false lateral-movement verdicts on ordinary hosts.
+        if addr == self_ip:
+            return False
+        try:
+            ip = ipaddress.ip_address(addr)
+        except Exception:
+            return False
+        if not ip.is_private:
+            return False
+        if (
+            ip.is_link_local
+            or ip.is_loopback
+            or ip.is_multicast
+            or ip.is_unspecified
+            or ip.is_reserved
+        ):
+            return False
+        if str(addr).endswith(".255") or str(addr).endswith(".0"):
+            return False
+        return True
+
     lateral_movement_scores: list[dict[str, object]] = []
     for endpoint in endpoint_rows:
-        if not _is_public_ip(endpoint.ip):
-            unique_peers = len(endpoint.peers)
-            unique_ports = len(endpoint.ports)
-            score = (
-                (unique_peers / 25.0)
-                + (unique_ports / 50.0)
-                + (endpoint.packets_sent / 5000.0)
-            )
-            if score >= 3.0:
+        # The actor must itself be a real internal unicast host that actually
+        # initiated traffic — broadcast/multicast addresses and passive
+        # receive-only endpoints (packets_sent == 0, e.g. a host that merely
+        # received LAN broadcasts from many sources) are not lateral movers.
+        if not _is_real_internal_host(endpoint.ip, ""):
+            continue
+        if endpoint.packets_sent <= 0:
+            continue
+        internal_peers = sum(
+            1 for p in endpoint.peers if _is_real_internal_host(p, endpoint.ip)
+        )
+        unique_ports = len(endpoint.ports)
+        # Lateral movement is BREADTH of internal reach, not packet volume: a
+        # chatty node (OT cyclic polling, a busy server) sends huge volumes to a
+        # few peers and must not score. Require contact with many distinct
+        # internal hosts; small (<10-host) spread is left to --tcp/--smb/--threats.
+        score = (internal_peers / 10.0) + (unique_ports / 50.0)
+        if internal_peers >= 10:
                 lateral_movement_scores.append(
                     {
                         "ip": endpoint.ip,
                         "score": round(score, 2),
-                        "peers": unique_peers,
+                        "peers": internal_peers,
                         "ports": unique_ports,
                         "packets_sent": endpoint.packets_sent,
                     }
@@ -1767,12 +1810,14 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                     }
                 )
 
-        if duration_seconds and duration_seconds > 0:
+        # Sustained high rate only — guard against a few packets in a sub-second
+        # capture producing a meaningless pkt/s via a near-zero duration.
+        if duration_seconds and duration_seconds >= 1.0:
             top_src = src_counts.most_common(1)
             if top_src:
                 src_ip, src_count = top_src[0]
                 src_rate = src_count / duration_seconds
-                if src_rate > 5000:
+                if src_rate > 5000 and src_count >= 1000:
                     detections.append(
                         {
                             "severity": "warning",

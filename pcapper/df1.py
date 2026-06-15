@@ -4,7 +4,7 @@ import ipaddress
 import re
 from pathlib import Path
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
+from .industrial_helpers import append_public_exposure_anomaly, IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
 
 DF1_DLE_STX = b"\x10\x02"
 DF1_DLE_ETX = b"\x10\x03"
@@ -32,13 +32,12 @@ _LIKELY_ENCRYPTED_PORTS = {
 _SESSION_PORT_RE = re.compile(r"^.+:(\d+)\s*->\s*.+:(\d+)$")
 
 
-def _is_df1_control_payload(payload: bytes) -> bool:
-    return payload in {DF1_DLE_ACK, DF1_DLE_NAK}
-
-
 def _match_signature(payload: bytes) -> bool:
-    if _is_df1_control_payload(payload):
-        return True
+    # A lone DLE-ACK/DLE-NAK (\x10\x06 / \x10\x15) is NOT used as a signature:
+    # those 2-byte sequences occur constantly in arbitrary TCP/binary streams
+    # and were the dominant DF1 false positive on non-DF1 (IT) captures. DF1 is
+    # only confirmed by a well-formed command frame; control bytes are still
+    # counted as commands once a flow is confirmed (see _parse_commands).
     for frame in _extract_df1_frames(payload):
         if _parse_df1_frame(frame) is not None:
             return True
@@ -71,11 +70,19 @@ def _extract_df1_frames(payload: bytes) -> list[bytes]:
 
 
 def _parse_df1_frame(frame: bytes) -> tuple[str, bool] | None:
-    if len(frame) < 4:
+    # DF1 full-duplex message (de-stuffed, between DLE STX and DLE ETX):
+    # DST, SRC, CMD, STS, TNS_lo, TNS_hi, [data...]. A real command request is
+    # therefore >= 6 bytes and carries STS == 0x00 (status is only non-zero on
+    # replies, whose CMD has bit 0x40 set and is not in DF1_COMMANDS). Requiring
+    # both makes the signature ~256x less likely to fire on random binary that
+    # merely contains DLE STX .. DLE ETX with a command-valued third byte.
+    if len(frame) < 6:
         return None
     cmd = frame[2]
     name = DF1_COMMANDS.get(cmd)
     if not name:
+        return None
+    if frame[3] != 0x00:
         return None
     write = cmd in DF1_WRITE_COMMANDS
     return f"DF1 {name}", write
@@ -196,22 +203,5 @@ def analyze_df1(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         analysis.anomalies = []
         return analysis
 
-    public_endpoints = []
-    for ip_value in set(analysis.src_ips) | set(analysis.dst_ips):
-        try:
-            if ipaddress.ip_address(ip_value).is_global:
-                public_endpoints.append(ip_value)
-        except Exception:
-            continue
-    if public_endpoints and len(analysis.anomalies) < 200:
-        analysis.anomalies.append(
-            IndustrialAnomaly(
-                severity="HIGH",
-                title="DF1 Exposure to Public IP",
-                description=f"DF1 traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-                src="*",
-                dst="*",
-                ts=0.0,
-            )
-        )
+    append_public_exposure_anomaly(analysis, "DF1")
     return analysis

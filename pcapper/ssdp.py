@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_public_ip as _is_public_ip
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -67,21 +67,6 @@ class SsdpSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        ip_obj = ipaddress.ip_address(value)
-    except Exception:
-        return False
-    return bool(
-        not ip_obj.is_private
-        and not ip_obj.is_loopback
-        and not ip_obj.is_link_local
-        and not ip_obj.is_multicast
-        and not ip_obj.is_reserved
-        and not ip_obj.is_unspecified
-    )
 
 
 def _normalize_header_value(value: str) -> str:
@@ -321,7 +306,10 @@ def analyze_ssdp(
             if sport != SSDP_PORT and dport != SSDP_PORT:
                 nonstandard_port_messages += 1
 
-            if _is_public_ip(src_ip) or _is_public_ip(dst_ip):
+            # Require BOTH ends public to count as internet-traversing SSDP. A
+            # single public endpoint is usually a local box with a public WAN
+            # address (router/CPE) — one such packet should not raise HIGH.
+            if _is_public_ip(src_ip) and _is_public_ip(dst_ip):
                 public_messages += 1
                 public_peers[src_ip] += 1
                 public_peers[dst_ip] += 1

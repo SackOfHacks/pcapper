@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +42,12 @@ ROUTING_IP_PROTOS = {
     2: "IGMP",
     124: "IS-IS",
 }
+
+# Interior gateway / first-hop-redundancy protocols whose presence on a public
+# IP is a genuine exposure finding (OSPF, EIGRP, IGRP, PIM, VRRP/CARP). eBGP and
+# IGMP are deliberately excluded: eBGP over public IPs is normal peering, and
+# IGMP is multicast group management rather than inter-host routing.
+_ROUTING_IGP_PROTOS = {9, 88, 89, 103, 112}
 
 OSPF_TYPES = {
     1: "Hello",
@@ -939,6 +946,7 @@ def _parse_hsrp(payload: bytes) -> dict[str, object]:
     }
 
 
+@lru_cache(maxsize=100000)
 def _public_ip(ip_text: str) -> bool:
     try:
         return ipaddress.ip_address(ip_text).is_global
@@ -999,6 +1007,7 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
 
     total_packets = 0
     routing_packets = 0
+    seen_ospf_noauth: set[str] = set()
     protocol_counts: Counter[str] = Counter()
     message_counts: Counter[str] = Counter()
     endpoint_counts: Counter[str] = Counter()
@@ -1103,12 +1112,14 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             proto_val = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
+            ip_layer = pkt.getlayer(IP) if IP is not None else None  # type: ignore[arg-type]
+            ip6_layer = None
+            if ip_layer is not None:
                 proto_val = int(getattr(ip_layer, "proto", 0) or 0)
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                proto_val = int(getattr(ip_layer, "nh", 0) or 0)
+            else:
+                ip6_layer = pkt.getlayer(IPv6) if IPv6 is not None else None  # type: ignore[arg-type]
+                if ip6_layer is not None:
+                    proto_val = int(getattr(ip6_layer, "nh", 0) or 0)
             src_label = src_ip
             dst_label = dst_ip
             if (
@@ -1123,10 +1134,17 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
             if not src_label or not dst_label:
                 continue
 
-            if src_ip and _public_ip(src_ip):
-                public_endpoints.add(src_ip)
-            if dst_ip and _public_ip(dst_ip):
-                public_endpoints.add(dst_ip)
+            # Only an interior gateway protocol (OSPF 89, PIM 103, EIGRP 88,
+            # VRRP/CARP 112, IGRP 9) traversing a public IP is a meaningful
+            # exposure finding. Collecting public endpoints from *every* packet
+            # (the previous behaviour) meant any IT capture's ordinary internet
+            # hosts triggered "routing traffic with public IPs"; eBGP peering
+            # legitimately uses public IPs so it is intentionally excluded here.
+            if proto_val in _ROUTING_IGP_PROTOS:
+                if src_ip and _public_ip(src_ip):
+                    public_endpoints.add(src_ip)
+                if dst_ip and _public_ip(dst_ip):
+                    public_endpoints.add(dst_ip)
 
             # ICMP redirect detection
             if ICMP is not None and pkt.haslayer(ICMP):  # type: ignore[truthy-bool]
@@ -1155,13 +1173,21 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                 endpoint_counts[dst_label] += 1
                 payload = b""
                 try:
-                    if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                        payload = bytes(pkt[IP].payload)  # type: ignore[index]
-                    elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                        payload = bytes(pkt[IPv6].payload)  # type: ignore[index]
+                    if ip_layer is not None:
+                        payload = bytes(ip_layer.payload)
+                    elif ip6_layer is not None:
+                        payload = bytes(ip6_layer.payload)
                 except Exception:
                     payload = b""
 
+                # OSPF-specific fields consumed below are only assigned inside the
+                # OSPF branch but referenced at this (16-space) level, so a
+                # non-OSPF routing packet (e.g. PIM/EIGRP in the same capture)
+                # raised UnboundLocalError. Bind them per packet up front.
+                area_id = None
+                auth_type = None
+                auth_data = b""
+                lsa_count = None
                 if proto_name == "OSPF":
                     info = _parse_ospf(payload)
                     msg_type = info.get("type")
@@ -1247,16 +1273,23 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                             "ospf_router_id", f"{router_id}", src_label, dst_label
                         )
                     )
-                if area_id:
-                    artifacts.append(
-                        RoutingArtifact("ospf_area", f"{area_id}", src_label, dst_label)
-                    )
-                if lsa_count is not None:
-                    artifacts.append(
-                        RoutingArtifact(
-                            "ospf_lsa_count", f"{lsa_count}", src_label, dst_label
+                    # NB: these were previously DEDENTED to col-16 (outside the
+                    # OSPF branch) which (a) gated the auth/no-auth handling under
+                    # `if lsa_count is not None` so it only fired on LSUpd, never
+                    # on the common OSPF Hello, and (b) made the `elif EIGRP`
+                    # below pair with `if lsa_count` instead of this OSPF branch.
+                    if area_id:
+                        artifacts.append(
+                            RoutingArtifact(
+                                "ospf_area", f"{area_id}", src_label, dst_label
+                            )
                         )
-                    )
+                    if lsa_count is not None:
+                        artifacts.append(
+                            RoutingArtifact(
+                                "ospf_lsa_count", f"{lsa_count}", src_label, dst_label
+                            )
+                        )
                     if auth_type is not None:
                         auth_label = {0: "None", 1: "Simple", 2: "Cryptographic"}.get(
                             auth_type, f"Type {auth_type}"
@@ -1275,13 +1308,18 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                                 )
                             )
                         elif auth_type == 0:
-                            detections.append(
-                                {
-                                    "severity": "warning",
-                                    "summary": "OSPF without authentication",
-                                    "details": f"{src_label} -> {dst_label} area {area_id or '-'}",
-                                }
-                            )
+                            # Dedup per src->dst: OSPF Hellos repeat every ~10 s,
+                            # so one finding per adjacency, not one per packet.
+                            noauth_key = f"{src_label}->{dst_label}"
+                            if noauth_key not in seen_ospf_noauth:
+                                seen_ospf_noauth.add(noauth_key)
+                                detections.append(
+                                    {
+                                        "severity": "warning",
+                                        "summary": "OSPF without authentication",
+                                        "details": f"{src_label} -> {dst_label} area {area_id or '-'}",
+                                    }
+                                )
                     _update_session("OSPF", src_label, dst_label, 0, 0, ts, msg_name)
 
                 elif proto_name == "EIGRP":
@@ -1516,7 +1554,21 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                         isis_payload = bytes(llc.payload)
                     except Exception:
                         isis_payload = None
-            if isis_payload is None and Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
+            # IS-IS is a layer-2 CLNS protocol — it never rides over IP/TCP/UDP.
+            # Only treat a raw 0x83-led payload as IS-IS on a NON-IP frame;
+            # otherwise a TCP segment that merely starts with 0x83 (common in
+            # TLS/binary/HTTP bodies) false-matched as IS-IS and produced bogus
+            # "IS-IS without authentication" / routing-exposure findings on IT
+            # captures.
+            is_ip_packet = (IP is not None and pkt.haslayer(IP)) or (  # type: ignore[truthy-bool]
+                IPv6 is not None and pkt.haslayer(IPv6)  # type: ignore[truthy-bool]
+            )
+            if (
+                isis_payload is None
+                and not is_ip_packet
+                and Raw is not None
+                and pkt.haslayer(Raw)  # type: ignore[truthy-bool]
+            ):
                 try:
                     raw_payload = bytes(pkt[Raw])  # type: ignore[index]
                     if raw_payload and raw_payload[0] == 0x83:
@@ -1865,7 +1917,11 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
             insights.append(
                 f"Routing-control traffic is {ratio:.1%} of total packets (control-plane heavy capture)."
             )
-    if public_endpoints:
+    # Only meaningful when routing-protocol traffic was actually identified —
+    # otherwise the public endpoints are just ordinary internet hosts (the
+    # public-endpoint set is populated for every packet, so without this gate
+    # any IT/malware capture with public IPs falsely raised this finding).
+    if public_endpoints and routing_packets:
         detections.append(
             {
                 "severity": "high",

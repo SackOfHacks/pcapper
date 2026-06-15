@@ -14,7 +14,8 @@ from .netbios import analyze_netbios
 from .ntlm import analyze_ntlm
 from .pcap_cache import PcapMeta, get_reader
 from .progress import run_with_busy_status
-from .utils import safe_float, extract_packet_endpoints
+from .utils import safe_float, extract_packet_endpoints, extract_ascii_strings as _extract_ascii_strings
+from .utils import extract_utf16le_strings as _extract_utf16le_strings
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -201,48 +202,6 @@ def _base_domain(name: str) -> str:
     if len(parts) >= 2:
         return ".".join(parts[-2:])
     return name
-
-
-def _extract_ascii_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> List[str]:
-    results: List[str] = []
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
-def _extract_utf16le_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> List[str]:
-    results: List[str] = []
-    current = bytearray()
-    i = 0
-    while i + 1 < len(data):
-        ch = data[i]
-        if 32 <= ch <= 126 and data[i + 1] == 0x00:
-            current.append(ch)
-            i += 2
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-            i += 2
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
 
 
 def _extract_kerberos_message_types(payload: bytes) -> List[str]:

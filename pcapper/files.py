@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+
+from .utils import is_public_ip as _is_public_ip
 import base64
 import email
 import hashlib
-import ipaddress
 import os
 import re
 import socket
@@ -34,7 +35,7 @@ from .aim import analyze_aim
 from .cip import CIP_SERVICE_NAMES
 from .nfs import analyze_nfs
 from .pcap_cache import get_reader
-from .utils import detect_file_type_bytes, extract_packet_endpoints, safe_float
+from .utils import detect_file_type_bytes, extract_packet_endpoints, memoize_analysis, packet_length, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
@@ -1071,19 +1072,32 @@ def _flow_protocol(sport: Optional[int], dport: Optional[int]) -> str:
     return "UNKNOWN"
 
 
+_EXECUTABLE_FILE_TYPES = {"EXE/DLL", "ELF"}
+_EXECUTABLE_EXTS = {
+    ".exe", ".dll", ".sys", ".scr", ".cpl", ".ocx", ".com",
+    ".elf", ".so", ".bin", ".o", ".out", ".axf",
+}
+
+
 def _extension_mismatch(
     filename: str, file_type: str
 ) -> Optional[tuple[str, set[str]]]:
     if not filename or not file_type:
         return None
-    expected = FILE_TYPE_EXTENSIONS.get(file_type.upper())
-    if not expected:
+    ftype = file_type.upper()
+    # Only *executable* content wearing a non-executable extension is a real
+    # masquerade (e.g. an EXE delivered as image.gif). Benign image<->image
+    # mismatches (a .gif that is really a PNG) and Office documents (ZIP by
+    # magic) differing from their extension are not security findings and were
+    # flagged HIGH on normal web traffic.
+    if ftype not in _EXECUTABLE_FILE_TYPES:
         return None
     ext = Path(filename).suffix.lower()
     if not ext:
         return None
-    if ext in expected:
-        return None
+    if ext in _EXECUTABLE_EXTS:
+        return None  # correctly-named executable
+    expected = FILE_TYPE_EXTENSIONS.get(ftype) or _EXECUTABLE_EXTS
     return ext, expected
 
 
@@ -1772,31 +1786,6 @@ def _parse_http_stream(stream: bytes) -> List[Dict[str, Any]]:
     return messages
 
 
-def _parse_smb2(stream: bytes) -> Tuple[Dict[bytes, str], Dict[bytes, bytes]]:
-    # Partial SMB2 parser for file constructs
-    file_map = {}  # GUID/Handle -> Name
-    file_data = defaultdict(bytearray)
-
-    offset = 0
-    while offset + 64 < len(stream):
-        if stream[offset : offset + 4] == b"\xfeSMB":
-            # Header
-            try:
-                int.from_bytes(stream[offset + 12 : offset + 14], "little")
-                # flags = int.from_bytes(stream[offset+16:offset+20], "little")
-                # Structure size = 64
-                pass
-            except (TypeError, ValueError, IndexError):
-                pass
-
-        # Brute force scan for \xfeSMB since alignment varies
-        next_sig = stream.find(b"\xfeSMB", offset + 1)
-
-        offset = next_sig if next_sig != -1 else len(stream)
-
-    return file_map, file_data
-
-
 def _scan_filenames(data: bytes) -> List[str]:
     # Extract likely filenames from binary blob
     found = set()
@@ -2160,22 +2149,6 @@ def _append_extension_if_missing(
     return f"{name}.{ext}"
 
 
-def _imf_filename_from_headers(part: email.message.Message) -> Optional[str]:
-    if part.get_filename():
-        return part.get_filename()
-    name = part.get_param("name", header="content-type")
-    if name:
-        return name
-    cd = part.get("Content-Disposition", "") or ""
-    match = re.search(r'filename\*?=["\']?([^"\';]+)', cd, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    cid = part.get("Content-ID")
-    if cid:
-        return cid.strip("<>")
-    return None
-
-
 def _parse_smb2_create_filename(record: bytes) -> Optional[str]:
     if len(record) < 120:
         return None
@@ -2404,7 +2377,7 @@ class FileExtractor:
             key = (src, dst, proto, sport, dport)
             f = self.flows[key]
             f["packets"] += 1
-            f["bytes"] += len(pkt)
+            f["bytes"] += packet_length(pkt)
             if f["first_seen"] is None or ts < f["first_seen"]:
                 f["first_seen"] = ts
             if f["last_seen"] is None or ts > f["last_seen"]:
@@ -2667,9 +2640,13 @@ class FileExtractor:
             if self.smb_versions.get("SMB1"):
                 self.detections.append(
                     {
-                        "severity": "critical",
+                        # HIGH, not CRITICAL: SMBv1 *presence* is a serious legacy
+                        # exposure (EternalBlue/WannaCry-class) but common in
+                        # OT/legacy environments; CRITICAL is reserved for active
+                        # exploitation. Matches the --smb analyzer's severity.
+                        "severity": "high",
                         "summary": "SMBv1 detected",
-                        "details": "Legacy SMBv1 traffic observed; susceptible to known exploits.",
+                        "details": "Legacy SMBv1 traffic observed; susceptible to known exploits (EternalBlue/WannaCry-class); common in OT/legacy environments.",
                         "source": "Files",
                         "top_sources": self.smb1_sources.most_common(5),
                         "top_destinations": self.smb1_destinations.most_common(5),
@@ -3351,7 +3328,14 @@ def _export_with_dpkt(
     hashes: List[Dict[str, str]] = []
     detections: List[Dict[str, str]] = []
     errors: List[str] = []
-    need_payload = bool(extract_name or view_name or hash_name)
+    # File hashes (MD5/SHA-256) are the single most valuable forensic artifact —
+    # they enable VirusTotal / threat-intel correlation and known-bad matching —
+    # so the carved bytes are always retained long enough to hash by default,
+    # not only when --extract/--view/--hash is requested. The payload is then
+    # released (below, in _add_artifact) unless the user actually needs it, so
+    # default triage gains hashes without holding every file in memory.
+    need_payload = True
+    retain_payload = bool(extract_name or view_name or hash_name)
     seen_x509: set[str] = set()
     seen_x509_meta: set[tuple[str, str, str, int]] = set()
     enip_buffers: Dict[tuple[str, str, int, int, str, str], Dict[str, object]] = {}
@@ -3365,6 +3349,11 @@ def _export_with_dpkt(
     s7_transfer_events: List[Dict[str, Any]] = []
 
     def _add_artifact(artifact: FileArtifact) -> None:
+        # __post_init__ has already computed md5/sha256 from the payload; drop
+        # the raw bytes unless the user requested extract/view/hash so default
+        # runs keep the hashes without retaining every file in memory.
+        if not retain_payload:
+            artifact.payload = None
         artifacts.append(artifact)
 
     tcp_streams: Dict[Tuple[str, str, int, int], List[Tuple[int, bytes, int]]] = (
@@ -4517,19 +4506,15 @@ def _expected_extensions_for_type(file_type: str) -> Optional[set[str]]:
 def _collect_extension_mismatches(
     artifacts: List[FileArtifact],
 ) -> List[Tuple[str, str, str]]:
+    # Single source of truth: reuse _extension_mismatch (executable-masquerade
+    # only) rather than re-implementing the same rule.
     mismatches: List[Tuple[str, str, str]] = []
     for art in artifacts:
         filename = art.filename or ""
         file_type = getattr(art, "file_type", "") or ""
-        if not filename or not file_type:
-            continue
-        expected = _expected_extensions_for_type(file_type)
-        if not expected:
-            continue
-        ext = Path(filename).suffix.lower()
-        if not ext:
-            continue
-        if ext not in expected:
+        result = _extension_mismatch(filename, file_type)
+        if result is not None:
+            ext, _expected = result
             mismatches.append((filename, file_type, ext))
     return mismatches
 
@@ -4542,25 +4527,136 @@ def _collect_lolbas_hits(artifacts: List[FileArtifact]) -> List[FileArtifact]:
     return hits
 
 
-def _is_public_ip(value: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(value)
-        return not (
-            ip.is_private or ip.is_loopback or ip.is_multicast or ip.is_link_local
-        )
-    except Exception:
-        return False
+# File types that are executable code or the high-risk delivery containers
+# malware uses (macro docs, shortcuts, cabinets, archives). Downloading these —
+# especially inbound from a public host — is the dropper/lure signature.
+_DANGEROUS_DOWNLOAD_TYPES = {
+    "EXE/DLL": "Windows executable",
+    "ELF": "Linux executable",
+    "MACHO": "macOS executable",
+    "OLE2/Office": "legacy Office document (macro-malware container)",
+    "LNK": "Windows shortcut (exec lure)",
+    "CAB": "Microsoft Cabinet archive",
+}
+_SCRIPT_FILE_EXTS = {
+    ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta",
+    ".bat", ".cmd", ".sh", ".py", ".jar", ".scr",
+}
 
 
 def _build_files_enrichment(
     artifacts: List[FileArtifact],
     detections: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    _ = (artifacts, detections)
+    """Derive file-forensic threat signals from the reconstructed artifacts.
+
+    Populates the deterministic-check categories that drive the --files verdict
+    and risk matrix, and appends high-signal detections (which also reach the
+    triage layer). Kept deliberately low-FP: web assets are excluded, masquerade
+    reuses the executable-only rule, and the dropper signal requires a genuine
+    executable/lure type arriving inbound from a public host.
+    """
+    checks: Dict[str, List[str]] = defaultdict(list)
+    masquerade_signals: List[Dict[str, Any]] = []
+    seen_dropper: set[str] = set()
+
+    def _inbound_from_public(art: FileArtifact) -> bool:
+        src = str(art.src_ip or "")
+        dst = str(art.dst_ip or "")
+        return bool(src) and _is_public_ip(src) and not _is_public_ip(dst)
+
+    # 1. Executable-masquerade (e.g. a PE delivered as image.gif) — the strongest
+    #    dropper signal and very low FP, so it is HIGH regardless of direction.
+    for filename, file_type, ext in _collect_extension_mismatches(artifacts):
+        evidence = f"{filename} is {file_type} but carries a {ext} extension"
+        checks["multi_signal_masquerade"].append(evidence)
+        masquerade_signals.append(
+            {"filename": filename, "file_type": file_type, "extension": ext}
+        )
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "File masquerade (executable disguised by extension)",
+                "details": (
+                    f"{evidence} — a real executable served under a benign "
+                    "extension is a hallmark of malware delivery."
+                ),
+                "source": "Files",
+            }
+        )
+
+    # 2. Macro/script/shortcut delivery FROM A PUBLIC HOST. Legacy Office (OLE2),
+    #    Windows shortcuts, and script files downloaded from the internet are the
+    #    macro-malware / script-dropper lure pattern (Hancitor/Emotet). Gated on
+    #    inbound-from-public so benign internal document sharing doesn't fire;
+    #    LOLBAS tool names are flagged regardless of direction.
+    for art in artifacts:
+        if _is_likely_web_asset_artifact(art):
+            continue
+        ftype = getattr(art, "file_type", "") or ""
+        name = (art.filename or "").lower()
+        ext = name[name.rfind(".") :] if "." in name else ""
+        reason = None
+        external = _inbound_from_public(art)
+        if ftype in {"OLE2/Office", "LNK"} and external:
+            reason = _DANGEROUS_DOWNLOAD_TYPES.get(ftype, ftype)
+        elif ext in _SCRIPT_FILE_EXTS and external:
+            reason = f"script/executable file ({ext})"
+        elif _is_lolbas_filename(art.filename):
+            reason = "LOLBAS tool name"
+        if not reason:
+            continue
+        checks["macro_script_lolbas_staging"].append(
+            f"{art.filename} ({reason}) {art.src_ip}->{art.dst_ip}"
+        )
+        key = f"macro:{art.filename}:{art.src_ip}->{art.dst_ip}"
+        if key not in seen_dropper:
+            seen_dropper.add(key)
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Macro/script/shortcut file delivered from public host",
+                    "details": (
+                        f"{art.filename} ({reason}) from {art.src_ip} to "
+                        f"{art.dst_ip} over {art.protocol} — macro-doc / script "
+                        "lure delivery pattern."
+                    ),
+                    "source": "Files",
+                }
+            )
+
+    # 3. Plain executables / archives downloaded from a public host are recorded
+    #    at INFO only: they are a real dropper vector but indistinguishable from
+    #    legitimate software/update downloads (Windows KB exes, authrootstl.cab),
+    #    so they belong in the file inventory rather than the triage alarm path.
+    for art in artifacts:
+        ftype = getattr(art, "file_type", "") or ""
+        label = _DANGEROUS_DOWNLOAD_TYPES.get(ftype)
+        if not label or ftype in {"OLE2/Office", "LNK"}:
+            continue
+        if not _inbound_from_public(art):
+            continue
+        key = f"exec:{art.filename}:{art.src_ip}"
+        if key in seen_dropper:
+            continue
+        seen_dropper.add(key)
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "Executable/archive downloaded from public host",
+                "details": (
+                    f"{art.filename} ({label}) from {art.src_ip} to {art.dst_ip} "
+                    f"over {art.protocol}. Confirm against expected software/update "
+                    "sources; correlate the file hash with threat intel."
+                ),
+                "source": "Files",
+            }
+        )
+
     return {
-        "deterministic_checks": {},
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
         "reconstruction_issues": [],
-        "masquerade_signals": [],
+        "masquerade_signals": masquerade_signals,
         "archive_abuse_signals": [],
         "exfil_signals": [],
         "lateral_copy_clusters": [],
@@ -4571,6 +4667,7 @@ def _build_files_enrichment(
         "benign_context": [],
     }
 
+@memoize_analysis
 def analyze_files(
     path: Path,
     extract_name: Optional[str] = None,

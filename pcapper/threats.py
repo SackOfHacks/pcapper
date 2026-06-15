@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+
+from .utils import is_private_ip as _is_private_ip
+from .utils import is_public_ip as _is_public_ip
 import hashlib
-import ipaddress
 import json
 import math
 import os
@@ -13,13 +15,13 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
 from .arp import analyze_arp
 from .bacnet import analyze_bacnet
 from .beacon import analyze_beacons
+from .remote_access import analyze_remote_access
 from .carving import analyze_carving
 from .cip import analyze_cip
 from .coap import analyze_coap
@@ -75,14 +77,26 @@ from .safety import SAFETY_PORTS
 from .smb import analyze_smb
 from .smtp import analyze_smtp
 from .snmp import analyze_snmp
+from .ftp import analyze_ftp
+from .nfs import analyze_nfs
+from .malware import analyze_malware
+from .email import analyze_email
+from .safety import analyze_safety
+from .telnet import analyze_telnet
+from .vnc import analyze_vnc
+from .routing import analyze_routing
 from .srtp import analyze_srtp
+from .synchrophasor import analyze_synchrophasor
+from .bsap import analyze_bsap
+from .genisys import analyze_genisys
+from .iec101_103 import analyze_iec101_103
 from .ssh import analyze_ssh
 from .sv import analyze_sv
 from .syslog import analyze_syslog
 from .tcp import analyze_tcp
 from .tls import analyze_tls
 from .udp import analyze_udp
-from .utils import counter_inc, safe_float, setdict_add, extract_packet_endpoints
+from .utils import counter_inc, extract_packet_endpoints, format_ts, memoize_analysis, packet_length, safe_float, setdict_add, shannon_entropy
 from .vpn import analyze_vpn
 from .winrm import analyze_winrm
 from .wmic import analyze_wmic
@@ -1160,34 +1174,72 @@ def analyze_suricata(
     )
 
 
+_SEVERITY_RANK = {"critical": 4, "high": 3, "warning": 2, "medium": 2, "low": 1, "info": 0}
+
+
 def _append_ot_anomalies(
     detections: list[dict[str, object]],
     source: str,
     anomalies: list[object],
 ) -> None:
-    seen: set[tuple[str, str, str, str]] = set()
+    # Aggregate by finding TYPE (title) rather than emitting one detection per
+    # anomaly. A write-heavy OT capture produces dozens of e.g. "Suspicious CIP
+    # Service" anomalies (one per service/target); surfacing them as dozens of
+    # separate critical/high detections inflates the threat count and floods the
+    # triage view. One detection per type — with the occurrence count and top
+    # sources/destinations — is what an analyst needs; they drill into the
+    # protocol view (--enip/--cip) for the per-event detail.
+    grouped: dict[str, dict[str, object]] = {}
+    order: list[str] = []
     for anomaly in anomalies:
         title = str(getattr(anomaly, "title", "OT Anomaly"))
         description = str(getattr(anomaly, "description", ""))
         src = str(getattr(anomaly, "src", "") or "")
         dst = str(getattr(anomaly, "dst", "") or "")
-        key = (title, description, src, dst)
-        if key in seen:
+        sev = _normalize_severity(getattr(anomaly, "severity", "info"))
+        grp = grouped.get(title)
+        if grp is None:
+            grp = {
+                "severity": sev,
+                "count": 0,
+                "descs": [],
+                "srcs": Counter(),
+                "dsts": Counter(),
+                "seen": set(),
+            }
+            grouped[title] = grp
+            order.append(title)
+        if _SEVERITY_RANK.get(sev, 0) > _SEVERITY_RANK.get(str(grp["severity"]), 0):
+            grp["severity"] = sev
+        ev_key = (description, src, dst)
+        if ev_key in grp["seen"]:  # type: ignore[operator]
             continue
-        seen.add(key)
-        details = description
-        if src or dst:
-            details = f"{description} ({src or '?'} -> {dst or '?'})"
+        grp["seen"].add(ev_key)  # type: ignore[union-attr]
+        grp["count"] = int(grp["count"]) + 1
+        if description and description not in grp["descs"] and len(grp["descs"]) < 5:  # type: ignore[operator]
+            grp["descs"].append(description)  # type: ignore[union-attr]
+        if src:
+            grp["srcs"][src] += 1  # type: ignore[index]
+        if dst:
+            grp["dsts"][dst] += 1  # type: ignore[index]
+    for title in order:
+        grp = grouped[title]
+        count = int(grp["count"])
+        details = "; ".join(grp["descs"][:4])  # type: ignore[index]
+        if count > 1:
+            details = f"{count} occurrences. {details}".strip()
         item: dict[str, object] = {
             "source": source,
-            "severity": _normalize_severity(getattr(anomaly, "severity", "info")),
+            "severity": grp["severity"],
             "summary": title,
-            "details": details,
+            "details": details[:400],
         }
-        if src:
-            item["top_sources"] = [(src, 1)]
-        if dst:
-            item["top_destinations"] = [(dst, 1)]
+        srcs: Counter = grp["srcs"]  # type: ignore[assignment]
+        dsts: Counter = grp["dsts"]  # type: ignore[assignment]
+        if srcs:
+            item["top_sources"] = srcs.most_common(5)
+        if dsts:
+            item["top_destinations"] = dsts.most_common(5)
         detections.append(item)
 
 
@@ -1470,6 +1522,34 @@ def _strict_dnp3_marker(payload: bytes) -> bool:
     return 5 <= frame_len <= 255
 
 
+# Ephemeral/dynamic source-port floor. Linux uses 32768+, Windows 49152+; we
+# take the lower bound so a server response (server_port -> ephemeral) is still
+# recognized as OT while a coincidental ephemeral source port is not.
+_EPHEMERAL_PORT_MIN = 32768
+
+
+def _ot_proto_for_flow(sport: int, dport: int) -> tuple[str, int] | None:
+    """Classify a TCP/UDP flow as OT only when the OT port is the *server* side.
+
+    Port-number matching alone produces false positives: a host's ephemeral
+    source port can collide with an OT port (e.g. a TCP DNS query to
+    ``8.8.8.8:53`` whose ephemeral source port happens to be 44818 would
+    otherwise be reported as "EtherNet/IP -> 8.8.8.8"). The OT service is the
+    listener, so a flow is OT when the OT port is the destination (client ->
+    server), or the source with an ephemeral destination (server -> client
+    response). An OT port appearing as the source while the destination is a
+    well-known/registered port (the real server) is an ephemeral collision and
+    is not OT.
+
+    Returns ``(proto_name, ot_port)`` or ``None``.
+    """
+    if dport in OT_PORTS:
+        return OT_PORTS[dport], dport
+    if sport in OT_PORTS and dport >= _EPHEMERAL_PORT_MIN:
+        return OT_PORTS[sport], sport
+    return None
+
+
 AUTH_PORTS: dict[int, str] = {
     21: "FTP",
     22: "SSH",
@@ -1514,27 +1594,59 @@ FAILED_AUTH_PATTERNS = [
     "authorization failed",
 ]
 
-SUSPICIOUS_PAYLOAD_MARKERS = [
-    "powershell",
-    "cmd.exe",
-    "/bin/sh",
-    "mimikatz",
-    "whoami",
-    "net user",
-    "certutil",
-    "wget ",
-    "curl ",
-    "nc ",
-    "rundll32",
-    "regsvr32",
-    "mshta",
-    "bitsadmin",
-    "wmic",
-    "schtasks",
-    "msiexec",
-    "cscript",
-    "wscript",
-]
+# Markers must be specific enough not to fire on ordinary text. Short generic
+# tokens (notably "nc " — which matches "Inc ", "func ", "sync ") were removed
+# because they matched constantly in benign payloads; netcat is now matched via
+# its unambiguous reverse-shell forms below. Each marker maps to the ATT&CK
+# tactic it most strongly implies, used to tag the resulting detection.
+SUSPICIOUS_PAYLOAD_MARKERS_TACTICS: dict[str, str] = {
+    # Execution / command interpreters (TA0002)
+    "powershell -": "Execution",
+    "powershell.exe": "Execution",
+    "cmd.exe /c": "Execution",
+    "cmd /c ": "Execution",
+    "/bin/sh -": "Execution",
+    "/bin/bash -": "Execution",
+    "cscript ": "Execution",
+    "wscript ": "Execution",
+    "mshta ": "Execution",
+    "wmic ": "Execution",
+    # Defense evasion / encoded & proxy execution (TA0005)
+    "-encodedcommand": "Defense Evasion",
+    "-enc ": "Defense Evasion",
+    "frombase64string": "Defense Evasion",
+    "iex(": "Defense Evasion",
+    "invoke-expression": "Defense Evasion",
+    "downloadstring": "Defense Evasion",
+    "rundll32 ": "Defense Evasion",
+    "regsvr32 ": "Defense Evasion",
+    "bitsadmin /": "Defense Evasion",
+    "certutil -": "Defense Evasion",
+    "msiexec /": "Defense Evasion",
+    # Ingress tool transfer (TA0011)
+    "wget http": "Command & Control",
+    "curl http": "Command & Control",
+    "/dev/tcp/": "Command & Control",
+    "nc -e": "Command & Control",
+    "nc -lvp": "Command & Control",
+    "ncat ": "Command & Control",
+    # Discovery (TA0007)
+    "whoami /": "Discovery",
+    "net user ": "Discovery",
+    "net localgroup": "Discovery",
+    "net group ": "Discovery",
+    # Persistence (TA0003)
+    "schtasks /create": "Persistence",
+    "reg add ": "Persistence",
+    # Credential access (TA0006)
+    "mimikatz": "Credential Access",
+    "sekurlsa": "Credential Access",
+    "lsass.dmp": "Credential Access",
+    # Impact / anti-recovery (TA0040)
+    "vssadmin delete": "Impact",
+    "wevtutil cl": "Impact",
+}
+SUSPICIOUS_PAYLOAD_MARKERS = list(SUSPICIOUS_PAYLOAD_MARKERS_TACTICS.keys())
 
 FAILED_AUTH_PATTERNS_BYTES = [
     pattern.encode("utf-8", errors="ignore") for pattern in FAILED_AUTH_PATTERNS
@@ -1564,22 +1676,6 @@ OT_SENSITIVE_ARTIFACT_TOKENS = (
     "interlock",
     "sensitive",
 )
-
-
-@lru_cache(maxsize=100000)
-def _is_private_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_private
-    except Exception:
-        return False
-
-
-@lru_cache(maxsize=100000)
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
 
 
 def _ot_risk_posture_from_detections(
@@ -1639,7 +1735,10 @@ def _threats_storyline(
         if value is None:
             return "unknown time"
         try:
-            return datetime.fromtimestamp(float(value)).strftime("%H:%M:%S")
+            # Render in UTC (ISO-8601 Z) for forensic unambiguity; the prior
+            # datetime.fromtimestamp(...) implicitly used the analyst's local
+            # timezone, which is unsafe for evidence timestamps.
+            return format_ts(float(value))
         except Exception:
             return "unknown time"
 
@@ -1878,14 +1977,6 @@ def _tcp_is_syn(flags: object) -> bool:
     return "S" in text and "A" not in text
 
 
-def _entropy(value: str) -> float:
-    if not value:
-        return 0.0
-    freq = Counter(value)
-    total = len(value)
-    return -sum((count / total) * math.log2(count / total) for count in freq.values())
-
-
 def _dedupe_evidence(values: list[str], limit: int = 8) -> list[str]:
     seen: set[str] = set()
     output: list[str] = []
@@ -2038,6 +2129,165 @@ def _detection_signal_score(item: dict[str, object]) -> int:
             score += 1
 
     return score
+
+
+_IP_TOKEN_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_PORT_TOKEN_RE = re.compile(r"[:/](\d{2,5})\b")
+_OT_PROTO_TOKENS = {str(name).lower() for name in OT_PORTS.values()} | {
+    "modbus",
+    "dnp3",
+    "iec-104",
+    "iec 104",
+    "ethernet/ip",
+    "enip",
+    "cip",
+    "s7",
+    "profinet",
+    "bacnet",
+    "opc",
+    "goose",
+    "mms",
+}
+
+# Broadcast/multicast discovery services that are periodic *by design* (Windows
+# browser/name service, service discovery, DHCP, link-local resolution). Steady
+# traffic on these to a broadcast/multicast address is baseline noise, never C2.
+_BROADCAST_DISCOVERY_PORTS = {137, 138, 139, 1900, 5353, 5355, 67, 68}
+
+
+def _ip_is_broadcast_or_multicast(ip: str) -> bool:
+    text = str(ip).strip()
+    if text == "255.255.255.255":
+        return True
+    if text.endswith(".255"):  # /24-style broadcast, the common case
+        return True
+    try:
+        first = int(text.split(".", 1)[0])
+    except Exception:
+        return False
+    return 224 <= first <= 239  # IPv4 multicast (mDNS/SSDP/LLMNR/IGMP/etc.)
+
+
+def _detection_ip_set(item: dict[str, object]) -> set[str]:
+    ips: set[str] = set()
+    for key in ("top_sources", "top_destinations", "top_clients", "top_servers"):
+        for pair in item.get(key, []) or []:
+            if isinstance(pair, tuple) and pair:
+                ips.add(str(pair[0]))
+    blob_parts = [str(item.get("details", ""))]
+    evidence = item.get("evidence")
+    if isinstance(evidence, list):
+        blob_parts.extend(str(value) for value in evidence)
+    elif isinstance(evidence, str):
+        blob_parts.append(evidence)
+    for match in _IP_TOKEN_RE.findall(" ".join(blob_parts)):
+        ips.add(match)
+    return {ip for ip in ips if ip}
+
+
+def _classify_internal_periodicity(
+    item: dict[str, object], ot_peer_ips: set[str] | None = None
+) -> str | None:
+    """Classify an internal-only periodic Beacon/C2/UDP-beacon detection.
+
+    Periodicity is not by itself command-and-control: genuine C2 beacons cross
+    to a *public* peer. An internal-only periodic flow is one of:
+      - "broadcast"  : to a broadcast/multicast address or on a discovery
+                       service port (NetBIOS/SSDP/mDNS/LLMNR/DHCP) — benign by
+                       design, never C2.
+      - "ot_baseline": OT service port / OT-protocol token / among confirmed OT
+                       peers — deterministic HMI<->PLC polling or cyclic I/O.
+      - "internal"   : any other internal-only periodicity — likely baseline or
+                       lateral, not external C2.
+    Returns the class, or None when the detection is not internal-only periodic
+    (e.g. a private->public beacon, which keeps its original severity).
+    """
+    source = str(item.get("source", "")).strip().lower()
+    summary = str(item.get("summary", "")).strip().lower()
+    is_periodic = source in {"beacon", "c2"} or (
+        source == "udp" and "beacon" in summary
+    )
+    if not is_periodic:
+        return None
+    ips = _detection_ip_set(item)
+    if not ips or not all(_is_private_ip(ip) for ip in ips):
+        return None
+
+    blob = summary + " " + str(item.get("details", "")).lower()
+    port_blob = str(item.get("summary", "")) + " " + str(item.get("details", ""))
+    evidence = item.get("evidence")
+    if isinstance(evidence, list):
+        ev_text = " ".join(str(value) for value in evidence)
+        blob += " " + ev_text.lower()
+        port_blob += " " + ev_text
+    ports: set[int] = set()
+    for port_text in _PORT_TOKEN_RE.findall(port_blob):
+        try:
+            ports.add(int(port_text))
+        except Exception:
+            continue
+
+    if any(_ip_is_broadcast_or_multicast(ip) for ip in ips) or (
+        ports & _BROADCAST_DISCOVERY_PORTS
+    ):
+        return "broadcast"
+    if (
+        any(token in blob for token in _OT_PROTO_TOKENS)
+        or (ports & set(OT_PORTS))
+        or (ot_peer_ips and ips <= ot_peer_ips)
+    ):
+        return "ot_baseline"
+    return "internal"
+
+
+def _recontextualize_ot_cyclic(
+    detections: list[dict[str, object]],
+    ot_peer_ips: set[str] | None = None,
+) -> list[dict[str, object]]:
+    # Downgrade internal-only periodicity that reads as high/critical "beaconing"
+    # but is baseline noise (broadcast/discovery, OT cyclic polling) or at most
+    # internal lateral -- so a capture full of NetBIOS broadcast and SCADA polls
+    # does not present as "ACTIVE THREAT / critical C2".
+    _NOTE = {
+        "broadcast": (
+            "Internal broadcast/multicast discovery traffic (NetBIOS/SSDP/mDNS/"
+            "LLMNR/DHCP) — periodic by design, not C2."
+        ),
+        "ot_baseline": (
+            "Internal-only periodic OT flow — likely baseline cyclic polling "
+            "(HMI/PLC poll or cyclic I/O); verify the (src,dst,port) tuple "
+            "against a process baseline rather than treating periodicity as C2."
+        ),
+        "internal": (
+            "Internal-only periodic flow with no external egress — genuine C2 "
+            "beacons cross to a public peer; treat as baseline/lateral and "
+            "verify against a network baseline."
+        ),
+    }
+    out: list[dict[str, object]] = []
+    for item in detections:
+        kind = (
+            _classify_internal_periodicity(item, ot_peer_ips)
+            if isinstance(item, dict)
+            else None
+        )
+        if kind is None:
+            out.append(item)
+            continue
+        adjusted = dict(item)
+        current = _normalize_severity(item.get("severity", "info"))
+        # Broadcast/discovery is benign (info); OT/internal periodicity is at
+        # most a baseline lead (warning, never critical/high).
+        if kind == "broadcast":
+            adjusted["severity"] = "info"
+        elif current in {"critical", "high"}:
+            adjusted["severity"] = "warning"
+        adjusted["confidence"] = "low"
+        details = str(adjusted.get("details", "")).strip()
+        note = _NOTE[kind]
+        adjusted["details"] = f"{details} [{note}]" if details else note
+        out.append(adjusted)
+    return out
 
 
 def _merge_detection_items(
@@ -2264,6 +2514,7 @@ def _file_detection_evidence(
     return _dedupe_evidence(evidence, limit=8)
 
 
+@memoize_analysis
 def analyze_threats(
     path: Path, show_status: bool = True, vt_lookup: bool = False
 ) -> ThreatSummary:
@@ -2288,6 +2539,7 @@ def analyze_threats(
     icmp_summary = analyze_icmp(path, show_status=show_status)
     dns_summary = analyze_dns(path, show_status=show_status, vt_lookup=vt_lookup)
     beacon_summary = analyze_beacons(path, show_status=show_status)
+    remote_access_summary = analyze_remote_access(path, show_status=show_status)
     files_summary = analyze_files(path, show_status=show_status)
     obfuscation_summary = analyze_obfuscation(path, show_status=show_status)
     carving_summary = analyze_carving(path, show_status=show_status)
@@ -2311,6 +2563,14 @@ def analyze_threats(
     powershell_summary = analyze_powershell(path, show_status=show_status)
     ssh_summary = analyze_ssh(path, show_status=show_status)
     smtp_summary = analyze_smtp(path, show_status=show_status)
+    ftp_summary = analyze_ftp(path, show_status=show_status)
+    nfs_summary = analyze_nfs(path, show_status=show_status)
+    malware_summary = analyze_malware(path, show_status=show_status)
+    email_summary = analyze_email(path, show_status=show_status)
+    safety_summary = analyze_safety(path, show_status=show_status)
+    telnet_summary = analyze_telnet(path, show_status=show_status)
+    vnc_summary = analyze_vnc(path, show_status=show_status)
+    routing_summary = analyze_routing(path, show_status=show_status)
     rpc_summary = analyze_rpc(path, show_status=show_status)
     snmp_summary = analyze_snmp(path, show_status=show_status)
     tcp_summary = analyze_tcp(path, show_status=show_status)
@@ -2320,6 +2580,8 @@ def analyze_threats(
     ptp_summary = analyze_ptp(path, show_status=show_status)
     lldp_summary = analyze_lldp_dcp(path, show_status=show_status)
     opc_classic_summary = analyze_opc_classic(path, show_status=show_status)
+    synchrophasor_summary = analyze_synchrophasor(path, show_status=show_status)
+    iec101_103_summary = analyze_iec101_103(path, show_status=show_status)
 
     artifacts_by_name: dict[str, list[object]] = defaultdict(list)
     for artifact in files_summary.artifacts:
@@ -2357,6 +2619,8 @@ def analyze_threats(
         "HART-IP": analyze_hart(path, show_status=show_status),
         "ProConOS": analyze_prconos(path, show_status=show_status),
         "ICCP": analyze_iccp(path, show_status=show_status),
+        "BSAP": analyze_bsap(path, show_status=show_status),
+        "Genisys": analyze_genisys(path, show_status=show_status),
     }
     ot_protocol_counts: Counter[str] = Counter()
     ot_enip_enum_sources: Counter[str] = Counter()
@@ -2434,6 +2698,17 @@ def analyze_threats(
     _append_detection_items(detections, "PowerShell", powershell_summary.detections)
     _append_detection_items(detections, "SSH", ssh_summary.detections)
     _append_detection_items(detections, "SMTP", smtp_summary.detections)
+    _append_detection_items(detections, "FTP", ftp_summary.detections)
+    _append_anomaly_items(detections, "NFS", nfs_summary.anomalies)
+    _append_detection_items(detections, "Malware", malware_summary.detections)
+    _append_detection_items(detections, "Email", email_summary.detections)
+    _append_anomaly_items(detections, "Email", email_summary.anomalies)
+    _append_detection_items(detections, "Safety/SIS", safety_summary.detections)
+    _append_detection_items(detections, "Telnet", telnet_summary.detections)
+    _append_anomaly_items(detections, "Telnet", telnet_summary.anomalies)
+    _append_detection_items(detections, "VNC", vnc_summary.detections)
+    _append_anomaly_items(detections, "VNC", vnc_summary.anomalies)
+    _append_detection_items(detections, "Routing", routing_summary.detections)
     _append_detection_items(detections, "RPC", rpc_summary.detections)
     _append_detection_items(detections, "SNMP", snmp_summary.detections)
     _append_detection_items(detections, "TCP", tcp_summary.detections)
@@ -2441,6 +2716,10 @@ def analyze_threats(
     _append_detection_items(detections, "GOOSE", goose_summary.detections)
     _append_detection_items(detections, "SV", sv_summary.detections)
     _append_detection_items(detections, "PTP", ptp_summary.detections)
+    _append_detection_items(
+        detections, "Synchrophasor", synchrophasor_summary.detections
+    )
+    _append_detection_items(detections, "IEC-101/103", iec101_103_summary.detections)
     _append_detection_items(detections, "LLDP/DCP", lldp_summary.detections)
     _append_detection_items(detections, "OPC Classic", opc_classic_summary.detections)
     _append_detection_items(detections, "Obfuscation", obfuscation_summary.detections)
@@ -2472,13 +2751,24 @@ def analyze_threats(
                 ),
             }
         )
-    if smb_summary.versions and smb_summary.versions.get("SMB1"):
+    # SMBv1 presence is a vulnerability/hygiene finding (exploitable by
+    # EternalBlue-class attacks), not by itself evidence of an active intrusion.
+    # It is reported once at "high" rather than "critical" so it does not
+    # outrank live attack activity in the verdict; the dedicated "SMBv1 hosts
+    # detected" emitter below (with src/dst attribution) is suppressed when this
+    # one fires to avoid double-counting the same condition.
+    smb_version_smb1 = bool(smb_summary.versions and smb_summary.versions.get("SMB1"))
+    if smb_version_smb1:
         detections.append(
             {
                 "source": "SMB",
-                "severity": "critical",
+                "severity": "high",
                 "summary": "Legacy SMBv1 usage observed",
-                "details": f"{smb_summary.versions.get('SMB1')} SMBv1 packet(s) detected.",
+                "details": (
+                    f"{smb_summary.versions.get('SMB1')} SMBv1 packet(s) detected "
+                    "(deprecated, EternalBlue/WannaCry-exploitable; remediate, then "
+                    "confirm whether the usage is attacker-driven)."
+                ),
             }
         )
 
@@ -2550,6 +2840,14 @@ def analyze_threats(
     errors.extend(powershell_summary.errors)
     errors.extend(ssh_summary.errors)
     errors.extend(smtp_summary.errors)
+    errors.extend(ftp_summary.errors)
+    errors.extend(nfs_summary.errors)
+    errors.extend(malware_summary.errors)
+    errors.extend(email_summary.errors)
+    errors.extend(safety_summary.errors)
+    errors.extend(telnet_summary.errors)
+    errors.extend(vnc_summary.errors)
+    errors.extend(routing_summary.errors)
     errors.extend(rpc_summary.errors)
     errors.extend(snmp_summary.errors)
     errors.extend(tcp_summary.errors)
@@ -2590,6 +2888,7 @@ def analyze_threats(
             if art.dst_ip:
                 smb1_destinations[art.dst_ip] += 1
 
+    external_beacon_candidates: list[object] = []
     if beacon_summary.candidates:
         for candidate in beacon_summary.candidates[:10]:
             duration = 0.0
@@ -2660,14 +2959,21 @@ def analyze_threats(
                 }
             )
 
-    # Suspicious file download detection
+    # Suspicious file download detection. NB: `.js` is intentionally excluded —
+    # every website serves JavaScript, so flagging .js as a malicious-download
+    # IOC floods benign captures (and buries the real EK payloads, which are
+    # exe/dll/archive/octet-stream). A masqueraded .js (PE/ELF magic) is still
+    # caught below via the magic-derived file_type check.
     suspicious_exts = {
         ".exe",
         ".dll",
         ".ps1",
         ".bat",
         ".vbs",
-        ".js",
+        ".vbe",
+        ".jse",
+        ".wsf",
+        ".hta",
         ".scr",
         ".sys",
         ".lnk",
@@ -2757,13 +3063,17 @@ def analyze_threats(
                 }
             )
 
-    if smb1_detected:
+    if smb1_detected and not smb_version_smb1:
         detections.append(
             {
                 "source": "Files",
-                "severity": "critical",
-                "summary": "SMBv1 hosts detected",
-                "details": "Hosts observed communicating with legacy SMBv1.",
+                "severity": "high",
+                "summary": "Legacy SMBv1 usage observed",
+                "details": (
+                    "Hosts observed communicating with legacy SMBv1 "
+                    "(deprecated, EternalBlue/WannaCry-exploitable; remediate, then "
+                    "confirm whether the usage is attacker-driven)."
+                ),
                 "top_sources": smb1_sources.most_common(10),
                 "top_destinations": smb1_destinations.most_common(10),
             }
@@ -2853,7 +3163,6 @@ def analyze_threats(
     last_seen: Optional[float] = None
     total_packets = 0
     control_command_total = 0
-    external_beacon_candidates: list[object] = []
 
     try:
         for pkt in reader:
@@ -2881,22 +3190,24 @@ def analyze_threats(
             counter_inc(src_counts, src_ip)
             counter_inc(dst_counts, dst_ip)
 
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             if _is_private_ip(src_ip) and _is_public_ip(dst_ip):
                 outbound_bytes_public[(src_ip, dst_ip)] += pkt_len
                 setdict_add(outbound_public_dests_by_src, src_ip, dst_ip)
 
             payload_data = _payload_bytes(pkt)
             payload_lower = payload_data.lower() if payload_data else b""
-            if payload_lower and any(
-                marker in payload_lower for marker in SUSPICIOUS_PAYLOAD_MARKERS_BYTES
-            ):
-                counter_inc(suspicious_payload_sources, src_ip)
+            if payload_lower:
+                # Single scan over the marker list; record hits as we go.
+                matched_any = False
                 for marker_text, marker_bytes in zip(
                     SUSPICIOUS_PAYLOAD_MARKERS, SUSPICIOUS_PAYLOAD_MARKERS_BYTES
                 ):
                     if marker_bytes in payload_lower:
+                        matched_any = True
                         command_markers[src_ip].add(marker_text)
+                if matched_any:
+                    counter_inc(suspicious_payload_sources, src_ip)
 
             if DNS is not None and DNSQR is not None and pkt.haslayer(DNS):
                 dns_layer = pkt[DNS]
@@ -2913,10 +3224,17 @@ def analyze_threats(
                         qtype = int(getattr(qd, "qtype", 0) or 0)
                         labels = [label for label in qname.split(".") if label]
                         longest_label = max((len(label) for label in labels), default=0)
-                        if (
-                            len(qname) >= 60
-                            or longest_label >= 32
-                            or _entropy(qname) >= 3.8
+                        # DNS-tunneling signal. Entropy alone is a weak signal:
+                        # benign CDN/cloud names ("d1a2b3c4.cloudfront.net") have
+                        # entropy ~3.8 and short hex labels, so an entropy-only
+                        # threshold floods on normal traffic. Require either a
+                        # genuinely long encoded label, an oversized qname, or
+                        # high entropy *combined* with a long label (the shape of
+                        # base32/hex tunneling). Reverse-DNS is excluded.
+                        if not qname.endswith((".in-addr.arpa", ".ip6.arpa")) and (
+                            longest_label >= 32
+                            or len(qname) >= 80
+                            or (longest_label >= 20 and shannon_entropy(qname) >= 4.0)
                         ):
                             counter_inc(dns_tunnel_sources, src_ip)
                         if qtype == 16:
@@ -2927,8 +3245,9 @@ def analyze_threats(
                 dport = int(getattr(tcp_layer, "dport", 0) or 0)
                 sport = int(getattr(tcp_layer, "sport", 0) or 0)
 
-                if dport in OT_PORTS or sport in OT_PORTS:
-                    proto = OT_PORTS.get(dport) or OT_PORTS.get(sport) or "OT"
+                ot_match = _ot_proto_for_flow(sport, dport)
+                if ot_match is not None:
+                    proto, _ot_port = ot_match
                     if _is_public_ip(src_ip) or _is_public_ip(dst_ip):
                         public_ot_pairs.add((proto, src_ip, dst_ip))
                         if _is_public_ip(src_ip):
@@ -2941,7 +3260,9 @@ def analyze_threats(
                         counter_inc(ot_peer_internal, dst_ip)
                     counter_inc(ot_protocol_counts, proto)
 
-                if sport in ENIP_PORTS or dport in ENIP_PORTS:
+                if _ot_proto_for_flow(sport, dport) is not None and (
+                    sport in ENIP_PORTS or dport in ENIP_PORTS
+                ):
                     enip_ok, cip_ok = _strict_enip_cip_marker(payload_data)
                     if enip_ok:
                         strict_ot_counts["EtherNet/IP"] += 1
@@ -2950,7 +3271,9 @@ def analyze_threats(
                         strict_ot_counts["CIP"] += 1
                         setdict_add(strict_ot_pairs, "CIP", (src_ip, dst_ip))
 
-                if sport == DNP3_PORT or dport == DNP3_PORT:
+                if (sport == DNP3_PORT or dport == DNP3_PORT) and _ot_proto_for_flow(
+                    sport, dport
+                ) is not None:
                     if _strict_dnp3_marker(payload_data):
                         strict_ot_counts["DNP3"] += 1
                         setdict_add(strict_ot_pairs, "DNP3", (src_ip, dst_ip))
@@ -3006,8 +3329,9 @@ def analyze_threats(
                 dport = int(getattr(udp_layer, "dport", 0) or 0)
                 sport = int(getattr(udp_layer, "sport", 0) or 0)
 
-                if dport in OT_PORTS or sport in OT_PORTS:
-                    proto = OT_PORTS.get(dport) or OT_PORTS.get(sport) or "OT"
+                ot_match = _ot_proto_for_flow(sport, dport)
+                if ot_match is not None:
+                    proto, _ot_port = ot_match
                     if _is_public_ip(src_ip) or _is_public_ip(dst_ip):
                         public_ot_pairs.add((proto, src_ip, dst_ip))
                         if _is_public_ip(src_ip):
@@ -3020,7 +3344,9 @@ def analyze_threats(
                         counter_inc(ot_peer_internal, dst_ip)
                     counter_inc(ot_protocol_counts, proto)
 
-                if sport in ENIP_PORTS or dport in ENIP_PORTS:
+                if _ot_proto_for_flow(sport, dport) is not None and (
+                    sport in ENIP_PORTS or dport in ENIP_PORTS
+                ):
                     enip_ok, cip_ok = _strict_enip_cip_marker(payload_data)
                     if enip_ok:
                         strict_ot_counts["EtherNet/IP"] += 1
@@ -3029,7 +3355,9 @@ def analyze_threats(
                         strict_ot_counts["CIP"] += 1
                         setdict_add(strict_ot_pairs, "CIP", (src_ip, dst_ip))
 
-                if sport == DNP3_PORT or dport == DNP3_PORT:
+                if (sport == DNP3_PORT or dport == DNP3_PORT) and _ot_proto_for_flow(
+                    sport, dport
+                ) is not None:
                     if _strict_dnp3_marker(payload_data):
                         strict_ot_counts["DNP3"] += 1
                         setdict_add(strict_ot_pairs, "DNP3", (src_ip, dst_ip))
@@ -3055,6 +3383,22 @@ def analyze_threats(
         else None
     )
 
+    # Internet-exposed OT is a HIGH-severity, risk-driving finding, so for the
+    # protocols where we can validate the wire format (ENIP/CIP/DNP3) require a
+    # strict marker match before believing a public flow is really that
+    # protocol. This drops port-number coincidences (e.g. an ephemeral source
+    # port equal to an OT port on an otherwise unrelated public flow).
+    _STRICT_VALIDATED_PROTOS = {"EtherNet/IP", "CIP", "DNP3"}
+    if public_ot_pairs:
+        validated_public_ot_pairs: set[tuple[str, str, str]] = set()
+        for proto, src, dst in public_ot_pairs:
+            if proto in _STRICT_VALIDATED_PROTOS:
+                pairs = strict_ot_pairs.get(proto, set())
+                if (src, dst) not in pairs and (dst, src) not in pairs:
+                    continue
+            validated_public_ot_pairs.add((proto, src, dst))
+        public_ot_pairs = validated_public_ot_pairs
+
     # Add layer-2 OT/ICS protocol presence not captured by port heuristics
     if goose_summary.goose_packets:
         ot_protocol_counts["GOOSE"] += goose_summary.goose_packets
@@ -3068,6 +3412,12 @@ def analyze_threats(
         ot_protocol_counts["DCP"] += lldp_summary.dcp_packets
     if opc_classic_summary.opc_packets:
         ot_protocol_counts["OPC Classic"] += opc_classic_summary.opc_packets
+    if synchrophasor_summary.synchrophasor_packets:
+        ot_protocol_counts["Synchrophasor"] += (
+            synchrophasor_summary.synchrophasor_packets
+        )
+    if iec101_103_summary.candidate_packets:
+        ot_protocol_counts["IEC-101/103"] += iec101_103_summary.candidate_packets
 
     for source, anomalies in ot_candidates.items():
         summary_obj = ot_summaries.get(source)
@@ -3091,10 +3441,15 @@ def analyze_threats(
             in {"high", "critical"}
         ]
 
-        if high_anoms:
-            _append_ot_anomalies(detections, source, high_anoms)
+        # Either/or, not both: when OT presence is confident, ingest the full
+        # anomaly set (which already includes the high/critical ones); otherwise
+        # surface only the high/critical anomalies. Calling both double-counted
+        # every high-severity OT anomaly (inflating the threat count and showing
+        # each finding type twice in the triage view).
         if _ot_presence_confident(source, summary_obj, anomalies):
             _append_ot_anomalies(detections, source, anomalies)
+        elif high_anoms:
+            _append_ot_anomalies(detections, source, high_anoms)
 
     # OT command/control activity across protocols
     for source, summary_obj in ot_summaries.items():
@@ -3686,10 +4041,12 @@ def analyze_threats(
                 }
             )
 
-    if dst_counts and duration_seconds and duration_seconds > 0:
+    # Sustained concentration only — a near-zero duration would otherwise turn a
+    # handful of packets into a fake multi-thousand pkt/s "flood".
+    if dst_counts and duration_seconds and duration_seconds >= 1.0:
         top_dst, top_dst_count = dst_counts.most_common(1)[0]
         rate = top_dst_count / duration_seconds
-        if rate >= 5000:
+        if rate >= 5000 and top_dst_count >= 1000:
             detections.append(
                 {
                     "source": "Traffic",
@@ -3775,20 +4132,38 @@ def analyze_threats(
             )
 
     if suspicious_payload_sources:
+        observed_markers = {
+            marker
+            for markers in command_markers.values()
+            for marker in markers
+        }
+        observed_tactics = sorted(
+            {
+                SUSPICIOUS_PAYLOAD_MARKERS_TACTICS.get(marker, "Execution")
+                for marker in observed_markers
+            }
+        )
+        marker_evidence = [
+            f"{src} markers=[{','.join(sorted(command_markers.get(src, set())))}] hits={count}"
+            for src, count in suspicious_payload_sources.most_common(10)
+        ]
         detections.append(
             {
                 "source": "Payload",
-                "severity": "warning",
+                # Cleartext offensive tooling on the wire is a strong signal; a
+                # single isolated marker can still be benign (documentation,
+                # admin scripting), so escalate only when a source shows several
+                # distinct command markers (corroborated tooling chain).
+                "severity": "high"
+                if any(len(m) >= 3 for m in command_markers.values())
+                else "warning",
                 "summary": "Suspicious command/tooling markers in payloads",
-                "details": "Payload markers matched common offensive tooling/command execution strings.",
-                "top_sources": suspicious_payload_sources.most_common(10),
-                "evidence": _dedupe_evidence(
-                    [
-                        f"{src} marker_hits={count}"
-                        for src, count in suspicious_payload_sources.most_common(10)
-                    ],
-                    limit=10,
+                "details": (
+                    "Cleartext payloads matched offensive tooling/command-execution "
+                    f"strings. ATT&CK tactics implied: {', '.join(observed_tactics) or '-'}."
                 ),
+                "top_sources": suspicious_payload_sources.most_common(10),
+                "evidence": _dedupe_evidence(marker_evidence, limit=10),
             }
         )
 
@@ -3947,6 +4322,39 @@ def analyze_threats(
             }
         )
 
+    # IT->OT pivot: a host that received an inbound remote-access connection
+    # (SSH/RDP/etc.) and then issued an OT command to another host -- the
+    # canonical industrial intrusion sequence. Flagged CRITICAL (external remote
+    # source) or HIGH (internal). Appended before curation so it is normalised,
+    # deduped and counted like every other detection.
+    for pivot in getattr(remote_access_summary, "pivots", []) or []:
+        ri = pivot.remote_in
+        scope = "external/public" if ri.external else "internal"
+        detections.append(
+            {
+                "source": "Pivot",
+                "severity": "critical" if pivot.severity == "critical" else "high",
+                "summary": "IT->OT pivot: remote access then OT command",
+                "details": (
+                    f"Host {pivot.host} accepted inbound {ri.proto} remote access "
+                    f"from {ri.client_ip} ({scope} source) and subsequently issued a "
+                    f"{pivot.ot_proto} command to {pivot.ot_target}."
+                ),
+                "top_sources": [(ri.client_ip, 1)],
+                "top_destinations": [(pivot.host, 1), (pivot.ot_target, 1)],
+                "evidence": [
+                    f"Inbound {ri.proto} from {ri.client_ip} ({scope}) -> {pivot.host}:{ri.port}",
+                    f"Then {pivot.host} issued {pivot.ot_proto} command -> "
+                    f"{pivot.ot_target} (+{max(0.0, pivot.ot_ts - ri.ts):.0f}s later)",
+                ],
+                "attack": "T0859 Valid Accounts / T0855 Unauthorized Command Message",
+            }
+        )
+
+    ot_peer_ip_set = {str(ip) for ip in ot_peer_internal} | {
+        str(ip) for ip in ot_peer_external
+    }
+    detections = _recontextualize_ot_cyclic(detections, ot_peer_ip_set)
     detections = _curate_threat_detections(detections)
 
     risk_score, risk_findings = _ot_risk_posture_from_detections(
@@ -3974,7 +4382,14 @@ def analyze_threats(
         "ot_ics_impact_safety": [],
         "ioc_intel_corroboration": [],
         "multi_stage_correlation": [],
+        "it_to_ot_pivot": [],
     }
+
+    for pivot in getattr(remote_access_summary, "pivots", []) or []:
+        ri = pivot.remote_in
+        deterministic_checks["it_to_ot_pivot"].append(
+            f"{ri.client_ip} -> {pivot.host} ({ri.proto}) then {pivot.ot_proto} -> {pivot.ot_target}"
+        )
 
     for src, dst, port_count in sorted(
         vertical_scan_hits, key=lambda item: item[2], reverse=True
@@ -4205,6 +4620,24 @@ def analyze_threats(
     _add_risk_row("OT/ICS Impact and Safety", "ot_ics_impact_safety", high=True)
     _add_risk_row("IOC/Intel Corroboration", "ioc_intel_corroboration", medium=True)
     _add_risk_row("Multi-Stage Correlation", "multi_stage_correlation", high=True)
+
+    # Collapse exact-duplicate detections (e.g. the EtherNet/IP and CIP analyzers
+    # both report "CIP Program Transfer"/"High-risk OT services" for the same
+    # shared traffic) so the triage view and the critical/high count aren't
+    # double-counted across overlapping sources.
+    _det_seen: set[tuple[str, str, str]] = set()
+    _det_unique: list[dict[str, object]] = []
+    for _det in detections:
+        _dk = (
+            str(_det.get("summary", "")),
+            str(_det.get("severity", "")),
+            str(_det.get("details", "")),
+        )
+        if _dk in _det_seen:
+            continue
+        _det_seen.add(_dk)
+        _det_unique.append(_det)
+    detections = _det_unique
 
     return ThreatSummary(
         path=path,

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from .industrial_helpers import (
+    append_public_exposure_anomaly,
     IndustrialAnalysis,
     IndustrialAnomaly,
     analyze_port_protocol,
@@ -93,9 +94,12 @@ def _parse_nodeid(payload: bytes, idx: int) -> tuple[tuple[int, int] | None, int
         node_id = payload[idx]
         idx += 1
         return (0, node_id), idx
-    if encoding == 0x01 and idx + 2 < len(payload):
-        node_id = int.from_bytes(payload[idx : idx + 2], "little")
-        ns = payload[idx + 2]
+    if encoding == 0x01 and idx + 3 <= len(payload):
+        # FourByteNodeId: Namespace (UInt8) comes BEFORE Identifier (UInt16).
+        # The previous order (id then ns) corrupted the service-id lookup so
+        # FourByte-encoded Write/Call/CreateSession were mislabeled.
+        ns = payload[idx]
+        node_id = int.from_bytes(payload[idx + 1 : idx + 3], "little")
         idx += 3
         return (ns, node_id), idx
     if encoding == 0x02 and idx + 5 < len(payload):
@@ -514,28 +518,10 @@ def _detect_anomalies(
     payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
 ) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
-    if any(cmd == "OpenSecureChannel" for cmd in commands):
-        anomalies.append(
-            IndustrialAnomaly(
-                severity="LOW",
-                title="OPC UA Secure Channel Open",
-                description="OpenSecureChannel observed.",
-                src=src_ip,
-                dst=dst_ip,
-                ts=ts,
-            )
-        )
-    if any(cmd == "CloseSecureChannel" for cmd in commands):
-        anomalies.append(
-            IndustrialAnomaly(
-                severity="LOW",
-                title="OPC UA Secure Channel Close",
-                description="CloseSecureChannel observed.",
-                src=src_ip,
-                dst=dst_ip,
-                ts=ts,
-            )
-        )
+    # Opening/closing an OPC UA secure channel is normal (and security-positive)
+    # session lifecycle, not an anomaly. Emitting a LOW per packet flooded the
+    # list (e.g. 90 "Secure Channel Open" + 31 "Close" on a normal capture) and
+    # buried the real findings (Error frames, Write/Call requests). Not flagged.
     if any(cmd == "Error" for cmd in commands):
         anomalies.append(
             IndustrialAnomaly(
@@ -547,7 +533,11 @@ def _detect_anomalies(
                 ts=ts,
             )
         )
-    if any(cmd in {"WriteRequest", "CallRequest"} for cmd in commands):
+    write_call = {
+        cmd for cmd in commands if cmd in {"WriteRequest", "CallRequest"}
+    }
+    if write_call:
+        has_call = "CallRequest" in write_call
         anomalies.append(
             IndustrialAnomaly(
                 severity="HIGH",
@@ -556,6 +546,17 @@ def _detect_anomalies(
                 src=src_ip,
                 dst=dst_ip,
                 ts=ts,
+                # CallRequest invokes a server method (T0871 Execution through
+                # API); WriteRequest modifies a node value (T0836).
+                attack=(
+                    "T0871 Execution through API"
+                    if has_call
+                    else "T0836 Modify Parameter"
+                ),
+                evidence=[
+                    "OPC UA service(s): " + ", ".join(sorted(write_call)),
+                    f"{src_ip} -> {dst_ip}",
+                ],
             )
         )
     if any(
@@ -585,22 +586,5 @@ def analyze_opc(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         enable_enrichment=True,
         show_status=show_status,
     )
-    public_endpoints = []
-    for ip_value in set(analysis.src_ips) | set(analysis.dst_ips):
-        try:
-            if ipaddress.ip_address(ip_value).is_global:
-                public_endpoints.append(ip_value)
-        except Exception:
-            continue
-    if public_endpoints and len(analysis.anomalies) < 200:
-        analysis.anomalies.append(
-            IndustrialAnomaly(
-                severity="HIGH",
-                title="OPC UA Exposure to Public IP",
-                description=f"OPC UA traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-                src="*",
-                dst="*",
-                ts=0.0,
-            )
-        )
+    append_public_exposure_anomaly(analysis, "OPC UA")
     return analysis

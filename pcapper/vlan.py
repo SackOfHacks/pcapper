@@ -14,7 +14,7 @@ except Exception:  # pragma: no cover
     IP = None  # type: ignore
     IPv6 = None  # type: ignore
 
-from .utils import safe_float
+from .utils import memoize_analysis, safe_float, packet_length
 
 try:
     from scapy.layers.l2 import Dot1Q  # type: ignore
@@ -53,6 +53,7 @@ def _layer_names(packet) -> list[str]:
     return names
 
 
+@memoize_analysis
 def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
     errors: list[str] = []
     if Dot1Q is None:
@@ -97,16 +98,18 @@ def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
                 except Exception:
                     pass
 
-            if not pkt.haslayer(Dot1Q):  # type: ignore[truthy-bool]
+            # Resolve each scapy layer class at most once per packet via
+            # getlayer (haslayer + pkt[X] would walk the layer chain twice).
+            vlan_layer = pkt.getlayer(Dot1Q)  # type: ignore[arg-type]
+            if vlan_layer is None:
                 continue
 
-            vlan_layer = pkt[Dot1Q]  # type: ignore[index]
             vlan_id = int(getattr(vlan_layer, "vlan", 0) or 0)
             if vlan_id == 0:
                 continue
 
             total_tagged_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_tagged_bytes += pkt_len
 
             info = vlan_stats[vlan_id]
@@ -120,14 +123,14 @@ def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
             if dst_mac:
                 info["dst_macs"].add(str(dst_mac))
 
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
+            ip_layer = pkt.getlayer(IP) if IP is not None else None  # type: ignore[arg-type]
+            if ip_layer is not None:
                 if getattr(ip_layer, "src", None):
                     info["src_ips"].add(str(ip_layer.src))
                 if getattr(ip_layer, "dst", None):
                     info["dst_ips"].add(str(ip_layer.dst))
-            if IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip6_layer = pkt[IPv6]  # type: ignore[index]
+            ip6_layer = pkt.getlayer(IPv6) if IPv6 is not None else None  # type: ignore[arg-type]
+            if ip6_layer is not None:
                 if getattr(ip6_layer, "src", None):
                     info["src_ips"].add(str(ip6_layer.src))
                 if getattr(ip6_layer, "dst", None):

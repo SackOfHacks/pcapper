@@ -96,6 +96,13 @@ _OT_PROTOCOL_MATCHERS: list[tuple[str, str, tuple[str, ...]]] = [
     ("hart", "HART-IP", ("hart",)),
     ("niagara", "Niagara Fox", ("niagara", "fox")),
     ("odesys", "ODESYS/CODESYS", ("odesys", "codesys")),
+    (
+        "synchrophasor",
+        "IEEE C37.118 Synchrophasor",
+        ("synchrophasor", "c37.118", "c37118", "4712"),
+    ),
+    ("bsap", "BSAP-IP", ("bsap", "bristol")),
+    ("genisys", "Genisys", ("genisys",)),
 ]
 
 
@@ -141,6 +148,9 @@ _MODULE_LABELS = {
     "hart": "HART-IP",
     "niagara": "Niagara",
     "odesys": "ODESYS",
+    "synchrophasor": "Synchrophasor",
+    "bsap": "BSAP-IP",
+    "genisys": "Genisys",
 }
 
 
@@ -167,6 +177,9 @@ _OT_MODULES = {
     "hart",
     "niagara",
     "odesys",
+    "synchrophasor",
+    "bsap",
+    "genisys",
 }
 
 
@@ -189,6 +202,8 @@ _OT_PORT_HINTS: dict[str, tuple[int, ...]] = {
     "hart": (5094,),
     "niagara": (1911, 4911),
     "odesys": (1217, 2455),
+    "synchrophasor": (4712, 4713),
+    "bsap": (1234, 1235),
 }
 
 
@@ -1129,6 +1144,21 @@ def _cross_zone_ot_iot_flow_count(
     return count
 
 
+_OV_DISCOVERY_PORTS = {137, 138, 139, 1900, 5353, 5355, 67, 68, 123}
+
+
+def _ov_is_broadcast_multicast(ip: str) -> bool:
+    text = str(ip).strip()
+    if not text:
+        return False
+    if text == "255.255.255.255" or text.endswith(".255"):
+        return True
+    try:
+        return ipaddress.ip_address(text).is_multicast
+    except Exception:
+        return False
+
+
 def _build_hunt_leads(
     *,
     ip_activity: list[dict[str, object]],
@@ -1261,6 +1291,7 @@ def _build_hunt_leads(
                 last_seen=last_seen,
             )
 
+    low_slow_added = 0
     for flow in notable_flows[:20]:
         if not isinstance(flow, dict):
             continue
@@ -1290,17 +1321,30 @@ def _build_hunt_leads(
             )
 
         if duration_seconds >= 900 and packets >= 30 and pps <= 0.2:
-            add_lead(
-                score=72,
-                entity=f"{src} -> {dst}",
-                finding="Low-and-slow persistent flow",
-                evidence=(
-                    f"{protocol} duration={duration_seconds:.1f}s packets={packets} "
-                    f"pps={pps:.3f} bytes={bytes_total}"
-                ),
-                first_seen=_coerce_ts(flow.get("start_ts")),
-                last_seen=_coerce_ts(flow.get("end_ts")),
+            # Low-and-slow is a C2 hunt heuristic. A steady low-rate flow to a
+            # broadcast/multicast address or on a discovery port (NetBIOS/SSDP/
+            # mDNS/LLMNR/DHCP/NTP) is baseline background traffic, not covert
+            # C2, so it is not a lead. Internal->internal low-and-slow is weak
+            # (no external egress) and is capped so it cannot flood the queue
+            # ahead of real recon/scan/exfil leads.
+            internal_only = scope_pair == "internal->internal"
+            is_baseline = (
+                _ov_is_broadcast_multicast(dst)
+                or any(p in _OV_DISCOVERY_PORTS for p in ports)
             )
+            if not is_baseline and not (internal_only and low_slow_added >= 2):
+                add_lead(
+                    score=58 if internal_only else 72,
+                    entity=f"{src} -> {dst}",
+                    finding="Low-and-slow persistent flow",
+                    evidence=(
+                        f"{protocol} duration={duration_seconds:.1f}s packets={packets} "
+                        f"pps={pps:.3f} bytes={bytes_total} scope={scope_pair or '-'}"
+                    ),
+                    first_seen=_coerce_ts(flow.get("start_ts")),
+                    last_seen=_coerce_ts(flow.get("end_ts")),
+                )
+                low_slow_added += 1
 
     for result in module_results:
         if result.module == "threats":

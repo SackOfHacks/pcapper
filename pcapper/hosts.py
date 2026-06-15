@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_valid_ip as _valid_ip
+from .utils import is_private_ip as _is_private_ip
+from .utils import is_public_ip as _is_public_ip
 import os
 import re
 from collections import Counter, defaultdict
@@ -81,21 +83,108 @@ class HostSummary:
     errors: list[str] = field(default_factory=list)
 
 
+_HOST_OT_PORTS = {
+    102, 502, 1962, 2404, 4840, 5006, 5007, 9600, 18245, 20000, 34962,
+    34963, 34964, 44818, 47808,
+}
+_HOST_ADMIN_PORTS = {22, 23, 135, 139, 445, 3389, 5900, 5985, 5986}
+
+
 def _build_hosts_enrichment(hosts: list[HostRecord]) -> dict[str, object]:
-    _ = hosts
-    return {}
+    checks: dict[str, list[str]] = defaultdict(list)
 
-def _valid_ip(value: str) -> bool:
-    if not value:
-        return False
-    try:
-        ip_obj = ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    if ip_obj.is_unspecified or ip_obj.is_multicast:
-        return False
-    return True
+    for host in hosts or []:
+        ip = str(getattr(host, "ip", "?"))
+        ports = list(getattr(host, "open_ports", []) or [])
+        port_nums = {int(getattr(p, "port", 0) or 0) for p in ports}
+        macs = [m for m in (getattr(host, "mac_addresses", []) or []) if m]
 
+        # Public host exposing administrative/remote-access services.
+        if _is_public_ip(ip):
+            exposed = sorted(port_nums & _HOST_ADMIN_PORTS)
+            if exposed:
+                checks["service_exposure_risk"].append(
+                    f"{ip}: admin/remote service(s) exposed on public IP: ports {exposed}"
+                )
+            if port_nums & _HOST_OT_PORTS:
+                checks["boundary_cross_zone_exposure"].append(
+                    f"{ip}: OT service port(s) reachable on public IP: {sorted(port_nums & _HOST_OT_PORTS)}"
+                )
+
+        # Single host serving both OT and IT admin services = segmentation risk.
+        if (port_nums & _HOST_OT_PORTS) and (port_nums & _HOST_ADMIN_PORTS):
+            checks["ot_it_boundary_crossing"].append(
+                f"{ip}: OT ports {sorted(port_nums & _HOST_OT_PORTS)} + IT admin ports {sorted(port_nums & _HOST_ADMIN_PORTS)} on one host"
+            )
+
+        # Identity collision: one IP presenting multiple distinct MACs (IP
+        # conflict / ARP spoofing / reassignment). Reported as context — it is
+        # also common with gateways and DHCP churn, so it does not score.
+        if len(set(macs)) >= 2:
+            checks["identity_drift_or_collision"].append(
+                f"{ip}: {len(set(macs))} distinct MACs ({', '.join(sorted(set(macs))[:4])})"
+            )
+
+    provenance = []
+    if hosts:
+        provenance.append(f"host inventory ({len(hosts)})")
+    if provenance:
+        checks["evidence_provenance"].append("; ".join(provenance))
+
+    score = 0
+    reasons: list[str] = []
+    if checks.get("service_exposure_risk"):
+        score += 3
+        reasons.append("Administrative/remote-access service exposed on a public host")
+    if checks.get("boundary_cross_zone_exposure"):
+        score += 3
+        reasons.append("OT service port reachable on a public host")
+    if checks.get("ot_it_boundary_crossing"):
+        score += 2
+        reasons.append("A single host serves both OT and IT administrative services (segmentation risk)")
+
+    if score >= 6:
+        verdict = "YES - high-confidence host-exposure risk (public admin/OT access) is present."
+        confidence = "high"
+    elif score >= 4:
+        verdict = "LIKELY - significant host-exposure risk is present."
+        confidence = "medium"
+    elif score >= 2:
+        verdict = "POSSIBLE - notable host-exposure risk observed; review the affected host(s)."
+        confidence = "low"
+    elif score >= 1:
+        verdict = "LOW SIGNAL - minor host-exposure findings present."
+        confidence = "low"
+    else:
+        verdict = ""
+        confidence = "low"
+    if not reasons and verdict:
+        reasons.append("Host-exposure heuristics crossed threshold")
+
+    _risk_meta = {
+        "service_exposure_risk": ("Public Service Exposure", "High"),
+        "boundary_cross_zone_exposure": ("Public OT Exposure", "High"),
+        "ot_it_boundary_crossing": ("OT/IT Boundary Crossing", "High"),
+        "identity_drift_or_collision": ("Identity Collision", "Low"),
+    }
+    risk_matrix = [
+        {
+            "category": cat,
+            "risk": risk,
+            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
+            "evidence": f"{len(checks.get(key, []))} host(s)",
+        }
+        for key, (cat, risk) in _risk_meta.items()
+        if checks.get(key)
+    ]
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons,
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
+        "risk_matrix": risk_matrix,
+    }
 
 def _normalize_mac(value: str) -> str | None:
     mac = value.strip().lower()
@@ -163,22 +252,6 @@ def _is_reasonable_domain(value: str) -> bool:
         if label.startswith("-") or label.endswith("-"):
             return False
     return True
-
-
-def _is_private_ip(value: str) -> bool:
-    try:
-        ip_obj = ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    return ip_obj.is_private
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        ip_obj = ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    return ip_obj.is_global
 
 
 def _clean_domain_candidate(value: str) -> str:
@@ -323,11 +396,43 @@ def _build_hostname_scores(
         base_weight = _hostname_weight(finding)
         method = str(getattr(finding, "method", "") or "")
         protocol = str(getattr(finding, "protocol", "") or "")
-        weight = base_weight * max(1, int(getattr(finding, "count", 1) or 1))
+        count = max(1, int(getattr(finding, "count", 1) or 1))
+        # A peer/server-derived name (SNI / TLS / HTTP Host of a site the host
+        # connected to) is NOT the host's own identity. On an INTERNAL host it
+        # must not win by sheer visit volume — a workstation that browses
+        # bing.com 500x is not named "www.bing.com". So cap the count multiplier
+        # to 1 for peer-source names on private IPs; self-identifying sources
+        # (NBNS/DHCP/Kerberos/NTLM/SMB/PTR) keep the volume bonus.
+        _ml = method.lower()
+        _pl = protocol.lower()
+        # Peer/server-derived names: a DNS query name (a site the host looked
+        # UP), an SNI/HTTP-Host/cert of a server the host connected TO. These
+        # name the PEER, never the local host.
+        is_peer_name = (
+            any(t in _ml for t in ("sni", "host header", "certificate", "dns query"))
+            or any(t in _pl for t in ("http", "https", "tls"))
+        )
+
+        def _eff_weight(ip: str) -> int:
+            if is_peer_name and _is_private_ip(ip):
+                return base_weight
+            return base_weight * count
+
         if mapped_ip and _valid_ip(mapped_ip):
             _add_hostname_score(
-                scores, mapped_ip, hostname, weight, method=method, protocol=protocol
+                scores,
+                mapped_ip,
+                hostname,
+                _eff_weight(mapped_ip),
+                method=method,
+                protocol=protocol,
             )
+            continue
+        # No resolved IP. For a peer name (looked-up domain / visited server)
+        # the src is the QUERIER and the dst is the RESOLVER/server — neither is
+        # named that, so do NOT fall back to the endpoints (this is what made a
+        # browsing host get labeled "www.bing.com").
+        if is_peer_name:
             continue
         for fallback_ip in (
             getattr(finding, "src_ip", ""),
@@ -336,7 +441,12 @@ def _build_hostname_scores(
             ip_text = str(fallback_ip or "")
             if _valid_ip(ip_text):
                 _add_hostname_score(
-                    scores, ip_text, hostname, weight, method=method, protocol=protocol
+                    scores,
+                    ip_text,
+                    hostname,
+                    _eff_weight(ip_text),
+                    method=method,
+                    protocol=protocol,
                 )
 
     for ip_value, host in getattr(netbios_summary, "hosts", {}).items():

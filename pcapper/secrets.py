@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from .utils import is_public_ip as _is_public_ip, get_packet_ports as _get_ports
 import base64
 import binascii
-import ipaddress
 import os
 import re
 import urllib.parse
@@ -117,20 +117,6 @@ def _get_ip_pair(pkt: Packet) -> tuple[str, str]:
     return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
 
-def _get_ports(pkt: Packet) -> tuple[Optional[int], Optional[int], str]:
-    if TCP is not None and TCP in pkt:
-        try:
-            return int(pkt[TCP].sport), int(pkt[TCP].dport), "TCP"
-        except Exception:
-            return None, None, "TCP"
-    if UDP is not None and UDP in pkt:
-        try:
-            return int(pkt[UDP].sport), int(pkt[UDP].dport), "UDP"
-        except Exception:
-            return None, None, "UDP"
-    return None, None, "OTHER"
-
-
 def _extract_payload(pkt: Packet) -> bytes:
     if Raw is not None and Raw in pkt:
         try:
@@ -219,6 +205,44 @@ def _looks_cleartext(data: bytes) -> bool:
     return False
 
 
+def _is_meaningful_text(text: str) -> bool:
+    """Decoded output that is actually readable, not binary-as-text soup.
+
+    `_looks_cleartext` only checks that bytes are *printable*, so decoding a
+    random identifier ("Content-Encoding") or certificate DER bytes as base64
+    yields all-printable garbage ("z{~w(v)", "<]8M4g@u") that gets reported as a
+    secret. A genuine encoded secret decodes to either structured data (JSON /
+    key=value) or natural text containing real words, so require one of those
+    and reject high-bit binary rendered as Latin-1.
+    """
+    t = (text or "").strip()
+    if len(t) < 6:
+        return False
+    # Reject high-bit / binary content rendered as text (cert DER, ciphertext).
+    ascii_printable = sum(1 for c in t if 32 <= ord(c) <= 126)
+    if ascii_printable / len(t) < 0.85:
+        return False
+    # Structured data is meaningful even when symbol-heavy: JSON / arrays / kv.
+    if t[0] in "{[" and ":" in t and '"' in t:
+        return True
+    if re.search(r"[A-Za-z][A-Za-z0-9_.-]{2,}\s*=", t):
+        return True
+    # Otherwise require word-bearing, alnum-dense, varied text.
+    alnum = sum(1 for c in t if c.isalnum())
+    if alnum / len(t) < 0.72:
+        return False
+    if len(set(t)) < 5:
+        return False
+    return bool(re.search(r"[A-Za-z]{4,}", t))
+
+
+def _looks_like_jwt_header(text: str) -> bool:
+    # A real JWT header is base64url-encoded JSON: {"alg":"HS256","typ":"JWT"}.
+    # JS member expressions (a.b.c) also match JWT_RE but never decode to this.
+    stripped = (text or "").strip()
+    return stripped.startswith("{") and ":" in stripped and '"' in stripped
+
+
 def _decode_base64(token: str, *, urlsafe: bool = False) -> Optional[bytes]:
     if not token:
         return None
@@ -249,16 +273,6 @@ def _decode_urlencoded(token: str) -> Optional[bytes]:
         return urllib.parse.unquote_to_bytes(token)
     except Exception:
         return None
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(str(value))
-        return not (
-            ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
-        )
-    except Exception:
-        return False
 
 
 def analyze_secrets(
@@ -342,6 +356,7 @@ def analyze_secrets(
             ts = safe_float(getattr(pkt, "time", None))
 
             jwt_spans: list[tuple[int, int]] = []
+            base64_spans: list[tuple[int, int]] = []
             for match in JWT_RE.finditer(text):
                 token = match.group(0)
                 if len(token) > MAX_TOKEN_LEN:
@@ -351,6 +366,11 @@ def analyze_secrets(
                     continue
                 header_raw = _decode_base64(parts[0], urlsafe=True) or b""
                 payload_raw = _decode_base64(parts[1], urlsafe=True) or b""
+                # The header MUST decode to JSON for this to be a real JWT —
+                # otherwise it is just an `a.b.c` token (JS member access, a
+                # filename, a version string) that happens to match JWT_RE.
+                if not _looks_like_jwt_header(_decode_text(header_raw)):
+                    continue
                 decoded_parts = []
                 note_parts = []
                 if _looks_cleartext(header_raw):
@@ -412,8 +432,11 @@ def analyze_secrets(
                 if not _looks_cleartext(decoded_bytes):
                     continue
                 decoded_text = _decode_text(decoded_bytes).strip()
-                if not decoded_text:
+                if not decoded_text or not _is_meaningful_text(decoded_text):
                     continue
+                # Standard-base64 tokens also match BASE64URL_RE; record the
+                # span so the base64url pass below doesn't double-report them.
+                base64_spans.append((match.start(), match.end()))
                 matches += 1
                 kind_counts["Base64"] += 1
                 key = (total_packets, "Base64", token, match.start())
@@ -440,11 +463,19 @@ def analyze_secrets(
                 else:
                     truncated = True
 
+            def _overlaps_base64(start: int, end: int) -> bool:
+                for s, e in base64_spans:
+                    if start < e and end > s:
+                        return True
+                return False
+
             for match in BASE64URL_RE.finditer(text):
                 token = match.group(0)
                 if len(token) < MIN_BASE64_LEN or len(token) > MAX_TOKEN_LEN:
                     continue
-                if _overlaps_jwt(match.start(), match.end()):
+                if _overlaps_jwt(match.start(), match.end()) or _overlaps_base64(
+                    match.start(), match.end()
+                ):
                     continue
                 raw = _decode_base64(token, urlsafe=True)
                 if not raw:
@@ -458,7 +489,7 @@ def analyze_secrets(
                 if not _looks_cleartext(decoded_bytes):
                     continue
                 decoded_text = _decode_text(decoded_bytes).strip()
-                if not decoded_text:
+                if not decoded_text or not _is_meaningful_text(decoded_text):
                     continue
                 matches += 1
                 kind_counts["Base64URL"] += 1
@@ -498,7 +529,7 @@ def analyze_secrets(
                 if not _looks_cleartext(raw):
                     continue
                 decoded_text = _decode_text(raw).strip()
-                if not decoded_text:
+                if not decoded_text or not _is_meaningful_text(decoded_text):
                     continue
                 matches += 1
                 kind_counts["Hex"] += 1
@@ -536,7 +567,11 @@ def analyze_secrets(
                 if not _looks_cleartext(raw):
                     continue
                 decoded_text = _decode_text(raw).strip()
-                if not decoded_text or decoded_text == token:
+                if (
+                    not decoded_text
+                    or decoded_text == token
+                    or not _is_meaningful_text(decoded_text)
+                ):
                     continue
                 matches += 1
                 kind_counts["URL-Encoded"] += 1

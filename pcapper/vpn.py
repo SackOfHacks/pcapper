@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -213,10 +213,22 @@ def _parse_wireguard_message(payload: bytes) -> Optional[str]:
     return WIREGUARD_MESSAGE_TYPES.get(message_type)
 
 
-def _parse_openvpn_opcode(payload: bytes) -> Optional[str]:
+def _parse_openvpn_opcode(payload: bytes, *, is_tcp: bool = False) -> Optional[str]:
     if not payload:
         return None
-    opcode = payload[0] >> 3
+    # OpenVPN over TCP frames each packet with a 2-byte big-endian length
+    # prefix, so the opcode/key-id byte is at offset 2. Over UDP there is no
+    # prefix and the opcode is the first byte. Reading byte 0 on TCP parses the
+    # high byte of the length field and yields a bogus opcode.
+    if is_tcp:
+        if len(payload) < 3:
+            return None
+        declared_len = int.from_bytes(payload[0:2], "big")
+        if declared_len != len(payload) - 2:
+            return None
+        opcode = payload[2] >> 3
+    else:
+        opcode = payload[0] >> 3
     return OPENVPN_OPCODES.get(opcode)
 
 
@@ -332,6 +344,7 @@ def _extract_tls_certificates(pkt: object) -> list[dict[str, object]]:
     return extracted
 
 
+@memoize_analysis
 def analyze_vpn(path: Path, show_status: bool = True) -> VpnSummary:
     reader, status, stream, size_bytes, _file_type = get_reader(
         path, show_status=show_status
@@ -418,7 +431,7 @@ def analyze_vpn(path: Path, show_status: bool = True) -> VpnSummary:
 
                     payload = _extract_layer_payload(tcp)
                     if server_port in {1194, 4433}:
-                        opcode = _parse_openvpn_opcode(payload)
+                        opcode = _parse_openvpn_opcode(payload, is_tcp=True)
                         if opcode:
                             handshake_counts[opcode] += 1
                             _record_artifact_correlation(
@@ -563,6 +576,10 @@ def analyze_vpn(path: Path, show_status: bool = True) -> VpnSummary:
                             server_ip,
                         )
 
+    except Exception as exc:
+        # Don't let one malformed IKE/ESP/cert packet abort the whole VPN
+        # analysis — record it and return what we have (other analyzers do this).
+        errors.append(f"{type(exc).__name__}: {exc}")
     finally:
         status.finish()
         reader.close()

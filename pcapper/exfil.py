@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-import ipaddress
-import math
+from .utils import shannon_entropy as _shannon_entropy
+from .utils import is_private_ip as _is_private_ip
+from .utils import is_public_ip as _is_public_ip
+from .utils import memoize_analysis
+
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -17,6 +20,8 @@ from .utils import (
     extract_packet_endpoints,
     format_bytes_as_mb,
     format_duration,
+    memoize_analysis,
+    packet_length,
     safe_float,
 )
 
@@ -58,30 +63,6 @@ class ExfilSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(value)
-    except Exception:
-        return False
-    return ip.is_global
-
-
-def _is_private_ip(value: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(value)
-    except Exception:
-        return False
-    return ip.is_private
-
-
-def _shannon_entropy(value: str) -> float:
-    if not value:
-        return 0.0
-    freq = Counter(value)
-    total = len(value)
-    return -sum((count / total) * math.log2(count / total) for count in freq.values())
 
 
 def _median(values: list[float]) -> float:
@@ -190,6 +171,7 @@ SUSPICIOUS_FILE_TYPES = {
 }
 
 
+@memoize_analysis
 def analyze_exfil(
     path: Path,
     show_status: bool = True,
@@ -288,7 +270,7 @@ def analyze_exfil(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
 

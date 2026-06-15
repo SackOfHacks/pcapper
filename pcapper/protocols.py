@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import ipaddress
 import re
 from collections import Counter, defaultdict
@@ -17,9 +18,7 @@ except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
 
 from .pcap_cache import get_reader
-from .utils import safe_float
-
-# from .services import get_service_name - Removed
+from .utils import memoize_analysis, packet_length, safe_float
 
 # --- Dataclasses ---
 
@@ -92,20 +91,6 @@ class ProtocolSummary:
     false_positive_context: List[str] = field(default_factory=list)
 
 
-def _ip_zone(value: str) -> str:
-    try:
-        ip_obj = ipaddress.ip_address(value)
-    except ValueError:
-        return "unknown"
-    if ip_obj.is_loopback:
-        return "loopback"
-    if ip_obj.is_private:
-        return "internal"
-    if ip_obj.is_global:
-        return "public"
-    return "other"
-
-
 def _build_protocol_enrichment(
     *,
     total_packets: int,
@@ -122,12 +107,96 @@ def _build_protocol_enrichment(
         duration,
         conversations,
         endpoints,
-        anomalies,
         top_protocols,
         port_protocols,
         ethertype_protocols,
     )
-    return {}
+    checks: Dict[str, List[str]] = defaultdict(list)
+
+    crit_count = 0
+    high_count = 0
+    for anom in anomalies or []:
+        sev = str(getattr(anom, "severity", "")).upper()
+        atype = str(getattr(anom, "type", ""))
+        desc = str(getattr(anom, "description", ""))
+        blob = atype.lower()
+        ev = f"{atype}: {desc}" + (
+            f" ({anom.src}->{anom.dst})" if getattr(anom, "src", None) else ""
+        )
+        if sev == "CRITICAL":
+            crit_count += 1
+        elif sev == "HIGH":
+            high_count += 1
+        if any(t in blob for t in ("scan", "flood", "storm", "fragmentation")):
+            checks["anomalous_protocol_sequence"].append(ev)
+        elif "arp" in blob:
+            checks["protocol_identity_mismatch"].append(ev)
+        elif sev in ("HIGH", "CRITICAL"):
+            # Cleartext creds / credential leakage / basic auth: a corroborating
+            # finding surfaced in the protocol view (also caught by --creds).
+            checks["cross_protocol_corroboration"].append(ev)
+
+    provenance = []
+    if anomalies:
+        provenance.append(f"protocol anomalies ({len(anomalies)})")
+    if top_protocols:
+        provenance.append(f"protocols ({len(top_protocols)})")
+    if provenance:
+        checks["evidence_provenance"].append("; ".join(provenance))
+
+    score = 0
+    reasons: List[str] = []
+    if crit_count:
+        score += 3
+        reasons.append(f"Critical protocol anomalies: {crit_count}")
+    if high_count:
+        score += 2
+        reasons.append(f"High-severity protocol anomalies: {high_count} (e.g. cleartext credentials / ARP spoofing)")
+    if checks.get("anomalous_protocol_sequence"):
+        score += 1
+        reasons.append("Scan/flood/storm protocol behavior observed")
+
+    if score >= 6:
+        verdict = "YES - high-confidence malicious protocol behavior is present."
+        confidence = "high"
+    elif score >= 4:
+        verdict = "LIKELY - suspicious protocol behavior with attack indicators is present."
+        confidence = "medium"
+    elif score >= 2:
+        verdict = "POSSIBLE - notable protocol anomalies observed; corroboration recommended."
+        confidence = "low"
+    elif score >= 1:
+        verdict = "LOW SIGNAL - minor protocol anomalies present."
+        confidence = "low"
+    else:
+        verdict = ""
+        confidence = "low"
+    if not reasons and verdict:
+        reasons.append("Protocol anomaly heuristics crossed threshold")
+
+    _risk_meta = {
+        "cross_protocol_corroboration": ("Cleartext/Credential Exposure", "High"),
+        "protocol_identity_mismatch": ("ARP/Identity Anomaly", "Medium"),
+        "anomalous_protocol_sequence": ("Scan/Flood Behavior", "Medium"),
+    }
+    risk_matrix = [
+        {
+            "category": cat,
+            "risk": risk,
+            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
+            "evidence": f"{len(checks.get(key, []))} finding(s)",
+        }
+        for key, (cat, risk) in _risk_meta.items()
+        if checks.get(key)
+    ]
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons,
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
+        "risk_matrix": risk_matrix,
+    }
 
 def merge_protocols_summaries(
     summaries: List[ProtocolSummary]
@@ -366,24 +435,44 @@ KNOWN_PORTS.update(INDUSTRIAL_PORTS)
 OSCILLATION_REPEAT_CAP = 3
 
 
-def _get_proto_name(pkt: Packet) -> str:
-    # Heuristic based on layers
-    if IP in pkt:
-        proto_num = pkt[IP].proto
-        if proto_num == 6 and TCP in pkt:
-            sport = pkt[TCP].sport
-            dport = pkt[TCP].dport
+def _get_proto_name(
+    pkt: Packet,
+    ip_layer: object | None = None,
+    ipv6_layer: object | None = None,
+    arp_layer: object | None = None,
+    tcp_layer: object | None = None,
+    udp_layer: object | None = None,
+    *,
+    layers_resolved: bool = False,
+) -> str:
+    # Heuristic based on layers. Callers in hot loops pass pre-resolved layer
+    # references (layers_resolved=True) to avoid re-walking the packet chain.
+    if not layers_resolved:
+        ip_layer = pkt.getlayer(IP)
+        ipv6_layer = None if ip_layer is not None else pkt.getlayer(IPv6)
+        arp_layer = (
+            None
+            if (ip_layer is not None or ipv6_layer is not None)
+            else pkt.getlayer(ARP)
+        )
+        tcp_layer = pkt.getlayer(TCP)
+        udp_layer = pkt.getlayer(UDP)
+    if ip_layer is not None:
+        proto_num = ip_layer.proto  # type: ignore[attr-defined]
+        if proto_num == 6 and tcp_layer is not None:
+            sport = tcp_layer.sport  # type: ignore[attr-defined]
+            dport = tcp_layer.dport  # type: ignore[attr-defined]
             return KNOWN_PORTS.get(sport) or KNOWN_PORTS.get(dport) or "TCP"
-        elif proto_num == 17 and UDP in pkt:
-            sport = pkt[UDP].sport
-            dport = pkt[UDP].dport
+        elif proto_num == 17 and udp_layer is not None:
+            sport = udp_layer.sport  # type: ignore[attr-defined]
+            dport = udp_layer.dport  # type: ignore[attr-defined]
             return KNOWN_PORTS.get(sport) or KNOWN_PORTS.get(dport) or "UDP"
         elif proto_num == 1:
             return "ICMP"
         return "IP"
-    elif IPv6 in pkt:
+    elif ipv6_layer is not None:
         return "IPv6"
-    elif ARP in pkt:
+    elif arp_layer is not None:
         return "ARP"
 
     # Fallback to layer name
@@ -397,6 +486,7 @@ def _get_proto_name(pkt: Packet) -> str:
         return "Unknown"
 
 
+@memoize_analysis
 def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
     if IP is None:
         return ProtocolSummary(
@@ -474,11 +564,35 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                 start_ts = ts
             end_ts = ts
 
-            pkt_len = len(pkt)
-            port_protocol_counts[_get_proto_name(pkt)] += 1
-            if Ether in pkt:
+            pkt_len = packet_length(pkt)
+            # Resolve each layer at most once per packet; scapy's
+            # haslayer/__contains__/__getitem__ each re-walk the chain.
+            ether_layer = pkt.getlayer(Ether)
+            ip_layer = pkt.getlayer(IP)
+            ipv6_layer = None if ip_layer is not None else pkt.getlayer(IPv6)
+            arp_layer = (
+                None
+                if (ip_layer is not None or ipv6_layer is not None)
+                else pkt.getlayer(ARP)
+            )
+            tcp_layer = pkt.getlayer(TCP)
+            udp_layer = pkt.getlayer(UDP)
+            icmp_layer = pkt.getlayer(ICMP)
+            raw_layer = pkt.getlayer(Raw)
+            port_protocol_counts[
+                _get_proto_name(
+                    pkt,
+                    ip_layer,
+                    ipv6_layer,
+                    arp_layer,
+                    tcp_layer,
+                    udp_layer,
+                    layers_resolved=True,
+                )
+            ] += 1
+            if ether_layer is not None:
                 try:
-                    ethertype = int(pkt[Ether].type)
+                    ethertype = int(ether_layer.type)
                 except Exception:
                     ethertype = None
                 if ethertype is not None:
@@ -555,18 +669,18 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
 
             # 1b. Inject port-based industrial protocol labels under L4 when no dissector exists.
             port_label = None
-            if TCP in pkt:
+            if tcp_layer is not None:
                 try:
                     port_label = KNOWN_PORTS.get(
-                        int(pkt[TCP].sport)
-                    ) or KNOWN_PORTS.get(int(pkt[TCP].dport))
+                        int(tcp_layer.sport)
+                    ) or KNOWN_PORTS.get(int(tcp_layer.dport))
                 except Exception:
                     port_label = None
-            elif UDP in pkt:
+            elif udp_layer is not None:
                 try:
                     port_label = KNOWN_PORTS.get(
-                        int(pkt[UDP].sport)
-                    ) or KNOWN_PORTS.get(int(pkt[UDP].dport))
+                        int(udp_layer.sport)
+                    ) or KNOWN_PORTS.get(int(udp_layer.dport))
                 except Exception:
                     port_label = None
             if (
@@ -587,54 +701,54 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
             proto = "Ethernet"
             ports = set()
 
-            if IP in pkt:
-                src = pkt[IP].src
-                dst = pkt[IP].dst
+            if ip_layer is not None:
+                src = ip_layer.src
+                dst = ip_layer.dst
                 proto = "IP"
-                if TCP in pkt:
+                if tcp_layer is not None:
                     proto = (
-                        KNOWN_PORTS.get(pkt[TCP].sport)
-                        or KNOWN_PORTS.get(pkt[TCP].dport)
+                        KNOWN_PORTS.get(tcp_layer.sport)
+                        or KNOWN_PORTS.get(tcp_layer.dport)
                         or "TCP"
                     )
-                    ports.add(pkt[TCP].sport)
-                    ports.add(pkt[TCP].dport)
-                elif UDP in pkt:
+                    ports.add(tcp_layer.sport)
+                    ports.add(tcp_layer.dport)
+                elif udp_layer is not None:
                     proto = (
-                        KNOWN_PORTS.get(pkt[UDP].sport)
-                        or KNOWN_PORTS.get(pkt[UDP].dport)
+                        KNOWN_PORTS.get(udp_layer.sport)
+                        or KNOWN_PORTS.get(udp_layer.dport)
                         or "UDP"
                     )
-                    ports.add(pkt[UDP].sport)
-                    ports.add(pkt[UDP].dport)
-                elif ICMP in pkt:
+                    ports.add(udp_layer.sport)
+                    ports.add(udp_layer.dport)
+                elif icmp_layer is not None:
                     proto = "ICMP"
-            elif IPv6 in pkt:
-                src = pkt[IPv6].src
-                dst = pkt[IPv6].dst
+            elif ipv6_layer is not None:
+                src = ipv6_layer.src
+                dst = ipv6_layer.dst
                 proto = "IPv6"
-            elif ARP in pkt:
-                src = pkt[ARP].psrc
-                dst = pkt[ARP].pdst
+            elif arp_layer is not None:
+                src = arp_layer.psrc
+                dst = arp_layer.pdst
                 proto = "ARP"
                 try:
-                    hwsrc = str(pkt[ARP].hwsrc)
-                    psrc = str(pkt[ARP].psrc)
+                    hwsrc = str(arp_layer.hwsrc)
+                    psrc = str(arp_layer.psrc)
                     if psrc and hwsrc:
                         arp_ip_macs[psrc].add(hwsrc)
-                    op = getattr(pkt[ARP], "op", None)
+                    op = getattr(arp_layer, "op", None)
                     if op == 2 and psrc == dst:
                         gratuitous_arp += 1
                 except Exception:
                     pass
-            elif Ether in pkt:
+            elif ether_layer is not None:
                 # Fallback L2
-                src = pkt[Ether].src
-                dst = pkt[Ether].dst
+                src = ether_layer.src
+                dst = ether_layer.dst
 
-            if Ether in pkt:
+            if ether_layer is not None:
                 try:
-                    eth_dst = str(pkt[Ether].dst).lower()
+                    eth_dst = str(ether_layer.dst).lower()
                     if eth_dst == "ff:ff:ff:ff:ff:ff":
                         broadcast_frames += 1
                 except Exception:
@@ -674,9 +788,8 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                 c.ports.update(ports)
 
             # 3. Anomaly Detection (Basic)
-            if IP in pkt:
+            if ip_layer is not None:
                 try:
-                    ip_layer = pkt[IP]
                     if getattr(ip_layer, "frag", 0) or getattr(ip_layer, "flags", 0):
                         if (
                             getattr(ip_layer, "frag", 0) > 0
@@ -688,11 +801,11 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                     pass
 
             # Cleartext Credentials
-            if TCP in pkt and Raw in pkt:
-                payload = bytes(pkt[Raw])
+            if tcp_layer is not None and raw_layer is not None:
+                payload = bytes(raw_layer)
                 # FTP/Telnet/HTTP Basic Auth check (very basic)
-                if (pkt[TCP].dport == 21 or pkt[TCP].sport == 21) or (
-                    pkt[TCP].dport == 23 or pkt[TCP].sport == 23
+                if (tcp_layer.dport == 21 or tcp_layer.sport == 21) or (
+                    tcp_layer.dport == 23 or tcp_layer.sport == 23
                 ):
                     if b"USER" in payload or b"PASS" in payload:
                         anomalies.append(
@@ -776,9 +889,9 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                             )
                         )
 
-            if TCP in pkt:
+            if tcp_layer is not None:
                 try:
-                    flags = pkt[TCP].flags
+                    flags = tcp_layer.flags
                 except Exception:
                     flags = None
 
@@ -790,25 +903,38 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                     rst = "R" in flags
                     psh = "P" in flags
                     urg = "U" in flags
-                elif isinstance(flags, int):
-                    syn = bool(flags & 0x02)
-                    ack = bool(flags & 0x10)
-                    fin = bool(flags & 0x01)
-                    rst = bool(flags & 0x04)
-                    psh = bool(flags & 0x08)
-                    urg = bool(flags & 0x20)
+                elif flags is not None:
+                    # scapy's TCP flags is a FlagValue, which is neither str nor
+                    # int, so the old `elif isinstance(flags, int)` branch never
+                    # ran and every flag stayed False -- SYN/RST/NULL/FIN/XMAS
+                    # scan detection here was silently dead. int(flags) coerces
+                    # FlagValue, int, and bool alike.
+                    try:
+                        bits = int(flags)
+                    except Exception:
+                        bits = 0
+                    syn = bool(bits & 0x02)
+                    ack = bool(bits & 0x10)
+                    fin = bool(bits & 0x01)
+                    rst = bool(bits & 0x04)
+                    psh = bool(bits & 0x08)
+                    urg = bool(bits & 0x20)
 
                 if syn and not ack and src:
                     tcp_syn_sources[src] += 1
                     try:
-                        tcp_syn_ports[src].add(int(pkt[TCP].dport))
+                        tcp_syn_ports[src].add(int(tcp_layer.dport))
                     except Exception:
                         pass
 
                 if rst and src:
                     tcp_rst_sources[src] += 1
 
-                if flags == 0 and src:
+                if (
+                    flags is not None
+                    and not (syn or ack or fin or rst or psh or urg)
+                    and src
+                ):
                     tcp_null_scan[src] += 1
 
                 if fin and not (syn or ack or rst) and src:
@@ -817,8 +943,8 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
                 if fin and psh and urg and src:
                     tcp_xmas_scan[src] += 1
 
-            if ICMP in pkt and Raw in pkt:
-                payload = bytes(pkt[Raw])
+            if icmp_layer is not None and raw_layer is not None:
+                payload = bytes(raw_layer)
                 if len(payload) >= 512:
                     icmp_large_payloads.append((src or "-", dst or "-", len(payload)))
 
