@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+
+from .utils import shannon_entropy as _shannon_entropy
 import ipaddress
 import math
 import re
@@ -10,7 +12,7 @@ from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.dhcp import BOOTP, DHCP  # type: ignore
@@ -200,15 +202,9 @@ class DhcpSummary:
     benign_context: list[str] = field(default_factory=list)
     artifacts: list[DhcpArtifact] = field(default_factory=list)
     anomalies: list[DhcpAnomaly] = field(default_factory=list)
+    # MAC -> (fingerprint string, OS/device guess) from DHCP option 55.
+    os_fingerprints: dict[str, tuple[str, str]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
-
-
-def _shannon_entropy(value: str) -> float:
-    if not value:
-        return 0.0
-    freq = Counter(value)
-    total = len(value)
-    return -sum((count / total) * math.log2(count / total) for count in freq.values())
 
 
 def _decode_name(value: object) -> str:
@@ -308,6 +304,49 @@ def _message_type_name(value: object) -> str:
     except Exception:
         return "UNKNOWN"
     return _DHCP_MESSAGE_TYPES.get(code, f"TYPE_{code}")
+
+
+# DHCP option-55 (parameter request list) fingerprints. The ordered list of
+# requested option codes is characteristic of the OS/stack ("DHCP fingerprint"),
+# which is valuable for passive asset identification on IT and OT networks — and
+# a changed fingerprint on a known MAC can indicate device spoofing or a NAC
+# bypass. Exact OS attribution needs a full Fingerbank DB; these are a small set
+# of high-confidence, widely-documented prefixes matched against the start of
+# the request list so minor tail variations still classify.
+_DHCP_FINGERPRINT_PREFIXES: tuple[tuple[tuple[int, ...], str], ...] = (
+    ((1, 15, 3, 6, 44, 46, 47, 31, 33, 121, 249, 43), "Windows (7/8/10/11)"),
+    ((1, 15, 3, 6, 44, 46, 47, 31, 33, 121, 249, 252, 43), "Windows"),
+    ((1, 3, 6, 15, 31, 33, 43, 44, 46, 47, 121, 249, 252), "Windows"),
+    ((1, 3, 6, 15, 119, 95, 252, 44, 46), "Apple macOS/iOS"),
+    ((1, 121, 3, 6, 15, 119, 252, 95, 44, 46), "Apple macOS/iOS"),
+    ((1, 33, 3, 6, 15, 28, 51, 58, 59), "Linux / Android (dhclient)"),
+    ((1, 28, 2, 3, 15, 6, 119, 12, 44, 47, 26, 121, 42), "Linux (dhclient)"),
+    ((1, 3, 6, 12, 15, 28, 42), "Linux / embedded"),
+    ((1, 3, 6, 15, 66, 67), "Network boot / thin client (PXE)"),
+    ((1, 3, 6, 12, 15, 28), "Embedded / IoT device"),
+    ((1, 3, 6, 15, 42, 66, 150), "VoIP phone (Cisco/Avaya)"),
+)
+
+
+def _dhcp_fingerprint(param_req_list: object) -> Optional[tuple[str, str]]:
+    """Build a DHCP option-55 fingerprint string and best-effort OS/device guess."""
+    if not isinstance(param_req_list, (list, tuple)):
+        return None
+    codes: list[int] = []
+    for item in param_req_list:
+        try:
+            codes.append(int(item))
+        except Exception:
+            return None
+    if len(codes) < 3:
+        return None
+    fp = ",".join(str(c) for c in codes)
+    guess = "unknown"
+    for prefix, label in _DHCP_FINGERPRINT_PREFIXES:
+        if tuple(codes[: len(prefix)]) == prefix:
+            guess = label
+            break
+    return fp, guess
 
 
 def _lease_bucket(seconds: int) -> str:
@@ -423,6 +462,7 @@ def _parse_dhcp6_options(payload: bytes) -> tuple[str, dict[str, object], int]:
     return msg_type, options, xid
 
 
+@memoize_analysis
 def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
     if DHCP is None or BOOTP is None or UDP is None:
         return DhcpSummary(
@@ -613,6 +653,13 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 option_map.get("vendor_class_id", option_map.get("vendor_class", ""))
             )
             client_id = _decode_name(option_map.get("client_id", ""))
+
+            # Passive OS/device fingerprint from the parameter request list (opt 55).
+            prl = option_map.get("param_req_list", option_map.get("param_req_list_"))
+            if prl is not None and chaddr and chaddr not in summary.os_fingerprints:
+                fp_result = _dhcp_fingerprint(prl)
+                if fp_result:
+                    summary.os_fingerprints[chaddr] = fp_result
 
             session_client_ip = ciaddr if ciaddr != "0.0.0.0" else src_ip
 
@@ -1228,6 +1275,13 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
         if hostname_count >= 4 or client_id_count >= 4 or vendor_count >= 3:
             deterministic_checks["starvation_exhaustion_behavior"].append(
                 f"{client_mac} identity churn hostnames={hostname_count} client_ids={client_id_count} vendors={vendor_count}"
+            )
+        # Volumetric flood/DoS from a single MAC: a legitimate client sends only
+        # a handful of DHCP messages per capture (lease + renewals hours apart),
+        # so a high request count is anomalous even without identity churn.
+        if req_count >= 100:
+            deterministic_checks["starvation_exhaustion_behavior"].append(
+                f"{client_mac} high DHCP request volume requests={req_count} (possible flood/DoS)"
             )
 
     potential_failover = (

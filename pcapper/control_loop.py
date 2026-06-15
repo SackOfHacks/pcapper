@@ -48,11 +48,15 @@ def _to_number(value: object) -> Optional[float]:
         return float(value)
     if isinstance(value, str):
         stripped = value.strip()
-        if stripped.replace(".", "", 1).isdigit():
-            try:
-                return float(stripped)
-            except Exception:
-                return None
+        if not stripped:
+            return None
+        try:
+            # float() handles negative/signed/scientific setpoints ("-5",
+            # "-12.3", "1e3") that the previous isdigit() check silently dropped
+            # — exactly the analog manipulations this module exists to catch.
+            return float(stripped)
+        except (ValueError, TypeError):
+            return None
     return None
 
 
@@ -139,6 +143,10 @@ def build_control_loop_summary(
 
     findings: list[ControlLoopFinding] = []
     kind_counts: Counter[str] = Counter()
+    # One oscillation finding per target — a normally-toggling discrete point
+    # (pump on/off, status bit, 2-position valve) otherwise emits a finding per
+    # toggle and floods the 200-finding cap, burying real setpoint manipulation.
+    oscillation_seen: set[str] = set()
     max_findings = 200
 
     for target, records in records_by_target.items():
@@ -245,9 +253,14 @@ def build_control_loop_summary(
                     and new_val is not None
                     and prev_prev_val == new_val
                 ):
-                    if prev_prev_ts is not None and ts is not None:
+                    if (
+                        prev_prev_ts is not None
+                        and ts is not None
+                        and target not in oscillation_seen
+                    ):
                         delta_ts = float(ts) - float(prev_prev_ts)
                         if 0.0 <= delta_ts <= 60.0:
+                            oscillation_seen.add(target)
                             findings.append(
                                 ControlLoopFinding(
                                     protocol=str(proto),

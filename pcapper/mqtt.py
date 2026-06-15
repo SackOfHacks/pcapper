@@ -4,6 +4,7 @@ import ipaddress
 from pathlib import Path
 
 from .industrial_helpers import (
+    append_public_exposure_anomaly,
     IndustrialAnalysis,
     IndustrialAnomaly,
     analyze_port_protocol,
@@ -188,28 +189,11 @@ def _detect_anomalies(
 ) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     parsed = _parse_mqtt_packets(payload)
-    if any(cmd == "CONNECT" for cmd in commands):
-        anomalies.append(
-            IndustrialAnomaly(
-                severity="LOW",
-                title="MQTT Connect",
-                description="MQTT CONNECT observed (check for auth configuration).",
-                src=src_ip,
-                dst=dst_ip,
-                ts=ts,
-            )
-        )
-    if any(cmd.startswith("PUBLISH") for cmd in commands):
-        anomalies.append(
-            IndustrialAnomaly(
-                severity="LOW",
-                title="MQTT Publish",
-                description="MQTT PUBLISH message observed.",
-                src=src_ip,
-                dst=dst_ip,
-                ts=ts,
-            )
-        )
+    # Plain CONNECT and PUBLISH are normal MQTT operations — a broker capture
+    # has thousands of publishes, so a LOW anomaly per message floods the list
+    # and buries the notable findings (retained publishes, subscription changes,
+    # public-IP exposure — kept below). The CONNECT/PUBLISH volume is already in
+    # the command counters and command_events; not flagged per-message.
     if any(cmd.startswith("PUBLISH") and "retain" in cmd for cmd in commands):
         anomalies.append(
             IndustrialAnomaly(
@@ -274,22 +258,5 @@ def analyze_mqtt(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         enable_enrichment=True,
         show_status=show_status,
     )
-    public_endpoints = []
-    for ip_value in set(analysis.src_ips) | set(analysis.dst_ips):
-        try:
-            if ipaddress.ip_address(ip_value).is_global:
-                public_endpoints.append(ip_value)
-        except Exception:
-            continue
-    if public_endpoints and len(analysis.anomalies) < 200:
-        analysis.anomalies.append(
-            IndustrialAnomaly(
-                severity="HIGH",
-                title="MQTT Exposure to Public IP",
-                description=f"MQTT traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-                src="*",
-                dst="*",
-                ts=0.0,
-            )
-        )
+    append_public_exposure_anomaly(analysis, "MQTT")
     return analysis

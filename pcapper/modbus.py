@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_private_ip as _is_private_ip, packet_length, memoize_analysis
+from .utils import is_public_ip as _is_public_ip
 import math
+import re
 import struct
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -48,6 +50,13 @@ FUNC_NAMES = {
 
 WRITE_FUNCTIONS = {5, 6, 15, 16, 21, 22, 23}
 DIAGNOSTIC_FUNCTIONS = {8, 43}
+
+# FC8 (Diagnostics) sub-function codes that have operational/forensic impact.
+DANGEROUS_DIAG_SUBFUNCS = {
+    0x0001: "Restart Communications",
+    0x0004: "Force Listen-Only Mode",
+    0x000A: "Clear Counters & Diagnostic Register",
+}
 ENUMERATION_FUNCTIONS = {17, 43}
 
 WRITE_BASELINE_MIN = 10
@@ -213,20 +222,6 @@ def _bucketize_duration(duration: float) -> str:
         if low <= duration <= high:
             return label
     return ">30m"
-
-
-def _is_private_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_private
-    except Exception:
-        return False
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
 
 
 def _modbus_reg_type(func_code: int) -> Optional[str]:
@@ -404,11 +399,7 @@ def _parse_device_id_response(pdu: bytes) -> dict[str, str]:
     return fields
 
 
-def _parse_modbus_request_detail(func_code: int, pdu: bytes) -> str | None:
-    detail, _, _, _ = _parse_modbus_request_info(func_code, pdu)
-    return detail
-
-
+@memoize_analysis
 def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     if TCP is None:
         return ModbusAnalysis(
@@ -425,13 +416,6 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
             path=path,
             errors=[f"Error: {e}"],
         )
-    # Attempt to find file handle for progress
-    # for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-    #    candidate = getattr(reader, attr, None)
-    #    if candidate is not None:
-    #        stream = candidate
-    #        break
-
     total_packets = 0
     modbus_packets = 0
     total_bytes = 0
@@ -478,6 +462,7 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     write_events = Counter()
     exception_events = Counter()
     diagnostic_events = Counter()
+    dangerous_diag_events: Counter = Counter()
     enumeration_events = Counter()
     reserved_events = Counter()
     write_details: Dict[Tuple[str, int, str, str], str] = {}
@@ -488,6 +473,11 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     asset_write_targets: Dict[Tuple[str, int], Set[str]] = defaultdict(set)
     asset_write_counts: Counter[Tuple[str, int]] = Counter()
     write_target_anoms_seen: Set[str] = set()
+    # Cap distinct "new write target" anomalies per asset — a controller that
+    # legitimately writes hundreds of registers would otherwise emit one finding
+    # per range and flood the cap. After the cap we still count (see summary).
+    asset_write_anom_emitted: Counter[Tuple[str, int]] = Counter()
+    WRITE_TARGET_ANOM_CAP = 8
     last_values: Dict[Tuple[str, int, str, int], int] = {}
     value_changes: List[dict[str, object]] = []
 
@@ -505,7 +495,7 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                         pass
 
                 total_packets += 1
-                pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+                pkt_len = packet_length(pkt)
                 total_bytes += pkt_len
                 ts = safe_float(getattr(pkt, "time", 0))
                 if start_time is None:
@@ -519,9 +509,6 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
 
                 if pkt.haslayer(TCP):
                     has_tcp = True
-                    # Debug Check
-                    # print(f"DEBUG: Pkt {total_packets} TCP Sport={pkt[TCP].sport} Dport={pkt[TCP].dport}")
-
                     sport = int(pkt[TCP].sport)
                     dport = int(pkt[TCP].dport)
 
@@ -722,9 +709,12 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                             if (
                                                 anomaly_key
                                                 not in write_target_anoms_seen
+                                                and asset_write_anom_emitted[asset_key]
+                                                < WRITE_TARGET_ANOM_CAP
                                                 and len(anomalies) < max_anomalies
                                             ):
                                                 write_target_anoms_seen.add(anomaly_key)
+                                                asset_write_anom_emitted[asset_key] += 1
                                                 anomalies.append(
                                                     ModbusAnomaly(
                                                         severity="MEDIUM",
@@ -837,45 +827,23 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                                     }
                                                 )
                                             last_values[key] = value
-                                        else:
-                                            for idx in range(
-                                                min(int(qty or 0), max_values)
-                                            ):
-                                                start = idx * 2
-                                                if start + 2 > len(data):
-                                                    break
-                                                value = int.from_bytes(
-                                                    data[start : start + 2], "big"
-                                                )
-                                                target_idx = addr + idx
-                                                key = (
-                                                    dst_ip,
-                                                    unit_id,
-                                                    reg_type,
-                                                    target_idx,
-                                                )
-                                                prev = last_values.get(key)
-                                                if (
-                                                    prev is not None
-                                                    and prev != value
-                                                    and len(value_changes) < 200
-                                                ):
-                                                    value_changes.append(
-                                                        {
-                                                            "target": f"{dst_ip} Unit {unit_id} {reg_type}[{target_idx}]",
-                                                            "old": prev,
-                                                            "new": value,
-                                                            "src": src_ip,
-                                                            "dst": dst_ip,
-                                                            "ts": ts,
-                                                            "func": func_name,
-                                                        }
-                                                    )
-                                                last_values[key] = value
 
                             # Diagnostic functions can be risky
                             if original_func in DIAGNOSTIC_FUNCTIONS:
                                 diagnostic_events[(func_name, src_ip, dst_ip)] += 1
+                                # FC8 sub-functions that disrupt the slave or
+                                # erase forensic counters are high-signal
+                                # (Restart=ATT&CK T0816, Force Listen-Only=
+                                # denial of comms, Clear Counters=anti-forensics).
+                                if original_func == 8 and request_detail:
+                                    m = re.search(r"subfunc=0x([0-9a-fA-F]+)", request_detail)
+                                    if m:
+                                        sub = int(m.group(1), 16)
+                                        sub_label = DANGEROUS_DIAG_SUBFUNCS.get(sub)
+                                        if sub_label:
+                                            dangerous_diag_events[
+                                                (sub_label, src_ip, dst_ip)
+                                            ] += 1
 
                             if (
                                 original_func == 43
@@ -1090,6 +1058,24 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                         ts=0.0,
                     )
                 )
+
+    for (sub_label, src_ip, dst_ip), count in dangerous_diag_events.items():
+        if len(anomalies) >= max_anomalies:
+            break
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(
+            ModbusAnomaly(
+                severity="HIGH",
+                title="Modbus Diagnostic Control",
+                description=(
+                    f"FC8 diagnostic sub-function '{sub_label}'{suffix} — disrupts "
+                    "the slave or clears diagnostic counters (T0816/anti-forensics)."
+                ),
+                src=src_ip,
+                dst=dst_ip,
+                ts=0.0,
+            )
+        )
 
     for (func_name, src_ip, dst_ip), count in diagnostic_events.items():
         suffix = f" (x{count})" if count > 1 else ""

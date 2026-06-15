@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .utils import read_ber_length as _read_ber_length
 import ipaddress
 import os
 import re
@@ -10,8 +11,10 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .bacnet import BACNET_PORT
-from .cip import ENIP_COMMANDS
+from .cip import ENIP_COMMANDS, analyze_cip
 from .creds import analyze_creds
+from .enip import analyze_enip
+from .remote_access import analyze_remote_access
 from .dnp3 import DNP3_PORT, analyze_dnp3
 from .dns import _vt_lookup_domains
 from .files import analyze_files
@@ -263,6 +266,8 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
     first_seen = None
     last_seen = None
     category_counts: Counter[str] = Counter()
+    peer_counts: Counter[str] = Counter()
+    port_counts: Counter[int] = Counter()
     ot_protocol_counts: Counter[str] = Counter()
     ot_activity_bins: dict[str, list[int]] = {}
     ot_bin_count = 0
@@ -539,34 +544,8 @@ EMAIL_PORT_SERVICES: dict[int, str] = {
     993: "IMAPS",
 }
 
-OT_PORT_PROTOCOLS: dict[int, str] = {
-    MODBUS_TCP_PORT: "Modbus",
-    DNP3_PORT: "DNP3",
-    IEC104_PORT: "IEC-104",
-    S7_PORT: "S7",
-    44818: "ENIP",
-    2222: "CIP",
-    BACNET_PORT: "BACnet",
-    OPC_UA_PORT: "OPC UA",
-    1911: "Niagara Fox",
-    4911: "Niagara Fox",
-    9600: "FINS",
-    5094: "HART-IP",
-    18245: "SRTP",
-    18246: "SRTP",
-    1962: "PCWorx",
-    5006: "MELSEC",
-    5007: "MELSEC",
-    20547: "ProConOS",
-    2455: "CODESYS",
-    1217: "CODESYS",
-    5683: "CoAP",
-    5684: "CoAP",
-    1502: "Triconex/SIS",
-}
-
-for _port in PROFINET_PORTS:
-    OT_PORT_PROTOCOLS[_port] = "PROFINET"
+# Canonical OT port map now lives in ot_ports.py (shared with hostname.py).
+from .ot_ports import OT_PORT_PROTOCOLS  # noqa: E402
 
 OT_CATEGORIES = {
     "Modbus",
@@ -1148,14 +1127,6 @@ def _dnp3_frame_seen(payload: bytes | None) -> bool:
     return payload.find(b"\x05\x64") != -1
 
 
-def _s7comm_seen(payload: bytes | None) -> bool:
-    if not payload:
-        return False
-    if len(payload) >= 4 and payload[:2] == b"\x03\x00":
-        return b"\x32" in payload
-    return False
-
-
 def _ts_bucket_ms(ts: float | None) -> int | None:
     if ts is None:
         return None
@@ -1205,7 +1176,7 @@ def _format_s7_timeline_command(command: str) -> tuple[str, str | None]:
 
 def _extract_ip_candidates(text: str) -> set[str]:
     candidates: set[str] = set()
-    for token in re.findall(r"(?:\\d{1,3}\\.){3}\\d{1,3}", text):
+    for token in re.findall(r"(?:\d{1,3}\.){3}\d{1,3}", text):
         candidates.add(token)
     return candidates
 
@@ -1364,115 +1335,6 @@ def _compute_ot_storyline(
     return storyline
 
 
-def _first_ts_for_category(
-    events: list[TimelineEvent], category: str
-) -> Optional[float]:
-    timestamps = [
-        event.ts
-        for event in events
-        if event.category == category and event.ts is not None
-    ]
-    return min(timestamps) if timestamps else None
-
-
-def _extract_event_ips(text: str) -> list[str]:
-    found: list[str] = []
-    for token in re.findall(r"(?:\d{1,3}\.){3}\d{1,3}", text):
-        if token not in found:
-            found.append(token)
-    return found
-
-
-def _extract_event_flow(
-    event: TimelineEvent, target_ip: str
-) -> tuple[str | None, str | None, int | None]:
-    details = event.details
-    match = re.search(
-        r"((?:\d{1,3}\.){3}\d{1,3})\s*->\s*((?:\d{1,3}\.){3}\d{1,3})(?::(\d+))?",
-        details,
-    )
-    if not match:
-        return None, None, None
-    src, dst, port_text = match.group(1), match.group(2), match.group(3)
-    port = int(port_text) if port_text and port_text.isdigit() else None
-    actor = src
-    peer = dst
-    if src == target_ip:
-        actor, peer = src, dst
-    elif dst == target_ip:
-        actor, peer = dst, src
-    return actor, peer, port
-
-
-def _classify_timeline_stage(event: TimelineEvent) -> str | None:
-    text = f"{event.category} {event.summary} {event.details}".lower()
-    if any(
-        token in text
-        for token in (
-            "scan",
-            "recon",
-            "probe",
-            "icmp",
-            "nbns",
-            "mdns",
-            "potential port scan",
-        )
-    ):
-        return "Recon"
-    if any(
-        token in text
-        for token in (
-            "auth",
-            "login",
-            "kerberos",
-            "ntlm",
-            "ldap",
-            "domain service",
-            "credential",
-            "password",
-            "user ",
-        )
-    ):
-        return "Access"
-    if any(
-        token in text
-        for token in (
-            "powershell",
-            "wmic",
-            "winrm",
-            "telnet command",
-            "execute",
-            "cmd.exe",
-            "rundll32",
-            "mshta",
-        )
-    ):
-        return "Execution"
-    if any(token in text for token in ("beacon", "c2", "command and control")):
-        return "C2"
-    if any(
-        token in text
-        for token in ("http post", "stor ", "appe ", "upload", "file artifact", "exfil")
-    ):
-        return "Exfil"
-    if event.category in OT_CATEGORIES and any(
-        token in text
-        for token in (
-            "write",
-            "setpoint",
-            "program",
-            "firmware",
-            "start",
-            "stop",
-            "trip",
-            "shutdown",
-            "operate",
-        )
-    ):
-        return "Impact"
-    return None
-
-
 def _build_timeline_enrichment(
     events: list[TimelineEvent],
     target_ip: str,
@@ -1480,23 +1342,116 @@ def _build_timeline_enrichment(
     ot_risk_score: int,
     ot_risk_findings: list[str],
 ) -> dict[str, object]:
-    _ = (events, target_ip, file_downloads, ot_risk_score, ot_risk_findings)
-    return {}
+    _ = (target_ip,)
+    checks: dict[str, list[str]] = defaultdict(list)
 
-def _read_ber_length(payload: bytes, offset: int) -> tuple[Optional[int], int]:
-    if offset >= len(payload):
-        return None, offset
-    first = payload[offset]
-    offset += 1
-    if first < 0x80:
-        return first, offset
-    num_bytes = first & 0x7F
-    if num_bytes == 0 or offset + num_bytes > len(payload):
-        return None, offset
-    length = int.from_bytes(payload[offset : offset + num_bytes], "big")
-    offset += num_bytes
-    return length, offset
+    # OT impact: the pre-computed OT attack-posture findings for this host.
+    for finding in ot_risk_findings or []:
+        checks["ot_impact_signal"].append(str(finding))
 
+    # Remote-execution / admin tooling aimed at this host (mined from the event
+    # stream). PowerShell remoting, WMIC and WinRM are classic lateral-movement
+    # / remote-code-execution channels; Telnet is cleartext remote admin.
+    _exec_cats = {"PowerShell", "WMIC", "WinRM"}
+    for ev in events or []:
+        cat = str(getattr(ev, "category", "") or "")
+        summ = str(getattr(ev, "summary", "") or "")
+        if cat in _exec_cats:
+            checks["remote_execution_tooling"].append(f"{cat}: {summ}"[:160])
+        elif cat == "Telnet":
+            checks["cleartext_remote_admin"].append(f"{cat}: {summ}"[:160])
+
+    # Access -> execution: executable/script payloads delivered to the host.
+    _risky_exts = (
+        ".exe", ".dll", ".scr", ".ps1", ".vbs", ".js", ".hta", ".jar",
+        ".bat", ".cmd", ".msi", ".elf", ".apk", ".bin",
+    )
+    _exec_types = ("EXE", "DLL", "ELF", "MACHO", "MSI")
+    for d in file_downloads or []:
+        ftype = str(getattr(d, "file_type", "") or "").upper()
+        fname = str(getattr(d, "filename", "") or "").lower()
+        if any(t in ftype for t in _exec_types) or fname.endswith(_risky_exts):
+            checks["access_to_execution_sequence"].append(
+                f"{getattr(d, 'filename', '?')} ({getattr(d, 'file_type', '?')}) from {getattr(d, 'src_ip', '?')}"
+            )
+
+    provenance = []
+    if events:
+        provenance.append(f"timeline events ({len(events)})")
+    if file_downloads:
+        provenance.append(f"file downloads ({len(file_downloads)})")
+    if ot_risk_score:
+        provenance.append(f"OT risk posture {ot_risk_score}/100")
+    if provenance:
+        checks["evidence_provenance"].append("; ".join(provenance))
+
+    score = 0
+    reasons: list[str] = []
+    try:
+        ot_score = int(ot_risk_score or 0)
+    except Exception:
+        ot_score = 0
+    if ot_score >= 50:
+        score += 3
+        reasons.append(f"High OT attack-posture score ({ot_score}/100)")
+    elif ot_score >= 20:
+        score += 2
+        reasons.append(f"Elevated OT attack-posture score ({ot_score}/100)")
+    elif ot_score >= 1:
+        score += 1
+        reasons.append(f"OT attack-posture indicators present ({ot_score}/100)")
+    if checks.get("access_to_execution_sequence"):
+        score += 2
+        reasons.append("Executable/script payload delivered to the host (access -> execution)")
+    if checks.get("remote_execution_tooling"):
+        score += 2
+        reasons.append("Remote-execution/admin tooling targeting the host (PowerShell/WMIC/WinRM)")
+    if checks.get("cleartext_remote_admin"):
+        score += 1
+        reasons.append("Cleartext remote administration (Telnet) observed")
+
+    if score >= 6:
+        verdict = "YES - high-confidence attack storyline (OT impact / payload execution) is present for this host."
+        confidence = "high"
+    elif score >= 4:
+        verdict = "LIKELY - an attack storyline with multiple kill-chain stages is present for this host."
+        confidence = "medium"
+    elif score >= 2:
+        verdict = "POSSIBLE - notable attack-chain activity observed for this host; corroboration recommended."
+        confidence = "low"
+    elif score >= 1:
+        verdict = "LOW SIGNAL - minor attack-chain indicators present for this host."
+        confidence = "low"
+    else:
+        verdict = ""
+        confidence = "low"
+    if not reasons and verdict:
+        reasons.append("Timeline kill-chain heuristics crossed threshold")
+
+    _risk_meta = {
+        "ot_impact_signal": ("OT Impact", "High"),
+        "access_to_execution_sequence": ("Payload Execution", "High"),
+        "remote_execution_tooling": ("Remote Execution Tooling", "High"),
+        "cleartext_remote_admin": ("Cleartext Remote Admin", "Medium"),
+    }
+    risk_matrix = [
+        {
+            "category": cat,
+            "risk": risk,
+            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
+            "evidence": f"{len(checks.get(key, []))} signal(s)",
+        }
+        for key, (cat, risk) in _risk_meta.items()
+        if checks.get(key)
+    ]
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons,
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
+        "risk_matrix": risk_matrix,
+    }
 
 def _icmp_label(pkt) -> str | None:
     if ICMP is not None and pkt.haslayer(ICMP):  # type: ignore[truthy-bool]
@@ -1701,6 +1656,38 @@ def analyze_timeline(
                 source=source,
             )
         )
+
+    def _emit_ot_summary_events(
+        summary, category: str, source: str, *, include_artifacts: bool = True
+    ) -> None:
+        """Emit timeline events from any IndustrialAnalysis-shaped summary
+        (anomalies + artifacts), filtered to the target host. Shared by the
+        CIP/ENIP/DNP3/IEC-104/S7 blocks so the per-protocol code stays DRY.
+        `include_artifacts=False` skips artifacts (used for CIP, whose ENIP-layer
+        artifacts are already emitted by the ENIP block)."""
+        errors.extend(getattr(summary, "errors", []) or [])
+        for anomaly in getattr(summary, "anomalies", []) or []:
+            if anomaly.src != target_ip and anomaly.dst != target_ip:
+                continue
+            _emit_event(
+                ts=anomaly.ts,
+                category=category,
+                summary=anomaly.title,
+                details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
+                source=source,
+            )
+        if not include_artifacts:
+            return
+        for artifact in getattr(summary, "artifacts", []) or []:
+            if artifact.src != target_ip and artifact.dst != target_ip:
+                continue
+            _emit_event(
+                ts=artifact.ts,
+                category=category,
+                summary=f"{category} artifact ({artifact.kind})",
+                details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
+                source=source,
+            )
 
     domain_ports = {88, 464, 445, 139, 135, 593, 3268, 3269}
     ldap_ports = {389, 636, 3268, 3269}
@@ -2972,27 +2959,7 @@ def analyze_timeline(
 
     if "IEC-104" in ot_protocol_counts:
         iec_summary = _busy("IEC-104", analyze_iec104, path, show_status=False)
-        errors.extend(iec_summary.errors)
-        for anomaly in iec_summary.anomalies:
-            if anomaly.src != target_ip and anomaly.dst != target_ip:
-                continue
-            _emit_event(
-                ts=anomaly.ts,
-                category="IEC-104",
-                summary=anomaly.title,
-                details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
-                source="iec104",
-            )
-        for artifact in iec_summary.artifacts:
-            if artifact.src != target_ip and artifact.dst != target_ip:
-                continue
-            _emit_event(
-                ts=artifact.ts,
-                category="IEC-104",
-                summary=f"IEC-104 artifact ({artifact.kind})",
-                details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
-                source="iec104",
-            )
+        _emit_ot_summary_events(iec_summary, "IEC-104", "iec104")
         if iec_summary.command_events:
             seen_cmds: set[tuple[str, str, str, int]] = set()
             for cmd_event in iec_summary.command_events:
@@ -3017,27 +2984,7 @@ def analyze_timeline(
 
     if "S7" in ot_protocol_counts:
         s7_summary = _busy("S7", analyze_s7, path, show_status=False)
-        errors.extend(s7_summary.errors)
-        for anomaly in s7_summary.anomalies:
-            if anomaly.src != target_ip and anomaly.dst != target_ip:
-                continue
-            _emit_event(
-                ts=anomaly.ts,
-                category="S7",
-                summary=anomaly.title,
-                details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
-                source="s7",
-            )
-        for artifact in s7_summary.artifacts:
-            if artifact.src != target_ip and artifact.dst != target_ip:
-                continue
-            _emit_event(
-                ts=artifact.ts,
-                category="S7",
-                summary=f"S7 artifact ({artifact.kind})",
-                details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
-                source="s7",
-            )
+        _emit_ot_summary_events(s7_summary, "S7", "s7")
         if s7_summary.command_events:
             seen_cmds: set[tuple[str, str, str, int | None]] = set()
             for cmd_event in s7_summary.command_events:
@@ -3068,6 +3015,41 @@ def analyze_timeline(
                     dedupe_key=("s7-cmd",) + key,
                     source="s7",
                 )
+
+    # EtherNet/IP encapsulation activity (RegisterSession, ListIdentity,
+    # SendRRData/SendUnitData) on TCP 44818 / UDP 2222.
+    if "ENIP" in ot_protocol_counts:
+        enip_summary = _busy("ENIP", analyze_enip, path, show_status=False)
+        _emit_ot_summary_events(enip_summary, "ENIP", "enip")
+
+    # CIP service operations (Read/Write Tag, Reset, Program up/download, etc.)
+    # are carried inside ENIP on 44818, so analyze whenever either is present.
+    # Only emit CIP *anomalies* (the service-layer operations/threats) -- the
+    # ENIP-layer session/CPF/cip_object artifacts are already covered above.
+    if "CIP" in ot_protocol_counts or "ENIP" in ot_protocol_counts:
+        cip_summary = _busy("CIP", analyze_cip, path, show_status=False)
+        _emit_ot_summary_events(cip_summary, "CIP", "cip", include_artifacts=False)
+
+    # Inbound remote-access connections TO the target host (SSH/RDP/Telnet/etc.).
+    # A remote foothold landing on a host that then issues OT commands is the
+    # classic IT->OT pivot, so these are flagged high-risk (external = CRITICAL).
+    ra_summary = _busy("RemoteAccess", analyze_remote_access, path, show_status=False)
+    errors.extend(ra_summary.errors)
+    for sess in ra_summary.sessions:
+        if sess.server_ip != target_ip:
+            continue
+        sev = "CRITICAL" if sess.external else "HIGH"
+        scope = "external/public" if sess.external else "internal"
+        _emit_event(
+            ts=sess.ts,
+            category="Remote IN",
+            summary=f"Inbound {sess.proto} remote access ({sev}: {scope} source)",
+            details=(
+                f"{sess.client_ip} -> {sess.server_ip}:{sess.port} ({sess.proto}) "
+                "established"
+            ),
+            source="remote_access",
+        )
 
     if categories is not None:
         if invert_categories:

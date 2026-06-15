@@ -10,7 +10,8 @@ from typing import Optional
 
 from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .utils import beacon_score as _beaconing_score
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -163,23 +164,51 @@ AUTH_METHODS = {
     "none",
 }
 
+# Only genuinely obsolete/broken algorithms that a current, securely-configured
+# endpoint does NOT offer. The detection matches against the *offered* KEXINIT
+# name-lists, and modern OpenSSH still offers diffie-hellman-group14-sha1,
+# aes*-cbc, hmac-sha1 and ssh-rsa for backward compatibility — flagging those
+# fired "Weak SSH algorithms" on essentially every OpenSSH handshake. (Assessing
+# the actually-negotiated algorithm would be stronger; that needs per-direction
+# KEXINIT tracking and is noted for a future pass.)
 WEAK_ALGOS = {
     "diffie-hellman-group1-sha1",
-    "diffie-hellman-group14-sha1",
-    "diffie-hellman-group-exchange-sha1",
-    "ssh-rsa",
     "3des-cbc",
+    "des-cbc",
+    "blowfish-cbc",
+    "cast128-cbc",
     "arcfour",
-    "hmac-sha1",
+    "arcfour128",
+    "arcfour256",
     "hmac-md5",
-    "aes128-cbc",
-    "aes192-cbc",
-    "aes256-cbc",
+    "hmac-md5-96",
+    "none",
+    "ssh-dss",
+}
+
+# SSH client banners that indicate a scripted/library client rather than an
+# interactive human admin. Legitimate automation uses these too, so this is a
+# context signal (info/warning), but malware, C2 frameworks, brute-forcers and
+# automated lateral-movement tooling overwhelmingly ride non-OpenSSH libraries.
+SSH_AUTOMATION_CLIENTS = {
+    "paramiko": "Python paramiko (scripted)",
+    "asyncssh": "Python AsyncSSH (scripted)",
+    "libssh": "libssh (library/tooling)",
+    "libssh2": "libssh2 (library/tooling)",
+    "go": "Go x/crypto/ssh (tooling — common in offensive tools)",
+    "russh": "Rust russh (tooling)",
+    "thrussh": "Rust thrussh (tooling)",
+    "renci.sshnet": "SSH.NET (.NET scripted)",
+    "ssh.net": "SSH.NET (.NET scripted)",
+    "jsch": "JSch (Java scripted)",
+    "phpseclib": "phpseclib (PHP scripted)",
+    "node": "Node ssh2 (scripted)",
+    "warp": "WarpSSH",
 }
 
 SUSPICIOUS_PLAINTEXT = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential indicator"),
-    (re.compile(r"user(name)?\s*[:=]", re.IGNORECASE), "User indicator"),
+    (re.compile(r"(?<![\w-])user(name)?\s*[:=]\s*\S", re.IGNORECASE), "User indicator"),
     (re.compile(r"ssh-rsa|ssh-ed25519", re.IGNORECASE), "SSH key material"),
     (re.compile(r"BEGIN OPENSSH PRIVATE KEY", re.IGNORECASE), "Private key material"),
     (re.compile(r"scp\s+|sftp\s+", re.IGNORECASE), "File transfer tooling"),
@@ -657,46 +686,6 @@ class _SessionState:
     saw_kexinit: bool = False
 
 
-def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance**0.5
-    if avg < 5 or avg > 86400:
-        return None
-    if stddev > max(5.0, avg * 0.25):
-        return None
-    return {"avg": avg, "stddev": stddev}
-
-
-def _extract_ascii_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> list[str]:
-    results: list[str] = []
-    if not data:
-        return results
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
 def _extract_version(text: str) -> Optional[str]:
     match = SSH_BANNER_RE.search(text)
     if not match:
@@ -984,6 +973,7 @@ def _scan_plaintext(
             artifacts.append(item)
 
 
+@memoize_analysis
 def analyze_ssh(
     path: Path,
     show_status: bool = True,
@@ -1141,7 +1131,7 @@ def analyze_ssh(
 
             pkt_index += 1
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
@@ -1612,6 +1602,59 @@ def analyze_ssh(
                         "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
                     }
                 )
+
+    # Flag scripted/library SSH clients (paramiko, Go, libssh, ...). One match
+    # is logged per software string with the connection count so an analyst can
+    # tell scripted automation/C2 from interactive OpenSSH/PuTTY admin sessions.
+    for software, count in client_software.items():
+        software_l = software.lower()
+        label = next(
+            (
+                desc
+                for marker, desc in SSH_AUTOMATION_CLIENTS.items()
+                if marker in software_l
+            ),
+            None,
+        )
+        if label:
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "Scripted/library SSH client",
+                    "details": (
+                        f"{software} — {label}; {count} connection(s). "
+                        "Non-interactive SSH clients are common in automation but "
+                        "also in brute-forcers, C2 and lateral-movement tooling."
+                    ),
+                }
+            )
+
+    # A scripted/library SSH *server* is a stronger signal — production SSH
+    # daemons are OpenSSH/dropbear/Cisco, so a paramiko/AsyncSSH/Go/libssh
+    # server banner points to a reverse-shell implant, honeypot, or custom tool.
+    for software, count in server_software.items():
+        software_l = software.lower()
+        label = next(
+            (
+                desc
+                for marker, desc in SSH_AUTOMATION_CLIENTS.items()
+                if marker in software_l
+            ),
+            None,
+        )
+        if label:
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Scripted/library SSH server (possible reverse shell/implant)",
+                    "details": (
+                        f"{software} — {label} acting as an SSH server; "
+                        f"{count} connection(s). Production SSH servers are "
+                        "OpenSSH/dropbear — a library server suggests a reverse "
+                        "shell, custom implant, or honeypot."
+                    ),
+                }
+            )
 
     total_sessions = len(conversations)
 

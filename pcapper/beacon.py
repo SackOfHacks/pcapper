@@ -11,7 +11,7 @@ from .dns import analyze_dns
 from .http import analyze_http
 from .pcap_cache import get_reader
 from .services import COMMON_PORTS
-from .utils import extract_packet_endpoints, safe_float
+from .utils import extract_packet_endpoints, packet_length, safe_float, memoize_analysis
 
 try:
     from scapy.layers.inet import ICMP, IP, TCP, UDP  # type: ignore
@@ -115,6 +115,11 @@ class BeaconCandidate:
     last_seen: Optional[float]
     timeline: list[int]
     packet_samples: list[int]
+    # Established handshake ratio (TCP; 1.0 for connectionless protocols) and
+    # total application payload bytes across the flow. established_ratio≈0 with
+    # data_bytes==0 means failed/refused connection attempts, not a data channel.
+    established_ratio: float = 1.0
+    data_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -150,22 +155,22 @@ def _flow_key(pkt) -> Optional[tuple[str, str, str, Optional[int], Optional[int]
 
     if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
         layer = pkt[TCP]  # type: ignore[index]
-        return (
-            src_ip,
-            dst_ip,
-            "TCP",
-            int(getattr(layer, "sport", 0)),
-            int(getattr(layer, "dport", 0)),
-        )
+        # Drop the EPHEMERAL port (keep only the stable service port). HTTP/TCP
+        # C2 opens a fresh connection per check-in (new client sport each time);
+        # keying on the 4-tuple split every beacon into a 1-event flow, so
+        # reconnecting beacons (Ursnif, most HTTP C2) were never detected.
+        sport = int(getattr(layer, "sport", 0))
+        dport = int(getattr(layer, "dport", 0))
+        if sport > dport:
+            return (src_ip, dst_ip, "TCP", None, dport)
+        return (src_ip, dst_ip, "TCP", sport, None)
     if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
         layer = pkt[UDP]  # type: ignore[index]
-        return (
-            src_ip,
-            dst_ip,
-            "UDP",
-            int(getattr(layer, "sport", 0)),
-            int(getattr(layer, "dport", 0)),
-        )
+        sport = int(getattr(layer, "sport", 0))
+        dport = int(getattr(layer, "dport", 0))
+        if sport > dport:
+            return (src_ip, dst_ip, "UDP", None, dport)
+        return (src_ip, dst_ip, "UDP", sport, None)
     if ICMP is not None and pkt.haslayer(ICMP):  # type: ignore[truthy-bool]
         return (src_ip, dst_ip, "ICMP", None, None)
 
@@ -180,20 +185,6 @@ def _flow_key(pkt) -> Optional[tuple[str, str, str, Optional[int], Optional[int]
         return (src_ip, dst_ip, label, None, None)
 
     return (src_ip, dst_ip, "IP", None, None)
-
-
-def _flow_key_bidirectional(
-    pkt,
-) -> Optional[tuple[str, str, str, Optional[int], Optional[int]]]:
-    key = _flow_key(pkt)
-    if not key:
-        return None
-    src_ip, dst_ip, proto, sport, dport = key
-    a, b = sorted([src_ip, dst_ip])
-    ports = [p for p in (sport, dport) if p is not None]
-    min_port = min(ports) if ports else None
-    max_port = max(ports) if ports else None
-    return (a, b, proto, min_port, max_port)
 
 
 def _normalize_pair(src_ip: str, dst_ip: str) -> tuple[str, str]:
@@ -211,10 +202,15 @@ def _normalize_pair(src_ip: str, dst_ip: str) -> tuple[str, str]:
     return dst_ip, src_ip
 
 
-def _compute_stats(timestamps: list[float]) -> tuple[float, float, float]:
+def _compute_stats(
+    timestamps: list[float], deltas: list[float] | None = None
+) -> tuple[float, float, float]:
     if len(timestamps) < 2:
         return 0.0, 0.0, 0.0
-    deltas = [b - a for a, b in zip(timestamps, timestamps[1:]) if b >= a]
+    # Reuse caller-supplied inter-arrival deltas when available (the beacon loop
+    # already computes them) to avoid recomputing the same list per flow.
+    if deltas is None:
+        deltas = [b - a for a, b in zip(timestamps, timestamps[1:]) if b >= a]
     if not deltas:
         return 0.0, 0.0, 0.0
     mean = sum(deltas) / len(deltas)
@@ -285,6 +281,7 @@ def _burst_sleep_score(timeline: list[int]) -> float:
     return (0.6 * burstiness) + (0.4 * sleepiness)
 
 
+@memoize_analysis
 def analyze_beacons(
     path: Path, show_status: bool = True, min_events: int = 20
 ) -> BeaconSummary:
@@ -349,6 +346,16 @@ def analyze_beacons(
     conn_bytes: dict[tuple[str, str, str, Optional[int], Optional[int]], int] = (
         defaultdict(int)
     )
+    # Application payload bytes per connection (TCP segment data, both
+    # directions), and whether the handshake completed (a server SYN-ACK was
+    # seen). These let us tell a real data-bearing beacon from failed/refused
+    # connection attempts (SYN-only, no payload) - which otherwise score
+    # identically because the SYN/RST frame overhead is perfectly periodic and
+    # perfectly stable in size.
+    conn_data_bytes: dict[tuple[str, str, str, Optional[int], Optional[int]], int] = (
+        defaultdict(int)
+    )
+    conn_established: set[tuple[str, str, str, Optional[int], Optional[int]]] = set()
     total_packets = 0
 
     try:
@@ -365,16 +372,30 @@ def analyze_beacons(
             ts = safe_float(getattr(pkt, "time", None))
             if ts is None:
                 continue
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            # packet_length() reads len(pkt.original) (~50x faster than len(pkt),
+            # which re-serializes the packet) - matters in this per-packet loop.
+            pkt_len = packet_length(pkt)
 
             if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 tcp_layer = pkt[TCP]  # type: ignore[index]
                 flags = getattr(tcp_layer, "flags", None)
                 is_syn = False
-                if isinstance(flags, str):
+                is_synack = False
+                # scapy exposes TCP flags as a FlagValue (not a plain int/str),
+                # so isinstance(flags, int) is False - int(flags) coerces it
+                # (FlagValue, int, and bool all work); a str fallback covers
+                # "SA"-style flag strings.
+                flag_int = None
+                try:
+                    flag_int = int(flags)
+                except Exception:
+                    flag_int = None
+                if flag_int is not None:
+                    is_syn = (flag_int & 0x02) != 0 and (flag_int & 0x10) == 0
+                    is_synack = (flag_int & 0x02) != 0 and (flag_int & 0x10) != 0
+                elif isinstance(flags, str):
                     is_syn = "S" in flags and "A" not in flags
-                elif isinstance(flags, int):
-                    is_syn = (flags & 0x02) != 0 and (flags & 0x10) == 0
+                    is_synack = "S" in flags and "A" in flags
                 key = _flow_key(pkt)
                 if not key:
                     continue
@@ -392,6 +413,15 @@ def analyze_beacons(
                     conn_first_ts[conn_key] = ts
                     conn_first_idx[conn_key] = pkt_index
                 conn_bytes[conn_key] += pkt_len
+                seg_len = 0
+                try:
+                    seg_len = len(tcp_layer.payload)
+                except Exception:
+                    seg_len = 0
+                if seg_len:
+                    conn_data_bytes[conn_key] += int(seg_len)
+                if is_synack:
+                    conn_established.add(conn_key)
                 if is_syn:
                     conn_syn_ts[conn_key] = ts
                     conn_syn_idx[conn_key] = pkt_index
@@ -440,12 +470,23 @@ def analyze_beacons(
 
     candidates: list[BeaconCandidate] = []
 
+    # Per-TCP-session handshake/payload accounting, so a flow of failed/refused
+    # connection attempts is distinguished from a real data-bearing beacon.
+    session_tcp_established: dict[tuple[str, str, str, Optional[int]], int] = defaultdict(int)
+    session_tcp_total: dict[tuple[str, str, str, Optional[int]], int] = defaultdict(int)
+
     for conn_key, first_ts in conn_first_ts.items():
         client_ip, server_ip, proto, server_port, _client_port = conn_key
         session_key = (client_ip, server_ip, proto, server_port)
         ts = conn_syn_ts.get(conn_key, first_ts)
         session_conn_times[session_key].append(ts)
-        session_conn_sizes[session_key].append(conn_bytes.get(conn_key, 0))
+        # Size is the connection's application payload, not total frame bytes:
+        # SYN/RST overhead would otherwise make a refused-connection flow look
+        # like a perfectly stable-sized data channel (size score 1.0).
+        session_conn_sizes[session_key].append(conn_data_bytes.get(conn_key, 0))
+        session_tcp_total[session_key] += 1
+        if conn_key in conn_established:
+            session_tcp_established[session_key] += 1
         pkt_idx = conn_syn_idx.get(conn_key, conn_first_idx.get(conn_key))
         if (
             pkt_idx is not None
@@ -524,12 +565,59 @@ def analyze_beacons(
         long_duration = (
             (times_sorted[-1] - times_sorted[0]) if len(times_sorted) >= 2 else 0.0
         )
-        if len(times_sorted) < min_events and long_duration < 1800:
+
+        # Established-handshake ratio and payload total for this flow.
+        data_bytes_total = int(sum(int(v) for v in sizes)) if sizes else 0
+        if proto == "TCP":
+            tcp_total = session_tcp_total.get((src_ip, dst_ip, proto, sport), 0)
+            tcp_est = session_tcp_established.get((src_ip, dst_ip, proto, sport), 0)
+            established_ratio = (tcp_est / tcp_total) if tcp_total else 0.0
+        else:
+            # Connectionless protocols have no handshake; datagrams carry payload.
+            established_ratio = 1.0
+
+        # A periodic, *established*, data-bearing flow crossing to a public peer
+        # is the highest-confidence beacon shape, so accept it at a lower event
+        # count than the generic threshold (a 9-request HTTP C2 check-in is a
+        # real beacon even though it is below min_events). Failed/refused
+        # connection attempts do NOT get this relaxation.
+        # Lightweight cadence check (full stats computed below) so a SMALL number
+        # of very regularly-spaced check-ins can be accepted — short captures of
+        # real C2 (e.g. Ursnif POSTs ~every 5 min) only contain 4-8 beacons.
+        # Computed once here and reused for the low-count gate, _compute_stats,
+        # and the interval metrics below (was recomputed three times per flow).
+        deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b >= a]
+        _lc_med = _median(deltas) if deltas else 0.0
+        _lc_mad = _mad(deltas, _lc_med) if deltas else 0.0
+        _lc_periodicity = (
+            max(0.0, 1.0 - min(1.0, _lc_mad / _lc_med)) if _lc_med > 0 else 0.0
+        )
+        high_conf_external_data = (
+            (_is_public(src_ip) or _is_public(dst_ip))
+            and established_ratio >= 0.5
+            and data_bytes_total > 0
+            and (
+                len(times_sorted) >= 8
+                # A handful of tightly-periodic data check-ins to a public peer
+                # is a real low-volume C2 beacon (Ursnif-class). Require a
+                # C2-like interval (>=60s) so sub-30s page-load/CDN bursts don't
+                # qualify on coincidental regularity.
+                or (
+                    len(times_sorted) >= 4
+                    and _lc_periodicity >= 0.8
+                    and _lc_med >= 60.0
+                )
+            )
+        )
+        if (
+            len(times_sorted) < min_events
+            and long_duration < 1800
+            and not high_conf_external_data
+        ):
             continue
-        mean, std, jitter = _compute_stats(times_sorted)
+        mean, std, jitter = _compute_stats(times_sorted, deltas=deltas)
         if mean <= 0:
             continue
-        deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b >= a]
         interval_range = (max(deltas) - min(deltas)) if deltas else 0.0
         median_interval = _median(deltas)
         mad_interval = _mad(deltas, median_interval)
@@ -639,6 +727,8 @@ def analyze_beacons(
                 last_seen=times_sorted[-1],
                 timeline=_timeline(times_sorted),
                 packet_samples=packet_samples,
+                established_ratio=round(float(established_ratio), 3),
+                data_bytes=data_bytes_total,
             )
         )
 

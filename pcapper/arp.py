@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import ipaddress
 import math
 import re
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import is_private_ip as _is_private_ipv4, memoize_analysis, safe_float
 
 try:
     from scapy.layers.l2 import ARP, Ether  # type: ignore
@@ -181,13 +182,7 @@ def _is_virtual_mac(mac: str) -> bool:
     return any(lower.startswith(prefix) for prefix in _VIRTUAL_MAC_PREFIXES)
 
 
-def _is_private_ipv4(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_private
-    except Exception:
-        return False
-
-
+@memoize_analysis
 def analyze_arp(
     path: Path,
     show_status: bool = True,

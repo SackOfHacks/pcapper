@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_public_ip as _is_public_ip, extract_ascii_strings as _extract_ascii_strings
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -11,7 +11,7 @@ from .dns import analyze_dns
 from .files import analyze_files
 from .pcap_cache import PcapMeta, get_reader
 from .progress import run_with_busy_status
-from .utils import counter_inc, decode_payload, safe_float, set_add_cap, extract_packet_endpoints
+from .utils import counter_inc, decode_payload, extract_packet_endpoints, memoize_analysis, safe_float, set_add_cap
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -68,6 +68,23 @@ LDAP_RESULT_CODES = {
 }
 
 LDAP_RESULT_NAMES = {name.lower(): name for name in LDAP_RESULT_CODES.values()}
+
+# LDAP result codes live in the BER bytes as an ENUMERATED integer, not as the
+# ASCII text "invalidCredentials"/"resultCode" — so the string heuristics never
+# match real binary LDAP and bind-failure/brute-force detection was dead. Each
+# response protocolOp (bindResponse [APPLICATION 1]=0x61, searchResultDone=0x65,
+# modifyResponse=0x67, addResponse=0x69, delResponse=0x6b, modDNResponse=0x6d,
+# compareResponse=0x6f, extendedResponse=0x78) begins with resultCode as the
+# first ENUMERATED field (0x0a 0x01 <code>).
+_LDAP_RESP_RE = re.compile(
+    rb"[\x61\x65\x67\x69\x6b\x6d\x6f\x78](?:[\x00-\x7f]|\x81.|\x82..)\x0a\x01(.)",
+    re.DOTALL,
+)
+
+
+def _ldap_result_codes_from_payload(payload: bytes) -> list[int]:
+    """Decode LDAP response result codes from raw BER bytes."""
+    return [m.group(1)[0] for m in _LDAP_RESP_RE.finditer(payload)]
 
 DN_TOKEN_RE = re.compile(
     r"(?i)\b(?:cn|ou|dc|uid|sn|givenname|displayname|o|c|l|st|samaccountname|userprincipalname|mail|member|memberof|dnshostname|serviceprincipalname)\s*=\s*[^,;]+"
@@ -188,25 +205,6 @@ def _parse_http_request(
         return None, None, None
 
 
-def _extract_ascii_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> List[str]:
-    results: List[str] = []
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = decode_payload(current, encoding="latin-1")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = decode_payload(current, encoding="latin-1")
-        results.append(value[:max_len])
-    return results
-
-
 def _extract_utf16le_strings(
     data: bytes, min_len: int = 4, max_len: int = 200
 ) -> List[str]:
@@ -289,14 +287,7 @@ def _extract_bind_identities(text: str) -> list[str]:
     return identities
 
 
-def _is_public_ip(value: str) -> bool:
-    try:
-        addr = ipaddress.ip_address(value)
-        return addr.is_global
-    except Exception:
-        return False
-
-
+@memoize_analysis
 def analyze_ldap(
     path: Path,
     show_status: bool = True,
@@ -459,6 +450,16 @@ def analyze_ldap(
                                             else token,
                                         }
                                     )
+
+                    # Recover result codes from the binary BER (the ASCII
+                    # heuristics below never match real LDAP responses).
+                    for code in _ldap_result_codes_from_payload(payload):
+                        name = LDAP_RESULT_CODES.get(code, str(code))
+                        counter_inc(response_codes, f"{code} ({name})")
+                        # 0=success, 5/6=compareFalse/True, 14=saslBindInProgress
+                        # are normal results, not errors.
+                        if code not in (0, 5, 6, 14):
+                            counter_inc(ldap_error_codes, f"{code} ({name})")
 
                     for value in _extract_ascii_strings(
                         payload
@@ -695,6 +696,25 @@ def analyze_ldap(
                 "severity": "critical",
                 "summary": "LDAP queries for password attributes",
                 "details": "Queries include ms-Mcs-AdmPwd or unicodePwd.",
+                "source": "LDAP",
+            }
+        )
+
+    # A query that filters on servicePrincipalName is how attackers enumerate
+    # kerberoastable accounts (PowerView Get-NetUser -SPN, BloodHound, Rubeus
+    # /stats) before requesting the crackable TGS tickets — the recon step that
+    # precedes Kerberos kerberoasting. Correlate with --kerberos etype downgrade.
+    spn_queries = int(ldap_filter_types.get("servicePrincipalName", 0))
+    if spn_queries:
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "LDAP servicePrincipalName enumeration (kerberoast recon)",
+                "details": (
+                    f"{spn_queries} query(ies) filtered on servicePrincipalName — "
+                    "enumeration of kerberoastable service accounts. Correlate with "
+                    "--kerberos for TGS harvesting / RC4 downgrade."
+                ),
                 "source": "LDAP",
             }
         )

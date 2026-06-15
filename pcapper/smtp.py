@@ -9,7 +9,8 @@ from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length
+from .utils import beacon_score
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -51,6 +52,30 @@ FILE_NAME_RE = re.compile(
 ATTACHMENT_RE = re.compile(r"filename=\"?([^\";]+)\"?", re.IGNORECASE)
 NAME_RE = re.compile(r"name=\"?([^\";]+)\"?", re.IGNORECASE)
 
+# Attachment extensions associated with malspam payload delivery: executables
+# and scripts, plus the container types (.iso/.img/.lnk) malspam uses to smuggle
+# them past mail filters.
+_SMTP_RISKY_ATTACH_EXTS = {
+    "exe", "scr", "com", "pif", "cpl", "msi", "msp", "bat", "cmd", "ps1",
+    "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta", "jar", "lnk", "iso",
+    "img", "vhd", "ace", "uue", "dll", "apk",
+}
+
+
+def _smtp_risky_attachment(filename: str) -> Optional[str]:
+    """Return the offending extension if an attachment name is malspam-risky.
+
+    Catches a plain risky extension and the classic double-extension lure
+    (``invoice.pdf.exe``), where a benign-looking name ends in an executable.
+    """
+    name = (filename or "").strip().strip("\"'").lower()
+    if "." not in name:
+        return None
+    ext = name.rsplit(".", 1)[-1]
+    if ext in _SMTP_RISKY_ATTACH_EXTS:
+        return ext
+    return None
+
 SUSPICIOUS_PATTERNS = [
     (
         re.compile(r"powershell|cmd\.exe|wmic|winrs", re.IGNORECASE),
@@ -61,7 +86,10 @@ SUSPICIOUS_PATTERNS = [
         "Malware tooling",
     ),
     (
-        re.compile(r"rundll32|regsvr32|schtasks|at\s+", re.IGNORECASE),
+        # NB: the bare `at\s+` form matched the English word "at " in any email
+        # body (massive false positive). Restrict to the remote-scheduling
+        # `at \\host` invocation, which is the actual lateral-movement command.
+        re.compile(r"rundll32|regsvr32|schtasks|\bat\s+\\\\", re.IGNORECASE),
         "Execution/persistence tooling",
     ),
     (re.compile(r"nmap|masscan|sqlmap", re.IGNORECASE), "Recon tooling"),
@@ -181,25 +209,13 @@ def _readable_text(payload: bytes) -> str:
         return ""
 
 
-def _beacon_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance**0.5
-    if avg < 1 or avg > 3600:
-        return None
-    if stddev / avg > 0.15:
-        return None
-    return {"avg": avg, "stddev": stddev}
+def _beacon_score(times: list[float]):
+    return beacon_score(
+        times, min_interval=1.0, max_interval=3600.0, rel_jitter=0.15, abs_jitter_floor=0.0
+    )
 
 
+@memoize_analysis
 def analyze_smtp(
     path: Path,
     show_status: bool = True,
@@ -325,6 +341,20 @@ def analyze_smtp(
                                 kind="attachment", detail=match, src=src, dst=dst
                             )
                         )
+                        risky_ext = _smtp_risky_attachment(match)
+                        if risky_ext:
+                            detections.append(
+                                {
+                                    "severity": "high",
+                                    "summary": "Malspam-risky email attachment",
+                                    "details": (
+                                        f"{src} -> {dst} attachment '{match}' "
+                                        f"(.{risky_ext}) — executable/script/container "
+                                        "attachment typical of malspam payload delivery."
+                                    ),
+                                    "source": "SMTP",
+                                }
+                            )
                     for match in NAME_RE.findall(mime_text):
                         file_artifacts[match] += 1
                     data_lines = []
@@ -402,7 +432,7 @@ def analyze_smtp(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:

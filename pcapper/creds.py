@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, unquote_plus, urlsplit
 
 from .pcap_cache import PcapMeta, get_reader
 from .services import COMMON_PORTS
-from .utils import decode_payload, safe_float, extract_packet_endpoints
+from .utils import decode_payload, extract_packet_endpoints, memoize_analysis, safe_float, get_packet_ports as _get_ports
 
 try:
     from .cip import (
@@ -141,7 +141,10 @@ HTTP_DIGEST_USER_RE = re.compile(
 HTTP_COOKIE_RE = re.compile(r"(?i)\bcookie:\s*([^\r\n]+)")
 HTTP_NTLM_RE = re.compile(r"(?i)authorization:\s*ntlm\s+([A-Za-z0-9+/=]+)")
 HTTP_REQUEST_LINE_RE = re.compile(
-    r"(?im)^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)\s+([^\s]+)\s+HTTP/\d(?:\.\d+)?$"
+    # NB: tolerate the trailing CR of real CRLF request lines — anchoring with a
+    # bare `$` silently failed to match `...HTTP/1.1\r\n`, which broke request
+    # detection (and request-URI credential extraction) on real-world traffic.
+    r"(?im)^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)\s+([^\s]+)\s+HTTP/\d(?:\.\d+)?\r?$"
 )
 HTTP_HOST_RE = re.compile(r"(?im)^Host:\s*([^\s:\r\n]+)(?::\d+)?\s*$")
 
@@ -259,6 +262,23 @@ OT_USERNAME_NOISE = {
     "request",
     "response",
 }
+# Form-control / submit-button values and JS literals that a `login=`/`user=`
+# field match reports as a username (e.g. an HTML submit button "Login=Login").
+_FORM_CONTROL_NOISE = {
+    "login", "logon", "log_in", "signin", "sign_in", "signon", "logout",
+    "submit", "ok", "cancel", "yes", "no", "none", "null", "undefined",
+    "true", "false", "function", "object", "default",
+}
+# Weekday / month words that appear in login banners ("Last login: Sat Nov 27
+# ...") and get mis-captured as usernames by the generic `login:` key match.
+_DATE_WORD_NOISE = {
+    "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept",
+    "oct", "nov", "dec",
+    "january", "february", "march", "april", "june", "july", "august",
+    "september", "october", "november", "december",
+}
 OT_DROP_TOKENS = {
     "class",
     "instance",
@@ -310,20 +330,6 @@ class CredentialSummary:
 def _get_ip_pair(pkt: Packet) -> tuple[str, str]:
     src_ip, dst_ip = extract_packet_endpoints(pkt)
     return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
-
-
-def _get_ports(pkt: Packet) -> tuple[Optional[int], Optional[int], str]:
-    if TCP is not None and TCP in pkt:
-        try:
-            return int(pkt[TCP].sport), int(pkt[TCP].dport), "TCP"
-        except Exception:
-            return None, None, "TCP"
-    if UDP is not None and UDP in pkt:
-        try:
-            return int(pkt[UDP].sport), int(pkt[UDP].dport), "UDP"
-        except Exception:
-            return None, None, "UDP"
-    return None, None, "OTHER"
 
 
 def _service_name(sport: Optional[int], dport: Optional[int], proto: str) -> str:
@@ -485,7 +491,11 @@ def _is_likely_username(value: str) -> bool:
     if " " in token:
         return False
     lower = token.lower()
-    if lower in OT_USERNAME_NOISE:
+    if (
+        lower in OT_USERNAME_NOISE
+        or lower in _DATE_WORD_NOISE
+        or lower in _FORM_CONTROL_NOISE
+    ):
         return False
     if lower.startswith("0x"):
         return False
@@ -1169,9 +1179,14 @@ def _extract_kv_creds(
     text: str, *, kind_prefix: str = ""
 ) -> list[tuple[str, Optional[str], Optional[str], str]]:
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
+    # Usernames must look like usernames and tokens must look like tokens —
+    # otherwise a `userid=` in HTML or a `sessionid:sessionid` in JS is reported
+    # as a credential. Password values are left unvalidated because the explicit
+    # password-style key is itself strong evidence and weak/short passwords are
+    # legitimate findings we must not drop.
     for match in USER_RE.finditer(text):
         user = _clean_value(match.group(1), allow_spaces=False, max_len=128)
-        if user:
+        if user and _is_likely_username(user):
             hits.append((f"{kind_prefix}Credential Field", user, None, match.group(0)))
     for match in PASS_RE.finditer(text):
         secret = _clean_value(match.group(1), allow_spaces=False, max_len=256)
@@ -1181,12 +1196,12 @@ def _extract_kv_creds(
             )
     for match in TOKEN_RE.finditer(text):
         token = _clean_value(match.group(1), allow_spaces=False, max_len=512)
-        if token:
+        if token and _is_likely_secret(token):
             hits.append((f"{kind_prefix}Token Field", None, token, match.group(0)))
 
     for match in URL_USER_RE.finditer(text):
         user = _clean_value(match.group(1), allow_spaces=False, max_len=128)
-        if user:
+        if user and _is_likely_username(user):
             hits.append((f"{kind_prefix}URL Credential", user, None, match.group(0)))
     for match in URL_PASS_RE.finditer(text):
         secret = _clean_value(match.group(1), allow_spaces=False, max_len=256)
@@ -1194,12 +1209,12 @@ def _extract_kv_creds(
             hits.append((f"{kind_prefix}URL Credential", None, secret, match.group(0)))
     for match in URL_TOKEN_RE.finditer(text):
         token = _clean_value(match.group(1), allow_spaces=False, max_len=512)
-        if token:
+        if token and _is_likely_secret(token):
             hits.append((f"{kind_prefix}URL Token", None, token, match.group(0)))
 
     for match in JSON_USER_RE.finditer(text):
         user = _clean_value(match.group(1), allow_spaces=False, max_len=128)
-        if user:
+        if user and _is_likely_username(user):
             hits.append((f"{kind_prefix}JSON Credential", user, None, match.group(0)))
     for match in JSON_PASS_RE.finditer(text):
         secret = _clean_value(match.group(1), allow_spaces=False, max_len=256)
@@ -1207,7 +1222,7 @@ def _extract_kv_creds(
             hits.append((f"{kind_prefix}JSON Credential", None, secret, match.group(0)))
     for match in JSON_TOKEN_RE.finditer(text):
         token = _clean_value(match.group(1), allow_spaces=False, max_len=512)
-        if token:
+        if token and _is_likely_secret(token):
             hits.append((f"{kind_prefix}JSON Token", None, token, match.group(0)))
     return hits
 
@@ -1529,7 +1544,7 @@ def _extract_prompt_creds(
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
     for match in PROMPT_USER_RE.finditer(text):
         user = _clean_value(match.group(1), allow_spaces=False, max_len=128)
-        if user:
+        if user and _is_likely_username(user):
             hits.append(
                 (
                     f"{kind_prefix}Prompt Credential",
@@ -1831,6 +1846,7 @@ def _extract_ot_protocol_creds(
     return hits
 
 
+@memoize_analysis
 def analyze_creds(
     path: Path,
     *,
@@ -1923,17 +1939,31 @@ def analyze_creds(
                             src_port,
                             dst_port,
                         )
-                for item in _extract_http_basic(text):
-                    seen.add(item)
-                for item in _extract_http_query_creds(text):
-                    seen.add(item)
-                for item in _extract_kv_creds(text, kind_prefix="HTTP "):
-                    seen.add(item)
-                for item in _extract_prompt_creds(text, kind_prefix="HTTP "):
-                    seen.add(item)
-                for item in _extract_xml_creds(text, kind_prefix="HTTP "):
-                    seen.add(item)
-            else:
+                # Credentials in HTTP only ever travel in the REQUEST: the
+                # Authorization/Cookie headers, the request-line URI query, and
+                # the POST body. Response bodies (HTML/CSS/JS) routinely contain
+                # userid= links, sessionid= tracking JS and "username:hover" CSS
+                # that are not credentials, so scanning them produces a flood of
+                # false positives. Restrict keyword scanning to request packets
+                # (identified by an HTTP request line); response and body-
+                # continuation packets carry no request line and are skipped.
+                if HTTP_REQUEST_LINE_RE.search(text):
+                    for item in _extract_http_basic(text):
+                        seen.add(item)
+                    for item in _extract_http_query_creds(text):
+                        seen.add(item)
+                    for item in _extract_kv_creds(text, kind_prefix="HTTP "):
+                        seen.add(item)
+                    for item in _extract_xml_creds(text, kind_prefix="HTTP "):
+                        seen.add(item)
+            elif not (
+                looks_telnet or looks_ftp or looks_pop3 or looks_imap or looks_smtp
+            ):
+                # Generic keyword scan is a catch-all for protocols WITHOUT a
+                # dedicated handler. Skip it when a text protocol with its own
+                # extractor matched (telnet/ftp/pop3/imap/smtp) — otherwise the
+                # same line is reported twice (e.g. "Credential Field" and
+                # "TELNET Credential Field" for one telnet login prompt).
                 for item in _extract_kv_creds(text):
                     seen.add(item)
                 for item in _extract_prompt_creds(text):

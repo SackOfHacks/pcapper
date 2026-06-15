@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import ipaddress
 import re
 from collections import Counter, defaultdict
@@ -23,7 +24,8 @@ except ImportError:
     NBNSQueryRequest = NBNSQueryResponse = NBNSNodeStatusResponse = None
 
 from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, safe_float
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length
+from .utils import is_public_ip as _is_public_ip
 
 # NetBIOS Suffix Types commonly seen
 SUFFIX_MAP = {
@@ -392,6 +394,7 @@ def _extract_plaintext(data: bytes, max_items: int = 8) -> List[str]:
     return tokens
 
 
+@memoize_analysis
 def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysis:
     analysis = NetbiosAnalysis(path=pcap_path)
 
@@ -510,7 +513,7 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                 if last_time is None or ts > last_time:
                     last_time = ts
 
-                pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+                pkt_len = packet_length(pkt)
 
                 src_ip, dst_ip = extract_packet_endpoints(pkt)
                 if not src_ip or not dst_ip:
@@ -945,12 +948,6 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
     analysis.service_endpoints = dict(service_endpoints)
     analysis.files_discovered = sorted(file_set)[:200]
     analysis.artifacts = sorted(artifacts)[:300]
-
-    def _is_public_ip(value: str) -> bool:
-        try:
-            return ipaddress.ip_address(str(value)).is_global
-        except Exception:
-            return False
 
     deterministic_checks: Dict[str, List[str]] = {
         "nbns_spoofing_or_conflict": [],

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import base64
+import copy
+import functools
+import ipaddress
+import math
 import os
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -22,6 +27,11 @@ try:
     from scapy.layers.l2 import ARP  # type: ignore
 except Exception:  # pragma: no cover
     ARP = None  # type: ignore
+
+try:
+    from scapy.layers.inet import TCP, UDP  # type: ignore
+except Exception:  # pragma: no cover
+    TCP = UDP = None  # type: ignore
 
 PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
 
@@ -176,6 +186,21 @@ def detect_file_type_bytes(data: bytes) -> str:
         return "GIF"
     if data.startswith(b"\x1f\x8b"):
         return "GZIP"
+    # OLE2 / Compound File Binary — legacy Office (.doc/.xls/.ppt) and the
+    # dominant macro-malware delivery container (Hancitor, Emotet, Dridex lures).
+    if data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return "OLE2/Office"
+    if data.startswith(b"Rar!\x1a\x07"):
+        return "RAR"
+    if data.startswith(b"7z\xbc\xaf\x27\x1c"):
+        return "7Z"
+    if data.startswith(b"MSCF"):  # Microsoft Cabinet — seen in malware staging
+        return "CAB"
+    if data.startswith((b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe")):
+        return "MACHO"
+    # Windows shortcut (LNK) — common phishing/exec lure (HasLinkTargetIDList).
+    if data.startswith(b"L\x00\x00\x00\x01\x14\x02\x00"):
+        return "LNK"
     if data.startswith(b"<!DOCTYPE html") or data.startswith(b"<html"):
         return "HTML"
     if data.lstrip().startswith(b"{\\rtf"):
@@ -232,28 +257,98 @@ def safe_float(value: object | None) -> Optional[float]:
         return None
 
 
+# --- Canonical IP classification ---------------------------------------------
+# These replace ~35 near-duplicate per-module copies. "Public" means globally
+# routable per IANA (ipaddress.is_global), which correctly excludes RFC1918,
+# loopback, link-local, multicast, CGNAT (100.64/10), reserved, and
+# documentation ranges — some old per-module copies used a looser
+# "not private/loopback/multicast/link-local" test that misclassified CGNAT
+# and reserved space as public. lru_cache keeps per-packet calls cheap.
+
+
+@lru_cache(maxsize=100000)
+def is_valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+@lru_cache(maxsize=100000)
+def is_public_ip(value: str) -> bool:
+    try:
+        return bool(ipaddress.ip_address(value).is_global)
+    except (ValueError, TypeError):
+        return False
+
+
+@lru_cache(maxsize=100000)
+def is_private_ip(value: str) -> bool:
+    try:
+        return bool(ipaddress.ip_address(value).is_private)
+    except (ValueError, TypeError):
+        return False
+
+
+def shannon_entropy(value: str) -> float:
+    """Base-2 Shannon entropy of a string (bits per symbol)."""
+    if not value:
+        return 0.0
+    freq = Counter(value)
+    total = len(value)
+    return -sum(
+        (count / total) * math.log2(count / total) for count in freq.values()
+    )
+
+
+def read_ber_length(data: bytes, offset: int) -> tuple[int, int]:
+    """Decode an ASN.1/BER length field at data[offset].
+
+    Returns (length, next_offset). Short form (<0x80) is the value itself;
+    long form encodes the byte-count in the low 7 bits followed by that many
+    big-endian length octets. Returns (0, offset+1) on a malformed field.
+    """
+    if offset >= len(data):
+        return 0, offset
+    first = data[offset]
+    offset += 1
+    if first < 0x80:
+        return first, offset
+    num_bytes = first & 0x7F
+    if num_bytes == 0 or offset + num_bytes > len(data):
+        return 0, offset
+    length = int.from_bytes(data[offset : offset + num_bytes], "big")
+    return length, offset + num_bytes
+
+
 def extract_packet_endpoints(
     pkt: object,
     *,
     include_arp: bool = True,
 ) -> tuple[Optional[str], Optional[str]]:
-    haslayer = getattr(pkt, "haslayer", None)
-    if not callable(haslayer):
+    getlayer = getattr(pkt, "getlayer", None)
+    if not callable(getlayer):
         return None, None
 
+    # Single layer walk per protocol (getlayer) instead of haslayer + index.
     try:
-        if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-            src = str(getattr(pkt[IP], "src", "")).strip()  # type: ignore[index]
-            dst = str(getattr(pkt[IP], "dst", "")).strip()  # type: ignore[index]
-            return (src or None), (dst or None)
+        if IP is not None:
+            layer = getlayer(IP)
+            if layer is not None:
+                src = str(getattr(layer, "src", "")).strip()
+                dst = str(getattr(layer, "dst", "")).strip()
+                return (src or None), (dst or None)
     except Exception:
         pass
 
     try:
-        if IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-            src = str(getattr(pkt[IPv6], "src", "")).strip()  # type: ignore[index]
-            dst = str(getattr(pkt[IPv6], "dst", "")).strip()  # type: ignore[index]
-            return (src or None), (dst or None)
+        if IPv6 is not None:
+            layer = getlayer(IPv6)
+            if layer is not None:
+                src = str(getattr(layer, "src", "")).strip()
+                dst = str(getattr(layer, "dst", "")).strip()
+                return (src or None), (dst or None)
     except Exception:
         pass
 
@@ -261,14 +356,136 @@ def extract_packet_endpoints(
         return None, None
 
     try:
-        if ARP is not None and pkt.haslayer(ARP):  # type: ignore[truthy-bool]
-            src = str(getattr(pkt[ARP], "psrc", "")).strip()  # type: ignore[index]
-            dst = str(getattr(pkt[ARP], "pdst", "")).strip()  # type: ignore[index]
-            return (src or None), (dst or None)
+        if ARP is not None:
+            layer = getlayer(ARP)
+            if layer is not None:
+                src = str(getattr(layer, "psrc", "")).strip()
+                dst = str(getattr(layer, "pdst", "")).strip()
+                return (src or None), (dst or None)
     except Exception:
         pass
 
     return None, None
+
+
+_ANALYSIS_MEMO: "OrderedDict[tuple, Any]" = OrderedDict()
+_ANALYSIS_MEMO_MAX = 24
+_MEMO_SCALARS = (str, int, float, bool, Path)
+_MEMO_SKIP_KWARGS = {"show_status", "packets", "meta"}
+
+
+class _MemoUnkeyable(Exception):
+    pass
+
+
+def _memo_key_value(value: object) -> str:
+    if value is None or isinstance(value, _MEMO_SCALARS):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        inner = ",".join(_memo_key_value(item) for item in value)
+        return f"[{inner}]"
+    if isinstance(value, (set, frozenset)):
+        try:
+            items = sorted(value)  # type: ignore[type-var]
+        except Exception:
+            raise _MemoUnkeyable()
+        inner = ",".join(_memo_key_value(item) for item in items)
+        return f"{{{inner}}}"
+    if callable(value):
+        module = getattr(value, "__module__", None)
+        qualname = getattr(value, "__qualname__", None)
+        if module is None or qualname is None:
+            raise _MemoUnkeyable()
+        # id() keeps distinct closures/lambdas with the same qualname from
+        # aliasing; module-level functions keep a stable id per process.
+        return f"<fn {module}.{qualname}#{id(value)}>"
+    raise _MemoUnkeyable()
+
+
+def clear_analysis_memo() -> None:
+    _ANALYSIS_MEMO.clear()
+
+
+def memoize_analysis(func):
+    """Memoize an analyze_* function per capture state and arguments.
+
+    Several analyzers run more than once within a single invocation: --ips
+    runs the hostname analyzer internally, --hostdetails and --overview fan
+    out into analyzers that may also be requested as top-level steps, and
+    --files runs the NFS analyzer. The capture data is immutable for the
+    duration of a run, so an identical repeat call can return a deep copy of
+    the first result instead of re-iterating every packet.
+
+    The cache key includes the capture file identity (path, size, mtime) and
+    a fingerprint of the packet view in effect (explicit packets= argument or
+    the forced packet view registered for the path), so filtered and
+    unfiltered analyses never alias. Calls with non-scalar extra arguments
+    bypass the cache entirely. Set PCAPPER_ANALYSIS_MEMO=0 to disable.
+    """
+
+    @functools.wraps(func)
+    def wrapper(path, *args, **kwargs):
+        if os.environ.get("PCAPPER_ANALYSIS_MEMO", "1") == "0":
+            return func(path, *args, **kwargs)
+        try:
+            st = Path(path).stat()
+            file_key = (str(path), st.st_size, st.st_mtime_ns)
+        except Exception:
+            return func(path, *args, **kwargs)
+
+        packets = kwargs.get("packets")
+        if packets is not None:
+            view_key: tuple = ("packets", id(packets), len(packets))
+        else:
+            try:
+                from .pcap_cache import get_forced_packet_view
+
+                forced = get_forced_packet_view(Path(path))
+            except Exception:
+                forced = None
+            if forced is not None:
+                view_key = ("forced", id(forced), len(forced))
+            else:
+                view_key = ("disk",)
+
+        try:
+            key_args = [_memo_key_value(value) for value in args]
+            key_kwargs = [
+                (name, _memo_key_value(kwargs[name]))
+                for name in sorted(kwargs)
+                if name not in _MEMO_SKIP_KWARGS
+            ]
+        except _MemoUnkeyable:
+            return func(path, *args, **kwargs)
+
+        key = (
+            func.__module__,
+            func.__qualname__,
+            file_key,
+            view_key,
+            tuple(key_args),
+            tuple(key_kwargs),
+        )
+        cached = _ANALYSIS_MEMO.get(key)
+        if cached is not None:
+            _ANALYSIS_MEMO.move_to_end(key)
+            try:
+                return copy.deepcopy(cached)
+            except Exception:
+                _ANALYSIS_MEMO.pop(key, None)
+                return func(path, *args, **kwargs)
+
+        result = func(path, *args, **kwargs)
+        try:
+            snapshot = copy.deepcopy(result)
+        except Exception:
+            return result
+        _ANALYSIS_MEMO[key] = snapshot
+        while len(_ANALYSIS_MEMO) > _ANALYSIS_MEMO_MAX:
+            _ANALYSIS_MEMO.popitem(last=False)
+        return result
+
+    return wrapper
 
 
 def sparkline(values: list[int]) -> str:
@@ -344,3 +561,135 @@ def parse_time_arg(value: Optional[str]) -> Optional[float]:
         return dt.timestamp()
     except Exception:
         return None
+
+
+def packet_length(pkt: object) -> int:
+    """Length of the captured packet bytes without re-serializing.
+
+    len(pkt) on a scapy Packet rebuilds the packet; for packets read from a
+    capture, pkt.original holds the raw bytes and is authoritative.
+    """
+    original = getattr(pkt, "original", None)
+    if isinstance(original, (bytes, bytearray)):
+        return len(original)
+    try:
+        return int(len(pkt))  # type: ignore[arg-type]
+    except Exception:
+        return 0
+
+
+def extract_ascii_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
+    """Extract printable-ASCII runs (>= min_len) from a byte buffer.
+
+    Canonical implementation shared by the protocol modules. Runs are split on
+    any non-printable byte and decoded latin-1 with errors ignored; the trailing
+    run (if any) is flushed so a string at the very end of the buffer is kept.
+    """
+    results: list[str] = []
+    if not data:
+        return results
+    current = bytearray()
+    for b in data:
+        if 32 <= b <= 126:
+            current.append(b)
+        else:
+            if len(current) >= min_len:
+                results.append(current.decode("latin-1", errors="ignore")[:max_len])
+            current = bytearray()
+    if len(current) >= min_len:
+        results.append(current.decode("latin-1", errors="ignore")[:max_len])
+    return results
+
+
+def extract_utf16le_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
+    """Extract printable-ASCII runs encoded as UTF-16LE (Windows wide strings).
+
+    Canonical implementation shared by the protocol modules (each printable byte
+    followed by a 0x00). Runs are decoded latin-1 with errors ignored; the
+    trailing run is flushed.
+    """
+    results: list[str] = []
+    current = bytearray()
+    i = 0
+    while i + 1 < len(data):
+        ch = data[i]
+        if 32 <= ch <= 126 and data[i + 1] == 0:
+            current.append(ch)
+        elif len(current) >= min_len:
+            results.append(current.decode("latin-1", errors="ignore")[:max_len])
+            current = bytearray()
+        else:
+            current = bytearray()
+        i += 2
+    if len(current) >= min_len:
+        results.append(current.decode("latin-1", errors="ignore")[:max_len])
+    return results
+
+
+def beacon_score(
+    times: list[float],
+    *,
+    min_interval: float = 5.0,
+    max_interval: float = 86400.0,
+    rel_jitter: float = 0.25,
+    abs_jitter_floor: float = 5.0,
+) -> Optional[dict[str, float]]:
+    """Score a timestamp series for periodic (beaconing) behaviour.
+
+    Canonical implementation shared by the per-protocol analyzers (previously
+    copy-pasted as `_beaconing_score`/`_beacon_score`). Returns {avg, stddev} when
+    the inter-arrival deltas are regular (mean within [min_interval, max_interval]
+    and stddev <= max(abs_jitter_floor, mean*rel_jitter)), else None.
+    """
+    if len(times) < 5:
+        return None
+    times_sorted = sorted(times)
+    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
+    if len(deltas) < 4:
+        return None
+    avg = sum(deltas) / len(deltas)
+    if avg <= 0:
+        return None
+    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
+    stddev = variance**0.5
+    if avg < min_interval or avg > max_interval:
+        return None
+    if stddev > max(abs_jitter_floor, avg * rel_jitter):
+        return None
+    return {"avg": avg, "stddev": stddev}
+
+
+def tcp_flags_int(flags: object) -> int:
+    """Normalize a scapy TCP flags value (FlagValue/str/int) to an int bitmask."""
+    try:
+        if isinstance(flags, str):
+            value = 0
+            for ch, bit in (
+                ("F", 1), ("S", 2), ("R", 4), ("P", 8),
+                ("A", 16), ("U", 32), ("E", 64), ("C", 128),
+            ):
+                if ch in flags:
+                    value |= bit
+            return value
+        return int(flags)  # type: ignore[arg-type]
+    except Exception:
+        return 0
+
+
+def get_packet_ports(pkt: object) -> tuple[Optional[int], Optional[int], str]:
+    """Return (sport, dport, transport) for a packet; transport in TCP/UDP/OTHER."""
+    if TCP is not None and TCP in pkt:
+        try:
+            return (int(pkt[TCP].sport), int(pkt[TCP].dport), "TCP")
+        except Exception:
+            return (None, None, "TCP")
+    if UDP is not None and UDP in pkt:
+        try:
+            return (int(pkt[UDP].sport), int(pkt[UDP].dport), "UDP")
+        except Exception:
+            return (None, None, "UDP")
+    return (None, None, "OTHER")

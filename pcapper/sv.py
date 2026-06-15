@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .utils import read_ber_length as _read_ber_length, memoize_analysis
 import struct
 from collections import Counter
 from dataclasses import dataclass
@@ -16,6 +17,11 @@ except Exception:  # pragma: no cover
 
 
 SV_ETHERTYPE = 0x88BA
+
+# Max backward smpCnt step still treated as a replay/out-of-order anomaly.
+# A normal cycle wrap-to-zero is a much larger drop (≈ smpRate, thousands) and
+# is intentionally excluded.
+SMP_REPLAY_STEP = 64
 
 SV_TAGS = {
     0x80: "svID",
@@ -61,21 +67,6 @@ def _extract_length(payload: bytes) -> Optional[int]:
     if len(payload) < 4:
         return None
     return int.from_bytes(payload[2:4], "big")
-
-
-def _read_ber_length(data: bytes, idx: int) -> tuple[Optional[int], int]:
-    if idx >= len(data):
-        return None, idx
-    first = data[idx]
-    idx += 1
-    if (first & 0x80) == 0:
-        return first, idx
-    count = first & 0x7F
-    if count == 0 or idx + count > len(data):
-        return None, idx
-    length = int.from_bytes(data[idx : idx + count], "big")
-    idx += count
-    return length, idx
 
 
 def _parse_sv_tlvs(data: bytes, result: dict[str, object], depth: int = 0) -> None:
@@ -135,6 +126,7 @@ def _parse_sv_payload(payload: bytes) -> dict[str, object]:
     return result
 
 
+@memoize_analysis
 def analyze_sv(path: Path, show_status: bool = True) -> SvSummary:
     if Ether is None:
         return SvSummary(
@@ -180,6 +172,9 @@ def analyze_sv(path: Path, show_status: bool = True) -> SvSummary:
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
     smp_state: dict[tuple[str, str], int] = {}
+    # One regression finding per (src, appid) -- a sustained replay would
+    # otherwise emit a unique detail string per frame and flood the report.
+    smp_regression_seen: set[tuple[str, str]] = set()
 
     try:
         for pkt in reader:
@@ -240,12 +235,26 @@ def analyze_sv(path: Path, show_status: bool = True) -> SvSummary:
                 if appid is not None:
                     key = (src_mac, f"0x{appid:04x}")
                     prev = smp_state.get(key)
-                    if prev is not None and smp_cnt < prev:
+                    # smpCnt resets to 0 at the start of each sampling cycle
+                    # (IEC 61850-9-2: typically once per second at thousands of
+                    # samples/sec), so the large periodic wrap-to-zero is normal
+                    # and must NOT be flagged. Only a SMALL backward step is a
+                    # genuine anomaly (out-of-order or replayed SV frame).
+                    if (
+                        prev is not None
+                        and 0 < (prev - smp_cnt) <= SMP_REPLAY_STEP
+                        and key not in smp_regression_seen
+                    ):
+                        smp_regression_seen.add(key)
                         detections.append(
                             {
                                 "severity": "warning",
-                                "summary": "SV Sample Counter Decrease",
-                                "details": f"{key[0]} appid {key[1]} smpCnt decreased {prev}->{smp_cnt}.",
+                                "summary": "SV Sample Counter Regression",
+                                "details": (
+                                    f"{key[0]} appid {key[1]} smpCnt stepped back "
+                                    f"{prev}->{smp_cnt} (out-of-order or replayed SV frame; "
+                                    "first occurrence shown)."
+                                ),
                             }
                         )
                     smp_state[key] = smp_cnt

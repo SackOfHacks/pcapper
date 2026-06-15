@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from .utils import is_valid_ip as _valid_ip, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .utils import beacon_score as _beaconing_score
 import hashlib
-import ipaddress
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP
@@ -35,6 +36,37 @@ PS_COMMAND_RE = re.compile(r"\b(?:powershell|pwsh)\b[^\r\n]{0,300}", re.IGNORECA
 PS_ENCODED_RE = re.compile(
     r"(?:-enc(?:odedcommand)?|frombase64string)\b", re.IGNORECASE
 )
+# Capture the base64 blob that follows a -EncodedCommand/-enc/-e flag so it can
+# be decoded back to the cleartext command the attacker actually ran. PowerShell
+# requires a 4-aligned base64 string of UTF-16LE bytes; require a decent length
+# to avoid matching short flag values.
+PS_ENCODED_ARG_RE = re.compile(
+    r"-e(?:nc(?:odedcommand)?|c)?\s+([A-Za-z0-9+/]{24,}={0,2})", re.IGNORECASE
+)
+
+
+def _decode_ps_encoded(blob: str) -> Optional[str]:
+    """Decode a PowerShell -EncodedCommand base64 blob to its cleartext command.
+
+    PowerShell encodes the command as UTF-16LE then base64. Returns the decoded
+    text if it looks like a real command (mostly printable), else ``None``.
+    """
+    import base64
+
+    try:
+        raw = base64.b64decode(blob + "=" * (-len(blob) % 4), validate=False)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    # Heuristic: UTF-16LE PowerShell payloads have a NUL in every other byte.
+    text = raw.decode("utf-16le", errors="ignore")
+    if not text:
+        text = raw.decode("latin-1", errors="ignore")
+    printable = sum(1 for ch in text if 32 <= ord(ch) < 127 or ch in "\r\n\t")
+    if not text or printable < len(text) * 0.8 or len(text) < 4:
+        return None
+    return text.strip()
 PS_IEX_RE = re.compile(r"\binvoke-expression\b|\biex\b", re.IGNORECASE)
 PS_DOWNLOAD_RE = re.compile(
     r"(downloadstring|invoke-webrequest|invoke-restmethod|new-object\s+net\.webclient)",
@@ -45,7 +77,9 @@ PS_BYPASS_RE = re.compile(
     r"-executionpolicy\s+bypass|bypass\s+\w+\s+policy", re.IGNORECASE
 )
 PS_LM_RE = re.compile(
-    r"(psexec|wmic|winrs|schtasks|at\s+|rundll32|regsvr32)", re.IGNORECASE
+    # `at\s+` matched "that "/"what "/"great " etc. (any "at" + space); restrict
+    # to the `at \\host` remote-scheduling lateral-movement invocation.
+    r"(psexec|wmic|winrs|schtasks|\bat\s+\\\\|rundll32|regsvr32)", re.IGNORECASE
 )
 PS_CRED_RE = re.compile(
     r"(get-credential|convertto-securestring|asplaintext)", re.IGNORECASE
@@ -73,10 +107,6 @@ HOST_VALUE_RE = re.compile(
     r"(?:hostname|computername|name)\s*[:=]\s*([A-Za-z0-9_.-]{2,64})", re.IGNORECASE
 )
 DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9_.-]{1,64})\b")
-SECRET_ASSIGN_RE = re.compile(
-    r"(?i)\b(password|passwd|pwd|token|api[_-]?key|authorization|bearer|secret)\b\s*[:=]\s*[^\s;,'\"]+"
-)
-B64_LONG_RE = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")
 
 MAX_PLAINTEXT_UNIQUES = 1200
 MAX_INDICATOR_UNIQUES = 3000
@@ -236,27 +266,6 @@ class _SessionState:
             self.hints = Counter()
 
 
-def _extract_ascii_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> list[str]:
-    results: list[str] = []
-    if not data:
-        return results
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
 def _extract_utf16le_strings(
     data: bytes, min_len: int = 4, max_len: int = 200
 ) -> list[str]:
@@ -296,37 +305,11 @@ def _direction(
     return src_ip, dst_ip, sport, dport
 
 
-def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance**0.5
-    if avg < 5 or avg > 86400:
-        return None
-    if stddev > max(5.0, avg * 0.25):
-        return None
-    return {"avg": avg, "stddev": stddev}
-
-
-def _valid_ip(value: str) -> bool:
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except Exception:
-        return False
-
-
 def _safe_excerpt(value: str, limit: int = MAX_TEXT_LEN) -> str:
+    # Secret/base64 redaction intentionally removed: command excerpts are shown
+    # verbatim so recovered credentials and encoded payloads are fully visible.
+    # The length cap below is a display bound only, not redaction.
     text = value.strip()
-    text = SECRET_ASSIGN_RE.sub("<redacted-assignment>", text)
-    text = B64_LONG_RE.sub("<redacted-base64>", text)
     if len(text) > limit:
         text = text[:limit].rstrip() + "..."
     return text
@@ -343,6 +326,7 @@ def _indicator_key(label: str, value: str) -> str:
     return f"{label}: {snippet} [sha1:{digest}]"
 
 
+@memoize_analysis
 def analyze_powershell(
     path: Path,
     show_status: bool = True,
@@ -471,9 +455,12 @@ def analyze_powershell(
     artifacts: list[str] = []
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
+    decoded_ps_commands: Counter[str] = Counter()
     errors = []
 
-    client_times: dict[str, list[float]] = defaultdict(list)
+    # Keyed per (client, server) flow, not per client: a host talking to
+    # several servers would otherwise merge into one series and look "periodic".
+    client_times: dict[tuple[str, str], list[float]] = defaultdict(list)
     client_targets: dict[str, set[str]] = defaultdict(set)
 
     try:
@@ -487,7 +474,7 @@ def analyze_powershell(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
@@ -627,7 +614,7 @@ def analyze_powershell(
                 server_bytes += pkt_len
 
             if ts is not None:
-                client_times[client_ip].append(ts)
+                client_times[(client_ip, server_ip)].append(ts)
             client_targets[client_ip].add(server_ip)
 
             for value in strings:
@@ -645,6 +632,11 @@ def analyze_powershell(
                 if cmd_match:
                     cmd = cmd_match.group(0).strip()
                     commands[cmd] += 1
+
+                for enc_match in PS_ENCODED_ARG_RE.finditer(value):
+                    decoded = _decode_ps_encoded(enc_match.group(1))
+                    if decoded and len(decoded_ps_commands) < 50:
+                        decoded_ps_commands[_safe_excerpt(decoded)] += 1
 
                 host_match = HOST_VALUE_RE.search(value)
                 if host_match:
@@ -721,14 +713,14 @@ def analyze_powershell(
                 }
             )
 
-    for client, times in client_times.items():
+    for (client, server), times in client_times.items():
         score = _beaconing_score(times)
         if score:
             detections.append(
                 {
                     "severity": "warning",
                     "summary": "Possible PowerShell beaconing",
-                    "details": f"{client} interval avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s",
+                    "details": f"{client} -> {server} interval avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s",
                 }
             )
 
@@ -741,12 +733,24 @@ def analyze_powershell(
             }
         )
 
-    if any(PS_ENCODED_RE.search(key) for key in suspicious_indicators.keys()):
+    if decoded_ps_commands:
+        # Decoding the base64 reveals what actually ran — a high-value forensic
+        # artifact. Surface it at HIGH so the decoded command reaches triage.
+        for decoded, count in decoded_ps_commands.most_common(10):
+            suffix = f" (x{count})" if count > 1 else ""
+            detections.append(
+                {
+                    "severity": "high",
+                    "summary": "Decoded PowerShell EncodedCommand",
+                    "details": f"Decoded -EncodedCommand payload{suffix}: {decoded}",
+                }
+            )
+    elif any(PS_ENCODED_RE.search(key) for key in suspicious_indicators.keys()):
         detections.append(
             {
                 "severity": "warning",
                 "summary": "Encoded PowerShell command",
-                "details": "EncodedCommand/FromBase64String observed",
+                "details": "EncodedCommand/FromBase64String observed (base64 not recoverable from capture)",
             }
         )
 

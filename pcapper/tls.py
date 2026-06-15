@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from .utils import shannon_entropy as _shannon_entropy, packet_length
 import hashlib
 import ipaddress
-import math
 import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -10,12 +10,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .certificates import CertificateInfo, analyze_certificates
+from .certificates import CertificateInfo, analyze_certificates, is_weak_pubkey
 from .dns import _vt_lookup_domains
 from .http import analyze_http
 from .pcap_cache import get_reader
 from .progress import run_with_busy_status
-from .utils import decode_payload, safe_float, extract_packet_endpoints
+from .tls_fingerprints import (
+    _coerce_int_list,
+    _extract_alpn,
+    _extract_sni,
+    _iter_tls_extensions,
+    _ja3_from_client_hello,
+    _ja4_from_client_hello,
+    _ja4s_from_server_hello,
+    _resolve_negotiated_version,
+    _tls_extension_type,
+    lookup_ja3_intel,
+)
+from .utils import decode_payload, extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -257,90 +269,9 @@ class TlsSummary:
         }
 
 
-def _is_grease(value: int) -> bool:
-    return (value & 0x0F0F) == 0x0A0A
 
 
-def _coerce_int_list(values: object) -> list[int]:
-    if values is None:
-        return []
-    if isinstance(values, (list, tuple, set)):
-        out = []
-        for item in values:
-            try:
-                out.append(int(item))
-            except Exception:
-                continue
-        return out
-    try:
-        return [int(values)]
-    except Exception:
-        return []
 
-
-def _iter_tls_extensions(client_hello) -> list[object]:
-    exts = getattr(client_hello, "ext", None)
-    if exts is None:
-        exts = getattr(client_hello, "extensions", None)
-    if exts is None:
-        return []
-    try:
-        return list(exts)
-    except Exception:
-        return []
-
-
-def _tls_extension_type(ext: object) -> Optional[int]:
-    for attr in ("type", "ext_type", "etype", "extension_type"):
-        value = getattr(ext, attr, None)
-        if value is not None:
-            try:
-                return int(value)
-            except Exception:
-                continue
-    return None
-
-
-def _extract_sni(ext: object) -> Optional[str]:
-    name = ext.__class__.__name__
-    if "ServerName" not in name and "SNI" not in name:
-        return None
-    for attr in ("servernames", "server_names", "server_name", "names"):
-        names = getattr(ext, attr, None)
-        if names:
-            try:
-                if isinstance(names, (list, tuple)):
-                    first = names[0]
-                else:
-                    first = names
-                candidate = (
-                    getattr(first, "servername", None)
-                    or getattr(first, "name", None)
-                    or first
-                )
-                if isinstance(candidate, bytes):
-                    return candidate.decode("utf-8", errors="ignore").strip(".")
-                return str(candidate).strip(".")
-            except Exception:
-                return None
-    return None
-
-
-def _extract_alpn(ext: object) -> list[str]:
-    name = ext.__class__.__name__
-    if "ALPN" not in name and "ApplicationLayerProtocol" not in name:
-        return []
-    for attr in ("protocols", "alpn_protocols"):
-        protocols = getattr(ext, attr, None)
-        if protocols:
-            out: list[str] = []
-            for proto in protocols:
-                if isinstance(proto, bytes):
-                    out.append(proto.decode("utf-8", errors="ignore"))
-                else:
-                    out.append(str(proto))
-            return out
-    return []
 
 
 def _is_ech_extension(ext: object) -> bool:
@@ -437,14 +368,6 @@ def _is_ip_literal(value: str) -> bool:
         return False
 
 
-def _shannon_entropy(value: str) -> float:
-    if not value:
-        return 0.0
-    freq = Counter(value)
-    total = len(value)
-    return -sum((count / total) * math.log2(count / total) for count in freq.values())
-
-
 def _parse_iso_ts(value: str) -> Optional[datetime]:
     if not value:
         return None
@@ -462,110 +385,8 @@ def _parse_iso_ts(value: str) -> Optional[datetime]:
     return dt
 
 
-def _ja3_from_client_hello(client_hello) -> Optional[str]:
-    version = getattr(client_hello, "version", None)
-    if version is None:
-        return None
-    try:
-        version_val = int(version)
-    except Exception:
-        return None
-
-    ciphers = []
-    for attr in ("ciphers", "cipher_suites", "ciphersuites"):
-        ciphers = _coerce_int_list(getattr(client_hello, attr, None))
-        if ciphers:
-            break
-    ciphers = [c for c in ciphers if not _is_grease(c)]
-
-    exts = _iter_tls_extensions(client_hello)
-    ext_types = []
-    curves = []
-    ec_points = []
-    for ext in exts:
-        ext_type = _tls_extension_type(ext)
-        if ext_type is not None and not _is_grease(ext_type):
-            ext_types.append(ext_type)
-
-        for attr in ("groups", "supported_groups", "elliptic_curves"):
-            groups = _coerce_int_list(getattr(ext, attr, None))
-            if groups:
-                curves.extend(groups)
-                break
-
-        for attr in ("ecpl", "ec_point_formats", "formats", "ec_points"):
-            points = _coerce_int_list(getattr(ext, attr, None))
-            if points:
-                ec_points.extend(points)
-                break
-
-    curves = [c for c in curves if not _is_grease(c)]
-    ec_points = [p for p in ec_points if not _is_grease(p)]
-
-    def _join(values: list[int]) -> str:
-        return "-".join(str(v) for v in values)
-
-    ja3_str = f"{version_val},{_join(ciphers)},{_join(ext_types)},{_join(curves)},{_join(ec_points)}"
-    return ja3_str
-
-
-def _ja4_from_client_hello(
-    client_hello, sni: Optional[str], alpn: list[str]
-) -> Optional[str]:
-    version = getattr(client_hello, "version", None)
-    if version is None:
-        return None
-    try:
-        version_val = int(version)
-    except Exception:
-        return None
-
-    ciphers = []
-    for attr in ("ciphers", "cipher_suites", "ciphersuites"):
-        ciphers = _coerce_int_list(getattr(client_hello, attr, None))
-        if ciphers:
-            break
-    ciphers = [c for c in ciphers if not _is_grease(c)]
-    first_cipher = str(ciphers[0]) if ciphers else "0"
-
-    ext_types = []
-    for ext in _iter_tls_extensions(client_hello):
-        ext_type = _tls_extension_type(ext)
-        if ext_type is not None and not _is_grease(ext_type):
-            ext_types.append(ext_type)
-    ext_str = "-".join(str(v) for v in ext_types)
-    ext_hash = hashlib.sha256(ext_str.encode("utf-8", errors="ignore")).hexdigest()[:8]
-
-    alpn_token = alpn[0] if alpn else "na"
-    sni_flag = "s" if sni else "n"
-    return f"t{version_val}{sni_flag}-{alpn_token}-{first_cipher}-{ext_hash}"
-
-
-def _ja4s_from_server_hello(server_hello) -> Optional[str]:
-    version = getattr(server_hello, "version", None)
-    if version is None:
-        return None
-    try:
-        version_val = int(version)
-    except Exception:
-        return None
-
-    cipher = getattr(server_hello, "cipher", None)
-    try:
-        cipher_val = int(cipher) if cipher is not None else 0
-    except Exception:
-        cipher_val = 0
-
-    ext_types = []
-    for ext in _iter_tls_extensions(server_hello):
-        ext_type = _tls_extension_type(ext)
-        if ext_type is not None and not _is_grease(ext_type):
-            ext_types.append(ext_type)
-    ext_str = "-".join(str(v) for v in ext_types)
-    ext_hash = hashlib.sha256(ext_str.encode("utf-8", errors="ignore")).hexdigest()[:8]
-    return f"s{version_val}-{cipher_val}-{ext_hash}"
-
-
+# JA3/JA4/JA4S construction lives in tls_fingerprints (shared with ips.py).
+@memoize_analysis
 def analyze_tls(
     path: Path,
     show_status: bool = True,
@@ -712,7 +533,7 @@ def analyze_tls(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             ts = safe_float(getattr(pkt, "time", None))
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
@@ -828,7 +649,11 @@ def analyze_tls(
             if TLSClientHello is not None and pkt.haslayer(TLSClientHello):  # type: ignore[truthy-bool]
                 client_hello = pkt[TLSClientHello]  # type: ignore[index]
                 client_hellos += 1
-                client_ver = _tls_version_label(getattr(client_hello, "version", "?"))
+                client_ver = _tls_version_label(
+                    _resolve_negotiated_version(
+                        client_hello, getattr(client_hello, "version", "?")
+                    )
+                )
                 versions[client_ver] += 1
                 if client_ver in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
                     legacy_version_servers[client_ver][server] += 1
@@ -879,7 +704,11 @@ def analyze_tls(
             if TLSServerHello is not None and pkt.haslayer(TLSServerHello):  # type: ignore[truthy-bool]
                 server_hello = pkt[TLSServerHello]  # type: ignore[index]
                 server_hellos += 1
-                server_ver = _tls_version_label(getattr(server_hello, "version", "?"))
+                server_ver = _tls_version_label(
+                    _resolve_negotiated_version(
+                        server_hello, getattr(server_hello, "version", "?")
+                    )
+                )
                 versions[server_ver] += 1
                 if server_ver in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
                     legacy_version_servers[server_ver][server] += 1
@@ -892,7 +721,11 @@ def analyze_tls(
                     if any(marker in upper for marker in WEAK_CIPHER_MARKERS):
                         weak_ciphers[cipher_name] += 1
 
-                ja4s = _ja4s_from_server_hello(server_hello)
+                server_alpn: list[str] = []
+                for ext in _iter_tls_extensions(server_hello):
+                    if not server_alpn:
+                        server_alpn = _extract_alpn(ext)
+                ja4s = _ja4s_from_server_hello(server_hello, server_alpn)
                 if ja4s:
                     ja4s_counts[ja4s] += 1
 
@@ -997,7 +830,12 @@ def analyze_tls(
     cert_sans: Counter[str] = Counter(cert.san for cert in filtered_cert_artifacts)
     cert_count = len(filtered_cert_artifacts)
     weak_certs = sum(
-        1 for cert in filtered_cert_artifacts if int(getattr(cert, "pubkey_size", 0) or 0) < 2048
+        1
+        for cert in filtered_cert_artifacts
+        if is_weak_pubkey(
+            str(getattr(cert, "pubkey_type", "")),
+            int(getattr(cert, "pubkey_size", 0) or 0),
+        )
     )
     expired_certs = 0
     self_signed_certs = 0
@@ -1019,7 +857,10 @@ def analyze_tls(
     now_dt = datetime.now(timezone.utc)
     for cert in filtered_cert_artifacts:
         marker = _cert_endpoint_marker(cert)
-        if int(getattr(cert, "pubkey_size", 0) or 0) < 2048:
+        if is_weak_pubkey(
+            str(getattr(cert, "pubkey_type", "")),
+            int(getattr(cert, "pubkey_size", 0) or 0),
+        ):
             weak_cert_endpoints[marker] += 1
         if str(cert.subject or "").strip() and str(cert.subject) == str(cert.issuer):
             self_signed_endpoints[marker] += 1
@@ -1072,6 +913,35 @@ def analyze_tls(
                 "summary": "Legacy TLS versions observed",
                 "details": details,
                 "top_destinations": host_evidence,
+            }
+        )
+
+    # Known-malicious / offensive-tool JA3 fingerprint matches (abuse.ch SSLBL
+    # + public C2 research). A malware-family fingerprint is a strong hunting
+    # lead (HIGH); the C2-socket fingerprints collide with benign Windows TLS
+    # so they are surfaced at INFO with the collision caveat in the detail.
+    for ja3_hash, count in ja3_counts.items():
+        intel = lookup_ja3_intel(ja3_hash)
+        if not intel:
+            continue
+        label, confidence = intel
+        sni_ctx = ja3_to_sni.get(ja3_hash, Counter())
+        sni_hosts = ", ".join(host for host, _ in sni_ctx.most_common(5)) or "-"
+        if confidence == "low":
+            severity = "info"
+            qualifier = " (low-confidence: this TLS socket is also used by benign software — corroborate with beacon timing / destination reputation)"
+        else:
+            severity = "high"
+            qualifier = ""
+        detections.append(
+            {
+                "severity": severity,
+                "summary": f"Known-malicious JA3 fingerprint: {label}",
+                "details": (
+                    f"JA3 {ja3_hash} matches threat intel ({label}); {count} "
+                    f"handshake(s), SNI: {sni_hosts}{qualifier}."
+                ),
+                "source": "TLS",
             }
         )
 
@@ -1389,8 +1259,13 @@ def analyze_tls(
         blob = f"{cert.subject} {cert.san}".lower()
         if not any(keyword in blob for keyword in BRAND_KEYWORDS):
             continue
-        suspicious = cert.subject == cert.issuer or (
-            cert.pubkey_size and cert.pubkey_size < 2048
+        # A self-signed *CA* (root/intermediate) legitimately has subject==issuer
+        # and carries the brand name; only a self-signed leaf is impersonation.
+        suspicious = (
+            cert.subject == cert.issuer and not getattr(cert, "is_ca", False)
+        ) or is_weak_pubkey(
+            str(getattr(cert, "pubkey_type", "")),
+            int(getattr(cert, "pubkey_size", 0) or 0),
         )
         if cert.sni and any(
             str(cert.sni).lower().endswith(tld) for tld in SUSPICIOUS_TLDS

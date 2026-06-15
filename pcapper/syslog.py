@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_public_ip as _is_public_ip, packet_length, extract_ascii_strings as _extract_ascii_strings
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -87,14 +87,43 @@ SUSPICIOUS_PATTERNS = [
     (re.compile(r"accepted\s+password", re.IGNORECASE), "Password login accepted"),
     (re.compile(r"root\s+login|root\s+user", re.IGNORECASE), "Root login activity"),
     (re.compile(r"useradd|usermod|passwd\s+", re.IGNORECASE), "Account management"),
-    (re.compile(r"ssh-\d", re.IGNORECASE), "SSH version exposure"),
-    (re.compile(r"nmap|masscan|sqlmap", re.IGNORECASE), "Recon tooling"),
+    (re.compile(r"\bnmap\b|\bmasscan\b|\bsqlmap\b", re.IGNORECASE), "Recon tooling"),
     (re.compile(r"wget\s+http|curl\s+http", re.IGNORECASE), "Download tooling"),
     (
         re.compile(r"powershell|cmd\.exe|/bin/(sh|bash)", re.IGNORECASE),
         "Command execution",
     ),
-    (re.compile(r"ransom|malware|c2|beacon", re.IGNORECASE), "Malware indicator"),
+    # Word-boundaried: bare "SSH-2.0" banners, "MalwareBytes" / "anti-ransomware
+    # service" / "beacon frame" log lines were firing as malware indicators.
+    (
+        re.compile(r"\bransomware?\b|\bmalware\b|\bc2\b|\bbeacon(?:ing)?\b", re.IGNORECASE),
+        "Malware indicator",
+    ),
+    # Anti-forensics / log tampering (ATT&CK T1070 Indicator Removal) — clearing
+    # audit logs or stopping the logging daemon is a high-value IR signal.
+    (
+        re.compile(
+            r"(audit\s+log|event\s+log|security\s+log|the\s+audit\s+log)\s+(was\s+)?cleared",
+            re.IGNORECASE,
+        ),
+        "Log cleared (anti-forensics)",
+    ),
+    (
+        re.compile(r"\beventid[=:\s]+1102\b|\b1102\b.*log\s+cleared", re.IGNORECASE),
+        "Windows Security log cleared (EventID 1102)",
+    ),
+    (
+        re.compile(
+            r"auditd.*(halt|stopp|exiting)|stopping\s+(rsyslog|systemd-journald|auditd)|"
+            r"audit.*daemon.*(stop|disabl)",
+            re.IGNORECASE,
+        ),
+        "Logging daemon stopped (anti-forensics)",
+    ),
+    (
+        re.compile(r"history\s+-c|unset\s+HISTFILE|HISTSIZE=0", re.IGNORECASE),
+        "Shell history cleared (anti-forensics)",
+    ),
 ]
 
 FILE_NAME_RE = re.compile(
@@ -225,34 +254,6 @@ class SyslogSummary:
         }
 
 
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
-
-
-def _extract_ascii_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> list[str]:
-    results: list[str] = []
-    if not data:
-        return results
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
 def _parse_syslog(text: str) -> dict[str, Optional[str]]:
     match_5424 = SYSLOG_5424_RE.match(text)
     if match_5424:
@@ -309,6 +310,7 @@ def _parse_syslog(text: str) -> dict[str, Optional[str]]:
     }
 
 
+@memoize_analysis
 def analyze_syslog(
     path: Path,
     show_status: bool = True,
@@ -401,7 +403,7 @@ def analyze_syslog(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
@@ -574,9 +576,11 @@ def analyze_syslog(
 
     if suspicious_counter:
         for summary, count in suspicious_counter.most_common(10):
+            # Log-tampering / anti-forensics is a high-confidence IR signal.
+            severity = "high" if "anti-forensics" in summary or "cleared" in summary.lower() else "warning"
             detections.append(
                 {
-                    "severity": "warning",
+                    "severity": severity,
                     "summary": summary,
                     "details": f"Observed {count} occurrences in syslog messages.",
                 }
@@ -602,16 +606,27 @@ def analyze_syslog(
                 )
             )
 
-    if (
-        severity_counts.get("Critical")
-        or severity_counts.get("Alert")
-        or severity_counts.get("Emergency")
-    ):
+    _high_sev = (
+        int(severity_counts.get("Emergency", 0) or 0)
+        + int(severity_counts.get("Alert", 0) or 0)
+        + int(severity_counts.get("Critical", 0) or 0)
+    )
+    if _high_sev:
+        # Routine infrastructure (link flaps, daemon restarts) legitimately
+        # emits Critical/Alert/Emergency, so this is context (LOW), not a HIGH
+        # alert on its own -- the real high-value syslog signals are the
+        # log-cleared / anti-forensics patterns handled separately at HIGH.
         anomalies.append(
             SyslogAnomaly(
                 title="High-severity syslog events",
-                details="Critical/Alert/Emergency severity events observed.",
-                severity="HIGH",
+                details=(
+                    f"{_high_sev} Critical/Alert/Emergency event(s) observed "
+                    f"(Emergency={int(severity_counts.get('Emergency', 0) or 0)}, "
+                    f"Alert={int(severity_counts.get('Alert', 0) or 0)}, "
+                    f"Critical={int(severity_counts.get('Critical', 0) or 0)}); "
+                    "review against expected device health."
+                ),
+                severity="LOW",
             )
         )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_public_ip as _is_public_ip, extract_ascii_strings as _extract_ascii_strings
+from .utils import extract_utf16le_strings as _extract_utf16le_strings
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .pcap_cache import PcapMeta, get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -31,6 +32,131 @@ REQ_RE = re.compile(
     r"\b(AS-REQ|AS-REP|TGS-REQ|TGS-REP|KRB_ERROR|S4U2SELF|S4U2PROXY|PA-ENC-TIMESTAMP)\b",
     re.IGNORECASE,
 )
+
+# Kerberos message types and error codes are ASN.1 *integers*, not ASCII text,
+# so the string regexes above never match real binary Kerberos. The msg-type is
+# the outer [APPLICATION n] tag (RFC 4120 §5.4) and KRB-ERROR carries the error
+# as an INTEGER. These helpers recover both from the raw payload so the attack
+# heuristics (kerberoasting, AS-REP roasting, password spray, pass-the-ticket)
+# actually have data to work with.
+_KRB_APP_TAGS = {
+    0x6A: "AS-REQ",     # [APPLICATION 10]
+    0x6B: "AS-REP",     # [APPLICATION 11]
+    0x6C: "TGS-REQ",    # [APPLICATION 12]
+    0x6D: "TGS-REP",    # [APPLICATION 13]
+    0x6E: "AP-REQ",     # [APPLICATION 14]
+    0x6F: "AP-REP",     # [APPLICATION 15]
+    0x7E: "KRB-ERROR",  # [APPLICATION 30]
+}
+_KRB_ERROR_CODE_NAMES = {
+    6: "KDC_ERR_C_PRINCIPAL_UNKNOWN",
+    7: "KDC_ERR_S_PRINCIPAL_UNKNOWN",
+    18: "KDC_ERR_CLIENT_REVOKED",
+    23: "KDC_ERR_KEY_EXPIRED",
+    24: "KDC_ERR_PREAUTH_FAILED",
+    25: "KDC_ERR_PREAUTH_REQUIRED",
+}
+
+
+def _krb_der_len_ok(payload: bytes, off: int) -> bool:
+    if off + 1 >= len(payload):
+        return False
+    length_byte = payload[off + 1]
+    return length_byte < 0x80 or length_byte in (0x81, 0x82, 0x83, 0x84)
+
+
+def _krb_msgtype_from_payload(payload: bytes) -> Optional[str]:
+    """Kerberos message name from the outer APPLICATION tag, or None.
+
+    On UDP/88 the tag is at offset 0; on TCP/88 a 4-byte length prefix precedes
+    it. A plausible DER length byte must follow the tag to avoid false matches.
+    """
+    if len(payload) < 2:
+        return None
+    for off in (0, 4):
+        if (
+            len(payload) > off + 1
+            and payload[off] in _KRB_APP_TAGS
+            and _krb_der_len_ok(payload, off)
+        ):
+            return _KRB_APP_TAGS[payload[off]]
+    return None
+
+
+def _krb_error_code_from_payload(payload: bytes) -> Optional[str]:
+    """Error name from a KRB-ERROR's error-code field ([6] INTEGER -> A6 03 02 01 cc)."""
+    idx = payload.find(b"\xa6\x03\x02\x01")
+    if idx >= 0 and idx + 4 < len(payload):
+        return _KRB_ERROR_CODE_NAMES.get(payload[idx + 4])
+    return None
+
+
+# RFC 3961/4120 + Microsoft etype numbers. AES (17/18) is the modern default;
+# RC4-HMAC (23/24) and the single-DES types (1/2/3) are crackable offline and a
+# client that requests *only* those is downgrading — the kerberoast / AS-REP
+# roast signature (Rubeus, Impacket, etc. force RC4 to harvest crackable tickets).
+_KRB_ETYPE_NAMES = {
+    1: "des-cbc-crc",
+    2: "des-cbc-md4",
+    3: "des-cbc-md5",
+    16: "des3-cbc-sha1",
+    17: "aes128-cts-hmac-sha1",
+    18: "aes256-cts-hmac-sha1",
+    19: "aes128-cts-hmac-sha256",
+    20: "aes256-cts-hmac-sha384",
+    23: "rc4-hmac",
+    24: "rc4-hmac-exp",
+    25: "camellia128-cts-cmac",
+    26: "camellia256-cts-cmac",
+}
+_KRB_WEAK_ETYPES = {1, 2, 3, 23, 24}  # single-DES + RC4: crackable offline
+_KRB_STRONG_ETYPES = {16, 17, 18, 19, 20, 25, 26}  # AES / 3DES / Camellia
+
+
+def _krb_reqbody_etypes(payload: bytes) -> list[int]:
+    """Encryption types a KDC-REQ offers, from the req-body [8] etype list.
+
+    DER for the field is ``A8 ll 30 ll (02 ll ee...)+`` ([8] SEQUENCE OF Int32).
+    Each element is a DER INTEGER of variable length — Windows lists the AES/RC4
+    etypes as one-byte values but also Microsoft-proprietary negative etypes as
+    two-byte values (e.g. ``02 02 FF 7B`` = -133), so a fixed 1-byte assumption
+    drops the whole list. The whole SEQUENCE is parsed as INTEGER TLVs that must
+    exactly fill it, which keeps the ``A8`` anchor unambiguous against unrelated
+    context tags. Returns the (signed) etypes in request/preference order, or
+    ``[]`` if no valid etype SEQUENCE is found.
+    """
+    n = len(payload)
+    for idx in range(n - 5):
+        if (
+            payload[idx] == 0xA8
+            and payload[idx + 2] == 0x30
+            and payload[idx + 4] == 0x02
+        ):
+            seq_len = payload[idx + 3]
+            seq_start = idx + 4
+            seq_end = seq_start + seq_len
+            if seq_len == 0 or seq_end > n:
+                continue
+            etypes: list[int] = []
+            ok = True
+            pos = seq_start
+            while pos < seq_end:
+                if payload[pos] != 0x02:  # every element must be an INTEGER
+                    ok = False
+                    break
+                int_len = payload[pos + 1]
+                val_start = pos + 2
+                val_end = val_start + int_len
+                if int_len == 0 or int_len > 4 or val_end > seq_end:
+                    ok = False
+                    break
+                etypes.append(
+                    int.from_bytes(payload[val_start:val_end], "big", signed=True)
+                )
+                pos = val_end
+            if ok and pos == seq_end and etypes:
+                return etypes
+    return []
 
 CNAME_SUFFIXES = (
     ".local",
@@ -299,6 +425,7 @@ class KerberosAnalysis:
     errors: List[str]
     deterministic_checks: Dict[str, List[str]] = field(default_factory=dict)
     attack_matrix: List[Dict[str, str]] = field(default_factory=list)
+    etype_counts: Counter[int] = field(default_factory=Counter)
 
 
 def _build_kerberos_attack_overview(
@@ -610,56 +737,7 @@ def _build_kerberos_attack_overview(
     return checks, matrix
 
 
-def _extract_ascii_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> List[str]:
-    results: List[str] = []
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
-def _extract_utf16le_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
-) -> List[str]:
-    results: List[str] = []
-    current = bytearray()
-    i = 0
-    while i + 1 < len(data):
-        ch = data[i]
-        if 32 <= ch <= 126 and data[i + 1] == 0x00:
-            current.append(ch)
-            i += 2
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-            i += 2
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        addr = ipaddress.ip_address(value)
-        return addr.is_global
-    except Exception:
-        return False
-
-
+@memoize_analysis
 def analyze_kerberos(
     path: Path,
     show_status: bool = True,
@@ -698,6 +776,8 @@ def analyze_kerberos(
     spns_by_client: dict[str, set[str]] = defaultdict(set)
     realms_by_client: dict[str, set[str]] = defaultdict(set)
     error_by_client: dict[str, Counter[str]] = defaultdict(Counter)
+    etype_counts: Counter[int] = Counter()  # encryption types offered across all KDC-REQs
+    weak_only_etype_clients: Dict[str, list[int]] = {}  # client -> RC4/DES-only request list
 
     try:
         for pkt in reader:
@@ -772,6 +852,39 @@ def analyze_kerberos(
             packet_krbtgt = False
             saw_asrep_preauth = False
             saw_pa_enc_timestamp = False
+
+            # Recover msg-type / error-code from the binary ASN.1 (the ASCII
+            # regexes never match real Kerberos). This is what feeds the attack
+            # heuristics below.
+            binary_msgtype = _krb_msgtype_from_payload(payload)
+            if binary_msgtype:
+                packet_req_tokens.add(
+                    "KRB_ERROR" if binary_msgtype == "KRB-ERROR" else binary_msgtype
+                )
+                if binary_msgtype == "KRB-ERROR":
+                    err_name = _krb_error_code_from_payload(payload)
+                    if err_name:
+                        packet_err_tokens.add(err_name)
+                elif binary_msgtype in ("AS-REQ", "TGS-REQ"):
+                    req_etypes = _krb_reqbody_etypes(payload)
+                    if req_etypes:
+                        # Only count recognized cryptographic etypes; Windows
+                        # also lists Microsoft-proprietary negative markers that
+                        # are not session-crypto choices.
+                        crypto_etypes = [
+                            e for e in req_etypes if e in _KRB_ETYPE_NAMES
+                        ]
+                        etype_counts.update(crypto_etypes)
+                        # A request offering ONLY single-DES/RC4 (no AES) is an
+                        # encryption downgrade — the kerberoast / AS-REP-roast
+                        # signature. Normal Windows clients list AES first and
+                        # only fall back to RC4, so a mixed list is benign.
+                        if crypto_etypes and all(
+                            e in _KRB_WEAK_ETYPES for e in crypto_etypes
+                        ):
+                            weak_only_etype_clients.setdefault(
+                                src_ip, crypto_etypes
+                            )
 
             for value in candidate_strings:
                 if _is_useful_kerberos_artifact(value):
@@ -918,6 +1031,26 @@ def analyze_kerberos(
             }
         )
 
+    if weak_only_etype_clients:
+        sample_client = next(iter(weak_only_etype_clients))
+        sample_etypes = weak_only_etype_clients[sample_client]
+        etype_label = ", ".join(
+            _KRB_ETYPE_NAMES.get(e, str(e)) for e in sample_etypes
+        )
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Kerberos encryption downgrade (weak-only etype request)",
+                "details": (
+                    f"{len(weak_only_etype_clients)} client(s) requested only "
+                    f"crackable encryption (no AES) — e.g. {sample_client} offered "
+                    f"[{etype_label}]. RC4/DES-only requests are the kerberoast / "
+                    f"AS-REP-roast downgrade signature (Rubeus, Impacket)."
+                ),
+                "source": "Kerberos",
+            }
+        )
+
     as_rep = request_types.get("AS-REP", 0)
     if as_rep and "KDC_ERR_PREAUTH_REQUIRED" not in error_codes:
         detections.append(
@@ -939,12 +1072,24 @@ def analyze_kerberos(
             }
         )
 
-    if spns.get("krbtgt") and request_types.get("TGS-REP", 0) > 0 and tgs_req > 0:
+    # Golden/silver tickets are forged tickets *used* without a preceding AS
+    # exchange, so the signal is TGS activity disproportionate to AS-REQ — not
+    # the mere presence of krbtgt+TGS traffic, which is every normal session.
+    tgs_rep_total = int(request_types.get("TGS-REP", 0))
+    as_req_total = int(request_types.get("AS-REQ", 0))
+    if (
+        spns.get("krbtgt")
+        and tgs_rep_total >= 20
+        and as_req_total <= max(2, tgs_rep_total // 10)
+    ):
         detections.append(
             {
                 "severity": "warning",
                 "summary": "Potential golden/silver ticket indicators (heuristic)",
-                "details": "krbtgt SPN activity observed alongside TGS traffic.",
+                "details": (
+                    f"TGS traffic (TGS-REP={tgs_rep_total}) with disproportionately "
+                    f"few AS-REQ ({as_req_total}); tickets used without AS exchange."
+                ),
                 "source": "Kerberos",
             }
         )
@@ -1056,4 +1201,5 @@ def analyze_kerberos(
         errors=errors,
         deterministic_checks=deterministic_checks,
         attack_matrix=attack_matrix,
+        etype_counts=etype_counts,
     )

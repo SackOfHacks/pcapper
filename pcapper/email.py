@@ -12,7 +12,7 @@ from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, safe_float
+from .utils import extract_packet_endpoints, safe_float, packet_length
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -70,7 +70,9 @@ SUSPICIOUS_CONTENT_RE = [
         "Malware tooling",
     ),
     (
-        re.compile(r"rundll32|regsvr32|schtasks|at\s+", re.IGNORECASE),
+        # `at\s+` matched the English word "at " in any message body; restrict to
+        # the remote-scheduling `at \\host` lateral-movement invocation.
+        re.compile(r"rundll32|regsvr32|schtasks|\bat\s+\\\\", re.IGNORECASE),
         "Execution/persistence tooling",
     ),
     (re.compile(r"nmap|masscan|sqlmap", re.IGNORECASE), "Recon tooling"),
@@ -330,11 +332,6 @@ def _looks_like_mail_text(text: str) -> bool:
     if cue_hits >= 1:
         return True
     return bool(EMAIL_RE.search(text) and ("subject:" in lowered or "auth " in lowered))
-
-
-def _is_http_request_line(line: str) -> bool:
-    upper = (line or "").upper()
-    return any(upper.startswith(f"{method} ") for method in HTTP_METHODS)
 
 
 def _extract_http_context(text: str) -> dict[str, str]:
@@ -1282,7 +1279,7 @@ def analyze_email(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             ts = safe_float(getattr(pkt, "time", None))

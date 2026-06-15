@@ -48,24 +48,42 @@ CAUSES = {
     10: "Activation Termination",
 }
 
+# Control-direction ASDU type IDs (commands that change process/IED state).
+# A command type carrying an Activation/Deactivation cause (COT 6/8) is an
+# unauthorized-command indicator -- benign monitoring uses Periodic/Spontaneous.
+IEC_COMMAND_TYPES = {
+    45: "C_SC_NA (Single Command)",
+    46: "C_DC_NA (Double Command)",
+    47: "C_RC_NA (Regulating Step Command)",
+    48: "C_SE_NA (Setpoint, normalized)",
+    49: "C_SE_NB (Setpoint, scaled)",
+    50: "C_SE_NC (Setpoint, short float)",
+    51: "C_BO_NA (Bitstring 32-bit)",
+    58: "C_SC_TA (Single Command +time)",
+    59: "C_DC_TA (Double Command +time)",
+    60: "C_RC_TA (Regulating Step +time)",
+    61: "C_SE_TA (Setpoint normalized +time)",
+    62: "C_SE_TB (Setpoint scaled +time)",
+    63: "C_SE_TC (Setpoint float +time)",
+    64: "C_BO_TA (Bitstring +time)",
+    105: "C_RP_NA (Reset Process Command)",
+}
+_IEC_ACTIVATION_COTS = {6, 8}
 
-def _parse_asdu(payload: bytes) -> tuple[Optional[str], Optional[str]]:
+
+def _parse_asdu(
+    payload: bytes,
+) -> tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
     if len(payload) < 9:
-        return None, None
+        return None, None, None, None
     if payload[0] != 0x68:
-        return None, None
+        return None, None, None, None
     if len(payload) >= 6 and payload[3] == 0x68:
-        idx = 4
-        if idx + 1 >= len(payload):
-            return None, None
-        idx += 1
-        if idx + 1 >= len(payload):
-            return None, None
-        idx += 1
+        idx = 6
     else:
         idx = 6
     if idx + 6 > len(payload):
-        return None, None
+        return None, None, None, None
     type_id = payload[idx]
     vsq = payload[idx + 1]
     _ = vsq
@@ -73,28 +91,61 @@ def _parse_asdu(payload: bytes) -> tuple[Optional[str], Optional[str]]:
     cot = cot_raw & 0x3F
     cause_name = CAUSES.get(cot, f"COT {cot}")
     type_name = f"ASDU {type_id}"
-    return type_name, cause_name
+    return type_name, cause_name, type_id, cot
 
 
 def _iec_apdu_candidate(payload: bytes) -> bool:
-    if not payload or len(payload) < 4:
+    # IEC 60870-5-101/103 FT1.2 *variable*-length frame: 0x68 L L 0x68 <L user
+    # bytes> CS 0x16. Requiring the repeated start byte AND the repeated length
+    # field (payload[1]==payload[2]) makes the signature specific — a bare
+    # "starts with 0x68" test matches ~0.2% of arbitrary binary/IT traffic and
+    # produced false "IEC-101/103 exposure" detections on malware/HTTP captures.
+    if not payload or len(payload) < 6:
         return False
-    if payload[0] != 0x68:
+    if payload[0] != 0x68 or payload[3] != 0x68:
         return False
     length = payload[1]
-    return 4 <= length <= 255
+    if length != payload[2] or not (1 <= length <= 253):
+        return False
+    # The frame is 0x68 L L 0x68 + L user bytes + checksum + 0x16. Validate the
+    # declared length against the captured frame where it isn't TCP-coalesced.
+    expected = length + 6
+    if len(payload) >= expected and payload[expected - 1] != 0x16:
+        return False
+    return True
 
 
 def analyze_iec101_103(path: Path, show_status: bool = True) -> Iec101103Summary:
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
+    try:
+        reader, status, stream, size_bytes, _file_type = get_reader(
+            path, show_status=show_status
+        )
+    except Exception as exc:
+        # Unreadable/unsupported capture — return gracefully like the other
+        # analyzers instead of propagating the exception and crashing the run.
+        return Iec101103Summary(
+            path=path,
+            total_packets=0,
+            candidate_packets=0,
+            client_counts=Counter(),
+            server_counts=Counter(),
+            type_counts=Counter(),
+            cause_counts=Counter(),
+            detections=[],
+            errors=[f"{type(exc).__name__}: {exc}"],
+            first_seen=None,
+            last_seen=None,
+            duration_seconds=None,
+        )
     total_packets = 0
     candidate_packets = 0
     client_counts: Counter[str] = Counter()
     server_counts: Counter[str] = Counter()
     type_counts: Counter[str] = Counter()
     cause_counts: Counter[str] = Counter()
+    # (src, dst, type_id) -> count of control commands carrying an
+    # Activation/Deactivation cause (the unauthorized-command surface).
+    command_activations: dict[tuple[str, str, int], int] = {}
     detections: list[dict[str, object]] = []
     errors: list[str] = []
     first_seen: Optional[float] = None
@@ -133,11 +184,17 @@ def analyze_iec101_103(path: Path, show_status: bool = True) -> Iec101103Summary
             client_counts[src_ip] += 1
             server_counts[dst_ip] += 1
 
-            type_name, cause_name = _parse_asdu(payload)
+            type_name, cause_name, type_id, cot = _parse_asdu(payload)
             if type_name:
                 type_counts[type_name] += 1
             if cause_name:
                 cause_counts[cause_name] += 1
+            if (
+                type_id in IEC_COMMAND_TYPES
+                and cot in _IEC_ACTIVATION_COTS
+            ):
+                key = (src_ip, dst_ip, type_id)
+                command_activations[key] = command_activations.get(key, 0) + 1
 
     finally:
         status.finish()
@@ -151,6 +208,31 @@ def analyze_iec101_103(path: Path, show_status: bool = True) -> Iec101103Summary
                 "details": f"{candidate_packets} packets matched IEC 101/103 APDU framing heuristics.",
             }
         )
+    if command_activations:
+        top = sorted(
+            command_activations.items(), key=lambda kv: kv[1], reverse=True
+        )[:8]
+        evidence = [
+            f"{src} -> {dst}: {IEC_COMMAND_TYPES[tid]} x{cnt} (Activation)"
+            for (src, dst, tid), cnt in top
+        ]
+        has_reset = any(tid == 105 for (_s, _d, tid) in command_activations)
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "IEC 101/103 Control Command (Activation)",
+                "details": (
+                    f"{sum(command_activations.values())} control-command activation(s) "
+                    "observed (setpoint/command/reset to controlled equipment). "
+                    "Confirm authorization and change-window."
+                ),
+                "evidence": evidence,
+                "attack": "T0816 Device Restart/Shutdown"
+                if has_reset
+                else "T0855 Unauthorized Command Message",
+            }
+        )
+
     unique_clients = len(client_counts)
     unique_servers = len(server_counts)
     if unique_servers >= 20 and candidate_packets >= 50:

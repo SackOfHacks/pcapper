@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from .industrial_helpers import (
+    append_public_exposure_anomaly,
     IndustrialAnalysis,
     IndustrialAnomaly,
     analyze_port_protocol,
@@ -102,22 +103,5 @@ def analyze_niagara(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         enable_enrichment=True,
         show_status=show_status,
     )
-    public_endpoints = []
-    for ip_value in set(analysis.src_ips) | set(analysis.dst_ips):
-        try:
-            if ipaddress.ip_address(ip_value).is_global:
-                public_endpoints.append(ip_value)
-        except Exception:
-            continue
-    if public_endpoints and len(analysis.anomalies) < 200:
-        analysis.anomalies.append(
-            IndustrialAnomaly(
-                severity="HIGH",
-                title="Niagara Exposure to Public IP",
-                description=f"Niagara Fox traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-                src="*",
-                dst="*",
-                ts=0.0,
-            )
-        )
+    append_public_exposure_anomaly(analysis, "Niagara")
     return analysis

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .equipment import equipment_artifacts
 from .industrial_helpers import (
+    append_public_exposure_anomaly,
     IndustrialAnalysis,
     IndustrialAnomaly,
     analyze_port_protocol,
@@ -1021,29 +1022,20 @@ def analyze_s7(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         show_status=show_status,
     )
 
-    if state.is_low_confidence(analysis):
+    # A surgical attack (CR/CC + one STOP or program-download Job) has only ~1
+    # semantic command and would trip the low-confidence gate — but that single
+    # command IS the finding. Never discard when a HIGH/CRITICAL anomaly
+    # (CPU-state change / program transfer, T0813/T0843) was produced.
+    _has_high_anomaly = any(
+        str(getattr(a, "severity", "")).upper() in {"HIGH", "CRITICAL"}
+        for a in analysis.anomalies
+    )
+    if not _has_high_anomaly and state.is_low_confidence(analysis):
         return _clear_low_confidence(analysis)
 
     analysis.anomalies = _rollup_anomalies(analysis.anomalies)
 
-    public_endpoints = []
-    for ip_value in set(analysis.src_ips) | set(analysis.dst_ips):
-        try:
-            if ipaddress.ip_address(ip_value).is_global:
-                public_endpoints.append(ip_value)
-        except Exception:
-            continue
-    if public_endpoints and len(analysis.anomalies) < 200:
-        analysis.anomalies.append(
-            IndustrialAnomaly(
-                severity="HIGH",
-                title="S7 Exposure to Public IP",
-                description=f"S7 traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-                src="*",
-                dst="*",
-                ts=0.0,
-            )
-        )
+    append_public_exposure_anomaly(analysis, "S7")
 
     analysis.anomalies = _rollup_anomalies(analysis.anomalies)
     return analysis

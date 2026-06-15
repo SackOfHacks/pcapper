@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -7,8 +8,15 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, get_reader
-from .services import COMMON_PORTS
-from .utils import safe_float, extract_packet_endpoints
+from .services import COMMON_PORTS, _OT_SERVICE_PORTS
+from .utils import (
+    extract_packet_endpoints,
+    is_private_ip,
+    is_public_ip,
+    memoize_analysis,
+    safe_float,
+    tcp_flags_int as _tcp_flags_int,
+)
 
 try:
     from scapy.layers.inet import ICMP, IP, TCP, UDP
@@ -61,6 +69,19 @@ class ScanSourceResult:
     scanner_software_guess: str = "-"
     top_ports: list[int] = field(default_factory=list)
     targets: list[ScanTargetResult] = field(default_factory=list)
+    # Threat-hunt / IR context.
+    techniques: list[str] = field(default_factory=list)
+    probe_packets: int = 0
+    scanner_scope: str = "-"  # internal / external
+    target_scope: str = "-"  # internal / external / mixed
+    duration_seconds: float = 0.0
+    packets_per_second: float = 0.0
+    open_responses: int = 0  # SYN/ACK received -> open service
+    closed_responses: int = 0  # RST received -> port closed
+    filtered_responses: int = 0  # ICMP unreachable -> filtered
+    responsive_targets: int = 0  # targets that answered at all
+    ot_ports: list[int] = field(default_factory=list)
+    ot_targets: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -141,32 +162,6 @@ def _tcp_is_syn(flags: object) -> bool:
         return False
 
 
-def _tcp_flags_int(flags: object) -> int:
-    try:
-        if isinstance(flags, str):
-            value = 0
-            if "F" in flags:
-                value |= 0x01
-            if "S" in flags:
-                value |= 0x02
-            if "R" in flags:
-                value |= 0x04
-            if "P" in flags:
-                value |= 0x08
-            if "A" in flags:
-                value |= 0x10
-            if "U" in flags:
-                value |= 0x20
-            if "E" in flags:
-                value |= 0x40
-            if "C" in flags:
-                value |= 0x80
-            return value
-        return int(flags)
-    except Exception:
-        return 0
-
-
 def _tcp_is_synack(flags: object) -> bool:
     try:
         if isinstance(flags, str):
@@ -176,19 +171,59 @@ def _tcp_is_synack(flags: object) -> bool:
         return False
 
 
-def _tcp_is_ack_no_syn(flags: object) -> bool:
-    try:
-        if isinstance(flags, str):
-            return "A" in flags and "S" not in flags
-        value = int(flags)
-        return bool(value & 0x10) and not bool(value & 0x02)
-    except Exception:
-        return False
-
-
 def _tcp_is_rst(flags: object) -> bool:
     value = _tcp_flags_int(flags)
     return bool(value & 0x04)
+
+
+# Map a client-side TCP packet's flag combination to the nmap scan technique it
+# implements. RST is a response (not a probe); SYN/ACK is a response. The
+# stealth flavors (fin/null/xmas/maimon/ack) are flag combinations a normal
+# client never sends to *open* a connection — but FIN+ACK is also a normal
+# teardown and a bare ACK is normal mid-stream traffic, so the caller must gate
+# those on "no SYN was seen for this flow and the probe carries no payload".
+def _tcp_scan_flavor(flags: object) -> Optional[str]:
+    v = _tcp_flags_int(flags)
+    syn = bool(v & 0x02)
+    ack = bool(v & 0x10)
+    fin = bool(v & 0x01)
+    rst = bool(v & 0x04)
+    psh = bool(v & 0x08)
+    urg = bool(v & 0x20)
+    if rst:
+        return None
+    if syn and not ack:
+        return "syn"
+    if syn and ack:
+        return None  # SYN/ACK is a response
+    if fin and psh and urg and not (syn or ack):
+        return "xmas"
+    if fin and ack and not (syn or psh or urg):
+        return "maimon"
+    if fin and not (syn or ack or psh or urg):
+        return "fin"
+    if not (syn or ack or fin or psh or urg):
+        return "null"
+    if ack and not (syn or fin):
+        return "ack"  # ACK / Window scan (firewall-state mapping)
+    return None
+
+
+# Stealth flavors that require gating (could be normal teardown / mid-stream).
+_GATED_FLAVORS = {"fin", "null", "xmas", "maimon", "ack"}
+
+_TECHNIQUE_LABELS = {
+    "syn": "TCP SYN half-open (-sS)",
+    "connect": "TCP connect (-sT)",
+    "fin": "TCP FIN stealth (-sF)",
+    "null": "TCP NULL stealth (-sN)",
+    "xmas": "TCP XMAS stealth (-sX)",
+    "maimon": "TCP Maimon (-sM)",
+    "ack": "TCP ACK/Window firewall-mapping (-sA/-sW)",
+    "udp": "UDP (-sU)",
+    "arp": "ARP host sweep (-PR)",
+    "icmp": "ICMP echo ping sweep (-sn/-PE)",
+}
 
 
 def _tcp_is_final_handshake_ack(flags: object) -> bool:
@@ -507,6 +542,35 @@ def _is_scanner_source(
     return False
 
 
+def _record_probe(
+    src_ip: str,
+    dst_ip: str,
+    dport: int,
+    ts: Optional[float],
+    src_targets: dict[str, set[str]],
+    src_ports: dict[str, set[int]],
+    src_dst_ports: dict[tuple[str, str], set[int]],
+    src_dst_packets: Counter[tuple[str, str]],
+    src_first_seen: dict[str, float],
+    src_last_seen: dict[str, float],
+    src_ot_ports: dict[str, set[int]],
+    src_ot_targets: dict[str, set[str]],
+) -> None:
+    """Accumulate one scan probe (any technique) into the shared per-source
+    target/port spread used for scanner detection and reporting."""
+    src_targets[src_ip].add(dst_ip)
+    src_ports[src_ip].add(dport)
+    src_dst_ports[(src_ip, dst_ip)].add(dport)
+    src_dst_packets[(src_ip, dst_ip)] += 1
+    if dport in _OT_SERVICE_PORTS:
+        src_ot_ports[src_ip].add(dport)
+        src_ot_targets[src_ip].add(dst_ip)
+    if ts is not None:
+        src_first_seen[src_ip] = min(ts, src_first_seen.get(src_ip, ts))
+        src_last_seen[src_ip] = max(ts, src_last_seen.get(src_ip, ts))
+
+
+@memoize_analysis
 def analyze_scan(
     path: Path,
     show_status: bool = True,
@@ -528,6 +592,17 @@ def analyze_scan(
     src_dst_packets: Counter[tuple[str, str]] = Counter()
     src_probe_targets: dict[str, set[str]] = defaultdict(set)
     src_probe_packets: Counter[str] = Counter()
+    # Per-source scan-technique spread: flavor -> distinct (target, port) probed.
+    src_flavor_probes: dict[tuple[str, str], set[tuple[str, int]]] = defaultdict(set)
+    src_flavor_packets: Counter[tuple[str, str]] = Counter()
+    # Responses received BY a host (it is the scanner being answered).
+    recv_synack: Counter[str] = Counter()
+    recv_rst: Counter[str] = Counter()
+    recv_icmp_unreach: Counter[str] = Counter()
+    responsive_pairs: set[tuple[str, str]] = set()  # (scanner, target) answered
+    # OT/ICS service ports probed.
+    src_ot_ports: dict[str, set[int]] = defaultdict(set)
+    src_ot_targets: dict[str, set[str]] = defaultdict(set)
     syn_seen: set[tuple[str, str, int, int]] = set()
     syn_ack_seen: set[tuple[str, str, int, int]] = set()
     handshake_complete: set[tuple[str, str, int, int]] = set()
@@ -618,11 +693,18 @@ def analyze_scan(
                         flow_stats["payload_bytes_ab"] += int(payload_len)
                     else:
                         flow_stats["payload_bytes_ba"] += int(payload_len)
+                    flags_int = _tcp_flags_int(flags)
                     if _tcp_is_rst(flags):
                         if src_is_left:
                             flow_stats["rst_ab"] += 1
                         else:
                             flow_stats["rst_ba"] += 1
+                        # RST+ACK is a closed-port response back to the prober;
+                        # a bare RST is usually the scanner tearing a half-open
+                        # connection, so only the former counts as "closed".
+                        if (flags_int & 0x10) and dst_ip != src_ip:
+                            recv_rst[dst_ip] += 1
+                            responsive_pairs.add((dst_ip, src_ip))
                     if _tcp_is_syn(flags):
                         syn_seen.add(flow_key)
                         if src_is_left:
@@ -630,21 +712,76 @@ def analyze_scan(
                         else:
                             flow_stats["syn_ba"] += 1
                     elif _tcp_is_synack(flags):
+                        # SYN/ACK is an open-port response back to the scanner.
+                        recv_synack[dst_ip] += 1
+                        responsive_pairs.add((dst_ip, src_ip))
                         if reverse_key in syn_seen:
                             syn_ack_seen.add(reverse_key)
                     elif _tcp_is_final_handshake_ack(flags):
                         if flow_key in syn_seen and flow_key in syn_ack_seen:
                             handshake_complete.add(flow_key)
 
-                if _tcp_is_syn(flags) and dport is not None:
-                    src_targets[src_ip].add(dst_ip)
-                    src_ports[src_ip].add(int(dport))
-                    src_dst_ports[(src_ip, dst_ip)].add(int(dport))
-                    src_dst_packets[(src_ip, dst_ip)] += 1
-                    src_syn[src_ip] += 1
-                    if ts is not None:
-                        src_first_seen[src_ip] = min(ts, src_first_seen.get(src_ip, ts))
-                        src_last_seen[src_ip] = max(ts, src_last_seen.get(src_ip, ts))
+                # Classify the client-side probe by flag combination so stealth
+                # scans (FIN/NULL/XMAS/Maimon/ACK) and connect scans are detected
+                # alongside SYN scans rather than silently ignored.
+                if dport is not None:
+                    flavor = _tcp_scan_flavor(flags)
+                    payload_len = len(payload)
+                    probe_flow = (src_ip, dst_ip, int(sport or 0), int(dport))
+                    probe_reverse = (dst_ip, src_ip, int(dport), int(sport or 0))
+                    if flavor == "syn":
+                        accept = True
+                    elif flavor in _GATED_FLAVORS:
+                        # Genuine probe only if the connection was never
+                        # SYN-initiated in EITHER direction (so server-side
+                        # FIN+ACK teardowns and mid-session ACKs of an
+                        # established flow are not mistaken for stealth scans)
+                        # and the packet carries no payload.
+                        accept = (
+                            probe_flow not in syn_seen
+                            and probe_reverse not in syn_seen
+                            and payload_len == 0
+                        )
+                    else:
+                        accept = False
+                    if accept:
+                        _record_probe(
+                            src_ip,
+                            dst_ip,
+                            int(dport),
+                            ts,
+                            src_targets,
+                            src_ports,
+                            src_dst_ports,
+                            src_dst_packets,
+                            src_first_seen,
+                            src_last_seen,
+                            src_ot_ports,
+                            src_ot_targets,
+                        )
+                        src_flavor_probes[(src_ip, flavor)].add((dst_ip, int(dport)))
+                        src_flavor_packets[(src_ip, flavor)] += 1
+                        if flavor == "syn":
+                            src_syn[src_ip] += 1
+            elif UDP is not None and pkt.haslayer(UDP):
+                # UDP scan: a host firing UDP datagrams at many ports/targets.
+                if dport is not None:
+                    _record_probe(
+                        src_ip,
+                        dst_ip,
+                        int(dport),
+                        ts,
+                        src_targets,
+                        src_ports,
+                        src_dst_ports,
+                        src_dst_packets,
+                        src_first_seen,
+                        src_last_seen,
+                        src_ot_ports,
+                        src_ot_targets,
+                    )
+                    src_flavor_probes[(src_ip, "udp")].add((dst_ip, int(dport)))
+                    src_flavor_packets[(src_ip, "udp")] += 1
             elif ICMP is not None and pkt.haslayer(ICMP):
                 try:
                     icmp_type = int(getattr(pkt[ICMP], "type", -1))
@@ -653,9 +790,15 @@ def analyze_scan(
                 if icmp_type == 8:
                     src_probe_targets[src_ip].add(dst_ip)
                     src_probe_packets[src_ip] += 1
+                    src_flavor_probes[(src_ip, "icmp")].add((dst_ip, 0))
+                    src_flavor_packets[(src_ip, "icmp")] += 1
                     if ts is not None:
                         src_first_seen[src_ip] = min(ts, src_first_seen.get(src_ip, ts))
                         src_last_seen[src_ip] = max(ts, src_last_seen.get(src_ip, ts))
+                elif icmp_type == 3:
+                    # Destination/port unreachable -> filtered/closed signal to
+                    # the host that sent the probe (the scanner = dst_ip here).
+                    recv_icmp_unreach[dst_ip] += 1
 
             if ARP is not None and pkt.haslayer(ARP):
                 try:
@@ -665,6 +808,8 @@ def analyze_scan(
                 if op == 1:
                     src_probe_targets[src_ip].add(dst_ip)
                     src_probe_packets[src_ip] += 1
+                    src_flavor_probes[(src_ip, "arp")].add((dst_ip, 0))
+                    src_flavor_packets[(src_ip, "arp")] += 1
                     if ts is not None:
                         src_first_seen[src_ip] = min(ts, src_first_seen.get(src_ip, ts))
                         src_last_seen[src_ip] = max(ts, src_last_seen.get(src_ip, ts))
@@ -765,9 +910,18 @@ def analyze_scan(
         ):
             continue
 
-        has_vertical = max_ports_single_target >= 20 and syn_packets > 0
+        # Flavor-agnostic classification: a port scan (vertical) is many ports
+        # on a target via ANY technique, not only SYN — so stealth/UDP scans are
+        # detected too.
+        has_vertical = max_ports_single_target >= 20
+        # A TCP horizontal "scan" that matters for IR is a LATERAL sweep of many
+        # INTERNAL hosts. A workstation contacting 100+ EXTERNAL hosts is just
+        # web browsing / CDN / telemetry (the Ursnif victim hit 121 external web
+        # servers + its DC). So gate the TCP horizontal branch on internal-target
+        # breadth; ICMP/ARP sweeps (probe_targets) still always flag.
+        internal_targets = sum(1 for t in targets if is_private_ip(t))
         has_horizontal = len(probe_targets) >= 10 or (
-            unique_targets >= 10 and syn_packets > 0 and not has_vertical
+            internal_targets >= 10 and not has_vertical
         )
 
         common_mac_addresses = [
@@ -779,6 +933,73 @@ def analyze_scan(
             name
             for name, _count in src_hostname_hints.get(scanner, Counter()).most_common(6)
         ]
+
+        # Techniques used (by flag combination / protocol), connect vs half-open.
+        scanner_handshakes = sum(
+            1 for (c, _s, _cp, _sp) in handshake_complete if c == scanner
+        )
+        techniques: list[str] = []
+        for flavor in ("syn", "fin", "null", "xmas", "maimon", "ack", "udp", "arp", "icmp"):
+            spread = len(src_flavor_probes.get((scanner, flavor), set()))
+            if spread < 5:
+                continue
+            label = _TECHNIQUE_LABELS[flavor]
+            # A -sS half-open scan RSTs after the SYN/ACK and never completes a
+            # handshake; a -sT connect scan completes the handshake on each open
+            # port. So any completed handshakes during a SYN sweep => connect.
+            if flavor == "syn" and scanner_handshakes >= 2:
+                label = _TECHNIQUE_LABELS["connect"]
+            techniques.append(label)
+
+        def _scope(ip: str) -> str:
+            if is_private_ip(ip):
+                return "internal"
+            if is_public_ip(ip):
+                return "external"
+            return "-"
+
+        def _scope_of(target_set: set[str]) -> str:
+            scopes = {_scope(t) for t in target_set} - {"-"}
+            if scopes == {"internal"}:
+                return "internal"
+            if scopes == {"external"}:
+                return "external"
+            return "mixed" if scopes else "-"
+
+        scanner_scope = _scope(scanner)
+        first_ts = src_first_seen.get(scanner)
+        last_ts = src_last_seen.get(scanner)
+        duration = (
+            float(last_ts) - float(first_ts)
+            if first_ts is not None and last_ts is not None and last_ts > first_ts
+            else 0.0
+        )
+        total_probe_packets = (
+            sum(c for (s, _d), c in src_dst_packets.items() if s == scanner)
+            + probe_packets
+        )
+        pps = (total_probe_packets / duration) if duration > 0 else 0.0
+        open_resp = int(recv_synack.get(scanner, 0))
+        closed_resp = int(recv_rst.get(scanner, 0))
+        filtered_resp = int(recv_icmp_unreach.get(scanner, 0))
+        responsive = sum(1 for (s, _t) in responsive_pairs if s == scanner)
+        ot_ports_hit = sorted(src_ot_ports.get(scanner, set()))
+        ot_targets_hit = sorted(src_ot_targets.get(scanner, set()))
+
+        def _decorate(res: ScanSourceResult, target_set: set[str]) -> ScanSourceResult:
+            res.techniques = list(techniques)
+            res.probe_packets = total_probe_packets
+            res.scanner_scope = scanner_scope
+            res.target_scope = _scope_of(target_set)
+            res.duration_seconds = round(duration, 3)
+            res.packets_per_second = round(pps, 1)
+            res.open_responses = open_resp
+            res.closed_responses = closed_resp
+            res.filtered_responses = filtered_resp
+            res.responsive_targets = responsive
+            res.ot_ports = ot_ports_hit
+            res.ot_targets = ot_targets_hit
+            return res
 
         def _build_targets(target_set: set[str]) -> list[ScanTargetResult]:
             rows: list[ScanTargetResult] = []
@@ -805,31 +1026,34 @@ def analyze_scan(
             return popularity
 
         if has_vertical:
-            vertical_targets = set(syn_targets) if syn_targets else set(targets)
+            vertical_targets = set(targets)
             vertical_ports = _build_port_popularity(vertical_targets)
             results.append(
-                ScanSourceResult(
-                    scanner_ip=scanner,
-                    scan_type="vertical",
-                    unique_targets=len(vertical_targets),
-                    unique_ports=unique_ports,
-                    syn_packets=syn_packets,
-                    first_seen=src_first_seen.get(scanner),
-                    last_seen=src_last_seen.get(scanner),
-                    mac_addresses=common_mac_addresses,
-                    possible_os=common_os,
-                    hostname_hints=common_hostname_hints,
-                    scanner_software_guess=_guess_scanner_tool(
+                _decorate(
+                    ScanSourceResult(
+                        scanner_ip=scanner,
                         scan_type="vertical",
                         unique_targets=len(vertical_targets),
                         unique_ports=unique_ports,
                         syn_packets=syn_packets,
-                        probe_packets=0,
+                        first_seen=src_first_seen.get(scanner),
+                        last_seen=src_last_seen.get(scanner),
+                        mac_addresses=common_mac_addresses,
+                        possible_os=common_os,
+                        hostname_hints=common_hostname_hints,
+                        scanner_software_guess=_guess_scanner_tool(
+                            scan_type="vertical",
+                            unique_targets=len(vertical_targets),
+                            unique_ports=unique_ports,
+                            syn_packets=syn_packets,
+                            probe_packets=0,
+                            top_ports=[p for p, _ in vertical_ports.most_common(12)],
+                            markers=src_tool_markers.get(scanner, Counter()),
+                        ),
                         top_ports=[p for p, _ in vertical_ports.most_common(12)],
-                        markers=src_tool_markers.get(scanner, Counter()),
+                        targets=_build_targets(vertical_targets),
                     ),
-                    top_ports=[p for p, _ in vertical_ports.most_common(12)],
-                    targets=_build_targets(vertical_targets),
+                    vertical_targets,
                 )
             )
             included_scanners.add(scanner)
@@ -839,28 +1063,31 @@ def analyze_scan(
             horizontal_ports = _build_port_popularity(horizontal_targets)
             horizontal_syn = 0 if probe_targets else syn_packets
             results.append(
-                ScanSourceResult(
-                    scanner_ip=scanner,
-                    scan_type="horizontal",
-                    unique_targets=len(horizontal_targets),
-                    unique_ports=len(horizontal_ports),
-                    syn_packets=horizontal_syn,
-                    first_seen=src_first_seen.get(scanner),
-                    last_seen=src_last_seen.get(scanner),
-                    mac_addresses=common_mac_addresses,
-                    possible_os=common_os,
-                    hostname_hints=common_hostname_hints,
-                    scanner_software_guess=_guess_scanner_tool(
+                _decorate(
+                    ScanSourceResult(
+                        scanner_ip=scanner,
                         scan_type="horizontal",
                         unique_targets=len(horizontal_targets),
                         unique_ports=len(horizontal_ports),
                         syn_packets=horizontal_syn,
-                        probe_packets=probe_packets,
+                        first_seen=src_first_seen.get(scanner),
+                        last_seen=src_last_seen.get(scanner),
+                        mac_addresses=common_mac_addresses,
+                        possible_os=common_os,
+                        hostname_hints=common_hostname_hints,
+                        scanner_software_guess=_guess_scanner_tool(
+                            scan_type="horizontal",
+                            unique_targets=len(horizontal_targets),
+                            unique_ports=len(horizontal_ports),
+                            syn_packets=horizontal_syn,
+                            probe_packets=probe_packets,
+                            top_ports=[p for p, _ in horizontal_ports.most_common(12)],
+                            markers=src_tool_markers.get(scanner, Counter()),
+                        ),
                         top_ports=[p for p, _ in horizontal_ports.most_common(12)],
-                        markers=src_tool_markers.get(scanner, Counter()),
+                        targets=_build_targets(horizontal_targets),
                     ),
-                    top_ports=[p for p, _ in horizontal_ports.most_common(12)],
-                    targets=_build_targets(horizontal_targets),
+                    horizontal_targets,
                 )
             )
             included_scanners.add(scanner)
@@ -871,7 +1098,8 @@ def analyze_scan(
         reverse=True,
     )
     summary.relevant_packets = sum(
-        int(src_syn.get(scanner, 0)) + int(src_probe_packets.get(scanner, 0))
+        sum(c for (s, _d), c in src_dst_packets.items() if s == scanner)
+        + int(src_probe_packets.get(scanner, 0))
         for scanner in included_scanners
     )
     return summary
@@ -907,6 +1135,18 @@ def merge_scan_summaries(summaries: list[ScanSummary]) -> ScanSummary:
                     scanner_software_guess=src.scanner_software_guess,
                     top_ports=list(src.top_ports),
                     targets=list(src.targets),
+                    techniques=list(src.techniques),
+                    probe_packets=src.probe_packets,
+                    scanner_scope=src.scanner_scope,
+                    target_scope=src.target_scope,
+                    duration_seconds=src.duration_seconds,
+                    packets_per_second=src.packets_per_second,
+                    open_responses=src.open_responses,
+                    closed_responses=src.closed_responses,
+                    filtered_responses=src.filtered_responses,
+                    responsive_targets=src.responsive_targets,
+                    ot_ports=list(src.ot_ports),
+                    ot_targets=list(src.ot_targets),
                 )
                 continue
 
@@ -948,6 +1188,32 @@ def merge_scan_summaries(summaries: list[ScanSummary]) -> ScanSummary:
                 and not src.scanner_software_guess.startswith("Heuristic:")
             ):
                 current.scanner_software_guess = src.scanner_software_guess
+
+            current.techniques = list(
+                dict.fromkeys((current.techniques or []) + (src.techniques or []))
+            )
+            current.probe_packets += src.probe_packets
+            current.open_responses += src.open_responses
+            current.closed_responses += src.closed_responses
+            current.filtered_responses += src.filtered_responses
+            current.responsive_targets += src.responsive_targets
+            current.packets_per_second = max(
+                current.packets_per_second, src.packets_per_second
+            )
+            if current.first_seen is not None and current.last_seen is not None:
+                current.duration_seconds = round(
+                    max(0.0, current.last_seen - current.first_seen), 3
+                )
+            if src.scanner_scope and src.scanner_scope != "-":
+                current.scanner_scope = src.scanner_scope
+            if src.target_scope and src.target_scope != "-":
+                current.target_scope = (
+                    src.target_scope
+                    if current.target_scope in ("-", src.target_scope)
+                    else "mixed"
+                )
+            current.ot_ports = sorted(set(current.ot_ports) | set(src.ot_ports))
+            current.ot_targets = sorted(set(current.ot_targets) | set(src.ot_targets))
 
             by_target: dict[str, ScanTargetResult] = {
                 item.target_ip: item for item in current.targets

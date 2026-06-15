@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import ipaddress
+
+from .utils import is_public_ip as _is_public_ip, tcp_flags_int as _tcp_flags_int
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -17,7 +18,23 @@ except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
 
 from .pcap_cache import PcapMeta, get_reader
-from .utils import extract_packet_endpoints, safe_float
+from .utils import extract_packet_endpoints, memoize_analysis, packet_length, safe_float
+
+import ipaddress as _ipaddress
+
+
+def _is_group_address(ip: str) -> bool:
+    """True for multicast / broadcast / unspecified addresses (not real hosts)."""
+    if not ip:
+        return True
+    if ip == "255.255.255.255":
+        return True
+    try:
+        addr = _ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return bool(addr.is_multicast or addr.is_unspecified)
+
 
 # --- Dataclasses ---
 
@@ -67,19 +84,146 @@ class ServiceSummary:
     errors: List[str] = field(default_factory=list)
 
 
-def _is_public_ip(value: str) -> bool:
-    try:
-        ip_addr = ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    return ip_addr.is_global
+_OT_SERVICE_PORTS = {
+    102,    # S7 / ISO-TSAP
+    502,    # Modbus
+    2404,   # IEC 60870-5-104
+    4000,   # OPC / various
+    4840,   # OPC UA
+    9600,   # OMRON FINS
+    18245,  # GE-SRTP
+    20000,  # DNP3
+    44818,  # EtherNet/IP
+    47808,  # BACnet
+    34962,  # PROFINET
+    34963,  # PROFINET
+    34964,  # PROFINET
+    5006,   # MELSEC
+    5007,   # MELSEC
+    1962,   # PCWorx
+    2222,   # EtherNet/IP I/O (also SSH-alt; OT context)
+}
+_ADMIN_SERVICE_NAMES = {"SSH", "RDP", "SMB", "VNC", "Telnet", "WinRM"}
 
 
 def _build_services_enrichment(
     assets: List[ServiceAsset], risks: List[ServiceRisk]
 ) -> Dict[str, object]:
-    _ = (assets, risks)
-    return {}
+    checks: Dict[str, List[str]] = defaultdict(list)
+
+    # Map the analyzer's curated ServiceRisk findings to triage check buckets.
+    for risk in risks or []:
+        title = str(getattr(risk, "title", ""))
+        sev = str(getattr(risk, "severity", "")).upper()
+        ev = f"{getattr(risk, 'affected_asset', '?')}: {title} — {getattr(risk, 'description', '')}"
+        if title == "Public Admin Service":
+            checks["public_edge_admin_exposure"].append(ev)
+        elif title == "Potential UDP Amplification":
+            checks["udp_amplification_readiness"].append(ev)
+        elif title == "Non-Standard Port":
+            checks["service_identity_mismatch"].append(ev)
+        elif title in ("Cleartext Service", "Obsolete Software"):
+            checks["legacy_or_weak_service_hygiene"].append(ev)
+        else:
+            checks["legacy_or_weak_service_hygiene"].append(ev)
+
+    # Asset-derived context (not scored on its own — surfaces attack surface).
+    ot_assets: List[str] = []
+    it_admin_assets: List[str] = []
+    for asset in assets or []:
+        name = str(getattr(asset, "service_name", ""))
+        port = int(getattr(asset, "port", 0) or 0)
+        ip = str(getattr(asset, "ip", "?"))
+        if port in _OT_SERVICE_PORTS:
+            ot_assets.append(f"{ip}:{port} ({name})")
+        if any(a in name for a in _ADMIN_SERVICE_NAMES):
+            it_admin_assets.append(f"{ip}:{port} ({name})")
+            checks["lateral_admin_surface"].append(
+                f"{ip}:{port} {name} — {len(getattr(asset, 'clients', []) or [])} client(s)"
+            )
+
+    # OT/IT boundary mix: an IT admin service and an OT service observed in the
+    # same capture is a segmentation red flag (engineering access reachable from
+    # the IT side). Only fires when BOTH are genuinely present.
+    if ot_assets and it_admin_assets:
+        for a in ot_assets[:5]:
+            checks["ot_it_boundary_mix"].append(f"OT service: {a}")
+        for a in it_admin_assets[:5]:
+            checks["ot_it_boundary_mix"].append(f"IT admin service: {a}")
+
+    provenance = []
+    if assets:
+        provenance.append(f"discovered services ({len(assets)})")
+    if risks:
+        provenance.append(f"service risks ({len(risks)})")
+    if provenance:
+        checks["evidence_provenance"].append("; ".join(provenance))
+
+    crit_count = sum(1 for r in (risks or []) if str(r.severity).upper() == "CRITICAL")
+    high_count = sum(1 for r in (risks or []) if str(r.severity).upper() == "HIGH")
+
+    score = 0
+    reasons: List[str] = []
+    if checks.get("public_edge_admin_exposure"):
+        score += 3
+        reasons.append("Administrative service exposed on a public IP")
+    if crit_count:
+        score += 3
+        reasons.append(f"Critical service risk(s): {crit_count} (e.g. obsolete/EOL software)")
+    # Cleartext credential protocols (Telnet/FTP/TFTP) are rated HIGH by the
+    # analyzer; cleartext HTTP and other MEDIUM items stay context-only so an
+    # ordinary web/SNMP capture does not produce a verdict.
+    if high_count:
+        score += 2
+        reasons.append(f"High-severity service risk(s): {high_count} (e.g. cleartext credential services)")
+    if checks.get("ot_it_boundary_mix"):
+        score += 2
+        reasons.append("OT and IT administrative services observed together (segmentation risk)")
+
+    if score >= 6:
+        verdict = "YES - high-confidence service-exposure risk (public admin access / critical exposure) is present."
+        confidence = "high"
+    elif score >= 4:
+        verdict = "LIKELY - significant service-exposure risk is present."
+        confidence = "medium"
+    elif score >= 2:
+        verdict = "POSSIBLE - notable service-exposure risk observed; review the affected assets."
+        confidence = "low"
+    elif score >= 1:
+        verdict = "LOW SIGNAL - minor service-hygiene findings present."
+        confidence = "low"
+    else:
+        verdict = ""
+        confidence = "low"
+    if not reasons and verdict:
+        reasons.append("Service-risk heuristics crossed threshold")
+
+    _risk_meta = {
+        "public_edge_admin_exposure": ("Public Admin Exposure", "High"),
+        "ot_it_boundary_mix": ("OT/IT Boundary Mix", "High"),
+        "legacy_or_weak_service_hygiene": ("Legacy / Weak Hygiene", "Medium"),
+        "udp_amplification_readiness": ("UDP Amplification", "Medium"),
+        "service_identity_mismatch": ("Service/Port Mismatch", "Low"),
+        "lateral_admin_surface": ("Lateral Admin Surface", "Low"),
+    }
+    risk_matrix = [
+        {
+            "category": cat,
+            "risk": risk,
+            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
+            "evidence": f"{len(checks.get(key, []))} finding(s)",
+        }
+        for key, (cat, risk) in _risk_meta.items()
+        if checks.get(key)
+    ]
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons,
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
+        "risk_matrix": risk_matrix,
+    }
 
 def merge_services_summaries(
     summaries: List[ServiceSummary] | Tuple[ServiceSummary, ...] | Set[ServiceSummary],
@@ -339,32 +483,6 @@ def _guess_service(payload: bytes, port: int) -> tuple[Optional[str], Optional[s
     return None, None
 
 
-def _tcp_flags_int(flags: object) -> int:
-    try:
-        if isinstance(flags, str):
-            value = 0
-            if "F" in flags:
-                value |= 0x01
-            if "S" in flags:
-                value |= 0x02
-            if "R" in flags:
-                value |= 0x04
-            if "P" in flags:
-                value |= 0x08
-            if "A" in flags:
-                value |= 0x10
-            if "U" in flags:
-                value |= 0x20
-            if "E" in flags:
-                value |= 0x40
-            if "C" in flags:
-                value |= 0x80
-            return value
-        return int(flags)
-    except Exception:
-        return 0
-
-
 def _tcp_is_syn(flags: object) -> bool:
     value = _tcp_flags_int(flags)
     return bool(value & 0x02) and not bool(value & 0x10)
@@ -373,11 +491,6 @@ def _tcp_is_syn(flags: object) -> bool:
 def _tcp_is_synack(flags: object) -> bool:
     value = _tcp_flags_int(flags)
     return bool(value & 0x02) and bool(value & 0x10)
-
-
-def _tcp_is_ack_no_syn(flags: object) -> bool:
-    value = _tcp_flags_int(flags)
-    return bool(value & 0x10) and not bool(value & 0x02)
 
 
 def _tcp_is_rst(flags: object) -> bool:
@@ -501,6 +614,7 @@ def _seen_traffic_supports_service_presence(
     return False
 
 
+@memoize_analysis
 def analyze_services(
     path: Path,
     show_status: bool = True,
@@ -553,7 +667,7 @@ def analyze_services(
             else:
                 continue
 
-            pkt_len = len(pkt)
+            pkt_len = packet_length(pkt)
 
             # TCP
             if TCP in pkt:
@@ -672,62 +786,73 @@ def analyze_services(
                     if banner and not s.software:
                         s.software = banner
 
-            # UDP
+            # UDP (stateless): the service is the side bound to the well-known
+            # port. When BOTH ports are well-known the port number alone cannot
+            # tell client from server -- the classic case is NTP, where the
+            # client also sources from 123, so "traffic FROM a well-known port
+            # is a service" misclassifies the querying client as an NTP server.
+            # Use the protocol payload to recover direction: NTP's mode field is
+            # 3 for a client request and 4/5 for a server/broadcast response.
             elif UDP in pkt:
                 udp = pkt[UDP]
                 sport = udp.sport
                 dport = udp.dport
 
-                # UDP is stateless. Logic: Traffic FROM a well known port (DNS, NTP) is a service
-                if sport in COMMON_PORTS:
-                    k = (src, sport, "UDP")
-                    if filter_ip and src != filter_ip:
-                        continue
-                    if k not in services:
-                        s_name = COMMON_PORTS.get(sport, f"UDP/{sport}")
-                        services[k] = ServiceAsset(
-                            src,
-                            sport,
-                            "UDP",
-                            s_name,
-                            first_seen=ts,
-                            last_seen=ts,
-                            handshake_confirmed=False,
-                            discovery_method="udp_observed",
-                        )
+                ntp_mode: Optional[int] = None
+                if sport == 123 or dport == 123:
+                    try:
+                        udp_payload = bytes(udp.payload)
+                    except Exception:
+                        udp_payload = b""
+                    if udp_payload:
+                        ntp_mode = udp_payload[0] & 0x07
 
-                    s = services[k]
-                    s.clients.add(dst)
-                    s.packets += 1
-                    s.bytes += pkt_len
-                    s.last_seen = ts
-
-                    # DNS Answer?
-                    if sport == 53 and DNS in pkt and pkt[DNS].qr == 1:
-                        # It's a DNS Server
-                        pass
+                server_ip: Optional[str] = None
+                server_port: Optional[int] = None
+                client_ip: Optional[str] = None
+                if ntp_mode == 3:
+                    # NTP client request -> the destination is the NTP server.
+                    server_ip, server_port, client_ip = dst, dport, src
+                elif ntp_mode in (4, 5):
+                    # NTP server/broadcast response -> the source is the server.
+                    server_ip, server_port, client_ip = src, sport, dst
+                elif sport in COMMON_PORTS and dport in COMMON_PORTS:
+                    # Both well-known and no protocol disambiguation available:
+                    # treat the destination (the side being queried) as the
+                    # server rather than assuming the sender hosts the service.
+                    server_ip, server_port, client_ip = dst, dport, src
+                elif sport in COMMON_PORTS:
+                    server_ip, server_port, client_ip = src, sport, dst
                 elif dport in COMMON_PORTS:
-                    # Provisional UDP service (one-way client -> server)
-                    k = (dst, dport, "UDP")
-                    if filter_ip and dst != filter_ip:
-                        continue
-                    if k not in services:
-                        s_name = COMMON_PORTS.get(dport, f"UDP/{dport}")
-                        services[k] = ServiceAsset(
-                            dst,
-                            dport,
-                            "UDP",
-                            s_name,
-                            first_seen=ts,
-                            last_seen=ts,
-                            handshake_confirmed=False,
-                            discovery_method="udp_observed",
-                        )
-                    s = services[k]
-                    s.clients.add(src)
-                    s.packets += 1
-                    s.bytes += pkt_len
-                    s.last_seen = ts
+                    server_ip, server_port, client_ip = dst, dport, src
+                else:
+                    continue
+
+                if filter_ip and server_ip != filter_ip:
+                    continue
+                # Multicast / broadcast destinations (SSDP 239.255.255.250,
+                # mDNS 224.0.0.251, LLMNR, NetBIOS/LLMNR broadcast, 255.255.255.255)
+                # are group addresses, not hosts -- never record them as servers.
+                if _is_group_address(server_ip):
+                    continue
+                k = (server_ip, server_port, "UDP")
+                if k not in services:
+                    s_name = COMMON_PORTS.get(server_port, f"UDP/{server_port}")
+                    services[k] = ServiceAsset(
+                        server_ip,
+                        server_port,
+                        "UDP",
+                        s_name,
+                        first_seen=ts,
+                        last_seen=ts,
+                        handshake_confirmed=False,
+                        discovery_method="udp_observed",
+                    )
+                s = services[k]
+                s.clients.add(client_ip)
+                s.packets += 1
+                s.bytes += pkt_len
+                s.last_seen = ts
 
     except Exception as e:
         errors.append(str(e))

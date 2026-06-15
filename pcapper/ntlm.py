@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import ipaddress
 import re
 import struct
@@ -15,7 +16,8 @@ except ImportError:
     TCP = UDP = Raw = None
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
+from .utils import is_public_ip as _is_public_ip
 
 # --- Dataclasses ---
 
@@ -88,6 +90,7 @@ class NtlmAnalysis:
     deterministic_checks: Dict[str, List[str]] = field(default_factory=dict)
     threat_hypotheses: List[Dict[str, object]] = field(default_factory=list)
     benign_context: List[str] = field(default_factory=list)
+    crackable_hashes: List[Dict[str, str]] = field(default_factory=list)
 
     @property
     def total_sessions(self) -> int:
@@ -198,18 +201,22 @@ NTSTATUS_MAP = {
     0xC0000071: "STATUS_PASSWORD_EXPIRED",
     0xC0000072: "STATUS_ACCOUNT_DISABLED",
     0xC0000073: "STATUS_NONE_MAPPED",
-    0xC0000074: "STATUS_INVALID_ACCOUNT_NAME",
-    0xC0000075: "STATUS_USER_EXISTS",
-    0xC0000076: "STATUS_NO_SUCH_USER",
-    0xC0000077: "STATUS_GROUP_EXISTS",
-    0xC0000078: "STATUS_NO_SUCH_GROUP",
-    0xC0000079: "STATUS_MEMBER_IN_GROUP",
-    0xC000007A: "STATUS_MEMBER_NOT_IN_GROUP",
-    0xC000007B: "STATUS_LAST_ADMIN",
-    0xC000007C: "STATUS_WRONG_PASSWORD",
-    0xC000007D: "STATUS_ILL_FORMED_PASSWORD",
-    0xC000007E: "STATUS_PASSWORD_RESTRICTION",
-    0xC000007F: "STATUS_LOGON_FAILURE",
+    # The account/password status names below belong to the 0xC0000062-006D
+    # key range per MS-ERREF; they were previously mis-keyed to 0x74-0x7F
+    # (which are unrelated codes like STATUS_DISK_FULL 0x7F), causing the
+    # auth-failure heuristic to both miscount unrelated statuses and miss the
+    # real STATUS_WRONG_PASSWORD/STATUS_NO_SUCH_USER responses.
+    0xC0000062: "STATUS_INVALID_ACCOUNT_NAME",
+    0xC0000063: "STATUS_USER_EXISTS",
+    0xC0000064: "STATUS_NO_SUCH_USER",
+    0xC0000065: "STATUS_GROUP_EXISTS",
+    0xC0000066: "STATUS_NO_SUCH_GROUP",
+    0xC0000067: "STATUS_MEMBER_IN_GROUP",
+    0xC0000068: "STATUS_MEMBER_NOT_IN_GROUP",
+    0xC0000069: "STATUS_LAST_ADMIN",
+    0xC000006A: "STATUS_WRONG_PASSWORD",
+    0xC000006B: "STATUS_ILL_FORMED_PASSWORD",
+    0xC000006C: "STATUS_PASSWORD_RESTRICTION",
     0xC00000A2: "STATUS_PIPE_NOT_AVAILABLE",
     0xC00000AC: "STATUS_PIPE_BUSY",
     0xC00000B0: "STATUS_PIPE_DISCONNECTED",
@@ -349,6 +356,37 @@ def _parse_smb1_ids(payload: bytes) -> Tuple[Optional[int], Optional[int]]:
     return int(uid), int(mid)
 
 
+_HTTP_NTLM_MARKERS = (
+    b"Authorization: NTLM ",
+    b"WWW-Authenticate: NTLM ",
+    b"Proxy-Authorization: NTLM ",
+    b"Proxy-Authenticate: NTLM ",
+)
+
+
+def _extract_http_ntlm(payload: bytes) -> Optional[bytes]:
+    """Decode an HTTP NTLM auth header's base64 token to raw NTLMSSP bytes.
+
+    NTLM-over-HTTP (Exchange, SharePoint, web proxies, internal apps) carries the
+    NTLMSSP message base64-encoded in an Authorization/WWW-Authenticate header, so
+    the raw binary signature scan misses it entirely.
+    """
+    for marker in _HTTP_NTLM_MARKERS:
+        j = payload.find(marker)
+        if j < 0:
+            continue
+        token = payload[j + len(marker) :].split(b"\r\n", 1)[0].strip()
+        if not token:
+            continue
+        try:
+            decoded = base64.b64decode(token, validate=False)
+        except Exception:
+            continue
+        if decoded.startswith(NTLM_SIG):
+            return decoded
+    return None
+
+
 def _parse_http_status(payload: bytes) -> Optional[str]:
     if not payload.startswith(b"HTTP/"):
         return None
@@ -389,9 +427,58 @@ def _extract_string(data: bytes, length: int, offset: int, unicode: bool) -> str
         return raw.hex()
 
 
+def _build_netntlm_hash(
+    user: str,
+    domain: str,
+    server_challenge: bytes,
+    lm_resp: bytes,
+    nt_resp: bytes,
+) -> Optional[Dict[str, str]]:
+    """Reconstruct a Hashcat/John-crackable Net-NTLM hash from a captured auth.
+
+    NTLM authentication carries everything needed to crack the account password
+    offline: the server challenge (Type-2) plus the client's NT/LM responses
+    (Type-3). Emitting the hash in the standard tool format lets an IR analyst
+    feed it straight to Hashcat to recover or confirm the password — a core
+    forensic value-add (this is exactly what Responder/Inveigh/ntlmrelayx
+    produce). Returns the hash record, or ``None`` if the inputs are unusable.
+    """
+    if not user or user in ("Unknown", "(Anonymous)") or len(server_challenge) != 8:
+        return None
+    # Hashcat omits a blank domain rather than embedding "Unknown".
+    domain_field = "" if (not domain or domain == "Unknown") else domain
+    chal_hex = server_challenge.hex()
+    if len(nt_resp) > 24:
+        # NetNTLMv2 (hashcat -m 5600):
+        #   user::domain:serverchallenge:NTProofStr:blob
+        nt_proof = nt_resp[:16].hex()
+        blob = nt_resp[16:].hex()
+        return {
+            "username": user,
+            "domain": domain_field,
+            "version": "NTLMv2",
+            "hashcat_mode": "5600",
+            "hash": f"{user}::{domain_field}:{chal_hex}:{nt_proof}:{blob}",
+        }
+    if len(nt_resp) == 24:
+        # NetNTLMv1 (hashcat -m 5500):
+        #   user::domain:LMresponse:NTresponse:serverchallenge
+        if len(lm_resp) != 24:
+            lm_resp = b"\x00" * 24
+        return {
+            "username": user,
+            "domain": domain_field,
+            "version": "NTLMv1",
+            "hashcat_mode": "5500",
+            "hash": f"{user}::{domain_field}:{lm_resp.hex()}:{nt_resp.hex()}:{chal_hex}",
+        }
+    return None
+
+
 # --- Analysis Functions ---
 
 
+@memoize_analysis
 def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
     if TCP is None:
         return NtlmAnalysis(
@@ -451,6 +538,11 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
     anomalies: List[NtlmAnomaly] = []
     artifacts: List[NtlmArtifact] = []
     artifact_seen: Set[Tuple[str, str]] = set()
+    # Server challenge (Type-2) keyed by direction-agnostic connection so the
+    # later Type-3 response on the same TCP flow can be paired to crack-format it.
+    pending_challenges: Dict[Tuple[Tuple[str, int], Tuple[str, int]], bytes] = {}
+    crackable_hashes: List[Dict[str, str]] = []
+    crackable_seen: Set[str] = set()
     errors: List[str] = []
     src_counts = Counter()
     dst_counts = Counter()
@@ -478,19 +570,34 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                 start_time = ts
             last_time = ts
 
-            # Look for NTLM Signature in Raw payload
-            # Can be in TCP or UDP
-            if not pkt.haslayer(Raw):
+            # Look for the NTLMSSP signature in the L4 payload. Using the TCP/UDP
+            # payload (not just pkt[Raw]) is essential: when NTLM rides a carrier
+            # scapy fully dissects — LDAP/SMB/DCE-RPC binds — the NTLM bytes live
+            # inside that dissected layer and the packet has no Raw layer, so a
+            # Raw-only scan silently drops the Type-2 challenge (and breaks
+            # challenge<->response pairing for hash reconstruction).
+            if pkt.haslayer(TCP):
+                payload = bytes(pkt[TCP].payload)
+            elif pkt.haslayer(UDP):
+                payload = bytes(pkt[UDP].payload)
+            elif pkt.haslayer(Raw):
+                payload = bytes(pkt[Raw])
+            else:
                 continue
-
-            payload = bytes(pkt[Raw])
+            if not payload:
+                continue
             idx = payload.find(NTLM_SIG)
 
             if idx == -1:
-                continue
+                # NTLM-over-HTTP carries the message base64-encoded in an auth
+                # header rather than as raw binary; recover it before giving up.
+                ntlm_data = _extract_http_ntlm(payload)
+                if ntlm_data is None:
+                    continue
+            else:
+                ntlm_data = payload[idx:]
 
             ntlm_packets += 1
-            ntlm_data = payload[idx:]
 
             if len(ntlm_data) < 12:
                 continue
@@ -499,8 +606,12 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
             try:
                 msg_type = struct.unpack("<I", ntlm_data[8:12])[0]
 
-                src = pkt[0].src if hasattr(pkt[0], "src") else "0.0.0.0"
-                dst = pkt[0].dst if hasattr(pkt[0], "dst") else "0.0.0.0"
+                # Use the network-layer (IP/IPv6) addresses, not the Ethernet
+                # MACs — hunting/triage needs IPs, and the public-endpoint
+                # exposure check is meaningless against a MAC.
+                src, dst = extract_packet_endpoints(pkt)
+                if not src or not dst:
+                    continue
                 sport = 0
                 dport = 0
                 if pkt.haslayer(TCP):
@@ -605,6 +716,22 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                         ver = "NTLMv2"
                         versions["NTLMv2"] += 1
 
+                    # Reconstruct the crackable Net-NTLM hash by pairing this
+                    # response with the server challenge seen on the same flow.
+                    conn_key = tuple(sorted(((src, int(sport)), (dst, int(dport)))))
+                    server_challenge = pending_challenges.get(conn_key)
+                    if server_challenge and nt_len >= 24:
+                        lm_resp = ntlm_data[lm_off : lm_off + lm_len]
+                        nt_resp = ntlm_data[nt_off : nt_off + nt_len]
+                        record = _build_netntlm_hash(
+                            user, domain, server_challenge, lm_resp, nt_resp
+                        )
+                        if record and record["hash"] not in crackable_seen:
+                            crackable_seen.add(record["hash"])
+                            record["src_ip"] = src
+                            record["dst_ip"] = dst
+                            crackable_hashes.append(record)
+
                     # Check for Null Session / Anonymous
                     if flags & NTLMSSP_NEGOTIATE_ANONYMOUS:
                         anomalies.append(
@@ -663,6 +790,12 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                     convo.messages["Challenge"] += 1
                     handshake_state[convo_key]["challenge"] = ts
                     if len(ntlm_data) >= 32:
+                        # Server challenge is the 8 bytes at offset 24; stash it
+                        # against this flow so the matching Type-3 can be cracked.
+                        conn_key = tuple(
+                            sorted(((src, int(sport)), (dst, int(dport))))
+                        )
+                        pending_challenges[conn_key] = ntlm_data[24:32]
                         target_name_len = struct.unpack("<H", ntlm_data[12:14])[0]
                         target_name_off = struct.unpack("<I", ntlm_data[16:20])[0]
                         if target_name_len and target_name_off + target_name_len <= len(
@@ -739,12 +872,6 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
     }
     threat_hypotheses: List[Dict[str, object]] = []
     benign_context: List[str] = []
-
-    def _is_public_ip(value: str) -> bool:
-        try:
-            return ipaddress.ip_address(str(value)).is_global
-        except Exception:
-            return False
 
     ntlmv1_count = int(versions.get("NTLMv1", 0))
     if ntlmv1_count > 0:
@@ -898,5 +1025,6 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
         deterministic_checks={k: v[:60] for k, v in deterministic_checks.items()},
         threat_hypotheses=threat_hypotheses[:20],
         benign_context=benign_context[:20],
+        crackable_hashes=crackable_hashes,
         errors=errors,
     )

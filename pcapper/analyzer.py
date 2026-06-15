@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 from collections import Counter, defaultdict
 from numbers import Real
 from pathlib import Path
@@ -20,7 +21,7 @@ except Exception:  # pragma: no cover
 
 from .models import InterfaceStat, PcapSummary
 from .services import COMMON_PORTS
-from .utils import detect_file_type, extract_packet_endpoints
+from .utils import detect_file_type, extract_packet_endpoints, memoize_analysis
 
 IGNORE_LAYERS = {"Raw", "Padding", "NoPayload"}
 
@@ -156,6 +157,7 @@ def _as_int(value: object | None) -> Optional[int]:
         return None
 
 
+@memoize_analysis
 def analyze_pcap(
     path: Path,
     show_status: bool = True,

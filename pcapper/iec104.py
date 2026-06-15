@@ -5,6 +5,7 @@ import struct
 from pathlib import Path
 
 from .industrial_helpers import (
+    append_public_exposure_anomaly,
     IndustrialAnalysis,
     IndustrialAnomaly,
     analyze_port_protocol,
@@ -25,6 +26,13 @@ ASDU_TYPES = {
     49: "C_SE_NB_1 (Setpoint scaled)",
     50: "C_SE_NC_1 (Setpoint short)",
     51: "C_BO_NA_1 (Bitstring command)",
+    # System/control-direction commands (names deliberately not prefixed with
+    # "C_" so the generic control-command check doesn't double-flag them).
+    100: "General Interrogation (C_IC_NA_1)",
+    101: "Counter Interrogation (C_CI_NA_1)",
+    103: "Clock Synchronization (C_CS_NA_1)",
+    105: "Reset Process (C_RP_NA_1)",
+    107: "Test Command (C_TS_TA_1)",
 }
 
 CONTROL_ASDU_TYPES = {45, 46, 47, 48, 49, 50, 51}
@@ -72,30 +80,41 @@ UFRAME_TYPES = {
 def _parse_commands(payload: bytes) -> list[str]:
     if not payload or len(payload) < 6:
         return []
-    if payload[0] != 0x68:
-        return []
 
-    ctrl0 = payload[2]
     cmds: list[str] = []
-    if ctrl0 & 0x01 == 0:
-        cmds.append("I-Frame")
-    elif ctrl0 & 0x03 == 1:
-        cmds.append("S-Frame")
-    elif ctrl0 & 0x03 == 3:
-        cmds.append("U-Frame")
-        if ctrl0 in UFRAME_TYPES:
-            cmds.append(UFRAME_TYPES[ctrl0])
-
-    if len(payload) > 6:
-        type_id = payload[6]
-        type_name = ASDU_TYPES.get(type_id, f"ASDU {type_id}")
-        cmds.append(type_name)
-        if type_id in CONTROL_ASDU_TYPES:
-            cmds.append("Control ASDU")
-    asdu_cmds, _ = _parse_asdu(payload)
-    for cmd in asdu_cmds:
-        if cmd not in cmds:
-            cmds.append(cmd)
+    idx = 0
+    n = len(payload)
+    # A single TCP segment can carry MULTIPLE IEC-104 APDUs back-to-back
+    # (0x68, length, 4 control octets, ASDU). The previous code read only the
+    # first APDU, so a C_SC/STARTDT in the 2nd+ APDU (common) was missed.
+    while idx + 2 <= n and payload[idx] == 0x68:
+        apdu_len = payload[idx + 1]
+        apdu = payload[idx : idx + 2 + apdu_len]
+        if len(apdu) < 6:
+            break
+        ctrl0 = apdu[2]
+        if ctrl0 & 0x01 == 0:
+            cmds.append("I-Frame")
+        elif ctrl0 & 0x03 == 1:
+            cmds.append("S-Frame")
+        elif ctrl0 & 0x03 == 3:
+            cmds.append("U-Frame")
+            if ctrl0 in UFRAME_TYPES:
+                cmds.append(UFRAME_TYPES[ctrl0])
+        if len(apdu) > 6:
+            type_id = apdu[6]
+            type_name = ASDU_TYPES.get(type_id, f"ASDU {type_id}")
+            if type_name not in cmds:
+                cmds.append(type_name)
+            if type_id in CONTROL_ASDU_TYPES and "Control ASDU" not in cmds:
+                cmds.append("Control ASDU")
+        asdu_cmds, _ = _parse_asdu(apdu)
+        for cmd in asdu_cmds:
+            if cmd not in cmds:
+                cmds.append(cmd)
+        if apdu_len <= 0:
+            break
+        idx += 2 + apdu_len
     return cmds
 
 
@@ -217,6 +236,39 @@ def _detect_anomalies(
                 ts=ts,
             )
         )
+    # System commands carried in the ASDU type id (payload[6]) that aren't in
+    # the C_xC setpoint/command range but are operationally significant.
+    if len(payload) > 6 and payload[0] == 0x68:
+        type_id = payload[6]
+        if type_id == 105:
+            anomalies.append(
+                IndustrialAnomaly(
+                    severity="HIGH",
+                    title="IEC-104 Reset Process",
+                    description=(
+                        "Reset-process command (C_RP_NA_1) observed; reinitialises "
+                        "the RTU/outstation (ATT&CK T0816)."
+                    ),
+                    src=src_ip,
+                    dst=dst_ip,
+                    ts=ts,
+                )
+            )
+        elif type_id == 103:
+            anomalies.append(
+                IndustrialAnomaly(
+                    severity="MEDIUM",
+                    title="IEC-104 Clock Synchronization",
+                    description=(
+                        "Clock-sync command (C_CS_NA_1) observed; confirm the source "
+                        f"({src_ip}) is the authorised time master — clock manipulation "
+                        "corrupts sequence-of-events forensics."
+                    ),
+                    src=src_ip,
+                    dst=dst_ip,
+                    ts=ts,
+                )
+            )
     return anomalies
 
 
@@ -231,22 +283,5 @@ def analyze_iec104(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         enable_enrichment=True,
         show_status=show_status,
     )
-    public_endpoints = []
-    for ip_value in set(analysis.src_ips) | set(analysis.dst_ips):
-        try:
-            if ipaddress.ip_address(ip_value).is_global:
-                public_endpoints.append(ip_value)
-        except Exception:
-            continue
-    if public_endpoints and len(analysis.anomalies) < 200:
-        analysis.anomalies.append(
-            IndustrialAnomaly(
-                severity="HIGH",
-                title="IEC-104 Exposure to Public IP",
-                description=f"IEC-104 traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-                src="*",
-                dst="*",
-                ts=0.0,
-            )
-        )
+    append_public_exposure_anomaly(analysis, "IEC-104")
     return analysis

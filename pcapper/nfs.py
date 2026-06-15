@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+
 import struct
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -14,7 +15,7 @@ except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
 
 from .pcap_cache import get_reader
-from .utils import counter_inc, decode_payload, safe_float, set_add_cap, extract_packet_endpoints
+from .utils import counter_inc, decode_payload, extract_packet_endpoints, memoize_analysis, safe_float, set_add_cap
 
 RPC_CALL = 0
 RPC_REPLY = 1
@@ -238,6 +239,7 @@ def _parse_auth_unix(blob: bytes) -> Tuple[Optional[str], Optional[int], Optiona
     return None, None, None
 
 
+@memoize_analysis
 def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
     if TCP is None:
         return NfsSummary(
@@ -439,7 +441,7 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
                     cred_len = struct.unpack(">I", rpc_payload[28:32])[0]
                     cred_blob = (
                         rpc_payload[32 : 32 + cred_len]
-                        if cred_len <= len(rpc_payload)
+                        if 32 + cred_len <= len(rpc_payload)
                         else b""
                     )
 
@@ -558,6 +560,43 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
     finally:
         status.finish()
         reader.close()
+
+    # Bulk file access from one client — many distinct files read/written in a
+    # session is the signature of data harvesting/exfil or ransomware-style mass
+    # access over NFS, distinct from a handful of normal file operations.
+    read_files_by_client: Dict[str, set] = defaultdict(set)
+    write_files_by_client: Dict[str, set] = defaultdict(set)
+    for op in files:
+        if op.action == "READ" and op.name:
+            read_files_by_client[op.client_ip].add(op.name)
+        elif op.action in {"WRITE", "CREATE", "REMOVE"} and op.name:
+            write_files_by_client[op.client_ip].add(op.name)
+    for client_ip, names in read_files_by_client.items():
+        if len(names) >= 100:
+            anomalies.append(
+                NfsAnomaly(
+                    "HIGH",
+                    "NFS Bulk File Access",
+                    f"{client_ip} read {len(names)} distinct files — possible "
+                    "data harvesting/exfiltration or ransomware enumeration.",
+                    total_packets,
+                    client_ip,
+                    "",
+                )
+            )
+    for client_ip, names in write_files_by_client.items():
+        if len(names) >= 100:
+            anomalies.append(
+                NfsAnomaly(
+                    "HIGH",
+                    "NFS Bulk File Modification",
+                    f"{client_ip} created/removed/wrote {len(names)} distinct "
+                    "files — possible ransomware encryption or mass tampering.",
+                    total_packets,
+                    client_ip,
+                    "",
+                )
+            )
 
     return NfsSummary(
         path=path,

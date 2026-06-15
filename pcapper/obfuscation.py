@@ -10,7 +10,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -243,6 +243,75 @@ def _printable_ratio(data: bytes) -> float:
         if 32 <= b <= 126 or b in (9, 10, 13):
             printable += 1
     return printable / len(data)
+
+
+# Magic-byte prefixes of content that is high-entropy BY DESIGN (compression /
+# media containers). Such payloads are not covert channels — excluding them
+# removes the dominant false positive on benign web traffic (gzip responses,
+# images, fonts, video) while leaving raw encrypted/packed malware payloads
+# (e.g. an application/octet-stream blob with no recognizable structure) flagged.
+_COMPRESSED_MEDIA_MAGIC = (
+    b"\x1f\x8b",          # gzip
+    b"\x78\x01", b"\x78\x9c", b"\x78\xda",  # zlib/deflate
+    b"\x89PNG",           # PNG
+    b"\xff\xd8\xff",      # JPEG
+    b"GIF87a", b"GIF89a", # GIF
+    b"BM",                # BMP (often low-entropy, harmless to skip)
+    b"PK\x03\x04", b"PK\x05\x06",  # ZIP / Office / JAR / XAP
+    b"Rar!",              # RAR
+    b"7z\xbc\xaf",        # 7z
+    b"RIFF",              # WebP / WAV / AVI
+    b"OggS",              # Ogg
+    b"ID3",               # MP3
+    b"\xff\xfb",          # MP3 frame
+    b"fLaC",              # FLAC
+    b"\x00\x00\x01\xba", b"\x00\x00\x01\xb3",  # MPEG
+    b"wOFF", b"wOF2", b"\x00\x01\x00\x00",  # fonts (WOFF/WOFF2/TTF)
+    b"BZh",               # bzip2
+    b"\xfd7zXZ",          # xz
+)
+
+
+def _looks_compressed_or_media(data: bytes) -> bool:
+    if len(data) < 4:
+        return False
+    if any(data.startswith(magic) for magic in _COMPRESSED_MEDIA_MAGIC):
+        return True
+    # MP4/MOV: "....ftyp" at offset 4.
+    if data[4:8] == b"ftyp":
+        return True
+    return False
+
+
+def _http_declares_compressed_or_media(text: str) -> bool:
+    """True if an HTTP response header block declares a compressed transfer or
+    a media/compressed content type (so its high-entropy body is expected)."""
+    head = text[:1024].lower()
+    if "http/" not in head:
+        return False
+    if "content-encoding:" in head and any(
+        enc in head for enc in ("gzip", "deflate", "br", "compress", "zstd")
+    ):
+        return True
+    if "content-type:" in head and any(
+        ct in head
+        for ct in (
+            "image/",
+            "video/",
+            "audio/",
+            "font/",
+            "application/font",
+            "application/zip",
+            "application/x-gzip",
+            "application/gzip",
+            "application/x-7z",
+            "application/x-rar",
+            "application/java-archive",
+            "application/x-shockwave-flash",
+        )
+    ):
+        return True
+    return False
 
 
 def _is_valid_ipv4(value: str) -> bool:
@@ -827,6 +896,7 @@ def merge_obfuscation_summaries(
     )
 
 
+@memoize_analysis
 def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSummary:
     if TCP is None and UDP is None:
         summary = _empty_summary(path)
@@ -857,6 +927,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
     errors: list[str] = []
 
     flow_state: dict[str, dict[str, object]] = {}
+    # Flows whose payload is high-entropy by design (gzip/compressed/media) and
+    # therefore must NOT be counted as covert-channel/high-entropy hits.
+    expected_he_flows: set[str] = set()
     artifacts: list[ObfuscationArtifact] = []
     artifact_seen: set[tuple[str, str, str, str, str, str, str]] = set()
 
@@ -933,11 +1006,21 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
             text = sample.decode("latin-1", errors="ignore")
             packet_suspicious = False
 
+            # Once a flow is identified as compressed/media content, every
+            # subsequent (header-less) high-entropy body segment of that flow is
+            # expected and must be excluded.
+            if flow not in expected_he_flows and (
+                _looks_compressed_or_media(sample)
+                or _http_declares_compressed_or_media(text)
+            ):
+                expected_he_flows.add(flow)
+
             high_entropy_match = (
                 entropy_val >= ENTROPY_HIGH
                 and printable_val <= PRINTABLE_MIN_RATIO
                 and (src_port not in ENCRYPTED_PORTS)
                 and (dst_port not in ENCRYPTED_PORTS)
+                and flow not in expected_he_flows
             )
             if high_entropy_match:
                 packet_suspicious = True
@@ -991,6 +1074,42 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
 
             for match in BASE64_RE.finditer(text):
                 token = match.group(0)
+                # Always decode for IOC/artifact extraction...
+                decoded = _safe_base64_decode(token)
+                ioc_before = sum(ioc_counts.values()) + sum(attack_counts.values())
+                if decoded:
+                    _extract_decoded_artifacts(
+                        decoded,
+                        source_kind="base64",
+                        src=src_ip,
+                        dst=dst_ip,
+                        src_port=src_port,
+                        dst_port=dst_port,
+                        proto=proto,
+                        flow_id=flow,
+                        ts=ts,
+                        artifacts=artifacts,
+                        artifact_seen=artifact_seen,
+                        ioc_counts=ioc_counts,
+                        attack_counts=attack_counts,
+                    )
+                # ...but only treat the token itself as a covert/obfuscation
+                # signal when it decodes to binary-like content (a tunneled
+                # payload) or yields an IOC/attack artifact. Plain base64 of
+                # readable text -- cookies, JWTs, ETags, MIME bodies -- is
+                # ubiquitous and benign, and flagging all of it floods the report.
+                decoded_binary = False
+                if decoded:
+                    printable = sum(
+                        1 for b in decoded if b in (9, 10, 13) or 32 <= b <= 126
+                    )
+                    ratio = printable / len(decoded)
+                    decoded_binary = ratio < 0.75
+                gained_ioc = (
+                    sum(ioc_counts.values()) + sum(attack_counts.values())
+                ) > ioc_before
+                if not (decoded_binary or gained_ioc):
+                    continue
                 if len(base64_hits) < MAX_HITS:
                     base64_hits.append(
                         ObfuscationHit(
@@ -1008,18 +1127,29 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
                             ts=ts,
                             packet_index=pkt_index,
                             reasoning=(
-                                f"Base64-like token length {len(token)} detected; decoded for IOC/artifact extraction."
+                                f"Base64 token length {len(token)} decoded to "
+                                + (
+                                    "binary/non-text payload"
+                                    if decoded_binary
+                                    else "content containing IOC/attack indicators"
+                                )
                             ),
                         )
                     )
                 packet_suspicious = True
                 state["base64_hits"] = int(state["base64_hits"]) + 1
                 hit_kind_counts["base64"] += 1
-                decoded = _safe_base64_decode(token)
+                break
+
+            for match in HEX_RE.finditer(text):
+                token = match.group(0)
+                # Always decode for IOC/artifact extraction...
+                decoded = _safe_hex_decode(token)
+                ioc_before = sum(ioc_counts.values()) + sum(attack_counts.values())
                 if decoded:
                     _extract_decoded_artifacts(
                         decoded,
-                        source_kind="base64",
+                        source_kind="hex",
                         src=src_ip,
                         dst=dst_ip,
                         src_port=src_port,
@@ -1032,10 +1162,22 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
                         ioc_counts=ioc_counts,
                         attack_counts=attack_counts,
                     )
-                break
-
-            for match in HEX_RE.finditer(text):
-                token = match.group(0)
+                # ...but only treat the token as a covert/obfuscation signal when
+                # it decodes to binary-like content or yields an IOC/attack
+                # artifact. Long hex tokens are common in benign API traffic
+                # (request IDs, ETags, signatures) -- flagging all of them floods
+                # the report (mirrors the base64 gate above).
+                decoded_binary = False
+                if decoded:
+                    printable = sum(
+                        1 for b in decoded if b in (9, 10, 13) or 32 <= b <= 126
+                    )
+                    decoded_binary = (printable / len(decoded)) < 0.75
+                gained_ioc = (
+                    sum(ioc_counts.values()) + sum(attack_counts.values())
+                ) > ioc_before
+                if not (decoded_binary or gained_ioc):
+                    continue
                 if len(hex_hits) < MAX_HITS:
                     hex_hits.append(
                         ObfuscationHit(
@@ -1053,30 +1195,18 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
                             ts=ts,
                             packet_index=pkt_index,
                             reasoning=(
-                                f"Hex-like token length {len(token)} detected; decoded for IOC/artifact extraction."
+                                f"Hex token length {len(token)} decoded to "
+                                + (
+                                    "binary/non-text payload"
+                                    if decoded_binary
+                                    else "content containing IOC/attack indicators"
+                                )
                             ),
                         )
                     )
                 packet_suspicious = True
                 state["hex_hits"] = int(state["hex_hits"]) + 1
                 hit_kind_counts["hex"] += 1
-                decoded = _safe_hex_decode(token)
-                if decoded:
-                    _extract_decoded_artifacts(
-                        decoded,
-                        source_kind="hex",
-                        src=src_ip,
-                        dst=dst_ip,
-                        src_port=src_port,
-                        dst_port=dst_port,
-                        proto=proto,
-                        flow_id=flow,
-                        ts=ts,
-                        artifacts=artifacts,
-                        artifact_seen=artifact_seen,
-                        ioc_counts=ioc_counts,
-                        attack_counts=attack_counts,
-                    )
                 break
 
             if packet_suspicious:

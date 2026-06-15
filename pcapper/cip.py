@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import is_public_ip as _is_public_ip, packet_length, memoize_analysis
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,13 +13,25 @@ except ImportError:  # pragma: no cover - scapy optional at runtime
     TCP = UDP = IP = Raw = None
 
 from .equipment import equipment_artifacts
-from .industrial_helpers import IndustrialAnomaly, IndustrialArtifact
+from .industrial_helpers import IndustrialAnomaly, IndustrialArtifact, _extract_transport
 from .pcap_cache import get_reader
 from .utils import extract_packet_endpoints, safe_float
 
 CIP_TCP_PORT = 44818
 CIP_UDP_PORT = 2222
 CIP_SECURITY_PORT = 2221
+# Hoisted out of the per-packet loop (was rebuilt for every packet).
+_CIP_PORTS = frozenset({CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT})
+
+_ENIP_ENCAP_STATUSES = {
+    0x00000000,
+    0x00000001,
+    0x00000002,
+    0x00000003,
+    0x00000064,
+    0x00000065,
+    0x00000069,
+}
 
 ENIP_COMMANDS = {
     0x0001: "NOP",
@@ -68,6 +80,18 @@ CPF_ITEM_TYPES = {
     0x8002: "Sequenced Address",
 }
 
+# Authoritative CIP service codes (CIP Vol 1 + Wireshark CIP dissector). The
+# previous table was hand-entered from a bad reference and was wrong from 0x0F
+# onward — most critically it had 0x4C=WriteTag / 0x4D=ReadTagFragmented, but the
+# real codes are 0x4C=Read_Tag / 0x4D=Write_Tag. That inverted read/write
+# classification: the write/high-risk/suspicious sets keyed on 0x4C (actually a
+# read), so the analyzers flagged benign reads as suspicious writes and missed
+# real Write_Tag (0x4D) operations — the primary OT threat. Validated against
+# tshark on real EtherNet/IP captures. NB: 0x4E/0x52 are object-class-dependent
+# (Read_Modify_Write/Read_Tag_Fragmented under the Symbol object; Forward_Close/
+# Unconnected_Send under the Connection Manager) — the tag-access (Symbol)
+# meaning is used here as that dominates Logix traffic. 0x73-0x75/0x91 are the
+# codebase's vendor program-transfer convention and are left unchanged.
 CIP_SERVICE_NAMES = {
     0x01: "Get_Attributes_All",
     0x02: "Set_Attributes_All",
@@ -79,23 +103,24 @@ CIP_SERVICE_NAMES = {
     0x08: "Create",
     0x09: "Delete",
     0x0A: "Multiple_Service_Packet",
+    0x0D: "Apply_Attributes",
     0x0E: "Get_Attribute_Single",
-    0x0F: "Set_Attribute_Single",
-    0x10: "Find_Next_Object_Instance",
-    0x11: "Restore",
-    0x12: "Save",
-    0x13: "No_Operation",
-    0x4B: "ReadTag",
-    0x4C: "WriteTag",
-    0x4D: "ReadTagFragmented",
-    0x4E: "WriteTagFragmented",
-    0x4F: "ReadModifyWriteTag",
-    0x50: "Get_Instance_Attribute_List",
-    0x51: "Forward_Close",
-    0x52: "ResetService",
-    0x54: "ReadData",
-    0x55: "WriteData",
-    0x5C: "Forward_Open",
+    0x10: "Set_Attribute_Single",
+    0x11: "Find_Next_Object_Instance",
+    0x14: "Restore",
+    0x15: "Save",
+    0x16: "No_Operation",
+    0x17: "Get_Member",
+    0x18: "Set_Member",
+    0x4B: "Execute_PCCC",
+    0x4C: "Read_Tag",
+    0x4D: "Write_Tag",
+    0x4E: "Read_Modify_Write_Tag",
+    0x52: "Read_Tag_Fragmented",
+    0x53: "Write_Tag_Fragmented",
+    0x54: "Forward_Open",
+    0x55: "Get_Instance_Attribute_List",
+    0x5B: "Large_Forward_Open",
     0x73: "ProgramUpload",
     0x74: "ProgramDownload",
     0x75: "ProgramCommand",
@@ -137,6 +162,7 @@ CIP_CLASS_NAMES = {
     0x0F: "Discrete Input Group",
     0x10: "Discrete Output Group",
     0x11: "Discrete Group",
+    0x37: "File Object",
 }
 
 CIP_ATTRIBUTE_NAMES = {
@@ -182,42 +208,51 @@ CIP_DATA_TYPES = {
 
 CIP_SAFETY_CLASS_IDS = {0x43, 0x44}
 CIP_SECURITY_CLASS_IDS = {0x64}
+# CIP File Object (class 0x37) transfers files including device firmware and
+# program content — a write/create here is a program/firmware download.
+CIP_FILE_CLASS_IDS = {0x37}
 
+# Write/control/program services (not reads). Rederived for the corrected
+# service codes: Read_Tag (0x4C) and Read_Tag_Fragmented (0x52) are reads and
+# must NOT be here; the writes are Write_Tag (0x4D), Write_Tag_Fragmented (0x53),
+# Read_Modify_Write_Tag (0x4E) and the Set_Attribute services.
 SUSPICIOUS_SERVICE_CODES = {
-    0x05,
-    0x06,
-    0x07,
-    0x08,
-    0x09,
-    0x4C,
-    0x4E,
-    0x4F,
-    0x51,
-    0x52,
-    0x55,
-    0x5C,
-    0x73,
-    0x74,
-    0x75,
+    0x02,  # Set_Attributes_All
+    0x04,  # Set_Attribute_List
+    0x05,  # Reset
+    0x06,  # Start
+    0x07,  # Stop
+    0x08,  # Create
+    0x09,  # Delete
+    0x10,  # Set_Attribute_Single
+    0x4D,  # Write_Tag
+    0x4E,  # Read_Modify_Write_Tag
+    0x53,  # Write_Tag_Fragmented
+    # 0x54 (Forward_Open) is ubiquitous CIP connection setup -- flagging every
+    # one floods the report. Connection paths to safety/critical classes are
+    # still caught by the dedicated safety/security-class detection.
+    0x73,  # ProgramUpload
+    0x74,  # ProgramDownload
+    0x75,  # ProgramCommand
 }
 
 HIGH_RISK_SERVICE_CODES = {
-    0x05,
-    0x06,
-    0x07,
-    0x4C,
-    0x4E,
-    0x4F,
-    0x55,
-    0x74,
-    0x75,
+    0x05,  # Reset
+    0x06,  # Start
+    0x07,  # Stop
+    0x08,  # Create
+    0x09,  # Delete
+    0x4D,  # Write_Tag
+    0x4E,  # Read_Modify_Write_Tag
+    0x53,  # Write_Tag_Fragmented
+    0x74,  # ProgramDownload
+    0x75,  # ProgramCommand
 }
 
 CONTROL_SERVICE_CODES = {
-    0x05,
-    0x06,
-    0x07,
-    0x52,
+    0x05,  # Reset
+    0x06,  # Start
+    0x07,  # Stop
 }
 
 PROGRAM_SERVICE_CODES = {
@@ -226,23 +261,62 @@ PROGRAM_SERVICE_CODES = {
     0x75,
 }
 
+# CIP service code -> ATT&CK for ICS technique. Used to give the generic
+# "Suspicious CIP Service" anomaly an accurate technique id instead of relying
+# on imprecise title-keyword inference downstream.
+CIP_SERVICE_ATTACK = {
+    0x02: "T0836 Modify Parameter",  # Set_Attributes_All
+    0x04: "T0836 Modify Parameter",  # Set_Attribute_List
+    0x10: "T0836 Modify Parameter",  # Set_Attribute_Single
+    0x4D: "T0836 Modify Parameter",  # Write_Tag
+    0x4E: "T0836 Modify Parameter",  # Read_Modify_Write_Tag
+    0x53: "T0836 Modify Parameter",  # Write_Tag_Fragmented
+    0x05: "T0816 Device Restart/Shutdown",  # Reset
+    0x06: "T0858 Change Operating Mode",  # Start
+    0x07: "T0858 Change Operating Mode",  # Stop
+    0x08: "T0855 Unauthorized Command Message",  # Create
+    0x09: "T0855 Unauthorized Command Message",  # Delete
+    0x73: "T0845 Program Upload",  # ProgramUpload
+    0x74: "T0843 Program Download",  # ProgramDownload
+    0x75: "T0858 Change Operating Mode",  # ProgramCommand
+}
+
+# More descriptive titles per service so triage reads the intent at a glance.
+CIP_SERVICE_TITLE = {
+    0x02: "CIP Set Attributes (Write)",
+    0x04: "CIP Set Attribute List (Write)",
+    0x10: "CIP Set Attribute (Write)",
+    0x4D: "CIP Write Tag",
+    0x4E: "CIP Read-Modify-Write Tag",
+    0x53: "CIP Write Tag (Fragmented)",
+    0x05: "CIP Device Reset",
+    0x06: "CIP Run Command (Start)",
+    0x07: "CIP Stop Command",
+    0x08: "CIP Object Create",
+    0x09: "CIP Object Delete",
+    0x54: "CIP Forward Open (Connection Setup)",
+    0x73: "CIP Program Upload",
+    0x74: "CIP Program Download",
+    0x75: "CIP Program Command",
+}
+
 WRITE_SERVICE_CODES = {
-    0x02,
-    0x04,
-    0x0F,
-    0x4C,
-    0x4E,
-    0x4F,
-    0x55,
+    0x02,  # Set_Attributes_All
+    0x04,  # Set_Attribute_List
+    0x10,  # Set_Attribute_Single
+    0x4D,  # Write_Tag
+    0x4E,  # Read_Modify_Write_Tag
+    0x53,  # Write_Tag_Fragmented
 }
 
 ENUMERATION_SERVICE_CODES = {
-    0x01,
-    0x03,
-    0x0E,
-    0x4B,
-    0x4D,
-    0x50,
+    0x01,  # Get_Attributes_All
+    0x03,  # Get_Attribute_List
+    0x0E,  # Get_Attribute_Single
+    0x11,  # Find_Next_Object_Instance
+    0x4C,  # Read_Tag
+    0x52,  # Read_Tag_Fragmented
+    0x55,  # Get_Instance_Attribute_List
 }
 
 CIP_RECON_STATUS_CODES = {
@@ -387,60 +461,12 @@ def merge_cip_summaries(summaries: list[CIPAnalysis]) -> CIPAnalysis:
     return merged
 
 
-def _extract_transport(pkt) -> tuple[bool, str, str, int, int, bytes]:
-    src_ip = "?"
-    dst_ip = "?"
-    sport = 0
-    dport = 0
-    payload = b""
-
-    if TCP is not None and pkt.haslayer(TCP):
-        sport = int(pkt[TCP].sport)
-        dport = int(pkt[TCP].dport)
-        payload_obj = pkt[TCP].payload
-        payload = bytes(payload_obj) if payload_obj else b""
-        if not payload and Raw is not None and pkt.haslayer(Raw):
-            try:
-                payload = bytes(pkt[Raw].load)
-            except Exception:
-                pass
-    elif UDP is not None and pkt.haslayer(UDP):
-        sport = int(pkt[UDP].sport)
-        dport = int(pkt[UDP].dport)
-        payload_obj = pkt[UDP].payload
-        payload = bytes(payload_obj) if payload_obj else b""
-        if not payload and Raw is not None and pkt.haslayer(Raw):
-            try:
-                payload = bytes(pkt[Raw].load)
-            except Exception:
-                pass
-    else:
-        return False, src_ip, dst_ip, sport, dport, payload
-
-    src_raw, dst_raw = extract_packet_endpoints(pkt)
-    if src_raw and dst_raw:
-        src_ip = src_raw
-        dst_ip = dst_raw
-    else:
-        src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
-        dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "?"
-
-    return True, src_ip, dst_ip, sport, dport, payload
-
-
 def _format_ascii(payload: bytes, limit: int = 200) -> str:
     if not payload:
         return ""
     text = payload[:limit].decode("utf-8", errors="ignore")
     cleaned = "".join(ch if ch.isprintable() else " " for ch in text)
     return " ".join(cleaned.split())
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
 
 
 def _parse_cpf_with_meta(data: bytes) -> tuple[Optional[bytes], bool, list[int], bool]:
@@ -480,11 +506,6 @@ def _parse_cpf_with_meta(data: bytes) -> tuple[Optional[bytes], bool, list[int],
     return cip_payload, is_connected, item_types, malformed
 
 
-def _parse_cpf(data: bytes) -> tuple[Optional[bytes], bool]:
-    cip_payload, is_connected, _item_types, _malformed = _parse_cpf_with_meta(data)
-    return cip_payload, is_connected
-
-
 def _parse_enip_details(payload: bytes) -> dict[str, object]:
     info: dict[str, object] = {
         "command": None,
@@ -520,7 +541,12 @@ def _parse_enip_details(payload: bytes) -> dict[str, object]:
     info["session_handle"] = session_handle
     info["declared_length"] = length
     info["actual_length"] = actual_length
-    info["length_mismatch"] = length != actual_length
+    # Only a declared length *larger* than the data present is suspect
+    # (truncation/overflow). EtherNet/IP routinely pipelines several ENIP PDUs
+    # into one TCP segment, so `declared < actual` is normal — flagging
+    # `declared != actual` raised hundreds of false "Malformed ENIP Length"
+    # findings on valid captures.
+    info["length_mismatch"] = length > actual_length
     info["encap_data"] = encap_data
     info["is_cip_carrier"] = is_cip_carrier
     info["cip_payload"] = None if not is_cip_carrier else encap_data
@@ -714,7 +740,12 @@ def _parse_multiple_service_packet(payload: bytes, limit: int = 16) -> list[int]
         offsets.append(offset)
     service_codes: list[int] = []
     for offset in offsets[: max(1, limit)]:
-        service_idx = table_len + offset
+        # Per CIP Vol 1, the Multiple_Service_Packet offsets are measured from
+        # the start of the "Number of Services" field (payload[0]) and already
+        # point past the offset table — so the service byte is at payload[offset]
+        # directly. (Adding table_len double-counts and reads garbage bytes,
+        # which mis-mapped benign Read_Tag bundles to bogus high-risk services.)
+        service_idx = offset
         if service_idx >= len(payload):
             continue
         service_codes.append(payload[service_idx] & 0x7F)
@@ -870,6 +901,7 @@ def _bucketize(values: list[int]) -> list[SizeBucket]:
     return buckets
 
 
+@memoize_analysis
 def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
     if TCP is None and UDP is None:
         return CIPAnalysis(path=path, errors=["Scapy unavailable (TCP/UDP missing)"])
@@ -885,6 +917,9 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
     start_time = None
     last_time = None
     seen_artifacts: set[str] = set()
+    seen_cip_error_status: set[str] = set()
+    enip_layer_anom_seen: set[str] = set()
+    seen_suspicious_cip_svc: set[str] = set()
     max_anomalies = 200
     payload_sizes: list[int] = []
     packet_sizes: list[int] = []
@@ -908,6 +943,7 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
     write_target_anoms_seen: set[str] = set()
     security_sessions_seen: set[str] = set()
     sensitive_write_seen: set[str] = set()
+    msp_bundle_seen: set[str] = set()
 
     try:
         with status as pbar:
@@ -923,7 +959,7 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         pass
 
                 analysis.total_packets += 1
-                pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+                pkt_len = packet_length(pkt)
                 analysis.total_bytes += pkt_len
                 ts = safe_float(getattr(pkt, "time", 0))
                 if start_time is None:
@@ -936,15 +972,28 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                 if not has_transport:
                     continue
 
-                matches_port = sport in {
-                    CIP_TCP_PORT,
-                    CIP_UDP_PORT,
-                    CIP_SECURITY_PORT,
-                } or dport in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}
+                # OT port counts only as the SERVER side (destination, or source
+                # with an ephemeral destination). CIP/ENIP 44818 is in the
+                # ephemeral range, so a bare port match misclassifies unrelated
+                # flows whose ephemeral source port equals 44818; real CIP on a
+                # nonstandard port is still caught by the signature path below.
+                matches_port = dport in _CIP_PORTS or (
+                    sport in _CIP_PORTS and dport >= 32768
+                )
+                # Validate the full 24-byte encapsulation header for a
+                # non-standard-port match, not just the 2-byte command, so
+                # arbitrary binary/HTTP content isn't misread as ENIP/CIP (see
+                # _ENIP_ENCAP_STATUSES note).
                 matches_signature = False
-                if payload and len(payload) >= 2:
+                if payload and len(payload) >= 24:
                     cmd_guess = int.from_bytes(payload[0:2], "little")
-                    matches_signature = cmd_guess in ENIP_COMMANDS
+                    declared_len = int.from_bytes(payload[2:4], "little")
+                    enc_status = int.from_bytes(payload[8:12], "little")
+                    matches_signature = (
+                        cmd_guess in ENIP_COMMANDS
+                        and 24 + declared_len == len(payload)
+                        and enc_status in _ENIP_ENCAP_STATUSES
+                    )
 
                 if not matches_port and not matches_signature:
                     continue
@@ -1058,10 +1107,13 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         enip.get("status_text") or f"0x{int(encap_status):08x}"
                     )
                     analysis.status_codes[f"ENIP:{status_text}"] += 1
+                    _es_key = f"ENIP Error Status|{src_ip}|{dst_ip}|{status_text}"
                     if (
                         int(encap_status) != 0
+                        and _es_key not in enip_layer_anom_seen
                         and len(analysis.anomalies) < max_anomalies
                     ):
+                        enip_layer_anom_seen.add(_es_key)
                         analysis.anomalies.append(
                             IndustrialAnomaly(
                                 severity="LOW",
@@ -1073,7 +1125,13 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                             )
                         )
 
-                if length_mismatch and len(analysis.anomalies) < max_anomalies:
+                _ml_key = f"Malformed ENIP Length|{src_ip}|{dst_ip}"
+                if (
+                    length_mismatch
+                    and _ml_key not in enip_layer_anom_seen
+                    and len(analysis.anomalies) < max_anomalies
+                ):
+                    enip_layer_anom_seen.add(_ml_key)
                     analysis.anomalies.append(
                         IndustrialAnomaly(
                             severity="MEDIUM",
@@ -1085,11 +1143,14 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         )
                     )
 
+                _cpf_key = f"Malformed ENIP CPF|{src_ip}|{dst_ip}"
                 if (
                     is_cip_carrier
                     and cpf_malformed
+                    and _cpf_key not in enip_layer_anom_seen
                     and len(analysis.anomalies) < max_anomalies
                 ):
+                    enip_layer_anom_seen.add(_cpf_key)
                     analysis.anomalies.append(
                         IndustrialAnomaly(
                             severity="MEDIUM",
@@ -1137,6 +1198,15 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                 ):
                     # Non-encapsulated/raw fallback for captures on unusual ports.
                     parse_payload = bytes(cip_payload)
+
+                # Connected (Class 1) CIP messages carry a 2-byte CIP sequence
+                # count on the 0x00B1 connected-data item *before* the CIP
+                # service byte. Without stripping it the service code is read
+                # from the sequence count, so every connected message (the
+                # dominant form in Logix/EtherNet/IP) was misidentified — e.g. a
+                # Start (0x06) request read as a bogus response. Strip it here.
+                if is_connected and len(parse_payload) >= 2:
+                    parse_payload = parse_payload[2:]
 
                 (
                     service,
@@ -1256,18 +1326,34 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                     ):
                                         src_write_commands[src_ip] += 1
 
-                                if (
-                                    any(
-                                        code in HIGH_RISK_SERVICE_CODES
+                                high_risk_subs = sorted(
+                                    {
+                                        CIP_SERVICE_NAMES.get(code, f"0x{code:02x}")
                                         for code in sub_codes
-                                    )
+                                        if code in HIGH_RISK_SERVICE_CODES
+                                    }
+                                )
+                                # Aggregate per (src, dst, high-risk service set):
+                                # a Logix MSP carries the same bundle thousands of
+                                # times, which floods the 200-cap and buries other
+                                # findings. One finding per distinct bundle/pair.
+                                msp_bundle_key = (
+                                    f"{src_ip}->{dst_ip}:{','.join(high_risk_subs)}"
+                                )
+                                if (
+                                    high_risk_subs
+                                    and msp_bundle_key not in msp_bundle_seen
                                     and len(analysis.anomalies) < max_anomalies
                                 ):
+                                    msp_bundle_seen.add(msp_bundle_key)
                                     analysis.anomalies.append(
                                         IndustrialAnomaly(
                                             severity="HIGH",
                                             title="CIP Multi-Service High-Risk Bundle",
-                                            description=f"Multiple_Service_Packet includes high-risk operation(s): {msp_detail}",
+                                            description=(
+                                                "Multiple_Service_Packet includes "
+                                                f"high-risk operation(s): {', '.join(high_risk_subs)}"
+                                            ),
                                             src=src_ip,
                                             dst=dst_ip,
                                             ts=ts or 0.0,
@@ -1451,6 +1537,28 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                         ts=ts or 0.0,
                                     )
                                 )
+                    if class_id in CIP_FILE_CLASS_IDS and is_request:
+                        if (
+                            service_code
+                            in WRITE_SERVICE_CODES
+                            | CONTROL_SERVICE_CODES
+                            | HIGH_RISK_SERVICE_CODES
+                            and len(analysis.anomalies) < max_anomalies
+                        ):
+                            analysis.anomalies.append(
+                                IndustrialAnomaly(
+                                    severity="HIGH",
+                                    title="CIP File/Program Download",
+                                    description=(
+                                        f"Write/control service {service_name or service_code} "
+                                        "targeted the CIP File Object (class 0x37) — "
+                                        "program/firmware download (ATT&CK T0843/T0857)."
+                                    ),
+                                    src=src_ip,
+                                    dst=dst_ip,
+                                    ts=ts or 0.0,
+                                )
+                            )
                 if instance_id is not None:
                     analysis.instance_ids[instance_id] += 1
                 if attribute_id is not None:
@@ -1495,9 +1603,12 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                         if tag_offset is not None:
                             op_parts.append(f"offset={tag_offset}")
                         if is_request:
+                            # 0x4C=Read_Tag (read!), 0x4D=Write_Tag,
+                            # 0x4E=Read_Modify_Write, 0x53=Write_Tag_Fragmented.
+                            # Previous {0x4C,0x4E,0x4F} inverted read/write.
                             op_kind = (
                                 "tag_write"
-                                if service_code in {0x4C, 0x4E, 0x4F}
+                                if service_code in {0x4D, 0x4E, 0x53}
                                 else "tag_read"
                             )
                         else:
@@ -1561,18 +1672,28 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                     and is_request
                     and (service & 0x7F) in SUSPICIOUS_SERVICE_CODES
                 ):
-                    severity = (
-                        "HIGH" if (service & 0x7F) in {0x74, 0x75, 0x05} else "MEDIUM"
-                    )
-                    title = "Suspicious CIP Service"
-                    description = (
-                        f"{service_name or f'Service 0x{service:02x}'} observed"
-                    )
+                    svc = service & 0x7F
+                    severity = "HIGH" if svc in {0x74, 0x75, 0x05} else "MEDIUM"
+                    title = CIP_SERVICE_TITLE.get(svc, "Suspicious CIP Service")
+                    svc_label = service_name or f"Service 0x{service:02x}"
+                    description = f"{svc_label} observed"
+                    evidence = [f"service=0x{svc:02x} ({svc_label})"]
                     if tag_name:
                         description = f"{description} tag={tag_name}"
+                        evidence.append(f"tag={tag_name}")
                     elif path_str:
                         description = f"{description} path={path_str[:80]}"
-                    if len(analysis.anomalies) < max_anomalies:
+                        evidence.append(f"path={path_str[:80]}")
+                    evidence.append(f"{src_ip} -> {dst_ip}")
+                    # Aggregate per (service, src, dst): a control/write service
+                    # used repeatedly is one finding, not one per packet (~197
+                    # "Suspicious CIP Service" on a normal capture hit the cap).
+                    svc_key = f"{svc:#x}|{src_ip}|{dst_ip}"
+                    if (
+                        svc_key not in seen_suspicious_cip_svc
+                        and len(analysis.anomalies) < max_anomalies
+                    ):
+                        seen_suspicious_cip_svc.add(svc_key)
                         analysis.anomalies.append(
                             IndustrialAnomaly(
                                 severity=severity,
@@ -1581,16 +1702,29 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                 src=src_ip,
                                 dst=dst_ip,
                                 ts=ts or 0.0,
+                                attack=CIP_SERVICE_ATTACK.get(svc, ""),
+                                evidence=evidence,
                             )
                         )
 
                 if general_status is not None and general_status != 0x00:
-                    if len(analysis.anomalies) < max_anomalies:
+                    # Emit the LOW anomaly once per distinct status; one per error
+                    # packet flooded the list (~170 LOW on a normal capture). Full
+                    # counts remain in analysis.status_codes.
+                    status_label = general_status_text or f"0x{general_status:02x}"
+                    if (
+                        status_label not in seen_cip_error_status
+                        and len(analysis.anomalies) < max_anomalies
+                    ):
+                        seen_cip_error_status.add(status_label)
                         analysis.anomalies.append(
                             IndustrialAnomaly(
                                 severity="LOW",
                                 title="CIP Error Response",
-                                description=f"General status {general_status_text or f'0x{general_status:02x}'}",
+                                description=(
+                                    f"General status {status_label} "
+                                    "(see CIP status code distribution for full counts)."
+                                ),
                                 src=src_ip,
                                 dst=dst_ip,
                                 ts=ts or 0.0,

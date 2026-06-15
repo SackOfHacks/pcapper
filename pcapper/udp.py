@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-import ipaddress
+from .utils import shannon_entropy as _shannon_entropy
+from .utils import is_private_ip as _is_private_ip
+from .utils import is_public_ip as _is_public_ip
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -12,7 +14,7 @@ from .http import analyze_http
 from .pcap_cache import get_reader
 from .progress import run_with_busy_status
 from .services import analyze_services
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, packet_length, safe_float
 
 try:
     from scapy.layers.dns import DNS  # type: ignore
@@ -139,28 +141,6 @@ def _stats_from_samples(samples: list[int]) -> dict[str, float]:
     }
 
 
-def _is_private_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_private
-    except Exception:
-        return False
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
-
-
-def _shannon_entropy(value: str) -> float:
-    if not value:
-        return 0.0
-    freq = Counter(value)
-    total = len(value)
-    return -sum((count / total) * math.log2(count / total) for count in freq.values())
-
-
 def _is_likely_udp_initiator_packet(sport: int, dport: int) -> bool:
     # Prefer request/initiator direction to avoid attributing responder traffic as scanner behavior.
     if dport in AMPLIFICATION_PORTS and sport not in AMPLIFICATION_PORTS:
@@ -197,7 +177,6 @@ def _build_udp_enrichment(
     _ = (
         udp_packets,
         conversations,
-        detections,
         src_to_ports,
         src_to_dsts,
         src_port_dsts,
@@ -209,8 +188,93 @@ def _build_udp_enrichment(
         avg_dns_len,
         avg_dns_entropy,
     )
-    return {}
+    checks: dict[str, list[str]] = defaultdict(list)
 
+    # Map the analyzer's already-thresholded detections to triage categories.
+    for det in detections:
+        if str(det.get("severity", "info")).lower() == "info":
+            continue
+        summary_text = str(det.get("summary", ""))
+        blob = summary_text.lower()
+        ev = summary_text + (f" — {det.get('details','')}" if det.get("details") else "")
+        if any(t in blob for t in ("port scan", "fan-out", "port sweep", "host sweep")):
+            checks["udp_recon_scan_behavior"].append(ev)
+        if "amplification" in blob or "reflection" in blob:
+            checks["reflection_amplification_risk"].append(ev)
+        if "tunneling" in blob or "large outbound" in blob:
+            checks["udp_tunneling_signal"].append(ev)
+        if "beacon" in blob or "periodic" in blob or "cadence" in blob:
+            checks["udp_periodic_cadence"].append(ev)
+        if "empty" in blob:
+            checks["udp_transport_fragmentation_reliability"].append(ev)
+
+    score = 0
+    reasons: list[str] = []
+    if checks.get("udp_tunneling_signal"):
+        score += 3
+        reasons.append("UDP covert channel / DNS tunneling / large outbound transfer (possible exfiltration)")
+    if checks.get("reflection_amplification_risk"):
+        score += 2
+        reasons.append("UDP reflection/amplification pattern (DDoS participation or abuse)")
+    if checks.get("udp_recon_scan_behavior"):
+        score += 2
+        reasons.append("UDP reconnaissance (port scan / sweep / fan-out)")
+    if checks.get("udp_periodic_cadence"):
+        score += 2
+        reasons.append("Periodic UDP cadence (possible beaconing)")
+    high_ct = sum(
+        1
+        for d in detections
+        if str(d.get("severity", "")).lower() in {"high", "critical"}
+    )
+    if high_ct:
+        reasons.append(f"High-severity UDP detections: {high_ct}")
+
+    if score >= 6:
+        verdict = "YES - high-confidence malicious UDP behavior (exfil / amplification / scanning) is present."
+        confidence = "high"
+    elif score >= 4:
+        verdict = "LIKELY - suspicious UDP behavior with attack indicators is present."
+        confidence = "medium"
+    elif score >= 2:
+        verdict = "POSSIBLE - notable UDP behavior (recon/amplification) observed; corroboration recommended."
+        confidence = "low"
+    elif score >= 1:
+        verdict = "LOW SIGNAL - minor UDP anomalies present but not strongly corroborated."
+        confidence = "low"
+    else:
+        verdict = ""
+        confidence = "low"
+    if not reasons and verdict:
+        reasons.append("UDP anomaly heuristics crossed threshold")
+
+    _risk_meta = {
+        "udp_tunneling_signal": ("Tunneling / Exfil", "High"),
+        "reflection_amplification_risk": ("Reflection / Amplification", "High"),
+        "udp_recon_scan_behavior": ("Recon / Scan", "Medium"),
+        "udp_periodic_cadence": ("Periodic Beaconing", "Medium"),
+        "udp_transport_fragmentation_reliability": ("Transport/Reliability", "Low"),
+    }
+    risk_matrix = [
+        {
+            "category": cat,
+            "risk": risk,
+            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
+            "evidence": f"{len(checks.get(key, []))} signal(s)",
+        }
+        for key, (cat, risk) in _risk_meta.items()
+        if checks.get(key)
+    ]
+
+    return {
+        "analyst_verdict": verdict,
+        "analyst_confidence": confidence,
+        "analyst_reasons": reasons,
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
+        "risk_matrix": risk_matrix,
+    }
+
+@memoize_analysis
 def analyze_udp(
     path: Path,
     show_status: bool = True,
@@ -331,7 +395,7 @@ def analyze_udp(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
 
@@ -388,9 +452,17 @@ def analyze_udp(
                 if convo["last_seen"] is None or ts > convo["last_seen"]:
                     convo["last_seen"] = ts
 
+            # Use the UDP header length field (datagram len - 8B header) rather
+            # than len(bytes(udp.payload)): scapy folds Ethernet padding into the
+            # payload on sub-60-byte frames, which inflated byte counts and made
+            # the empty-payload (payload_len==0) check never match.
             payload_len = 0
             try:
-                payload_len = len(bytes(udp_layer.payload))
+                udp_len = int(getattr(udp_layer, "len", 0) or 0)
+                if udp_len >= 8:
+                    payload_len = udp_len - 8
+                else:
+                    payload_len = len(bytes(udp_layer.payload))
             except Exception:
                 payload_len = 0
             udp_payload_bytes += payload_len

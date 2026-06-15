@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import ipaddress
 import os
 import re
@@ -11,7 +12,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from .dns import _vt_lookup_domains
 from .pcap_cache import PcapMeta, get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -62,8 +63,14 @@ _TRAVERSAL_RE = re.compile(r"(?i)(\.\./|%2e%2e%2f|%252e%252e%252f)")
 _CMD_INJECT_RE = re.compile(
     r"(?i)(;|\|\||&&|\$\(|`)(?:[^\\n\\r]{0,80})(cmd|sh|bash|powershell|whoami|curl|wget)"
 )
+# SSRF target indicators. Require the loopback/unspecified host to follow a
+# scheme (http://) or a param assignment (=) and be a whole token, so benign
+# paths like /api/localhost-monitor or fields like localhostname=x don't match.
+# The cloud-metadata IP (169.254.169.254) is an unambiguous SSRF target and is
+# matched wherever it appears.
 _SSRF_RE = re.compile(
-    r"(?i)(https?://)?(127\.0\.0\.1|localhost|169\.254\.169\.254|0\.0\.0\.0)"
+    r"(?i)(?:https?://|=)(?:127\.0\.0\.1|localhost|0\.0\.0\.0)(?![\w.-])"
+    r"|169\.254\.169\.254"
 )
 _LONG_B64_RE = re.compile(r"\b[A-Za-z0-9+/]{200,}={0,2}\b")
 _CRED_KEYS = {
@@ -221,13 +228,14 @@ def _score_request(
     if method_u in {"TRACE", "CONNECT"}:
         score += 2
         reasons.append(f"uncommon_method={method_u}")
-    if method_u == "POST":
-        # Baseline hunting stance: POST carries payload and deserves elevated scrutiny.
-        score += 3
-        reasons.append("post_request_baseline")
+    # NB: a plain POST is NOT scored — every form submit / API call / telemetry
+    # beacon is a POST, so an unconditional +3 made every benign POST "medium"
+    # and every POST-to-a-public-IP "high". POST is context only; the real
+    # indicators below (SQLi/traversal/cmd-inject/cred-in-body/encoded payload)
+    # drive the score. Outbound POST to a public IP is a weak lead (+1) that
+    # must be corroborated to reach medium/high.
     if method_u == "POST" and _is_public_ip(dst_ip):
-        # Deterministic baseline: outbound POST to public IP is suspicious until proven benign.
-        score += 3
+        score += 1
         reasons.append(f"post_to_public_ip={dst_ip}")
     if _SQLI_RE.search(combined):
         score += 3
@@ -496,6 +504,7 @@ def _consume_http_responses(buffer: str) -> tuple[list[tuple[int, str, str]], st
     return out, remaining
 
 
+@memoize_analysis
 def analyze_webrequests(
     path: Path,
     target_ip: str | None = None,

@@ -307,12 +307,7 @@ def _extract_host_only_bpf_ip(bpf: str | None) -> str | None:
     return candidate
 
 
-def _packet_matches_host(pkt: object, host_ip: str) -> bool:
-    try:
-        host_addr = ipaddress.ip_address(host_ip)
-    except Exception:
-        return False
-
+def _packet_matches_host(pkt: object, host_addr: object) -> bool:
     if IP is not None and getattr(pkt, "haslayer", None) and pkt.haslayer(IP):  # type: ignore[truthy-bool]
         try:
             src = ipaddress.ip_address(str(pkt[IP].src))  # type: ignore[index]
@@ -400,21 +395,18 @@ def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], Pc
     reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
     status = build_statusbar(path, enabled=show_status)
     stream = _reader_stream(reader)
-    linktype = getattr(reader, "linktype", None)
-    snaplen = getattr(reader, "snaplen", None)
-    interfaces = getattr(reader, "interfaces", None)
-    linktype = getattr(reader, "linktype", None)
-    snaplen = getattr(reader, "snaplen", None)
-    interfaces = getattr(reader, "interfaces", None)
-    linktype = getattr(reader, "linktype", None)
-    snaplen = getattr(reader, "snaplen", None)
-    interfaces = getattr(reader, "interfaces", None)
 
     packets: list[object] = []
+    track_progress = status.enabled and stream is not None and bool(size_bytes)
+    append = packets.append
+    count = 0
     try:
         for pkt in reader:
-            packets.append(pkt)
-            if status.enabled and stream is not None and size_bytes:
+            append(pkt)
+            count += 1
+            # Throttle progress updates; stream.tell() per packet is wasted
+            # work on large captures.
+            if track_progress and not (count & 0x1FF):
                 try:
                     pos = stream.tell()
                     percent = int(min(100, (pos / size_bytes) * 100))
@@ -485,7 +477,13 @@ def load_packets_if_allowed(
         size_bytes = 0
     if size_bytes and size_bytes > max_file:
         return None, None
-    return get_cached_packets(path, show_status=show_status)
+    try:
+        return get_cached_packets(path, show_status=show_status)
+    except Exception:
+        # Unreadable/unsupported capture: behave as "not preloaded" so the
+        # caller falls back to the per-analyzer reader (which degrades to an
+        # empty reader) instead of crashing the whole run.
+        return None, None
 
 
 def load_filtered_packets(
@@ -548,17 +546,27 @@ def load_filtered_packets(
     linktype = getattr(reader, "linktype", None)
     snaplen = getattr(reader, "snaplen", None)
     interfaces = getattr(reader, "interfaces", None)
+    host_only_addr = None
+    if host_only_ip:
+        try:
+            host_only_addr = ipaddress.ip_address(host_only_ip)
+        except Exception:
+            host_only_addr = None
     packets: list[object] = []
+    track_progress = status.enabled and stream is not None and bool(size_bytes)
+    has_time_filter = time_start is not None or time_end is not None
+    count = 0
     try:
         for pkt in reader:
-            if status.enabled and stream is not None and size_bytes:
+            count += 1
+            if track_progress and not (count & 0x1FF):
                 try:
                     pos = stream.tell()
                     percent = int(min(100, (pos / size_bytes) * 100))
                     status.update(percent)
                 except Exception:
                     pass
-            if time_start is not None or time_end is not None:
+            if has_time_filter:
                 ts = getattr(pkt, "time", None)
                 if ts is None:
                     continue
@@ -566,7 +574,9 @@ def load_filtered_packets(
                     continue
                 if time_end is not None and ts > time_end:
                     continue
-            if host_only_ip and not _packet_matches_host(pkt, host_only_ip):
+            if host_only_addr is not None and not _packet_matches_host(
+                pkt, host_only_addr
+            ):
                 continue
             packets.append(pkt)
     finally:
@@ -602,6 +612,11 @@ def clear_forced_packet_view(path: Path) -> None:
     _FORCED_PACKET_VIEWS.pop(Path(path), None)
 
 
+def get_forced_packet_view(path: Path) -> list[object] | None:
+    forced = _FORCED_PACKET_VIEWS.get(Path(path))
+    return forced[0] if forced is not None else None
+
+
 def get_reader(
     path: Path,
     *,
@@ -630,6 +645,17 @@ def get_reader(
             (meta.file_type if meta else detect_file_type(path)),
         )
 
+    # Serve straight from the in-process cache when the packets are already
+    # loaded (e.g. preloaded by the CLI for chained steps), regardless of the
+    # per-file size limit that gates *new* cache loads.
+    cached = _PACKET_CACHE.get(path)
+    if cached is not None:
+        _PACKET_CACHE.move_to_end(path)
+        cached_packets, cached_meta = cached
+        reader = PacketListReader(cached_packets, cached_meta)
+        status = build_statusbar(path, enabled=show_status)
+        return reader, status, reader, len(cached_packets), cached_meta.file_type
+
     enabled, max_cache, max_file = _cache_config()
     file_type = meta.file_type if meta else detect_file_type(path)
     try:
@@ -643,14 +669,28 @@ def get_reader(
         and max_file > 0
         and (size_bytes == 0 or size_bytes <= max_file)
     )
-    if cache_allowed:
-        cached_packets, cached_meta = get_cached_packets(path, show_status=show_status)
-        reader = PacketListReader(cached_packets, cached_meta)
-        status = build_statusbar(path, enabled=show_status)
-        return reader, status, reader, len(cached_packets), cached_meta.file_type
+    # An unreadable / unsupported / truncated capture must not crash the run:
+    # opening it raises (scapy's "Not a supported capture file"), and with the
+    # analyzers and the --overview/--threats fan-out all calling get_reader, a
+    # single bad file would abort the whole batch with a traceback. Fall back to
+    # an empty reader so each analyzer simply reports zero packets.
+    try:
+        if cache_allowed:
+            cached_packets, cached_meta = get_cached_packets(
+                path, show_status=show_status
+            )
+            reader = PacketListReader(cached_packets, cached_meta)
+            status = build_statusbar(path, enabled=show_status)
+            return reader, status, reader, len(cached_packets), cached_meta.file_type
 
-    _require_scapy()
-    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
-    status = build_statusbar(path, enabled=show_status)
-    stream = _reader_stream(reader)
-    return reader, status, stream, size_bytes, file_type
+        _require_scapy()
+        reader = (
+            PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
+        )
+        status = build_statusbar(path, enabled=show_status)
+        stream = _reader_stream(reader)
+        return reader, status, stream, size_bytes, file_type
+    except Exception:
+        empty = PacketListReader([], None)
+        status = build_statusbar(path, enabled=show_status)
+        return empty, status, empty, 0, file_type or "unknown"

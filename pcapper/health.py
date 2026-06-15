@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .utils import read_ber_length as _read_ber_length, packet_length
 import ipaddress
 import math
 from collections import Counter, defaultdict
@@ -527,21 +528,6 @@ def _timing_stats(
     return rows[:limit]
 
 
-def _read_ber_length(payload: bytes, offset: int) -> tuple[Optional[int], int]:
-    if offset >= len(payload):
-        return None, offset
-    first = payload[offset]
-    offset += 1
-    if first < 0x80:
-        return first, offset
-    num_bytes = first & 0x7F
-    if num_bytes == 0 or offset + num_bytes > len(payload):
-        return None, offset
-    length = int.from_bytes(payload[offset : offset + num_bytes], "big")
-    offset += num_bytes
-    return length, offset
-
-
 def _parse_snmp(payload: bytes) -> tuple[Optional[str], Optional[str]]:
     if not payload or payload[0] != 0x30:
         return None, None
@@ -696,7 +682,7 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:
@@ -772,16 +758,21 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
                                 payload_len = 0
 
                         key = (src_ip, dst_ip, sport, dport)
-                        sig = (seq, payload_len)
-                        if sig in seen_seq[key]:
-                            retransmissions += 1
-                            if ts is not None:
-                                minute_metrics[int(ts // 60)]["retrans"] += 1
-                                minute_samples[int(ts // 60)].append(
-                                    f"Retrans {src_ip}->{dst_ip}:{dport}"
-                                )
-                        else:
-                            seen_seq[key].add(sig)
+                        # Only data-bearing segments can be retransmissions. A
+                        # repeated (seq, 0) is a normal cumulative/duplicate ACK
+                        # or window update -- counting those inflated the
+                        # retransmission rate on chatty-but-healthy flows.
+                        if payload_len > 0:
+                            sig = (seq, payload_len)
+                            if sig in seen_seq[key]:
+                                retransmissions += 1
+                                if ts is not None:
+                                    minute_metrics[int(ts // 60)]["retrans"] += 1
+                                    minute_samples[int(ts // 60)].append(
+                                        f"Retrans {src_ip}->{dst_ip}:{dport}"
+                                    )
+                            else:
+                                seen_seq[key].add(sig)
                         if len(seen_seq[key]) > 20000:
                             seen_seq[key].clear()
 

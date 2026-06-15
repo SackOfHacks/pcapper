@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import packet_length, safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -282,7 +282,7 @@ def analyze_streams(
                 stream_ids[stream_key] = sid
             info = stats[stream_key]
             info["packets"] += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             info["bytes"] += pkt_len
             if info["first_pkt"] is None:
                 info["first_pkt"] = packet_number

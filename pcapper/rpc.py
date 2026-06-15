@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length
+from .utils import is_public_ip as _is_public_ip
+from .utils import beacon_score
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -51,6 +53,29 @@ RPC_INTERFACES = {
     "12345678-1234-abcd-ef00-01234567cffb": "NETLOGON",
     "1ff70682-0a51-30e8-076d-740be8cee98b": "ATSVC (AT Scheduler)",
     "338cd001-2244-31f1-aaaa-900038001003": "WINREG (Remote Registry)",
+    "86d35949-83c9-4044-b424-db363231fd0c": "TSCH (Task Scheduler)",
+    "e3514235-4b06-11d1-ab04-00c04fc2dcd2": "DRSUAPI (Directory Replication)",
+    "3919286a-b10c-11d0-9ba8-00c04fd92ef5": "DSSETUP (LSA DS)",
+    "894de0c0-0d55-461c-bb6c-5f3c6f4b4e30": "NTSVCS (PNP / RemoteRegistry)",
+    "f6beaff7-1e19-4fbb-9f8f-b89e2018337c": "EVENTLOG (Event Log Remoting)",
+    "afa8bd80-7d8a-11c9-bef4-08002b102989": "MGMT (RPC Management)",
+    "76f03f96-cdfd-44fc-a22c-64950a001209": "ITaskSchedulerService (TSCH)",
+}
+
+# DCE/RPC interfaces abused for remote code execution, persistence, credential
+# theft and lateral movement (the named pipes PsExec/Impacket/wmiexec/secretsdump
+# bind to). DRSUAPI especially = DCSync (ATT&CK T1003.006); SVCCTL = remote
+# service create (T1021.003); ATSVC/TSCH = scheduled task (T1053); WINREG/NTSVCS
+# = remote registry (T1112); EVENTLOG = log manipulation (T1070.001).
+_RPC_HIGH_RISK_INTERFACES = {
+    "367abb81-9844-35f1-ad32-98f038001003": ("SVCCTL (remote service control)", "T1021.003"),
+    "1ff70682-0a51-30e8-076d-740be8cee98b": ("ATSVC (scheduled task)", "T1053.002"),
+    "86d35949-83c9-4044-b424-db363231fd0c": ("TSCH (scheduled task)", "T1053.005"),
+    "76f03f96-cdfd-44fc-a22c-64950a001209": ("TSCH (scheduled task)", "T1053.005"),
+    "338cd001-2244-31f1-aaaa-900038001003": ("WINREG (remote registry)", "T1112"),
+    "894de0c0-0d55-461c-bb6c-5f3c6f4b4e30": ("NTSVCS (remote registry/PnP)", "T1112"),
+    "e3514235-4b06-11d1-ab04-00c04fc2dcd2": ("DRSUAPI (DCSync credential theft)", "T1003.006"),
+    "f6beaff7-1e19-4fbb-9f8f-b89e2018337c": ("EVENTLOG (log manipulation)", "T1070.001"),
 }
 
 SAMR_UUID = "12345778-1234-abcd-ef00-0123456789ac"
@@ -71,11 +96,16 @@ DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9_.-]{1,64})\b
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 IPV6_RE = re.compile(r"\b(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b")
 MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})\b")
-UNC_SHARE_RE = re.compile(r"\\\\([A-Za-z0-9_.-]{1,64})\\\\([A-Za-z0-9.$_-]{1,64})")
+# UNC / named-pipe paths on the wire use a 2-backslash prefix and single-
+# backslash separators (\\HOST\share, \\HOST\pipe\svcctl, \\.\pipe\atsvc).
+# The separators were previously double-escaped (\\\\ = two literal backslashes
+# in regex), so these never matched and admin-share / PsExec pipe attribution
+# was dead.
+UNC_SHARE_RE = re.compile(r"\\\\([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9.$_-]{1,64})")
 PIPE_REMOTE_RE = re.compile(
-    r"\\\\([A-Za-z0-9_.-]{1,64})\\\\pipe\\\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE
+    r"\\\\([A-Za-z0-9_.-]{1,64})\\pipe\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE
 )
-PIPE_LOCAL_RE = re.compile(r"\\\\\\.\\\\pipe\\\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE)
+PIPE_LOCAL_RE = re.compile(r"\\\\\.\\pipe\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE)
 PIPE_GENERIC_RE = re.compile(r"\\pipe\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE)
 
 SAMR_FULLNAME_STOPWORDS = {
@@ -104,7 +134,8 @@ SUSPICIOUS_STRINGS = [
         "Malware tooling",
     ),
     (
-        re.compile(r"rundll32|regsvr32|schtasks|at\s+", re.IGNORECASE),
+        # `at\s+` matched the English word "at "; restrict to `at \\host`.
+        re.compile(r"rundll32|regsvr32|schtasks|\bat\s+\\\\", re.IGNORECASE),
         "Execution/persistence tooling",
     ),
     (re.compile(r"nmap|masscan|sqlmap", re.IGNORECASE), "Recon tooling"),
@@ -429,25 +460,13 @@ def _extract_samr_fullnames(payload: bytes) -> list[str]:
     return names
 
 
-def _beacon_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance**0.5
-    if avg < 1 or avg > 3600:
-        return None
-    if stddev / avg > 0.15:
-        return None
-    return {"avg": avg, "stddev": stddev}
+def _beacon_score(times: list[float]):
+    return beacon_score(
+        times, min_interval=1.0, max_interval=3600.0, rel_jitter=0.15, abs_jitter_floor=0.0
+    )
 
 
+@memoize_analysis
 def analyze_rpc(
     path: Path,
     show_status: bool = True,
@@ -526,6 +545,7 @@ def analyze_rpc(
     artifacts: list[RpcArtifact] = []
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
+    high_risk_iface_use: dict[tuple[str, str], set[str]] = defaultdict(set)
     pending_calls: dict[tuple[str, str, str, int, int], dict[str, object]] = {}
 
     dst_by_src: dict[str, set[str]] = defaultdict(set)
@@ -545,7 +565,7 @@ def analyze_rpc(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:
@@ -659,6 +679,11 @@ def analyze_rpc(
                                     src=client_ip,
                                     dst=server_ip,
                                 )
+                            )
+                        risk = _RPC_HIGH_RISK_INTERFACES.get(uuid.lower())
+                        if risk:
+                            high_risk_iface_use[(risk[0], risk[1])].add(
+                                f"{client_ip} -> {server_ip}"
                             )
 
             if pdu_type == "request" and len(rpc_payload) >= 24:
@@ -806,6 +831,24 @@ def analyze_rpc(
         except Exception:
             pass
 
+    for (iface_label, attack_id), pairs in high_risk_iface_use.items():
+        sample = ", ".join(sorted(pairs)[:5])
+        # DCSync (DRSUAPI) is credential theft from a DC — rate it highest.
+        severity = "high" if "DCSync" in iface_label else "warning"
+        detections.append(
+            {
+                "severity": severity,
+                "summary": f"High-risk DCE/RPC interface: {iface_label}",
+                "details": (
+                    f"Bind to {iface_label} ({attack_id}) over {len(pairs)} "
+                    f"flow(s): {sample}. This interface is used by remote-exec / "
+                    "lateral-movement / credential-theft tooling (PsExec, "
+                    "Impacket, secretsdump) — confirm it is authorized admin activity."
+                ),
+                "source": "RPC",
+            }
+        )
+
     for src, dsts in dst_by_src.items():
         if len(dsts) >= 20:
             detections.append(
@@ -864,12 +907,6 @@ def analyze_rpc(
     }
     threat_hypotheses: list[dict[str, object]] = []
     benign_context: list[str] = []
-
-    def _is_public_ip(value: str) -> bool:
-        try:
-            return ipaddress.ip_address(str(value)).is_global
-        except Exception:
-            return False
 
     for src, dsts in dst_by_src.items():
         if len(dsts) >= 10:

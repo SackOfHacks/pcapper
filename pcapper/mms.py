@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from .utils import read_ber_length as _read_ber_length
 import ipaddress
 from pathlib import Path
 
 from .industrial_helpers import (
+    append_public_exposure_anomaly,
     IndustrialAnalysis,
     IndustrialAnomaly,
     analyze_port_protocol,
@@ -83,21 +85,6 @@ def _parse_mms_commands(payload: bytes) -> list[str]:
     return commands
 
 
-def _read_ber_length(data: bytes, idx: int) -> tuple[int | None, int]:
-    if idx >= len(data):
-        return None, idx
-    first = data[idx]
-    idx += 1
-    if first < 0x80:
-        return first, idx
-    count = first & 0x7F
-    if count == 0 or idx + count > len(data):
-        return None, idx
-    length = int.from_bytes(data[idx : idx + count], "big")
-    idx += count
-    return length, idx
-
-
 def _read_ber_tlv(data: bytes, idx: int) -> tuple[int | None, bytes, int]:
     if idx >= len(data):
         return None, b"", idx
@@ -129,31 +116,100 @@ def _parse_commands(payload: bytes) -> list[str]:
     return _parse_mms_commands(payload)
 
 
+# High-signal MMS services. On an IEC 61850 substation network a MMS Write
+# (variable write to an IED) is an unauthorized-command indicator (ATT&CK ICS
+# T0855), and Delete/File operations indicate config/firmware tampering or
+# anti-forensic activity (T0809/T0872).
+MMS_WRITE_SERVICES = {"Write"}
+MMS_DELETE_SERVICES = {
+    "FileDelete",
+    "DeleteNamedVariableList",
+    "DeleteVariableAccess",
+    "DeleteNamedType",
+}
+MMS_FILE_SERVICES = {"FileOpen", "FileRead", "FileRename"}
+
+
+def _detect_mms_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
+    anomalies: list[IndustrialAnomaly] = []
+    services = {
+        cmd.split("MMS Service ", 1)[1]
+        for cmd in commands
+        if cmd.startswith("MMS Service ")
+    }
+    writes = services & MMS_WRITE_SERVICES
+    if writes:
+        anomalies.append(
+            IndustrialAnomaly(
+                severity="HIGH",
+                title="MMS Write Operation",
+                description="MMS Write service observed (variable write to IED; ATT&CK T0855).",
+                src=src_ip,
+                dst=dst_ip,
+                ts=ts,
+                attack="T0855 Unauthorized Command Message",
+                evidence=[
+                    "MMS service(s): " + ", ".join(sorted(writes)),
+                    f"{src_ip} -> {dst_ip}",
+                ],
+            )
+        )
+    deletes = services & MMS_DELETE_SERVICES
+    if deletes:
+        anomalies.append(
+            IndustrialAnomaly(
+                severity="HIGH",
+                title="MMS Delete/File Removal",
+                description=(
+                    "MMS delete service observed ("
+                    + ", ".join(sorted(deletes))
+                    + "); possible config tampering or anti-forensics (T0872)."
+                ),
+                src=src_ip,
+                dst=dst_ip,
+                ts=ts,
+                attack="T0809 Data Destruction",
+                evidence=[
+                    "MMS service(s): " + ", ".join(sorted(deletes)),
+                    f"{src_ip} -> {dst_ip}",
+                ],
+            )
+        )
+    files = services & MMS_FILE_SERVICES
+    if files:
+        anomalies.append(
+            IndustrialAnomaly(
+                severity="MEDIUM",
+                title="MMS File Operation",
+                description=(
+                    "MMS file service observed ("
+                    + ", ".join(sorted(files))
+                    + "); config/firmware file access."
+                ),
+                src=src_ip,
+                dst=dst_ip,
+                ts=ts,
+                attack="T0857 System Firmware",
+                evidence=[
+                    "MMS service(s): " + ", ".join(sorted(files)),
+                    f"{src_ip} -> {dst_ip}",
+                ],
+            )
+        )
+    return anomalies
+
+
 def analyze_mms(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,
         protocol_name="IEC 61850 MMS",
         tcp_ports={MMS_PORT},
         command_parser=_parse_commands,
+        anomaly_detector=_detect_mms_anomalies,
         enable_enrichment=True,
         show_status=show_status,
     )
-    public_endpoints = []
-    for ip_value in set(analysis.src_ips) | set(analysis.dst_ips):
-        try:
-            if ipaddress.ip_address(ip_value).is_global:
-                public_endpoints.append(ip_value)
-        except Exception:
-            continue
-    if public_endpoints and len(analysis.anomalies) < 200:
-        analysis.anomalies.append(
-            IndustrialAnomaly(
-                severity="HIGH",
-                title="MMS Exposure to Public IP",
-                description=f"MMS traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-                src="*",
-                dst="*",
-                ts=0.0,
-            )
-        )
+    append_public_exposure_anomaly(analysis, "MMS")
     return analysis

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from .utils import is_public_ip as _is_public_ip
 import ipaddress
 from collections import Counter, defaultdict
 from pathlib import Path
 
 from .industrial_helpers import (
+    append_public_exposure_anomaly,
     IndustrialAnalysis,
     IndustrialAnomaly,
     analyze_port_protocol,
@@ -215,13 +217,6 @@ HIGH_RISK_NETWORK_MESSAGES = {
 }
 
 
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
-
-
 def _parse_context_tag(data: bytes, idx: int) -> tuple[dict[str, object] | None, int]:
     if idx >= len(data):
         return None, idx
@@ -379,11 +374,13 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
     }
     issues: list[str] = info["issues"]  # type: ignore[assignment]
 
-    if len(payload) < 4:
-        issues.append("BACnet payload shorter than BVLC header.")
-        return info
-    if payload[0] != 0x81:
-        issues.append(f"Unexpected BVLC type 0x{payload[0]:02x}.")
+    # A packet too short for a BVLC header, or not starting with the BACnet/IP
+    # type byte 0x81, simply is not BACnet/IP (noise / another protocol on the
+    # port) — not a *malformed* BACnet frame. Returning without recording an
+    # "issue" avoids flagging hundreds of non-BACnet packets as "BACnet
+    # Malformed Frame". Genuine structural problems (bad BVLC length, truncated
+    # NPDU, etc.) on real 0x81 frames are still recorded below.
+    if len(payload) < 4 or payload[0] != 0x81:
         return info
 
     info["valid"] = True
@@ -758,10 +755,14 @@ def _detect_anomalies(
                 ts=ts,
             )
         )
+    # Routine WriteProperty is the DOMINANT normal operation on a BMS/control
+    # network (supervisory setpoint writes), so it is MEDIUM context, not HIGH.
+    # High-consequence operations (DeviceCommunicationControl, ReinitializeDevice,
+    # program/config writes) are flagged HIGH separately below.
     if "WriteProperty" in command_set:
         anomalies.append(
             IndustrialAnomaly(
-                severity="HIGH",
+                severity="MEDIUM",
                 title="BACnet WriteProperty",
                 description=f"WriteProperty service request observed.{target_suffix}",
                 src=src_ip,
@@ -772,7 +773,7 @@ def _detect_anomalies(
     if "WritePropertyMultiple" in command_set:
         anomalies.append(
             IndustrialAnomaly(
-                severity="HIGH",
+                severity="MEDIUM",
                 title="BACnet WritePropertyMultiple",
                 description=f"WritePropertyMultiple service request observed.{target_suffix}",
                 src=src_ip,
@@ -1094,22 +1095,5 @@ def analyze_bacnet(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     )
     _append_behavioral_anomalies(analysis)
 
-    public_endpoints = []
-    for ip_value in set(analysis.src_ips) | set(analysis.dst_ips):
-        try:
-            if ipaddress.ip_address(ip_value).is_global:
-                public_endpoints.append(ip_value)
-        except Exception:
-            continue
-    if public_endpoints and len(analysis.anomalies) < 200:
-        analysis.anomalies.append(
-            IndustrialAnomaly(
-                severity="HIGH",
-                title="BACnet Exposure to Public IP",
-                description=f"BACnet traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-                src="*",
-                dst="*",
-                ts=0.0,
-            )
-        )
+    append_public_exposure_anomaly(analysis, "BACnet")
     return analysis

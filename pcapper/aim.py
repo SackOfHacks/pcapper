@@ -8,7 +8,7 @@ from typing import Iterable, Optional
 from urllib.parse import parse_qsl
 
 from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .utils import safe_float, extract_packet_endpoints, packet_length
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -106,7 +106,9 @@ def _decode_payload(payload: bytes) -> str:
         return ""
 
 
-def _looks_like_aim_payload(payload: bytes, text: str) -> bool:
+def _looks_like_aim_payload(
+    payload: bytes, text: str, *, require_strong: bool = False
+) -> bool:
     if not payload:
         return False
     if payload.startswith(b"OFT2"):
@@ -114,6 +116,11 @@ def _looks_like_aim_payload(payload: bytes, text: str) -> bool:
     lowered = text.lower()
     if any(marker in lowered for marker in AIM_STRONG_MARKERS):
         return True
+    # On the TLS-tunnel port (443) the generic user/pass/msg/file score is far
+    # too loose -- any cleartext-on-443 capture with a user=/pass= pair would be
+    # mislabeled AIM. There, require an unambiguous AIM marker (OFT2 / strong).
+    if require_strong:
+        return False
 
     score = 0
     if USER_RE.search(text):
@@ -236,7 +243,7 @@ def analyze_aim(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:
@@ -263,7 +270,9 @@ def analyze_aim(
             is_standard_aim = sport in AIM_PORTS or dport in AIM_PORTS
             looks_tunneled_aim = False
             if (sport in TLS_TUNNEL_PORTS or dport in TLS_TUNNEL_PORTS) and payload:
-                looks_tunneled_aim = _looks_like_aim_payload(payload, text)
+                looks_tunneled_aim = _looks_like_aim_payload(
+                    payload, text, require_strong=True
+                )
             if not is_standard_aim and not looks_tunneled_aim:
                 continue
 

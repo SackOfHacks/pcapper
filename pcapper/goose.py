@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .utils import read_ber_length as _read_ber_length, memoize_analysis
 import struct
 from collections import Counter
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ GOOSE_TAGS = {
 
 GOOSE_STRING_TAGS = {"gocbRef", "datSet", "goID"}
 GOOSE_INT_TAGS = {"timeAllowedToLive", "stNum", "sqNum", "confRev", "numDatSetEntries"}
+GOOSE_BOOL_TAGS = {"simulation", "ndsCom"}
 
 GOOSE_DATA_TAGS = {
     0x80: "boolean",
@@ -87,21 +89,6 @@ def _extract_length(payload: bytes) -> Optional[int]:
     return int.from_bytes(payload[2:4], "big")
 
 
-def _read_ber_length(data: bytes, idx: int) -> tuple[Optional[int], int]:
-    if idx >= len(data):
-        return None, idx
-    first = data[idx]
-    idx += 1
-    if (first & 0x80) == 0:
-        return first, idx
-    count = first & 0x7F
-    if count == 0 or idx + count > len(data):
-        return None, idx
-    length = int.from_bytes(data[idx : idx + count], "big")
-    idx += count
-    return length, idx
-
-
 def _parse_goose_tlvs(data: bytes, result: dict[str, object], depth: int = 0) -> None:
     if depth > 4:
         return
@@ -121,6 +108,8 @@ def _parse_goose_tlvs(data: bytes, result: dict[str, object], depth: int = 0) ->
                 result[tag_name] = value.decode("utf-8", errors="ignore").strip("\x00")
             elif tag_name in GOOSE_INT_TAGS:
                 result[tag_name] = int.from_bytes(value, "big") if value else 0
+            elif tag_name in GOOSE_BOOL_TAGS:
+                result[tag_name] = bool(value[0]) if value else False
             elif tag_name == "allData":
                 result["allData_len"] = len(value)
                 result["allData_preview"] = value[:16].hex()
@@ -244,6 +233,7 @@ def _parse_goose_payload(payload: bytes) -> dict[str, object]:
     return result
 
 
+@memoize_analysis
 def analyze_goose(path: Path, show_status: bool = True) -> GooseSummary:
     if Ether is None:
         return GooseSummary(
@@ -297,6 +287,15 @@ def analyze_goose(path: Path, show_status: bool = True) -> GooseSummary:
     state_map: dict[tuple[str, str, str], tuple[int, int]] = {}
     conf_map: dict[tuple[str, str, str], int] = {}
     entries_map: dict[tuple[str, str, str], int] = {}
+    jump_flagged: set[tuple[str, str, str]] = set()
+    sim_flagged: set[tuple[str, str, str]] = set()
+    ndscom_flagged: set[tuple[str, str, str]] = set()
+    # gocbRef -> set of publishing source MACs. A given GOOSE control block has
+    # exactly ONE legitimate publisher MAC; the same gocbRef from a 2nd MAC is
+    # the classic publisher-spoofing / injection attack (Industroyer-class,
+    # ATT&CK ICS T0856 Spoof Reporting Message / T0832 Manipulation of View).
+    gocbref_macs: dict[str, set[str]] = {}
+    gocbref_spoof_flagged: set[str] = set()
     data_len_map: dict[tuple[str, str, str], int] = {}
 
     try:
@@ -356,10 +355,60 @@ def analyze_goose(path: Path, show_status: bool = True) -> GooseSummary:
             num_entries_val = goose_info.get("numDatSetEntries")
             data_len = goose_info.get("allData_len")
             data_values = goose_info.get("allData_values") or []
+
+            # Simulation/test bit (IEC 61850-8-1 "simulation"/"test"): an IED in
+            # Sim mode acts on these frames, so a test frame on a production bus
+            # is a classic GOOSE-injection vector (ATT&CK ICS T0852/T0856).
+            # ndsCom=true means the GoCB is not properly commissioned.
+            sim_key = (src_mac, f"0x{appid:04x}" if appid is not None else "-",
+                       dataset or gocb_ref or "-")
+            if goose_info.get("simulation") and sim_key not in sim_flagged:
+                sim_flagged.add(sim_key)
+                detections.append(
+                    {
+                        "severity": "warning",
+                        "summary": "GOOSE Simulation/Test Bit Set",
+                        "details": (
+                            f"{src_mac} {sim_key[2]} published GOOSE with the "
+                            "simulation/test bit set; IEDs in Sim mode will act "
+                            "on it (possible test-frame injection)."
+                        ),
+                    }
+                )
+            if goose_info.get("ndsCom") and sim_key not in ndscom_flagged:
+                ndscom_flagged.add(sim_key)
+                detections.append(
+                    {
+                        "severity": "info",
+                        "summary": "GOOSE needsCommissioning Set",
+                        "details": (
+                            f"{src_mac} {sim_key[2]} published GOOSE with "
+                            "ndsCom=true (control block not commissioned / "
+                            "configuration incomplete)."
+                        ),
+                    }
+                )
             if dataset:
                 datasets[dataset] += 1
             if gocb_ref:
                 gocb_refs[gocb_ref] += 1
+                # Publisher-spoofing: same control block (gocbRef) from >1 MAC.
+                macs = gocbref_macs.setdefault(gocb_ref, set())
+                macs.add(src_mac)
+                if len(macs) >= 2 and gocb_ref not in gocbref_spoof_flagged:
+                    gocbref_spoof_flagged.add(gocb_ref)
+                    detections.append(
+                        {
+                            "severity": "high",
+                            "summary": "GOOSE Publisher Spoofing",
+                            "details": (
+                                f"gocbRef {gocb_ref} published from multiple source "
+                                f"MACs ({', '.join(sorted(macs))}); a control block has "
+                                "one legitimate publisher — likely GOOSE spoofing/"
+                                "injection (ATT&CK ICS T0856)."
+                            ),
+                        }
+                    )
             if isinstance(st_num, int):
                 st_nums[st_num] += 1
             if isinstance(sq_num, int):
@@ -401,6 +450,36 @@ def analyze_goose(path: Path, show_status: bool = True) -> GooseSummary:
                                 "details": f"{key[0]} {key[2]} sqNum decreased {prev_sq}->{sq_num}.",
                             }
                         )
+                    # Forward-injection coverage: per IEC 61850-8-1, a new
+                    # state (stNum increment) restarts sqNum at 0 (some
+                    # stacks use 1). A state advance that starts mid-sequence
+                    # suggests an injected frame or missed frames; a multi-
+                    # state skip likewise. Info severity (capture gaps look
+                    # the same) and flagged once per publisher/dataset.
+                    if st_num > prev_st and key not in jump_flagged:
+                        skipped_states = st_num - prev_st > 1
+                        high_start_sq = sq_num > 1
+                        if skipped_states or high_start_sq:
+                            jump_flagged.add(key)
+                            reasons = []
+                            if skipped_states:
+                                reasons.append(
+                                    f"stNum jumped {prev_st}->{st_num}"
+                                )
+                            if high_start_sq:
+                                reasons.append(
+                                    f"new state started at sqNum={sq_num}"
+                                )
+                            detections.append(
+                                {
+                                    "severity": "info",
+                                    "summary": "GOOSE State Jump",
+                                    "details": (
+                                        f"{key[0]} {key[2]} {'; '.join(reasons)} "
+                                        "(possible missed frames or injected GOOSE)."
+                                    ),
+                                }
+                            )
                 state_map[key] = (st_num, sq_num)
                 if isinstance(conf_rev, int):
                     prev_conf = conf_map.get(key)
