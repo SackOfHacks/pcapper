@@ -84,6 +84,7 @@ class StreamSummary:
     filter_ip: Optional[str] = None
     filter_port: Optional[int] = None
     established_only: bool = False
+    view_content: bool = False
 
 
 def _canonical_key(
@@ -179,7 +180,12 @@ def analyze_streams(
     filter_ip: Optional[str] = None,
     filter_port: Optional[int] = None,
     established_only: bool = False,
+    view_content: bool = False,
 ) -> StreamSummary:
+    # When the caller wants to VIEW stream content (-view), retain a much larger
+    # reassembled slice per record for the HEX/ASCII dump; otherwise keep the
+    # small 512-byte preview that only feeds the followed-stream display.
+    preview_cap = 65536 if view_content else 512
     if TCP is None:
         return StreamSummary(
             path=path,
@@ -323,11 +329,11 @@ def analyze_streams(
                     payload = bytes(pkt[Raw].load)  # type: ignore[index]
                 except Exception:
                     payload = b""
-            else:
-                try:
-                    payload = bytes(getattr(tcp, "payload", b""))
-                except Exception:
-                    payload = b""
+            # A TCP segment carrying application data always exposes a Raw layer.
+            # When there is none, the segment is a pure ACK/control packet -- do
+            # NOT fall back to bytes(tcp.payload), which would pull in the
+            # Ethernet frame Padding (null bytes) Scapy attaches to short frames
+            # and corrupt the reassembled stream content.
             if payload:
                 seq = int(getattr(tcp, "seq", 0) or 0)
                 if (src_ip, sport, dst_ip, dport) == stream_key:
@@ -433,8 +439,8 @@ def analyze_streams(
                 last_seen=info["last"],
                 first_packet_number=info["first_pkt"],
                 syn_packet_number=info["syn_pkt"],
-                client_payload_preview=payload_ab[:512],
-                server_payload_preview=payload_ba[:512],
+                client_payload_preview=payload_ab[:preview_cap],
+                server_payload_preview=payload_ba[:preview_cap],
                 client_gaps=gaps_ab,
                 server_gaps=gaps_ba,
             )
@@ -491,4 +497,5 @@ def analyze_streams(
         filter_ip=filter_ip,
         filter_port=filter_port,
         established_only=established_only,
+        view_content=view_content,
     )

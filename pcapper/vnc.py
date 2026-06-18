@@ -25,7 +25,49 @@ except Exception:  # pragma: no cover
 
 VNC_PORTS = {5900, 5901, 5902, 5903, 5904, 5905, 5906, 5907, 5908, 5909, 5800}
 VNC_BANNER_RE = re.compile(r"(RFB\s+\d+\.\d+)")
-VNC_AUTH_RE = re.compile(r"VNC Authentication|None|Tight|Ultra|RealVNC", re.IGNORECASE)
+# RFB security types are BINARY bytes negotiated in the handshake (NOT text), so
+# they must be parsed from the handshake — matching the words "None"/"Tight" in
+# arbitrary framebuffer/clipboard text produced constant false "no auth" alerts.
+VNC_SECURITY_TYPES = {
+    0: "Invalid",
+    1: "None (no authentication)",
+    2: "VNC Authentication (DES challenge-response)",
+    5: "RA2",
+    6: "RA2ne",
+    16: "Tight",
+    17: "Ultra",
+    18: "TLS",
+    19: "VeNCrypt",
+    20: "SASL",
+    30: "Apple Remote Desktop",
+}
+
+
+def _parse_rfb_version(payload: bytes) -> Optional[tuple[int, int]]:
+    """Parse an 'RFB 003.008\\n' ProtocolVersion (exactly 12 bytes)."""
+    if len(payload) < 12 or not payload.startswith(b"RFB "):
+        return None
+    try:
+        major = int(payload[4:7])
+        minor = int(payload[8:11])
+        return (major, minor)
+    except (ValueError, IndexError):
+        return None
+
+
+def _parse_rfb_security_types(payload: bytes, version: tuple[int, int]) -> list[int]:
+    """Parse the server's security-type message. RFB 3.3 sends a single 4-byte
+    big-endian type; RFB 3.7+ sends [count][type bytes]."""
+    if not payload:
+        return []
+    if version <= (3, 3):
+        if len(payload) >= 4:
+            return [int.from_bytes(payload[:4], "big")]
+        return []
+    count = payload[0]
+    if count == 0 or count > 13 or len(payload) < 1 + count:
+        return []
+    return list(payload[1 : 1 + count])
 
 SUSPICIOUS_PLAINTEXT = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential indicator"),
@@ -168,6 +210,10 @@ class _SessionState:
     last_seen: Optional[float] = None
     client_banner: Optional[str] = None
     server_banner: Optional[str] = None
+    # RFB handshake state for binary security-type parsing.
+    rfb_version: tuple[int, int] = (0, 0)
+    rfb_stage: int = 0  # 0=init, 1=server-version, 2=client-version, 3=sec-types parsed
+    vnc_security: str = ""
 
 
 def _scan_plaintext(
@@ -189,9 +235,9 @@ def _scan_plaintext(
                 suspicious_counter[f"{reason}: {item}"] += 1
         for match in FILE_NAME_RE.findall(item):
             file_counter[match] += 1
-        auth_match = VNC_AUTH_RE.search(item)
-        if auth_match:
-            auth_types[auth_match.group(0)] += 1
+        # NOTE: VNC security types are parsed from the binary RFB handshake (see
+        # the analyze loop), NOT matched as text here — matching "None"/"Tight"
+        # in framebuffer/clipboard text caused constant false "no auth" alerts.
         if "RFB" in item:
             artifacts.append(item)
 
@@ -416,6 +462,26 @@ def analyze_vnc(
                 except Exception:
                     text = ""
 
+            # ---- RFB handshake security-type parsing (binary) ----------------
+            from_server = src_ip == server_ip
+            ver = _parse_rfb_version(payload)
+            if ver is not None:
+                session.rfb_version = ver
+                # Server sends its version first, then the client echoes its own.
+                if from_server and session.rfb_stage == 0:
+                    session.rfb_stage = 1
+                elif not from_server and session.rfb_stage in (0, 1):
+                    session.rfb_stage = 2
+            elif from_server and session.rfb_stage == 2 and not session.vnc_security:
+                # First server payload after the version exchange = security types.
+                sec_types = _parse_rfb_security_types(payload, session.rfb_version)
+                if sec_types:
+                    session.rfb_stage = 3
+                    for st in sec_types:
+                        name = VNC_SECURITY_TYPES.get(st, f"Security Type {st}")
+                        session.vnc_security = name
+                        auth_types[name] += 1
+
             if text:
                 banner = VNC_BANNER_RE.search(text)
                 if banner:
@@ -490,12 +556,29 @@ def analyze_vnc(
         )
 
     if auth_types:
-        if any(name.lower() == "none" for name in auth_types):
+        if any("no authentication" in name.lower() for name in auth_types):
+            detections.append(
+                {
+                    "severity": "high",
+                    "summary": "VNC server offering NO authentication",
+                    "details": (
+                        "RFB security type 1 (None) negotiated — the VNC server "
+                        "grants remote screen/keyboard/mouse control with no "
+                        "password. Anyone who can reach the port has full control "
+                        "(ATT&CK T1021.005 Remote Services: VNC)."
+                    ),
+                }
+            )
+        if any("DES challenge-response" in name for name in auth_types):
             detections.append(
                 {
                     "severity": "warning",
-                    "summary": "VNC sessions with no authentication detected",
-                    "details": "RFB authentication scheme indicates 'None'.",
+                    "summary": "VNC using weak DES challenge-response auth",
+                    "details": (
+                        "RFB security type 2 (VNC Authentication) uses a DES "
+                        "challenge/response limited to an 8-character password — "
+                        "the captured challenge/response is offline-crackable."
+                    ),
                 }
             )
 

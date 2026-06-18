@@ -12,7 +12,14 @@ from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, safe_float, packet_length
+from .utils import (
+    beacon_score,
+    extract_packet_endpoints,
+    is_private_ip,
+    is_public_ip,
+    packet_length,
+    safe_float,
+)
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -29,6 +36,8 @@ IMAP_PORTS = {143, 993}
 MAIL_PORTS = SMTP_PORTS | POP3_PORTS | IMAP_PORTS
 
 EMAIL_RE = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+DOMAIN_RE = re.compile(r"\b([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}\b")
+HELO_HOST_RE = re.compile(r"^(?:HELO|EHLO)\s+(\S+)", re.IGNORECASE)
 SUBJECT_RE = re.compile(r"^Subject:\s*(.+)$", re.IGNORECASE)
 FROM_RE = re.compile(r"^From:\s*(.+)$", re.IGNORECASE)
 TO_RE = re.compile(r"^(?:To|Cc|Bcc):\s*(.+)$", re.IGNORECASE)
@@ -55,6 +64,45 @@ SECRET_RE = re.compile(
     r"\b(?:secret|token|apikey|api_key|api-key|session|sessionid|auth|authorization)\b\s*[:=]\s*([^\s&;,]{3,256})",
     re.IGNORECASE,
 )
+
+# --- Forensic header / content extraction (threat-hunt / IR additions) -----
+# Email-authentication results. Authentication-Results / ARC headers carry
+# spf=, dkim= and dmarc= verdicts; a fail/softfail/none on a message claiming
+# to be from a trusted brand is a primary spoofing/phishing/BEC signal.
+AUTH_RESULT_TOKEN_RE = re.compile(
+    r"\b(spf|dkim|dmarc)\s*=\s*([A-Za-z]+)", re.IGNORECASE
+)
+RECEIVED_SPF_RE = re.compile(r"^Received-SPF:\s*([A-Za-z]+)", re.IGNORECASE)
+RETURN_PATH_RE = re.compile(r"^Return-Path:\s*<?\s*([^>\s]+)\s*>?", re.IGNORECASE)
+REPLY_TO_RE = re.compile(r"^Reply-To:\s*(.+)$", re.IGNORECASE)
+# Mail-client / sender software fingerprint (forensic context; malspam toolkits
+# such as PHPMailer/mass-mailers leave recognizable X-Mailer strings).
+X_MAILER_RE = re.compile(r"^(?:X-Mailer|X-Mimeole):\s*(.+)$", re.IGNORECASE)
+USER_AGENT_HDR_RE = re.compile(r"^User-Agent:\s*(.+)$", re.IGNORECASE)
+# Originating-IP family — the true client IP a relay recorded.
+X_ORIGINATING_IP_RE = re.compile(
+    r"^X-(?:Originating|Sender|Source|Originated)-IP:\s*\[?\s*([0-9A-Fa-f:.]+)\s*\]?",
+    re.IGNORECASE,
+)
+# First public/private IP recorded in a "Received: from ... [ip]" hop.
+RECEIVED_FROM_IP_RE = re.compile(
+    r"^Received:\s+from\b.*?[\[(]\s*((?:\d{1,3}\.){3}\d{1,3})\s*[\])]",
+    re.IGNORECASE,
+)
+# SMTP envelope sender (compared against the displayed From: header).
+MAIL_FROM_ADDR_RE = re.compile(r"MAIL\s+FROM:\s*<?\s*([^>\s]*)\s*>?", re.IGNORECASE)
+# URLs in message bodies — phishing links are primary IOCs.
+URL_RE = re.compile(r"\bhttps?://[^\s\"'<>)\]}]+", re.IGNORECASE)
+IP_LITERAL_URL_RE = re.compile(r"^https?://(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?", re.IGNORECASE)
+# Common link-shorteners abused to mask phishing destinations.
+URL_SHORTENERS = {
+    "bit.ly", "tinyurl.com", "goo.gl", "t.co", "ow.ly", "is.gd", "buff.ly",
+    "rebrand.ly", "cutt.ly", "shorturl.at", "rb.gy", "tiny.cc", "bl.ink",
+    "lnkd.in", "trib.al", "soo.gd", "shor.by",
+}
+# Verdicts that indicate the message failed (or was not covered by) an
+# anti-spoofing control. "neutral" is intentionally NOT treated as a failure.
+AUTH_FAIL_VERDICTS = {"fail", "softfail", "none", "temperror", "permerror", "hardfail"}
 
 SUSPICIOUS_SUBJECT_RE = re.compile(
     r"invoice|payment|wire|urgent|action required|verify account|password reset|gift card|bank transfer|mfa",
@@ -226,6 +274,14 @@ class EmailSummary:
     webmail_action_counts: Counter[str]
     attachment_counts: Counter[str]
     message_id_counts: Counter[str]
+    auth_result_counts: Counter[str]
+    originating_ip_counts: Counter[str]
+    mailer_counts: Counter[str]
+    url_counts: Counter[str]
+    hostname_counts: Counter[str]
+    domain_counts: Counter[str]
+    auth_failure_ip_counts: Counter[str]
+    auth_success_ip_counts: Counter[str]
     plaintext_strings: Counter[str]
     conversations: list[EmailConversation]
     detections: list[dict[str, object]]
@@ -269,6 +325,14 @@ class EmailSummary:
             "webmail_action_counts": dict(self.webmail_action_counts),
             "attachment_counts": dict(self.attachment_counts),
             "message_id_counts": dict(self.message_id_counts),
+            "auth_result_counts": dict(self.auth_result_counts),
+            "originating_ip_counts": dict(self.originating_ip_counts),
+            "mailer_counts": dict(self.mailer_counts),
+            "url_counts": dict(self.url_counts),
+            "hostname_counts": dict(self.hostname_counts),
+            "domain_counts": dict(self.domain_counts),
+            "auth_failure_ip_counts": dict(self.auth_failure_ip_counts),
+            "auth_success_ip_counts": dict(self.auth_success_ip_counts),
             "plaintext_strings": dict(self.plaintext_strings),
             "conversations": [
                 {
@@ -408,16 +472,22 @@ def _detect_webmail_context(text: str) -> dict[str, object] | None:
             )
         )
     )
-    uri_hit = bool(pages) or any(
+    # NOTE: `pages` (from WEBMAIL_PATH_KEYWORDS) deliberately does NOT classify a
+    # packet as webmail on its own — it includes generic paths like /download,
+    # /login and /api/ that any website has, so a plain software-download URL
+    # (e.g. /download/foo.tar.gz) would otherwise be flagged as webmail and its
+    # URL mined for "attachments". Classification requires a webmail-SPECIFIC
+    # URI; `pages` is used only to label the action once webmail is established.
+    uri_hit = any(
         token in uri.lower()
         for token in (
             "/owa/",
             "/ews/",
-            "/mail",
             "/webmail",
             "/roundcube",
             "/squirrelmail",
             "/zimbra",
+            "/mail/",
         )
     )
     referer_hit = any(
@@ -545,6 +615,17 @@ def _looks_base64_blob(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9+/=]{40,}", token))
 
 
+def _is_qp_artifact(token: str) -> bool:
+    """True when a captured credential token is nothing but quoted-printable
+    noise. A QP body encodes a literal '=' as '=3D'; when PASS_RE/SECRET_RE
+    consume the '=' as the key/value separator, the leftover '3D' (optionally
+    repeated, e.g. '3D=3D') is captured as a bogus password. Drop those —
+    real creds recovered from the base64 AUTH path are unaffected."""
+    if token in {"=", "=3D"}:
+        return True
+    return bool(re.fullmatch(r"(?:3D)(?:=?3D)*", token, re.IGNORECASE))
+
+
 def _extract_pair_tokens(
     text: str,
     username_counts: Counter[str],
@@ -553,16 +634,16 @@ def _extract_pair_tokens(
 ) -> None:
     for user in USER_RE.findall(text):
         token = user.strip()
-        if token:
+        if token and not _is_qp_artifact(token):
             username_counts[token] += 1
     for password in PASS_RE.findall(text):
         token = password.strip()
-        if token:
+        if token and not _is_qp_artifact(token):
             password_counts[token] += 1
             secret_counts[token] += 1
     for secret in SECRET_RE.findall(text):
         token = secret.strip()
-        if token:
+        if token and not _is_qp_artifact(token):
             secret_counts[token] += 1
 
 
@@ -666,6 +747,73 @@ def _parse_mime_message(mime_text: str) -> dict[str, object]:
     return result
 
 
+def _from_header_address(value: str) -> str:
+    """Best-effort extraction of the actual mailbox from a From/Sender header
+    value (``"Display Name" <user@dom>`` -> ``user@dom``)."""
+    text = str(value or "")
+    angle = re.search(r"<\s*([^>\s]+@[^>\s]+)\s*>", text)
+    if angle:
+        return angle.group(1).strip().lower()
+    found = EMAIL_RE.findall(text)
+    return found[0].strip().lower() if found else ""
+
+
+def _from_display_name_spoof(value: str) -> Optional[str]:
+    """Return a spoofed brand address when a From: display name *contains* an
+    email/domain that differs from the real mailbox — a classic phishing/BEC
+    lure (``From: "billing@paypal.com" <attacker@evil.ru>``)."""
+    text = str(value or "")
+    real = _from_header_address(text)
+    if not real:
+        return None
+    # Display name is everything before the <real@addr> token.
+    display = re.split(r"<[^>]*>", text)[0]
+    real_domain = real.split("@")[-1]
+    for addr in EMAIL_RE.findall(display):
+        if addr.strip().lower() != real and addr.split("@")[-1].lower() != real_domain:
+            return f"display '{addr.strip()}' vs actual <{real}>"
+    return None
+
+
+_DOUBLE_EXT_LURE_RE = re.compile(
+    r"\.(?:pdf|doc|docx|xls|xlsx|ppt|pptx|txt|jpg|jpeg|png|htm|html|zip|csv|rtf)"
+    r"\.(?:exe|scr|com|pif|cpl|bat|cmd|ps1|vbs|js|jse|wsf|hta|jar|lnk)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _attachment_risk(filename: str, content_type: str = "") -> Optional[str]:
+    """Classify a MIME attachment for malspam-style payload-delivery risk and
+    return a short reason, or None when it is unremarkable."""
+    name = (filename or "").strip().strip("\"'").lower()
+    if not name or "." not in name:
+        return None
+    if _DOUBLE_EXT_LURE_RE.search(name):
+        return "double-extension lure (benign name hiding an executable)"
+    ext = "." + name.rsplit(".", 1)[-1]
+    if ext in RISKY_EXTENSIONS:
+        return f"executable/script/container extension ({ext})"
+    return None
+
+
+def _classify_url(url: str) -> list[str]:
+    """Return phishing/IOC reason tags for a URL found in a message body."""
+    reasons: list[str] = []
+    lowered = url.lower()
+    if IP_LITERAL_URL_RE.match(url):
+        reasons.append("IP-literal host (no domain)")
+    host = re.sub(r"^https?://", "", lowered).split("/")[0].split(":")[0].strip("[]")
+    host = host.split("@")[-1]  # strip any userinfo
+    if host in URL_SHORTENERS:
+        reasons.append(f"link shortener ({host})")
+    if "xn--" in host:
+        reasons.append("punycode/IDN host (possible homograph)")
+    # NB: do NOT flag on label depth — multi-label ccTLDs (.ac.uk, .co.uk,
+    # .com.au) and CDN/tracking hosts routinely have 4+ labels, so a depth
+    # heuristic produces constant false positives on legitimate mail.
+    return reasons
+
+
 def analyze_email(
     path: Path,
     show_status: bool = True,
@@ -705,6 +853,14 @@ def analyze_email(
             webmail_action_counts=Counter(),
             attachment_counts=Counter(),
             message_id_counts=Counter(),
+            auth_result_counts=Counter(),
+            originating_ip_counts=Counter(),
+            mailer_counts=Counter(),
+            url_counts=Counter(),
+            hostname_counts=Counter(),
+            domain_counts=Counter(),
+            auth_failure_ip_counts=Counter(),
+            auth_success_ip_counts=Counter(),
             plaintext_strings=Counter(),
             conversations=[],
             detections=[],
@@ -754,6 +910,12 @@ def analyze_email(
     webmail_action_counts: Counter[str] = Counter()
     attachment_counts: Counter[str] = Counter()
     message_id_counts: Counter[str] = Counter()
+    auth_result_counts: Counter[str] = Counter()
+    originating_ip_counts: Counter[str] = Counter()
+    mailer_counts: Counter[str] = Counter()
+    url_counts: Counter[str] = Counter()
+    hostname_counts: Counter[str] = Counter()
+    domain_counts: Counter[str] = Counter()
     plaintext_strings: Counter[str] = Counter()
 
     conv_map: dict[tuple[str, str, str, int], dict[str, object]] = {}
@@ -764,10 +926,13 @@ def analyze_email(
 
     seen_device_artifacts: set[str] = set()
     seen_mime_messages: set[str] = set()
+    seen_forensic_markers: set[str] = set()
     client_server_fanout: dict[str, set[str]] = defaultdict(set)
     auth_failures_by_client: Counter[str] = Counter()
     auth_success_by_client: Counter[str] = Counter()
     bytes_by_client_server: Counter[tuple[str, str]] = Counter()
+    flow_times: dict[tuple[str, str], list[float]] = defaultdict(list)
+    vrfy_expn_by_client: Counter[str] = Counter()
     stream_state: dict[tuple[str, str, int, int], dict[str, object]] = {}
 
     def _stream_bucket(src: str, dst: str, sport: int, dport: int) -> dict[str, object]:
@@ -820,7 +985,146 @@ def analyze_email(
 
         for mail_addr in EMAIL_RE.findall(line):
             email_counts[mail_addr] += 1
+            domain = mail_addr.rsplit("@", 1)[-1].lower()
+            if domain:
+                domain_counts[domain] += 1
+        for match in DOMAIN_RE.finditer(line):
+            host = match.group(0).lower().strip(".")
+            if host and "@" not in host and len(domain_counts) < 4000:
+                domain_counts[host] += 1
         _extract_pair_tokens(line, username_counts, password_counts, secret_counts)
+
+        # --- Forensic header & content extraction (all mail protocols) -----
+        # Email-authentication verdicts (SPF/DKIM/DMARC). Failures on inbound
+        # mail are the primary spoofing / phishing / BEC signal.
+        for mech, verdict in AUTH_RESULT_TOKEN_RE.findall(line):
+            mech_l = mech.lower()
+            verdict_l = verdict.lower()
+            if verdict_l not in {
+                "pass", "fail", "softfail", "neutral", "none",
+                "temperror", "permerror", "hardfail", "bestguesspass",
+            }:
+                continue
+            auth_result_counts[f"{mech_l}={verdict_l}"] += 1
+            if verdict_l in AUTH_FAIL_VERDICTS:
+                marker = f"authfail:{src_ip}:{dst_ip}:{mech_l}={verdict_l}"
+                if marker not in seen_forensic_markers:
+                    seen_forensic_markers.add(marker)
+                    sev = "high" if mech_l == "dmarc" and verdict_l in {"fail", "hardfail"} else "warning"
+                    detections.append(
+                        {
+                            "severity": sev,
+                            "summary": f"Email authentication failure ({mech_l.upper()}={verdict_l})",
+                            "details": (
+                                f"{src_ip}->{dst_ip} {mech_l.upper()}={verdict_l} — "
+                                "sender failed anti-spoofing validation (possible "
+                                f"spoofing/phishing). Evidence: {line[:160]}"
+                            ),
+                            "source": "EMAIL",
+                        }
+                    )
+                    _timeline_emit("Authentication", f"{mech_l.upper()} {verdict_l}", line)
+        spf_match = RECEIVED_SPF_RE.match(line)
+        if spf_match:
+            verdict_l = spf_match.group(1).lower()
+            auth_result_counts[f"spf={verdict_l}"] += 1
+
+        # Originating client IP recorded by relays (true sender location).
+        orig_ip = ""
+        xorig = X_ORIGINATING_IP_RE.match(line)
+        if xorig:
+            orig_ip = xorig.group(1).strip()
+        else:
+            recv = RECEIVED_FROM_IP_RE.match(line)
+            if recv:
+                orig_ip = recv.group(1).strip()
+        # Loopback Received hops (127.0.0.0/8, ::1) are local relay noise, not a
+        # sender location — drop them so the IOC list stays actionable.
+        if orig_ip.startswith("127.") or orig_ip == "::1":
+            orig_ip = ""
+        if orig_ip:
+            originating_ip_counts[orig_ip] += 1
+            marker = f"origip:{orig_ip}"
+            if marker not in seen_forensic_markers:
+                seen_forensic_markers.add(marker)
+                scope = (
+                    "public" if is_public_ip(orig_ip)
+                    else "private" if is_private_ip(orig_ip) else "?"
+                )
+                artifacts.append(
+                    EmailArtifact(
+                        "originating_ip",
+                        f"{orig_ip} ({scope})",
+                        src_ip,
+                        dst_ip,
+                        packet_no,
+                    )
+                )
+
+        # Sending-client / mailer fingerprint.
+        mailer_match = X_MAILER_RE.match(line) or USER_AGENT_HDR_RE.match(line)
+        if mailer_match:
+            mailer = mailer_match.group(1).strip()[:120]
+            if mailer:
+                mailer_counts[mailer] += 1
+                marker = f"mailer:{mailer}"
+                if marker not in seen_forensic_markers:
+                    seen_forensic_markers.add(marker)
+                    artifacts.append(
+                        EmailArtifact("mailer", mailer, src_ip, dst_ip, packet_no)
+                    )
+
+        # Display-name spoofing in the From: header.
+        from_hdr = FROM_RE.match(line)
+        if from_hdr:
+            spoof = _from_display_name_spoof(from_hdr.group(1))
+            if spoof:
+                marker = f"dispspoof:{src_ip}:{spoof}"
+                if marker not in seen_forensic_markers:
+                    seen_forensic_markers.add(marker)
+                    detections.append(
+                        {
+                            "severity": "high",
+                            "summary": "From: display-name spoofing",
+                            "details": (
+                                f"{src_ip}->{dst_ip} From header shows a different "
+                                f"address in the display name than the real mailbox "
+                                f"({spoof}) — classic phishing/BEC lure."
+                            ),
+                            "source": "EMAIL",
+                        }
+                    )
+
+        # URLs in message content — phishing links are primary IOCs.
+        for url in URL_RE.findall(line):
+            clean_url = url.rstrip(".,;)\"'>")
+            if len(url_counts) < 800 or clean_url in url_counts:
+                url_counts[clean_url] += 1
+            reasons = _classify_url(clean_url)
+            if reasons:
+                marker = f"url:{clean_url[:120]}"
+                if marker not in seen_forensic_markers:
+                    seen_forensic_markers.add(marker)
+                    artifacts.append(
+                        EmailArtifact(
+                            "suspicious_url",
+                            f"{clean_url[:160]} [{'; '.join(reasons)}]",
+                            src_ip,
+                            dst_ip,
+                            packet_no,
+                        )
+                    )
+                    detections.append(
+                        {
+                            "severity": "warning",
+                            "summary": "Suspicious URL in email content",
+                            "details": (
+                                f"{src_ip}->{dst_ip} {clean_url[:160]} "
+                                f"({'; '.join(reasons)})"
+                            ),
+                            "source": "EMAIL",
+                        }
+                    )
 
         subject_match = SUBJECT_RE.search(line)
         if subject_match:
@@ -867,14 +1171,25 @@ def analyze_email(
                     EmailArtifact("attachment", name, src_ip, dst_ip, packet_no)
                 )
                 _timeline_emit("Attachment", "Attachment Name", name)
-        for match in NAME_RE.findall(line):
-            name = match.strip()
-            if name:
-                attachment_counts[name] += 1
-        for match in FILE_NAME_RE.findall(line):
-            name = match.strip()
-            if name:
-                attachment_counts[name] += 1
+        # NAME_RE (`name="..."`) and FILE_NAME_RE (bare *.js/*.txt/*.tar.gz)
+        # match HTML form fields, JS object keys and arbitrary URLs in web
+        # pages — none of which are mail attachments. Only mine them when the
+        # line is an actual MIME part header (Content-Disposition/Content-Type),
+        # so we extract real attachment/part names instead of web noise.
+        line_l = line.lower()
+        if (
+            "content-disposition" in line_l
+            or "content-type" in line_l
+            or "filename" in line_l
+        ):
+            for match in NAME_RE.findall(line):
+                name = match.strip()
+                if name:
+                    attachment_counts[name] += 1
+            for match in FILE_NAME_RE.findall(line):
+                name = match.strip()
+                if name:
+                    attachment_counts[name] += 1
 
         if proto == "SMTP":
             smtp_auth_login = bool(state.get("smtp_auth_login"))
@@ -919,6 +1234,46 @@ def analyze_email(
                             _timeline_emit(
                                 "Authentication", "Decoded AUTH Blob", decoded
                             )
+                            # AUTH PLAIN carries authzid\0authcid\0passwd in one
+                            # blob — split on the NUL boundaries so the username
+                            # and password land in the credential tables (not
+                            # just the raw artifact).
+                            if method == "PLAIN":
+                                try:
+                                    raw = base64.b64decode(
+                                        blob.encode("ascii"), validate=False
+                                    )
+                                except Exception:
+                                    raw = b""
+                                parts = raw.split(b"\x00")
+                                if len(parts) >= 2:
+                                    authcid = parts[-2].decode(
+                                        "utf-8", errors="ignore"
+                                    ).strip()
+                                    passwd = parts[-1].decode(
+                                        "utf-8", errors="ignore"
+                                    ).strip()
+                                    if authcid and _looks_reasonable_credential(authcid):
+                                        username_counts[authcid] += 1
+                                        _timeline_emit(
+                                            "Authentication", "Username", authcid
+                                        )
+                                    if passwd and _looks_reasonable_credential(passwd):
+                                        password_counts[passwd] += 1
+                                        secret_counts[passwd] += 1
+                                        _timeline_emit(
+                                            "Authentication", "Password", passwd
+                                        )
+                                    if authcid and passwd:
+                                        artifacts.append(
+                                            EmailArtifact(
+                                                "credential_pair",
+                                                f"{authcid}:{passwd}",
+                                                src_ip,
+                                                dst_ip,
+                                                packet_no,
+                                            )
+                                        )
                             if method == "LOGIN":
                                 decoded_clean = decoded.replace("\x00", " ").strip()
                                 if decoded_clean and _looks_reasonable_credential(
@@ -946,12 +1301,19 @@ def analyze_email(
                 "RCPT TO",
                 "DATA",
                 "STARTTLS",
+                "VRFY",
+                "EXPN",
+                "RSET",
+                "NOOP",
                 "QUIT",
             ):
                 if upper.startswith(cmd):
                     smtp_command_counts[cmd] += 1
                     if cmd in {"EHLO", "HELO"}:
                         stage = "Session Setup"
+                        helo_match = HELO_HOST_RE.search(line)
+                        if helo_match:
+                            hostname_counts[helo_match.group(1)] += 1
                     elif cmd in {"MAIL FROM", "RCPT TO"}:
                         stage = "Envelope"
                     elif cmd == "DATA":
@@ -961,6 +1323,16 @@ def analyze_email(
                     else:
                         stage = "Interaction"
                     _timeline_emit(stage, f"SMTP {cmd}", line)
+                    # Capture the SMTP envelope so it can be compared with the
+                    # message From: header (sender spoofing) and used for
+                    # open-relay analysis.
+                    if cmd == "MAIL FROM":
+                        m = MAIL_FROM_ADDR_RE.search(line)
+                        if m and m.group(1):
+                            state["envelope_from"] = m.group(1).strip().lower()
+                    elif cmd in {"VRFY", "EXPN"}:
+                        # SMTP user/alias enumeration (recon).
+                        vrfy_expn_by_client[src_ip] += 1
                     break
             smtp_resp = SMTP_RESPONSE_RE.match(line)
             if smtp_resp:
@@ -1084,6 +1456,49 @@ def analyze_email(
                                 from_counts[addr] += 1
                                 email_counts[addr] += 1
                                 _timeline_emit("Message Build", "MIME From", addr)
+                            # Display-name spoofing in the MIME From: header.
+                            mime_spoof = _from_display_name_spoof(parsed_from)
+                            if mime_spoof:
+                                marker = f"dispspoof:{src_ip}:{mime_spoof}"
+                                if marker not in seen_forensic_markers:
+                                    seen_forensic_markers.add(marker)
+                                    detections.append(
+                                        {
+                                            "severity": "high",
+                                            "summary": "From: display-name spoofing",
+                                            "details": (
+                                                f"{src_ip}->{dst_ip} From header shows a "
+                                                f"different address in the display name "
+                                                f"than the real mailbox ({mime_spoof}) — "
+                                                "classic phishing/BEC lure."
+                                            ),
+                                            "source": "EMAIL",
+                                        }
+                                    )
+                            # Envelope (MAIL FROM) vs header From: domain mismatch.
+                            envelope_from = str(state.get("envelope_from") or "")
+                            header_from = _from_header_address(parsed_from)
+                            if envelope_from and header_from:
+                                env_dom = envelope_from.split("@")[-1]
+                                hdr_dom = header_from.split("@")[-1]
+                                if env_dom and hdr_dom and env_dom != hdr_dom:
+                                    marker = f"envmismatch:{envelope_from}:{header_from}"
+                                    if marker not in seen_forensic_markers:
+                                        seen_forensic_markers.add(marker)
+                                        detections.append(
+                                            {
+                                                "severity": "warning",
+                                                "summary": "Envelope/header sender mismatch",
+                                                "details": (
+                                                    f"{src_ip}->{dst_ip} envelope MAIL FROM "
+                                                    f"<{envelope_from}> differs from header "
+                                                    f"From <{header_from}> — common in "
+                                                    "spoofing/BEC (also seen with legitimate "
+                                                    "forwarders/mailing lists)."
+                                                ),
+                                                "source": "EMAIL",
+                                            }
+                                        )
                         if parsed_to:
                             for addr in EMAIL_RE.findall(parsed_to):
                                 to_counts[addr] += 1
@@ -1132,6 +1547,23 @@ def analyze_email(
                                     )
                                 )
                                 _timeline_emit("Attachment", "MIME Attachment", detail)
+                                # Malspam payload-delivery risk, with the full
+                                # SHA-256 surfaced as an IOC for VT/sandbox pivot.
+                                att_risk = _attachment_risk(att_name, att_type)
+                                if att_risk:
+                                    detections.append(
+                                        {
+                                            "severity": "high",
+                                            "summary": "Risky email attachment (malspam payload delivery)",
+                                            "details": (
+                                                f"{src_ip}->{dst_ip} attachment "
+                                                f"'{att_name}' — {att_risk}; "
+                                                f"type={att_type or '-'} size={att_size} "
+                                                f"sha256={att_hash or 'n/a'}"
+                                            ),
+                                            "source": "EMAIL",
+                                        }
+                                    )
 
                         parsed_body = parsed_mime.get("body_lines", [])
                         if isinstance(parsed_body, list):
@@ -1352,6 +1784,11 @@ def analyze_email(
             server_ports[int(server_port)] += 1
             client_server_fanout[client_ip].add(server_ip)
             bytes_by_client_server[(client_ip, server_ip)] += pkt_len
+            # Connection cadence for SMTP beaconing (mail-protocol C2/exfil):
+            # only client->server packets carrying payload to the SMTP submit
+            # path, so keep-alive ACKs do not pollute the interval series.
+            if client_to_server and proto == "SMTP" and ts is not None:
+                flow_times[(client_ip, server_ip)].append(ts)
 
             conv_key = (client_ip, server_ip, proto, int(server_port))
             conv = conv_map.get(conv_key)
@@ -1473,11 +1910,89 @@ def analyze_email(
         "auth_abuse": [],
         "suspicious_attachments": [],
         "phishing_indicators": [],
+        "email_auth_failures": [],
+        "sender_spoofing": [],
+        "phishing_urls": [],
+        "smtp_recon": [],
         "exfiltration_signals": [],
+        "beaconing": [],
         "server_fanout": [],
+        "originating_ips": [],
         "webmail_activity": [],
         "webmail_credential_submission": [],
     }
+
+    # Email-authentication failures (SPF/DKIM/DMARC) — spoofing/phishing signal.
+    auth_fail_summary = [
+        f"{token} ({count})"
+        for token, count in auth_result_counts.most_common()
+        if token.split("=", 1)[-1] in AUTH_FAIL_VERDICTS
+    ]
+    if auth_fail_summary:
+        deterministic_checks["email_auth_failures"].extend(auth_fail_summary[:8])
+
+    # Display-name / envelope spoofing detections already raised inline; mirror
+    # them into the deterministic-check ribbon for the verdict roll-up.
+    for det in detections:
+        summ = str(det.get("summary", ""))
+        if summ in {"From: display-name spoofing", "Envelope/header sender mismatch"}:
+            deterministic_checks["sender_spoofing"].append(str(det.get("details", ""))[:160])
+        elif summ == "Suspicious URL in email content":
+            deterministic_checks["phishing_urls"].append(str(det.get("details", ""))[:160])
+    deterministic_checks["sender_spoofing"] = deterministic_checks["sender_spoofing"][:8]
+    deterministic_checks["phishing_urls"] = deterministic_checks["phishing_urls"][:8]
+
+    # SMTP VRFY/EXPN user enumeration (recon).
+    for client, count in vrfy_expn_by_client.items():
+        deterministic_checks["smtp_recon"].append(
+            f"{client} issued {count} VRFY/EXPN command(s)"
+        )
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "SMTP user enumeration (VRFY/EXPN)",
+                "details": (
+                    f"{client} issued {count} VRFY/EXPN command(s) — address/alias "
+                    "harvesting reconnaissance (ATT&CK T1087 Account Discovery)."
+                ),
+                "source": "EMAIL",
+            }
+        )
+
+    # Originating IPs recovered from Received/X-Originating-IP headers (IOCs).
+    if originating_ip_counts:
+        deterministic_checks["originating_ips"].extend(
+            f"{ip} ({count})" for ip, count in originating_ip_counts.most_common(8)
+        )
+
+    # Mail-protocol beaconing (regular cadence => possible C2 / scripted exfil).
+    for (client, server), times in flow_times.items():
+        if len(times) < 6:
+            continue
+        score = beacon_score(
+            sorted(times),
+            min_interval=1.0,
+            max_interval=3600.0,
+            rel_jitter=0.15,
+            abs_jitter_floor=0.0,
+        )
+        if score:
+            deterministic_checks["beaconing"].append(
+                f"{client}->{server} ~{score['avg']:.1f}s interval x{len(times)}"
+            )
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Mail-protocol beaconing suspected",
+                    "details": (
+                        f"{client}->{server} sent SMTP traffic on a regular "
+                        f"~{score['avg']:.1f}s cadence ({len(times)} events) — "
+                        "possible C2 or scripted exfil over mail "
+                        "(ATT&CK T1071.003)."
+                    ),
+                    "source": "EMAIL",
+                }
+            )
 
     if username_counts or password_counts or secret_counts:
         top_users = ", ".join(
@@ -1641,12 +2156,24 @@ def analyze_email(
     if len(timeline_events) > 1200:
         timeline_events = timeline_events[:1200]
 
+    # `total_messages` was incremented once per parsed protocol LINE above, so it
+    # reported line count (e.g. 1291 for a single 78-packet message). Derive a
+    # real message count from actual message boundaries, preferring the
+    # strongest available signal: unique Message-IDs, then SMTP DATA
+    # transactions, then POP3 RETR / IMAP FETCH retrievals.
+    message_estimate = (
+        len(message_id_counts)
+        or int(smtp_command_counts.get("DATA", 0))
+        or int(pop3_command_counts.get("RETR", 0))
+        or int(imap_command_counts.get("FETCH", 0))
+    )
+
     return EmailSummary(
         path=path,
         total_packets=total_packets,
         email_packets=email_packets,
         total_bytes=total_bytes,
-        total_messages=total_messages,
+        total_messages=message_estimate,
         unique_clients=len(client_counts),
         unique_servers=len(server_counts),
         client_counts=client_counts,
@@ -1671,6 +2198,14 @@ def analyze_email(
         webmail_action_counts=webmail_action_counts,
         attachment_counts=attachment_counts,
         message_id_counts=message_id_counts,
+        auth_result_counts=auth_result_counts,
+        originating_ip_counts=originating_ip_counts,
+        mailer_counts=mailer_counts,
+        url_counts=url_counts,
+        hostname_counts=hostname_counts,
+        domain_counts=domain_counts,
+        auth_failure_ip_counts=auth_failures_by_client,
+        auth_success_ip_counts=auth_success_by_client,
         plaintext_strings=plaintext_strings,
         conversations=conversations,
         detections=detections,
@@ -1718,6 +2253,14 @@ def merge_email_summaries(summaries: Iterable[EmailSummary]) -> EmailSummary:
             webmail_action_counts=Counter(),
             attachment_counts=Counter(),
             message_id_counts=Counter(),
+            auth_result_counts=Counter(),
+            originating_ip_counts=Counter(),
+            mailer_counts=Counter(),
+            url_counts=Counter(),
+            hostname_counts=Counter(),
+            domain_counts=Counter(),
+            auth_failure_ip_counts=Counter(),
+            auth_success_ip_counts=Counter(),
             plaintext_strings=Counter(),
             conversations=[],
             detections=[],
@@ -1761,6 +2304,14 @@ def merge_email_summaries(summaries: Iterable[EmailSummary]) -> EmailSummary:
     webmail_action_counts: Counter[str] = Counter()
     attachment_counts: Counter[str] = Counter()
     message_id_counts: Counter[str] = Counter()
+    auth_result_counts: Counter[str] = Counter()
+    originating_ip_counts: Counter[str] = Counter()
+    mailer_counts: Counter[str] = Counter()
+    url_counts: Counter[str] = Counter()
+    hostname_counts: Counter[str] = Counter()
+    domain_counts: Counter[str] = Counter()
+    auth_failure_ip_counts: Counter[str] = Counter()
+    auth_success_ip_counts: Counter[str] = Counter()
     plaintext_strings: Counter[str] = Counter()
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
@@ -1812,6 +2363,14 @@ def merge_email_summaries(summaries: Iterable[EmailSummary]) -> EmailSummary:
         webmail_action_counts.update(summary.webmail_action_counts)
         attachment_counts.update(summary.attachment_counts)
         message_id_counts.update(summary.message_id_counts)
+        auth_result_counts.update(summary.auth_result_counts)
+        originating_ip_counts.update(summary.originating_ip_counts)
+        mailer_counts.update(summary.mailer_counts)
+        url_counts.update(summary.url_counts)
+        hostname_counts.update(summary.hostname_counts)
+        domain_counts.update(summary.domain_counts)
+        auth_failure_ip_counts.update(summary.auth_failure_ip_counts)
+        auth_success_ip_counts.update(summary.auth_success_ip_counts)
         plaintext_strings.update(summary.plaintext_strings)
 
         for det in summary.detections:
@@ -1914,6 +2473,14 @@ def merge_email_summaries(summaries: Iterable[EmailSummary]) -> EmailSummary:
         webmail_action_counts=webmail_action_counts,
         attachment_counts=attachment_counts,
         message_id_counts=message_id_counts,
+        auth_result_counts=auth_result_counts,
+        originating_ip_counts=originating_ip_counts,
+        mailer_counts=mailer_counts,
+        url_counts=url_counts,
+        hostname_counts=hostname_counts,
+        domain_counts=domain_counts,
+        auth_failure_ip_counts=auth_failure_ip_counts,
+        auth_success_ip_counts=auth_success_ip_counts,
         plaintext_strings=plaintext_strings,
         conversations=conversations,
         detections=detections,

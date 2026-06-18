@@ -68,8 +68,24 @@ C2_PATTERN = re.compile(
     r"\b(?:beacon|callback|c2|cnc|reverse[_ -]?shell|meterpreter|powershell\s+-enc|scheduledtask|schtasks)\b",
     re.IGNORECASE,
 )
+# A bare LOLBin name ("cmd", "powershell") matches far too much benign text —
+# CSS classes like `.btest-cmd`, prose, identifiers. Over raw cleartext we
+# require real execution context: an explicit `.exe`, a command-line switch, or
+# a known invocation form. This keeps Cobalt-Strike/loader command lines while
+# dropping web/doc noise.
 LOL_PATTERN = re.compile(
-    r"\b(?:powershell(?:\.exe)?|cmd(?:\.exe)?|wscript(?:\.exe)?|cscript(?:\.exe)?|mshta(?:\.exe)?|rundll32(?:\.exe)?|regsvr32(?:\.exe)?|certutil(?:\.exe)?|bitsadmin(?:\.exe)?)\b",
+    r"(?:"
+    r"(?:powershell|cmd|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin|wmic)\.exe"
+    r"|\bpowershell(?:\.exe)?\s+(?:-|/)[A-Za-z]"            # powershell -enc / -nop / -w
+    r"|\b-enc(?:odedcommand)?\s+[A-Za-z0-9+/]{16,}"          # encoded PS payload
+    r"|\bIEX\b|\bInvoke-Expression\b|\bDownloadString\b"
+    r"|\bcmd(?:\.exe)?\s+/[ckCK]\b"                          # cmd /c | /k
+    r"|\bcertutil\s+(?:-|/)\w"                                # certutil -urlcache / -decode
+    r"|\brundll32\s+\S+,"                                    # rundll32 dll,Export
+    r"|\bregsvr32\s+(?:-|/)\w"                               # regsvr32 /s /i:
+    r"|\bbitsadmin\s+(?:-|/)\w"
+    r"|\bmshta\s+(?:https?:|vbscript:|javascript:)"
+    r")",
     re.IGNORECASE,
 )
 OT_WRITE_PATTERN = re.compile(
@@ -123,6 +139,29 @@ class StringsSummary:
 def _get_ip_pair(pkt: Packet) -> Tuple[str, str]:
     src_ip, dst_ip = extract_packet_endpoints(pkt)
     return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
+
+
+_JS_JUNK_VALUES = {
+    "[]", "{}", "''", '""', "null", "true", "false", "undefined", "none",
+    "nil", "function", "function()", "0", "1", "-", "...",
+}
+
+
+def _plausible_secret_value(value: str) -> bool:
+    """Heuristic: does a captured password value look like a real secret rather
+    than JavaScript/JSON scaffolding (empty array, object literal, function,
+    template placeholder)? Used to suppress `username:`/`password:` matches in
+    benign web content."""
+    v = (value or "").strip().strip("'\"")
+    if len(v) < 3 or len(v) > 128:
+        return False
+    if v.lower() in _JS_JUNK_VALUES:
+        return False
+    if v[0] in "[{(<":  # JS array/object/JSX/template start
+        return False
+    if v.startswith("${") or v.startswith("{{") or v.startswith("%"):  # template var
+        return False
+    return True
 
 
 def _match_suspicious(value: str) -> Optional[str]:
@@ -359,12 +398,17 @@ def analyze_strings(
 
         user_match = CRED_USER_PATTERN.search(text)
         pass_match = CRED_PASS_PATTERN.search(text)
-        if user_match or pass_match:
+        # A bare `username:` field name is ubiquitous in JS/JSON/HTML and is NOT
+        # a credential exposure — the sensitive half is the password VALUE. Only
+        # fire the check when a plausible password value is present (not JS junk
+        # like `[]`, `{}`, a function, or an empty/templated value).
+        pass_value = pass_match.group(1).strip().strip("'\"") if pass_match else ""
+        has_real_pass = _plausible_secret_value(pass_value)
+        if has_real_pass:
             _append_check(deterministic_checks, "cleartext_credentials", evidence)
             if user_match:
                 credential_user_counter[user_match.group(1)] += count
-            if pass_match:
-                credential_pass_counter[pass_match.group(1)] += count
+            credential_pass_counter[pass_value] += count
         if (
             AWS_KEY_PATTERN.search(text)
             or JWT_PATTERN.search(text)

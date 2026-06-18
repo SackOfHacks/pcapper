@@ -133,7 +133,6 @@ class BeaconSummary:
     deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
     threat_hypotheses: list[dict[str, object]] = field(default_factory=list)
     benign_context: list[str] = field(default_factory=list)
-    risk_matrix: list[dict[str, str]] = field(default_factory=list)
     deterministic_category_checks: dict[str, list[str]] = field(default_factory=dict)
     campaign_summaries: list[dict[str, object]] = field(default_factory=list)
     host_rollups: list[dict[str, object]] = field(default_factory=list)
@@ -996,7 +995,6 @@ def analyze_beacons(
     }
     threat_hypotheses: list[dict[str, object]] = []
     benign_context: list[str] = []
-    risk_matrix: list[dict[str, str]] = []
     if candidates:
         severity_rank = {"info": 0, "warning": 1, "high": 2, "critical": 3}
 
@@ -1700,53 +1698,6 @@ def analyze_beacons(
             "No high-stability low-jitter beaconing pattern dominated the capture"
         )
 
-    def _risk_row(
-        label_text: str, key: str, high: bool = False, medium: bool = False
-    ) -> None:
-        evidence_items = [
-            str(v)
-            for v in list(deterministic_checks.get(key, []) or [])
-            if str(v).strip()
-        ]
-        if evidence_items:
-            if high:
-                risk_value, conf_value = "High", "High"
-            elif medium:
-                risk_value, conf_value = "Medium", "Medium"
-            else:
-                risk_value, conf_value = "Low", "Medium"
-            evidence_text = f"{len(evidence_items)} signal(s)"
-        else:
-            risk_value, conf_value, evidence_text = (
-                "None",
-                "Low",
-                "No matching evidence",
-            )
-        risk_matrix.append(
-            {
-                "category": label_text,
-                "risk": risk_value,
-                "confidence": conf_value,
-                "evidence": evidence_text,
-            }
-        )
-
-    _risk_row("External Periodic Beaconing", "external_periodic_beaconing", high=True)
-    _risk_row(
-        "DNS Beaconing or Tunnel Pattern", "dns_beaconing_or_tunnel_pattern", high=True
-    )
-    _risk_row("HTTP POST Check-In Pattern", "http_post_checkin_pattern", high=True)
-    _risk_row("Management Port Persistence", "management_port_persistence", medium=True)
-    _risk_row("OT Control Periodicity", "ot_control_periodicity", high=True)
-    _risk_row(
-        "Layer-2 Periodic Control Signal", "l2_periodic_control_signal", medium=True
-    )
-    _risk_row(
-        "High Stability Low Jitter Beacon",
-        "high_stability_low_jitter_beacon",
-        medium=True,
-    )
-
     return BeaconSummary(
         path=path,
         total_packets=total_packets,
@@ -1757,7 +1708,6 @@ def analyze_beacons(
         deterministic_checks=deterministic_checks,
         threat_hypotheses=threat_hypotheses,
         benign_context=benign_context,
-        risk_matrix=risk_matrix,
         deterministic_category_checks=deterministic_category_checks,
         campaign_summaries=campaign_summaries,
         host_rollups=host_rollups,

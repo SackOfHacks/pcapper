@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, unquote_plus, urlsplit
 
 from .pcap_cache import PcapMeta, get_reader
 from .services import COMMON_PORTS
-from .utils import decode_payload, extract_packet_endpoints, memoize_analysis, safe_float, get_packet_ports as _get_ports
+from .utils import decode_payload, extract_packet_endpoints, memoize_analysis, safe_float, get_packet_ports as _get_ports, is_public_ip as _util_is_public_ip
 
 try:
     from .cip import (
@@ -866,8 +866,207 @@ def _extract_ntlm_credentials(
     return hits
 
 
+def _ntlm_messages(payload: bytes) -> list[dict[str, object]]:
+    """Parse every NTLMSSP message in a payload. Returns dicts with the fields
+    needed to correlate a CHALLENGE (Type 2, server->client) with an
+    AUTHENTICATE (Type 3, client->server) into a crackable NetNTLM hash."""
+    out: list[dict[str, object]] = []
+    cursor = 0
+    while True:
+        idx = payload.find(NTLM_SIGNATURE, cursor)
+        if idx < 0:
+            break
+        cursor = idx + len(NTLM_SIGNATURE)
+        if idx + 12 > len(payload):
+            continue
+        try:
+            msg_type = int.from_bytes(payload[idx + 8 : idx + 12], "little")
+        except Exception:
+            continue
+        if msg_type == 2:
+            # CHALLENGE_MESSAGE: 8-byte ServerChallenge at offset 24.
+            if idx + 32 <= len(payload):
+                out.append(
+                    {"type": 2, "challenge": payload[idx + 24 : idx + 32]}
+                )
+        elif msg_type == 3:
+            flags = 0
+            if idx + 64 <= len(payload):
+                flags = int.from_bytes(payload[idx + 60 : idx + 64], "little")
+            is_unicode = bool(flags & NTLM_UNICODE_FLAG)
+            lm_resp = _read_ntlm_secbuf(payload, idx, 12)
+            nt_resp = _read_ntlm_secbuf(payload, idx, 20)
+            domain = _decode_ntlm_text(
+                _read_ntlm_secbuf(payload, idx, 28), unicode_text=is_unicode, max_len=96
+            )
+            user = _decode_ntlm_text(
+                _read_ntlm_secbuf(payload, idx, 36), unicode_text=is_unicode, max_len=96
+            )
+            out.append(
+                {
+                    "type": 3,
+                    "user": user,
+                    "domain": domain,
+                    "lm_resp": lm_resp,
+                    "nt_resp": nt_resp,
+                }
+            )
+    return out
+
+
+def _build_netntlm_hash(
+    msg3: dict[str, object], challenge: bytes
+) -> Optional[tuple[str, int, str]]:
+    """Build a hashcat-format NetNTLMv1/v2 hash from a Type-3 message and the
+    correlated server challenge. Returns (kind, hashcat_mode, hash_string)."""
+    user = str(msg3.get("user") or "")
+    domain = str(msg3.get("domain") or "")
+    nt_resp = msg3.get("nt_resp") or b""
+    lm_resp = msg3.get("lm_resp") or b""
+    if not user or not isinstance(nt_resp, (bytes, bytearray)) or not nt_resp:
+        return None
+    if not challenge or len(challenge) < 8:
+        return None
+    sc = challenge[:8].hex()
+    if len(nt_resp) > 24:
+        # NetNTLMv2: user::domain:serverchallenge:NTproofstr:blob   (-m 5600)
+        ntproof = nt_resp[:16].hex()
+        blob = nt_resp[16:].hex()
+        h = f"{user}::{domain}:{sc}:{ntproof}:{blob}"
+        return ("NetNTLMv2 Hash", 5600, h)
+    # NetNTLMv1: user::domain:LMresp:NTresp:serverchallenge          (-m 5500)
+    lm = (lm_resp.hex() if isinstance(lm_resp, (bytes, bytearray)) and lm_resp else "0" * 48)
+    h = f"{user}::{domain}:{lm}:{nt_resp.hex()}:{sc}"
+    return ("NetNTLMv1 Hash", 5500, h)
+
+
 def _ports_match(sport: Optional[int], dport: Optional[int], ports: set[int]) -> bool:
     return (sport in ports) or (dport in ports)
+
+
+def _ber_len(data: bytes, off: int) -> tuple[int, int]:
+    """Read a BER/DER length at ``off``. Returns (length, bytes_after_length).
+    Returns (-1, off) on malformed input."""
+    if off >= len(data):
+        return -1, off
+    first = data[off]
+    off += 1
+    if first < 0x80:
+        return first, off
+    num = first & 0x7F
+    if num == 0 or num > 4 or off + num > len(data):
+        return -1, off
+    length = int.from_bytes(data[off : off + num], "big")
+    return length, off + num
+
+
+def _extract_ldap_simple_bind(
+    payload: bytes,
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
+    """Recover cleartext LDAP simple-bind credentials (the bind DN and password).
+
+    LDAP simple bind sends the password in CLEARTEXT (no TLS) — an immediate
+    credential compromise. Wire (BER): LDAPMessage SEQUENCE { messageID INTEGER,
+    bindRequest [APPLICATION 0] { version INTEGER, name LDAPDN OCTET STRING,
+    authentication [0] simple OCTET STRING } }. The bindRequest tag is 0x60 and
+    the simple-auth choice is context tag 0x80.
+    """
+    hits: list[tuple[str, Optional[str], Optional[str], str]] = []
+    cursor = 0
+    while True:
+        idx = payload.find(b"\x60", cursor)  # [APPLICATION 0] bindRequest
+        if idx < 0:
+            break
+        cursor = idx + 1
+        blen, off = _ber_len(payload, idx + 1)
+        if blen <= 0 or off + blen > len(payload):
+            continue
+        end = off + blen
+        # version INTEGER
+        if off >= end or payload[off] != 0x02:
+            continue
+        vlen, voff = _ber_len(payload, off + 1)
+        if vlen <= 0:
+            continue
+        off = voff + vlen
+        # name LDAPDN OCTET STRING
+        if off >= end or payload[off] != 0x04:
+            continue
+        nlen, noff = _ber_len(payload, off + 1)
+        if nlen < 0 or noff + nlen > end:
+            continue
+        dn = payload[noff : noff + nlen].decode("utf-8", errors="replace").strip()
+        off = noff + nlen
+        # authentication: simple [0] (context-primitive tag 0x80)
+        if off >= end or payload[off] != 0x80:
+            continue
+        plen, poff = _ber_len(payload, off + 1)
+        if plen < 0 or poff + plen > end:
+            continue
+        password = payload[poff : poff + plen].decode("utf-8", errors="replace")
+        # A non-empty DN with a (possibly empty) simple password = cleartext bind.
+        if dn:
+            hits.append(
+                (
+                    "LDAP Simple Bind (cleartext)",
+                    dn,
+                    password if password else None,
+                    f"LDAP bindRequest simple auth, DN={dn[:80]}"
+                    + (" (empty/anonymous password)" if not password else ""),
+                )
+            )
+    return hits
+
+
+def _extract_snmp_community(
+    payload: bytes, sport: Optional[int], dport: Optional[int]
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
+    """Recover SNMP v1/v2c community strings (cleartext device credentials).
+
+    SNMP message (BER): SEQUENCE { version INTEGER (0=v1, 1=v2c), community
+    OCTET STRING, pdu }. The community string is a cleartext password granting
+    read (or, for SET, write) access to the device.
+    """
+    if not _ports_match(sport, dport, {161, 162}):
+        return []
+    if not payload or payload[0] != 0x30:
+        return []
+    slen, off = _ber_len(payload, 1)
+    if slen <= 0:
+        return []
+    # version INTEGER
+    if off >= len(payload) or payload[off] != 0x02:
+        return []
+    vlen, voff = _ber_len(payload, off + 1)
+    if vlen <= 0 or voff + vlen > len(payload):
+        return []
+    version = int.from_bytes(payload[voff : voff + vlen], "big")
+    if version not in (0, 1):  # v3 (3) uses USM, not a community string
+        return []
+    off = voff + vlen
+    # community OCTET STRING
+    if off >= len(payload) or payload[off] != 0x04:
+        return []
+    clen, coff = _ber_len(payload, off + 1)
+    if clen < 0 or coff + clen > len(payload):
+        return []
+    community = payload[coff : coff + clen].decode("latin-1", errors="replace").strip()
+    if not community or not community.isprintable():
+        return []
+    ver_name = "v1" if version == 0 else "v2c"
+    default_note = (
+        " (DEFAULT community — trivial device access)"
+        if community.lower() in {"public", "private"}
+        else ""
+    )
+    return [
+        (
+            "SNMP Community String",
+            None,
+            community,
+            f"SNMP{ver_name} community={community}{default_note}",
+        )
+    ]
 
 
 def _looks_like_http(
@@ -1877,6 +2076,9 @@ def analyze_creds(
     user_counts: Counter[str] = Counter()
     confidence_counts: Counter[str] = Counter()
     smtp_auth_state: dict[tuple[str, str, int, int], dict[str, object]] = {}
+    # Per-flow NTLM server challenge (Type 2), keyed direction-independently so a
+    # later Type 3 (client->server) can be joined into a crackable NetNTLM hash.
+    ntlm_challenges: dict[tuple[object, object], bytes] = {}
     http_url_observations: dict[
         str, tuple[int, Optional[float], str, str, Optional[int], Optional[int]]
     ] = {}
@@ -2008,6 +2210,40 @@ def analyze_creds(
                     payload, text, src_port, dst_port, service
                 ):
                     seen.add(item)
+            # LDAP simple bind (cleartext AD password) on the LDAP / Global
+            # Catalog ports, and the GC ports also carry LDAP.
+            if _ports_match(src_port, dst_port, {389, 3268}):
+                for item in _extract_ldap_simple_bind(payload):
+                    seen.add(item)
+            # SNMP v1/v2c community strings (cleartext device credentials).
+            for item in _extract_snmp_community(payload, src_port, dst_port):
+                seen.add(item)
+            # NTLM challenge/response correlation -> crackable NetNTLM hash.
+            # Type 2 (server->client) carries the challenge; Type 3 the response.
+            ntlm_msgs = _ntlm_messages(payload)
+            if ntlm_msgs:
+                flow_key = tuple(
+                    sorted([(src_ip, src_port), (dst_ip, dst_port)])
+                )
+                for msg in ntlm_msgs:
+                    if msg.get("type") == 2:
+                        chal = msg.get("challenge")
+                        if isinstance(chal, (bytes, bytearray)) and chal:
+                            ntlm_challenges[flow_key] = bytes(chal)
+                    elif msg.get("type") == 3:
+                        challenge = ntlm_challenges.get(flow_key)
+                        if challenge:
+                            built = _build_netntlm_hash(msg, challenge)
+                            if built:
+                                kind, mode, hash_str = built
+                                seen.add(
+                                    (
+                                        kind,
+                                        str(msg.get("user") or "") or None,
+                                        hash_str,
+                                        f"offline-crackable: hashcat -m {mode}",
+                                    )
+                                )
             for item in _extract_ot_protocol_creds(payload, src_port, dst_port):
                 seen.add(item)
 
@@ -2100,6 +2336,57 @@ def analyze_creds(
     except Exception as exc:
         errors.append(f"HTTP URL credential mining error: {exc}")
 
+    # Supplemental Telnet pass: interactive (character-mode) telnet sends one
+    # echoed keystroke per packet, so the per-packet scan above never sees a
+    # whole "login:"/"Password:" exchange. analyze_telnet reassembles the
+    # session transcript and recovers the credentials; fold its results in so
+    # --creds (the credential-focused view) reports them too.
+    try:
+        from .telnet import analyze_telnet
+
+        telnet_summary = analyze_telnet(
+            path, show_status=False, packets=packets, meta=meta
+        )
+        for conv in getattr(telnet_summary, "conversations", []) or []:
+            conv_users = list(getattr(conv, "usernames", []) or [])
+            conv_pwds = list(getattr(conv, "password_values", ()) or ())
+            if not conv_users and not conv_pwds:
+                continue
+            src = str(getattr(conv, "client_ip", "-") or "-")
+            dst = str(getattr(conv, "server_ip", "-") or "-")
+            dport = getattr(conv, "server_port", None)
+            # Pair user+password when both are present in the session; otherwise
+            # emit whichever was recovered.
+            user = conv_users[0] if conv_users else None
+            secret = conv_pwds[0] if conv_pwds else None
+            evidence = "telnet session transcript (reassembled)"
+            key = ("Telnet Login", user, secret, evidence)
+            if key not in {
+                (str(h.kind), h.username, h.secret, str(h.evidence)) for h in hits
+            }:
+                matches += 1
+                kind_counts["Telnet Login"] += 1
+                if user:
+                    user_counts[user] += 1
+                if len(hits) < max_hits:
+                    hits.append(
+                        CredentialHit(
+                            packet_number=0,
+                            ts=getattr(conv, "first_seen", None),
+                            src_ip=src,
+                            dst_ip=dst,
+                            src_port=getattr(conv, "client_port", None),
+                            dst_port=dport,
+                            protocol="Telnet",
+                            kind="Telnet Login",
+                            username=user,
+                            secret=secret,
+                            evidence=evidence,
+                        )
+                    )
+    except Exception as exc:
+        errors.append(f"Telnet credential mining error: {exc}")
+
     truncated = matches > len(hits)
 
     auth_abuse_sequences: list[dict[str, object]] = []
@@ -2109,6 +2396,7 @@ def analyze_creds(
     external_exposures: list[dict[str, object]] = []
     deterministic_checks: dict[str, list[str]] = {
         "plaintext_credential_exposure": [],
+        "crackable_hash_capture": [],
         "auth_abuse_pattern": [],
         "credential_replay": [],
         "privileged_account_exposure": [],
@@ -2117,11 +2405,10 @@ def analyze_creds(
         "likely_benign_test_credentials": [],
     }
 
-    def _is_public_ip(value: str) -> bool:
-        try:
-            return ipaddress.ip_address(value).is_global
-        except Exception:
-            return False
+    # Routable internet UNICAST peer. Shared helper excludes IPv6 multicast,
+    # which Python otherwise reports as is_global=True (mislabeling mDNS / ND
+    # as "credential sent to the public internet").
+    _is_public_ip = _util_is_public_ip
 
     for hit in hits:
         score = 0
@@ -2147,9 +2434,25 @@ def analyze_creds(
             confidence = "low"
         confidence_counts[confidence] += 1
 
-        deterministic_checks["plaintext_credential_exposure"].append(
-            f"pkt={hit.packet_number} {hit.src_ip}->{hit.dst_ip} {hit.kind} confidence={confidence}"
+        # Classify the evidence accurately: a captured NetNTLM/Kerberos hash or
+        # NTLM challenge-response is offline-crackable material (NOT plaintext);
+        # only a hit carrying an actual cleartext secret is a plaintext exposure;
+        # a username-only observation (e.g. "NTLM Authenticate User") is neither.
+        kind_low = hit.kind.lower()
+        is_hash = (
+            "hashcat -m" in str(hit.evidence or "")
+            or hit.kind.endswith("Hash")
+            or "challenge response" in kind_low
         )
+        if is_hash:
+            deterministic_checks["crackable_hash_capture"].append(
+                f"pkt={hit.packet_number} {hit.src_ip}->{hit.dst_ip} {hit.kind} "
+                f"account={user or '-'}"
+            )
+        elif secret:
+            deterministic_checks["plaintext_credential_exposure"].append(
+                f"pkt={hit.packet_number} {hit.src_ip}->{hit.dst_ip} {hit.kind} confidence={confidence}"
+            )
 
         if _is_public_ip(hit.dst_ip):
             external_exposures.append(
@@ -2184,23 +2487,52 @@ def analyze_creds(
                 f"placeholder secret on pkt={hit.packet_number} {hit.src_ip}->{hit.dst_ip}"
             )
 
+    # Classify auth-abuse by the shape of the attempt set per source. The three
+    # canonical patterns an IR analyst cares about are distinguished by which
+    # dimension fans out:
+    #   - password brute-force : one (or few) account(s)/target(s), MANY distinct
+    #     secrets tried (the most common pattern, e.g. an FTP/SSH guessing run).
+    #   - password spray       : MANY distinct accounts, few secrets/targets.
+    #   - credential stuffing / lateral reuse : same material replayed at MANY
+    #     destinations.
     by_src: dict[str, list[CredentialHit]] = {}
     for hit in hits:
         by_src.setdefault(hit.src_ip, []).append(hit)
     for src_ip, items in by_src.items():
         unique_users = {str(item.username).lower() for item in items if item.username}
-        unique_dsts = {item.dst_ip for item in items}
-        if len(items) >= 8 and (len(unique_users) >= 4 or len(unique_dsts) >= 4):
+        unique_dsts = {item.dst_ip for item in items if item.dst_ip and item.dst_ip != "-"}
+        unique_secrets = {str(item.secret) for item in items if item.secret}
+        events = len(items)
+        n_users, n_dsts, n_secrets = (
+            len(unique_users),
+            len(unique_dsts),
+            len(unique_secrets),
+        )
+        patterns: list[str] = []
+        if events >= 6 and n_secrets >= 5 and n_users <= 2 and n_dsts <= 2:
+            patterns.append("password brute-force")
+        if n_users >= 4:
+            patterns.append("password spray")
+        if n_dsts >= 4:
+            patterns.append("credential stuffing / lateral reuse")
+        if patterns:
+            sample_user = next(iter(sorted(unique_users)), "-") if unique_users else "-"
+            sample_dst = next(iter(sorted(unique_dsts)), "-") if unique_dsts else "-"
             auth_abuse_sequences.append(
                 {
                     "src": src_ip,
-                    "events": len(items),
-                    "users": len(unique_users),
-                    "dsts": len(unique_dsts),
+                    "patterns": patterns,
+                    "events": events,
+                    "users": n_users,
+                    "dsts": n_dsts,
+                    "secrets": n_secrets,
+                    "sample_user": sample_user,
+                    "sample_dst": sample_dst,
                 }
             )
             deterministic_checks["auth_abuse_pattern"].append(
-                f"{src_ip} events={len(items)} users={len(unique_users)} dsts={len(unique_dsts)}"
+                f"{src_ip} {'/'.join(patterns)}: events={events} accounts={n_users} "
+                f"passwords={n_secrets} targets={n_dsts}"
             )
 
     replay_index: dict[tuple[str, str], set[str]] = {}

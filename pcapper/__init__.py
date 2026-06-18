@@ -11,7 +11,7 @@ from collections import Counter
 from typing import Any
 
 __all__ = ["__version__"]
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 
 # --- Early quiet-mode hook ---------------------------------------------------

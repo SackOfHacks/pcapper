@@ -1036,10 +1036,22 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
         suffix = f" (x{count})" if count > 1 else ""
         detail = write_details.get((func_name, unit_id, src_ip, dst_ip))
         detail_text = f" [{detail}]" if detail else ""
+        # A coil write (FC 5/15) forces a digital OUTPUT on/off — direct
+        # manipulation of a physical actuator (valve/relay/motor), i.e. ATT&CK
+        # for ICS T0831 Manipulation of Control. Register writes (FC 6/16/22/23)
+        # change setpoints/parameters = T0836 Modify Parameter. The title drives
+        # the ATT&CK mapping (the shared keyword map routes "force" -> T0831), so
+        # name coil writes distinctly.
+        is_coil = "coil" in func_name.lower()
+        write_title = (
+            "Modbus Coil Force (output manipulation)"
+            if is_coil
+            else "Modbus Write Operation"
+        )
         anomalies.append(
             ModbusAnomaly(
                 severity="HIGH",
-                title="Modbus Write Operation",
+                title=write_title,
                 description=f"Write command ({func_name}) sent to Unit ID {unit_id}{suffix}{detail_text}",
                 src=src_ip,
                 dst=dst_ip,
@@ -1121,6 +1133,13 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
             )
         )
 
+    # Re-bucket exceptions by (exc_desc, src, dst). The raw key also carries the
+    # requesting function code, so a capture that exercises many functions
+    # against one endpoint produces dozens of near-identical findings that bury
+    # the real signal. For triage the relevant fact is "endpoint X returned N
+    # <type> exceptions (probe/fuzz/misconfig)"; the per-function breakdown is
+    # detail folded into the description and total count.
+    exc_rollup: dict[tuple[str, str, str], dict[str, object]] = {}
     for (
         exc_code,
         exc_desc,
@@ -1128,11 +1147,29 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
         src_ip,
         dst_ip,
     ), count in exception_events.items():
+        key = (str(exc_desc), str(src_ip), str(dst_ip))
+        entry = exc_rollup.setdefault(
+            key, {"count": 0, "funcs": set(), "code": exc_code}
+        )
+        entry["count"] = int(entry["count"]) + int(count)
+        funcs = entry["funcs"]
+        if isinstance(funcs, set):
+            funcs.add(original_func)
+    for (exc_desc, src_ip, dst_ip), entry in sorted(
+        exc_rollup.items(), key=lambda kv: -int(kv[1]["count"])
+    ):
         if len(anomalies) >= max_anomalies:
             break
-        suffix = f" (x{count})" if count > 1 else ""
+        total = int(entry["count"])
+        funcs = entry["funcs"] if isinstance(entry["funcs"], set) else set()
+        func_note = (
+            f" across {len(funcs)} function code(s)"
+            if len(funcs) > 1
+            else (f" for Function {next(iter(funcs))}" if funcs else "")
+        )
+        count_note = f" (x{total})" if total > 1 else ""
         desc_text = (
-            f"Exception {exc_code} ({exc_desc}) for Function {original_func}{suffix}"
+            f"Exception {entry['code']} ({exc_desc}){func_note}{count_note}"
         )
         severity = "MEDIUM"
         if exc_desc in {"Illegal Function", "Illegal Data Address"}:

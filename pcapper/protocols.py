@@ -87,7 +87,6 @@ class ProtocolSummary:
     tunneling_profiles: List[Dict[str, object]] = field(default_factory=list)
     beacon_profiles: List[Dict[str, object]] = field(default_factory=list)
     role_inversion_profiles: List[Dict[str, object]] = field(default_factory=list)
-    risk_matrix: List[Dict[str, str]] = field(default_factory=list)
     false_positive_context: List[str] = field(default_factory=list)
 
 
@@ -174,28 +173,12 @@ def _build_protocol_enrichment(
     if not reasons and verdict:
         reasons.append("Protocol anomaly heuristics crossed threshold")
 
-    _risk_meta = {
-        "cross_protocol_corroboration": ("Cleartext/Credential Exposure", "High"),
-        "protocol_identity_mismatch": ("ARP/Identity Anomaly", "Medium"),
-        "anomalous_protocol_sequence": ("Scan/Flood Behavior", "Medium"),
-    }
-    risk_matrix = [
-        {
-            "category": cat,
-            "risk": risk,
-            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
-            "evidence": f"{len(checks.get(key, []))} finding(s)",
-        }
-        for key, (cat, risk) in _risk_meta.items()
-        if checks.get(key)
-    ]
 
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
         "analyst_reasons": reasons,
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
-        "risk_matrix": risk_matrix,
     }
 
 def merge_protocols_summaries(
@@ -228,7 +211,6 @@ def merge_protocols_summaries(
             tunneling_profiles=[],
             beacon_profiles=[],
             role_inversion_profiles=[],
-            risk_matrix=[],
             false_positive_context=[],
         )
 
@@ -329,11 +311,6 @@ def merge_protocols_summaries(
         tunneling_profiles=list(context.get("tunneling_profiles", []) or []),
         beacon_profiles=list(context.get("beacon_profiles", []) or []),
         role_inversion_profiles=list(context.get("role_inversion_profiles", []) or []),
-        risk_matrix=[
-            dict(item)
-            for item in list(context.get("risk_matrix", []) or [])
-            if isinstance(item, dict)
-        ],
         false_positive_context=[
             str(v) for v in list(context.get("false_positive_context", []) or [])
         ],
@@ -1145,11 +1122,6 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
         tunneling_profiles=list(context.get("tunneling_profiles", []) or []),
         beacon_profiles=list(context.get("beacon_profiles", []) or []),
         role_inversion_profiles=list(context.get("role_inversion_profiles", []) or []),
-        risk_matrix=[
-            dict(item)
-            for item in list(context.get("risk_matrix", []) or [])
-            if isinstance(item, dict)
-        ],
         false_positive_context=[
             str(v) for v in list(context.get("false_positive_context", []) or [])
         ],

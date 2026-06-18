@@ -498,6 +498,25 @@ def analyze_teamviewer(
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
+    # The mere presence of TeamViewer is a hunt-relevant finding: it is remote
+    # access software (ATT&CK T1219) frequently used for unsanctioned access /
+    # adversary remote control, and is a policy concern on corporate and
+    # especially OT networks. Informational so it doesn't over-alarm where the
+    # tool is approved — the analyst confirms whether it is sanctioned.
+    if tv_packets > 0:
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "TeamViewer remote-access software in use [T1219]",
+                "details": (
+                    "TeamViewer remote-access traffic observed — confirm it is "
+                    "sanctioned for these hosts; unapproved remote-access tools "
+                    "are an exfiltration / hands-on-keyboard vector (ATT&CK "
+                    "T1219 Remote Access Software)."
+                ),
+            }
+        )
+
     non_standard_ports = [
         port for port in server_tcp_ports if port not in TEAMVIEWER_PORTS
     ]

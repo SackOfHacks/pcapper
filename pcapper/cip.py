@@ -1673,7 +1673,12 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                     and (service & 0x7F) in SUSPICIOUS_SERVICE_CODES
                 ):
                     svc = service & 0x7F
-                    severity = "HIGH" if svc in {0x74, 0x75, 0x05} else "MEDIUM"
+                    # HIGH = device-state / program control: ProgramDownload(0x74),
+                    # ProgramCommand(0x75), Reset(0x05), Start(0x06), Stop(0x07).
+                    # Halting/restarting/mode-changing a PLC is a denial-of-control
+                    # attack — consistent with S7 PLCStop and DNP3 restart = HIGH.
+                    # Plain tag/attribute writes stay MEDIUM (routine on a live cell).
+                    severity = "HIGH" if svc in {0x74, 0x75, 0x05, 0x06, 0x07} else "MEDIUM"
                     title = CIP_SERVICE_TITLE.get(svc, "Suspicious CIP Service")
                     svc_label = service_name or f"Service 0x{service:02x}"
                     description = f"{svc_label} observed"

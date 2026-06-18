@@ -80,7 +80,6 @@ class IcmpSummary:
     ot_boundary_profiles: list[dict[str, object]] = field(default_factory=list)
     role_drift_profiles: list[dict[str, object]] = field(default_factory=list)
     corroborated_findings: list[dict[str, object]] = field(default_factory=list)
-    risk_matrix: list[dict[str, str]] = field(default_factory=list)
     false_positive_context: list[str] = field(default_factory=list)
 
 
@@ -102,7 +101,6 @@ def _build_icmp_enrichment(
     """
     _ = (total_packets, type_counts, src_ip_counts, conversations, payload_summaries)
     checks: dict[str, list[str]] = defaultdict(list)
-    risk_matrix: list[dict[str, object]] = []
 
     # Map each detection to a deterministic-check category by intent.
     for det in detections:
@@ -124,6 +122,34 @@ def _build_icmp_enrichment(
             checks["icmp_control_plane_abuse"].append(evidence)
         if "flood" in blob or "high icmp rate" in blob:
             checks["icmp_recon_sweep_behavior"].append(evidence)
+
+    # ICMP crossing the internet boundary: echo/redirect/timestamp/etc. to or
+    # from a PUBLIC IP is unusual for internal hosts and is the egress path for
+    # ICMP covert channels / C2 and external host-discovery. Surface the
+    # external peers and volume explicitly (the detection-text checks above do
+    # not capture this).
+    boundary_pairs: list[tuple[str, str, int]] = []
+    for conv in conversations:
+        src = str(conv.get("src", "") or "")
+        dst = str(conv.get("dst", "") or "")
+        if not src or not dst:
+            continue
+        # A genuine internet-boundary crossing is internal(private) <-> public;
+        # public<->public transit is not this host's exposure.
+        crosses = (_is_public_ip(src) and _is_private_ip(dst)) or (
+            _is_public_ip(dst) and _is_private_ip(src)
+        )
+        if crosses:
+            pkts = int(conv.get("packets", 0) or 0) or (
+                int(conv.get("requests", 0) or 0) + int(conv.get("replies", 0) or 0)
+            )
+            boundary_pairs.append((src, dst, pkts))
+    for src, dst, pkts in sorted(
+        boundary_pairs, key=lambda row: row[2], reverse=True
+    )[:8]:
+        checks["icmp_zone_boundary_exposure"].append(
+            f"{src} <-> {dst} ({pkts} ICMP pkts crossing the internet boundary)"
+        )
 
     # Verdict: synthesize the categories into a triage call. Covert-channel /
     # exfil (tunneling) and control-plane abuse (ICMP redirect = MITM) are the
@@ -168,30 +194,11 @@ def _build_icmp_enrichment(
     if not reasons and verdict:
         reasons.append("ICMP anomaly heuristics crossed threshold")
 
-    # Build the risk matrix from the populated checks.
-    _risk_meta = {
-        "icmp_tunneling_signal": ("ICMP Tunneling/Covert Channel", "High"),
-        "icmp_control_plane_abuse": ("ICMP Control-Plane Abuse", "High"),
-        "icmp_recon_sweep_behavior": ("ICMP Recon/Sweep", "Medium"),
-    }
-    for key, (cat, risk) in _risk_meta.items():
-        vals = checks.get(key, [])
-        if vals:
-            risk_matrix.append(
-                {
-                    "category": cat,
-                    "risk": risk,
-                    "confidence": "High" if len(vals) >= 2 else "Medium",
-                    "evidence": f"{len(vals)} signal(s)",
-                }
-            )
-
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
         "analyst_reasons": reasons,
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
-        "risk_matrix": risk_matrix,
     }
 
 @memoize_analysis
@@ -972,11 +979,6 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
         ot_boundary_profiles=list(context.get("ot_boundary_profiles", []) or []),
         role_drift_profiles=list(context.get("role_drift_profiles", []) or []),
         corroborated_findings=list(context.get("corroborated_findings", []) or []),
-        risk_matrix=[
-            dict(item)
-            for item in list(context.get("risk_matrix", []) or [])
-            if isinstance(item, dict)
-        ],
         false_positive_context=[
             str(v) for v in list(context.get("false_positive_context", []) or [])
         ],

@@ -75,7 +75,6 @@ from .rpc import analyze_rpc
 from .s7 import analyze_s7
 from .safety import SAFETY_PORTS
 from .smb import analyze_smb
-from .smtp import analyze_smtp
 from .snmp import analyze_snmp
 from .ftp import analyze_ftp
 from .nfs import analyze_nfs
@@ -230,7 +229,6 @@ class ThreatSummary:
     deterministic_checks: dict[str, list[str]] = None  # type: ignore[assignment]
     threat_hypotheses: list[dict[str, object]] = None  # type: ignore[assignment]
     benign_context: list[str] = None  # type: ignore[assignment]
-    risk_matrix: list[dict[str, str]] = None  # type: ignore[assignment]
 
 
 def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
@@ -256,7 +254,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
             deterministic_checks={},
             threat_hypotheses=[],
             benign_context=[],
-            risk_matrix=[],
         )
 
     merged_detections: list[dict[str, object]] = []
@@ -280,7 +277,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
     deterministic_checks: dict[str, list[str]] = defaultdict(list)
     threat_hypotheses: list[dict[str, object]] = []
     benign_context: list[str] = []
-    risk_matrix: list[dict[str, str]] = []
     for summary in summaries:
         merged_detections.extend(summary.detections)
         merged_errors.extend(summary.errors)
@@ -328,10 +324,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
                     threat_hypotheses.append(dict(item))
         if summary.benign_context:
             benign_context.extend(str(v) for v in summary.benign_context)
-        if summary.risk_matrix:
-            for row in summary.risk_matrix:
-                if isinstance(row, dict):
-                    risk_matrix.append({str(k): str(v) for k, v in row.items()})
 
     deduped_errors = sorted(set(merged_errors))
     duration = None
@@ -390,27 +382,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
             break
 
     deduped_benign = _dedupe_evidence(benign_context, limit=10)
-    deduped_matrix: list[dict[str, str]] = []
-    seen_matrix: set[tuple[str, str, str, str]] = set()
-    for row in risk_matrix:
-        category = str(row.get("category", "")).strip()
-        risk = str(row.get("risk", "")).strip()
-        confidence = str(row.get("confidence", "")).strip()
-        evidence = str(row.get("evidence", "")).strip()
-        key = (category, risk, confidence, evidence)
-        if not category or key in seen_matrix:
-            continue
-        seen_matrix.add(key)
-        deduped_matrix.append(
-            {
-                "category": category,
-                "risk": risk or "-",
-                "confidence": confidence or "-",
-                "evidence": evidence or "-",
-            }
-        )
-        if len(deduped_matrix) >= 14:
-            break
 
     return ThreatSummary(
         path=Path("ALL_PCAPS"),
@@ -433,7 +404,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
         deterministic_checks=merged_det_checks,
         threat_hypotheses=deduped_hypotheses,
         benign_context=deduped_benign,
-        risk_matrix=deduped_matrix,
     )
 
 
@@ -1170,7 +1140,6 @@ def analyze_suricata(
         deterministic_checks={},
         threat_hypotheses=[],
         benign_context=[],
-        risk_matrix=[],
     )
 
 
@@ -2562,7 +2531,6 @@ def analyze_threats(
     wmic_summary = analyze_wmic(path, show_status=show_status)
     powershell_summary = analyze_powershell(path, show_status=show_status)
     ssh_summary = analyze_ssh(path, show_status=show_status)
-    smtp_summary = analyze_smtp(path, show_status=show_status)
     ftp_summary = analyze_ftp(path, show_status=show_status)
     nfs_summary = analyze_nfs(path, show_status=show_status)
     malware_summary = analyze_malware(path, show_status=show_status)
@@ -2697,7 +2665,6 @@ def analyze_threats(
     _append_detection_items(detections, "WMIC", wmic_summary.detections)
     _append_detection_items(detections, "PowerShell", powershell_summary.detections)
     _append_detection_items(detections, "SSH", ssh_summary.detections)
-    _append_detection_items(detections, "SMTP", smtp_summary.detections)
     _append_detection_items(detections, "FTP", ftp_summary.detections)
     _append_anomaly_items(detections, "NFS", nfs_summary.anomalies)
     _append_detection_items(detections, "Malware", malware_summary.detections)
@@ -2734,7 +2701,6 @@ def analyze_threats(
     _append_anomaly_items(detections, "WMIC", wmic_summary.anomalies)
     _append_anomaly_items(detections, "PowerShell", powershell_summary.anomalies)
     _append_anomaly_items(detections, "SSH", ssh_summary.anomalies)
-    _append_anomaly_items(detections, "SMTP", smtp_summary.anomalies)
     _append_anomaly_items(detections, "RPC", rpc_summary.anomalies)
     _append_anomaly_items(detections, "SNMP", snmp_summary.anomalies)
 
@@ -2839,7 +2805,6 @@ def analyze_threats(
     errors.extend(wmic_summary.errors)
     errors.extend(powershell_summary.errors)
     errors.extend(ssh_summary.errors)
-    errors.extend(smtp_summary.errors)
     errors.extend(ftp_summary.errors)
     errors.extend(nfs_summary.errors)
     errors.extend(malware_summary.errors)
@@ -4584,43 +4549,6 @@ def analyze_threats(
             "No direct OT/ICS impact/safety-risk chain crossed deterministic thresholds"
         )
 
-    risk_matrix: list[dict[str, str]] = []
-
-    def _add_risk_row(
-        label_text: str, key: str, high: bool = False, medium: bool = False
-    ) -> None:
-        evidence_items = [
-            str(v) for v in deterministic_checks.get(key, []) if str(v).strip()
-        ]
-        if evidence_items:
-            if high:
-                risk_val, conf_val = "High", "High"
-            elif medium:
-                risk_val, conf_val = "Medium", "Medium"
-            else:
-                risk_val, conf_val = "Low", "Medium"
-            evidence_text = f"{len(evidence_items)} signal(s)"
-        else:
-            risk_val, conf_val, evidence_text = "None", "Low", "No matching evidence"
-        risk_matrix.append(
-            {
-                "category": label_text,
-                "risk": risk_val,
-                "confidence": conf_val,
-                "evidence": evidence_text,
-            }
-        )
-
-    _add_risk_row("Recon/Scanning Pressure", "recon_scan_pressure", medium=True)
-    _add_risk_row("Credential Access Abuse", "credential_access_abuse", high=True)
-    _add_risk_row("Execution/Payload Tooling", "execution_payload_tooling", high=True)
-    _add_risk_row("Lateral Movement", "lateral_movement", high=True)
-    _add_risk_row("C2/Tunneling", "c2_tunneling", high=True)
-    _add_risk_row("Exfiltration Staging", "exfiltration_staging", high=True)
-    _add_risk_row("OT/ICS Impact and Safety", "ot_ics_impact_safety", high=True)
-    _add_risk_row("IOC/Intel Corroboration", "ioc_intel_corroboration", medium=True)
-    _add_risk_row("Multi-Stage Correlation", "multi_stage_correlation", high=True)
-
     # Collapse exact-duplicate detections (e.g. the EtherNet/IP and CIP analyzers
     # both report "CIP Program Transfer"/"High-risk OT services" for the same
     # shared traffic) so the triage view and the critical/high count aren't
@@ -4657,5 +4585,4 @@ def analyze_threats(
         deterministic_checks=deterministic_checks,
         threat_hypotheses=threat_hypotheses,
         benign_context=benign_context,
-        risk_matrix=risk_matrix,
     )

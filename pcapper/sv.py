@@ -175,6 +175,11 @@ def analyze_sv(path: Path, show_status: bool = True) -> SvSummary:
     # One regression finding per (src, appid) -- a sustained replay would
     # otherwise emit a unique detail string per frame and flood the report.
     smp_regression_seen: set[tuple[str, str]] = set()
+    # A given SV stream (svID) is published by exactly ONE merging unit (MAC);
+    # the same svID from 2+ source MACs = injected/spoofed Sampled Values, the
+    # SV analogue of GOOSE publisher spoofing (ATT&CK ICS T0856).
+    svid_macs: dict[str, set[str]] = {}
+    svid_spoof_flagged: set[str] = set()
 
     try:
         for pkt in reader:
@@ -230,6 +235,22 @@ def analyze_sv(path: Path, show_status: bool = True) -> SvSummary:
             conf_rev = sv_info.get("confRev")
             if sv_id:
                 sv_ids[sv_id] += 1
+                macs = svid_macs.setdefault(sv_id, set())
+                macs.add(src_mac)
+                if len(macs) >= 2 and sv_id not in svid_spoof_flagged:
+                    svid_spoof_flagged.add(sv_id)
+                    detections.append(
+                        {
+                            "severity": "high",
+                            "summary": "SV Publisher Spoofing",
+                            "details": (
+                                f"svID {sv_id} published from multiple source MACs "
+                                f"({', '.join(sorted(macs))}); a Sampled Values stream "
+                                "has one legitimate merging unit — likely SV injection/"
+                                "spoofing into the protection bus (ATT&CK ICS T0856)."
+                            ),
+                        }
+                    )
             if isinstance(smp_cnt, int):
                 smp_counts[smp_cnt] += 1
                 if appid is not None:

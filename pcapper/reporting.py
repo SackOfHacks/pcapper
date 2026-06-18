@@ -80,7 +80,6 @@ from .secrets import SecretsSummary
 from .services import COMMON_PORTS, ServiceSummary
 from .sizes import SizeSummary, render_size_sparkline
 from .smb import SmbSummary
-from .smtp import SmtpSummary
 from .snmp import SnmpSummary
 from .ssdp import SsdpSummary
 from .ssh import SshSummary
@@ -903,13 +902,89 @@ def _normalize_finding(item: object) -> tuple[str, str, str]:
         detail = str(item.get("details") or item.get("description") or "")
     else:
         sev = str(getattr(item, "severity", "info") or "info").lower()
+        # Fall back to `.type` (the anomaly category, e.g. NetbiosAnomaly) so the
+        # verdict ribbon never shows a bare "-" when a dataclass lacks title/summary.
         title = str(
-            getattr(item, "title", None) or getattr(item, "summary", None) or "-"
+            getattr(item, "title", None)
+            or getattr(item, "summary", None)
+            or getattr(item, "type", None)
+            or "-"
         )
         detail = str(
             getattr(item, "description", None) or getattr(item, "details", None) or ""
         )
     return sev, title, detail
+
+
+_PLAINTEXT_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+
+
+def _is_meaningful_plaintext(text: str) -> bool:
+    """An "Observed Plaintext" entry worth showing an analyst, vs. binary noise.
+
+    Protocol string-carvers (e.g. rpc/_extract_strings) emit every printable
+    4+ byte run found in binary payloads, which floods the verbose view with
+    junk like ``@gE::`` and ``Cj::#6?\\``. A real artifact (username, UNC path,
+    hostname, command) contains an actual word and is mostly text/path chars."""
+    t = (text or "").strip()
+    if len(t) < 5:
+        return False
+    if not _PLAINTEXT_WORD_RE.search(t):  # needs a >=3-letter run
+        return False
+    texty = sum(1 for c in t if c.isalnum() or c in " ._-\\/:@$")
+    return texty / len(t) >= 0.75
+
+
+def _meaningful_plaintext_items(
+    counter: "Counter[str]", limit: int
+) -> list[tuple[str, int]]:
+    """Filter a plaintext-string counter to meaningful entries, most-common
+    first, capped at ``limit`` — keeps the carved-string sections useful for
+    forensics instead of an unreadable binary-noise dump."""
+    out: list[tuple[str, int]] = []
+    for text, count in counter.most_common():
+        if _is_meaningful_plaintext(str(text)):
+            out.append((text, count))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _render_deterministic_checks(
+    lines: list[str],
+    summary: object,
+    title: str,
+    check_labels: list[tuple[str, str]],
+) -> None:
+    """Render a module's computed deterministic_checks as a standard
+    "Deterministic … Security Checks" section (label + per-finding evidence,
+    with cleared checks collapsed to one line). Used by protocol renderers that
+    compute rich checks but had no surfacing path of their own."""
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+    if not isinstance(checks, dict):
+        return
+    lines.append(SUBSECTION_BAR)
+    lines.append(header(title))
+    cleared: list[str] = []
+    any_fired = False
+    for key, label_text in check_labels:
+        evidence = [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
+        if evidence:
+            any_fired = True
+            lines.append(label(label_text))
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
+            for item in evidence[: _limit_value(6)]:
+                lines.append(muted(f"- {_redact_in_text(item)}"))
+        else:
+            cleared.append(label_text)
+    if not any_fired:
+        lines.append(ok("No deterministic checks crossed threshold in this capture."))
+    elif cleared:
+        lines.append(muted(f"Cleared (no evidence): {', '.join(cleared)}"))
 
 
 def _render_protocol_verdict(
@@ -1368,6 +1443,12 @@ def render_vlan_summary(
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"VLAN ANALYSIS :: {summary.path.name}"))
+    _render_protocol_verdict(
+        lines,
+        label="VLAN",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(SECTION_BAR)
 
     lines.append(_format_kv("Tagged Packets", str(summary.total_tagged_packets)))
@@ -1774,14 +1855,23 @@ def render_domain_summary(
     check_labels = [
         ("dc_role_consistency", "DC Role Consistency"),
         ("kerberos_ticket_abuse", "Kerberos Ticket Abuse"),
+        ("kerberos_roast_or_cipher_risk", "Kerberoasting / Weak Cipher Risk"),
         ("dcsync_replication_activity", "DCSync/Replication-like Activity"),
+        ("dcsync_fingerprint_evidence", "DCSync Fingerprint Evidence"),
+        ("adcs_or_certificate_abuse_context", "AD CS / Certificate Abuse Context"),
         ("ldap_bind_risk", "LDAP Bind Risk"),
+        ("ldap_directory_abuse_context", "LDAP Directory Abuse Context"),
         ("ntlm_downgrade_or_relay_exposure", "NTLM Downgrade/Relay Exposure"),
+        ("relay_coercion_chain_context", "Relay/Coercion Chain Context"),
+        ("credential_material_in_domain_flows", "Credential Material in Domain Flows"),
         ("auth_sequence_plausibility", "Authentication Sequence Plausibility"),
         ("name_resolution_poisoning_context", "Name Resolution Poisoning Context"),
         ("privileged_account_spread", "Privileged Account Spread"),
+        ("identity_attack_path_correlation", "Identity Attack-Path Correlation"),
+        ("public_domain_service_exposure", "Public Domain Service Exposure"),
+        ("baseline_service_deviation", "Baseline Service Deviation"),
+        ("ot_identity_attack_surface_overlap", "OT Identity Attack-Surface Overlap"),
     ]
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for key, label_text in check_labels:
         evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
         evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
@@ -1794,38 +1884,12 @@ def render_domain_summary(
             )
             for item in evidence_items[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-
-            if key in {
-                "dcsync_replication_activity",
-                "kerberos_ticket_abuse",
-                "ntlm_downgrade_or_relay_exposure",
-            }:
-                risk = "High"
-                conf_level = "High"
-            elif key in {
-                "ldap_bind_risk",
-                "auth_sequence_plausibility",
-                "dc_role_consistency",
-            }:
-                risk = "Medium"
-                conf_level = "Medium"
-            else:
-                risk = "Low"
-                conf_level = "Medium"
-            matrix_rows.append(
-                [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
-            )
         else:
             lines.append(
                 ok(
                     f"No, there is no strong evidence for {label_text.lower()} in this capture."
                 )
             )
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Domain Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     if summary.domains:
         lines.append(SUBSECTION_BAR)
@@ -2299,6 +2363,19 @@ def render_ldap_summary(
                 lines.append(muted(f"  {details}"))
 
     lines.append(SECTION_BAR)
+    _render_deterministic_checks(
+        lines, summary, "Deterministic LDAP Security Checks", [
+            ("cleartext_ldap_exposure", "Cleartext LDAP Exposure"),
+            ("bind_auth_risk", "Bind Authentication Risk"),
+            ("anonymous_or_guest_bind_activity", "Anonymous/Guest Bind Activity"),
+            ("credential_error_burst", "Credential Error Burst"),
+            ("enumeration_burst_activity", "Enumeration Burst Activity"),
+            ("sensitive_attribute_access", "Sensitive Attribute Access"),
+            ("secret_material_exposure", "Secret Material Exposure"),
+            ("directory_write_activity", "Directory Write Activity"),
+            ("public_ldap_endpoint_exposure", "Public LDAP Endpoint Exposure"),
+        ]
+    )
     return _finalize_output(lines)
 
 
@@ -2793,17 +2870,10 @@ def render_icmp_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Deterministic ICMP Security Checks"))
         check_labels = {
-            "icmp_request_reply_asymmetry": "ICMP request/reply asymmetry",
             "icmp_recon_sweep_behavior": "ICMP recon/sweep behavior",
             "icmp_control_plane_abuse": "ICMP control-plane abuse",
-            "icmp_fragmentation_pmtud_abuse": "ICMP fragmentation/PMTUD abuse",
-            "icmp_periodic_cadence": "ICMP periodic cadence",
             "icmp_tunneling_signal": "ICMP tunneling/covert signal",
-            "icmp_zone_boundary_exposure": "ICMP zone boundary exposure",
-            "icmp_ot_boundary_crossing": "ICMP OT boundary crossing",
-            "icmp_role_drift": "ICMP role drift",
-            "cross_signal_corroboration": "Cross-signal corroboration",
-            "evidence_provenance": "Evidence provenance",
+            "icmp_zone_boundary_exposure": "ICMP internet-boundary crossing",
         }
         for key, label in check_labels.items():
             values = [str(v) for v in list(checks.get(key, []) or [])]
@@ -2814,24 +2884,6 @@ def render_icmp_summary(
             else:
                 lines.append(ok(f"[ ] {label}: none"))
 
-    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
-    if risk_matrix:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("ICMP Risk Matrix"))
-        rows = [["Category", "Risk", "Confidence", "Evidence"]]
-        for row in risk_matrix[: _limit_value(12)]:
-            if not isinstance(row, dict):
-                continue
-            rows.append(
-                [
-                    str(row.get("category", "")),
-                    str(row.get("risk", "")),
-                    str(row.get("confidence", "")),
-                    str(row.get("evidence", "")),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
 
     asymmetry_profiles = list(getattr(summary, "asymmetry_profiles", []) or [])
     if asymmetry_profiles:
@@ -3734,9 +3786,10 @@ def render_dns_summary(
         ("resolver_policy_violation", "Resolver Policy Violation"),
         ("dnssec_or_integrity_anomaly", "DNSSEC/Integrity Anomaly"),
         ("amplification_abuse_signal", "Amplification Abuse Signal"),
+        ("opcode_or_any_abuse", "Opcode / ANY-Query Abuse"),
+        ("dns_beaconing_periodicity", "DNS Beaconing Periodicity"),
         ("likely_benign_cdn_rotation", "Likely Benign CDN Rotation"),
     ]
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for key, label_text in check_labels:
         evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
         evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
@@ -3748,35 +3801,11 @@ def render_dns_summary(
                         f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
                     )
                 )
-                matrix_rows.append(
-                    [label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"]
-                )
             else:
                 lines.append(
                     warn(
                         f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
                     )
-                )
-                if key in {
-                    "dns_tunneling_indicators",
-                    "dga_like_behavior",
-                    "fast_flux_or_rebinding",
-                    "zone_transfer_attempt",
-                }:
-                    risk = "High"
-                    conf_level = "High"
-                elif key in {
-                    "resolver_policy_violation",
-                    "dnssec_or_integrity_anomaly",
-                    "amplification_abuse_signal",
-                }:
-                    risk = "Medium"
-                    conf_level = "Medium"
-                else:
-                    risk = "Low"
-                    conf_level = "Low"
-                matrix_rows.append(
-                    [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
                 )
             for item in evidence_items[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
@@ -3786,11 +3815,6 @@ def render_dns_summary(
                     f"No, there is no strong evidence for {label_text.lower()} in this capture."
                 )
             )
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("DNS Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
     if summary.edns0_opt_count:
         lines.append(_format_kv("EDNS0 OPT Records", str(summary.edns0_opt_count)))
     if summary.mdns_packets:
@@ -4503,11 +4527,8 @@ def render_ips_summary(
         lines.append(header("Deterministic IPS Security Checks"))
         check_labels = {
             "indicator_quality_gate": "Indicator quality gate",
-            "recency_and_persistence": "Recency and persistence",
             "boundary_cross_zone_contact": "Boundary cross-zone contact",
-            "internal_critical_asset_contact": "Internal critical asset contact",
             "corroborated_multi_signal_hit": "Corroborated multi-signal hit",
-            "infrastructure_clustering": "Infrastructure clustering",
             "intent_heuristics": "Intent heuristics",
             "evidence_provenance": "Evidence provenance",
         }
@@ -4520,24 +4541,6 @@ def render_ips_summary(
             else:
                 lines.append(ok(f"[ ] {label}: none"))
 
-    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
-    if risk_matrix:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("IPS Risk Matrix"))
-        rows = [["Category", "Risk", "Confidence", "Evidence"]]
-        for row in risk_matrix[: _limit_value(12)]:
-            if not isinstance(row, dict):
-                continue
-            rows.append(
-                [
-                    str(row.get("category", "")),
-                    str(row.get("risk", "")),
-                    str(row.get("confidence", "")),
-                    str(row.get("evidence", "")),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
 
     priority_asset_profiles = list(
         getattr(summary, "priority_asset_profiles", []) or []
@@ -4721,25 +4724,27 @@ def render_ips_summary(
         rows = [
             [
                 "IP",
+                "Class / Role",
                 "Hostname",
-                "MACs (count)",
+                "Geo / ASN / Org",
                 "Service Ports",
                 "Traffic",
-                "Unique MACs",
             ]
         ]
+        ip_enrichment = getattr(summary, "ip_enrichment", {}) or {}
+        # Role classification: scanners (in a scan profile), servers (confirmed
+        # listening ports), else clients — the key "what is this host" triage cue.
+        scanner_ips = {
+            str(p.get("src", ""))
+            for p in (getattr(summary, "suspicious_port_profiles", []) or [])
+            if p.get("src")
+        }
         sorted_macs = sorted(
             summary.ip_mac_counts.items(),
             key=lambda item: sum(item[1].values()),
             reverse=True,
         )
         for ip_value, mac_counts in sorted_macs[:limit]:
-            macs = ", ".join(
-                f"{mac}({count})"
-                for mac, count in mac_counts.most_common(_limit_value(3))
-            )
-            if len(mac_counts) > 3:
-                macs += "..."
             hostnames = list((summary.ip_hostnames or {}).get(ip_value, Counter()).items())
             hostname_text = "-"
             if hostnames:
@@ -4754,20 +4759,43 @@ def render_ips_summary(
             if confirmed_ports:
                 ports_text = ",".join(str(port) for port in confirmed_ports[:8])
                 if len(confirmed_ports) > 8:
-                        ports_text += "..."
+                    ports_text += "..."
             if endpoint is not None:
                 traffic_text = (
                     f"pkts s/r={endpoint.packets_sent}/{endpoint.packets_recv}, "
                     f"bytes={format_bytes_as_mb(endpoint.bytes_sent + endpoint.bytes_recv)}"
                 )
+            # Scope + role
+            external = _is_public_ip(ip_value)
+            scope = "ext" if external else "int"
+            if ip_value in scanner_ips:
+                role = "scanner"
+            elif confirmed_ports:
+                role = "server"
+            else:
+                role = "client"
+            class_text = f"{scope}/{role}"
+            # Geo / ASN / Org (MaxMind or online), with hosting/proxy flags.
+            enr = ip_enrichment.get(ip_value, {})
+            geo_bits: list[str] = []
+            if enr.get("country") or enr.get("geo"):
+                geo_bits.append(str(enr.get("country") or enr.get("geo")))
+            if enr.get("asn"):
+                geo_bits.append(str(enr.get("asn")))
+            elif enr.get("org"):
+                geo_bits.append(str(enr.get("org")))
+            flags = [f for f in ("hosting", "proxy", "mobile") if enr.get(f)]
+            if flags:
+                geo_bits.append("[" + ",".join(flags) + "]")
+            geo_text = " · ".join(geo_bits) if geo_bits else ("-" if external else "internal")
             rows.append(
                 [
-                    ip_value,
-                    _truncate_text(hostname_text, 42),
-                    macs or "-",
-                    _truncate_text(ports_text, 32),
-                    _truncate_text(traffic_text, 42),
-                    str(len(mac_counts)),
+                    danger(ip_value) if external and ip_value in scanner_ips else ip_value,
+                    class_text,
+                    _truncate_text(hostname_text, 34),
+                    _truncate_text(geo_text, 40),
+                    _truncate_text(ports_text, 24),
+                    _truncate_text(traffic_text, 38),
                 ]
             )
         lines.append(_format_table(rows))
@@ -5200,27 +5228,6 @@ def render_http_summary(
             )
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Threat & Compromise Overview"))
-    detection_counts = Counter(
-        str(item.get("severity", "info")).lower() for item in (summary.detections or [])
-    )
-    lines.append(
-        _format_kv("Critical Findings", str(detection_counts.get("critical", 0)))
-    )
-    lines.append(_format_kv("High Findings", str(detection_counts.get("high", 0))))
-    lines.append(
-        _format_kv("Warning Findings", str(detection_counts.get("warning", 0)))
-    )
-    lines.append(
-        _format_kv(
-            "Suspicious Downloads",
-            str(sum(1 for item in summary.downloads if bool(item.get("mismatch")))),
-        )
-    )
-    lines.append(_format_kv("POST Payload Samples", str(len(summary.post_payloads))))
-    lines.append(_format_kv("Unique Session Tokens", str(len(summary.session_tokens))))
-
-    lines.append(SUBSECTION_BAR)
     lines.append(header("Deterministic HTTP Security Checks"))
 
     detection_items = list(getattr(summary, "detections", []) or [])
@@ -5287,37 +5294,6 @@ def render_http_summary(
         ("Threat Intelligence Reputation", ("threat intelligence", "virustotal")),
     ]
 
-    def _matrix_rating_for_keywords(keywords: tuple[str, ...]) -> tuple[str, str, str]:
-        matches = _matching_detections(keywords)
-        if not matches:
-            return "None", "Low", "No matching detections"
-
-        severity_weight = {"critical": 4, "high": 3, "warning": 2, "info": 1}
-        weight_to_label = {4: "Critical", 3: "High", 2: "Warning", 1: "Info", 0: "Info"}
-
-        max_weight = 0
-        for det in matches:
-            sev = str(det.get("severity", "info") or "info").lower()
-            max_weight = max(max_weight, severity_weight.get(sev, 1))
-
-        evidence_count = len(matches)
-        score = max_weight + min(3, evidence_count)
-
-        if score >= 7:
-            risk = "High"
-            confidence = "High"
-        elif score >= 5:
-            risk = "Medium"
-            confidence = "Medium"
-        else:
-            risk = "Low"
-            confidence = "Low"
-
-        severity_label = weight_to_label.get(max_weight, "Info")
-        evidence_note = f"{evidence_count} detection(s), max severity={severity_label}"
-        return risk, confidence, evidence_note
-
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for label_text, keywords in checks:
         lines.append(label(label_text))
         evidence_lines = _matching_detection_lines(keywords)
@@ -5335,13 +5311,6 @@ def render_http_summary(
                     f"No, there is no strong evidence for {label_text.lower()} in this capture."
                 )
             )
-
-        risk, confidence_level, evidence_note = _matrix_rating_for_keywords(keywords)
-        matrix_rows.append([label_text, risk, confidence_level, evidence_note])
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("HTTP Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     if summary.method_counts:
         lines.append(SUBSECTION_BAR)
@@ -6183,13 +6152,9 @@ def render_ftp_summary(
         ("cleartext_credential_exposure", "Cleartext Credential Exposure"),
         ("anonymous_or_guest_abuse", "Anonymous/Guest Abuse"),
         ("bruteforce_or_spray", "Bruteforce/Spray Behavior"),
-        ("active_passive_mode_abuse", "Active/Passive Mode Abuse"),
         ("data_channel_integrity", "Data Channel Integrity"),
-        ("high_risk_file_staging", "High-Risk File Staging"),
-        ("ftps_downgrade_or_weak_protection", "FTPS Downgrade/Weak Protection"),
         ("ftp_exfiltration_signal", "FTP Exfiltration Signal"),
     ]
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for key, label_text in check_labels:
         evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
         evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
@@ -6202,36 +6167,12 @@ def render_ftp_summary(
             )
             for item in evidence_items[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-
-            if key in {
-                "cleartext_credential_exposure",
-                "bruteforce_or_spray",
-                "data_channel_integrity",
-                "high_risk_file_staging",
-                "ftp_exfiltration_signal",
-            }:
-                risk = "High"
-                conf_level = "High"
-            elif key in {"anonymous_or_guest_abuse", "active_passive_mode_abuse"}:
-                risk = "Medium"
-                conf_level = "Medium"
-            else:
-                risk = "Low"
-                conf_level = "Low"
-            matrix_rows.append(
-                [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
-            )
         else:
             lines.append(
                 ok(
                     f"No, there is no strong evidence for {label_text.lower()} in this capture."
                 )
             )
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("FTP Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     if summary.server_ports:
         lines.append(SUBSECTION_BAR)
@@ -6598,31 +6539,6 @@ def render_tls_summary(
                     )
                 )
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Threat & Compromise Overview"))
-    detection_counts = Counter(
-        str(item.get("severity", "info")).lower() for item in (summary.detections or [])
-    )
-    lines.append(
-        _format_kv("Critical Findings", str(detection_counts.get("critical", 0)))
-    )
-    lines.append(_format_kv("High Findings", str(detection_counts.get("high", 0))))
-    lines.append(
-        _format_kv("Warning Findings", str(detection_counts.get("warning", 0)))
-    )
-    lines.append(_format_kv("Weak Certificates", str(summary.weak_certs)))
-    lines.append(_format_kv("Expired Certificates", str(summary.expired_certs)))
-    lines.append(_format_kv("Self-Signed Certificates", str(summary.self_signed_certs)))
-    lines.append(
-        _format_kv("Weak Cipher Observations", str(sum(summary.weak_ciphers.values())))
-    )
-    lines.append(
-        _format_kv(
-            "SNI Missing (no ECH)",
-            f"{summary.sni_missing_no_ech}/{max(summary.client_hellos, 1)}",
-        )
-    )
-
     if (
         getattr(summary, "vt_lookup_enabled", False)
         or getattr(summary, "vt_results", None)
@@ -6778,35 +6694,6 @@ def render_tls_summary(
                 break
         return out[:limit_lines]
 
-    def _tls_matrix_rating_for_keywords(
-        keywords: tuple[str, ...],
-    ) -> tuple[str, str, str]:
-        matches = _matching_tls_detections(keywords)
-        if not matches:
-            return "None", "Low", "No matching detections"
-
-        severity_weight = {"critical": 4, "high": 3, "warning": 2, "info": 1}
-        weight_to_label = {4: "Critical", 3: "High", 2: "Warning", 1: "Info", 0: "Info"}
-        max_weight = 0
-        for det in matches:
-            sev = str(det.get("severity", "info") or "info").lower()
-            max_weight = max(max_weight, severity_weight.get(sev, 1))
-
-        evidence_count = len(matches)
-        score = max_weight + min(3, evidence_count)
-        if score >= 7:
-            risk = "High"
-            confidence_level = "High"
-        elif score >= 5:
-            risk = "Medium"
-            confidence_level = "Medium"
-        else:
-            risk = "Low"
-            confidence_level = "Low"
-
-        evidence_note = f"{evidence_count} detection(s), max severity={weight_to_label.get(max_weight, 'Info')}"
-        return risk, confidence_level, evidence_note
-
     tls_checks: list[tuple[str, tuple[str, ...]]] = [
         ("Certificate Pinning Drift", ("certificate pinning drift", "cert rotation")),
         ("JA3/JA4 Novelty", ("ja3 novelty", "ja4 novelty", "rarity spike")),
@@ -6846,7 +6733,6 @@ def render_tls_summary(
     ]
 
     if verbose:
-        tls_matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
         for label_text, keywords in tls_checks:
             lines.append(label(label_text))
             evidence_lines = _matching_tls_lines(keywords)
@@ -6864,14 +6750,6 @@ def render_tls_summary(
                         f"No, there is no strong evidence for {label_text.lower()} in this capture."
                     )
                 )
-            risk, confidence_level, evidence_note = _tls_matrix_rating_for_keywords(
-                keywords
-            )
-            tls_matrix_rows.append([label_text, risk, confidence_level, evidence_note])
-
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("TLS Risk Matrix"))
-        lines.append(_format_table(tls_matrix_rows))
 
         tls_total_bytes = sum(max(0, int(conv.bytes)) for conv in summary.conversations)
         lines.append(_format_kv("TLS Bytes (Conversations)", str(tls_total_bytes)))
@@ -7112,6 +6990,12 @@ def render_aim_summary(
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"AIM ANALYSIS :: {summary.path.name}"))
+    _render_protocol_verdict(
+        lines,
+        label="AIM",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(SECTION_BAR)
 
     if summary.errors:
@@ -7513,7 +7397,7 @@ def render_ssh_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Plaintext (Pre-Encryption)"))
         rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
             rows.append([_truncate_text(text, 60), str(count)])
         lines.append(_format_table(rows))
 
@@ -7794,7 +7678,7 @@ def render_rdp_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Plaintext (Pre-Encryption/Decrypted)"))
         rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
             rows.append([_truncate_text(text, 60), str(count)])
         lines.append(_format_table(rows))
 
@@ -7962,7 +7846,7 @@ def render_telnet_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Plaintext"))
         rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
             rows.append([_truncate_text(text, 60), str(count)])
         lines.append(_format_table(rows))
 
@@ -8139,7 +8023,7 @@ def render_vnc_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Plaintext"))
         rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
             rows.append([_truncate_text(text, 60), str(count)])
         lines.append(_format_table(rows))
 
@@ -8313,7 +8197,7 @@ def render_teamviewer_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Plaintext"))
         rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
             rows.append([_truncate_text(text, 60), str(count)])
         lines.append(_format_table(rows))
 
@@ -8496,7 +8380,7 @@ def render_winrm_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Plaintext"))
         rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
             rows.append([_truncate_text(text, 60), str(count)])
         lines.append(_format_table(rows))
 
@@ -8566,6 +8450,18 @@ def render_winrm_summary(
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
+    _render_deterministic_checks(
+        lines, summary, "Deterministic WinRM Security Checks", [
+            ("winrm_command_exec_telemetry", "Command-Execution Telemetry"),
+            ("winrm_weak_auth_scheme", "Weak Auth Scheme"),
+            ("winrm_plaintext_exposure", "Plaintext Exposure"),
+            ("winrm_scanning_or_bruteforce", "Scanning/Bruteforce"),
+            ("winrm_periodic_beaconing", "Periodic Beaconing"),
+            ("winrm_data_staging_asymmetry", "Data-Staging Asymmetry"),
+            ("winrm_nonstandard_port_usage", "Non-Standard Port Usage"),
+            ("winrm_public_endpoint_exposure", "Public Endpoint Exposure"),
+        ]
+    )
     return _finalize_output(lines)
 
 
@@ -8579,6 +8475,12 @@ def render_wmic_summary(
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"WMIC/WMI ANALYSIS :: {summary.path.name}"))
+    _render_protocol_verdict(
+        lines,
+        label="WMI/WMIC",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(SECTION_BAR)
 
     if summary.errors:
@@ -8726,7 +8628,7 @@ def render_wmic_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Plaintext"))
         rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
             rows.append([_truncate_text(text, 70), str(count)])
         lines.append(_format_table(rows))
 
@@ -8811,6 +8713,18 @@ def render_wmic_summary(
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
+    _render_deterministic_checks(
+        lines, summary, "Deterministic WMI/WMIC Security Checks", [
+            ("wmic_remote_execution_tradecraft", "Remote-Execution Tradecraft"),
+            ("wmic_namespace_persistence_context", "Namespace/Persistence Context"),
+            ("wmic_auth_failure_burst", "Auth Failure Burst"),
+            ("wmic_node_fanout", "Source Node Fan-out"),
+            ("wmic_target_fanout", "Target Fan-out"),
+            ("wmic_periodic_activity", "Periodic Activity"),
+            ("wmic_data_exfil_asymmetry", "Data-Exfil Asymmetry"),
+            ("wmic_public_endpoint_exposure", "Public Endpoint Exposure"),
+        ]
+    )
     return _finalize_output(lines)
 
 
@@ -8824,6 +8738,12 @@ def render_powershell_summary(
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"POWERSHELL ANALYSIS :: {summary.path.name}"))
+    _render_protocol_verdict(
+        lines,
+        label="PowerShell",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(SECTION_BAR)
 
     if summary.errors:
@@ -8971,7 +8891,7 @@ def render_powershell_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Plaintext"))
         rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
             rows.append([_truncate_text(text, 70), str(count)])
         lines.append(_format_table(rows))
 
@@ -9155,7 +9075,7 @@ def render_syslog_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Plaintext"))
         rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
             rows.append([_truncate_text(text, 70), str(count)])
         lines.append(_format_table(rows))
 
@@ -9273,6 +9193,21 @@ def render_snmp_summary(
             rows.append([_redact_secret(comm), str(count)])
         lines.append(_format_table(rows))
 
+    usm_users = getattr(summary, "usm_users", None)
+    if usm_users:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("SNMPv3 USM Users"))
+        lines.append(
+            muted(
+                "Device-management accounts (msgUserName is cleartext even in "
+                "authPriv) — identity artifact for the SNMP managers."
+            )
+        )
+        rows = [["USM Username", "Messages"]]
+        for uname, count in usm_users.most_common(limit):
+            rows.append([str(uname), str(count)])
+        lines.append(_format_table(rows))
+
     if summary.pdu_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("PDU Types"))
@@ -9316,163 +9251,13 @@ def render_snmp_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Plaintext"))
         rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
             rows.append([_truncate_text(text, 70), str(count)])
         lines.append(_format_table(rows))
 
     if summary.conversations:
         lines.append(SUBSECTION_BAR)
         lines.append(header("SNMP Sessions"))
-        lines.append(_format_sessions_table(summary.conversations, limit))
-
-    detections = _filtered_detections(summary, verbose)
-    if detections:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Detections"))
-        for item in detections:
-            severity = str(item.get("severity", "info")).lower()
-            summary_text = str(item.get("summary", ""))
-            details = _redact_in_text(str(item.get("details", "")))
-            if severity in {"critical", "high"}:
-                marker = danger("[HIGH]")
-                summary_text = danger(summary_text)
-            elif severity == "warning":
-                marker = warn("[WARN]")
-            else:
-                marker = ok("[INFO]")
-            lines.append(f"{marker} {summary_text}")
-            if details:
-                lines.append(muted(f"  {details}"))
-
-    if summary.artifacts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Artifacts"))
-        rows = [["Type", "Detail", "Src", "Dst"]]
-        for item in summary.artifacts[:limit]:
-            rows.append(
-                [
-                    str(item.kind),
-                    _truncate_text(str(item.detail), 60),
-                    str(item.src),
-                    str(item.dst),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
-
-
-def render_smtp_summary(
-    summary: SmtpSummary, limit: int = 12, verbose: bool = False
-) -> str:
-    limit = _apply_verbose_limit(limit)
-    if not summary:
-        return ""
-
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"SMTP ANALYSIS :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-
-    if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors:
-            lines.append(danger(f"- {err}"))
-
-    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
-    lines.append(_format_kv("SMTP Packets", str(summary.smtp_packets)))
-    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
-    if summary.duration_seconds is not None:
-        lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
-    lines.append(_format_kv("Messages", str(summary.total_messages)))
-    lines.append(_format_kv("Unique Clients", str(summary.unique_clients)))
-    lines.append(_format_kv("Unique Servers", str(summary.unique_servers)))
-
-    if summary.server_ports:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Server Ports"))
-        lines.append(_counter_table(summary.server_ports, "Port", limit=limit))
-
-    if summary.client_counts or summary.server_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top SMTP Clients & Servers"))
-        lines.append(
-            _format_client_server_table(summary.client_counts, summary.server_counts)
-        )
-
-    if summary.hostname_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed Hostnames (HELO/EHLO)"))
-        rows = [["Hostname", "Count"]]
-        for name, count in summary.hostname_counts.most_common(limit):
-            rows.append([_truncate_text(name, 50), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.command_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("SMTP Commands"))
-        lines.append(_counter_table(summary.command_counts, "Command", limit=limit))
-
-    if summary.response_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Response Codes"))
-        lines.append(_counter_table(summary.response_counts, "Code", limit=limit))
-
-    if summary.auth_methods:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Auth Methods"))
-        lines.append(_counter_table(summary.auth_methods, "Method", limit=limit))
-
-    if summary.auth_failures or summary.auth_successes:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Auth Outcomes"))
-        rows = [["Failures", "Successes"]]
-        fail_text = (
-            ", ".join(
-                f"{ip}({count})"
-                for ip, count in summary.auth_failures.most_common(_limit_value(6))
-            )
-            or "-"
-        )
-        succ_text = (
-            ", ".join(
-                f"{ip}({count})"
-                for ip, count in summary.auth_successes.most_common(_limit_value(6))
-            )
-            or "-"
-        )
-        rows.append([fail_text, succ_text])
-        lines.append(_format_table(rows))
-
-    if summary.email_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Email Addresses"))
-        rows = [["Email", "Count"]]
-        for name, count in summary.email_counts.most_common(limit):
-            rows.append([_truncate_text(name, 70), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.domain_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Domains"))
-        rows = [["Domain", "Count"]]
-        for name, count in summary.domain_counts.most_common(limit):
-            rows.append([_truncate_text(name, 50), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.plaintext_strings:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed Plaintext"))
-        rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
-            rows.append([_truncate_text(text, 70), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.conversations:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("SMTP Sessions"))
         lines.append(_format_sessions_table(summary.conversations, limit))
 
     detections = _filtered_detections(summary, verbose)
@@ -9640,7 +9425,7 @@ def render_rpc_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Observed Plaintext"))
         rows = [["String", "Count"]]
-        for text, count in summary.plaintext_strings.most_common(limit):
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
             rows.append([_truncate_text(text, 70), str(count)])
         lines.append(_format_table(rows))
 
@@ -9684,6 +9469,18 @@ def render_rpc_summary(
         lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
+    _render_deterministic_checks(
+        lines, summary, "Deterministic RPC Security Checks", [
+            ("rpc_admin_share_or_pipe_access", "Admin-Share/Named-Pipe Access"),
+            ("rpc_lateral_tooling", "Lateral-Movement Tooling"),
+            ("rpc_samr_enum_activity", "SAMR/Directory Enumeration"),
+            ("rpc_bind_failure_burst", "Bind Failure Burst"),
+            ("rpc_scanning_fanout", "Scanning Fan-out"),
+            ("rpc_beaconing_pattern", "Beaconing Pattern"),
+            ("rpc_data_asymmetry_exfil", "Data-Asymmetry Exfil"),
+            ("rpc_public_exposure", "Public Exposure"),
+        ]
+    )
     return _finalize_output(lines)
 
 
@@ -9780,16 +9577,12 @@ def render_tcp_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Deterministic TCP Security Checks"))
         check_labels = {
-            "session_state_integrity": "Session state integrity",
             "handshake_asymmetry_or_recon": "Handshake asymmetry/recon",
             "rst_teardown_abuse": "RST/teardown abuse",
             "tcp_periodic_cadence": "TCP periodic cadence",
             "lateral_movement_surface": "Lateral movement surface",
             "egress_exfil_outlier": "Egress exfil outlier",
-            "service_role_drift": "Service role drift",
             "transport_window_or_retrans_abuse": "Transport retrans/window abuse",
-            "cross_signal_corroboration": "Cross-signal corroboration",
-            "evidence_provenance": "Evidence provenance",
         }
         for key, label in check_labels.items():
             values = [str(v) for v in list(checks.get(key, []) or [])]
@@ -9800,24 +9593,6 @@ def render_tcp_summary(
             else:
                 lines.append(ok(f"[ ] {label}: none"))
 
-    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
-    if risk_matrix:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("TCP Risk Matrix"))
-        rows = [["Category", "Risk", "Confidence", "Evidence"]]
-        for row in risk_matrix[: _limit_value(12)]:
-            if not isinstance(row, dict):
-                continue
-            rows.append(
-                [
-                    str(row.get("category", "")),
-                    str(row.get("risk", "")),
-                    str(row.get("confidence", "")),
-                    str(row.get("evidence", "")),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
 
     session_profiles = list(getattr(summary, "session_integrity_profiles", []) or [])
     if session_profiles:
@@ -10507,17 +10282,11 @@ def render_udp_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Deterministic UDP Security Checks"))
         check_labels = {
-            "udp_request_response_asymmetry": "UDP request/response asymmetry",
             "reflection_amplification_risk": "Reflection/amplification risk",
             "udp_recon_scan_behavior": "UDP recon/scan behavior",
             "udp_periodic_cadence": "UDP periodic cadence",
             "udp_tunneling_signal": "UDP tunneling/covert signal",
-            "udp_zone_boundary_exposure": "UDP zone boundary exposure",
-            "ot_udp_boundary_crossing": "OT UDP boundary crossing",
-            "udp_role_drift": "UDP role drift",
             "udp_transport_fragmentation_reliability": "UDP transport/reliability abuse",
-            "cross_signal_corroboration": "Cross-signal corroboration",
-            "evidence_provenance": "Evidence provenance",
         }
         for key, label in check_labels.items():
             values = [str(v) for v in list(checks.get(key, []) or [])]
@@ -10528,24 +10297,6 @@ def render_udp_summary(
             else:
                 lines.append(ok(f"[ ] {label}: none"))
 
-    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
-    if risk_matrix:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("UDP Risk Matrix"))
-        rows = [["Category", "Risk", "Confidence", "Evidence"]]
-        for row in risk_matrix[: _limit_value(12)]:
-            if not isinstance(row, dict):
-                continue
-            rows.append(
-                [
-                    str(row.get("category", "")),
-                    str(row.get("risk", "")),
-                    str(row.get("confidence", "")),
-                    str(row.get("evidence", "")),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
 
     asymmetry_profiles = list(getattr(summary, "asymmetry_profiles", []) or [])
     if asymmetry_profiles:
@@ -11463,6 +11214,38 @@ def render_exfil_summary(
                     )
                 )
 
+    # The analyzer's own deterministic exfil checks (with per-finding evidence)
+    # were previously computed but only fed the cross-protocol threats rollup;
+    # surface them here in the exfil section too.
+    exfil_checks = getattr(summary, "deterministic_checks", {}) or {}
+    exfil_check_labels = [
+        ("dns_tunnel_indicators", "DNS Tunnel Indicators"),
+        ("http_post_exfil_channels", "HTTP POST Exfil Channels"),
+        ("ot_control_channel_exfil", "OT/ICS Control-Channel Exfil"),
+        ("internal_staging_then_external_exfil", "Internal Staging -> External Exfil"),
+        ("file_exfiltration_candidates", "File Exfiltration Candidates"),
+        ("management_port_bulk_transfer", "Management-Port Bulk Transfer"),
+        ("uncommon_egress_channels", "Uncommon Egress Channels"),
+        ("stealth_low_rate_long_lived_egress", "Stealth Low-Rate Long-Lived Egress"),
+    ]
+    if any(exfil_checks.get(k) for k, _ in exfil_check_labels):
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Deterministic Exfiltration Checks"))
+        for key, label_text in exfil_check_labels:
+            evidence = [
+                str(v) for v in list(exfil_checks.get(key, []) or []) if str(v).strip()
+            ]
+            if not evidence:
+                continue
+            lines.append(label(label_text))
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
+            for item in evidence[: _limit_value(8 if verbose else 5)]:
+                lines.append(muted(f"- {_redact_in_text(str(item))}"))
+
     lines.append(SUBSECTION_BAR)
     lines.append(header("Deterministic Protocol Checks"))
 
@@ -11761,6 +11544,12 @@ def render_sizes_summary(
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"PACKET SIZE ANALYSIS :: {summary.path.name}"))
+    _render_protocol_verdict(
+        lines,
+        label="Packet Sizes",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(SECTION_BAR)
 
     if summary.errors:
@@ -12399,7 +12188,6 @@ def render_beacon_summary(
         ("benign_periodic_likely", "Likely Benign Periodic Pattern"),
     ]
 
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for key, label_text in category_labels:
         evidence = (
             category_checks.get(key, []) if isinstance(category_checks, dict) else []
@@ -12421,33 +12209,12 @@ def render_beacon_summary(
                 )
             for item in evidence_items[: _limit_value(10 if verbose else 6)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-            if key == "benign_periodic_likely":
-                matrix_rows.append(
-                    [label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"]
-                )
-            elif key in {"multi_target_synchronized", "cross_protocol_cadence"}:
-                matrix_rows.append(
-                    [label_text, "High", "High", f"{len(evidence_items)} signal(s)"]
-                )
-            elif key in {"single_target_periodic_c2", "low_slow_persistence"}:
-                matrix_rows.append(
-                    [label_text, "Medium", "Medium", f"{len(evidence_items)} signal(s)"]
-                )
-            else:
-                matrix_rows.append(
-                    [label_text, "Medium", "Low", f"{len(evidence_items)} signal(s)"]
-                )
         else:
             lines.append(
                 ok(
                     f"No, there is no strong evidence for {label_text.lower()} in this capture."
                 )
             )
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Beacon Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     # (Per-candidate timeline sparklines are shown once under "Beacon Timelines"
     # above and in the Focus Here First queue; the duplicate heatmap was removed.)
@@ -13525,7 +13292,6 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
         ("ics_process_impact", "ICS Process/Safety Impact"),
         ("host_boundary_activity", "Host Boundary Activity"),
     ]
-    matrix_rows = [["Check", "Risk", "Confidence", "Evidence"]]
     for key, label_text in check_labels:
         evidence = checks.get(key, []) if isinstance(checks, dict) else []
         evidence_items = [str(v) for v in (evidence or []) if str(v).strip()]
@@ -13538,26 +13304,12 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
             )
             for item in evidence_items[: _limit_value(8 if verbose else 5)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-            risk = (
-                "High"
-                if key in {"cross_signal_corroboration", "ics_process_impact"}
-                else "Medium"
-            )
-            conf_level = "High" if len(evidence_items) >= 2 else "Medium"
-            matrix_rows.append(
-                [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
-            )
         else:
             lines.append(
                 ok(
                     f"No, there is no strong evidence for {label_text.lower()} in this capture."
                 )
             )
-            matrix_rows.append([label_text, "None", "Low", "No matching evidence"])
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("MITRE Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     if summary.errors:
         lines.append(SUBSECTION_BAR)
@@ -13867,8 +13619,16 @@ def render_mitre_summary(summary: MitreSummary, verbose: bool = False) -> str:
 
 
 def render_files_summary(
-    summary: FileTransferSummary, limit: int | None = None, verbose: bool = False
+    summary: FileTransferSummary,
+    limit: int | None = None,
+    verbose: bool = False,
+    show_hashes: bool = False,
+    hash_filter: str | None = None,
 ) -> str:
+    # `-hash` with no filename lists every discovered file's hash; `-hash FILE`
+    # narrows to the matching file(s), rendered by the "Requested File Hashes"
+    # section below, so the all-files table is suppressed in that case.
+    hash_filter_active = bool(str(hash_filter or "").strip())
     previous_verbose_state = _VERBOSE_OUTPUT
     forced_verbose_state = bool(verbose and not previous_verbose_state)
     if forced_verbose_state:
@@ -14009,16 +13769,9 @@ def render_files_summary(
     lines.append(header("Deterministic Files Security Checks"))
     checks = getattr(summary, "deterministic_checks", {}) or {}
     check_labels = [
-        ("reconstruction_confidence", "Reconstruction Confidence"),
         ("multi_signal_masquerade", "Multi-signal Masquerade"),
-        ("archive_container_abuse", "Archive/Container Abuse"),
         ("macro_script_lolbas_staging", "Macro/Script/LOLBAS Staging"),
-        ("exfiltration_file_movement", "Exfiltration File Movement"),
-        ("lateral_copy_propagation", "Lateral Copy Propagation"),
-        ("auth_file_correlation", "Auth-to-File Correlation"),
-        ("reputation_or_prevalence_outlier", "Reputation/Prevalence Outliers"),
     ]
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     cleared_checks: list[str] = []
     fired_any = False
     for key, label_text in check_labels:
@@ -14034,40 +13787,16 @@ def render_files_summary(
             )
             for item in evidence_items[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-
-            if key in {
-                "multi_signal_masquerade",
-                "archive_container_abuse",
-                "macro_script_lolbas_staging",
-                "exfiltration_file_movement",
-                "lateral_copy_propagation",
-            }:
-                risk = "High"
-                conf_level = "High"
-            elif key in {"auth_file_correlation", "reputation_or_prevalence_outlier"}:
-                risk = "Medium"
-                conf_level = "Medium"
-            else:
-                risk = "Low"
-                conf_level = "Low"
-            matrix_rows.append(
-                [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
-            )
         else:
             cleared_checks.append(label_text)
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
     # Collapse the (usually many) checks with no evidence into one line instead
-    # of a wall of negatives — the full pass/fail grid is in the Risk Matrix.
+    # of a wall of negatives.
     if not fired_any:
         lines.append(ok("No file-threat checks crossed threshold in this capture."))
     elif cleared_checks:
         lines.append(
             muted(f"Cleared (no evidence): {', '.join(cleared_checks)}")
         )
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Files Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
@@ -14169,6 +13898,21 @@ def render_files_summary(
                     f"Summarized view collapsed {collapsed} duplicate artifact row(s); occurrence counts are shown as [xN] in Note."
                 )
             )
+
+        # `-hash FILE` scopes the whole files view to the matching file(s): the
+        # Discovered Files table is filtered by filename here, mirroring the
+        # "Requested File Hashes" section so the two stay in sync.
+        if hash_filter_active:
+            needle = str(hash_filter).strip().lower()
+            display_artifacts = [
+                entry
+                for entry in display_artifacts
+                if needle in str(getattr(entry[0], "filename", "") or "").lower()
+            ]
+            if not display_artifacts:
+                lines.append(
+                    muted(f"No discovered files matched -hash filter: {hash_filter}")
+                )
 
         # Define executable types and extension mappings
         executable_types = {"EXE/DLL", "ELF"}
@@ -14273,6 +14017,8 @@ def render_files_summary(
         # File hashes — the primary forensic/IR deliverable: copy-pasteable
         # MD5/SHA-256 for VirusTotal / threat-intel lookups and known-bad
         # matching. Deduplicated by hash so repeated transfers list once.
+        # Only rendered when the user asked for hashes via -hash, keeping the
+        # default --files output focused on the transfer inventory.
         hashed_seen: set[str] = set()
         hash_rows = [["Filename", "Type", "Size", "MD5", "SHA-256"]]
         for item in summary.artifacts:
@@ -14297,7 +14043,7 @@ def render_files_summary(
                     sha or "-",
                 ]
             )
-        if len(hash_rows) > 1:
+        if show_hashes and not hash_filter_active and len(hash_rows) > 1:
             lines.append(SUBSECTION_BAR)
             lines.append(header("File Hashes (VirusTotal / threat-intel lookup)"))
             lines.append(_format_table(hash_rows))
@@ -14480,6 +14226,58 @@ def render_files_summary(
     return output
 
 
+# Cleartext / insecure protocols that are forensically notable on the wire
+# (credentials or sensitive data exposed, or commonly abused for spoofing/C2).
+_INSECURE_WIRE_PROTOCOLS = {
+    "Telnet": "cleartext remote admin (credentials in the clear) — T1040",
+    "FTP": "cleartext file transfer / credentials — T1040",
+    "FTP-Data": "cleartext file transfer payloads — T1040",
+    "TFTP": "no-auth file transfer (config/firmware exfil) — T1040",
+    "HTTP": "cleartext web (credentials/cookies/data exposed) — T1040",
+    "HTTP-Alt": "cleartext web (alt port) — T1040",
+    "HTTP-Proxy": "cleartext web proxy — T1040",
+    "POP3": "cleartext mail retrieval / credentials — T1040",
+    "IMAP": "cleartext mail access / credentials — T1040",
+    "SMTP": "cleartext mail (may carry AUTH LOGIN/PLAIN) — T1040",
+    "SNMP": "SNMP v1/v2c community strings in cleartext — T1040",
+    "LDAP": "cleartext directory queries / simple-bind credentials — T1040",
+    "Syslog": "cleartext log data (UDP, spoofable) — T1040",
+    "NetBIOS": "legacy name service — poisoning/relay abuse — T1557",
+    "mDNS": "multicast name service — spoofing/recon — T1557",
+}
+
+
+def _protocols_mitre_techniques(summary: ProtocolSummary) -> list[str]:
+    """Map observed protocol anomalies to ATT&CK technique IDs."""
+    tids: list[str] = []
+
+    def _add(tid: str) -> None:
+        if tid not in tids:
+            tids.append(tid)
+
+    type_map = {
+        "Port Scan": "T1046 Network Service Discovery",
+        "TCP Null Scan": "T1046 Network Service Discovery",
+        "TCP FIN Scan": "T1046 Network Service Discovery",
+        "TCP Xmas Scan": "T1046 Network Service Discovery",
+        "ARP Spoofing": "T1557.002 Adversary-in-the-Middle: ARP Cache Poisoning",
+        "Gratuitous ARP": "T1557.002 Adversary-in-the-Middle: ARP Cache Poisoning",
+        "Cleartext Creds": "T1040 Network Sniffing",
+        "Credential Leakage": "T1040 Network Sniffing",
+        "Basic Auth": "T1040 Network Sniffing",
+        "Cleartext Auth": "T1040 Network Sniffing",
+        "Broadcast Storm": "T1498 Network Denial of Service",
+        "TCP Reset Flood": "T1498 Network Denial of Service",
+        "Large ICMP Payloads": "T1572 Protocol Tunneling",
+        "IP Fragmentation": "T1599 Network Boundary Bridging / evasion",
+    }
+    for anom in getattr(summary, "anomalies", []) or []:
+        tid = type_map.get(str(getattr(anom, "type", "")))
+        if tid:
+            _add(tid)
+    return tids
+
+
 def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) -> str:
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -14504,6 +14302,9 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
             lines.append(_format_kv("Verdict", verdict))
         for reason in reasons:
             lines.append(muted(f"- {reason}"))
+        tids = _protocols_mitre_techniques(summary)
+        if tids:
+            lines.append(muted("  ATT&CK: " + ", ".join(tids)))
 
     lines.append(_format_kv("Total Packets", str(summary.total_packets)))
     lines.append(_format_kv("Duration", format_duration(summary.duration)))
@@ -14535,6 +14336,22 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
             rows.append([name, str(count), f"{pct:.1f}%"])
         lines.append(_format_table(rows))
 
+    # Insecure / cleartext protocols on the wire — core triage: what sensitive
+    # traffic is exposed and what's commonly abused for spoofing/relay.
+    insecure_seen: dict[str, int] = {}
+    for name, count in list(summary.port_protocols) + list(summary.top_protocols):
+        if name in _INSECURE_WIRE_PROTOCOLS:
+            insecure_seen[name] = max(insecure_seen.get(name, 0), int(count))
+    if insecure_seen:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Insecure / Cleartext Protocols Observed"))
+        rows = [["Protocol", "Packets", "Risk / ATT&CK"]]
+        for name in sorted(insecure_seen, key=lambda n: insecure_seen[n], reverse=True):
+            rows.append(
+                [name, str(insecure_seen[name]), _INSECURE_WIRE_PROTOCOLS[name]]
+            )
+        lines.append(_format_table(rows))
+
     checks = dict(getattr(summary, "deterministic_checks", {}) or {})
     if checks:
         lines.append(SUBSECTION_BAR)
@@ -14542,12 +14359,6 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
         check_labels = {
             "protocol_identity_mismatch": "Protocol identity mismatch",
             "anomalous_protocol_sequence": "Anomalous protocol sequence",
-            "boundary_cross_zone_protocol": "Boundary cross-zone protocol",
-            "tunneling_or_encapsulation_signal": "Tunneling/encapsulation signal",
-            "periodic_beacon_profile": "Periodic beacon profile",
-            "role_inversion_signal": "Role inversion signal",
-            "ot_protocol_boundary_crossing": "OT protocol boundary crossing",
-            "rare_or_low_prevalence_protocol": "Rare/low-prevalence protocol",
             "cross_protocol_corroboration": "Cross-protocol corroboration",
             "evidence_provenance": "Evidence provenance",
         }
@@ -14560,24 +14371,6 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
             else:
                 lines.append(ok(f"[ ] {label}: none"))
 
-    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
-    if risk_matrix:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Protocol Risk Matrix"))
-        rows = [["Category", "Risk", "Confidence", "Evidence"]]
-        for row in risk_matrix:
-            if not isinstance(row, dict):
-                continue
-            rows.append(
-                [
-                    str(row.get("category", "")),
-                    str(row.get("risk", "")),
-                    str(row.get("confidence", "")),
-                    str(row.get("evidence", "")),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
 
     corroborated_findings = list(getattr(summary, "corroborated_findings", []) or [])
     if corroborated_findings:
@@ -14910,6 +14703,34 @@ def _service_asset_key(asset: ServiceAsset) -> str:
     return f"{asset.ip}:{asset.port}"
 
 
+def _services_mitre_techniques(summary: ServiceSummary) -> list[str]:
+    """Map observed service-exposure findings to ATT&CK technique IDs."""
+    checks = dict(getattr(summary, "deterministic_checks", {}) or {})
+    tids: list[str] = []
+
+    def _add(tid: str) -> None:
+        if tid not in tids:
+            tids.append(tid)
+
+    if getattr(summary, "assets", None):
+        _add("T1046 Network Service Discovery")
+    if checks.get("internet_exposed_surface") or checks.get("public_edge_admin_exposure"):
+        _add("T1133 External Remote Services")
+    if checks.get("exposed_datastores"):
+        _add("T1133 External Remote Services (exposed datastore)")
+    if checks.get("lateral_admin_surface"):
+        _add("T1021 Remote Services")
+    risk_titles = {str(getattr(r, "title", "")) for r in (summary.risks or [])}
+    if "Cleartext Service" in risk_titles:
+        _add("T1040 Network Sniffing (cleartext credentials)")
+    if "Potential UDP Amplification" in risk_titles:
+        _add("T1498.002 Reflection Amplification")
+    if checks.get("ot_it_boundary_mix") or getattr(summary, "ot_it_crossing_profiles", None):
+        _add("ICS T0846 Remote System Discovery")
+        _add("ICS T0822 External Remote Services")
+    return tids
+
+
 def render_services_summary(summary: ServiceSummary, verbose: bool = False) -> str:
     lines: list[str] = []
     lines.append(SECTION_BAR)
@@ -14965,6 +14786,33 @@ def render_services_summary(summary: ServiceSummary, verbose: bool = False) -> s
                 row.append(str(getattr(asset, "discovery_method", "observed")))
             rows.append(row)
         lines.append(_format_table(rows))
+
+    # Internet-exposed attack surface — public-IP-bound services. High-value
+    # triage, shown by default (not gated on -v).
+    boundary_profiles = list(getattr(summary, "boundary_exposure_profiles", []) or [])
+    if boundary_profiles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Internet-Exposed Attack Surface (public IPs)"))
+        lines.append(
+            danger(
+                f"{len(boundary_profiles)} service(s) bound to public IP(s) — "
+                "reachable from the internet."
+            )
+        )
+        rows = [["Asset", "Service", "Clients", "Packets"]]
+        for profile in boundary_profiles[: _limit_value(15)]:
+            if not isinstance(profile, dict):
+                continue
+            rows.append(
+                [
+                    str(profile.get("asset", "-")),
+                    str(profile.get("service", "-")),
+                    str(profile.get("clients", 0)),
+                    str(profile.get("packets", 0)),
+                ]
+            )
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
 
     if summary.hierarchy and verbose:
         lines.append(SUBSECTION_BAR)
@@ -15037,18 +14885,20 @@ def render_services_summary(summary: ServiceSummary, verbose: bool = False) -> s
         if reasons:
             for reason in reasons:
                 lines.append(muted(f"- {reason}"))
+        tids = _services_mitre_techniques(summary)
+        if tids:
+            lines.append(muted("  ATT&CK: " + ", ".join(tids)))
 
     checks = dict(getattr(summary, "deterministic_checks", {}) or {})
     if checks:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Deterministic Service Security Checks"))
         check_labels = {
+            "exposed_datastores": "Exposed databases/datastores",
+            "internet_exposed_surface": "Internet-exposed services",
             "service_identity_mismatch": "Service identity mismatch",
-            "rare_or_newly_exposed_service": "Rare/newly exposed service",
             "lateral_admin_surface": "Lateral admin surface",
             "public_edge_admin_exposure": "Public edge admin exposure",
-            "service_drift_or_churn": "Service drift/churn",
-            "beacon_or_periodic_service_profile": "Beacon/periodic profile",
             "ot_it_boundary_mix": "OT/IT boundary mix",
             "udp_amplification_readiness": "UDP amplification readiness",
             "legacy_or_weak_service_hygiene": "Legacy/weak hygiene",
@@ -15063,24 +14913,6 @@ def render_services_summary(summary: ServiceSummary, verbose: bool = False) -> s
             else:
                 lines.append(ok(f"[ ] {label}: none"))
 
-    risk_matrix = list(getattr(summary, "risk_matrix", []) or [])
-    if risk_matrix:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Service Risk Matrix"))
-        rows = [["Category", "Risk", "Confidence", "Evidence"]]
-        for row in risk_matrix:
-            if not isinstance(row, dict):
-                continue
-            rows.append(
-                [
-                    str(row.get("category", "")),
-                    str(row.get("risk", "")),
-                    str(row.get("confidence", "")),
-                    str(row.get("evidence", "")),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
 
     mismatch_profiles = list(getattr(summary, "service_mismatch_profiles", []) or [])
     if mismatch_profiles and verbose:
@@ -16033,6 +15865,18 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
             lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
+    _render_deterministic_checks(
+        lines, summary, "Deterministic SMB Security Checks", [
+            ("smb_legacy_protocol", "Legacy SMB Protocol (SMBv1)"),
+            ("smb_signing_or_encryption_gap", "Signing/Encryption Gap"),
+            ("smb_auth_failure_burst", "Auth Failure Burst"),
+            ("smb_admin_share_lateral", "Admin-Share Lateral Movement"),
+            ("smb_sensitive_file_staging", "Sensitive File Staging"),
+            ("smb_scanning_fanout", "Scanning Fan-out"),
+            ("smb_beacon_or_periodicity", "Beacon/Periodicity"),
+            ("smb_public_endpoint_exposure", "Public Endpoint Exposure"),
+        ]
+    )
     return _finalize_output(lines)
 
 
@@ -16152,6 +15996,12 @@ def render_nfs_summary(summary: NfsSummary) -> str:
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"NFS PROTOCOL ANALYSIS :: {summary.path.name}"))
+    _render_protocol_verdict(
+        lines,
+        label="NFS",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(SECTION_BAR)
 
     if summary.errors:
@@ -16313,6 +16163,45 @@ def render_strings_summary(summary: StringsSummary) -> str:
     lines.append(_format_kv("Strings Found", str(summary.strings_found)))
     lines.append(_format_kv("Unique Strings", str(summary.unique_strings)))
 
+    # ---- Analyst Verdict -------------------------------------------------
+    dc = summary.deterministic_checks or {}
+
+    def _sdc(key: str) -> list[str]:
+        return [str(v) for v in (dc.get(key, []) or []) if str(v).strip()]
+
+    s_creds = _sdc("cleartext_credentials")
+    s_lolbin = _sdc("command_execution_or_lolbin")
+    s_exfil = _sdc("download_stager_or_exfil")
+    s_otwrite = _sdc("ot_ics_control_write_ops")
+    s_otmark = _sdc("ot_ics_protocol_markers")
+    s_ctf = _sdc("ctf_flag_or_challenge_markers")
+    reasons: list[str] = []
+    if s_creds:
+        reasons.append(f"cleartext credentials in {len(s_creds)} string(s)")
+    if s_lolbin:
+        reasons.append(f"command/LOLBin execution strings ({len(s_lolbin)})")
+    if s_exfil:
+        reasons.append(f"download-stager / exfil strings ({len(s_exfil)})")
+    if s_otwrite:
+        reasons.append(f"OT/ICS control-write operation markers ({len(s_otwrite)})")
+    if s_ctf:
+        reasons.append(f"CTF flag / challenge markers ({len(s_ctf)})")
+    if s_creds or s_lolbin or s_exfil:
+        v_text, v_fn = "MALICIOUS / SENSITIVE STRINGS PRESENT", danger
+    elif s_otwrite:
+        v_text, v_fn = "OT/ICS CONTROL-WRITE STRINGS PRESENT", warn
+    elif s_ctf:
+        v_text, v_fn = "CTF FLAG MARKERS IN STRINGS", warn
+    elif summary.suspicious_strings:
+        v_text, v_fn = "SUSPICIOUS STRINGS PRESENT", warn
+    else:
+        v_text, v_fn = "NO HIGH-RISK STRINGS DETECTED", ok
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    lines.append(v_fn(f"[VERDICT] {v_text}"))
+    for reason in reasons:
+        lines.append(warn(f"- {reason}"))
+
     lines.append(SUBSECTION_BAR)
     lines.append(header("Top Cleartext Strings"))
     if not summary.top_strings:
@@ -16407,6 +16296,40 @@ def render_strings_summary(summary: StringsSummary) -> str:
     else:
         for item in summary.anomalies:
             lines.append(warn(f"[WARN] {item}"))
+
+    if summary.threat_hypotheses:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Threat Hypotheses"))
+        for hyp in summary.threat_hypotheses:
+            conf = str(hyp.get("confidence", "?"))
+            text = str(hyp.get("hypothesis", "-"))
+            ev = hyp.get("evidence", "")
+            lines.append(warn(f"- [{conf}] {text} (evidence={ev})"))
+
+    if summary.ot_findings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OT/ICS Markers in Strings"))
+        for item in summary.ot_findings[: _limit_value(15)]:
+            lines.append(muted(f"- {item}"))
+    if summary.ctf_indicators:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("CTF Flag / Challenge Markers"))
+        for item in summary.ctf_indicators[: _limit_value(15)]:
+            lines.append(muted(f"- {item}"))
+
+    _render_deterministic_checks(
+        lines,
+        summary,
+        "Deterministic String Security Checks",
+        [
+            ("cleartext_credentials", "Cleartext Credentials"),
+            ("command_execution_or_lolbin", "Command Execution / LOLBin"),
+            ("download_stager_or_exfil", "Download Stager / Exfil"),
+            ("ot_ics_control_write_ops", "OT/ICS Control-Write Operations"),
+            ("ot_ics_protocol_markers", "OT/ICS Protocol Markers"),
+            ("ctf_flag_or_challenge_markers", "CTF Flag / Challenge Markers"),
+        ],
+    )
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
@@ -16702,12 +16625,34 @@ def render_creds_summary(summary: CredentialSummary) -> str:
     pair_groups: dict[tuple[str, str], dict[str, object]] = {}
     protocol_totals: Counter[str] = Counter()
 
+    # Offline-crackable authentication hashes (NetNTLMv1/v2, Kerberos pre-auth)
+    # are pulled into their own section — they are not cleartext and the long
+    # hash string would otherwise flood the Discovered Secrets table.
+    crackable_hashes: list[dict[str, object]] = []
     for hit in summary.hits:
         protocol = str(hit.protocol or "-")
-        protocol_totals[protocol] += 1
         packet_num = int(hit.packet_number)
         user = str(hit.username or "").strip()
         secret = str(hit.secret or "").strip()
+        evidence = str(hit.evidence or "")
+        kind = str(hit.kind or "")
+        if "hashcat -m" in evidence or kind.endswith("Hash"):
+            mode = ""
+            if "hashcat -m" in evidence:
+                mode = evidence.split("hashcat -m", 1)[1].strip().split()[0]
+            crackable_hashes.append(
+                {
+                    "account": user or "-",
+                    "type": kind,
+                    "mode": mode,
+                    "hash": secret,
+                    "pkt": packet_num,
+                }
+            )
+            protocol_totals[protocol] += 1
+            continue
+
+        protocol_totals[protocol] += 1
 
         if user:
             user_entry = username_groups.setdefault(
@@ -16752,12 +16697,104 @@ def render_creds_summary(summary: CredentialSummary) -> str:
     lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
     lines.append(_format_kv("Credential Hits", str(summary.matches)))
 
+    # ---- Analyst Verdict -------------------------------------------------
+    # Lead with the triage call derived from the computed risk dimensions, in
+    # descending order of severity. This is the line an IR analyst reads first.
+    ext = list(summary.external_exposures or [])
+    priv = list(summary.privileged_exposures or [])
+    abuse = list(summary.auth_abuse_sequences or [])
+    replay = list(summary.replay_candidates or [])
+    fanout = list(summary.token_fanout or [])
+    benign = list(
+        (summary.deterministic_checks or {}).get("likely_benign_test_credentials", [])
+    )
+    reasons: list[str] = []
+    if ext:
+        reasons.append(
+            f"{len(ext)} credential(s) sent to a PUBLIC internet destination"
+        )
+    if priv:
+        priv_users = sorted({str(p.get("user", "-")) for p in priv})
+        reasons.append(
+            f"privileged account(s) exposed (cleartext or captured hash): "
+            f"{', '.join(priv_users[:6])}"
+        )
+    if abuse:
+        pats = sorted(
+            {str(p) for seq in abuse for p in (seq.get("patterns") or [])}
+        )
+        reasons.append(
+            f"active credential attack ({', '.join(pats) or 'auth abuse'}) from "
+            f"{len(abuse)} source(s)"
+        )
+    if replay:
+        reasons.append(
+            f"credential reuse across multiple hosts ({len(replay)} value(s))"
+        )
+    if fanout:
+        reasons.append(f"token reused across multiple destinations ({len(fanout)})")
+    if crackable_hashes:
+        hash_accounts = sorted(
+            {str(h.get("account", "-")) for h in crackable_hashes if h.get("account")}
+        )
+        reasons.append(
+            f"{len(crackable_hashes)} offline-crackable authentication hash(es) "
+            f"captured for: {', '.join(hash_accounts[:6])}"
+        )
+
+    # Distinguish a real cleartext exposure from only-hashes-captured: cleartext
+    # secrets (non-hash hits) mean immediate compromise; hashes are crackable but
+    # not yet plaintext.
+    has_cleartext = summary.matches > len(crackable_hashes)
+    if ext or priv:
+        verdict_text, verdict_fn = "CREDENTIAL COMPROMISE — IMMEDIATE ACTION", danger
+    elif abuse:
+        verdict_text, verdict_fn = "ACTIVE CREDENTIAL ATTACK", danger
+    elif replay or fanout:
+        verdict_text, verdict_fn = "CREDENTIAL REUSE / TOKEN MISUSE", warn
+    elif has_cleartext:
+        verdict_text, verdict_fn = "CLEARTEXT CREDENTIALS EXPOSED", warn
+    elif crackable_hashes:
+        verdict_text, verdict_fn = "CAPTURED AUTH HASHES (offline-crackable)", warn
+    else:
+        verdict_text, verdict_fn = "NO CLEARTEXT CREDENTIALS DETECTED", ok
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    lines.append(verdict_fn(f"[VERDICT] {verdict_text}"))
+    for reason in reasons:
+        lines.append(warn(f"- {reason}"))
+    if not reasons and summary.matches > 0:
+        lines.append(
+            muted(
+                "Cleartext credential material is present but no high-risk pattern "
+                "(external exposure, privileged account, brute-force, reuse) fired."
+            )
+        )
+    if benign and summary.matches > 0:
+        lines.append(
+            muted(
+                f"Note: {len(benign)} hit(s) use known placeholder/test secrets "
+                "(e.g. password/admin/test) — likely benign."
+            )
+        )
+
     lines.append(SUBSECTION_BAR)
     lines.append(header("Summary"))
     lines.append(_format_kv("Unique Usernames", str(len(username_groups))))
     lines.append(_format_kv("Unique Secrets/Tokens", str(len(secret_groups))))
     lines.append(_format_kv("Unique Username+Secret Pairs", str(len(pair_groups))))
     lines.append(_format_kv("Protocols with Hits", str(len(protocol_totals))))
+    conf = summary.confidence_counts or Counter()
+    if conf:
+        lines.append(
+            _format_kv(
+                "Hit Confidence",
+                f"high={int(conf.get('high', 0))} "
+                f"medium={int(conf.get('medium', 0))} "
+                f"low={int(conf.get('low', 0))}",
+            )
+        )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Protocol Coverage"))
@@ -16780,6 +16817,144 @@ def render_creds_summary(summary: CredentialSummary) -> str:
         for proto, count in sorted_protocols[: _limit_value(24)]:
             protocol_rows.append([_protocol_family(str(proto)), str(proto), str(count)])
         lines.append(_format_table(protocol_rows))
+
+    # ---- High-risk exposures --------------------------------------------
+    if ext:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Credentials Sent to Public Internet"))
+        lines.append(
+            danger(
+                "Cleartext credentials were transmitted to a routable internet "
+                "destination — treat as exposed and rotate."
+            )
+        )
+        ext_rows = [["Source", "Public Dst", "Account", "Kind", "Pkt"]]
+        for item in ext[: _limit_value(20)]:
+            ext_rows.append(
+                [
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("user", "-")),
+                    str(item.get("kind", "-")),
+                    str(item.get("pkt", "-")),
+                ]
+            )
+        lines.append(_format_table(ext_rows))
+
+    if priv:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Privileged Account Exposure"))
+        lines.append(
+            danger(
+                "Administrative/privileged account credentials observed "
+                "(root/admin/sa/etc.) — cleartext or captured authentication hash."
+            )
+        )
+        priv_rows = [["Account", "Source", "Destination", "Kind", "Pkt"]]
+        for item in priv[: _limit_value(20)]:
+            priv_rows.append(
+                [
+                    str(item.get("user", "-")),
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("kind", "-")),
+                    str(item.get("pkt", "-")),
+                ]
+            )
+        lines.append(_format_table(priv_rows))
+
+    # ---- Suspicious authentication activity -----------------------------
+    if abuse:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Suspicious Authentication Activity"))
+        abuse_rows = [
+            ["Source", "Pattern", "Attempts", "Accounts", "Passwords", "Targets"]
+        ]
+        for seq in abuse[: _limit_value(20)]:
+            abuse_rows.append(
+                [
+                    str(seq.get("src", "-")),
+                    ", ".join(str(p) for p in (seq.get("patterns") or [])) or "-",
+                    str(seq.get("events", "-")),
+                    str(seq.get("users", "-")),
+                    str(seq.get("secrets", "-")),
+                    str(seq.get("dsts", "-")),
+                ]
+            )
+        lines.append(_format_table(abuse_rows))
+        for seq in abuse[: _limit_value(20)]:
+            lines.append(
+                warn(
+                    f"- {seq.get('src', '-')}: {seq.get('events', 0)} attempts vs "
+                    f"account '{seq.get('sample_user', '-')}' / target "
+                    f"{seq.get('sample_dst', '-')} "
+                    f"({seq.get('secrets', 0)} distinct passwords)"
+                )
+            )
+
+    if replay:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Credential Reuse Across Hosts"))
+        lines.append(
+            warn(
+                "The same credential/secret authenticated to 3+ distinct "
+                "destinations — possible lateral movement or shared-secret reuse."
+            )
+        )
+        replay_rows = [["Type", "Value", "Dst Count", "Destinations"]]
+        for item in replay[: _limit_value(20)]:
+            replay_rows.append(
+                [
+                    str(item.get("type", "-")),
+                    str(item.get("value", "-")),
+                    str(item.get("dst_count", "-")),
+                    ", ".join(str(d) for d in (item.get("dsts") or [])),
+                ]
+            )
+        lines.append(_format_table(replay_rows))
+
+    if fanout:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Token Reuse / Fan-out"))
+        fan_rows = [["Token (truncated)", "Dst Count", "Destinations"]]
+        for item in fanout[: _limit_value(20)]:
+            fan_rows.append(
+                [
+                    str(item.get("token", "-")),
+                    str(item.get("dst_count", "-")),
+                    ", ".join(str(d) for d in (item.get("dsts") or [])),
+                ]
+            )
+        lines.append(_format_table(fan_rows))
+
+    # ---- Crackable hashes (offline) -------------------------------------
+    if crackable_hashes:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Crackable Hashes (offline)"))
+        lines.append(
+            warn(
+                "Captured authentication hashes — recover the plaintext offline "
+                "(e.g. `hashcat -m <mode> <hash> wordlist`) or relay them."
+            )
+        )
+        hash_rows = [["Account", "Type", "hashcat -m", "Pkt", "Hash"]]
+        for h in crackable_hashes[: _limit_value(20)]:
+            hash_rows.append(
+                [
+                    str(h.get("account", "-")),
+                    str(h.get("type", "-")),
+                    str(h.get("mode", "-")) or "-",
+                    str(h.get("pkt", "-")),
+                    _truncate_text(str(h.get("hash", "")), 56),
+                ]
+            )
+        lines.append(_format_table(hash_rows))
+        lines.append(
+            muted(
+                "Full hashes are in the hit list (use -v); each line is ready for "
+                "hashcat/john."
+            )
+        )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Discovered Usernames"))
@@ -16902,6 +17077,22 @@ def render_creds_summary(summary: CredentialSummary) -> str:
             )
         lines.append(_format_table(pair_rows))
 
+    _render_deterministic_checks(
+        lines,
+        summary,
+        "Deterministic Credential Security Checks",
+        [
+            ("plaintext_credential_exposure", "Cleartext Credential Exposure"),
+            ("crackable_hash_capture", "Crackable Authentication Hash Captured"),
+            ("external_destination_exposure", "Credentials to Public Internet"),
+            ("privileged_account_exposure", "Privileged Account Exposure"),
+            ("auth_abuse_pattern", "Brute-force / Password-spray Pattern"),
+            ("credential_replay", "Credential Reuse Across Hosts"),
+            ("token_misuse_fanout", "Token Reuse / Fan-out"),
+            ("likely_benign_test_credentials", "Likely Benign Test Credentials"),
+        ],
+    )
+
     if summary.truncated:
         lines.append(
             warn(
@@ -16928,6 +17119,139 @@ def render_secrets_summary(summary: SecretsSummary, *, verbose: bool = False) ->
     lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
     lines.append(_format_kv("Matches", str(summary.matches)))
 
+    # ---- Analyst Verdict -------------------------------------------------
+    # The product of --secrets is the DECODED material and what it implies.
+    # Lead with a triage call derived from the computed deterministic checks.
+    dc = summary.deterministic_checks or {}
+
+    def _dc(key: str) -> list[str]:
+        return [str(v) for v in (dc.get(key, []) or []) if str(v).strip()]
+
+    keys_hit = _dc("private_key_or_cryptographic_material")
+    creds_hit = _dc("cleartext_credentials_in_decoded_secrets")
+    c2_hit = _dc("c2_or_exfil_markers_in_decoded_payloads")
+    lolbin_hit = _dc("command_execution_or_lolbin_in_secrets")
+    ext_hit = _dc("external_public_secret_flow")
+    token_hit = _dc("token_or_session_material")
+    chain_hit = _dc("multi_stage_decoding_chain")
+    ctf_hit = _dc("ctf_flag_or_challenge_markers")
+
+    reasons: list[str] = []
+    if keys_hit:
+        reasons.append(f"private key / cryptographic material in {len(keys_hit)} payload(s)")
+    if creds_hit:
+        reasons.append(f"decoded cleartext credentials in {len(creds_hit)} payload(s)")
+    if c2_hit:
+        reasons.append(f"C2/exfil markers in {len(c2_hit)} decoded payload(s)")
+    if lolbin_hit:
+        reasons.append(f"encoded command/LOLBin execution in {len(lolbin_hit)} payload(s)")
+    if ext_hit:
+        reasons.append(f"decoded secret(s) flowed to a PUBLIC destination ({len(ext_hit)})")
+    if token_hit:
+        reasons.append(f"token/session material in {len(token_hit)} payload(s)")
+    if chain_hit:
+        reasons.append(f"multi-stage decoding chain in {len(chain_hit)} payload(s)")
+    if ctf_hit:
+        reasons.append(f"CTF flag/challenge marker(s) ({len(ctf_hit)})")
+
+    if keys_hit or creds_hit or c2_hit or lolbin_hit:
+        verdict_text, verdict_fn = "SENSITIVE MATERIAL DECODED — INVESTIGATE", danger
+    elif ext_hit or token_hit or chain_hit:
+        verdict_text, verdict_fn = "ENCODED SECRET MATERIAL OF INTEREST", warn
+    elif ctf_hit:
+        verdict_text, verdict_fn = "CTF FLAG MARKERS IN DECODED CONTENT", warn
+    elif summary.matches > 0:
+        verdict_text, verdict_fn = "REVERSIBLE ENCODED CONTENT FOUND", warn
+    else:
+        verdict_text, verdict_fn = "NO REVERSIBLE SECRETS DETECTED", ok
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    lines.append(verdict_fn(f"[VERDICT] {verdict_text}"))
+    for reason in reasons:
+        lines.append(warn(f"- {reason}"))
+
+    # ---- Decoded findings (default-visible — this is the deliverable) ----
+    # Previously gated behind -v, so the default view showed only counters and
+    # the analyst never saw the decoded cleartext. Show the top findings by
+    # default; -v shows all of them.
+    if summary.hits:
+        lines.append(SUBSECTION_BAR)
+        shown = summary.hits if verbose else summary.hits[: _limit_value(15)]
+        lines.append(header(f"Decoded Findings ({len(shown)} of {len(summary.hits)})"))
+        rows = [["Type", "Encoded", "Cleartext", "Location", "Src", "Dst", "Note"]]
+        for hit in shown:
+            loc_parts = [f"pkt {hit.packet_number}"]
+            if hit.offset is not None:
+                loc_parts.append(f"@{hit.offset}")
+            location = " ".join(loc_parts)
+            src = hit.src_ip
+            dst = hit.dst_ip
+            if hit.src_port is not None:
+                src = f"{src}:{hit.src_port}"
+            if hit.dst_port is not None:
+                dst = f"{dst}:{hit.dst_port}"
+            rows.append(
+                [
+                    hit.kind,
+                    _truncate_text(hit.encoded, 48),
+                    _truncate_text(hit.decoded, 64),
+                    location,
+                    src,
+                    dst,
+                    _truncate_text(hit.note or "-", 28),
+                ]
+            )
+        lines.append(_format_table(rows))
+        if not verbose and len(summary.hits) > len(shown):
+            lines.append(
+                muted(
+                    f"... {len(summary.hits) - len(shown)} more finding(s); use -v for all."
+                )
+            )
+
+    # ---- Threat hypotheses ----------------------------------------------
+    if summary.threat_hypotheses:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Threat Hypotheses"))
+        for hyp in summary.threat_hypotheses:
+            conf = str(hyp.get("confidence", "?"))
+            text = str(hyp.get("hypothesis", "-"))
+            ev = hyp.get("evidence", "")
+            lines.append(warn(f"- [{conf}] {text} (evidence={ev})"))
+
+    # ---- OT / CTF context ------------------------------------------------
+    if summary.ot_findings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OT/ICS Markers in Decoded Content"))
+        for item in summary.ot_findings[: _limit_value(15)]:
+            lines.append(muted(f"- {item}"))
+    if summary.ctf_indicators:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("CTF Flag / Challenge Markers"))
+        for item in summary.ctf_indicators[: _limit_value(15)]:
+            lines.append(muted(f"- {item}"))
+
+    # ---- Deterministic checks -------------------------------------------
+    _render_deterministic_checks(
+        lines,
+        summary,
+        "Deterministic Secret Security Checks",
+        [
+            ("cleartext_credentials_in_decoded_secrets", "Decoded Cleartext Credentials"),
+            ("private_key_or_cryptographic_material", "Private Key / Crypto Material"),
+            ("token_or_session_material", "Token / Session Material"),
+            ("command_execution_or_lolbin_in_secrets", "Encoded Command Execution / LOLBin"),
+            ("c2_or_exfil_markers_in_decoded_payloads", "C2 / Exfil Markers"),
+            ("external_public_secret_flow", "Secrets to Public Internet"),
+            ("multi_stage_decoding_chain", "Multi-stage Decoding Chain"),
+            ("high_reuse_or_staging_pattern", "High Reuse / Staging Pattern"),
+            ("ot_ics_secret_transport_or_context", "OT/ICS Secret Transport / Context"),
+            ("ctf_flag_or_challenge_markers", "CTF Flag / Challenge Markers"),
+        ],
+    )
+
+    # ---- Aggregated counters (context, last) ----------------------------
     if (
         summary.kind_counts
         or summary.top_sources
@@ -16935,7 +17259,7 @@ def render_secrets_summary(summary: SecretsSummary, *, verbose: bool = False) ->
         or summary.protocol_counts
     ):
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Aggregated Counters"))
+        lines.append(header("Aggregated Counters"))
 
         if summary.kind_counts:
             lines.append(header("Kind Counts"))
@@ -16955,53 +17279,6 @@ def render_secrets_summary(summary: SecretsSummary, *, verbose: bool = False) ->
 
     if summary.truncated:
         lines.append(warn(f"[WARN] Showing first {len(summary.hits)} matches."))
-
-    if verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Findings"))
-        if not summary.hits:
-            lines.append(muted("No reversible obfuscated secrets detected."))
-        else:
-            rows = [
-                [
-                    "Type",
-                    "Secret",
-                    "Cleartext",
-                    "Location",
-                    "Src",
-                    "Dst",
-                    "Proto",
-                    "Note",
-                ]
-            ]
-            for hit in summary.hits:
-                secret_value = hit.encoded
-                clear_value = hit.decoded
-                loc_parts = [f"pkt {hit.packet_number}"]
-                if hit.offset is not None:
-                    loc_parts.append(f"@{hit.offset}")
-                if hit.ts is not None:
-                    loc_parts.append(format_ts(hit.ts))
-                location = " ".join(loc_parts)
-                src = hit.src_ip
-                dst = hit.dst_ip
-                if hit.src_port is not None:
-                    src = f"{src}:{hit.src_port}"
-                if hit.dst_port is not None:
-                    dst = f"{dst}:{hit.dst_port}"
-                rows.append(
-                    [
-                        hit.kind,
-                        secret_value,
-                        clear_value,
-                        location,
-                        src,
-                        dst,
-                        hit.protocol,
-                        _truncate_text(hit.note or "-", 40),
-                    ]
-                )
-            lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines)
@@ -17144,7 +17421,6 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
         ),
     ]
 
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for label_text, evidence_items in checks:
         lines.append(label(label_text))
         if evidence_items:
@@ -17166,39 +17442,12 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
                 else:
                     ev = str(item)
                 lines.append(muted(f"- {_redact_in_text(ev)}"))
-
-            if label_text in {
-                "Weak Signature Algorithms",
-                "Issuer/SAN Impersonation",
-                "Fingerprint/Serial Reuse",
-            }:
-                matrix_rows.append(
-                    [label_text, "High", "High", f"{len(evidence_items)} signal(s)"]
-                )
-            elif label_text in {
-                "Chain/Trust Gaps",
-                "EKU/KeyUsage Mismatch",
-                "Name/SAN Mismatch",
-                "Validity Outliers",
-            }:
-                matrix_rows.append(
-                    [label_text, "Medium", "Medium", f"{len(evidence_items)} signal(s)"]
-                )
-            else:
-                matrix_rows.append(
-                    [label_text, "Low", "Low", f"{len(evidence_items)} signal(s)"]
-                )
         else:
             lines.append(
                 ok(
                     f"No, there is no strong evidence for {label_text.lower()} in this capture."
                 )
             )
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Certificate Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     endpoint_profiles = list(getattr(summary, "endpoint_profiles", []) or [])
     if endpoint_profiles:
@@ -17390,7 +17639,6 @@ def render_health_summary(summary: HealthSummary) -> str:
         ("zone_policy_drift", "Peer Trust Zoning Drift"),
         ("evidence_provenance", "Evidence Provenance"),
     ]
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for key, label_text in check_labels:
         evidence_items = [
             str(v) for v in list(checks.get(key, []) or []) if str(v).strip()
@@ -17404,36 +17652,12 @@ def render_health_summary(summary: HealthSummary) -> str:
             )
             for item in evidence_items[: _limit_value(6)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-            risk = (
-                "High"
-                if key
-                in {
-                    "udp_reflection_amplification",
-                    "snmp_exposure_risk",
-                    "ot_cycle_instability",
-                    "sequence_degradation_chain",
-                }
-                else "Medium"
-            )
-            conf = (
-                "High"
-                if key in {"snmp_exposure_risk", "evidence_provenance"}
-                else "Medium"
-            )
-            matrix_rows.append(
-                [label_text, risk, conf, f"{len(evidence_items)} signal(s)"]
-            )
         else:
             lines.append(
                 ok(
                     f"No, there is no strong evidence for {label_text.lower()} in this capture."
                 )
             )
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Health Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     sequence_rows = list(getattr(summary, "sequence_findings", []) or [])
     if sequence_rows:
@@ -18178,7 +18402,6 @@ def render_compromised_summary(
         ("benign_automation_likely", "Likely Benign Automation"),
     ]
 
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for key, label_text in check_labels:
         evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
         evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
@@ -18190,40 +18413,20 @@ def render_compromised_summary(
                         f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
                     )
                 )
-                risk = "Low"
-                conf_level = "Medium"
             else:
                 lines.append(
                     warn(
                         f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
                     )
                 )
-                risk = (
-                    "High"
-                    if key in {"multi_stage_sequence", "high_confidence_ioc"}
-                    else "Medium"
-                )
-                conf_level = (
-                    "High"
-                    if key in {"multi_stage_sequence", "high_confidence_ioc"}
-                    else "Medium"
-                )
             for item in evidence_items[: _limit_value(8 if verbose else 5)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-            matrix_rows.append(
-                [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
-            )
         else:
             lines.append(
                 ok(
                     f"No, there is no strong evidence for {label_text.lower()} in this capture."
                 )
             )
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Compromise Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     priority_rows = list(getattr(summary, "host_priority", []) or [])
     if priority_rows:
@@ -18396,17 +18599,12 @@ def render_hosts_summary(
     # risk matrix on every capture. Render only when actually populated.
     checks = getattr(summary, "deterministic_checks", {}) or {}
     check_labels = [
-        ("host_role_impersonation_or_drift", "Host Role Impersonation or Drift"),
-        ("east_west_lateral_fanout", "East-West Lateral Fan-out"),
         ("service_exposure_risk", "Service Exposure Risk"),
         ("identity_drift_or_collision", "Identity Drift or Collision"),
-        ("protocol_consistency_mismatch", "Protocol Consistency Mismatch"),
         ("boundary_cross_zone_exposure", "Boundary Cross-Zone Exposure"),
-        ("beacon_or_periodic_profile", "Beacon or Periodic Profile"),
         ("ot_it_boundary_crossing", "OT/IT Boundary Crossing"),
         ("evidence_provenance", "Evidence Provenance"),
     ]
-    matrix_items = list(getattr(summary, "risk_matrix", []) or [])
     _has_checks = any(
         [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
         for key, _ in check_labels
@@ -18453,37 +18651,6 @@ def render_hosts_summary(
             )
             for value in values[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(value)}"))
-
-    if matrix_items or _has_checks:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Host Risk Matrix"))
-        matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
-        if matrix_items:
-            for item in matrix_items[: _limit_value(12)]:
-                matrix_rows.append(
-                    [
-                        str(item.get("category", "-")),
-                        str(item.get("risk", "-")),
-                        str(item.get("confidence", "-")),
-                        str(item.get("evidence", "-")),
-                    ]
-                )
-        else:
-            for key, label_text in check_labels[:6]:
-                evidence_count = len(
-                    [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
-                )
-                matrix_rows.append(
-                    [
-                        label_text,
-                        "Medium" if evidence_count else "None",
-                        "Medium" if evidence_count else "Low",
-                        str(evidence_count)
-                        if evidence_count
-                        else "No matching detections",
-                    ]
-                )
-        lines.append(_format_table(matrix_rows))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Host Table"))
@@ -18782,30 +18949,6 @@ def render_hostname_summary(
             _format_kv("Evidence Rows", str(sum(item.count for item in summary.findings)))
         )
 
-        # The hostname-abuse assessment (verdict / deterministic checks / risk
-        # matrix) is sourced from an enrichment builder that is currently
-        # disabled, so it was printing a fixed "NO STRONG SIGNAL" verdict plus
-        # nine "no evidence" check lines and an all-empty risk matrix on every
-        # capture -- pure noise that implied the host names had been assessed
-        # for spoofing/abuse. These render only when the assessment is populated.
-        checks = getattr(summary, "deterministic_checks", {}) or {}
-        check_labels = [
-            ("hostname_collision_or_spoofing", "Hostname Collision or Spoofing"),
-            ("ip_alias_or_fronting_anomaly", "IP Alias or Fronting Anomaly"),
-            ("cross_protocol_corroboration", "Cross-Protocol Corroboration"),
-            ("hostname_temporal_drift", "Hostname Temporal Drift"),
-            ("protocol_identity_mismatch", "Protocol Identity Mismatch"),
-            ("ad_naming_privilege_abuse", "AD/Privileged Naming Abuse"),
-            ("suspicious_naming_pattern", "Suspicious Naming Pattern"),
-            ("boundary_leak_or_cross_zone", "Boundary Leakage/Cross-Zone"),
-            ("evidence_provenance", "Evidence Provenance"),
-        ]
-        matrix_items = list(getattr(summary, "risk_matrix", []) or [])
-        _has_checks = any(
-            [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
-            for key, _ in check_labels
-        )
-
         if summary.analyst_verdict:
             verdict = str(summary.analyst_verdict)
             confidence = str(
@@ -18829,59 +18972,6 @@ def render_hostname_summary(
                 lines.append(muted("Why confidence:"))
                 for reason in reasons[: _limit_value(8)]:
                     lines.append(muted(f"- {_redact_in_text(reason)}"))
-
-        if _has_checks:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Deterministic Hostname Security Checks"))
-            for key, label_text in check_labels:
-                values = [
-                    str(v) for v in list(checks.get(key, []) or []) if str(v).strip()
-                ]
-                if not values:
-                    continue
-                lines.append(label(label_text))
-                lines.append(
-                    warn(
-                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
-                    )
-                )
-                for value in values[: _limit_value(8)]:
-                    lines.append(muted(f"- {_redact_in_text(value)}"))
-
-        if matrix_items or _has_checks:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Hostname Risk Matrix"))
-            matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
-            if matrix_items:
-                for item in matrix_items[: _limit_value(12)]:
-                    matrix_rows.append(
-                        [
-                            str(item.get("category", "-")),
-                            str(item.get("risk", "-")),
-                            str(item.get("confidence", "-")),
-                            str(item.get("evidence", "-")),
-                        ]
-                    )
-            else:
-                for key, label_text in check_labels[:8]:
-                    evidence_count = len(
-                        [
-                            str(v)
-                            for v in list(checks.get(key, []) or [])
-                            if str(v).strip()
-                        ]
-                    )
-                    matrix_rows.append(
-                        [
-                            label_text,
-                            "Medium" if evidence_count else "None",
-                            "Medium" if evidence_count else "Low",
-                            str(evidence_count)
-                            if evidence_count
-                            else "No matching detections",
-                        ]
-                    )
-            lines.append(_format_table(matrix_rows))
 
         if summary.protocol_counts:
             lines.append(SUBSECTION_BAR)
@@ -19188,6 +19278,19 @@ def render_hostdetails_summary(
         mac_parts.append(f"{mac} ({vendor})" if vendor and vendor != "-" else mac)
     lines.append(_format_kv("MAC Address", ", ".join(mac_parts) if mac_parts else "-"))
     lines.append(_format_kv("Inferred OS / Device", str(summary.operating_system)))
+    host_uas = list(getattr(summary, "user_agents", []) or [])
+    if host_uas:
+        if len(host_uas) == 1:
+            lines.append(_format_kv("Client User-Agent", _truncate_text(host_uas[0], 90)))
+        else:
+            lines.append(
+                _format_kv(
+                    "Client User-Agents",
+                    f"{len(host_uas)} distinct (e.g. {_truncate_text(host_uas[0], 72)})",
+                )
+            )
+            for ua in host_uas[1 : _limit_value(6)]:
+                lines.append(muted(f"  - {_truncate_text(ua, 90)}"))
     user_evidence = list(getattr(summary, "user_evidence", []) or [])
     if user_evidence:
         user_text = ", ".join(
@@ -19206,6 +19309,75 @@ def render_hostdetails_summary(
         lines.append(_format_kv("Port Filter", str(summary.port_filter)))
     if str(getattr(summary, "search_query", "") or "").strip():
         lines.append(_format_kv("Search Filter", str(summary.search_query)))
+
+    # ---- Observed Usernames (identities attributed to this host) ------------
+    # Accounts recovered for the host across every identity-bearing protocol:
+    # NetBIOS <03>, Kerberos cname, NTLM, HTTP Basic/forms, FTP, SMTP/POP3/IMAP,
+    # Telnet, SMB, etc. Consolidate the source method(s) per (username, domain).
+    # Always render the section (even when empty) so the analyst can see the
+    # check ran — "not shown" was being read as "broken".
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Observed Usernames"))
+    grouped: dict[tuple[str, str], dict[str, object]] = {}
+    for u in user_evidence:
+        uname = str(u.get("username", "")).strip()
+        if not uname:
+            continue
+        dom = str(u.get("domain", "")).strip()
+        entry = grouped.setdefault(
+            (uname.lower(), dom.lower()),
+            {"username": uname, "domain": dom, "methods": [], "where": ""},
+        )
+        method = str(u.get("method", "")).strip()
+        methods = entry["methods"]
+        if isinstance(methods, list) and method and method not in methods:
+            methods.append(method)
+        if not entry["where"]:
+            entry["where"] = str(u.get("location", "")).strip()
+    if grouped:
+        lines.append(
+            muted(
+                "Accounts recovered for this host across identity-bearing "
+                "protocols (NetBIOS / Kerberos / NTLM / HTTP / FTP / mail / "
+                "Telnet / SMB)."
+            )
+        )
+        rows = [["Username", "Domain", "Source Method(s)", "Where"]]
+        for entry in sorted(
+            grouped.values(), key=lambda e: str(e["username"]).lower()
+        )[: _limit_value(40)]:
+            methods = entry["methods"]
+            method_text = (
+                ", ".join(str(m) for m in methods)
+                if isinstance(methods, list)
+                else "-"
+            )
+            rows.append(
+                [
+                    str(entry["username"]),
+                    str(entry["domain"]) or "-",
+                    method_text or "-",
+                    _truncate_text(str(entry["where"]), 44) or "-",
+                ]
+            )
+        lines.append(_format_table(rows))
+    else:
+        # Distinguish "feature ran, nothing to find" from a bug. Point the
+        # analyst at the host/computer identity that IS available.
+        host_names = [str(h) for h in (getattr(summary, "hostnames", []) or []) if str(h).strip()]
+        note = (
+            "No user accounts recovered for this host — no authenticated "
+            "protocol carried a username (NetBIOS <03> logged-on user, Kerberos "
+            "cname, NTLM, HTTP/FTP/mail/Telnet/SMB credentials)."
+        )
+        lines.append(muted(note))
+        if host_names:
+            lines.append(
+                muted(
+                    "This capture only exposes the host/computer name "
+                    f"({', '.join(host_names[: _limit_value(3)])}), not a user account."
+                )
+            )
 
     # ---- Host Assessment (triage verdict, lead with it) --------------------
     host_detections = list(getattr(summary, "detections", []) or [])
@@ -19572,19 +19744,19 @@ def render_hostdetails_summary(
     remote_agg: dict[tuple[str, str, str], dict[str, object]] = {}
     sorted_rows: list[tuple[tuple[str, str, str], dict[str, object]]] = []
     for conv in summary.conversations or []:
-        if str(conv.get("direction", "")).lower() != "outbound":
-            continue
         peer = str(conv.get("peer", "") or "")
         if not peer or peer == target_ip:
             continue
         proto = str(conv.get("protocol", "-") or "-")
-        ports = [
-            p.strip()
-            for p in str(conv.get("ports", "") or "").split(",")
-            if p.strip().isdigit()
-        ]
+        # Only the peer's confirmed service ports count as a remote service this
+        # host connected to. This is role-aware (handshake-derived), so a host
+        # that merely *received* inbound connections — its own responses share
+        # the same IP-pair conversation — is not mislabeled as having reached
+        # out, and the peer's/host's ephemeral source ports are never listed.
+        service_ports = conv.get("remote_service_ports") or []
+        ports = [str(int(p)) for p in service_ports]
         if not ports:
-            ports = ["-"]
+            continue
         for port in ports:
             service_name = COMMON_PORTS.get(int(port), "-") if port.isdigit() else "-"
             key = (peer, port, proto)
@@ -19817,6 +19989,52 @@ def render_hostdetails_summary(
     else:
         lines.append(muted("No downloaded files attributed to this host."))
 
+    # ---- Host Activity Timeline (the chronological forensic record) --------
+    # The single most useful IR/forensics artifact for a host: what happened,
+    # in order. Built from the per-host timeline events already collected.
+    timeline_events = [
+        ev
+        for ev in (getattr(summary, "timeline_events", []) or [])
+        if isinstance(ev, dict)
+    ]
+    timeline_events.sort(
+        key=lambda ev: (
+            ev.get("ts") if isinstance(ev.get("ts"), (int, float)) else float("inf")
+        )
+    )
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Host Activity Timeline"))
+    if timeline_events:
+        event_cap = None if verbose else _limit_value(40)
+        shown = timeline_events if event_cap is None else timeline_events[:event_cap]
+        rows = [["Time", "Category", "Event", "Detail"]]
+        for ev in shown:
+            rows.append(
+                [
+                    format_ts(ev.get("ts")),
+                    _truncate_text(str(ev.get("category", "-") or "-"), 16),
+                    _truncate_text(
+                        _redact_in_text(str(ev.get("summary", "-") or "-")), 40
+                    ),
+                    _truncate_text(
+                        _highlight_public_ips(
+                            _redact_in_text(str(ev.get("details", "-") or "-"))
+                        ),
+                        66,
+                    ),
+                ]
+            )
+        lines.append(_format_table(rows))
+        if event_cap is not None and len(timeline_events) > event_cap:
+            lines.append(
+                muted(
+                    f"... {len(timeline_events) - event_cap} more event(s); use -v or "
+                    f"--timeline -ip {target_ip} for the full chronology."
+                )
+            )
+    else:
+        lines.append(muted("No timeline events were attributed to this host."))
+
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
 
@@ -19961,18 +20179,12 @@ def render_timeline_summary(
         return muted(line)
 
     check_labels = [
-        ("recon_to_access_sequence", "Recon to Access Sequence"),
         ("access_to_execution_sequence", "Access to Execution Sequence"),
-        ("execution_to_c2_or_exfil", "Execution to C2 or Exfil Sequence"),
-        ("ot_control_after_discovery", "OT Control After Discovery"),
-        ("beaconing_periodicity", "Beaconing Periodicity"),
-        ("authentication_abuse", "Authentication Abuse"),
-        ("lateral_movement_fanout", "Lateral Movement Fan-Out"),
-        ("exfiltration_chain", "Exfiltration Chain"),
+        ("remote_execution_tooling", "Remote Execution Tooling"),
+        ("cleartext_remote_admin", "Cleartext Remote Admin"),
         ("ot_impact_signal", "OT Impact Signal"),
         ("evidence_provenance", "Evidence Provenance"),
     ]
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for key, label_text in check_labels:
         evidence_items = [
             str(v) for v in list(checks.get(key, []) or []) if str(v).strip()
@@ -19984,35 +20196,12 @@ def render_timeline_summary(
             )
             for item in evidence_items[: _limit_value(8 if verbose else 5)]:
                 lines.append(_style_timeline_artifact_line(item))
-            risk = (
-                "High"
-                if key
-                in {
-                    "execution_to_c2_or_exfil",
-                    "exfiltration_chain",
-                    "ot_impact_signal",
-                }
-                else "Medium"
-            )
-            conf = (
-                "High"
-                if key in {"execution_to_c2_or_exfil", "evidence_provenance"}
-                else "Medium"
-            )
-            matrix_rows.append(
-                [label_text, risk, conf, f"{len(evidence_items)} signal(s)"]
-            )
         else:
             lines.append(
                 ok(
                     f"No, there is no strong evidence for {label_text.lower()} in this capture."
                 )
             )
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Timeline Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     sequence_rows = list(getattr(summary, "sequence_timeline", []) or [])
     if sequence_rows:
@@ -21042,6 +21231,18 @@ def render_ntlm_summary(summary: "NtlmAnalysis") -> str:
                 lines.append(line_str)
 
     lines.append(SECTION_BAR)
+    _render_deterministic_checks(
+        lines, summary, "Deterministic NTLM Security Checks", [
+            ("ntlmv1_legacy_authentication", "NTLMv1 Legacy Authentication"),
+            ("anonymous_or_null_session_attempts", "Anonymous/Null Session Attempts"),
+            ("auth_failure_burst", "Authentication Failure Burst"),
+            ("credential_reuse_spread", "Credential Reuse Spread"),
+            ("cross_service_ntlm_usage", "Cross-Service NTLM Usage"),
+            ("high_volume_ntlm_source", "High-Volume NTLM Source"),
+            ("incomplete_handshake_patterns", "Incomplete Handshake Patterns"),
+            ("public_endpoint_ntlm_activity", "Public Endpoint NTLM Activity"),
+        ]
+    )
     return _finalize_output(lines)
 
 
@@ -21368,6 +21569,18 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
             lines.append(f"  - {_truncate_text(value, 120)}")
 
     lines.append(SECTION_BAR)
+    _render_deterministic_checks(
+        lines, summary, "Deterministic NetBIOS Security Checks", [
+            ("nbns_spoofing_or_conflict", "NBNS Spoofing/Name Conflict"),
+            ("nbns_scan_or_probe_fanout", "NBNS Scan/Probe Fan-out"),
+            ("nbns_broadcast_storm", "NBNS Broadcast Storm"),
+            ("netbios_beaconing_pattern", "NetBIOS Beaconing Pattern"),
+            ("role_claim_anomaly", "Role-Claim Anomaly"),
+            ("smb_auth_abuse_over_netbios", "SMB Auth Abuse over NetBIOS"),
+            ("smb_write_exfil_over_netbios", "SMB Write/Exfil over NetBIOS"),
+            ("public_netbios_exposure", "Public NetBIOS Exposure"),
+        ]
+    )
     return _finalize_output(lines)
 
 
@@ -21513,65 +21726,34 @@ def render_arp_summary(
             )
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Threat & Compromise Overview"))
-    lines.append(_format_kv("Threat Categories", str(sum(summary.threats.values()))))
-    lines.append(_format_kv("Anomalies", str(len(summary.anomalies))))
-    lines.append(
-        _format_kv(
-            "High Severity Anomalies",
-            str(
-                sum(
-                    1
-                    for item in summary.anomalies
-                    if item.severity in {"HIGH", "CRITICAL"}
-                )
-            ),
-        )
-    )
-    lines.append(
-        _format_kv(
-            "Benign Indicators",
-            str(sum(getattr(summary, "benign_indicators", Counter()).values())),
-        )
-    )
-    lines.append(
-        _format_kv("Gateway Candidate", getattr(summary, "gateway_ip", "-") or "-")
-    )
-
-    lines.append(SUBSECTION_BAR)
     lines.append(header("Deterministic ARP Security Checks"))
 
-    def _arp_signal(*tokens: str) -> list[str]:
-        matches: list[str] = []
-        lowered_tokens = tuple(token.lower() for token in tokens)
-        for threat, count in summary.threats.items():
-            text = f"{threat}: {count}"
-            blob = text.lower()
-            if any(token in blob for token in lowered_tokens):
-                matches.append(text)
-        for item in summary.anomalies:
-            text = f"{item.title}: {item.description}"
-            blob = text.lower()
-            if any(token in blob for token in lowered_tokens):
-                matches.append(text)
-        return matches[: _limit_value(4)]
-
-    checks: list[tuple[str, tuple[str, ...]]] = [
-        ("Gateway ARP Integrity", ("gateway", "mac flip", "integrity")),
-        ("Poisoning Pair Pattern", ("poisoning pair", "claims", "high-value ips")),
-        ("Unsolicited Reply Abuse", ("unsolicited", "poisoning indicators")),
-        ("ARP Recon/Sweep Activity", ("sweep", "recon")),
-        ("ARP Flood/Storm", ("flood", "storm", "high arp traffic")),
-        ("Duplicate IP Ownership", ("ip/mac conflict", "multiple macs")),
-        ("Proxy ARP Misuse", ("proxy arp", "proxy arp-like")),
-        ("Likely Benign Failover", ("failover", "virtual mac")),
+    # Render the analyzer's own computed deterministic checks (authoritative,
+    # with per-finding evidence) rather than re-deriving via free-text keyword
+    # matching on threats/anomalies, which both under-covered the categories and
+    # discarded the evidence the ARP analyzer already built.
+    arp_checks = getattr(summary, "deterministic_checks", {}) or {}
+    arp_check_labels = [
+        ("gateway_integrity", "Gateway ARP Integrity"),
+        ("poisoning_pair_pattern", "Poisoning Pair Pattern"),
+        ("unsolicited_reply_abuse", "Unsolicited Reply Abuse"),
+        ("broadcast_unsolicited_reply", "Broadcast Unsolicited Replies"),
+        ("rapid_gateway_mac_flip", "Rapid Gateway MAC Flip"),
+        ("recon_to_poison_progression", "Recon-to-Poison Progression"),
+        ("arp_recon_sweep", "ARP Recon/Sweep Activity"),
+        ("probe_spray", "ARP Probe Spray"),
+        ("arp_storm_flood", "ARP Flood/Storm"),
+        ("duplicate_ip_ownership", "Duplicate IP Ownership"),
+        ("proxy_arp_misuse", "Proxy ARP Misuse"),
+        ("timing_automation_signal", "Timing/Automation Signal"),
+        ("likely_benign_failover", "Likely Benign Failover"),
     ]
-
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     cleared_arp: list[str] = []
     fired_arp = False
-    for label_text, tokens in checks:
-        evidence = _arp_signal(*tokens)
+    for key, label_text in arp_check_labels:
+        evidence = [
+            str(v) for v in list(arp_checks.get(key, []) or []) if str(v).strip()
+        ]
         if evidence:
             fired_arp = True
             lines.append(label(label_text))
@@ -21580,28 +21762,15 @@ def render_arp_summary(
                     f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
                 )
             )
-            for item in evidence:
+            for item in evidence[: _limit_value(6)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
-            high_hits = sum(
-                1
-                for item in evidence
-                if "high" in item.lower() or "poison" in item.lower()
-            )
-            risk = "High" if high_hits > 0 else "Medium"
-            conf = "High" if len(evidence) >= 2 else "Medium"
-            matrix_rows.append([label_text, risk, conf, f"{len(evidence)} signal(s)"])
         else:
             cleared_arp.append(label_text)
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
-    # Collapse the cleared checks into one line (full grid is in the Risk Matrix).
+    # Collapse the cleared checks into one line.
     if not fired_arp:
         lines.append(ok("No ARP attack checks crossed threshold in this capture."))
     elif cleared_arp:
         lines.append(muted(f"Cleared (no evidence): {', '.join(cleared_arp)}"))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("ARP Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     if getattr(summary, "gateway_mac_candidates", None):
         lines.append(SUBSECTION_BAR)
@@ -22002,7 +22171,6 @@ def render_dhcp_summary(
         ("likely_benign_failover_context", "Likely Benign Failover Context"),
     ]
 
-    matrix_rows = [["Category", "Risk", "Confidence", "Evidence"]]
     for key, label_text in check_labels:
         evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
         evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
@@ -22014,34 +22182,11 @@ def render_dhcp_summary(
                         f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
                     )
                 )
-                matrix_rows.append(
-                    [label_text, "Low", "Medium", f"{len(evidence_items)} signal(s)"]
-                )
             else:
                 lines.append(
                     warn(
                         f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
                     )
-                )
-                if key in {
-                    "transaction_integrity_violation",
-                    "option_tampering_router_dns_routes_wpad_pxe",
-                    "lease_conflict_duplicate_assignment",
-                }:
-                    risk = "High"
-                    conf_level = "High"
-                elif key in {
-                    "rogue_competing_server_evidence",
-                    "starvation_exhaustion_behavior",
-                    "relay_abuse_option82",
-                }:
-                    risk = "Medium"
-                    conf_level = "Medium"
-                else:
-                    risk = "Low"
-                    conf_level = "Low"
-                matrix_rows.append(
-                    [label_text, risk, conf_level, f"{len(evidence_items)} signal(s)"]
                 )
             for item in evidence_items[: _limit_value(8)]:
                 lines.append(muted(f"- {_redact_in_text(item)}"))
@@ -22051,11 +22196,6 @@ def render_dhcp_summary(
                     f"No, there is no strong evidence for {label_text.lower()} in this capture."
                 )
             )
-            matrix_rows.append([label_text, "None", "Low", "No matching detections"])
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("DHCP Risk Matrix"))
-    lines.append(_format_table(matrix_rows))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Message Type Statistics"))
@@ -23403,13 +23543,24 @@ def render_dnp3_rollup(summaries: Iterable["Dnp3Analysis"]) -> str:
 _OT_ATTACK_KEYWORDS = [
     ("program download", "T0843 Program Download"),
     ("program upload", "T0845 Program Upload"),
+    # Generic "program transfer" title (S7) — a transfer TO the PLC is the
+    # ladder-logic injection vector (Stuxnet). Map to Program Download.
+    ("program transfer", "T0843 Program Download"),
     ("download", "T0843 Program Download"),
     ("upload", "T0845 Program Upload"),
     ("firmware", "T0857 System Firmware"),
+    # Generic "CPU state change"/"state change" title (S7 PLCStop/Start) =
+    # device restart/shutdown / denial of control.
+    ("cpu state change", "T0816 Device Restart/Shutdown"),
+    ("state change", "T0816 Device Restart/Shutdown"),
+    ("reinitialize", "T0816 Device Restart/Shutdown"),  # BACnet ReinitializeDevice
     ("restart", "T0816 Device Restart/Shutdown"),
     ("reboot", "T0816 Device Restart/Shutdown"),
     ("stop", "T0816 Device Restart/Shutdown"),
     ("shutdown", "T0816 Device Restart/Shutdown"),
+    # BACnet DeviceCommunicationControl (disable comms) = denial of service.
+    ("communication control", "T0814 Denial of Service"),
+    ("denial of service", "T0814 Denial of Service"),
     ("key switch", "T0858 Change Operating Mode"),
     ("operating mode", "T0858 Change Operating Mode"),
     ("mode change", "T0858 Change Operating Mode"),
@@ -23528,6 +23679,9 @@ def _render_industrial_summary(
     lines.append(SECTION_BAR)
     lines.append(header(f"{title.upper()} ANALYSIS :: {summary.path.name}"))
     lines.append(SECTION_BAR)
+    # Triage lead, consistent with the dedicated OT renderers (modbus/enip/cip/
+    # s7/goose/...). Silent on benign captures; fires only on warning+ anomalies.
+    _render_ot_verdict(lines, title, anomalies)
 
     if errors:
         lines.append(SUBSECTION_BAR)
@@ -24801,6 +24955,12 @@ def render_routing_summary(
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"ROUTING ANALYSIS :: {summary.path.name}"))
+    _render_protocol_verdict(
+        lines,
+        label="Routing",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(SECTION_BAR)
 
     lines.append(_format_kv("Packets", str(summary.total_packets)))
@@ -25124,6 +25284,12 @@ def render_sv_summary(summary: SvSummary, verbose: bool = False) -> str:
 
 def render_lldp_dcp_summary(summary: LldpDcpSummary, verbose: bool = False) -> str:
     lines = [header("LLDP/DCP ANALYSIS")]
+    _render_protocol_verdict(
+        lines,
+        label="LLDP/DCP",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(_format_kv("LLDP Packets", str(summary.lldp_packets)))
     lines.append(_format_kv("DCP Packets", str(summary.dcp_packets)))
     lines.append(_format_kv("System Names", _format_counter(summary.system_names, 5)))
@@ -25172,6 +25338,12 @@ def render_lldp_dcp_summary(summary: LldpDcpSummary, verbose: bool = False) -> s
 
 def render_ptp_summary(summary: PtpSummary, verbose: bool = False) -> str:
     lines = [header("PTP ANALYSIS")]
+    _render_protocol_verdict(
+        lines,
+        label="PTP",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(_format_kv("PTP Packets", str(summary.ptp_packets)))
     lines.append(_format_kv("Message Types", _format_counter(summary.msg_types, 6)))
     if getattr(summary, "domain_numbers", None):
@@ -25343,6 +25515,46 @@ def render_streams_summary(summary: StreamSummary, verbose: bool = False) -> str
                 ]
             )
         lines.append(_format_table(rows))
+
+    # `-view`: dump the reassembled HEX/ASCII content of the displayed streams.
+    # The single followed stream (-id) already prints its full payload below, so
+    # skip it here to avoid duplication.
+    if getattr(summary, "view_content", False) and top:
+        followed_id = summary.followed_stream_id
+        stream_cap = None if verbose else 10
+        shown = 0
+        for rec in top:
+            if followed_id and rec.stream_id == followed_id:
+                continue
+            client = bytes(rec.client_payload_preview or b"")
+            server = bytes(rec.server_payload_preview or b"")
+            if not client and not server:
+                continue
+            if stream_cap is not None and shown >= stream_cap:
+                lines.append(
+                    muted(
+                        f"... content view capped at {stream_cap} streams; narrow with "
+                        "-ip/-port/-search/-id or use -v for all."
+                    )
+                )
+                break
+            lines.append(SUBSECTION_BAR)
+            lines.append(
+                header(
+                    f"Stream Content {rec.stream_id} :: "
+                    f"{rec.client_ip}:{rec.client_port} -> {rec.server_ip}:{rec.server_port}"
+                )
+            )
+            lines.append(f"Client -> Server ({len(client)} bytes):")
+            lines.append(hexdump(client) if client else "-")
+            lines.append(f"Server -> Client ({len(server)} bytes):")
+            lines.append(hexdump(server) if server else "-")
+            shown += 1
+        if shown == 0:
+            lines.append(
+                muted("No reassembled stream payload available to view.")
+            )
+
     if summary.followed_stream_id and not selected_stream:
         lines.append(
             muted(f"Selected stream ID not found: {summary.followed_stream_id}")
@@ -25461,89 +25673,567 @@ def render_streams_summary(summary: StreamSummary, verbose: bool = False) -> str
 
 def render_malware_summary(summary: MalwareSummary, verbose: bool = False) -> str:
     lines = [header("MALWARE ANALYSIS")]
-    _render_protocol_verdict(
-        lines, label="Malware", detections=getattr(summary, "detections", None)
-    )
-    lines.append(_format_kv("Packets", str(summary.total_packets)))
-    lines.append(_format_kv("IP Packets", str(summary.analyzed_ip_packets)))
-    lines.append(_format_kv("Total Bytes", str(summary.total_bytes)))
-    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
-    lines.append(_format_kv("Internal Hosts", str(summary.unique_internal_hosts)))
-    lines.append(_format_kv("External Hosts", str(summary.unique_external_hosts)))
-    lines.append(_format_kv("Protocols", _format_counter(summary.protocol_counts, 6)))
-    lines.append(_format_kv("Top Sources", _format_counter(summary.source_counts, 6)))
-    lines.append(
-        _format_kv("Top Destinations", _format_counter(summary.destination_counts, 6))
-    )
-    lines.append(
-        _format_kv("Top Ports", _format_counter(summary.destination_port_counts, 6))
-    )
-    lines.append(_format_kv("Downloads", str(len(summary.suspicious_downloads))))
-    lines.append(_format_kv("Uploads", str(len(summary.suspicious_uploads))))
-    lines.append(_format_kv("Exfil Signals", str(len(summary.suspicious_exfil))))
-    lines.append(_format_kv("Beacon Signals", str(len(summary.suspicious_beacons))))
-    lines.append(_format_kv("C2 Signals", str(len(summary.c2_signals))))
+
+    # ---- Verdict first (the triage answer: is malware present?) -------------
+    verdict = str(getattr(summary, "malware_verdict", "") or "")
+    if verdict:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Malware Verdict"))
+        if verdict.startswith(("MALWARE PRESENT", "LIKELY")):
+            lines.append(danger(verdict))
+        elif verdict.startswith("SUSPICIOUS"):
+            lines.append(warn(verdict))
+        else:
+            lines.append(ok(verdict))
+        lines.append(
+            _format_kv(
+                "Confidence",
+                f"{str(getattr(summary, 'malware_confidence', 'low')).capitalize()} "
+                f"(score={int(getattr(summary, 'malware_score', 0) or 0)})",
+            )
+        )
+        for reason in (getattr(summary, "verdict_reasons", []) or [])[: _limit_value(8)]:
+            lines.append(muted(f"- {_redact_in_text(str(reason))}"))
+
+    # ---- Executable payload downloads (the smoking gun) --------------------
+    execs = list(getattr(summary, "executable_downloads", []) or [])
+    if execs:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Executable Payload Downloads"))
+        rows = [["Filename", "Type", "Served As", "Flow", "SHA-256"]]
+        for item in execs[: _limit_value(12)]:
+            rows.append(
+                [
+                    _truncate_text(str(item.get("file", "-")), 30),
+                    str(item.get("type", "-")),
+                    danger(str(item.get("content_type", "-")))
+                    if item.get("masquerade")
+                    else str(item.get("content_type", "-")),
+                    f"{item.get('src', '-')} -> {item.get('dst', '-')}",
+                    str(item.get("sha256", "") or "-")[:32],
+                ]
+            )
+        lines.append(_format_table(rows))
+        lines.append(
+            muted(
+                "Pivot the SHA-256 on VirusTotal/threat-intel; a content-type "
+                "masquerade (red) is a strong dropper/exploit-kit indicator."
+            )
+        )
+
+    # ---- Exploit-kit / drive-by delivery ----------------------------------
+    delivery = list(getattr(summary, "delivery_signals", []) or [])
+    if delivery:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Exploit-Kit / Delivery Signals"))
+        for item in delivery[: _limit_value(8)]:
+            tgt = str(item.get("target", "") or item.get("proof", ""))
+            host = str(item.get("host", "") or item.get("dst", ""))
+            lines.append(
+                warn(
+                    f"- {item.get('src', '-')} -> {host} {_truncate_text(_redact_in_text(tgt), 90)}"
+                )
+            )
+
+    # ---- C2 / beacon signals ----------------------------------------------
+    c2 = list(getattr(summary, "c2_signals", []) or [])
+    if c2:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Command-and-Control / Beacon Signals"))
+        # Flow-style beacons (from the periodicity heuristic) render as a table;
+        # analyzer-derived C2 detections (HTTP check-ins) render as lines.
+        flow_items = [i for i in c2 if i.get("proto") or i.get("port")]
+        text_items = [i for i in c2 if not (i.get("proto") or i.get("port"))]
+        if flow_items:
+            rows = [["Source", "C2 Dest", "Proto/Port", "Interval", "Jitter", "Packets"]]
+            for item in flow_items[: _limit_value(8)]:
+                rows.append(
+                    [
+                        str(item.get("src", "-")),
+                        _highlight_public_ips(str(item.get("dst", "-"))),
+                        f"{item.get('proto', '-')}/{item.get('port', '-')}",
+                        f"{item.get('avg_interval', '-')}s",
+                        str(item.get("jitter_ratio", "-")),
+                        str(item.get("packets", "-")),
+                    ]
+                )
+            lines.append(_format_table(rows))
+        for item in text_items[: _limit_value(8)]:
+            lines.append(
+                warn(
+                    f"- {_truncate_text(_redact_in_text(str(item.get('summary', '-'))), 80)}"
+                )
+            )
+            detail = str(item.get("details", "") or "")
+            if detail:
+                lines.append(muted(f"  {_truncate_text(_redact_in_text(detail), 110)}"))
+
+    # ---- SMB lateral movement / worm spread -------------------------------
+    lateral = list(getattr(summary, "lateral_signals", []) or [])
+    if lateral:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Lateral Movement / Worm Spread (SMB)"))
+        for item in lateral[: _limit_value(8)]:
+            lines.append(
+                warn(
+                    f"- {item.get('summary', '-')}: "
+                    f"{_truncate_text(_redact_in_text(str(item.get('details', '-'))), 90)}"
+                )
+            )
+
+    # ---- Malicious DNS ----------------------------------------------------
+    dns_sig = list(getattr(summary, "dns_signals", []) or [])
+    if dns_sig:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Malicious / Suspicious DNS"))
+        for item in dns_sig[: _limit_value(8)]:
+            sev = str(item.get("severity", "warning")).upper()
+            lines.append(
+                warn(
+                    f"[{sev}] {_truncate_text(_redact_in_text(str(item.get('summary', '-'))), 100)}"
+                )
+            )
+
+    # ---- Threat-intel matches ---------------------------------------------
+    intel = list(getattr(summary, "intel_hits", []) or [])
+    if intel:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Threat-Intel Matches (known-bad)"))
+        for hit in intel[: _limit_value(8)]:
+            indicator = str(hit.get("indicator", hit.get("ip", hit.get("value", "?"))))
+            src = str(hit.get("source", hit.get("reason", "intel")))
+            lines.append(danger(f"- {_highlight_public_ips(indicator)} — {src}"))
+
+    # ---- Full detections list ---------------------------------------------
     detections = _filtered_detections(summary, verbose)
     if detections:
+        lines.append(SUBSECTION_BAR)
         lines.append(header("Detections"))
-        for item in detections[: _limit_value(8)]:
+        for item in detections[: _limit_value(12)]:
             sev = str(item.get("severity", "info")).upper()
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
             lines.append(warn(f"[{sev}] {summary_text}"))
             if details:
-                lines.append(muted(f"  {details}"))
-    if summary.discoveries:
-        lines.append(header("Findings"))
-        for item in summary.discoveries[: _limit_value(6)]:
-            title = str(item.get("title", "-"))
-            explanation = str(item.get("explanation", ""))
-            lines.append(muted(f"- {title}"))
-            if explanation:
-                lines.append(muted(f"  {_truncate_text(explanation, 120)}"))
+                lines.append(muted(f"  {_truncate_text(_redact_in_text(details), 120)}"))
+
+    # ---- Deterministic malware checks -------------------------------------
+    _render_deterministic_checks(
+        lines,
+        summary,
+        "Deterministic Malware Checks",
+        [
+            ("executable_payload_download", "Executable Payload Download"),
+            ("exploit_kit_delivery", "Exploit-Kit / Drive-by Delivery"),
+            ("threat_intel_match", "Threat-Intel Match"),
+            ("beaconing_or_c2", "Beaconing / C2"),
+            ("lateral_movement_or_worm", "Lateral Movement / Worm Spread"),
+            ("malicious_domain_or_tld", "Malicious Domain / Abuse-TLD"),
+            ("dns_tunnel_or_high_entropy", "DNS Tunnel / High-Entropy"),
+            ("download_activity", "Suspicious Download Activity"),
+            ("upload_exfil_activity", "Upload / Exfil Activity"),
+            ("malware_tooling", "Malware / LOLBIN Tooling"),
+        ],
+    )
+
+    # ---- Traffic context (reference) --------------------------------------
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Traffic Context"))
+    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
+    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+    lines.append(
+        _format_kv(
+            "Internal / External Hosts",
+            f"{summary.unique_internal_hosts} / {summary.unique_external_hosts}",
+        )
+    )
+    lines.append(_format_kv("Protocols", _format_counter(summary.protocol_counts, 6)))
+    lines.append(
+        _format_kv("Top Destinations", _format_counter(summary.destination_counts, 6))
+    )
+    lines.append(
+        _format_kv(
+            "Signal Tally",
+            f"exec={len(execs)} delivery={len(delivery)} c2={len(c2)} "
+            f"dns={len(dns_sig)} intel={len(intel)} "
+            f"downloads={len(summary.suspicious_downloads)} exfil={len(summary.suspicious_exfil)}",
+        )
+    )
     if summary.errors:
         lines.append(_format_kv("Errors", "; ".join(summary.errors[: _limit_value(4)])))
     return _finalize_output(lines)
 
 
+def _email_mitre_techniques(summary: EmailSummary) -> list[str]:
+    """Map observed email findings to ATT&CK technique IDs for triage."""
+    dc = summary.deterministic_checks or {}
+
+    def _has(key: str) -> bool:
+        return bool([v for v in (dc.get(key, []) or []) if str(v).strip()])
+
+    tids: list[str] = []
+
+    def _add(tid: str) -> None:
+        if tid not in tids:
+            tids.append(tid)
+
+    if _has("phishing_indicators") or _has("suspicious_attachments"):
+        _add("T1566.001 Phishing: Spearphishing Attachment")
+    if _has("phishing_urls"):
+        _add("T1566.002 Phishing: Spearphishing Link")
+    if _has("sender_spoofing") or _has("email_auth_failures"):
+        _add("T1566 Phishing")
+        _add("T1656 Impersonation (BEC)")
+    if _has("credential_exposure") or _has("webmail_credential_submission"):
+        _add("T1040 Network Sniffing (cleartext credentials)")
+    if _has("auth_abuse"):
+        _add("T1110 Brute Force")
+    if _has("smtp_recon"):
+        _add("T1087.003 Account Discovery: Email Account")
+    if _has("beaconing"):
+        _add("T1071.003 Application Layer Protocol: Mail Protocols")
+    if _has("exfiltration_signals"):
+        _add("T1048 Exfiltration Over Alternative Protocol")
+    if _has("server_fanout"):
+        _add("T1590/T1046 Mail infrastructure enumeration")
+    return tids
+
+
 def render_email_summary(
     summary: EmailSummary, verbose: bool = False, show_timeline: bool = False
 ) -> str:
-    lines = [header("EMAIL ANALYSIS")]
-    lines.append(_format_kv("Packets", str(summary.total_packets)))
+    limit = _apply_verbose_limit(12)
+    lines: list[str] = []
+    lines.append(SECTION_BAR)
+    lines.append(header(f"EMAIL ANALYSIS :: {summary.path.name}"))
+
+    # ---- Analyst Verdict -------------------------------------------------
+    dc = summary.deterministic_checks or {}
+
+    def _edc(key: str) -> list[str]:
+        return [str(v) for v in (dc.get(key, []) or []) if str(v).strip()]
+
+    e_phish = _edc("phishing_indicators")
+    e_cred = _edc("credential_exposure") + _edc("webmail_credential_submission")
+    e_exfil = _edc("exfiltration_signals")
+    e_attach = _edc("suspicious_attachments")
+    e_authabuse = _edc("auth_abuse")
+    e_fanout = _edc("server_fanout")
+    e_spoof = _edc("sender_spoofing")
+    e_authfail = _edc("email_auth_failures")
+    e_urls = _edc("phishing_urls")
+    e_recon = _edc("smtp_recon")
+    e_beacon = _edc("beaconing")
+    reasons: list[str] = []
+    if e_cred:
+        reasons.append(f"cleartext/webmail credential exposure ({len(e_cred)})")
+    if e_spoof:
+        reasons.append(f"sender spoofing / BEC indicator(s) ({len(e_spoof)})")
+    if e_authfail:
+        reasons.append(f"email-auth (SPF/DKIM/DMARC) failure(s) ({len(e_authfail)})")
+    if e_phish:
+        reasons.append(f"phishing subject indicator(s) ({len(e_phish)})")
+    if e_urls:
+        reasons.append(f"suspicious URL(s) in mail ({len(e_urls)})")
+    if e_attach:
+        reasons.append(f"suspicious attachment(s) ({len(e_attach)})")
+    if e_exfil:
+        reasons.append(f"exfiltration signal(s) ({len(e_exfil)})")
+    if e_beacon:
+        reasons.append(f"mail-protocol beaconing ({len(e_beacon)})")
+    if e_authabuse:
+        reasons.append(f"mail auth abuse ({len(e_authabuse)})")
+    if e_fanout:
+        reasons.append(f"mail-server fan-out ({len(e_fanout)})")
+    if e_recon:
+        reasons.append(f"SMTP user-enumeration recon ({len(e_recon)})")
+    malicious = e_phish or e_exfil or e_attach or e_spoof
+    if malicious:
+        v_text, v_fn = "MALICIOUS EMAIL ACTIVITY", danger
+    elif e_authfail:
+        v_text, v_fn = "EMAIL SPOOFING / AUTH FAILURE — REVIEW", warn
+    elif e_cred:
+        v_text, v_fn = "CLEARTEXT MAIL CREDENTIALS EXPOSED", warn
+    elif e_urls or e_authabuse or e_fanout or e_beacon or e_recon:
+        v_text, v_fn = "SUSPICIOUS EMAIL ACTIVITY", warn
+    elif summary.total_messages > 0 or summary.email_packets > 0:
+        v_text, v_fn = "EMAIL TRAFFIC — NO HIGH-RISK SIGNAL", ok
+    else:
+        v_text, v_fn = "NO EMAIL ACTIVITY DETECTED", ok
+    lines.append(header("Analyst Verdict"))
+    lines.append(v_fn(f"[VERDICT] {v_text}"))
+    for reason in reasons:
+        lines.append(warn(f"- {reason}"))
+    tids = _email_mitre_techniques(summary)
+    if tids:
+        lines.append(muted("  ATT&CK: " + ", ".join(tids)))
+    lines.append(SECTION_BAR)
+
+    if summary.errors:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Errors"))
+        for err in summary.errors[: _limit_value(4)]:
+            lines.append(danger(f"- {err}"))
+
+    # ---- Overview --------------------------------------------------------
+    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
     lines.append(_format_kv("Email Packets", str(summary.email_packets)))
+    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
+    lines.append(_format_kv("Start", format_ts(summary.first_seen)))
+    lines.append(_format_kv("End", format_ts(summary.last_seen)))
+    if summary.duration_seconds is not None:
+        lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
     lines.append(_format_kv("Messages", str(summary.total_messages)))
-    lines.append(_format_kv("Clients", str(summary.unique_clients)))
-    lines.append(_format_kv("Servers", str(summary.unique_servers)))
-    lines.append(_format_kv("Protocols", _format_counter(summary.protocol_counts, 6)))
-    lines.append(_format_kv("Server Ports", _format_counter(summary.server_ports, 6)))
-    lines.append(_format_kv("Top Senders", _format_counter(summary.from_counts, 6)))
-    lines.append(_format_kv("Top Recipients", _format_counter(summary.to_counts, 6)))
-    lines.append(_format_kv("Auth Methods", _format_counter(summary.auth_methods, 6)))
-    if summary.webmail_provider_counts:
+    lines.append(_format_kv("Unique Clients", str(summary.unique_clients)))
+    lines.append(_format_kv("Unique Servers", str(summary.unique_servers)))
+    if summary.protocol_counts:
+        lines.append(_format_kv("Protocols", _format_counter(summary.protocol_counts, 6)))
+
+    if summary.server_ports:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Server Ports"))
+        lines.append(_counter_table(summary.server_ports, "Port", limit=limit))
+
+    if summary.client_counts or summary.server_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Mail Clients & Servers"))
         lines.append(
-            _format_kv(
-                "Webmail Providers", _format_counter(summary.webmail_provider_counts, 6)
+            _format_client_server_table(summary.client_counts, summary.server_counts)
+        )
+
+    if summary.hostname_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Hostnames (HELO/EHLO)"))
+        rows = [["Hostname", "Count"]]
+        for name, count in summary.hostname_counts.most_common(limit):
+            rows.append([_truncate_text(name, 50), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.smtp_command_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("SMTP Commands"))
+        lines.append(_counter_table(summary.smtp_command_counts, "Command", limit=limit))
+    if summary.pop3_command_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("POP3 Commands"))
+        lines.append(_counter_table(summary.pop3_command_counts, "Command", limit=limit))
+    if summary.imap_command_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("IMAP Commands"))
+        lines.append(_counter_table(summary.imap_command_counts, "Command", limit=limit))
+
+    if summary.response_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Response Codes"))
+        lines.append(_counter_table(summary.response_counts, "Code", limit=limit))
+
+    if summary.auth_methods:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Auth Methods"))
+        lines.append(_counter_table(summary.auth_methods, "Method", limit=limit))
+
+    if summary.auth_failure_ip_counts or summary.auth_success_ip_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Auth Outcomes (by client)"))
+        rows = [["Failures", "Successes"]]
+        fail_text = (
+            ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.auth_failure_ip_counts.most_common(
+                    _limit_value(6)
+                )
             )
+            or "-"
         )
-    if summary.attachment_counts:
+        succ_text = (
+            ", ".join(
+                f"{ip}({count})"
+                for ip, count in summary.auth_success_ip_counts.most_common(
+                    _limit_value(6)
+                )
+            )
+            or "-"
+        )
+        rows.append([fail_text, succ_text])
+        lines.append(_format_table(rows))
+
+    # ---- Email authentication (SPF/DKIM/DMARC) ---------------------------
+    if summary.auth_result_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Email Authentication (SPF/DKIM/DMARC)"))
+        rows = [["Verdict", "Count"]]
+        for token, count in summary.auth_result_counts.most_common(_limit_value(10)):
+            verdict = token.split("=", 1)[-1].lower()
+            label = token
+            if verdict in {
+                "fail", "softfail", "none", "hardfail", "permerror", "temperror",
+            }:
+                label = f"{token}  <-- FAIL"
+            rows.append([label, str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.from_counts or summary.to_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Senders / Recipients"))
+        lines.append(_format_kv("Top Senders", _format_counter(summary.from_counts, 8)))
         lines.append(
-            _format_kv("Attachments", _format_counter(summary.attachment_counts, 6))
+            _format_kv("Top Recipients", _format_counter(summary.to_counts, 8))
         )
+
+    if summary.email_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Email Addresses"))
+        rows = [["Email", "Count"]]
+        for name, count in summary.email_counts.most_common(limit):
+            rows.append([_truncate_text(name, 70), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.domain_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Domains"))
+        rows = [["Domain", "Count"]]
+        for name, count in summary.domain_counts.most_common(limit):
+            rows.append([_truncate_text(name, 50), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.webmail_provider_counts or summary.webmail_host_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Webmail Activity"))
+        if summary.webmail_provider_counts:
+            lines.append(
+                _format_kv(
+                    "Providers", _format_counter(summary.webmail_provider_counts, 6)
+                )
+            )
+        if summary.webmail_host_counts:
+            lines.append(
+                _format_kv("Hosts", _format_counter(summary.webmail_host_counts, 6))
+            )
+        if summary.webmail_action_counts:
+            lines.append(
+                _format_kv("Actions", _format_counter(summary.webmail_action_counts, 8))
+            )
+
+    if summary.attachment_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Attachments"))
+        rows = [["Filename", "Count"]]
+        for name, count in summary.attachment_counts.most_common(limit):
+            rows.append([_truncate_text(name, 60), str(count)])
+        lines.append(_format_table(rows))
+
+    # ---- Detections ------------------------------------------------------
     detections = _filtered_detections(summary, verbose)
     if detections:
+        lines.append(SUBSECTION_BAR)
         lines.append(header("Detections"))
-        for item in detections[: _limit_value(8)]:
+        for item in detections[: _limit_value(14)]:
             sev = str(item.get("severity", "info")).upper()
             title = str(item.get("title") or item.get("summary") or "Detection")
-            details = str(item.get("details", ""))
-            lines.append(warn(f"[{sev}] {title}"))
+            details = _redact_in_text(str(item.get("details", "")))
+            paint = danger if sev in {"CRITICAL", "HIGH"} else warn
+            lines.append(paint(f"[{sev}] {title}"))
             if details:
                 lines.append(muted(f"  {details}"))
+
+    # ---- IOC summary (pivot points for the investigation) ----------------
+    ioc_lines: list[str] = []
+    if summary.originating_ip_counts:
+        ioc_lines.append(
+            _format_kv(
+                "Originating IPs", _format_counter(summary.originating_ip_counts, 8)
+            )
+        )
+    susp_urls = [
+        a for a in (summary.artifacts or []) if getattr(a, "kind", "") == "suspicious_url"
+    ]
+    if susp_urls:
+        ioc_lines.append(muted("Suspicious URLs:"))
+        for art in susp_urls[: _limit_value(8)]:
+            ioc_lines.append(muted(f"  - {_truncate_text(str(art.detail), 110)}"))
+    elif summary.url_counts:
+        ioc_lines.append(
+            _format_kv("URLs in mail", _format_counter(summary.url_counts, 6))
+        )
+    attach_iocs = [
+        a
+        for a in (summary.artifacts or [])
+        if getattr(a, "kind", "") == "mime_attachment" and "sha256=" in str(a.detail)
+    ]
+    if attach_iocs:
+        ioc_lines.append(muted("Attachment hashes:"))
+        for art in attach_iocs[: _limit_value(8)]:
+            ioc_lines.append(muted(f"  - {_truncate_text(str(art.detail), 110)}"))
+    if summary.mailer_counts:
+        ioc_lines.append(
+            _format_kv("Mailer/X-Mailer", _format_counter(summary.mailer_counts, 5))
+        )
+    if ioc_lines:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("IOC Summary"))
+        lines.extend(ioc_lines)
+
+    # ---- Cleartext credentials ------------------------------------------
+    if summary.username_counts or summary.password_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Cleartext Credential Exposure"))
+        lines.append(
+            danger("Mail credentials observed in cleartext (rotate exposed accounts).")
+        )
+        if summary.username_counts:
+            lines.append(
+                _format_kv("Usernames", _format_counter(summary.username_counts, 8))
+            )
+        if summary.password_counts:
+            lines.append(
+                _format_kv("Passwords", _format_counter(summary.password_counts, 8))
+            )
+
+    # ---- Observed plaintext ---------------------------------------------
+    if summary.plaintext_strings:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Observed Plaintext"))
+        rows = [["String", "Count"]]
+        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
+            rows.append([_truncate_text(text, 70), str(count)])
+        lines.append(_format_table(rows))
+
+    # ---- Sessions --------------------------------------------------------
+    if summary.conversations:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Mail Sessions"))
+        lines.append(
+            _format_sessions_table(
+                summary.conversations,
+                limit,
+                extra_cols=[("Proto", lambda c: getattr(c, "protocol", "-"))],
+            )
+        )
+
+    # ---- Artifacts -------------------------------------------------------
+    if summary.artifacts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Artifacts"))
+        rows = [["Type", "Detail", "Src", "Dst", "Pkt"]]
+        for item in summary.artifacts[: _limit_value(20)]:
+            rows.append(
+                [
+                    str(item.kind),
+                    _truncate_text(_redact_in_text(str(item.detail)), 56),
+                    str(item.src),
+                    str(item.dst),
+                    str(getattr(item, "packet", "") or "-"),
+                ]
+            )
+        lines.append(_format_table(rows))
+
+    # ---- Timeline --------------------------------------------------------
     if show_timeline and summary.timeline_events:
+        lines.append(SUBSECTION_BAR)
         lines.append(header("Timeline"))
         rows = [["Time", "Protocol", "Direction", "Stage", "Detail"]]
-        for ev in summary.timeline_events[: _limit_value(12)]:
+        for ev in summary.timeline_events[: _limit_value(20)]:
             rows.append(
                 [
                     format_ts(getattr(ev, "ts", None)),
@@ -25554,13 +26244,41 @@ def render_email_summary(
                 ]
             )
         lines.append(_format_table(rows))
-    if summary.errors:
-        lines.append(_format_kv("Errors", "; ".join(summary.errors[: _limit_value(4)])))
+
+    # ---- Deterministic checks -------------------------------------------
+    _render_deterministic_checks(
+        lines,
+        summary,
+        "Deterministic Email Security Checks",
+        [
+            ("credential_exposure", "Cleartext Credential Exposure"),
+            ("webmail_credential_submission", "Webmail Credential Submission"),
+            ("email_auth_failures", "Email Auth Failures (SPF/DKIM/DMARC)"),
+            ("sender_spoofing", "Sender Spoofing / BEC"),
+            ("phishing_indicators", "Phishing Indicators"),
+            ("phishing_urls", "Suspicious URLs"),
+            ("suspicious_attachments", "Suspicious Attachments"),
+            ("smtp_recon", "SMTP User Enumeration (VRFY/EXPN)"),
+            ("beaconing", "Mail-Protocol Beaconing"),
+            ("exfiltration_signals", "Exfiltration Signals"),
+            ("auth_abuse", "Mail Auth Abuse"),
+            ("server_fanout", "Server Fan-out"),
+            ("originating_ips", "Originating IPs"),
+            ("webmail_activity", "Webmail Activity"),
+        ],
+    )
+    lines.append(SECTION_BAR)
     return _finalize_output(lines)
 
 
 def render_qos_summary(summary: QosSummary, verbose: bool = False) -> str:
     lines = [header("QOS ANALYSIS")]
+    _render_protocol_verdict(
+        lines,
+        label="QoS",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(_format_kv("Packets", str(summary.total_packets)))
     lines.append(_format_kv("IP Packets", str(summary.total_ip_packets)))
     lines.append(_format_kv("QoS Packets", str(summary.qos_packets)))
@@ -25590,6 +26308,12 @@ def render_qos_summary(summary: QosSummary, verbose: bool = False) -> str:
 
 def render_wlan_summary(summary: WlanSummary) -> str:
     lines = [header("WLAN ANALYSIS")]
+    _render_protocol_verdict(
+        lines,
+        label="WLAN",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(_format_kv("Packets", str(summary.total_packets)))
     lines.append(_format_kv("WLAN Packets", str(summary.wlan_packets)))
     lines.append(
@@ -25623,6 +26347,12 @@ def render_wlan_summary(summary: WlanSummary) -> str:
 
 def render_ssdp_summary(summary: SsdpSummary, verbose: bool = False) -> str:
     lines = [header("SSDP ANALYSIS")]
+    _render_protocol_verdict(
+        lines,
+        label="SSDP",
+        detections=getattr(summary, "detections", None),
+        anomalies=getattr(summary, "anomalies", None),
+    )
     lines.append(_format_kv("Packets", str(summary.total_packets)))
     lines.append(_format_kv("UDP Packets", str(summary.udp_packets)))
     lines.append(_format_kv("SSDP Packets", str(summary.ssdp_packets)))
@@ -25986,6 +26716,8 @@ def render_ctf_summary(summary: CtfSummary) -> str:
         ("stream_reassembled_match", "Stream-Reassembled Match"),
         ("external_replay_exfil_behavior", "External Replay/Exfil Behavior"),
         ("challenge_file_hint_correlation", "Challenge File Hint Correlation"),
+        ("credential_pattern_present", "Credential Pattern Present"),
+        ("passphrase_parameter_present", "Passphrase Parameter Present"),
         ("likely_secret_not_flag", "Likely Secret (Not Flag)"),
     ]
 
@@ -26164,6 +26896,43 @@ def render_obfuscation_summary(summary) -> str:
     if not summary:
         return ""
     lines = [header("OBFUSCATION / TUNNELING")]
+
+    # ---- Analyst Verdict + Detections -----------------------------------
+    # The computed `detections` (with severity) were never rendered — only a
+    # wall of stats. Lead with the triage call. Note: base64/hex blobs are
+    # LOW severity on purpose (TLS, cookies, images encode constantly), so they
+    # must not escalate the verdict; only IOC/attack/covert-channel signals do.
+    detections = list(getattr(summary, "detections", []) or [])
+    sev_rank = {"high": 3, "warning": 2, "medium": 2, "low": 1, "info": 0}
+    worst = max((sev_rank.get(str(d.get("severity", "info")).lower(), 0) for d in detections), default=0)
+    if worst >= 3:
+        v_text, v_fn = "COVERT CHANNEL / ENCODED ATTACK CONTENT", danger
+    elif worst == 2:
+        v_text, v_fn = "OBFUSCATED CONTENT OF INTEREST", warn
+    elif worst == 1:
+        v_text, v_fn = "ENCODED CONTENT PRESENT (likely benign encoding)", muted
+    else:
+        v_text, v_fn = "NO OBFUSCATION / TUNNELING SIGNALS", ok
+    lines.append(v_fn(f"[VERDICT] {v_text}"))
+    if detections:
+        ordered = sorted(
+            detections,
+            key=lambda d: -sev_rank.get(str(d.get("severity", "info")).lower(), 0),
+        )
+        lines.append(header("Detections"))
+        for d in ordered[: _limit_value(8)]:
+            sev = str(d.get("severity", "info")).upper()
+            title = str(d.get("summary") or d.get("title") or "Detection")
+            sev_fn = danger if sev == "HIGH" else (warn if sev in ("WARNING", "MEDIUM") else muted)
+            lines.append(sev_fn(f"[{sev}] {title}"))
+            details = str(d.get("details", "")).strip()
+            if details:
+                lines.append(muted(f"  {details}"))
+            evidence = d.get("evidence") or []
+            if isinstance(evidence, list):
+                for ev in evidence[: _limit_value(4)]:
+                    lines.append(muted(f"  - {_truncate_text(str(ev), 140)}"))
+
     lines.append(_format_kv("Packets", str(summary.total_packets)))
     lines.append(_format_kv("Payload Bytes", str(summary.total_payload_bytes)))
     lines.append(

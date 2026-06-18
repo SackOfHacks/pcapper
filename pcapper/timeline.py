@@ -1428,29 +1428,12 @@ def _build_timeline_enrichment(
     if not reasons and verdict:
         reasons.append("Timeline kill-chain heuristics crossed threshold")
 
-    _risk_meta = {
-        "ot_impact_signal": ("OT Impact", "High"),
-        "access_to_execution_sequence": ("Payload Execution", "High"),
-        "remote_execution_tooling": ("Remote Execution Tooling", "High"),
-        "cleartext_remote_admin": ("Cleartext Remote Admin", "Medium"),
-    }
-    risk_matrix = [
-        {
-            "category": cat,
-            "risk": risk,
-            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
-            "evidence": f"{len(checks.get(key, []))} signal(s)",
-        }
-        for key, (cat, risk) in _risk_meta.items()
-        if checks.get(key)
-    ]
 
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
         "analyst_reasons": reasons,
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
-        "risk_matrix": risk_matrix,
     }
 
 def _icmp_label(pkt) -> str | None:

@@ -214,7 +214,7 @@ CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0
   source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
 ```
 
-## Current Release: v2.0.0
+## Current Release: v2.0.1
 
 Headline additions in this release:
 - **IT→OT pivot detection** and high-risk **"Remote IN"** timeline events (SSH/RDP/WinRM/VNC/Telnet/SMB-PsExec) across `--timeline`, `--threats`, `--overview`, and `--compromised`.
@@ -643,7 +643,6 @@ python -m pcapper --help
 - `--services`
 - `--sizes`
 - `--smb`
-- `--smtp`
 - `--snmp`
 - `--ssdp`
 - `--ssh`
