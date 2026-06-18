@@ -31,6 +31,20 @@ HTTPS_PORTS = {443, 5986, 8443}
 
 WSMAN_RE = re.compile(r"(WSMAN|WinRM|wsman)", re.IGNORECASE)
 SOAP_ACTION_RE = re.compile(r"SOAPAction:\s*([^\r\n]+)", re.IGNORECASE)
+# WSMan carries the operation in the WS-Addressing <a:Action> element inside the
+# SOAP body, NOT the HTTP SOAPAction header. Extract the trailing operation
+# segment (shell/Command = remote command execution, shell/Create = remote
+# shell, transfer/Create = resource create, etc.). Only visible when the SOAP is
+# cleartext (HTTP + AllowUnencrypted / Basic auth); default PSRemoting encrypts
+# the body and these are not recoverable.
+WSMAN_ACTION_RE = re.compile(
+    r"http://schemas\.[^\s<>\"']*?/"
+    r"(shell/(?:Create|Command|Send|Receive|Signal|Delete)"
+    r"|transfer/(?:Create|Delete|Get|Put)"
+    r"|wsman/1/wsman/(?:Enumerate|Pull)"
+    r"|windows/shell/cmd)",
+    re.IGNORECASE,
+)
 HOST_RE = re.compile(r"Host:\s*([^\r\n]+)", re.IGNORECASE)
 USER_AGENT_RE = re.compile(r"User-Agent:\s*([^\r\n]+)", re.IGNORECASE)
 AUTH_RE = re.compile(r"Authorization:\s*([^\r\n]+)", re.IGNORECASE)
@@ -227,6 +241,9 @@ def _scan_plaintext(
         soap_match = SOAP_ACTION_RE.search(item)
         if soap_match:
             soap_actions[soap_match.group(1).strip()] += 1
+        # WS-Addressing <a:Action> operation from the SOAP body.
+        for action_match in WSMAN_ACTION_RE.finditer(item):
+            soap_actions[action_match.group(1)] += 1
         host_match = HOST_RE.search(item)
         if host_match:
             hosts[host_match.group(1).strip()] += 1
@@ -578,6 +595,25 @@ def analyze_winrm(
             }
         )
 
+    # WSMan shell Create/Command actions = remote command execution over WinRM
+    # (interactive PSRemoting / WinRS lateral movement). T1021.006 / T1059.001.
+    exec_actions = sorted(
+        {
+            a
+            for a in soap_actions
+            if "shell/command" in a.lower() or "shell/create" in a.lower()
+        }
+    )
+    if exec_actions:
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "WinRM remote command/shell execution (WSMan) [T1021.006]",
+                "details": "WSMan shell operations observed (cleartext WinRM): "
+                + ", ".join(exec_actions),
+            }
+        )
+
     for (client_ip, server_ip), count in short_session_counts.items():
         if count >= 20:
             anomalies.append(
@@ -663,6 +699,10 @@ def analyze_winrm(
     for signal, count in suspicious_plaintext.most_common(20):
         deterministic_checks["winrm_command_exec_telemetry"].append(
             f"{signal[:120]} hits={int(count)}"
+        )
+    for action in exec_actions:
+        deterministic_checks["winrm_command_exec_telemetry"].append(
+            f"WSMan {action} (remote command/shell execution)"
         )
 
     for (client_ip, server_ip), count in short_session_counts.items():

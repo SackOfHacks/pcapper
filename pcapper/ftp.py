@@ -481,10 +481,25 @@ def _build_ftp_enrichment(
             )
             checks["data_channel_integrity"].append(ev)
 
+    # FTP is a cleartext protocol: surface observed credential exposure and
+    # anonymous/guest logins as deterministic checks (the parser already emits
+    # these as detections). These are core FTP hunt signals.
+    for det in detections:
+        summ = str(det.get("summary", "") or "").lower()
+        evidence = str(det.get("details", "") or det.get("summary", "") or "")
+        if "cleartext credential" in summ or "plaintext credential" in summ:
+            checks["cleartext_credential_exposure"].append(evidence)
+        elif "anonymous ftp login" in summ or (
+            "anonymous" in summ and "ftp" in summ
+        ):
+            checks["anonymous_or_guest_abuse"].append(evidence)
+
     if not checks.get("bruteforce_or_spray"):
         benign_context.append("No FTP brute-force / password-spray pattern observed")
     if not checks.get("ftp_exfiltration_signal"):
         benign_context.append("No large FTP upload to a public server observed")
+    if not checks.get("cleartext_credential_exposure"):
+        benign_context.append("No FTP cleartext credentials captured")
 
     return {
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},

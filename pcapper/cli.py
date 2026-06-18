@@ -27,7 +27,16 @@ from .carving import analyze_carving, merge_carve_summaries
 from .certificates import analyze_certificates
 from .cip import analyze_cip, merge_cip_summaries
 from .coap import analyze_coap
-from .coloring import set_color_override
+from .coloring import (
+    ANSI_BOLD,
+    ANSI_CYAN,
+    ANSI_DIM,
+    ANSI_GREEN,
+    ANSI_RESET,
+    ANSI_YELLOW,
+    set_color_override,
+    use_color,
+)
 from .compromised import analyze_compromised, merge_compromised_summaries
 from .config import find_config, load_config
 from .control_loop import analyze_control_loop, merge_control_loop_summaries
@@ -217,7 +226,6 @@ from .reporting import (
     render_services_summary,
     render_sizes_summary,
     render_smb_summary,
-    render_smtp_summary,
     render_snmp_summary,
     render_srtp_summary,
     render_ssdp_summary,
@@ -265,7 +273,6 @@ from .secrets import analyze_secrets, merge_secrets_summaries
 from .services import analyze_services, merge_services_summaries
 from .sizes import analyze_sizes
 from .smb import analyze_smb
-from .smtp import analyze_smtp, merge_smtp_summaries
 from .snmp import analyze_snmp, merge_snmp_summaries
 from .srtp import analyze_srtp
 from .ssdp import analyze_ssdp
@@ -337,7 +344,6 @@ def _builtin_flag_map() -> dict[str, str]:
         "--malware": "malware",
         "--syslog": "syslog",
         "--snmp": "snmp",
-        "--smtp": "smtp",
         "--email": "email",
         "--scan": "scan",
         "--rpc": "rpc",
@@ -489,7 +495,6 @@ _FILTER_COMPATIBLE_STEPS = {
     "arp",
     "syslog",
     "snmp",
-    "smtp",
     "email",
     "rpc",
     "tcp",
@@ -542,7 +547,6 @@ _IP_TARGET_FILTER_STEPS = {
     "services",
     "scan",
     "smb",
-    "smtp",
     "ssh",
     "streams",
     "strings",
@@ -967,6 +971,65 @@ def _parse_timeline_categories(
     return categories, False, invalid
 
 
+def _help_color_enabled() -> bool:
+    # -h fires during parse_args, before --no-color is applied via
+    # set_color_override, so consult argv/env/tty directly here.
+    argv = sys.argv[1:]
+    if "--no-color" in argv or "--quiet" in argv or "-q" in argv:
+        return False
+    return use_color()
+
+
+# Flag tokens like -x / --foo (not bullets, paths, or negative numbers).
+_HELP_FLAG_RE = re.compile(r"(?<![\w./-])(--?[A-Za-z][A-Za-z0-9-]*)")
+# Group headings rendered at column 0 ending in a colon (e.g. "GENERAL FLAGS:",
+# "options:", "positional arguments:").
+_HELP_HEADING_RE = re.compile(r"^([A-Za-z][\w /&\-]*):$", re.MULTILINE)
+_ANSI_STRIP_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class ColorHelpFormatter(argparse.RawTextHelpFormatter):
+    """RawTextHelpFormatter that colorizes the *finished* help text. Working on
+    the already-laid-out string (rather than the invocation strings) keeps
+    argparse's column alignment intact, because ANSI escapes are zero-width in
+    the terminal. Section headings -> bold cyan, option flags -> bold green,
+    the usage prefix/metavar hints -> dim/bold."""
+
+    def format_help(self) -> str:  # type: ignore[override]
+        text = super().format_help()
+        if not _help_color_enabled():
+            # Python 3.14+ argparse colorizes natively from NO_COLOR/isatty, which
+            # doesn't know about our --no-color/--quiet flags. Strip any codes it
+            # emitted so color-off requests are honored regardless of source.
+            return _ANSI_STRIP_RE.sub("", text)
+        # Python 3.14+ argparse colorizes help natively in a TTY. Defer to its
+        # (coherent) theme rather than stacking a second pass of ANSI on top,
+        # which would nest/garble codes. Our pass is the fallback for older
+        # Pythons whose argparse emits plain text.
+        if "\x1b[" in text:
+            return text
+
+        def _color_flags(segment: str) -> str:
+            return _HELP_FLAG_RE.sub(
+                lambda m: f"{ANSI_BOLD}{ANSI_GREEN}{m.group(1)}{ANSI_RESET}", segment
+            )
+
+        out_lines: list[str] = []
+        for line in text.split("\n"):
+            heading = _HELP_HEADING_RE.match(line)
+            if heading:
+                out_lines.append(
+                    f"{ANSI_BOLD}{ANSI_CYAN}{heading.group(1)}{ANSI_RESET}:"
+                )
+                continue
+            if line.startswith("usage:"):
+                rest = _color_flags(line[len("usage:") :])
+                out_lines.append(f"{ANSI_BOLD}{ANSI_YELLOW}usage:{ANSI_RESET}{rest}")
+                continue
+            out_lines.append(_color_flags(line))
+        return "\n".join(out_lines)
+
+
 class PcapperArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # type: ignore[override]
         if "unrecognized arguments:" in message:
@@ -984,10 +1047,24 @@ class PcapperArgumentParser(argparse.ArgumentParser):
 
 def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentParser:
     banner = _build_banner()
+    epilog = (
+        "EXAMPLES:\n"
+        "  pcapper capture.pcap --overview              Triage briefing: what to look at first\n"
+        "  pcapper capture.pcap --threats --ips --mitre Cross-protocol threats + IP intel + ATT&CK\n"
+        "  pcapper capture.pcap --malware               Is malware present? (verdict + evidence)\n"
+        "  pcapper capture.pcap --ips --ip-geo          IP inventory with geolocation/ASN enrichment\n"
+        "  pcapper capture.pcap --timeline -ip 10.0.0.5 Per-host forensic timeline\n"
+        "  pcapper capture.pcap --files -hash app.exe   Carve files; hash a specific one\n"
+        "  pcapper capture.pcap --dns --http --tls -vt  Web/DNS/TLS hunt with VirusTotal lookups\n"
+        "  pcapper *.pcap -summarize --threats          Roll up many captures into one view\n\n"
+        "Run a function flag (e.g. --dns) for that analysis; combine flags freely. "
+        "Use -v for full detail, --no-color to disable color."
+    )
     parser = PcapperArgumentParser(
         prog="pcapper",
         description=f"{banner}\n\nModular PCAP analyzer for fast triage and reporting across IT + OT/ICS traffic.",
-        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=epilog,
+        formatter_class=ColorHelpFormatter,
         allow_abbrev=False,
     )
     parser.add_argument(
@@ -1035,7 +1112,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     general.add_argument(
         "-ip",
         dest="timeline_ip",
-        help="Target IP scope for supported analyzers (e.g., --services/--ips/--http/--threats/--streams); required for --timeline and optional for --hostdetails. Also used as query input for --mac.",
+        help="Target IP scope for supported analyzers (e.g., --services/--ips/--http/--threats/--streams); required for --timeline and optional for --hostdetails and --hostnames (scopes output to hostnames discovered for that IP). Also used as query input for --mac.",
     )
     general.add_argument(
         "-mac",
@@ -1222,15 +1299,27 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Enable VirusTotal lookups/enrichment for --dns, --http, --tls/--tlsm, --threats, --webrequests, --timeline, and --compromised (requires VT_API_KEY).",
     )
     general.add_argument(
+        "--ip-geo",
+        dest="ip_geo",
+        action="store_true",
+        help="Enrich public IPs in --ips with geolocation/ASN/org (and hosting/proxy flags) via the free ip-api.com online lookup. Sends observed public IPs to a third party, so it is opt-in.",
+    )
+    general.add_argument(
         "-view",
+        nargs="?",
+        const="",
+        default=None,
         metavar="FILENAME",
-        help="View discovered file artifact content in ASCII/HEX (use with --files; supports IT and OT/ICS transfers).",
+        help="With --files: view discovered file artifact content matching FILENAME in ASCII/HEX. With --streams: bare -view renders the reassembled HEX/ASCII content of the displayed streams (combine with -ip/-port/-search/-id to scope).",
     )
     general.add_argument(
         "-hash",
         dest="hash_name",
+        nargs="?",
+        const="",
+        default=None,
         metavar="FILENAME",
-        help="Show SHA256/MD5/IMPHASH for discovered file(s) matching FILENAME (use with --files).",
+        help="Show the File Hashes section (use with --files). Bare -hash lists MD5/SHA-256 for all discovered files; -hash FILENAME also adds SHA256/MD5/IMPHASH for file(s) matching FILENAME.",
     )
     general.add_argument(
         "-raw",
@@ -1507,13 +1596,13 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
             "Include NFS protocol analysis (RPC, Clients, Servers, Files, Anomalies).",
         ),
         ("--ntlm", "Include NTLM authentication analysis (Users, Domains, Versions)."),
-        ("--protocols", "Include detailed protocol hierarchy and anomaly analysis."),
+        ("--protocols", "Protocol hierarchy, conversations and anomaly analysis (scans, ARP spoofing, cleartext creds, floods/tunneling) with insecure-protocol surfacing and MITRE ATT&CK mapping."),
         (
             "--routing",
             "Include routing protocol analysis (OSPF, IS-IS, BGP, RIP, EIGRP, VRRP, HSRP).",
         ),
         ("--rdp", "Include RDP analysis (sessions, hostnames, anomalies, threats)."),
-        ("--services", "Include service discovery and cybersecurity risk analysis."),
+        ("--services", "Service discovery and exposure triage: handshake-confirmed services/banners, internet-exposed attack surface, exposed databases/datastores, EOL/vulnerable software, cleartext/admin/OT exposure, with MITRE ATT&CK mapping."),
         ("--sizes", "Include packet size distribution analysis."),
         ("--smb", "Include SMB protocol analysis (Versioning, Shares, Anomalies)."),
         ("--ssh", "Include SSH analysis (sessions, versions, plaintext, anomalies)."),
@@ -1527,12 +1616,8 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
             "Include SNMP analysis (versions, communities, OIDs, host details, threats).",
         ),
         (
-            "--smtp",
-            "Include SMTP analysis (commands, auth, recipients, threats, exfil).",
-        ),
-        (
             "--email",
-            "Include email forensics across SMTP/POP3/IMAP (addresses, usernames/passwords, attachments, detections, deterministic checks). Add --timeline for email interaction timeline view.",
+            "Email threat-hunt/forensics across SMTP/POP3/IMAP/webmail: commands, senders/recipients, cleartext credentials, attachments (with SHA-256), SPF/DKIM/DMARC auth failures, sender/display-name spoofing (BEC), phishing URLs, originating IPs, X-Mailer, VRFY/EXPN recon, beaconing/exfil, MITRE ATT&CK mapping and an IOC summary. Add --timeline for the interaction timeline.",
         ),
         (
             "--scan",
@@ -1839,43 +1924,59 @@ def _collect_related_help_actions(
     return related
 
 
+def _hc(text: str, *codes: str) -> str:
+    """Wrap text in ANSI codes when help coloring is enabled, else return as-is."""
+    if not codes or not _help_color_enabled():
+        return text
+    return f"{''.join(codes)}{text}{ANSI_RESET}"
+
+
 def _print_contextual_function_help(
     parser: argparse.ArgumentParser,
     target_flags: list[str],
 ) -> None:
     option_actions = dict(getattr(parser, "_option_string_actions", {}))
-    print(_HELP_BAR)
-    print("PCAPPER FUNCTION HELP MODE")
-    print(_HELP_BAR)
+    bar = _hc(_HELP_BAR, ANSI_DIM)
+    print(bar)
+    print(_hc("PCAPPER FUNCTION HELP MODE", ANSI_BOLD, ANSI_CYAN))
+    print(bar)
     print("Showing focused help for requested function flag(s).")
-    print("Use `pcapper -h` for full global help.")
+    print(f"Use `{_hc('pcapper -h', ANSI_BOLD, ANSI_GREEN)}` for full global help.")
     for idx, flag in enumerate(target_flags, start=1):
         action = option_actions.get(flag)
         if action is None:
             continue
         if idx > 1:
-            print(_HELP_BAR)
-        print(f"Function: {flag}")
+            print(bar)
+        flag_c = _hc(flag, ANSI_BOLD, ANSI_GREEN)
+        print(f"{_hc('Function:', ANSI_BOLD, ANSI_CYAN)} {flag_c}")
         description = str(getattr(action, "help", "") or "").strip()
         if description:
-            print(f"Description: {description}")
+            print(f"{_hc('Description:', ANSI_BOLD)} {description}")
         if flag == "--decode":
-            print("Usage: pcapper --decode INPUT")
+            usage_line = f"pcapper {_hc('--decode', ANSI_BOLD, ANSI_GREEN)} {_hc('INPUT', ANSI_YELLOW)}"
         else:
-            print(f"Usage: pcapper <target> {flag} [function options]")
+            usage_line = (
+                f"pcapper {_hc('<target>', ANSI_YELLOW)} {flag_c} "
+                f"{_hc('[function options]', ANSI_DIM)}"
+            )
+        print(f"{_hc('Usage:', ANSI_BOLD)} {usage_line}")
         related = _collect_related_help_actions(parser, flag, action)
         if related:
-            print("Related options:")
+            print(_hc("Related options:", ANSI_BOLD, ANSI_CYAN))
             for rel_action in related:
                 usage = _format_action_usage(rel_action)
                 rel_help = str(getattr(rel_action, "help", "") or "").strip()
+                # Pad on the uncolored text so columns align, then colorize.
+                pad = max(0, 30 - len(usage))
+                usage_c = _hc(usage, ANSI_BOLD, ANSI_GREEN)
                 if rel_help:
-                    print(f"  {usage:<30} {rel_help}")
+                    print(f"  {usage_c}{' ' * pad} {rel_help}")
                 else:
-                    print(f"  {usage}")
+                    print(f"  {usage_c}")
         else:
-            print("Related options: (none)")
-    print(_HELP_BAR)
+            print(f"{_hc('Related options:', ANSI_BOLD, ANSI_CYAN)} (none)")
+    print(bar)
 
 
 def _handle_help_request(
@@ -1921,6 +2022,7 @@ def _analyze_paths(
     show_icmp: bool,
     show_dns: bool,
     dns_vt: bool,
+    ip_geo: bool,
     show_http: bool,
     show_webrequests: bool,
     webrequests_post_only: bool,
@@ -1940,7 +2042,6 @@ def _analyze_paths(
     show_malware: bool,
     show_syslog: bool,
     show_snmp: bool,
-    show_smtp: bool,
     show_email: bool,
     show_rpc: bool,
     show_tcp: bool,
@@ -2654,15 +2755,6 @@ def _analyze_paths(
                 else:
                     print(render_snmp_summary(snmp_summary, verbose=verbose))
                 export_summaries["snmp"] = snmp_summary
-            elif step == "smtp" and show_smtp:
-                smtp_summary = analyze_smtp(
-                    path, show_status=step_status, packets=packets, meta=meta
-                )
-                if summarize_rollups:
-                    rollups.setdefault("smtp", []).append(smtp_summary)
-                else:
-                    print(render_smtp_summary(smtp_summary, verbose=verbose))
-                export_summaries["smtp"] = smtp_summary
             elif step == "email" and show_email:
                 email_summary = analyze_email(
                     path, show_status=step_status, packets=packets, meta=meta
@@ -2720,7 +2812,9 @@ def _analyze_paths(
                     print(render_sizes_summary(size_summary, verbose=verbose))
                 export_summaries["sizes"] = size_summary
             elif step == "ips" and show_ips:
-                ips_summary = analyze_ips(path, show_status=step_status)
+                ips_summary = analyze_ips(
+                    path, show_status=step_status, geo_lookup=ip_geo
+                )
                 if summarize_rollups:
                     rollups.setdefault("ips", []).append(ips_summary)
                 else:
@@ -2901,6 +2995,8 @@ def _analyze_paths(
                         render_files_summary(
                             files_summary,
                             verbose=bool(verbose or files_executable_only),
+                            show_hashes=hash_name is not None,
+                            hash_filter=hash_name,
                         )
                     )
                 export_summaries["files"] = files_summary
@@ -2978,7 +3074,9 @@ def _analyze_paths(
                     print(render_strings_summary(strings_summary))
                 export_summaries["strings"] = strings_summary
             elif step == "obfuscation" and show_obfuscation:
-                ob_summary = analyze_obfuscation(path, show_status=step_status)
+                ob_summary = analyze_obfuscation(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("obfuscation", []).append(ob_summary)
                 else:
@@ -3046,6 +3144,7 @@ def _analyze_paths(
                     filter_ip=timeline_ip,
                     filter_port=stream_port,
                     established_only=streams_established,
+                    view_content=view_name is not None,
                 )
                 if summarize_rollups:
                     rollups.setdefault("streams", []).append(stream_summary)
@@ -3100,11 +3199,20 @@ def _analyze_paths(
                     path,
                     timeline_ip,
                     show_status=step_status,
-                    include_related=bool(timeline_ip),
+                    # Identity-only scoping: -ip shows hostnames that resolve to /
+                    # are presented by the target itself, not every name it merely
+                    # contacted or looked up. analyze_hostname keeps only findings
+                    # whose session-aware mapping points at the target IP.
+                    include_related=False,
                     hostname_query=hostname_name,
                     port_filter=stream_port,
                     search_query=stream_search,
-                    apply_filters=False,
+                    # Scope output to the supplied -ip (and -name/-port/-search)
+                    # when any filter is given; with no filter, show every
+                    # discovered hostname as before.
+                    apply_filters=bool(
+                        timeline_ip or hostname_name or stream_port or stream_search
+                    ),
                 )
                 if summarize_rollups:
                     rollups.setdefault("hostnames", []).append(hostname_summary)
@@ -3914,10 +4022,6 @@ def _analyze_paths(
                 merge_snmp_summaries,
                 lambda s: render_snmp_summary(s, verbose=verbose),
             ),
-            "smtp": (
-                merge_smtp_summaries,
-                lambda s: render_smtp_summary(s, verbose=verbose),
-            ),
             "email": (
                 merge_email_summaries,
                 lambda s: render_email_summary(
@@ -3942,7 +4046,10 @@ def _analyze_paths(
             "files": (
                 merge_files_summaries,
                 lambda s: render_files_summary(
-                    s, verbose=bool(verbose or files_executable_only)
+                    s,
+                    verbose=bool(verbose or files_executable_only),
+                    show_hashes=hash_name is not None,
+                    hash_filter=hash_name,
                 ),
             ),
             "obfuscation": (merge_obfuscation_summaries, render_obfuscation_summary),
@@ -3971,7 +4078,6 @@ def _analyze_paths(
             "malware": "MALWARE HUNTING ANALYSIS",
             "syslog": "SYSLOG ANALYSIS",
             "snmp": "SNMP ANALYSIS",
-            "smtp": "SMTP ANALYSIS",
             "email": "EMAIL ANALYSIS",
             "rpc": "RPC ANALYSIS",
             "tcp": "TCP ANALYSIS",
@@ -4232,6 +4338,28 @@ def main() -> int:
         print("Run with -h for full help and options.")
         return 0
     args = parser.parse_args(argv)
+    # `-hash` takes an optional FILENAME, so `--files -hash <pcap>` (target given
+    # last) lets argparse hand the capture path to -hash and leaves no target.
+    # If the -hash value is actually an existing path and no target was supplied,
+    # reclassify it as the target and treat -hash as the bare "all hashes" flag.
+    if (
+        getattr(args, "hash_name", None)
+        and not args.target
+        and Path(str(args.hash_name)).expanduser().exists()
+    ):
+        args.target = [Path(str(args.hash_name)).expanduser()]
+        args.hash_name = ""
+    # `-view` likewise takes an optional value, so `--streams -view <pcap>` can
+    # swallow the capture path. Same recovery: if the -view value is an existing
+    # path and no target was supplied, treat it as the target and -view as the
+    # bare "show content" toggle.
+    if (
+        getattr(args, "view", None)
+        and not args.target
+        and Path(str(args.view)).expanduser().exists()
+    ):
+        args.target = [Path(str(args.view)).expanduser()]
+        args.view = ""
     config_path = find_config(
         getattr(args, "config", None) or os.environ.get("PCAPPER_CONFIG")
     )
@@ -4451,7 +4579,9 @@ def main() -> int:
     ):
         _print_error("-exe requires --files.")
         return 2
-    if getattr(args, "hash_name", None) and not getattr(args, "files", False):
+    if getattr(args, "hash_name", None) is not None and not getattr(
+        args, "files", False
+    ):
         _print_error("-hash requires --files.")
         return 2
     if getattr(args, "hostname_name", None) and not (
@@ -4706,6 +4836,7 @@ def main() -> int:
             show_icmp=args.icmp,
             show_dns=args.dns,
             dns_vt=args.vt,
+            ip_geo=getattr(args, "ip_geo", False),
             show_http=args.http,
             show_webrequests=getattr(args, "webrequests", False),
             webrequests_post_only=bool(getattr(args, "webrequests_post_only", False)),
@@ -4725,7 +4856,6 @@ def main() -> int:
             show_malware=getattr(args, "malware", False),
             show_syslog=args.syslog,
             show_snmp=args.snmp,
-            show_smtp=args.smtp,
             show_email=getattr(args, "email", False),
             show_rpc=args.rpc,
             show_tcp=args.tcp,

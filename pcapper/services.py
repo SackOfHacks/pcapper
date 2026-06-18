@@ -79,7 +79,6 @@ class ServiceSummary:
     lateral_surface_profiles: List[Dict[str, object]] = field(default_factory=list)
     boundary_exposure_profiles: List[Dict[str, object]] = field(default_factory=list)
     ot_it_crossing_profiles: List[Dict[str, object]] = field(default_factory=list)
-    risk_matrix: List[Dict[str, str]] = field(default_factory=list)
     false_positive_context: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
@@ -105,6 +104,55 @@ _OT_SERVICE_PORTS = {
 }
 _ADMIN_SERVICE_NAMES = {"SSH", "RDP", "SMB", "VNC", "Telnet", "WinRM"}
 
+# Database / datastore services. Exposure of these is a primary IR finding:
+# they hold the crown-jewel data and several ship with NO authentication by
+# default (Redis, MongoDB, Elasticsearch, Memcached, CouchDB, Cassandra), so a
+# reachable instance is frequently an unauthenticated, internet-leaked breach.
+_DATASTORE_SERVICES = {
+    "MSSQL", "MySQL", "PostgreSQL", "Oracle", "Redis", "MongoDB",
+    "Elasticsearch", "Memcached", "CouchDB", "Cassandra", "Redis",
+}
+_UNAUTH_DEFAULT_DATASTORES = {
+    "Redis", "MongoDB", "Elasticsearch", "Memcached", "CouchDB", "Cassandra",
+}
+
+# Curated banner -> (severity, reason) map for end-of-life / known-vulnerable
+# server software. Deliberately conservative: each entry is software that is
+# clearly EOL or carries a well-known RCE/backdoor, to avoid false positives on
+# merely-not-latest versions.
+_EOL_SOFTWARE_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
+    (re.compile(r"vsftpd\s*2\.3\.4", re.I), "CRITICAL",
+     "vsftpd 2.3.4 contains a well-known backdoor (CVE-2011-2523)"),
+    (re.compile(r"ProFTPD\s*1\.3\.3", re.I), "HIGH",
+     "ProFTPD 1.3.3 is affected by known RCEs (e.g. CVE-2010-4221)"),
+    (re.compile(r"OpenSSH[_/ ]([0-5]\.\d+|6\.\d+)", re.I), "MEDIUM",
+     "Legacy OpenSSH (<7.x) — multiple known vulnerabilities, end-of-life"),
+    (re.compile(r"Apache/(1\.|2\.0\.|2\.2\.)", re.I), "HIGH",
+     "End-of-life Apache httpd (1.x/2.0/2.2) — no security updates"),
+    (re.compile(r"Microsoft-IIS/([0-6]\.)", re.I), "HIGH",
+     "End-of-life Microsoft IIS (<=6.0) — no security updates"),
+    (re.compile(r"nginx/(0\.|1\.[0-9]\.)", re.I), "MEDIUM",
+     "Legacy nginx (<1.10) — end-of-life branch"),
+    (re.compile(r"\bPHP/[45]\.", re.I), "HIGH",
+     "End-of-life PHP (4.x/5.x) exposed in Server header"),
+    (re.compile(r"Exim\s*4\.[0-8]\d?\b", re.I), "MEDIUM",
+     "Legacy Exim (<4.90) — multiple known RCEs"),
+    (re.compile(r"(?:OpenSSL/)(0\.|1\.0\.)", re.I), "MEDIUM",
+     "End-of-life OpenSSL (<1.1) advertised in banner"),
+]
+
+
+def _assess_software_risk(software: str) -> Optional[tuple[str, str]]:
+    """Return (severity, reason) when a service banner advertises EOL or
+    known-vulnerable software, else None."""
+    text = str(software or "")
+    if not text:
+        return None
+    for pattern, severity, reason in _EOL_SOFTWARE_PATTERNS:
+        if pattern.search(text):
+            return severity, f"{reason}. Banner: {text[:120]}"
+    return None
+
 
 def _build_services_enrichment(
     assets: List[ServiceAsset], risks: List[ServiceRisk]
@@ -118,29 +166,46 @@ def _build_services_enrichment(
         ev = f"{getattr(risk, 'affected_asset', '?')}: {title} — {getattr(risk, 'description', '')}"
         if title == "Public Admin Service":
             checks["public_edge_admin_exposure"].append(ev)
+        elif title in ("Internet-Exposed Database", "Exposed Datastore (no-auth-by-default)"):
+            checks["exposed_datastores"].append(ev)
         elif title == "Potential UDP Amplification":
             checks["udp_amplification_readiness"].append(ev)
         elif title == "Non-Standard Port":
             checks["service_identity_mismatch"].append(ev)
-        elif title in ("Cleartext Service", "Obsolete Software"):
-            checks["legacy_or_weak_service_hygiene"].append(ev)
         else:
             checks["legacy_or_weak_service_hygiene"].append(ev)
 
     # Asset-derived context (not scored on its own — surfaces attack surface).
     ot_assets: List[str] = []
     it_admin_assets: List[str] = []
+    admin_ports_by_host: Dict[str, Set[int]] = defaultdict(set)
+    ot_ports_by_host: Dict[str, Set[int]] = defaultdict(set)
+    boundary_exposure_profiles: List[Dict[str, object]] = []
     for asset in assets or []:
         name = str(getattr(asset, "service_name", ""))
         port = int(getattr(asset, "port", 0) or 0)
         ip = str(getattr(asset, "ip", "?"))
+        clients = len(getattr(asset, "clients", []) or [])
         if port in _OT_SERVICE_PORTS:
             ot_assets.append(f"{ip}:{port} ({name})")
+            ot_ports_by_host[ip].add(port)
         if any(a in name for a in _ADMIN_SERVICE_NAMES):
             it_admin_assets.append(f"{ip}:{port} ({name})")
+            admin_ports_by_host[ip].add(port)
             checks["lateral_admin_surface"].append(
-                f"{ip}:{port} {name} — {len(getattr(asset, 'clients', []) or [])} client(s)"
+                f"{ip}:{port} {name} — {clients} client(s)"
             )
+        # Internet-facing attack surface: any service bound to a public IP.
+        if _is_public_ip(ip):
+            boundary_exposure_profiles.append(
+                {
+                    "asset": f"{ip}:{port}",
+                    "service": name,
+                    "clients": clients,
+                    "packets": int(getattr(asset, "packets", 0) or 0),
+                }
+            )
+            checks["internet_exposed_surface"].append(f"{ip}:{port} ({name})")
 
     # OT/IT boundary mix: an IT admin service and an OT service observed in the
     # same capture is a segmentation red flag (engineering access reachable from
@@ -164,18 +229,24 @@ def _build_services_enrichment(
 
     score = 0
     reasons: List[str] = []
+    if checks.get("exposed_datastores"):
+        score += 3
+        reasons.append(
+            f"Database/datastore exposure ({len(checks['exposed_datastores'])}) "
+            "— crown-jewel data reachable"
+        )
     if checks.get("public_edge_admin_exposure"):
         score += 3
         reasons.append("Administrative service exposed on a public IP")
     if crit_count:
         score += 3
-        reasons.append(f"Critical service risk(s): {crit_count} (e.g. obsolete/EOL software)")
+        reasons.append(f"Critical service risk(s): {crit_count} (e.g. internet-exposed DB / backdoored software)")
     # Cleartext credential protocols (Telnet/FTP/TFTP) are rated HIGH by the
     # analyzer; cleartext HTTP and other MEDIUM items stay context-only so an
     # ordinary web/SNMP capture does not produce a verdict.
     if high_count:
         score += 2
-        reasons.append(f"High-severity service risk(s): {high_count} (e.g. cleartext credential services)")
+        reasons.append(f"High-severity service risk(s): {high_count} (e.g. cleartext credential services / EOL software)")
     if checks.get("ot_it_boundary_mix"):
         score += 2
         reasons.append("OT and IT administrative services observed together (segmentation risk)")
@@ -198,31 +269,54 @@ def _build_services_enrichment(
     if not reasons and verdict:
         reasons.append("Service-risk heuristics crossed threshold")
 
-    _risk_meta = {
-        "public_edge_admin_exposure": ("Public Admin Exposure", "High"),
-        "ot_it_boundary_mix": ("OT/IT Boundary Mix", "High"),
-        "legacy_or_weak_service_hygiene": ("Legacy / Weak Hygiene", "Medium"),
-        "udp_amplification_readiness": ("UDP Amplification", "Medium"),
-        "service_identity_mismatch": ("Service/Port Mismatch", "Low"),
-        "lateral_admin_surface": ("Lateral Admin Surface", "Low"),
-    }
-    risk_matrix = [
-        {
-            "category": cat,
-            "risk": risk,
-            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
-            "evidence": f"{len(checks.get(key, []))} finding(s)",
-        }
-        for key, (cat, risk) in _risk_meta.items()
-        if checks.get(key)
-    ]
+    # Lateral-movement surface: hosts presenting >=2 admin/remote-access ports.
+    lateral_surface_profiles: List[Dict[str, object]] = []
+    for host, ports in sorted(admin_ports_by_host.items()):
+        if len(ports) >= 2:
+            lateral_surface_profiles.append(
+                {
+                    "host": host,
+                    "admin_ports": sorted(ports),
+                    "admin_port_count": len(ports),
+                    "confidence": "high" if len(ports) >= 3 else "medium",
+                }
+            )
+
+    # OT/IT crossing: a single host presenting BOTH an OT service and an IT
+    # admin service is a dual-homed engineering-access red flag.
+    ot_it_crossing_profiles: List[Dict[str, object]] = []
+    for host in sorted(set(admin_ports_by_host) & set(ot_ports_by_host)):
+        ot_it_crossing_profiles.append(
+            {
+                "host": host,
+                "ot_ports": sorted(ot_ports_by_host[host]),
+                "admin_ports": sorted(admin_ports_by_host[host]),
+                "confidence": "high",
+            }
+        )
+
+    # Service identity mismatch: protocols seen on non-standard ports.
+    service_mismatch_profiles: List[Dict[str, object]] = []
+    for risk in risks or []:
+        if str(getattr(risk, "title", "")) == "Non-Standard Port":
+            service_mismatch_profiles.append(
+                {
+                    "asset": str(getattr(risk, "affected_asset", "-")),
+                    "service": str(getattr(risk, "description", "-")),
+                    "software": "-",
+                    "reasons": ["service observed on non-standard port"],
+                }
+            )
 
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
         "analyst_reasons": reasons,
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
-        "risk_matrix": risk_matrix,
+        "boundary_exposure_profiles": boundary_exposure_profiles,
+        "lateral_surface_profiles": lateral_surface_profiles,
+        "ot_it_crossing_profiles": ot_it_crossing_profiles,
+        "service_mismatch_profiles": service_mismatch_profiles,
     }
 
 def merge_services_summaries(
@@ -245,7 +339,6 @@ def merge_services_summaries(
             lateral_surface_profiles=[],
             boundary_exposure_profiles=[],
             ot_it_crossing_profiles=[],
-            risk_matrix=[],
             false_positive_context=[],
             errors=[],
         )
@@ -330,11 +423,6 @@ def merge_services_summaries(
             context.get("boundary_exposure_profiles", []) or []
         ),
         ot_it_crossing_profiles=list(context.get("ot_it_crossing_profiles", []) or []),
-        risk_matrix=[
-            dict(item)
-            for item in list(context.get("risk_matrix", []) or [])
-            if isinstance(item, dict)
-        ],
         false_positive_context=[
             str(v) for v in list(context.get("false_positive_context", []) or [])
         ],
@@ -377,7 +465,12 @@ COMMON_PORTS = {
     8080: "HTTP-Proxy",
     8443: "HTTPS-Alt",
     9200: "Elasticsearch",
+    9300: "Elasticsearch",
     27017: "MongoDB",
+    27018: "MongoDB",
+    11211: "Memcached",
+    5984: "CouchDB",
+    9042: "Cassandra",
     500: "IKE",
     4500: "IPsec NAT-T",
     1194: "OpenVPN",
@@ -951,15 +1044,55 @@ def analyze_services(
         if asset.service_name in risky_cleartext:
             cleartext_hits[(asset.ip, asset.service_name)].add(asset.port)
 
-        # Old versions (Simple check)
+        client_count = len(asset.clients or [])
+
+        # End-of-life / known-vulnerable server software (banner-driven).
         if asset.software:
-            sw = asset.software.lower()
-            if "apache/1." in sw or "php/4." in sw:
+            eol = _assess_software_risk(asset.software)
+            if eol:
+                severity, reason = eol
                 risks.append(
                     ServiceRisk(
-                        "CRITICAL",
-                        "Obsolete Software",
-                        f"Legacy software detected: {asset.software}",
+                        severity,
+                        "Obsolete/Vulnerable Software",
+                        reason,
+                        f"{asset.ip}:{asset.port}",
+                    )
+                )
+
+        # Database / datastore exposure. Internet-reachable datastores are a
+        # top breach vector; unauthenticated-by-default stores (Redis/Mongo/
+        # ES/Memcached/CouchDB/Cassandra) are high-risk even on internal IPs.
+        if asset.service_name in _DATASTORE_SERVICES:
+            unauth_default = asset.service_name in _UNAUTH_DEFAULT_DATASTORES
+            public = _is_public_ip(asset.ip)
+            if public:
+                sev = "CRITICAL"
+                detail = (
+                    f"{asset.service_name} datastore reachable on a PUBLIC IP "
+                    f"({client_count} client(s)). Internet-exposed databases are a "
+                    "primary breach/ransomware vector"
+                )
+                if unauth_default:
+                    detail += "; this engine ships with NO authentication by default"
+                risks.append(
+                    ServiceRisk(
+                        sev,
+                        "Internet-Exposed Database",
+                        detail + ".",
+                        f"{asset.ip}:{asset.port}",
+                    )
+                )
+            elif unauth_default:
+                risks.append(
+                    ServiceRisk(
+                        "HIGH",
+                        "Exposed Datastore (no-auth-by-default)",
+                        (
+                            f"{asset.service_name} reachable from {client_count} "
+                            "client(s). This engine has no authentication by default "
+                            "— verify access controls and network segmentation."
+                        ),
                         f"{asset.ip}:{asset.port}",
                     )
                 )
@@ -1065,11 +1198,6 @@ def analyze_services(
             context.get("boundary_exposure_profiles", []) or []
         ),
         ot_it_crossing_profiles=list(context.get("ot_it_crossing_profiles", []) or []),
-        risk_matrix=[
-            dict(item)
-            for item in list(context.get("risk_matrix", []) or [])
-            if isinstance(item, dict)
-        ],
         false_positive_context=[
             str(v) for v in list(context.get("false_positive_context", []) or [])
         ],

@@ -56,7 +56,6 @@ class ExfilSummary:
     deterministic_checks: dict[str, list[str]]
     threat_hypotheses: list[dict[str, object]]
     benign_context: list[str]
-    risk_matrix: list[dict[str, str]]
     detections: list[dict[str, object]]
     artifacts: list[str]
     errors: list[str]
@@ -206,7 +205,6 @@ def analyze_exfil(
             deterministic_checks={},
             threat_hypotheses=[],
             benign_context=[],
-            risk_matrix=[],
             detections=[],
             artifacts=[],
             errors=errors,
@@ -1383,60 +1381,6 @@ def analyze_exfil(
             "No sustained low-rate long-lived egress pattern was reconstructed"
         )
 
-    risk_matrix: list[dict[str, str]] = []
-
-    def _append_matrix(
-        category: str, key: str, high: bool = False, medium: bool = False
-    ) -> None:
-        evidence_items = [
-            str(v) for v in deterministic_checks.get(key, []) if str(v).strip()
-        ]
-        if evidence_items:
-            if high:
-                risk_value, conf_value = "High", "High"
-            elif medium:
-                risk_value, conf_value = "Medium", "Medium"
-            else:
-                risk_value, conf_value = "Low", "Medium"
-            evidence_text = f"{len(evidence_items)} signal(s)"
-        else:
-            risk_value, conf_value, evidence_text = (
-                "None",
-                "Low",
-                "No matching evidence",
-            )
-        risk_matrix.append(
-            {
-                "category": category,
-                "risk": risk_value,
-                "confidence": conf_value,
-                "evidence": evidence_text,
-            }
-        )
-
-    _append_matrix("DNS Tunnel Indicators", "dns_tunnel_indicators", high=True)
-    _append_matrix("HTTP POST Exfil Channels", "http_post_exfil_channels", high=True)
-    _append_matrix(
-        "OT/ICS Control Channel Exfil", "ot_control_channel_exfil", high=True
-    )
-    _append_matrix(
-        "Management Port Bulk Transfer", "management_port_bulk_transfer", medium=True
-    )
-    _append_matrix("Uncommon Egress Channels", "uncommon_egress_channels", medium=True)
-    _append_matrix(
-        "Internal Staging then External Exfil",
-        "internal_staging_then_external_exfil",
-        high=True,
-    )
-    _append_matrix(
-        "File Exfiltration Candidates", "file_exfiltration_candidates", high=True
-    )
-    _append_matrix(
-        "Stealth Low-Rate Long-Lived Egress",
-        "stealth_low_rate_long_lived_egress",
-        medium=True,
-    )
-
     artifacts: list[str] = []
     for dst, bytes_sent in external_dsts.most_common(5):
         artifacts.append(f"External dst: {dst} ({format_bytes_as_mb(bytes_sent)})")
@@ -1476,7 +1420,6 @@ def analyze_exfil(
         deterministic_checks=deterministic_checks,
         threat_hypotheses=threat_hypotheses,
         benign_context=benign_context,
-        risk_matrix=risk_matrix,
         detections=detections,
         artifacts=artifacts,
         errors=errors + http_summary.errors + dns_summary.errors + file_summary.errors,

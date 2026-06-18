@@ -90,7 +90,6 @@ class UdpSummary:
     role_drift_profiles: list[dict[str, object]] = field(default_factory=list)
     transport_profiles: list[dict[str, object]] = field(default_factory=list)
     corroborated_findings: list[dict[str, object]] = field(default_factory=list)
-    risk_matrix: list[dict[str, str]] = field(default_factory=list)
     false_positive_context: list[str] = field(default_factory=list)
 
 
@@ -248,30 +247,12 @@ def _build_udp_enrichment(
     if not reasons and verdict:
         reasons.append("UDP anomaly heuristics crossed threshold")
 
-    _risk_meta = {
-        "udp_tunneling_signal": ("Tunneling / Exfil", "High"),
-        "reflection_amplification_risk": ("Reflection / Amplification", "High"),
-        "udp_recon_scan_behavior": ("Recon / Scan", "Medium"),
-        "udp_periodic_cadence": ("Periodic Beaconing", "Medium"),
-        "udp_transport_fragmentation_reliability": ("Transport/Reliability", "Low"),
-    }
-    risk_matrix = [
-        {
-            "category": cat,
-            "risk": risk,
-            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
-            "evidence": f"{len(checks.get(key, []))} signal(s)",
-        }
-        for key, (cat, risk) in _risk_meta.items()
-        if checks.get(key)
-    ]
 
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
         "analyst_reasons": reasons,
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
-        "risk_matrix": risk_matrix,
     }
 
 @memoize_analysis
@@ -815,11 +796,6 @@ def analyze_udp(
         role_drift_profiles=list(context.get("role_drift_profiles", []) or []),
         transport_profiles=list(context.get("transport_profiles", []) or []),
         corroborated_findings=list(context.get("corroborated_findings", []) or []),
-        risk_matrix=[
-            dict(item)
-            for item in list(context.get("risk_matrix", []) or [])
-            if isinstance(item, dict)
-        ],
         false_positive_context=[
             str(v) for v in list(context.get("false_positive_context", []) or [])
         ],

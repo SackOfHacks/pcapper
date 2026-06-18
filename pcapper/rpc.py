@@ -60,6 +60,10 @@ RPC_INTERFACES = {
     "f6beaff7-1e19-4fbb-9f8f-b89e2018337c": "EVENTLOG (Event Log Remoting)",
     "afa8bd80-7d8a-11c9-bef4-08002b102989": "MGMT (RPC Management)",
     "76f03f96-cdfd-44fc-a22c-64950a001209": "ITaskSchedulerService (TSCH)",
+    # Coerced-authentication (NTLM relay) vectors.
+    "c681d488-d850-11d0-8c52-00c04fd90f7e": "MS-EFSR (EFSRPC)",
+    "df1941c5-fe89-4e79-bf10-463657acf44d": "MS-EFSR (EFSRPC / lsarpc)",
+    "12345678-1234-abcd-ef00-0123456789ab": "MS-RPRN (Print Spooler)",
 }
 
 # DCE/RPC interfaces abused for remote code execution, persistence, credential
@@ -76,6 +80,11 @@ _RPC_HIGH_RISK_INTERFACES = {
     "894de0c0-0d55-461c-bb6c-5f3c6f4b4e30": ("NTSVCS (remote registry/PnP)", "T1112"),
     "e3514235-4b06-11d1-ab04-00c04fc2dcd2": ("DRSUAPI (DCSync credential theft)", "T1003.006"),
     "f6beaff7-1e19-4fbb-9f8f-b89e2018337c": ("EVENTLOG (log manipulation)", "T1070.001"),
+    # EFSRPC = PetitPotam coerced authentication (NTLM relay). The interface is
+    # rarely seen benignly on the wire, so a bind is a strong signal. Both UUIDs
+    # are abused (the second is reachable over the lsarpc pipe). T1187.
+    "c681d488-d850-11d0-8c52-00c04fd90f7e": ("EFSRPC (PetitPotam coercion)", "T1187"),
+    "df1941c5-fe89-4e79-bf10-463657acf44d": ("EFSRPC (PetitPotam coercion)", "T1187"),
 }
 
 SAMR_UUID = "12345778-1234-abcd-ef00-0123456789ac"
@@ -83,11 +92,70 @@ SAMR_UUID = "12345778-1234-abcd-ef00-0123456789ac"
 SAMR_QUERY_USER_OPNUMS = {36, 47}
 
 RPC_OPNUM_MAP: dict[str, dict[int, str]] = {
-    # Basic/common mappings; keep conservative to avoid false attribution.
-    # UUIDs are lower-case, without version suffix.
+    # Operation names for the abused interfaces, so the analyst sees the actual
+    # tradecraft ("SVCCTL::RCreateServiceW") instead of a bare "opnum 12". Only
+    # opnums verified against the MS-protocol specs are mapped — a wrong mapping
+    # would be false evidence, worse than showing the raw opnum. UUIDs are
+    # lower-case, without version suffix.
+    # EPM (MS-RPCE)
     "e1af8308-5d1f-11c9-91a4-08002b14a0fa": {
         3: "ept_map",
         5: "ept_map_auth",
+    },
+    # SVCCTL / MS-SCMR — remote service control (PsExec). T1543.003 / T1021.003.
+    "367abb81-9844-35f1-ad32-98f038001003": {
+        12: "RCreateServiceW",
+        19: "RStartServiceW",
+        24: "RCreateServiceA",
+        31: "RStartServiceA",
+        2: "RDeleteService",
+        1: "RControlService",
+    },
+    # TSCH / MS-TSCH ITaskSchedulerService — scheduled tasks. T1053.005.
+    "86d35949-83c9-4044-b424-db363231fd0c": {
+        1: "SchRpcRegisterTask",
+        12: "SchRpcRun",
+    },
+    # ATSVC / MS-TSCH legacy AT interface. T1053.002.
+    "1ff70682-0a51-30e8-076d-740be8cee98b": {
+        0: "NetrJobAdd",
+        1: "NetrJobDel",
+        2: "NetrJobEnum",
+    },
+    # DRSUAPI / MS-DRSR — replication; opnum 3 is the DCSync vector. T1003.006.
+    "e3514235-4b06-11d1-ab04-00c04fc2dcd2": {
+        0: "DRSBind",
+        1: "DRSUnbind",
+        3: "IDL_DRSGetNCChanges",
+    },
+    # SAMR / MS-SAMR — account/group enumeration (T1087.002) + creation.
+    "12345778-1234-abcd-ef00-0123456789ac": {
+        6: "SamrEnumerateDomainsInSamServer",
+        12: "SamrCreateUserInDomain",
+        13: "SamrEnumerateUsersInDomain",
+        15: "SamrEnumerateAliasesInDomain",
+        17: "SamrLookupNamesInDomain",
+        36: "SamrQueryInformationUser",
+        47: "SamrQueryInformationUser2",
+        50: "SamrCreateUser2InDomain",
+    },
+    # MS-EFSR — PetitPotam coercion; EfsRpcOpenFileRaw (opnum 0) is the classic
+    # trigger, the others are equivalent coercion primitives. T1187.
+    "c681d488-d850-11d0-8c52-00c04fd90f7e": {
+        0: "EfsRpcOpenFileRaw",
+        4: "EfsRpcEncryptFileSrv",
+        5: "EfsRpcDecryptFileSrv",
+        6: "EfsRpcQueryUsersOnFile",
+    },
+    "df1941c5-fe89-4e79-bf10-463657acf44d": {
+        0: "EfsRpcOpenFileRaw",
+    },
+    # MS-RPRN — PrinterBug coercion opnums (RpcRemoteFindFirstPrinterChange*).
+    # Bind alone is NOT flagged high-risk (printing is benign), but naming the
+    # opnum surfaces the coercion primitive when it appears. T1187.
+    "12345678-1234-abcd-ef00-0123456789ab": {
+        62: "RpcRemoteFindFirstPrinterChangeNotification",
+        65: "RpcRemoteFindFirstPrinterChangeNotificationEx",
     },
 }
 

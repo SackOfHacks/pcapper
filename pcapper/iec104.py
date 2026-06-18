@@ -204,14 +204,41 @@ def _detect_anomalies(
 ) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
     if any(cmd.startswith("C_") or "command" in cmd.lower() for cmd in commands):
+        # Surface the SPECIFIC command as evidence — the type, the
+        # select/execute qualifier (execute = the actual actuation, the
+        # Industroyer breaker-trip vector), the on/off state and the IOA — not a
+        # generic "control ASDU observed". These were already parsed in `commands`.
+        detail_parts = [
+            cmd
+            for cmd in commands
+            if cmd.startswith(("C_", "SC ", "DC ", "RC ", "Setpoint"))
+            or cmd.startswith("IOA ")
+            or "command" in cmd.lower()
+        ]
+        detail = "; ".join(dict.fromkeys(detail_parts)) if detail_parts else ""
+        is_execute = any("execute" in cmd.lower() for cmd in commands)
+        description = (
+            f"IEC-104 control/setpoint command: {detail}"
+            if detail
+            else "Control/Setpoint ASDU observed in IEC-104 traffic."
+        )
+        if is_execute:
+            description += " [EXECUTE — actual actuation, not select]"
+        ev: list[str] = []
+        if detail:
+            ev.append(detail)
+        if is_execute:
+            ev.append("EXECUTE qualifier (actual actuation)")
         anomalies.append(
             IndustrialAnomaly(
                 severity="HIGH",
                 title="IEC-104 Control Command",
-                description="Control/Setpoint ASDU observed in IEC-104 traffic.",
+                description=description,
                 src=src_ip,
                 dst=dst_ip,
                 ts=ts,
+                attack="T0855 Unauthorized Command Message; T0831 Manipulation of Control",
+                evidence=ev,
             )
         )
     if any("STOPDT" in cmd or "STARTDT" in cmd for cmd in commands):

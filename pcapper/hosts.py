@@ -78,7 +78,6 @@ class HostSummary:
     role_drift_profiles: list[dict[str, object]] = field(default_factory=list)
     identity_drift_profiles: list[dict[str, object]] = field(default_factory=list)
     incident_clusters: list[dict[str, object]] = field(default_factory=list)
-    risk_matrix: list[dict[str, str]] = field(default_factory=list)
     false_positive_context: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -161,29 +160,11 @@ def _build_hosts_enrichment(hosts: list[HostRecord]) -> dict[str, object]:
     if not reasons and verdict:
         reasons.append("Host-exposure heuristics crossed threshold")
 
-    _risk_meta = {
-        "service_exposure_risk": ("Public Service Exposure", "High"),
-        "boundary_cross_zone_exposure": ("Public OT Exposure", "High"),
-        "ot_it_boundary_crossing": ("OT/IT Boundary Crossing", "High"),
-        "identity_drift_or_collision": ("Identity Collision", "Low"),
-    }
-    risk_matrix = [
-        {
-            "category": cat,
-            "risk": risk,
-            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
-            "evidence": f"{len(checks.get(key, []))} host(s)",
-        }
-        for key, (cat, risk) in _risk_meta.items()
-        if checks.get(key)
-    ]
-
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
         "analyst_reasons": reasons,
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
-        "risk_matrix": risk_matrix,
     }
 
 def _normalize_mac(value: str) -> str | None:
@@ -931,11 +912,6 @@ def analyze_hosts(path: Path, show_status: bool = True) -> HostSummary:
         role_drift_profiles=list(context.get("role_drift_profiles", []) or []),
         identity_drift_profiles=list(context.get("identity_drift_profiles", []) or []),
         incident_clusters=list(context.get("incident_clusters", []) or []),
-        risk_matrix=[
-            dict(item)
-            for item in list(context.get("risk_matrix", []) or [])
-            if isinstance(item, dict)
-        ],
         false_positive_context=[
             str(v) for v in list(context.get("false_positive_context", []) or [])
         ],
@@ -1065,11 +1041,6 @@ def merge_hosts_summaries(summaries: Iterable[HostSummary]) -> HostSummary:
         role_drift_profiles=list(context.get("role_drift_profiles", []) or []),
         identity_drift_profiles=list(context.get("identity_drift_profiles", []) or []),
         incident_clusters=list(context.get("incident_clusters", []) or []),
-        risk_matrix=[
-            dict(item)
-            for item in list(context.get("risk_matrix", []) or [])
-            if isinstance(item, dict)
-        ],
         false_positive_context=[
             str(v) for v in list(context.get("false_positive_context", []) or [])
         ],

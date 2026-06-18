@@ -5,7 +5,7 @@ from .utils import beacon_score
 from .utils import is_public_ip as _is_public_ip
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -119,6 +119,10 @@ class SnmpSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+    # SNMPv3 USM identities (msgUserName) — the device-management accounts. The
+    # username is cleartext even in authPriv mode, so it's a useful identity
+    # artifact. Defaulted for backward-compatible construction.
+    usm_users: Counter[str] = field(default_factory=Counter)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -396,6 +400,7 @@ def analyze_snmp(
     seen_device_artifacts: set[str] = set()
 
     community_by_flow: dict[tuple[str, str], set[str]] = defaultdict(set)
+    usm_users: Counter[str] = Counter()
     dst_by_src: dict[str, set[str]] = defaultdict(set)
     request_times: dict[tuple[str, str], list[float]] = defaultdict(list)
     response_bytes: Counter[tuple[str, str]] = Counter()
@@ -472,6 +477,9 @@ def analyze_snmp(
             varbinds = msg.get("varbinds", [])
 
             version_counts[version] += 1
+            usm_name = str(msg.get("username", "") or "").strip()
+            if usm_name:
+                usm_users[usm_name] += 1
             if community:
                 community_counts[community] += 1
             if pdu:
@@ -720,6 +728,7 @@ def analyze_snmp(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        usm_users=usm_users,
     )
 
 
@@ -784,6 +793,7 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
     mac_addresses: Counter[str] = Counter()
     services: Counter[str] = Counter()
     plaintext_strings: Counter[str] = Counter()
+    usm_users: Counter[str] = Counter()
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
     artifacts: list[SnmpArtifact] = []
@@ -820,6 +830,7 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
         mac_addresses.update(summary.mac_addresses)
         services.update(summary.services)
         plaintext_strings.update(summary.plaintext_strings)
+        usm_users.update(getattr(summary, "usm_users", Counter()))
 
         for item in summary.detections:
             key = (
@@ -907,4 +918,5 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        usm_users=usm_users,
     )

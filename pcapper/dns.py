@@ -1344,7 +1344,7 @@ def analyze_dns(
                         f"{mx_queries} MX lookups observed (top client {top_client}). "
                         "Endpoints rarely query MX; this indicates mail-server "
                         "enumeration — spam-bot/mass-mailer (e.g. malspam) or recon. "
-                        "Correlate with --smtp/--email for outbound mail."
+                        "Correlate with --email for outbound mail."
                     ),
                     "top_clients": mx_clients,
                     "top_servers": server_counts.most_common(3),
@@ -1646,6 +1646,11 @@ def analyze_dns(
                     "top_clients": client_counts.most_common(3),
                     "top_servers": server_counts.most_common(3),
                 }
+            )
+            deterministic_checks["dga_like_behavior"].append(
+                f"{len(high_risk_domains)} distinct domains under abuse-prone TLDs "
+                f"({', '.join(f'.{t}({c})' for t, c in tld_breakdown.most_common(6))}); "
+                f"e.g. {sample}"
             )
 
         if ot_qname_counts:

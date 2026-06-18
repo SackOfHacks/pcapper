@@ -26,8 +26,10 @@ except Exception:  # pragma: no cover
 
 TELNET_PORTS = {23, 2323, 9923}
 
+# Negative lookbehind on "last " avoids the ubiquitous "Last login: <weekday>"
+# MOTD banner being mistaken for a login prompt (captured "Thu", "Mon", ...).
 USERNAME_RE = re.compile(
-    r"(?:login|user(name)?|username)\s*[:=]\s*(\S+)", re.IGNORECASE
+    r"(?<!last )(?:login|user(name)?|username)\s*[:=]\s*(\S+)", re.IGNORECASE
 )
 PASSWORD_RE = re.compile(r"(?:password|passwd|pass)\s*[:=]\s*(\S+)", re.IGNORECASE)
 
@@ -64,6 +66,7 @@ class TelnetConversation:
     last_seen: Optional[float]
     usernames: list[str]
     passwords: int
+    password_values: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -176,12 +179,53 @@ class _SessionState:
     last_seen: Optional[float] = None
     usernames: Counter[str] = None  # type: ignore[assignment]
     passwords: Counter[str] = None  # type: ignore[assignment]
+    # Reassembled chronological transcript (both directions, in packet order).
+    # Interactive (character-mode) telnet sends one keystroke per packet with the
+    # server echoing it back, so a login prompt + typed value never appears whole
+    # in any single packet — it must be reassembled, Wireshark-Follow-Stream
+    # style, to pair the server's "login:"/"Password:" prompt with the client's
+    # typed value.
+    transcript_parts: list = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.usernames is None:
             self.usernames = Counter()
         if self.passwords is None:
             self.passwords = Counter()
+        if self.transcript_parts is None:
+            self.transcript_parts = []
+
+
+def _maybe_dedouble(value: str) -> str:
+    """Character-mode telnet interleaves each typed key with the server's echo,
+    so a reassembled transcript shows every character doubled ("ffaakkee" for
+    "fake"). When a token is fully pair-doubled, collapse it; otherwise leave it
+    untouched (line-mode telnet is not doubled, and we must not mangle it)."""
+    v = value.strip()
+    if len(v) >= 4 and len(v) % 2 == 0 and all(v[i] == v[i + 1] for i in range(0, len(v), 2)):
+        return v[::2]
+    return v
+
+
+def _extract_transcript_credentials(transcript: str) -> tuple[Optional[str], Optional[str]]:
+    """Pull a username/password out of a reassembled telnet transcript. The
+    server's "login:"/"Password:" prompt and the client's typed value only sit
+    next to each other once both directions are merged in order."""
+    user: Optional[str] = None
+    pwd: Optional[str] = None
+    user_match = USERNAME_RE.search(transcript)
+    if user_match:
+        candidate = _maybe_dedouble(user_match.group(2))
+        # Strip trailing CR/LF debris and reject prompt-only / empty captures.
+        candidate = candidate.strip().strip("\r\n")
+        if candidate and candidate.lower() not in {"login", "user", "username"}:
+            user = candidate
+    pass_match = PASSWORD_RE.search(transcript)
+    if pass_match:
+        candidate = _maybe_dedouble(pass_match.group(1)).strip().strip("\r\n")
+        if candidate and candidate.lower() not in {"password", "passwd", "pass"}:
+            pwd = candidate
+    return user, pwd
 
 
 def _strip_telnet_iac(payload: bytes) -> bytes:
@@ -464,6 +508,10 @@ def analyze_telnet(
                     text = ""
 
             if text:
+                # Accumulate the reassembled chronological transcript for a
+                # post-loop credential pass (catches character-mode telnet that
+                # the per-packet regex below cannot see).
+                session.transcript_parts.append(text)
                 user_match = USERNAME_RE.search(text)
                 if user_match:
                     value = user_match.group(2)
@@ -499,6 +547,17 @@ def analyze_telnet(
 
     conversations: list[TelnetConversation] = []
     for session in sessions.values():
+        # Reassembled-transcript credential pass: recovers interactive
+        # (character-mode) logins the per-packet regex above cannot see.
+        if session.transcript_parts:
+            transcript = "".join(session.transcript_parts)
+            t_user, t_pass = _extract_transcript_credentials(transcript)
+            if t_user and t_user not in session.usernames:
+                session.usernames[t_user] += 1
+                usernames[t_user] += 1
+            if t_pass and t_pass not in session.passwords:
+                session.passwords[t_pass] += 1
+                passwords[t_pass] += 1
         conversations.append(
             TelnetConversation(
                 client_ip=session.client_ip,
@@ -517,6 +576,7 @@ def analyze_telnet(
                 last_seen=session.last_seen,
                 usernames=list(session.usernames.keys()),
                 passwords=sum(session.passwords.values()),
+                password_values=tuple(session.passwords.keys()),
             )
         )
         if session.packets <= 6 and session.bytes < 2000:

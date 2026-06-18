@@ -146,6 +146,21 @@ def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
                 "details": "Control mode traffic can indicate management or misuse on NTP services.",
             }
         )
+    # Mode 7 (private) carries the monlist / ntpdc queries that are the classic
+    # NTP amplification / reflection DDoS vector (CVE-2013-5211): a tiny request
+    # elicits a large response, letting the server be abused as a reflector.
+    if ntp_packets and mode_counts.get("private", 0) > 0:
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "NTP mode 7 (private/monlist) traffic detected",
+                "details": (
+                    "Mode 7 private-mode NTP (ntpdc/monlist) observed — the "
+                    "amplification/reflection DDoS vector (CVE-2013-5211). "
+                    "Confirm the server restricts or disables mode 7."
+                ),
+            }
+        )
     if ntp_packets and stratum_counts:
         if any(stratum >= 16 for stratum in stratum_counts.keys()):
             detections.append(

@@ -33,8 +33,15 @@ POWERSHELL_HINT_RE = re.compile(
 )
 
 PS_COMMAND_RE = re.compile(r"\b(?:powershell|pwsh)\b[^\r\n]{0,300}", re.IGNORECASE)
+# PowerShell accepts any unambiguous prefix of -EncodedCommand, so attackers use
+# -e / -ec / -enc / -encodedcommand interchangeably (this Emotet cradle uses the
+# bare `powershell -e <base64>`). The detection previously only matched -enc and
+# missed -e/-ec entirely. Require a base64 blob after the short forms so a benign
+# `-e` flag value can't trip it; -encodedcommand and frombase64string stand alone.
 PS_ENCODED_RE = re.compile(
-    r"(?:-enc(?:odedcommand)?|frombase64string)\b", re.IGNORECASE
+    r"(?:-e(?:c|nc(?:odedcommand)?)?\s+[A-Za-z0-9+/]{24,}={0,2}"
+    r"|-encodedcommand\b|frombase64string)",
+    re.IGNORECASE,
 )
 # Capture the base64 blob that follows a -EncodedCommand/-enc/-e flag so it can
 # be decoded back to the cleartext command the attacker actually ran. PowerShell

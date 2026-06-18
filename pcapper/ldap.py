@@ -678,11 +678,19 @@ def analyze_ldap(
         )
 
     if any("invalidCredentials" in code for code in response_codes.keys()):
+        # Report only the failure codes, not every result code — listing benign
+        # results (0 success, 14 saslBindInProgress) made it look as if those
+        # were credential failures.
+        failure_detail = ", ".join(
+            c for c, _ in ldap_error_codes.most_common(5)
+        ) or ", ".join(
+            c for c in response_codes if "invalidCredentials" in c
+        )
         detections.append(
             {
                 "severity": "warning",
                 "summary": "LDAP invalid credentials observed",
-                "details": ", ".join([c for c, _ in response_codes.most_common(5)]),
+                "details": failure_detail,
                 "source": "LDAP",
             }
         )

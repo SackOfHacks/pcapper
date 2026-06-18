@@ -95,6 +95,16 @@ SUSPICIOUS_SMB_TOKENS = {
 
 HIGH_RISK_NBNS_CODES = {"Refused", "ServFail", "FormErr"}
 
+# Well-known NetBIOS group / browser names that many hosts legitimately answer,
+# so multiple responders is normal (not NBNS poisoning).
+_NBNS_GROUP_NAMES = {
+    "WORKGROUP",
+    "MSHOME",
+    "MSBROWSE",
+    "__MSBROWSE__",
+    "\x01\x02__MSBROWSE__\x02",
+}
+
 
 def _parse_ntlm_type3(
     payload: bytes,
@@ -626,17 +636,13 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                             analysis.observed_users[display_name] += 1
                             analysis.unique_names.add(display_name)
                             artifacts.add(display_name)
+                            # NOTE: do NOT flag "multiple hosts queried the same
+                            # name" as a conflict. Many hosts legitimately query
+                            # the same name (WORKGROUP for browser elections,
+                            # WPAD, a shared server). A real NBNS name conflict /
+                            # spoof is when multiple hosts RESPOND as the OWNER of
+                            # a unique name — handled in the response branch below.
                             name_registry[display_name].add(src_ip)
-                            if len(name_registry[display_name]) > 1:
-                                analysis.name_conflicts += 1
-                                _append_anomaly(
-                                    "HIGH",
-                                    "NameConflict",
-                                    f"Multiple hosts claimed query name {display_name}: {', '.join(sorted(name_registry[display_name]))}",
-                                    src_ip,
-                                    dst_ip,
-                                    ts,
-                                )
                     except Exception as exc:
                         analysis.errors.append(f"NBNS query parse: {exc}")
 
@@ -677,14 +683,42 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                             if (parsed_name and parsed_suffix is not None)
                             else parsed_name
                         )
+                        # Read the NBNS group bit from the response address entry:
+                        # G=Group registrations (workgroup/domain) are answered by
+                        # many hosts by design and must not be flagged.
+                        entry_is_group = False
+                        try:
+                            for _entry in getattr(nbns, "ADDR_ENTRY", []) or []:
+                                g_val = getattr(_entry, "G", None)
+                                if (isinstance(g_val, int) and g_val == 1) or (
+                                    isinstance(g_val, str) and "group" in g_val.lower()
+                                ):
+                                    entry_is_group = True
+                                    break
+                        except Exception:
+                            entry_is_group = False
                         if rr_name_text:
                             response_name_registry[rr_name_text].add(src_ip)
-                            if len(response_name_registry[rr_name_text]) > 1:
+                            # Names legitimately answered by MANY hosts and never a
+                            # poisoning signal: <1C> domain controllers, <1D> master
+                            # browser, <1E> browser elections, the group bit, and the
+                            # well-known workgroup/browser group names.
+                            base_name = (parsed_name or "").upper()
+                            is_group_name = (
+                                parsed_suffix in (0x1C, 0x1D, 0x1E)
+                                or entry_is_group
+                                or base_name in _NBNS_GROUP_NAMES
+                            )
+                            if (
+                                len(response_name_registry[rr_name_text]) > 1
+                                and not is_group_name
+                            ):
                                 analysis.threat_summary["NBNS Response Spoofing"] += 1
+                                analysis.name_conflicts += 1
                                 _append_anomaly(
                                     "HIGH",
-                                    "NBNS Spoofing",
-                                    f"Name {rr_name_text} resolved by multiple IPs: {', '.join(sorted(response_name_registry[rr_name_text]))}",
+                                    "NBNS Spoofing / Name Conflict",
+                                    f"Unique NetBIOS name {rr_name_text} answered by multiple hosts (possible NBNS poisoning): {', '.join(sorted(response_name_registry[rr_name_text]))}",
                                     src_ip,
                                     dst_ip,
                                     ts,

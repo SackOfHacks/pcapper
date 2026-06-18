@@ -897,15 +897,24 @@ def merge_obfuscation_summaries(
 
 
 @memoize_analysis
-def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSummary:
+def analyze_obfuscation(
+    path: Path,
+    show_status: bool = True,
+    *,
+    packets: list[object] | None = None,
+    meta: object | None = None,
+) -> ObfuscationSummary:
     if TCP is None and UDP is None:
         summary = _empty_summary(path)
         return ObfuscationSummary(
             **{**summary.__dict__, "errors": ["Scapy TCP/UDP unavailable"]},
         )
 
+    # Reuse the single pre-loaded packet set / file metadata when the CLI passes
+    # them, instead of re-reading the pcap from disk (perf on large captures in
+    # multi-function runs).
     reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
+        path, packets=packets, meta=meta, show_status=show_status
     )
     total_packets = 0
     total_payload_bytes = 0

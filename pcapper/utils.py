@@ -277,8 +277,13 @@ def is_valid_ip(value: str) -> bool:
 
 @lru_cache(maxsize=100000)
 def is_public_ip(value: str) -> bool:
+    # "Public" means a routable internet UNICAST peer. Python reports
+    # global-scope IPv6 multicast (e.g. ff0e::/16, and even link-local ff02::
+    # solicited-node groups) as is_global=True, so multicast must be excluded or
+    # benign IPv6 Neighbor Discovery / mDNS is mislabeled as public exposure.
     try:
-        return bool(ipaddress.ip_address(value).is_global)
+        obj = ipaddress.ip_address(value)
+        return bool(obj.is_global) and not obj.is_multicast
     except (ValueError, TypeError):
         return False
 

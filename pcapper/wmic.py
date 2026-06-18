@@ -63,7 +63,17 @@ SUSPICIOUS_COMMANDS = [
         re.compile(r"process\s+call\s+create", re.IGNORECASE),
         "Remote process creation",
     ),
-    (re.compile(r"cmd\.exe|powershell", re.IGNORECASE), "Shell execution"),
+    # Impacket wmiexec marshals `cmd.exe /Q /c <command> 1> \\127.0.0.1\ADMIN$\__<ts> 2>&1`
+    # over Win32_Process.Create — the `cmd /c` (no .exe) form and the `__<digits>`
+    # output file are the distinctive signatures the old `cmd\.exe` pattern missed.
+    (
+        re.compile(r"\\__\d{6,}|ADMIN\$\\__|\bcmd(?:\.exe)?\s+/q\s+/c\b", re.IGNORECASE),
+        "wmiexec command pattern (Impacket)",
+    ),
+    (
+        re.compile(r"\bcmd(?:\.exe)?\s+/[a-z]|powershell|pwsh\b", re.IGNORECASE),
+        "Shell execution",
+    ),
     (re.compile(r"rundll32|regsvr32", re.IGNORECASE), "DLL execution"),
     (re.compile(r"schtasks|\bat\s+\\\\", re.IGNORECASE), "Scheduled task creation"),
     (
@@ -684,6 +694,37 @@ def analyze_wmic(
                     "details": f"{client} -> {server} interval avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s",
                 }
             )
+
+    # WMI remote process execution (Win32_Process.Create) = wmiexec lateral
+    # movement (T1047), distinct from a benign `SELECT * FROM Win32_Process`
+    # inventory query. Win32_ProcessStartup is the strong discriminator — it
+    # carries the ProcessStartupInformation for Create() and is virtually never
+    # part of an inventory read. Surface the actual command line(s) as evidence.
+    exec_cmds = [
+        cmd
+        for cmd in suspicious_commands
+        if any(
+            tok in cmd.lower()
+            for tok in ("cmd", "powershell", "pwsh", "wmiexec", "process call create")
+        )
+    ]
+    process_create = bool(wmi_classes.get("Win32_ProcessStartup", 0)) or (
+        bool(wmi_classes.get("Win32_Process", 0)) and bool(exec_cmds)
+    )
+    if process_create:
+        sample = exec_cmds[:5] or [
+            f"{cls} class observed"
+            for cls in ("Win32_ProcessStartup", "Win32_Process")
+            if wmi_classes.get(cls, 0)
+        ]
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "WMI remote process execution (Win32_Process.Create) [T1047]",
+                "details": "Remote command execution over WMI (wmiexec-style lateral movement): "
+                + "; ".join(s[:160] for s in sample),
+            }
+        )
 
     if suspicious_commands:
         detections.append(

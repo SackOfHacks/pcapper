@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .analyzer import analyze_pcap
 from .arp import analyze_arp
+from .creds import analyze_creds
 from .dhcp import analyze_dhcp
 from .files import analyze_files
 from .hostname import analyze_hostname
@@ -90,6 +90,7 @@ class HostDetailsSummary:
     duration_seconds: Optional[float]
     mac_addresses: list[str]
     hostnames: list[str]
+    user_agents: list[str]
     hostname_findings: list[dict[str, object]]
     user_evidence: list[dict[str, object]]
     file_transfers: list[dict[str, object]]
@@ -158,8 +159,19 @@ def _host_window(
     return min(points), max(points)
 
 
-def _extract_mac_values(target_ip: str, arp_summary, dhcp_summary) -> list[str]:
+def _extract_mac_values(
+    target_ip: str, arp_summary, dhcp_summary, ips_summary=None
+) -> list[str]:
     macs: set[str] = set()
+
+    # Every Ethernet frame to/from the host carries its L2 address, so the IP
+    # pass already records the host's MAC(s) per IP. This is the primary, most
+    # reliable source — ARP/DHCP only see the subset of hosts that did ARP/DHCP,
+    # so on captures without ARP (e.g. a mid-session HTTP capture) those alone
+    # report no MAC even though every packet has one.
+    for mac in (getattr(ips_summary, "ip_mac_counts", {}) or {}).get(target_ip, {}):
+        if mac:
+            macs.add(str(mac).lower())
 
     for convo in getattr(arp_summary, "conversations", []) or []:
         if convo.src_ip == target_ip and convo.src_mac:
@@ -173,13 +185,27 @@ def _extract_mac_values(target_ip: str, arp_summary, dhcp_summary) -> list[str]:
         ) and session.client_mac:
             macs.add(str(session.client_mac).lower())
 
-    return sorted(mac for mac in macs if mac and mac != "00:00:00:00:00:00")
+    def _is_real_host_mac(mac: str) -> bool:
+        # A host's own NIC address is unicast; drop the all-zero placeholder and
+        # any broadcast/multicast address (ff:ff:ff:ff:ff:ff, 01:00:5e:*, 33:33:*),
+        # which are destinations seen in the host's frames, not its identity. The
+        # multicast/broadcast bit is the least-significant bit of the first octet.
+        if not mac or mac == "00:00:00:00:00:00":
+            return False
+        try:
+            first_octet = int(mac.split(":")[0], 16)
+        except (ValueError, IndexError):
+            return False
+        return not (first_octet & 0x01)
+
+    return sorted(mac for mac in macs if _is_real_host_mac(mac))
 
 
 def _infer_operating_system(
     hostnames: set[str],
     services: list[dict[str, object]],
     dhcp_summary,
+    user_agents: Iterable[str] = (),
 ) -> tuple[str, list[str]]:
     os_scores: Counter[str] = Counter()
     evidence: list[str] = []
@@ -190,6 +216,44 @@ def _infer_operating_system(
             return
         evidence_seen.add(label)
         evidence.append(label)
+
+    # HTTP User-Agent is the single strongest passive OS/client signal — it
+    # usually names the OS family and build directly (and exposes tooling/malware).
+    _WIN_NT_VERSIONS = {
+        "10.0": "Windows 10/11",
+        "6.3": "Windows 8.1 / Server 2012 R2",
+        "6.2": "Windows 8 / Server 2012",
+        "6.1": "Windows 7 / Server 2008 R2",
+        "6.0": "Windows Vista / Server 2008",
+        "5.1": "Windows XP",
+    }
+    for ua in user_agents:
+        low = str(ua or "").lower()
+        if not low:
+            continue
+        nt = re.search(r"windows nt (\d+\.\d+)", low)
+        if nt:
+            os_scores["Windows"] += 4
+            ver = _WIN_NT_VERSIONS.get(nt.group(1))
+            _add_evidence(
+                f"user-agent: Windows NT {nt.group(1)}"
+                + (f" ({ver})" if ver else "")
+            )
+        elif "windows" in low:
+            os_scores["Windows"] += 3
+            _add_evidence("user-agent: windows token")
+        if "android" in low:
+            os_scores["Mobile"] += 4
+            _add_evidence("user-agent: Android")
+        elif any(t in low for t in ("iphone", "ipad", "cfnetwork", " ios ")):
+            os_scores["Mobile"] += 4
+            _add_evidence("user-agent: iOS/Apple-mobile")
+        elif any(t in low for t in ("mac os x", "macintosh", "darwin")):
+            os_scores["macOS"] += 4
+            _add_evidence("user-agent: macOS")
+        elif any(t in low for t in ("linux", "ubuntu", "debian", "fedora", "x11")):
+            os_scores["Linux/Unix"] += 4
+            _add_evidence("user-agent: Linux/Unix")
 
     ics_protocol_markers = {
         "modbus",
@@ -402,6 +466,7 @@ def merge_hostdetails_summaries(
             duration_seconds=0.0,
             mac_addresses=[],
             hostnames=[],
+            user_agents=[],
             hostname_findings=[],
             user_evidence=[],
             file_transfers=[],
@@ -447,6 +512,7 @@ def merge_hostdetails_summaries(
 
     macs: set[str] = set()
     hostnames: set[str] = set()
+    user_agents: set[str] = set()
     hostname_findings: list[dict[str, object]] = []
     hostname_seen: dict[tuple[str, str, str, str, str, str], int] = {}
     user_evidence: list[dict[str, object]] = []
@@ -504,6 +570,7 @@ def merge_hostdetails_summaries(
 
         macs.update(summary.mac_addresses)
         hostnames.update(summary.hostnames)
+        user_agents.update(getattr(summary, "user_agents", []) or [])
         for finding in summary.hostname_findings:
             key = (
                 str(finding.get("hostname", "")),
@@ -777,6 +844,7 @@ def merge_hostdetails_summaries(
         duration_seconds=duration_seconds,
         mac_addresses=sorted(macs),
         hostnames=sorted(hostnames),
+        user_agents=sorted(user_agents),
         hostname_findings=hostname_findings,
         user_evidence=user_evidence,
         file_transfers=file_transfers,
@@ -841,6 +909,7 @@ def analyze_hostdetails(
             duration_seconds=None,
             mac_addresses=[],
             hostnames=[],
+            user_agents=[],
             hostname_findings=[],
             user_evidence=[],
             file_transfers=[],
@@ -967,7 +1036,6 @@ def analyze_hostdetails(
             path, show_status, f"Host details: {desc}", func, *args, **kwargs
         )
 
-    base_summary = analyze_pcap(path, show_status=show_status)
     ips_summary = _busy("IPs", analyze_ips, path, show_status=False)
     # Hostdetails identity should only include names mapped to the target IP itself.
     hostname_summary = _busy(
@@ -988,6 +1056,7 @@ def analyze_hostdetails(
     )
     netbios_summary = _busy("NetBIOS", analyze_netbios, path, show_status=False)
     kerberos_summary = _busy("Kerberos", analyze_kerberos, path, show_status=False)
+    creds_summary = _busy("Credentials", analyze_creds, path, show_status=False)
     webrequests_summary = _busy(
         "Web requests",
         analyze_webrequests,
@@ -1028,6 +1097,17 @@ def analyze_hostdetails(
 
     # Endpoint peer/protocol/port presence is intentionally not merged into packet-volume counters.
 
+    # Handshake-confirmed server ports per IP (who actually LISTENS on a port).
+    # This is the authoritative client/server role signal: a conversation's
+    # "remote service" is the *peer's* confirmed service port, never the focused
+    # host's own service port or either side's ephemeral source ports.
+    service_port_map: dict[str, set[int]] = {
+        str(ip_text): {int(p) for p in (ports or [])}
+        for ip_text, ports in (
+            getattr(ips_summary, "confirmed_tcp_service_ports", {}) or {}
+        ).items()
+    }
+
     conversations: list[dict[str, object]] = []
     relevant_packets = 0
     for conv in ips_summary.conversations:
@@ -1040,6 +1120,15 @@ def analyze_hostdetails(
         for port in conv.ports:
             port_counts[int(port)] += conv.packets
         relevant_packets += conv.packets
+        # Remote service(s) the focused host CONNECTED TO over this conversation:
+        # the ports the peer confirmed it serves. If the peer serves nothing in
+        # this conversation, the focused host is the server (or the role is
+        # unconfirmed), so it established no remote service here.
+        peer_service_ports = sorted(
+            int(port)
+            for port in conv.ports
+            if int(port) in service_port_map.get(peer, set())
+        )
         conversations.append(
             {
                 "direction": direction,
@@ -1054,6 +1143,7 @@ def analyze_hostdetails(
                 "ports": ",".join(str(port) for port in conv.ports[:8])
                 if conv.ports
                 else "-",
+                "remote_service_ports": peer_service_ports,
             }
         )
 
@@ -1150,10 +1240,23 @@ def analyze_hostdetails(
             }
         )
 
+    # User-Agent strings the host SENT are a high-value passive signal: they
+    # reveal the OS/build, the browser/tooling, and often malware (custom or
+    # anomalous UAs). Collect the distinct values the focused host emitted.
+    host_user_agents: Counter[str] = Counter()
     for req in getattr(webrequests_summary, "requests", []) or []:
         src_ip = str(getattr(req, "src_ip", "") or "")
         if src_ip != target_ip:
             continue
+        headers = getattr(req, "headers", {}) or {}
+        user_agent = ""
+        if isinstance(headers, dict):
+            for hk, hv in headers.items():
+                if str(hk).lower() == "user-agent":
+                    user_agent = str(hv or "").strip()
+                    break
+        if user_agent:
+            host_user_agents[user_agent] += 1
         web_requests.append(
             {
                 "ts": getattr(req, "ts", None),
@@ -1165,6 +1268,7 @@ def analyze_hostdetails(
                 "host": str(getattr(req, "host", "") or ""),
                 "uri": str(getattr(req, "uri", "") or ""),
                 "http_version": str(getattr(req, "http_version", "") or ""),
+                "user_agent": user_agent,
                 "response_code": getattr(req, "response_code", None),
                 "response_name": str(getattr(req, "response_name", "") or ""),
                 "risk_level": str(getattr(req, "risk_level", "") or ""),
@@ -1359,7 +1463,9 @@ def analyze_hostdetails(
             if search_token in str(value).lower()
         }
 
-    mac_addresses = _extract_mac_values(target_ip, arp_summary, dhcp_summary)
+    mac_addresses = _extract_mac_values(
+        target_ip, arp_summary, dhcp_summary, ips_summary
+    )
 
     dedup_errors: list[str] = []
     seen_errors: set[str] = set()
@@ -1372,7 +1478,7 @@ def analyze_hostdetails(
     conversations.sort(key=lambda item: int(item.get("bytes", 0) or 0), reverse=True)
     services.sort(key=lambda item: int(item.get("packets", 0) or 0), reverse=True)
     operating_system, os_evidence = _infer_operating_system(
-        hostnames, services, dhcp_summary
+        hostnames, services, dhcp_summary, user_agents=list(host_user_agents)
     )
     hostname_findings.sort(
         key=lambda item: int(item.get("count", 0) or 0), reverse=True
@@ -1391,9 +1497,9 @@ def analyze_hostdetails(
         conversations, timeline_events, dns_queries, file_transfers
     )
     if host_first_seen is None:
-        host_first_seen = base_summary.start_ts
+        host_first_seen = getattr(ips_summary, "first_seen", None)
     if host_last_seen is None:
-        host_last_seen = base_summary.end_ts
+        host_last_seen = getattr(ips_summary, "last_seen", None)
     host_duration_seconds = None
     if host_first_seen is not None and host_last_seen is not None:
         host_duration_seconds = max(0.0, float(host_last_seen) - float(host_first_seen))
@@ -1518,6 +1624,66 @@ def analyze_hostdetails(
             }
         )
 
+    # Credential-borne identities: analyze_creds already extracts usernames from
+    # HTTP Basic / form fields, NTLMSSP (binary + HTTP), FTP USER, SMTP/POP3/IMAP
+    # AUTH, Telnet, and SMB — the full PCredz/NetworkMiner-style protocol set.
+    # Attribute each to this host by traffic direction: a username sent FROM the
+    # host is the account in use on it (client); one sent TO the host is an
+    # account authenticating against it (server).
+    for hit in getattr(creds_summary, "hits", []) or []:
+        raw_user = str(getattr(hit, "username", "") or "").strip()
+        if not raw_user:
+            continue
+        src_ip = str(getattr(hit, "src_ip", "") or "")
+        dst_ip = str(getattr(hit, "dst_ip", "") or "")
+        if target_ip == src_ip:
+            seen_as = "as client (account in use on host)"
+        elif target_ip == dst_ip:
+            seen_as = "as server (account authenticating to host)"
+        else:
+            continue
+        # Split DOMAIN\\user and user@realm into username + domain.
+        domain = ""
+        username = raw_user
+        if "\\" in raw_user:
+            domain, _, username = raw_user.partition("\\")
+        elif "@" in raw_user:
+            username, _, domain = raw_user.partition("@")
+        username = username.strip()
+        if not username:
+            continue
+        # `kind` already describes the source (e.g. "NTLM Authenticate User",
+        # "HTTP Basic Auth", "FTP PASS"); `protocol` is often "TCP/<port>" which
+        # only adds per-port noise that breaks method consolidation. Prefer kind.
+        kind = str(getattr(hit, "kind", "") or "").strip()
+        protocol = str(getattr(hit, "protocol", "") or "").strip()
+        method = kind or protocol or "credential"
+        user_evidence.append(
+            {
+                "username": username,
+                "domain": domain.strip(),
+                "full_name": "",
+                "method": method,
+                "location": f"{src_ip}->{dst_ip} {seen_as}".strip(),
+            }
+        )
+
+    # De-duplicate identity evidence by (username, domain, method); keep the
+    # first (most specific) location seen for each.
+    _seen_user_keys: set[tuple[str, str, str]] = set()
+    _deduped_users: list[dict[str, object]] = []
+    for item in user_evidence:
+        key = (
+            str(item.get("username", "")).lower(),
+            str(item.get("domain", "")).lower(),
+            str(item.get("method", "")).lower(),
+        )
+        if key in _seen_user_keys:
+            continue
+        _seen_user_keys.add(key)
+        _deduped_users.append(item)
+    user_evidence = _deduped_users
+
     # --- Host verdict -----------------------------------------------------
     sev_counts: Counter[str] = Counter(
         str(d.get("severity", "info") or "info").lower() for d in detections
@@ -1586,7 +1752,7 @@ def analyze_hostdetails(
         search_query=search_query_text or None,
         operating_system=operating_system,
         os_evidence=os_evidence,
-        total_packets=base_summary.packet_count,
+        total_packets=int(getattr(ips_summary, "total_packets", 0) or 0),
         relevant_packets=relevant_packets,
         packets_sent=packets_sent,
         packets_recv=packets_recv,
@@ -1597,6 +1763,7 @@ def analyze_hostdetails(
         duration_seconds=host_duration_seconds,
         mac_addresses=mac_addresses,
         hostnames=sorted(hostnames),
+        user_agents=[ua for ua, _ in host_user_agents.most_common(12)],
         hostname_findings=hostname_findings,
         user_evidence=user_evidence,
         file_transfers=file_transfers,

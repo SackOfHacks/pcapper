@@ -109,12 +109,10 @@ class HostnameSummary:
     analyst_verdict: str = ""
     analyst_confidence: str = "low"
     analyst_reasons: list[str] = field(default_factory=list)
-    deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
     conflict_profiles: list[dict[str, object]] = field(default_factory=list)
     drift_profiles: list[dict[str, object]] = field(default_factory=list)
     suspicious_name_profiles: list[dict[str, object]] = field(default_factory=list)
     cross_protocol_corroboration: list[dict[str, object]] = field(default_factory=list)
-    risk_matrix: list[dict[str, str]] = field(default_factory=list)
     false_positive_context: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -161,12 +159,6 @@ def _build_hostname_enrichment(
                 f"{ip} presents {len(names)} hostnames ({', '.join(sorted(names)[:4])}...)"
             )
 
-    provenance = []
-    if findings:
-        provenance.append(f"hostname findings ({len(findings)})")
-    if provenance:
-        checks["evidence_provenance"].append("; ".join(provenance))
-
     score = 0
     reasons: list[str] = []
     if checks.get("hostname_collision_or_spoofing"):
@@ -191,27 +183,10 @@ def _build_hostname_enrichment(
     if not reasons and verdict:
         reasons.append("Hostname identity heuristics crossed threshold")
 
-    _risk_meta = {
-        "hostname_collision_or_spoofing": ("Hostname Collision/Spoofing", "Medium"),
-        "ip_alias_or_fronting_anomaly": ("IP Alias/Fronting", "Low"),
-    }
-    risk_matrix = [
-        {
-            "category": cat,
-            "risk": risk,
-            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
-            "evidence": f"{len(checks.get(key, []))} finding(s)",
-        }
-        for key, (cat, risk) in _risk_meta.items()
-        if checks.get(key)
-    ]
-
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
         "analyst_reasons": reasons,
-        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
-        "risk_matrix": risk_matrix,
     }
 
 def _normalize_hostname(value: str) -> str:
@@ -2065,65 +2040,6 @@ def _record_finding(
     return True
 
 
-def _scope_findings_to_target(
-    findings: list[HostnameFinding],
-    target_ip: str,
-) -> list[HostnameFinding]:
-    scoped_map: dict[tuple[str, str, str, str, str, str, str], HostnameFinding] = {}
-    for finding in findings:
-        mapped_ip = finding.mapped_ip
-        if finding.src_ip == target_ip or finding.dst_ip == target_ip:
-            mapped_ip = target_ip
-        key = (
-            finding.hostname,
-            mapped_ip,
-            finding.protocol,
-            finding.method,
-            finding.src_ip,
-            finding.dst_ip,
-            finding.details,
-        )
-        existing = scoped_map.get(key)
-        if existing is None:
-            scoped_map[key] = HostnameFinding(
-                hostname=finding.hostname,
-                mapped_ip=mapped_ip,
-                protocol=finding.protocol,
-                method=finding.method,
-                confidence=finding.confidence,
-                details=finding.details,
-                src_ip=finding.src_ip,
-                dst_ip=finding.dst_ip,
-                first_seen=finding.first_seen,
-                last_seen=finding.last_seen,
-                first_packet=finding.first_packet,
-                last_packet=finding.last_packet,
-                count=finding.count,
-            )
-            continue
-
-        existing.count += finding.count
-        if finding.first_seen is not None and (
-            existing.first_seen is None or finding.first_seen < existing.first_seen
-        ):
-            existing.first_seen = finding.first_seen
-        if finding.last_seen is not None and (
-            existing.last_seen is None or finding.last_seen > existing.last_seen
-        ):
-            existing.last_seen = finding.last_seen
-        if finding.first_packet is not None and (
-            existing.first_packet is None
-            or finding.first_packet < existing.first_packet
-        ):
-            existing.first_packet = finding.first_packet
-        if finding.last_packet is not None and (
-            existing.last_packet is None or finding.last_packet > existing.last_packet
-        ):
-            existing.last_packet = finding.last_packet
-
-    return list(scoped_map.values())
-
-
 def _matches_target_mapping(
     mapped_ip: str,
     target_ip: str | None,
@@ -2262,12 +2178,6 @@ def merge_hostname_summaries(summaries: list[HostnameSummary]) -> HostnameSummar
     merged.analyst_reasons = [
         str(v) for v in list(merged_context.get("analyst_reasons", []) or [])
     ]
-    merged.deterministic_checks = {
-        str(key): [str(v) for v in list(values or [])]
-        for key, values in dict(
-            merged_context.get("deterministic_checks", {}) or {}
-        ).items()
-    }
     merged.conflict_profiles = list(merged_context.get("conflict_profiles", []) or [])
     merged.drift_profiles = list(merged_context.get("drift_profiles", []) or [])
     merged.suspicious_name_profiles = list(
@@ -2276,11 +2186,6 @@ def merge_hostname_summaries(summaries: list[HostnameSummary]) -> HostnameSummar
     merged.cross_protocol_corroboration = list(
         merged_context.get("cross_protocol_corroboration", []) or []
     )
-    merged.risk_matrix = [
-        dict(item)
-        for item in list(merged_context.get("risk_matrix", []) or [])
-        if isinstance(item, dict)
-    ]
     merged.false_positive_context = [
         str(v) for v in list(merged_context.get("false_positive_context", []) or [])
     ]
@@ -3402,8 +3307,17 @@ def analyze_hostname(
             pass
 
     final_findings = list(findings_map.values())
-    if target_filter_enabled and include_related and target_ip:
-        final_findings = _scope_findings_to_target(final_findings, target_ip)
+    if target_filter_enabled and target_ip:
+        # A hostname belongs to the target only when the per-method, session-aware
+        # mapping attributed it to the target's own IP (a DNS A-record that
+        # resolves to it, a Host header/SNI where it is the server, its own
+        # NetBIOS/DHCP/mDNS announcement, etc.). Findings that map to a peer (a
+        # server the target merely contacted) or to no IP at all (a name the
+        # target only looked up) are the target's *activity*, not its *identity*,
+        # so they are excluded from an -ip scoped view.
+        final_findings = [
+            item for item in final_findings if item.mapped_ip == target_ip
+        ]
 
     if apply_filters and query_text:
         final_findings = [
@@ -3429,10 +3343,6 @@ def analyze_hostname(
     summary.analyst_reasons = [
         str(v) for v in list(context.get("analyst_reasons", []) or [])
     ]
-    summary.deterministic_checks = {
-        str(key): [str(v) for v in list(values or [])]
-        for key, values in dict(context.get("deterministic_checks", {}) or {}).items()
-    }
     summary.conflict_profiles = list(context.get("conflict_profiles", []) or [])
     summary.drift_profiles = list(context.get("drift_profiles", []) or [])
     summary.suspicious_name_profiles = list(
@@ -3441,11 +3351,6 @@ def analyze_hostname(
     summary.cross_protocol_corroboration = list(
         context.get("cross_protocol_corroboration", []) or []
     )
-    summary.risk_matrix = [
-        dict(item)
-        for item in list(context.get("risk_matrix", []) or [])
-        if isinstance(item, dict)
-    ]
     summary.false_positive_context = [
         str(v) for v in list(context.get("false_positive_context", []) or [])
     ]

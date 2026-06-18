@@ -528,6 +528,15 @@ def analyze_secrets(
                     continue
                 if not _looks_cleartext(raw):
                     continue
+                # Hex blobs are uniquely FP-prone: a random 8-byte value decodes
+                # to ~6/8 printable bytes by chance and, once the non-printable
+                # bytes are stripped by _decode_text, can look like a short word
+                # ("3001805773435453" -> "0WsCTS"). Genuine hex-encoded ASCII
+                # (passwords/tokens/keys) is essentially fully printable, so the
+                # hex path requires a high RAW printable ratio (evaluated before
+                # stripping) — base64/JWT keep the looser shared gate.
+                if _printable_ratio(raw) < 0.9:
+                    continue
                 decoded_text = _decode_text(raw).strip()
                 if not decoded_text or not _is_meaningful_text(decoded_text):
                     continue

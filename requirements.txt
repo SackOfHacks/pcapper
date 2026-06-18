@@ -1,4 +1,4 @@
-# Runtime dependencies for pcapper v2.0.0 (alphabetical; Scapy required for deep protocol analysis).
+# Runtime dependencies for pcapper v2.0.1 (alphabetical; Scapy required for deep protocol analysis).
 # Keep in sync with pyproject.toml [project.dependencies].
 cryptography>=42.0.0          # TLS/certificate parsing (JA3/JA4, cert IOCs)
 dpkt>=1.9.8                   # fast HTTP/file-carving fallback path

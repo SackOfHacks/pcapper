@@ -18,9 +18,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 
 try:
-    from scapy.packet import Packet, Raw  # type: ignore
+    from scapy.packet import Packet, Padding, Raw  # type: ignore
 except Exception:  # pragma: no cover
-    Raw = Packet = None  # type: ignore
+    Raw = Packet = Padding = None  # type: ignore
 
 try:
     import dpkt
@@ -30,6 +30,12 @@ try:
     import pefile
 except Exception:  # pragma: no cover
     pefile = None
+try:
+    from cryptography import x509 as _x509  # type: ignore
+    from cryptography.hazmat.backends import default_backend as _default_backend  # type: ignore
+except Exception:  # pragma: no cover
+    _x509 = None  # type: ignore
+    _default_backend = None  # type: ignore
 
 from .aim import analyze_aim
 from .cip import CIP_SERVICE_NAMES
@@ -1284,6 +1290,35 @@ def _extract_request_filename(
         return None
 
 
+def _scapy_segment_payload(layer: Any) -> bytes:
+    """Return the genuine TCP/UDP payload bytes from a Scapy transport layer.
+
+    Scapy attaches Ethernet frame padding (the zero bytes that pad frames up to
+    the 60-byte minimum, common on pure ACKs and other short segments) as a
+    ``Padding`` layer beneath TCP/UDP. A naive ``bytes(tcp.payload)`` pulls those
+    null pad bytes into the reassembled stream, corrupting carving and protocol
+    detection (e.g. an HTTP response's ``HTTP/1.`` gets overwritten by nulls and
+    is mis-detected as HTTP/2). The dpkt/disk path is immune because it derives
+    the payload length from the IP header; this mirrors that by excluding the
+    Padding so both paths produce identical streams.
+    """
+    body = getattr(layer, "payload", None)
+    if not body or (Padding is not None and isinstance(body, Padding)):
+        return b""
+    if Raw is not None:
+        raw = body.getlayer(Raw)
+        if raw is not None:
+            return bytes(raw.load)
+    data = bytes(body)
+    if Padding is not None:
+        tail = body.getlayer(Padding)
+        if tail is not None:
+            pad = bytes(tail)
+            if pad and data.endswith(pad):
+                data = data[: -len(pad)]
+    return data
+
+
 def _assemble_stream(
     chunks: List[Tuple[int, bytes, int]], limit: int = 50_000_000
 ) -> Tuple[bytes, int]:
@@ -2347,14 +2382,10 @@ class FileExtractor:
             tcp = pkt[TCP]
             proto = "TCP"
             sport, dport = int(tcp.sport), int(tcp.dport)
-            payload = b""
-            if Raw in pkt:
-                payload = bytes(pkt[Raw])
-            else:
-                try:
-                    payload = bytes(tcp.payload)
-                except Exception:
-                    payload = b""
+            try:
+                payload = _scapy_segment_payload(tcp)
+            except Exception:
+                payload = b""
             if payload:
                 seq = int(tcp.seq)
                 self.tcp_streams[(src, dst, sport, dport)].append((seq, payload, idx))
@@ -3237,6 +3268,34 @@ def _extract_pem_certs(data: bytes) -> List[bytes]:
     return certs
 
 
+def _is_der_certificate(blob: bytes) -> bool:
+    """True only if ``blob`` is an actual DER-encoded X.509 certificate.
+
+    The raw DER scanner keys on the ASN.1 SEQUENCE tag (0x30), which every
+    BER/DER protocol shares — MMS (port 102), LDAP, SNMP, Kerberos, etc. — so
+    without this gate their PDUs were carved as bogus "X509AF" certificates
+    (e.g. an IEC-61850 MMS capture with zero TLS reported 31 certs). A real
+    certificate is ``SEQUENCE { tbsCertificate SEQUENCE, ... }`` and is always
+    several hundred bytes (the RSA/EC public key alone exceeds the small PDUs),
+    so a cheap structural gate rejects almost everything before the definitive
+    parse via the cryptography library.
+    """
+    if len(blob) < 256 or blob[0] != 0x30 or blob[1] != 0x82:
+        return False
+    # First element of the outer SEQUENCE must itself be a (long-form) SEQUENCE
+    # — the tbsCertificate. Header is tag(1) + 0x82 + len(2) = 4 bytes.
+    if blob[4] != 0x30:
+        return False
+    if _x509 is None:
+        # cryptography unavailable: fall back to the structural gate alone.
+        return True
+    try:
+        _x509.load_der_x509_certificate(blob, _default_backend())
+        return True
+    except Exception:
+        return False
+
+
 def _extract_der_blobs(data: bytes) -> List[bytes]:
     blobs: List[bytes] = []
     idx = 0
@@ -3434,7 +3493,7 @@ def _export_with_dpkt(
 
             if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 tcp = pkt[TCP]  # type: ignore[index]
-                payload = bytes(getattr(tcp, "payload", b""))
+                payload = _scapy_segment_payload(tcp)
                 if payload:
                     seq = int(getattr(tcp, "seq", 0) or 0)
                     tcp_streams[
@@ -3442,7 +3501,7 @@ def _export_with_dpkt(
                     ].append((seq, payload, idx))
             elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                 udp = pkt[UDP]  # type: ignore[index]
-                payload = bytes(getattr(udp, "payload", b""))
+                payload = _scapy_segment_payload(udp)
                 if payload:
                     udp_packets.append(
                         (src_ip, dst_ip, int(udp.sport), int(udp.dport), payload, idx)
@@ -3909,6 +3968,8 @@ def _export_with_dpkt(
                 )
             )
         for der in _extract_der_blobs(stream):
+            if not _is_der_certificate(der):
+                continue
             digest = hashlib.sha256(_normalize_x509_payload(der)).hexdigest()
             meta_key = (src, dst, f"x509_{first_pkt}.cer", len(der))
             if digest in seen_x509 or meta_key in seen_x509_meta:

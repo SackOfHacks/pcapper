@@ -173,8 +173,66 @@ class IpSummary:
     infrastructure_clusters: list[dict[str, object]] = field(default_factory=list)
     intent_profiles: list[dict[str, object]] = field(default_factory=list)
     corroborated_findings: list[dict[str, object]] = field(default_factory=list)
-    risk_matrix: list[dict[str, str]] = field(default_factory=list)
     false_positive_context: list[str] = field(default_factory=list)
+    # Per-IP geo/ASN/org enrichment (MaxMind DB and/or online lookup). Keyed by
+    # IP -> {country, city, asn, org, hosting, proxy, source}.
+    ip_enrichment: dict[str, dict[str, str]] = field(default_factory=dict)
+
+
+def _enrich_ips_online(
+    ips: list[str], timeout: float = 6.0
+) -> tuple[dict[str, dict[str, str]], list[str]]:
+    """Look up geo/ASN/org for public IPs via the free ip-api.com batch API
+    (no key, <=100 IPs/request). Opt-in (--ip-geo) because it sends the observed
+    public IPs to a third party. Flags hosting/proxy/mobile networks, which is
+    high-value triage context (bulletproof hosting, VPN/anonymizer egress)."""
+    out: dict[str, dict[str, str]] = {}
+    errors: list[str] = []
+    fields = "status,country,countryCode,regionName,city,isp,org,as,asname,hosting,proxy,mobile,query"
+    unique = [ip for ip in dict.fromkeys(ips) if ip]
+    for i in range(0, len(unique), 100):
+        batch = unique[i : i + 100]
+        body = json.dumps(
+            [{"query": ip, "fields": fields, "lang": "en"} for ip in batch]
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            "http://ip-api.com/batch",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
+            errors.append(f"ip-api.com lookup failed: {exc}")
+            break
+        if not isinstance(payload, list):
+            continue
+        for entry in payload:
+            if not isinstance(entry, dict) or entry.get("status") != "success":
+                continue
+            ip = str(entry.get("query", ""))
+            if not ip:
+                continue
+            geo_parts = [
+                str(p)
+                for p in (entry.get("city"), entry.get("regionName"), entry.get("country"))
+                if p
+            ]
+            asn_field = str(entry.get("as", "") or "")
+            org = str(entry.get("org", "") or entry.get("isp", "") or entry.get("asname", "") or "")
+            out[ip] = {
+                "country": str(entry.get("country", "") or ""),
+                "country_code": str(entry.get("countryCode", "") or ""),
+                "geo": ", ".join(geo_parts),
+                "asn": asn_field,
+                "org": org,
+                "hosting": "yes" if entry.get("hosting") else "",
+                "proxy": "yes" if entry.get("proxy") else "",
+                "mobile": "yes" if entry.get("mobile") else "",
+                "source": "ip-api.com",
+            }
+    return out, errors
 
 
 def _tcp_is_syn(flags: object) -> bool:
@@ -359,29 +417,11 @@ def _build_ips_enrichment(
     if not reasons and verdict:
         reasons.append("IP intelligence heuristics crossed threshold")
 
-    _risk_meta = {
-        "indicator_quality_gate": ("Threat Indicator", "High"),
-        "corroborated_multi_signal_hit": ("Corroborated Hit", "High"),
-        "intent_heuristics": ("Recon / Lateral Movement", "Medium"),
-        "boundary_cross_zone_contact": ("Zone Boundary Contact", "Low"),
-    }
-    risk_matrix = [
-        {
-            "category": cat,
-            "risk": risk,
-            "confidence": "High" if len(checks.get(key, [])) >= 2 else "Medium",
-            "evidence": f"{len(checks.get(key, []))} signal(s)",
-        }
-        for key, (cat, risk) in _risk_meta.items()
-        if checks.get(key)
-    ]
-
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
         "analyst_reasons": reasons,
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
-        "risk_matrix": risk_matrix,
     }
 
 def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
@@ -653,6 +693,11 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
         for (rep_type, fingerprint, label), count in rep_hits.items()
     ]
 
+    ip_enrichment: dict[str, dict[str, str]] = {}
+    for summary in summary_list:
+        for ip_text, rec in (getattr(summary, "ip_enrichment", {}) or {}).items():
+            ip_enrichment.setdefault(ip_text, dict(rec))
+
     enrichment = _build_ips_enrichment(
         endpoints=endpoint_rows,
         conversations=conversation_rows,
@@ -719,10 +764,10 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
         corroborated_findings=list(
             enrichment.get("corroborated_findings", []) or []
         ),
-        risk_matrix=list(enrichment.get("risk_matrix", []) or []),
         false_positive_context=list(
             enrichment.get("false_positive_context", []) or []
         ),
+        ip_enrichment=ip_enrichment,
     )
 
 
@@ -1019,7 +1064,9 @@ def _infer_protocol(pkt) -> str:
 
 
 @memoize_analysis
-def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
+def analyze_ips(
+    path: Path, show_status: bool = True, geo_lookup: bool = False
+) -> IpSummary:
     errors: list[str] = []
     if IP is None and IPv6 is None and ARP is None:
         errors.append("Scapy IP layers unavailable; install scapy for IP analysis.")
@@ -1266,10 +1313,19 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                     elif reverse_key in handshake_complete:
                         confirmed_tcp_service_ports[src_ip].add(int(sport))
 
-                    setdict_add(
-                        src_to_ports, src_ip, int(dport), max_values=MAX_SET_VALUES
-                    )
-                    setdict_add(src_to_dsts, src_ip, dst_ip, max_values=MAX_SET_VALUES)
+                    # Only count CLIENT-INITIATED flows toward scan/sweep
+                    # profiling: a scanner connects FROM an ephemeral source port
+                    # TO target ports, whereas a server RESPONDS from its service
+                    # port to the client's ephemeral port. Without this guard a
+                    # DNS/HTTP server's replies (sport 53/80 -> many client
+                    # ephemeral dports) are mislabeled as a high-port sweep.
+                    if int(sport) >= 1024:
+                        setdict_add(
+                            src_to_ports, src_ip, int(dport), max_values=MAX_SET_VALUES
+                        )
+                        setdict_add(
+                            src_to_dsts, src_ip, dst_ip, max_values=MAX_SET_VALUES
+                        )
                     setdict_add(
                         dst_to_ports, dst_ip, int(dport), max_values=MAX_SET_VALUES
                     )
@@ -1282,10 +1338,16 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 if conv is not None and dport is not None:
                     set_add_cap(conv["ports"], int(dport), max_size=MAX_SET_VALUES)
                 if sport is not None and dport is not None:
-                    setdict_add(
-                        src_to_ports, src_ip, int(dport), max_values=MAX_SET_VALUES
-                    )
-                    setdict_add(src_to_dsts, src_ip, dst_ip, max_values=MAX_SET_VALUES)
+                    # Client-initiated only (see TCP note above) — keeps a UDP
+                    # service (DNS:53) responding to clients from registering as a
+                    # high-port sweep.
+                    if int(sport) >= 1024:
+                        setdict_add(
+                            src_to_ports, src_ip, int(dport), max_values=MAX_SET_VALUES
+                        )
+                        setdict_add(
+                            src_to_dsts, src_ip, dst_ip, max_values=MAX_SET_VALUES
+                        )
                     setdict_add(
                         dst_to_ports, dst_ip, int(dport), max_values=MAX_SET_VALUES
                     )
@@ -1494,6 +1556,19 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                     "high_ports": high_ports,
                 }
             )
+        elif is_vertical_scan and unique_ports >= 50:
+            # Vertical scan: one/few targets enumerated across many ports — the
+            # most common nmap-style port scan, which the broad/sweep thresholds
+            # (needing >=3 destinations) miss entirely.
+            suspicious_port_profiles.append(
+                {
+                    "type": "vertical_scan",
+                    "src": src_ip,
+                    "unique_ports": unique_ports,
+                    "unique_dsts": unique_dsts,
+                    "high_ports": high_ports,
+                }
+            )
 
     # Lateral movement is INTERNAL host-to-host spread. Scoring on ALL peers
     # (the old behavior) made any workstation browsing many public HTTPS sites
@@ -1647,6 +1722,41 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 )
             )
         endpoint_rows = updated_rows
+
+    # Build the per-IP geo/ASN/org enrichment map. MaxMind (offline) results come
+    # first; the opt-in online ip-api.com lookup fills the rest (and adds org /
+    # hosting / proxy context MaxMind alone does not provide).
+    ip_enrichment: dict[str, dict[str, str]] = {}
+    for ip_text, (geo_label, asn_label) in enriched.items():
+        rec: dict[str, str] = {"source": "maxmind"}
+        if geo_label:
+            rec["geo"] = geo_label
+        if asn_label:
+            rec["asn"] = asn_label
+        if rec.get("geo") or rec.get("asn"):
+            ip_enrichment[ip_text] = rec
+    if geo_lookup:
+        public_ips = [e.ip for e in endpoint_rows if _is_public_ip(e.ip)]
+        # Prioritise the highest-volume public peers within the rate-limit window.
+        public_ips = sorted(
+            public_ips,
+            key=lambda ip: next(
+                (
+                    e.bytes_sent + e.bytes_recv
+                    for e in endpoint_rows
+                    if e.ip == ip
+                ),
+                0,
+            ),
+            reverse=True,
+        )[:100]
+        online, online_errors = _enrich_ips_online(public_ips)
+        errors.extend(online_errors)
+        for ip_text, rec in online.items():
+            existing = ip_enrichment.get(ip_text, {})
+            # Online org/hosting/proxy augment MaxMind geo/asn.
+            merged = {**rec, **{k: v for k, v in existing.items() if v}}
+            ip_enrichment[ip_text] = merged
 
     if ja3_rep:
         for ja3_hash, count in ja3_counts.items():
@@ -1936,8 +2046,8 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
         corroborated_findings=list(
             enrichment.get("corroborated_findings", []) or []
         ),
-        risk_matrix=list(enrichment.get("risk_matrix", []) or []),
         false_positive_context=list(
             enrichment.get("false_positive_context", []) or []
         ),
+        ip_enrichment=ip_enrichment,
     )
