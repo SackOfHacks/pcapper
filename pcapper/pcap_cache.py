@@ -42,6 +42,9 @@ class PcapMeta:
     linktype: object | None
     snaplen: object | None
     interfaces: object | None
+    capture_hardware: str | None = None
+    capture_os: str | None = None
+    capture_application: str | None = None
 
 
 PCAP_MAGIC = {
@@ -72,9 +75,16 @@ def _read_pcap_header(path: Path) -> tuple[object | None, object | None]:
         return None, None
 
 
-def _read_pcapng_interfaces(path: Path) -> list[dict[str, object]]:
+def _decode_pcapng_text(value: bytes) -> str:
+    return value.rstrip(b"\x00").decode("utf-8", errors="ignore").strip()
+
+
+def _read_pcapng_metadata(
+    path: Path,
+) -> tuple[list[dict[str, object]], dict[str, str]]:
     interfaces: list[dict[str, object]] = []
     if_stats: dict[int, dict[str, object]] = {}
+    section_info: dict[str, str] = {}
     try:
         with path.open("rb") as handle:
             endian = "<"
@@ -95,17 +105,34 @@ def _read_pcapng_interfaces(path: Path) -> list[dict[str, object]]:
 
                 if block_type == 0x0A0D0D0A:
                     body_len = block_len - 12
-                    bom_bytes = handle.read(4)
-                    if len(bom_bytes) < 4:
+                    body = handle.read(body_len)
+                    if len(body) < body_len or len(body) < 4:
                         break
-                    bom = struct.unpack("<I", bom_bytes)[0]
+                    bom = struct.unpack("<I", body[:4])[0]
                     if bom == 0x1A2B3C4D:
                         endian = "<"
                     elif bom == 0x4D3C2B1A:
                         endian = ">"
-                    remaining = body_len - 4
-                    if remaining > 0:
-                        handle.seek(remaining, 1)
+                    if len(body) >= 16:
+                        opt_offset = 16
+                        while opt_offset + 4 <= len(body):
+                            code, length = struct.unpack(
+                                f"{endian}HH", body[opt_offset : opt_offset + 4]
+                            )
+                            opt_offset += 4
+                            if code == 0:
+                                break
+                            value = body[opt_offset : opt_offset + length]
+                            opt_offset += (length + 3) & ~3
+                            text = _decode_pcapng_text(value)
+                            if not text:
+                                continue
+                            if code == 2 and "hardware" not in section_info:
+                                section_info["hardware"] = text
+                            elif code == 3 and "os" not in section_info:
+                                section_info["os"] = text
+                            elif code == 4 and "application" not in section_info:
+                                section_info["application"] = text
                     handle.seek(4, 1)
                     continue
 
@@ -134,13 +161,9 @@ def _read_pcapng_interfaces(path: Path) -> list[dict[str, object]]:
                             opt_offset += (length + 3) & ~3
 
                             if code == 2:  # if_name
-                                iface["if_name"] = value.rstrip(b"\x00").decode(
-                                    errors="ignore"
-                                )
+                                iface["if_name"] = _decode_pcapng_text(value)
                             elif code == 3:  # if_description
-                                iface["if_description"] = value.rstrip(b"\x00").decode(
-                                    errors="ignore"
-                                )
+                                iface["if_description"] = _decode_pcapng_text(value)
                             elif code == 6:  # if_MACaddr
                                 iface["if_macaddr"] = ":".join(
                                     f"{b:02x}" for b in value[:6]
@@ -151,13 +174,9 @@ def _read_pcapng_interfaces(path: Path) -> list[dict[str, object]]:
                                 )[0]
                             elif code == 11 and len(value) >= 1:  # if_filter
                                 filter_val = value[1:]
-                                iface["if_filter"] = filter_val.rstrip(b"\x00").decode(
-                                    errors="ignore"
-                                )
+                                iface["if_filter"] = _decode_pcapng_text(filter_val)
                             elif code == 12:  # if_os
-                                iface["if_os"] = value.rstrip(b"\x00").decode(
-                                    errors="ignore"
-                                )
+                                iface["if_os"] = _decode_pcapng_text(value)
 
                         iface["id"] = len(interfaces)
                         interfaces.append(iface)
@@ -192,12 +211,17 @@ def _read_pcapng_interfaces(path: Path) -> list[dict[str, object]]:
 
                 handle.seek(block_len - 8, 1)
     except Exception:
-        return interfaces
+        return interfaces, section_info
 
     for iface_id, stats in if_stats.items():
         if 0 <= iface_id < len(interfaces):
             interfaces[iface_id].update(stats)
 
+    return interfaces, section_info
+
+
+def _read_pcapng_interfaces(path: Path) -> list[dict[str, object]]:
+    interfaces, _section_info = _read_pcapng_metadata(path)
     return interfaces
 
 
@@ -217,7 +241,7 @@ def _finalize_meta(
             snaplen = header_snaplen
 
     if file_type == "pcapng":
-        parsed_interfaces = _read_pcapng_interfaces(path)
+        parsed_interfaces, section_info = _read_pcapng_metadata(path)
         if not interfaces:
             interfaces = parsed_interfaces
         elif isinstance(interfaces, list) and parsed_interfaces:
@@ -238,6 +262,8 @@ def _finalize_meta(
             linktype = parsed_interfaces[0].get("linktype")
         if snaplen is None and parsed_interfaces:
             snaplen = parsed_interfaces[0].get("snaplen")
+    else:
+        section_info = {}
 
     return PcapMeta(
         path=path,
@@ -246,6 +272,9 @@ def _finalize_meta(
         linktype=linktype,
         snaplen=snaplen,
         interfaces=interfaces,
+        capture_hardware=section_info.get("hardware"),
+        capture_os=section_info.get("os"),
+        capture_application=section_info.get("application"),
     )
 
 
@@ -267,6 +296,9 @@ class PacketListReader:
         self.linktype = meta.linktype if meta else None
         self.snaplen = meta.snaplen if meta else None
         self.interfaces = meta.interfaces if meta else None
+        self.capture_hardware = meta.capture_hardware if meta else None
+        self.capture_os = meta.capture_os if meta else None
+        self.capture_application = meta.capture_application if meta else None
         self._pos = 0
 
     def __iter__(self):

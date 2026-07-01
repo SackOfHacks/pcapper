@@ -44,6 +44,12 @@ class StreamRecord:
     server_payload_preview: bytes
     client_gaps: list[dict[str, int]]
     server_gaps: list[dict[str, int]]
+    # TCP connection state derived from the handshake, NOT from reassembly.
+    # "established" = full 3-way handshake observed; "syn-only" = SYN(s) sent but
+    # never answered (blocked/dropped egress, scans); "half-open" = SYN-ACK seen
+    # but no final ACK; "refused" = SYN answered with RST; "reset" = RST without a
+    # captured SYN; "no-handshake" = data/flags seen without a captured SYN.
+    conn_state: str = "unknown"
 
 
 @dataclass
@@ -120,6 +126,34 @@ def _client_server_tuple(
     if sport < dport:
         return dst, dport, src, sport
     return src, sport, dst, dport
+
+
+def _conn_state(
+    info: dict, has_client_payload: bool, has_server_payload: bool
+) -> str:
+    """Classify a stream's TCP connection state from observed handshake flags.
+
+    This is deliberately distinct from reassembly completeness: a SYN-only flow
+    that never connected carries no data, so it has no reassembly gaps and would
+    otherwise look "complete". The state below reflects whether the TCP
+    connection actually came up.
+    """
+    if info.get("established"):
+        return "established"
+    if info.get("synack_seen"):
+        return "half-open"
+    saw_syn = info.get("syn_pkt") is not None
+    if saw_syn and info.get("rst_seen"):
+        return "refused"
+    if saw_syn:
+        return "syn-only"
+    # No SYN captured. If application data flowed in BOTH directions the session
+    # was clearly up -- the capture just started after the handshake.
+    if has_client_payload and has_server_payload:
+        return "active"
+    if info.get("rst_seen"):
+        return "reset"
+    return "no-handshake"
 
 
 def _tcp_flags_text(flags: int) -> str:
@@ -219,6 +253,7 @@ def analyze_streams(
             "syn_dir": None,
             "synack_seen": False,
             "established": False,
+            "rst_seen": False,
         }
     )
     segments_ab: dict[tuple[str, int, str, int], list[tuple[int, bytes]]] = defaultdict(
@@ -303,6 +338,8 @@ def analyze_streams(
             # Prefer the first SYN without ACK as stream start packet.
             is_ab = (src_ip, sport, dst_ip, dport) == stream_key
             direction = "ab" if is_ab else "ba"
+            if flags & 0x04:  # RST
+                info["rst_seen"] = True
             if (flags & 0x02) and not (flags & 0x10) and info["syn_pkt"] is None:
                 info["syn_pkt"] = packet_number
                 info["syn_dir"] = direction
@@ -443,6 +480,7 @@ def analyze_streams(
                 server_payload_preview=payload_ba[:preview_cap],
                 client_gaps=gaps_ab,
                 server_gaps=gaps_ba,
+                conn_state=_conn_state(info, bool(payload_ab), bool(payload_ba)),
             )
         )
         if target_followed_id and sid == target_followed_id:
