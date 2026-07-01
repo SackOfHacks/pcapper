@@ -291,15 +291,25 @@ def _extract_url(host: str, uri: str) -> str:
     return uri
 
 
+def _safe_urlparse(url: str):
+    """urlparse() that never raises. Python's urlsplit rejects malformed
+    netlocs (e.g. an unbalanced IPv6 bracket -> "Invalid IPv6 URL"), which would
+    otherwise crash the whole HTTP analysis on a single bad request URL."""
+    try:
+        return urlparse(url)
+    except ValueError:
+        return urlparse("")
+
+
 def _parse_referrer(referrer: str) -> tuple[str, str, str]:
     ref = referrer.strip()
     if not ref or ref == "-":
         return "", "", ""
-    parsed = urlparse(ref)
+    parsed = _safe_urlparse(ref)
     if not parsed.scheme and not parsed.netloc and ref.startswith("/"):
         return "", "", ref
     if not parsed.scheme and not parsed.netloc:
-        parsed = urlparse(f"http://{ref}")
+        parsed = _safe_urlparse(f"http://{ref}")
     scheme = (parsed.scheme or "").lower()
     host = (parsed.hostname or "").lower()
     path = parsed.path or "/"
@@ -663,7 +673,8 @@ def analyze_http(
     session_tokens: Counter[str] = Counter()
     client_counts: Counter[str] = Counter()
     server_counts: Counter[str] = Counter()
-    client_host_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    # client_host_counts is derived after the loop from server_host_counts (see
+    # the summary construction) -- the Host header names servers, not clients.
     server_host_counts: dict[str, Counter[str]] = defaultdict(Counter)
     version_counts: Counter[str] = Counter()
     post_payloads: list[dict[str, object]] = []
@@ -1048,8 +1059,11 @@ def analyze_http(
                         counter_inc(host_counts, host)
                     host_key = host_norm or host.lower()
                     if host_key:
+                        # The HTTP Host header names the SERVER (request target),
+                        # so it maps to the destination IP only. Do NOT attribute
+                        # it to the client (src_ip) -- that stamped every client
+                        # with the hostname of the server it was talking to.
                         counter_inc(host_ip_counts[host_key], dst_ip)
-                        counter_inc(client_host_counts[src_ip], host_key)
                         counter_inc(server_host_counts[dst_ip], host_key)
                     counter_inc(url_counts, url)
 
@@ -2074,7 +2088,7 @@ def analyze_http(
             for url, count in url_counts.items():
                 if not url:
                     continue
-                parsed = urlparse(url)
+                parsed = _safe_urlparse(url)
                 host = (parsed.hostname or "").lower()
                 if host and _is_internal_host(host):
                     continue
@@ -2178,7 +2192,17 @@ def analyze_http(
         session_tokens=session_tokens,
         client_counts=client_counts,
         server_counts=server_counts,
-        client_host_counts=dict(client_host_counts),
+        # A client's own hostname is not exposed by HTTP request headers (the
+        # Host header names the server). The only HTTP-derived name for an IP is
+        # the vhost it serves, so a client IP gets a hostname here only when that
+        # same IP is independently observed acting as a named HTTP server (e.g. a
+        # proxy or an internal service that also makes requests). Pure clients
+        # correctly show "-" instead of their destination's name.
+        client_host_counts={
+            ip: Counter(server_host_counts[ip])
+            for ip in client_counts
+            if ip in server_host_counts
+        },
         server_host_counts=dict(server_host_counts),
         version_counts=version_counts,
         post_payloads=post_payloads,

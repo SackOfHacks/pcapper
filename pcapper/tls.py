@@ -16,14 +16,19 @@ from .http import analyze_http
 from .pcap_cache import get_reader
 from .progress import run_with_busy_status
 from .tls_fingerprints import (
+    ALPN_EXT_TYPE,
+    SNI_EXT_TYPE,
     _coerce_int_list,
     _extract_alpn,
     _extract_sni,
+    _is_grease,
     _iter_tls_extensions,
     _ja3_from_client_hello,
     _ja4_from_client_hello,
+    _ja4_alpn_token,
     _ja4s_from_server_hello,
     _resolve_negotiated_version,
+    _sha256_12,
     _tls_extension_type,
     lookup_ja3_intel,
 )
@@ -53,6 +58,36 @@ TLS_PORTS = {443, 8443, 9443, 4433}
 SUSPICIOUS_TLDS = {".ru", ".cn", ".top", ".xyz", ".gq", ".tk", ".ml", ".ga"}
 TLS_CONTENT_TYPES = {20, 21, 22, 23}
 WEAK_CIPHER_MARKERS = ("RC4", "3DES", "DES", "NULL", "EXPORT", "MD5", "ANON")
+WEAK_CIPHER_IDS = {
+    0x0000,  # TLS_NULL_WITH_NULL_NULL
+    0x0001,  # TLS_RSA_WITH_NULL_MD5
+    0x0002,  # TLS_RSA_WITH_NULL_SHA
+    0x0003,  # TLS_RSA_EXPORT_WITH_RC4_40_MD5
+    0x0004,  # TLS_RSA_WITH_RC4_128_MD5
+    0x0005,  # TLS_RSA_WITH_RC4_128_SHA
+    0x0006,  # TLS_RSA_EXPORT_WITH_RC2_CBC_40_MD5
+    0x0007,  # TLS_RSA_WITH_IDEA_CBC_SHA
+    0x0008,  # TLS_RSA_EXPORT_WITH_DES40_CBC_SHA
+    0x0009,  # TLS_RSA_WITH_DES_CBC_SHA
+    0x000A,  # TLS_RSA_WITH_3DES_EDE_CBC_SHA
+    0x000B,  # TLS_DH_DSS_EXPORT_WITH_DES40_CBC_SHA
+    0x000C,  # TLS_DH_DSS_WITH_DES_CBC_SHA
+    0x000D,  # TLS_DH_DSS_WITH_3DES_EDE_CBC_SHA
+    0x000E,  # TLS_DH_RSA_EXPORT_WITH_DES40_CBC_SHA
+    0x000F,  # TLS_DH_RSA_WITH_DES_CBC_SHA
+    0x0010,  # TLS_DH_RSA_WITH_3DES_EDE_CBC_SHA
+    0x0011,  # TLS_DHE_DSS_EXPORT_WITH_DES40_CBC_SHA
+    0x0012,  # TLS_DHE_DSS_WITH_DES_CBC_SHA
+    0x0013,  # TLS_DHE_DSS_WITH_3DES_EDE_CBC_SHA
+    0x0014,  # TLS_DHE_RSA_EXPORT_WITH_DES40_CBC_SHA
+    0x0015,  # TLS_DHE_RSA_WITH_DES_CBC_SHA
+    0x0016,  # TLS_DHE_RSA_WITH_3DES_EDE_CBC_SHA
+    0x0017,  # TLS_DH_anon_EXPORT_WITH_RC4_40_MD5
+    0x0018,  # TLS_DH_anon_WITH_RC4_128_MD5
+    0x0019,  # TLS_DH_anon_EXPORT_WITH_DES40_CBC_SHA
+    0x001A,  # TLS_DH_anon_WITH_DES_CBC_SHA
+    0x001B,  # TLS_DH_anon_WITH_3DES_EDE_CBC_SHA
+}
 ECH_EXTENSION_IDS = {0xFE0D}
 COMMON_ALPN_TOKENS = {
     "h2",
@@ -81,6 +116,27 @@ BRAND_KEYWORDS = (
 
 
 @dataclass(frozen=True)
+class _RawClientHello:
+    legacy_version: int
+    negotiated_version: Optional[int]
+    sni: Optional[str]
+    alpn: tuple[str, ...]
+    ech_present: bool
+    ja3: str
+    ja3_hash: str
+    ja4: str
+
+
+@dataclass(frozen=True)
+class _RawServerHello:
+    legacy_version: int
+    negotiated_version: Optional[int]
+    cipher: int
+    alpn: tuple[str, ...]
+    ja4s: str
+
+
+@dataclass(frozen=True)
 class TlsConversation:
     client_ip: str
     server_ip: str
@@ -90,6 +146,15 @@ class TlsConversation:
     first_seen: Optional[float]
     last_seen: Optional[float]
     sni: Optional[str]
+    client_hellos: int = 0
+    server_hellos: int = 0
+    client_bytes: int = 0
+    server_bytes: int = 0
+    versions: tuple[str, ...] = ()
+    alpn: tuple[str, ...] = ()
+    ja3: tuple[str, ...] = ()
+    ja4: tuple[str, ...] = ()
+    ja4s: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -158,6 +223,27 @@ class TlsSummary:
     vt_lookup_enabled: bool = False
     vt_results: dict[str, dict[str, object]] = field(default_factory=dict)
     vt_errors: list[str] = field(default_factory=list)
+    raw_client_hellos: int = 0
+    raw_server_hellos: int = 0
+    client_hello_counts: Counter[str] = field(default_factory=Counter)
+    server_hello_counts: Counter[str] = field(default_factory=Counter)
+    client_sni_counts: dict[str, Counter[str]] = field(default_factory=dict)
+    server_sni_counts: dict[str, Counter[str]] = field(default_factory=dict)
+    server_endpoint_sni_counts: dict[str, Counter[str]] = field(default_factory=dict)
+    sni_to_clients: dict[str, Counter[str]] = field(default_factory=dict)
+    sni_to_servers: dict[str, Counter[str]] = field(default_factory=dict)
+    client_ja3_counts: dict[str, Counter[str]] = field(default_factory=dict)
+    client_ja4_counts: dict[str, Counter[str]] = field(default_factory=dict)
+    server_ja4s_counts: dict[str, Counter[str]] = field(default_factory=dict)
+    server_endpoint_ja4s_counts: dict[str, Counter[str]] = field(default_factory=dict)
+    client_alpn_counts: dict[str, Counter[str]] = field(default_factory=dict)
+    client_missing_sni: Counter[str] = field(default_factory=Counter)
+    client_missing_sni_no_ech: Counter[str] = field(default_factory=Counter)
+    client_ech_counts: Counter[str] = field(default_factory=Counter)
+    client_handshake_failures: Counter[str] = field(default_factory=Counter)
+    server_handshake_failures: Counter[str] = field(default_factory=Counter)
+    nonstandard_tls_clients: Counter[str] = field(default_factory=Counter)
+    nonstandard_tls_servers: Counter[str] = field(default_factory=Counter)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -204,6 +290,15 @@ class TlsSummary:
                     "first_seen": conv.first_seen,
                     "last_seen": conv.last_seen,
                     "sni": conv.sni,
+                    "client_hellos": conv.client_hellos,
+                    "server_hellos": conv.server_hellos,
+                    "client_bytes": conv.client_bytes,
+                    "server_bytes": conv.server_bytes,
+                    "versions": list(conv.versions),
+                    "alpn": list(conv.alpn),
+                    "ja3": list(conv.ja3),
+                    "ja4": list(conv.ja4),
+                    "ja4s": list(conv.ja4s),
                 }
                 for conv in self.conversations
             ],
@@ -266,6 +361,49 @@ class TlsSummary:
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "duration_seconds": self.duration_seconds,
+            "raw_client_hellos": self.raw_client_hellos,
+            "raw_server_hellos": self.raw_server_hellos,
+            "client_hello_counts": dict(self.client_hello_counts),
+            "server_hello_counts": dict(self.server_hello_counts),
+            "client_sni_counts": {
+                key: dict(counter) for key, counter in self.client_sni_counts.items()
+            },
+            "server_sni_counts": {
+                key: dict(counter) for key, counter in self.server_sni_counts.items()
+            },
+            "server_endpoint_sni_counts": {
+                key: dict(counter)
+                for key, counter in self.server_endpoint_sni_counts.items()
+            },
+            "sni_to_clients": {
+                key: dict(counter) for key, counter in self.sni_to_clients.items()
+            },
+            "sni_to_servers": {
+                key: dict(counter) for key, counter in self.sni_to_servers.items()
+            },
+            "client_ja3_counts": {
+                key: dict(counter) for key, counter in self.client_ja3_counts.items()
+            },
+            "client_ja4_counts": {
+                key: dict(counter) for key, counter in self.client_ja4_counts.items()
+            },
+            "server_ja4s_counts": {
+                key: dict(counter) for key, counter in self.server_ja4s_counts.items()
+            },
+            "server_endpoint_ja4s_counts": {
+                key: dict(counter)
+                for key, counter in self.server_endpoint_ja4s_counts.items()
+            },
+            "client_alpn_counts": {
+                key: dict(counter) for key, counter in self.client_alpn_counts.items()
+            },
+            "client_missing_sni": dict(self.client_missing_sni),
+            "client_missing_sni_no_ech": dict(self.client_missing_sni_no_ech),
+            "client_ech_counts": dict(self.client_ech_counts),
+            "client_handshake_failures": dict(self.client_handshake_failures),
+            "server_handshake_failures": dict(self.server_handshake_failures),
+            "nonstandard_tls_clients": dict(self.nonstandard_tls_clients),
+            "nonstandard_tls_servers": dict(self.nonstandard_tls_servers),
         }
 
 
@@ -354,6 +492,358 @@ def _tls_handshake_type(payload: bytes) -> Optional[int]:
     return payload[5]
 
 
+def _tls_handshake_body(payload: bytes, wanted_type: int) -> Optional[bytes]:
+    if not _looks_like_tls_record(payload) or payload[0] != 22:
+        return None
+    if len(payload) < 9:
+        return None
+    record_len = int.from_bytes(payload[3:5], "big")
+    record_end = min(len(payload), 5 + record_len)
+    pos = 5
+    while pos + 4 <= record_end:
+        handshake_type = payload[pos]
+        handshake_len = int.from_bytes(payload[pos + 1 : pos + 4], "big")
+        body_start = pos + 4
+        body_end = body_start + handshake_len
+        if body_end > record_end or body_end > len(payload):
+            return None
+        if handshake_type == wanted_type:
+            return payload[body_start:body_end]
+        pos = body_end
+    return None
+
+
+def _parse_extensions(data: bytes) -> list[tuple[int, bytes]]:
+    extensions: list[tuple[int, bytes]] = []
+    pos = 0
+    while pos + 4 <= len(data):
+        ext_type = int.from_bytes(data[pos : pos + 2], "big")
+        ext_len = int.from_bytes(data[pos + 2 : pos + 4], "big")
+        pos += 4
+        if pos + ext_len > len(data):
+            break
+        extensions.append((ext_type, data[pos : pos + ext_len]))
+        pos += ext_len
+    return extensions
+
+
+def _parse_sni_extension(data: bytes) -> Optional[str]:
+    if len(data) < 5:
+        return None
+    list_len = int.from_bytes(data[0:2], "big")
+    pos = 2
+    end = min(len(data), 2 + list_len)
+    while pos + 3 <= end:
+        name_type = data[pos]
+        name_len = int.from_bytes(data[pos + 1 : pos + 3], "big")
+        pos += 3
+        if pos + name_len > end:
+            break
+        if name_type == 0:
+            try:
+                return data[pos : pos + name_len].decode(
+                    "utf-8", errors="ignore"
+                ).strip(".")
+            except Exception:
+                return None
+        pos += name_len
+    return None
+
+
+def _parse_alpn_extension(data: bytes) -> list[str]:
+    if len(data) < 3:
+        return []
+    list_len = int.from_bytes(data[0:2], "big")
+    pos = 2
+    end = min(len(data), 2 + list_len)
+    protocols: list[str] = []
+    while pos + 1 <= end:
+        proto_len = data[pos]
+        pos += 1
+        if proto_len <= 0 or pos + proto_len > end:
+            break
+        protocols.append(
+            data[pos : pos + proto_len].decode("utf-8", errors="ignore")
+        )
+        pos += proto_len
+    return protocols
+
+
+def _parse_supported_versions_client(data: bytes) -> list[int]:
+    if len(data) < 3:
+        return []
+    list_len = int(data[0])
+    pos = 1
+    end = min(len(data), 1 + list_len)
+    versions: list[int] = []
+    while pos + 2 <= end:
+        versions.append(int.from_bytes(data[pos : pos + 2], "big"))
+        pos += 2
+    return [version for version in versions if not _is_grease(version)]
+
+
+def _parse_supported_versions_server(data: bytes) -> list[int]:
+    if len(data) < 2:
+        return []
+    version = int.from_bytes(data[0:2], "big")
+    if _is_grease(version):
+        return []
+    return [version]
+
+
+def _parse_u16_vector(data: bytes) -> list[int]:
+    values: list[int] = []
+    pos = 0
+    while pos + 2 <= len(data):
+        value = int.from_bytes(data[pos : pos + 2], "big")
+        if not _is_grease(value):
+            values.append(value)
+        pos += 2
+    return values
+
+
+def _resolve_raw_tls_version(versions: list[int], fallback: int) -> int:
+    if versions:
+        tls_versions = [v for v in versions if v < 0xFE00]
+        if tls_versions:
+            return max(tls_versions)
+        return min(versions)
+    return fallback
+
+
+def _join_decimal(values: list[int]) -> str:
+    return "-".join(str(value) for value in values)
+
+
+def _ja4_from_raw_client_hello(
+    *,
+    version: int,
+    ciphers: list[int],
+    ext_types: list[int],
+    sig_algs: list[int],
+    sni: Optional[str],
+    alpn: list[str],
+) -> str:
+    cipher_count = min(len(ciphers), 99)
+    ext_count = min(len(ext_types), 99)
+    sni_flag = "d" if sni else "i"
+    ja4_a = (
+        f"t{_tls_fingerprints_version_code(version)}{sni_flag}"
+        f"{cipher_count:02d}{ext_count:02d}{_ja4_alpn_token(alpn)}"
+    )
+    ja4_b = (
+        _sha256_12(",".join(f"{cipher:04x}" for cipher in sorted(ciphers)))
+        if ciphers
+        else "0" * 12
+    )
+    hash_exts = sorted(
+        ext_type
+        for ext_type in ext_types
+        if ext_type not in (SNI_EXT_TYPE, ALPN_EXT_TYPE)
+    )
+    if hash_exts:
+        ext_str = ",".join(f"{ext_type:04x}" for ext_type in hash_exts)
+        if sig_algs:
+            ext_str += "_" + ",".join(f"{alg:04x}" for alg in sig_algs)
+        ja4_c = _sha256_12(ext_str)
+    else:
+        ja4_c = "0" * 12
+    return f"{ja4_a}_{ja4_b}_{ja4_c}"
+
+
+def _ja4s_from_raw_server_hello(
+    *, version: int, cipher: int, ext_types: list[int], alpn: list[str]
+) -> str:
+    ja4s_a = (
+        f"t{_tls_fingerprints_version_code(version)}"
+        f"{min(len(ext_types), 99):02d}{_ja4_alpn_token(alpn)}"
+    )
+    ja4s_b = f"{cipher:04x}"
+    ja4s_c = (
+        _sha256_12(",".join(f"{ext_type:04x}" for ext_type in ext_types))
+        if ext_types
+        else "0" * 12
+    )
+    return f"{ja4s_a}_{ja4s_b}_{ja4s_c}"
+
+
+def _tls_fingerprints_version_code(version: Optional[int]) -> str:
+    mapping = {
+        0x0304: "13",
+        0x0303: "12",
+        0x0302: "11",
+        0x0301: "10",
+        0x0300: "s3",
+        0x0200: "s2",
+        0x0002: "s2",
+        0xFEFF: "d1",
+        0xFEFD: "d2",
+        0xFEFC: "d3",
+    }
+    if version is None:
+        return "00"
+    return mapping.get(version, "00")
+
+
+def _parse_raw_client_hello(payload: bytes) -> Optional[_RawClientHello]:
+    body = _tls_handshake_body(payload, 1)
+    if body is None or len(body) < 41:
+        return None
+    pos = 0
+    legacy_version = int.from_bytes(body[pos : pos + 2], "big")
+    pos += 2 + 32
+    if pos >= len(body):
+        return None
+    session_len = int(body[pos])
+    pos += 1 + session_len
+    if pos + 2 > len(body):
+        return None
+    cipher_len = int.from_bytes(body[pos : pos + 2], "big")
+    pos += 2
+    if cipher_len <= 0 or pos + cipher_len > len(body):
+        return None
+    ciphers = _parse_u16_vector(body[pos : pos + cipher_len])
+    pos += cipher_len
+    if pos >= len(body):
+        return None
+    compression_len = int(body[pos])
+    pos += 1 + compression_len
+    if pos + 2 > len(body):
+        extensions: list[tuple[int, bytes]] = []
+    else:
+        ext_len = int.from_bytes(body[pos : pos + 2], "big")
+        pos += 2
+        extensions = _parse_extensions(body[pos : min(len(body), pos + ext_len)])
+
+    sni: Optional[str] = None
+    alpn: list[str] = []
+    supported_versions: list[int] = []
+    groups: list[int] = []
+    ec_points: list[int] = []
+    sig_algs: list[int] = []
+    ech_present = False
+    ext_types: list[int] = []
+    for ext_type, ext_data in extensions:
+        if not _is_grease(ext_type):
+            ext_types.append(ext_type)
+        if ext_type == SNI_EXT_TYPE and sni is None:
+            sni = _parse_sni_extension(ext_data)
+        elif ext_type == ALPN_EXT_TYPE and not alpn:
+            alpn = _parse_alpn_extension(ext_data)
+        elif ext_type == 43:
+            supported_versions = _parse_supported_versions_client(ext_data)
+        elif ext_type == 10:
+            if len(ext_data) >= 2:
+                group_len = int.from_bytes(ext_data[0:2], "big")
+                groups = _parse_u16_vector(ext_data[2 : 2 + group_len])
+        elif ext_type == 11:
+            if ext_data:
+                point_len = int(ext_data[0])
+                ec_points = [
+                    int(value)
+                    for value in ext_data[1 : 1 + point_len]
+                    if not _is_grease(int(value))
+                ]
+        elif ext_type == 13:
+            if len(ext_data) >= 2:
+                sig_len = int.from_bytes(ext_data[0:2], "big")
+                sig_algs = _parse_u16_vector(ext_data[2 : 2 + sig_len])
+        if ext_type in ECH_EXTENSION_IDS:
+            ech_present = True
+
+    negotiated_version = _resolve_raw_tls_version(supported_versions, legacy_version)
+    ja3 = (
+        f"{legacy_version},{_join_decimal(ciphers)},"
+        f"{_join_decimal(ext_types)},{_join_decimal(groups)},"
+        f"{_join_decimal(ec_points)}"
+    )
+    ja3_hash = hashlib.md5(ja3.encode("utf-8", errors="ignore")).hexdigest()
+    ja4 = _ja4_from_raw_client_hello(
+        version=negotiated_version,
+        ciphers=ciphers,
+        ext_types=ext_types,
+        sig_algs=sig_algs,
+        sni=sni,
+        alpn=alpn,
+    )
+    return _RawClientHello(
+        legacy_version=legacy_version,
+        negotiated_version=negotiated_version,
+        sni=sni,
+        alpn=tuple(alpn),
+        ech_present=ech_present,
+        ja3=ja3,
+        ja3_hash=ja3_hash,
+        ja4=ja4,
+    )
+
+
+def _parse_raw_server_hello(payload: bytes) -> Optional[_RawServerHello]:
+    body = _tls_handshake_body(payload, 2)
+    if body is None or len(body) < 38:
+        return None
+    pos = 0
+    legacy_version = int.from_bytes(body[pos : pos + 2], "big")
+    pos += 2 + 32
+    if pos >= len(body):
+        return None
+    session_len = int(body[pos])
+    pos += 1 + session_len
+    if pos + 3 > len(body):
+        return None
+    cipher = int.from_bytes(body[pos : pos + 2], "big")
+    pos += 2
+    pos += 1  # compression method
+    if pos + 2 > len(body):
+        extensions: list[tuple[int, bytes]] = []
+    else:
+        ext_len = int.from_bytes(body[pos : pos + 2], "big")
+        pos += 2
+        extensions = _parse_extensions(body[pos : min(len(body), pos + ext_len)])
+
+    alpn: list[str] = []
+    selected_versions: list[int] = []
+    ext_types: list[int] = []
+    for ext_type, ext_data in extensions:
+        if not _is_grease(ext_type):
+            ext_types.append(ext_type)
+        if ext_type == ALPN_EXT_TYPE and not alpn:
+            alpn = _parse_alpn_extension(ext_data)
+        elif ext_type == 43:
+            selected_versions = _parse_supported_versions_server(ext_data)
+    negotiated_version = _resolve_raw_tls_version(selected_versions, legacy_version)
+    ja4s = _ja4s_from_raw_server_hello(
+        version=negotiated_version,
+        cipher=cipher,
+        ext_types=ext_types,
+        alpn=alpn,
+    )
+    return _RawServerHello(
+        legacy_version=legacy_version,
+        negotiated_version=negotiated_version,
+        cipher=cipher,
+        alpn=tuple(alpn),
+        ja4s=ja4s,
+    )
+
+
+def _cipher_label(value: object) -> str:
+    try:
+        return f"0x{int(value):04x}"
+    except Exception:
+        return str(value)
+
+
+def _is_weak_cipher(value: object) -> bool:
+    try:
+        if int(str(value), 0) in WEAK_CIPHER_IDS:
+            return True
+    except Exception:
+        pass
+    upper = str(value).upper()
+    return any(marker in upper for marker in WEAK_CIPHER_MARKERS)
+
+
 def _ssl2_handshake_type(payload: bytes) -> Optional[int]:
     if not _looks_like_ssl2_record(payload):
         return None
@@ -440,6 +930,7 @@ def analyze_tls(
             http_user_agents=Counter(),
             http_files=Counter(),
             http_referrers=Counter(),
+            http_referrer_request_hosts={},
             http_referrer_hosts=Counter(),
             http_referrer_schemes=Counter(),
             http_referrer_paths=Counter(),
@@ -493,11 +984,30 @@ def analyze_tls(
     client_counts: Counter[str] = Counter()
     server_counts: Counter[str] = Counter()
     server_ports: Counter[int] = Counter()
+    raw_client_hellos = 0
+    raw_server_hellos = 0
+    client_hello_counts: Counter[str] = Counter()
+    server_hello_counts: Counter[str] = Counter()
     sni_to_ja3: dict[str, Counter[str]] = defaultdict(Counter)
     sni_to_ja4: dict[str, Counter[str]] = defaultdict(Counter)
     ja3_to_sni: dict[str, Counter[str]] = defaultdict(Counter)
     ja4_to_sni: dict[str, Counter[str]] = defaultdict(Counter)
     sni_to_alpn: dict[str, Counter[str]] = defaultdict(Counter)
+    client_sni_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    server_sni_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    server_endpoint_sni_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    sni_to_clients: dict[str, Counter[str]] = defaultdict(Counter)
+    sni_to_servers: dict[str, Counter[str]] = defaultdict(Counter)
+    client_ja3_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    client_ja4_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    server_ja4s_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    server_endpoint_ja4s_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    client_alpn_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    client_missing_sni: Counter[str] = Counter()
+    client_missing_sni_no_ech: Counter[str] = Counter()
+    client_ech_counts: Counter[str] = Counter()
+    nonstandard_tls_clients: Counter[str] = Counter()
+    nonstandard_tls_servers: Counter[str] = Counter()
     sni_no_alpn: Counter[str] = Counter()
     server_cipher_counts: dict[str, Counter[str]] = defaultdict(Counter)
     legacy_version_servers: dict[str, Counter[str]] = defaultdict(Counter)
@@ -509,6 +1019,15 @@ def analyze_tls(
             "first_seen": None,
             "last_seen": None,
             "sni": None,
+            "client_hellos": 0,
+            "server_hellos": 0,
+            "client_bytes": 0,
+            "server_bytes": 0,
+            "versions": Counter(),
+            "alpn": Counter(),
+            "ja3": Counter(),
+            "ja4": Counter(),
+            "ja4s": Counter(),
         }
     )
 
@@ -521,6 +1040,114 @@ def analyze_tls(
     hostname_token = str(hostname_query or "").strip().lower()
     search_token = str(search_query or "").strip().lower()
     port_filter_value = int(port_filter) if isinstance(port_filter, int) else None
+
+    def _get_convo_counter(convo: dict[str, object], key: str) -> Counter[str]:
+        value = convo.get(key)
+        if isinstance(value, Counter):
+            return value
+        counter: Counter[str] = Counter()
+        convo[key] = counter
+        return counter
+
+    def _record_client_hello_observation(
+        *,
+        client: str,
+        server: str,
+        server_port: int,
+        server_endpoint: str,
+        convo: dict[str, object],
+        version_label: str,
+        sni_val: Optional[str],
+        alpn_vals: list[str],
+        ech_present: bool,
+        ja3_hash: Optional[str],
+        ja4: Optional[str],
+    ) -> None:
+        nonlocal client_hellos, ech_hellos, ech_sni_missing
+        client_hellos += 1
+        client_hello_counts[client] += 1
+        convo["client_hellos"] = int(convo.get("client_hellos", 0) or 0) + 1
+        versions[version_label] += 1
+        _get_convo_counter(convo, "versions")[version_label] += 1
+        if version_label in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
+            legacy_version_servers[version_label][server] += 1
+        if sni_val:
+            sni_counts[sni_val] += 1
+            client_sni_counts[client][sni_val] += 1
+            server_sni_counts[server][sni_val] += 1
+            server_endpoint_sni_counts[server_endpoint][sni_val] += 1
+            sni_to_clients[sni_val][client] += 1
+            sni_to_servers[sni_val][server_endpoint] += 1
+            if convo.get("sni") is None:
+                convo["sni"] = sni_val
+            if _is_ip_literal(sni_val):
+                sni_ip_literals.add(sni_val)
+        else:
+            client_missing_sni[client] += 1
+            if not ech_present:
+                client_missing_sni_no_ech[client] += 1
+        if ech_present:
+            ech_hellos += 1
+            client_ech_counts[client] += 1
+            if not sni_val:
+                ech_sni_missing += 1
+        for alpn in alpn_vals:
+            alpn_counts[alpn] += 1
+            client_alpn_counts[client][alpn] += 1
+            _get_convo_counter(convo, "alpn")[alpn] += 1
+            if sni_val:
+                sni_to_alpn[sni_val][alpn] += 1
+        if sni_val and not alpn_vals:
+            sni_no_alpn[sni_val] += 1
+        if ja3_hash:
+            ja3_counts[ja3_hash] += 1
+            client_ja3_counts[client][ja3_hash] += 1
+            _get_convo_counter(convo, "ja3")[ja3_hash] += 1
+            if sni_val:
+                sni_to_ja3[sni_val][ja3_hash] += 1
+                ja3_to_sni[ja3_hash][sni_val] += 1
+        if ja4:
+            ja4_counts[ja4] += 1
+            client_ja4_counts[client][ja4] += 1
+            _get_convo_counter(convo, "ja4")[ja4] += 1
+            if sni_val:
+                sni_to_ja4[sni_val][ja4] += 1
+                ja4_to_sni[ja4][sni_val] += 1
+        if server_port not in TLS_PORTS:
+            nonstandard_tls_clients[client] += 1
+            nonstandard_tls_servers[server_endpoint] += 1
+
+    def _record_server_hello_observation(
+        *,
+        server: str,
+        server_endpoint: str,
+        convo: dict[str, object],
+        version_label: str,
+        cipher: object | None,
+        alpn_vals: list[str],
+        ja4s: Optional[str],
+    ) -> None:
+        nonlocal server_hellos
+        server_hellos += 1
+        server_hello_counts[server] += 1
+        convo["server_hellos"] = int(convo.get("server_hellos", 0) or 0) + 1
+        versions[version_label] += 1
+        _get_convo_counter(convo, "versions")[version_label] += 1
+        if version_label in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
+            legacy_version_servers[version_label][server] += 1
+        if cipher is not None:
+            cipher_name = _cipher_label(cipher)
+            cipher_suites[cipher_name] += 1
+            server_cipher_counts[server][cipher_name] += 1
+            if _is_weak_cipher(cipher):
+                weak_ciphers[cipher_name] += 1
+        for alpn in alpn_vals:
+            _get_convo_counter(convo, "alpn")[alpn] += 1
+        if ja4s:
+            ja4s_counts[ja4s] += 1
+            server_ja4s_counts[server][ja4s] += 1
+            server_endpoint_ja4s_counts[server_endpoint][ja4s] += 1
+            _get_convo_counter(convo, "ja4s")[ja4s] += 1
 
     try:
         for pkt in reader:
@@ -581,12 +1208,35 @@ def analyze_tls(
                     continue
 
             is_tls_layer = TLS is not None and pkt.haslayer(TLS)  # type: ignore[truthy-bool]
-            is_tls_handshake = (
+            has_scapy_client_hello = (
                 TLSClientHello is not None and pkt.haslayer(TLSClientHello)
-            ) or (TLSServerHello is not None and pkt.haslayer(TLSServerHello))
+            )
+            has_scapy_server_hello = (
+                TLSServerHello is not None and pkt.haslayer(TLSServerHello)
+            )
             is_tls_like_record = _looks_like_tls_record(payload)
             is_ssl2_like_record = _looks_like_ssl2_record(payload)
             is_tls_like = is_tls_like_record or is_ssl2_like_record
+            raw_client_hello = (
+                None
+                if has_scapy_client_hello
+                else _parse_raw_client_hello(payload)
+                if is_tls_like_record
+                else None
+            )
+            raw_server_hello = (
+                None
+                if has_scapy_server_hello
+                else _parse_raw_server_hello(payload)
+                if is_tls_like_record
+                else None
+            )
+            is_tls_handshake = (
+                has_scapy_client_hello
+                or has_scapy_server_hello
+                or raw_client_hello is not None
+                or raw_server_hello is not None
+            )
             if not is_tls_layer and not is_tls_handshake and not is_tls_like:
                 continue
 
@@ -596,7 +1246,11 @@ def analyze_tls(
 
             handshake_type = None
             if is_tls_like and not (dport in TLS_PORTS or sport in TLS_PORTS):
-                if is_tls_like_record:
+                if raw_server_hello is not None:
+                    handshake_type = 2
+                elif raw_client_hello is not None:
+                    handshake_type = 1
+                elif is_tls_like_record:
                     handshake_type = _tls_handshake_type(payload)
                 elif is_ssl2_like_record:
                     ssl2_type = _ssl2_handshake_type(payload)
@@ -625,38 +1279,42 @@ def analyze_tls(
                 server = dst_ip or "-"
                 server_port = dport
 
-            if not is_tls_handshake:
-                record_version = _record_version_label(payload)
-                if record_version:
-                    versions[record_version] += 1
-                    if record_version in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
-                        legacy_version_servers[record_version][server] += 1
-
             client_counts[client] += 1
             server_counts[server] += 1
             server_ports[server_port] += 1
 
             convo_key = (client, server, server_port)
+            server_endpoint = f"{server}:{server_port}"
             convo = conversations[convo_key]
             convo["packets"] = int(convo["packets"]) + 1
             convo["bytes"] = int(convo["bytes"]) + pkt_len
+            if src_ip == client:
+                convo["client_bytes"] = int(convo["client_bytes"]) + pkt_len
+            elif src_ip == server:
+                convo["server_bytes"] = int(convo["server_bytes"]) + pkt_len
             if ts is not None:
                 if convo["first_seen"] is None or ts < convo["first_seen"]:
                     convo["first_seen"] = ts
                 if convo["last_seen"] is None or ts > convo["last_seen"]:
                     convo["last_seen"] = ts
 
+            if not is_tls_handshake:
+                record_version = _record_version_label(payload)
+                if record_version:
+                    versions[record_version] += 1
+                    convo_versions = convo.get("versions")
+                    if isinstance(convo_versions, Counter):
+                        convo_versions[record_version] += 1
+                    if record_version in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
+                        legacy_version_servers[record_version][server] += 1
+
             if TLSClientHello is not None and pkt.haslayer(TLSClientHello):  # type: ignore[truthy-bool]
                 client_hello = pkt[TLSClientHello]  # type: ignore[index]
-                client_hellos += 1
                 client_ver = _tls_version_label(
                     _resolve_negotiated_version(
                         client_hello, getattr(client_hello, "version", "?")
                     )
                 )
-                versions[client_ver] += 1
-                if client_ver in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
-                    legacy_version_servers[client_ver][server] += 1
                 sni_val = None
                 alpn_vals: list[str] = []
                 ech_present = False
@@ -667,67 +1325,82 @@ def analyze_tls(
                         alpn_vals = _extract_alpn(ext)
                     if not ech_present and _is_ech_extension(ext):
                         ech_present = True
-                if sni_val:
-                    sni_counts[sni_val] += 1
-                    if convo.get("sni") is None:
-                        convo["sni"] = sni_val
-                    if _is_ip_literal(sni_val):
-                        sni_ip_literals.add(sni_val)
-                if ech_present:
-                    ech_hellos += 1
-                    if not sni_val:
-                        ech_sni_missing += 1
-                for alpn in alpn_vals:
-                    alpn_counts[alpn] += 1
-                    if sni_val:
-                        sni_to_alpn[sni_val][alpn] += 1
-                if sni_val and not alpn_vals:
-                    sni_no_alpn[sni_val] += 1
 
+                ja3_hash = None
                 ja3 = _ja3_from_client_hello(client_hello)
                 if ja3:
                     ja3_hash = hashlib.md5(
                         ja3.encode("utf-8", errors="ignore")
                     ).hexdigest()
-                    ja3_counts[ja3_hash] += 1
-                    if sni_val:
-                        sni_to_ja3[sni_val][ja3_hash] += 1
-                        ja3_to_sni[ja3_hash][sni_val] += 1
 
                 ja4 = _ja4_from_client_hello(client_hello, sni_val, alpn_vals)
-                if ja4:
-                    ja4_counts[ja4] += 1
-                    if sni_val:
-                        sni_to_ja4[sni_val][ja4] += 1
-                        ja4_to_sni[ja4][sni_val] += 1
+                _record_client_hello_observation(
+                    client=client,
+                    server=server,
+                    server_port=server_port,
+                    server_endpoint=server_endpoint,
+                    convo=convo,
+                    version_label=client_ver,
+                    sni_val=sni_val,
+                    alpn_vals=alpn_vals,
+                    ech_present=ech_present,
+                    ja3_hash=ja3_hash,
+                    ja4=ja4,
+                )
+            elif raw_client_hello is not None:
+                raw_client_hellos += 1
+                _record_client_hello_observation(
+                    client=client,
+                    server=server,
+                    server_port=server_port,
+                    server_endpoint=server_endpoint,
+                    convo=convo,
+                    version_label=_tls_version_label(
+                        raw_client_hello.negotiated_version
+                    ),
+                    sni_val=raw_client_hello.sni,
+                    alpn_vals=list(raw_client_hello.alpn),
+                    ech_present=raw_client_hello.ech_present,
+                    ja3_hash=raw_client_hello.ja3_hash,
+                    ja4=raw_client_hello.ja4,
+                )
 
             if TLSServerHello is not None and pkt.haslayer(TLSServerHello):  # type: ignore[truthy-bool]
                 server_hello = pkt[TLSServerHello]  # type: ignore[index]
-                server_hellos += 1
                 server_ver = _tls_version_label(
                     _resolve_negotiated_version(
                         server_hello, getattr(server_hello, "version", "?")
                     )
                 )
-                versions[server_ver] += 1
-                if server_ver in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
-                    legacy_version_servers[server_ver][server] += 1
                 cipher = getattr(server_hello, "cipher", None)
-                if cipher is not None:
-                    cipher_name = str(cipher)
-                    cipher_suites[cipher_name] += 1
-                    server_cipher_counts[server][cipher_name] += 1
-                    upper = cipher_name.upper()
-                    if any(marker in upper for marker in WEAK_CIPHER_MARKERS):
-                        weak_ciphers[cipher_name] += 1
 
                 server_alpn: list[str] = []
                 for ext in _iter_tls_extensions(server_hello):
                     if not server_alpn:
                         server_alpn = _extract_alpn(ext)
                 ja4s = _ja4s_from_server_hello(server_hello, server_alpn)
-                if ja4s:
-                    ja4s_counts[ja4s] += 1
+                _record_server_hello_observation(
+                    server=server,
+                    server_endpoint=server_endpoint,
+                    convo=convo,
+                    version_label=server_ver,
+                    cipher=cipher,
+                    alpn_vals=server_alpn,
+                    ja4s=ja4s,
+                )
+            elif raw_server_hello is not None:
+                raw_server_hellos += 1
+                _record_server_hello_observation(
+                    server=server,
+                    server_endpoint=server_endpoint,
+                    convo=convo,
+                    version_label=_tls_version_label(
+                        raw_server_hello.negotiated_version
+                    ),
+                    cipher=raw_server_hello.cipher,
+                    alpn_vals=list(raw_server_hello.alpn),
+                    ja4s=raw_server_hello.ja4s,
+                )
 
     except Exception as exc:
         errors.append(str(exc))
@@ -740,7 +1413,20 @@ def analyze_tls(
         duration_seconds = max(0.0, last_seen - first_seen)
 
     conversation_rows: list[TlsConversation] = []
+    client_handshake_failures: Counter[str] = Counter()
+    server_handshake_failures: Counter[str] = Counter()
     for (client, server, port), data in conversations.items():
+        conv_client_hellos = int(data.get("client_hellos", 0) or 0)
+        conv_server_hellos = int(data.get("server_hellos", 0) or 0)
+        failed_hellos = max(0, conv_client_hellos - conv_server_hellos)
+        if failed_hellos:
+            client_handshake_failures[client] += failed_hellos
+            server_handshake_failures[f"{server}:{port}"] += failed_hellos
+        conv_versions = data.get("versions")
+        conv_alpn = data.get("alpn")
+        conv_ja3 = data.get("ja3")
+        conv_ja4 = data.get("ja4")
+        conv_ja4s = data.get("ja4s")
         conversation_rows.append(
             TlsConversation(
                 client_ip=client,
@@ -751,6 +1437,17 @@ def analyze_tls(
                 first_seen=data["first_seen"],
                 last_seen=data["last_seen"],
                 sni=data.get("sni"),
+                client_hellos=conv_client_hellos,
+                server_hellos=conv_server_hellos,
+                client_bytes=int(data.get("client_bytes", 0) or 0),
+                server_bytes=int(data.get("server_bytes", 0) or 0),
+                versions=tuple(conv_versions.keys())
+                if isinstance(conv_versions, Counter)
+                else (),
+                alpn=tuple(conv_alpn.keys()) if isinstance(conv_alpn, Counter) else (),
+                ja3=tuple(conv_ja3.keys()) if isinstance(conv_ja3, Counter) else (),
+                ja4=tuple(conv_ja4.keys()) if isinstance(conv_ja4, Counter) else (),
+                ja4s=tuple(conv_ja4s.keys()) if isinstance(conv_ja4s, Counter) else (),
             )
         )
 
@@ -876,6 +1573,10 @@ def analyze_tls(
         analysis_notes.append(
             f"{tls_like_packets - tls_packets} TLS-like packet(s) were detected without full handshake parsing."
         )
+    if raw_client_hellos or raw_server_hellos:
+        analysis_notes.append(
+            f"Raw TLS parser recovered {raw_client_hellos} client hello(s) and {raw_server_hellos} server hello(s) that Scapy did not expose as TLS layers."
+        )
     if client_hellos and not server_hellos:
         analysis_notes.append(
             "Client hellos observed without any server hellos (possible blocked/failed handshakes)."
@@ -952,11 +1653,41 @@ def analyze_tls(
         and missing_sni_no_ech >= 10
         and (missing_sni_no_ech / max(client_hellos, 1)) >= 0.35
     ):
+        client_evidence = ", ".join(
+            f"{client}({count}/{client_hello_counts.get(client, 0)})"
+            for client, count in client_missing_sni_no_ech.most_common(6)
+        )
         detections.append(
             {
                 "severity": "warning",
                 "summary": "High rate of TLS handshakes without SNI",
-                "details": f"{missing_sni_no_ech}/{client_hellos} client hello(s) missing SNI (excluding ECH).",
+                "details": (
+                    f"{missing_sni_no_ech}/{client_hellos} client hello(s) missing SNI "
+                    f"(excluding ECH)."
+                    + (f" Top clients: {client_evidence}." if client_evidence else "")
+                ),
+            }
+        )
+
+    sni_evasion_clients: list[tuple[str, int, int]] = []
+    for client, missing_count in client_missing_sni_no_ech.items():
+        total_for_client = int(client_hello_counts.get(client, 0))
+        if total_for_client >= 5 and missing_count >= 5:
+            ratio = missing_count / max(total_for_client, 1)
+            if ratio >= 0.7:
+                sni_evasion_clients.append((client, int(missing_count), total_for_client))
+    if sni_evasion_clients:
+        sni_evasion_clients.sort(key=lambda row: (row[1] / max(row[2], 1), row[1]), reverse=True)
+        details = ", ".join(
+            f"{client} missing_sni={missing}/{total}"
+            for client, missing, total in sni_evasion_clients[:6]
+        )
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Client-specific SNI suppression pattern",
+                "details": details,
+                "top_clients": [(client, missing) for client, missing, _ in sni_evasion_clients[:8]],
             }
         )
 
@@ -965,11 +1696,23 @@ def analyze_tls(
         ratio = failed / client_hellos
         if failed >= 10 and ratio >= 0.35:
             severity = "high" if ratio >= 0.65 else "warning"
+            client_evidence = ", ".join(
+                f"{client}({count})"
+                for client, count in client_handshake_failures.most_common(6)
+            )
+            server_evidence = ", ".join(
+                f"{server}({count})"
+                for server, count in server_handshake_failures.most_common(6)
+            )
             detections.append(
                 {
                     "severity": severity,
                     "summary": "TLS handshake failures",
-                    "details": f"{failed}/{client_hellos} client hello(s) without server hello response.",
+                    "details": (
+                        f"{failed}/{client_hellos} client hello(s) without server hello response."
+                        + (f" Clients: {client_evidence}." if client_evidence else "")
+                        + (f" Destinations: {server_evidence}." if server_evidence else "")
+                    ),
                 }
             )
 
@@ -1019,11 +1762,23 @@ def analyze_tls(
         ports_text = ", ".join(
             f"{port}({count})" for port, count in sorted(non_standard_ports)[:8]
         )
+        client_text = ", ".join(
+            f"{client}({count})"
+            for client, count in nonstandard_tls_clients.most_common(6)
+        )
+        server_text = ", ".join(
+            f"{server}({count})"
+            for server, count in nonstandard_tls_servers.most_common(6)
+        )
         detections.append(
             {
                 "severity": "warning",
                 "summary": "Significant TLS on non-standard ports",
-                "details": f"Ports: {ports_text}",
+                "details": (
+                    f"Ports: {ports_text}"
+                    + (f" | Clients: {client_text}" if client_text else "")
+                    + (f" | Services: {server_text}" if server_text else "")
+                ),
             }
         )
 
@@ -1177,8 +1932,7 @@ def analyze_tls(
         weak = 0
         modern = 0
         for name, count in counter.items():
-            upper = str(name).upper()
-            if any(marker in upper for marker in WEAK_CIPHER_MARKERS):
+            if _is_weak_cipher(name):
                 weak += int(count)
             else:
                 modern += int(count)
@@ -1335,6 +2089,13 @@ def analyze_tls(
         artifacts.append(f"ALPN: {alpn} ({count})")
     for ja3, count in ja3_counts.most_common(5):
         artifacts.append(f"JA3: {ja3} ({count})")
+    for cert in filtered_cert_artifacts[:5]:
+        sha256 = str(getattr(cert, "sha256", "") or "").strip()
+        if not sha256 or sha256 == "-":
+            continue
+        service = str(getattr(cert, "sni", "") or getattr(cert, "dst_ip", "") or "-")
+        serial = str(getattr(cert, "serial", "") or "-")
+        artifacts.append(f"Cert SHA256: {sha256} serial={serial} service={service}")
 
     vt_results: dict[str, dict[str, object]] = {}
     vt_errors: list[str] = []
@@ -1444,4 +2205,41 @@ def analyze_tls(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        raw_client_hellos=raw_client_hellos,
+        raw_server_hellos=raw_server_hellos,
+        client_hello_counts=client_hello_counts,
+        server_hello_counts=server_hello_counts,
+        client_sni_counts={
+            key: Counter(val) for key, val in client_sni_counts.items()
+        },
+        server_sni_counts={
+            key: Counter(val) for key, val in server_sni_counts.items()
+        },
+        server_endpoint_sni_counts={
+            key: Counter(val) for key, val in server_endpoint_sni_counts.items()
+        },
+        sni_to_clients={key: Counter(val) for key, val in sni_to_clients.items()},
+        sni_to_servers={key: Counter(val) for key, val in sni_to_servers.items()},
+        client_ja3_counts={
+            key: Counter(val) for key, val in client_ja3_counts.items()
+        },
+        client_ja4_counts={
+            key: Counter(val) for key, val in client_ja4_counts.items()
+        },
+        server_ja4s_counts={
+            key: Counter(val) for key, val in server_ja4s_counts.items()
+        },
+        server_endpoint_ja4s_counts={
+            key: Counter(val) for key, val in server_endpoint_ja4s_counts.items()
+        },
+        client_alpn_counts={
+            key: Counter(val) for key, val in client_alpn_counts.items()
+        },
+        client_missing_sni=client_missing_sni,
+        client_missing_sni_no_ech=client_missing_sni_no_ech,
+        client_ech_counts=client_ech_counts,
+        client_handshake_failures=client_handshake_failures,
+        server_handshake_failures=server_handshake_failures,
+        nonstandard_tls_clients=nonstandard_tls_clients,
+        nonstandard_tls_servers=nonstandard_tls_servers,
     )

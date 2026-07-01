@@ -1325,7 +1325,8 @@ def _protocol_rows(
 
 
 def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
-    protocol_limit = _apply_verbose_limit(protocol_limit)
+    del protocol_limit
+    protocol_limit = _FULL_OUTPUT_LIMIT
     lines: list[str] = []
     lines.append(SECTION_BAR)
     lines.append(header(f"PCAPPER REPORT :: {summary.path.name}"))
@@ -1353,6 +1354,26 @@ def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
         lines.append(_format_kv("LinkTypes", ", ".join(linktypes)))
     if snaplens:
         lines.append(_format_kv("SnapLen", ", ".join(str(val) for val in snaplens)))
+    encapsulations = sorted({_format_linktype(value) for value in linktypes})
+    lines.append(
+        _format_kv(
+            "Encapsulation", ", ".join(encapsulations) if encapsulations else "-"
+        )
+    )
+    lines.append(_format_kv("Hash (SHA256)", summary.hash_sha256 or "-"))
+    lines.append(_format_kv("Hash (SHA1)", summary.hash_sha1 or "-"))
+
+    def _capture_value(value: object | None) -> str:
+        text = str(value or "").strip()
+        return text if text else "not recorded"
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Capture"))
+    lines.append(_format_kv("Hardware", _capture_value(summary.capture_hardware)))
+    lines.append(_format_kv("OS", _capture_value(summary.capture_os)))
+    lines.append(
+        _format_kv("Application", _capture_value(summary.capture_application))
+    )
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("Interface Statistics"))
@@ -1433,7 +1454,7 @@ def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
         )
     lines.append(SECTION_BAR)
 
-    return _finalize_output(lines)
+    return _finalize_output(lines, show_truncation_note=False)
 
 
 def render_vlan_summary(
@@ -6371,7 +6392,7 @@ def render_ftp_summary(
     return _finalize_output(lines)
 
 
-def render_tls_summary(
+def _render_tls_summary_impl(
     summary: TlsSummary, limit: int = 12, verbose: bool = False
 ) -> str:
     limit = _apply_verbose_limit(limit) or limit
@@ -6405,6 +6426,15 @@ def render_tls_summary(
         lines.append(_format_kv("TLS-Like Packets", str(summary.tls_like_packets)))
     lines.append(_format_kv("Client Hellos", str(summary.client_hellos)))
     lines.append(_format_kv("Server Hellos", str(summary.server_hellos)))
+    if getattr(summary, "raw_client_hellos", 0) or getattr(
+        summary, "raw_server_hellos", 0
+    ):
+        lines.append(
+            _format_kv(
+                "Raw Parsed Hellos",
+                f"client={getattr(summary, 'raw_client_hellos', 0)}, server={getattr(summary, 'raw_server_hellos', 0)}",
+            )
+        )
     if summary.client_hellos:
         lines.append(
             _format_kv(
@@ -6414,10 +6444,129 @@ def render_tls_summary(
         )
     lines.append(_format_kv("Unique TLS Clients", str(len(summary.client_counts))))
     lines.append(_format_kv("Unique TLS Servers", str(len(summary.server_counts))))
+    lines.append(_format_kv("Unique SNI", str(len(summary.sni_counts))))
+    lines.append(_format_kv("Unique JA3", str(len(summary.ja3_counts))))
+    lines.append(_format_kv("Unique JA4", str(len(summary.ja4_counts))))
+    if getattr(summary, "ech_hellos", 0):
+        lines.append(_format_kv("ECH Client Hellos", str(summary.ech_hellos)))
+    if getattr(summary, "sni_missing_no_ech", 0):
+        lines.append(
+            _format_kv(
+                "Missing SNI (No ECH)",
+                f"{summary.sni_missing_no_ech}/{summary.client_hellos}",
+            )
+        )
     lines.append(_format_kv("TLS Conversations", str(len(summary.conversations))))
     lines.append(_format_kv("Start", format_ts(summary.first_seen)))
     lines.append(_format_kv("End", format_ts(summary.last_seen)))
     lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Deterministic TLS Security Checks"))
+
+    detection_items = list(getattr(summary, "detections", []) or [])
+
+    def _matching_tls_detections(keywords: tuple[str, ...]) -> list[dict[str, object]]:
+        matches: list[dict[str, object]] = []
+        for det in detection_items:
+            summary_text = str(det.get("summary", "") or "")
+            details_text = str(det.get("details", "") or "")
+            blob = f"{summary_text} {details_text}".lower()
+            if any(key in blob for key in keywords):
+                matches.append(det)
+        return matches
+
+    def _matching_tls_lines(
+        keywords: tuple[str, ...], limit_lines: int = 4
+    ) -> list[str]:
+        out: list[str] = []
+        for det in _matching_tls_detections(keywords):
+            summary_text = str(det.get("summary", "") or "")
+            details_text = str(det.get("details", "") or "")
+            line = summary_text
+            if details_text:
+                line = f"{summary_text}: {details_text}"
+            out.append(_redact_in_text(line))
+            if len(out) >= limit_lines:
+                break
+        return out[:limit_lines]
+
+    tls_checks: list[tuple[str, tuple[str, ...]]] = [
+        ("Certificate Pinning Drift", ("certificate pinning drift", "cert rotation")),
+        ("JA3/JA4 Novelty", ("ja3 novelty", "ja4 novelty", "rarity spike")),
+        (
+            "Fingerprint Cardinality Anomalies",
+            ("cardinality anomaly", "ja3 to sni", "sni to ja3"),
+        ),
+        ("Cipher Downgrade Inconsistency", ("cipher downgrade inconsistency",)),
+        (
+            "ALPN Mismatch/Anomalies",
+            ("alpn mismatch", "alpn missing anomaly", "uncommon protocol tokens"),
+        ),
+        ("Certificate Validity Outliers", ("certificate validity outliers",)),
+        ("Issuer/SAN Impersonation", ("impersonation heuristics", "issuer/san")),
+        ("Handshake Periodicity", ("handshake periodicity",)),
+        (
+            "Session Resumption Abuse",
+            ("session resumption-heavy", "session resumption"),
+        ),
+        (
+            "SNI Evasion/Anomaly",
+            (
+                "sni missing",
+                "sni suppression",
+                "high-entropy sni",
+                "suspicious sni",
+                "sni uses ip literal",
+            ),
+        ),
+        (
+            "Non-Standard TLS Service Ports",
+            ("non-standard ports", "non-standard tls"),
+        ),
+        (
+            "Legacy/Weak TLS Crypto",
+            ("legacy tls versions", "weak tls cipher", "weak tls certificate keys"),
+        ),
+        (
+            "TLS Handshake Failure Pattern",
+            ("tls handshake failures", "without server hello"),
+        ),
+    ]
+
+    for label_text, keywords in tls_checks:
+        lines.append(label(label_text))
+        evidence_lines = _matching_tls_lines(keywords)
+        if evidence_lines:
+            lines.append(
+                warn(
+                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
+                )
+            )
+            for item in evidence_lines:
+                lines.append(muted(f"- {item}"))
+        else:
+            lines.append(
+                ok(
+                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
+                )
+            )
+
+    tls_total_bytes = sum(max(0, int(conv.bytes)) for conv in summary.conversations)
+    lines.append(_format_kv("TLS Bytes (Conversations)", str(tls_total_bytes)))
+    if summary.conversations:
+        lines.append(
+            _format_kv(
+                "Avg Bytes / Conversation",
+                f"{tls_total_bytes / max(len(summary.conversations), 1):.1f}",
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Avg Packets / Conversation",
+                f"{sum(int(conv.packets) for conv in summary.conversations) / max(len(summary.conversations), 1):.1f}",
+            )
+        )
 
     def _tls_verdict() -> tuple[str, str, list[str], int]:
         score = 0
@@ -6500,7 +6649,7 @@ def render_tls_summary(
     for reason in verdict_reasons[: _limit_value(10)]:
         lines.append(muted(f"- {_redact_in_text(reason)}"))
 
-    # Add concrete context for immediate triage (verbose mode).
+    # Add concrete context for immediate triage.
     if verbose:
         if summary.server_counts:
             lines.append(muted("Where:"))
@@ -6538,6 +6687,197 @@ def render_tls_summary(
                         f"{_redact_in_text(str(det.get('summary', '-')))}"
                     )
                 )
+
+    def _as_counter(value: object) -> Counter[str]:
+        if isinstance(value, Counter):
+            return value
+        if isinstance(value, dict):
+            counter: Counter[str] = Counter()
+            for key, count in value.items():
+                try:
+                    counter[str(key)] = int(count)
+                except Exception:
+                    continue
+            return counter
+        return Counter()
+
+    def _nested_counter(mapping: object, key: str) -> Counter[str]:
+        if not isinstance(mapping, dict):
+            return Counter()
+        return _as_counter(mapping.get(key, {}))
+
+    def _top_counter_text(counter: Counter[str], limit_items: int, width: int) -> str:
+        if not counter:
+            return "-"
+        return ", ".join(
+            f"{_truncate_text(_redact_in_text(str(name)), width)}({int(count)})"
+            for name, count in counter.most_common(_limit_value(limit_items))
+        )
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Server Name"))
+    if summary.sni_counts:
+        rows = [["Server Name (SNI)", "Count", "Clients", "Services"]]
+        for sni, count in summary.sni_counts.most_common(
+            _limit_value(limit if verbose else min(10, limit))
+        ):
+            sni_text = str(sni)
+            client_counter = _nested_counter(
+                getattr(summary, "sni_to_clients", {}), sni_text
+            )
+            service_counter = _nested_counter(
+                getattr(summary, "sni_to_servers", {}), sni_text
+            )
+            rows.append(
+                [
+                    _truncate_text(_redact_in_text(sni_text), 56),
+                    str(int(count)),
+                    _top_counter_text(client_counter, 3, 24),
+                    _top_counter_text(service_counter, 3, 30),
+                ]
+            )
+        lines.append(_format_table(rows))
+    else:
+        lines.append(
+            muted(
+                "No TLS Server Name Indication (SNI) values were parsed from ClientHello messages."
+            )
+        )
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Protocol Version"))
+    if summary.versions:
+        total_versions = sum(int(count) for count in summary.versions.values())
+        rows = [["Version", "Count", "%", "Assessment"]]
+        legacy_versions = {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}
+        for version, count in summary.versions.most_common(
+            _limit_value(limit if verbose else min(10, limit))
+        ):
+            count_int = int(count)
+            pct = (count_int / max(total_versions, 1)) * 100.0
+            assessment = "legacy" if str(version) in legacy_versions else "modern"
+            rows.append([str(version), str(count_int), f"{pct:.1f}%", assessment])
+        lines.append(_format_table(rows))
+    else:
+        lines.append(muted("No TLS protocol versions were parsed from this capture."))
+
+    profile_clients = set(getattr(summary, "client_counts", {}).keys()) | set(
+        getattr(summary, "client_hello_counts", {}).keys()
+    )
+    ranked_profile_clients = sorted(
+        profile_clients,
+        key=lambda client: (
+            int(getattr(summary, "client_handshake_failures", {}).get(client, 0) or 0),
+            int(getattr(summary, "client_missing_sni_no_ech", {}).get(client, 0) or 0),
+            int(getattr(summary, "client_hello_counts", {}).get(client, 0) or 0),
+            int(getattr(summary, "client_counts", {}).get(client, 0) or 0),
+        ),
+        reverse=True,
+    )
+    if ranked_profile_clients:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TLS Client Hunt Pivots"))
+        rows = [
+            [
+                "Client",
+                "Hellos",
+                "SNI",
+                "JA3",
+                "No SNI",
+                "ECH",
+                "Failed",
+                "Top SNI / ALPN",
+            ]
+        ]
+        client_cap = _limit_value(limit if verbose else min(8, limit))
+        for client in ranked_profile_clients[:client_cap]:
+            client_text = str(client)
+            sni_counter = _nested_counter(
+                getattr(summary, "client_sni_counts", {}), client_text
+            )
+            ja3_counter = _nested_counter(
+                getattr(summary, "client_ja3_counts", {}), client_text
+            )
+            alpn_counter = _nested_counter(
+                getattr(summary, "client_alpn_counts", {}), client_text
+            )
+            top_sni = _top_counter_text(sni_counter, 2, 34)
+            top_alpn = _top_counter_text(alpn_counter, 2, 18)
+            rows.append(
+                [
+                    _highlight_public_ips(client_text),
+                    str(int(getattr(summary, "client_hello_counts", {}).get(client, 0) or 0)),
+                    str(len(sni_counter)),
+                    str(len(ja3_counter)),
+                    str(
+                        int(
+                            getattr(summary, "client_missing_sni_no_ech", {}).get(
+                                client, 0
+                            )
+                            or 0
+                        )
+                    ),
+                    str(int(getattr(summary, "client_ech_counts", {}).get(client, 0) or 0)),
+                    str(
+                        int(
+                            getattr(summary, "client_handshake_failures", {}).get(
+                                client, 0
+                            )
+                            or 0
+                        )
+                    ),
+                    _truncate_text(f"{top_sni} / {top_alpn}", 70),
+                ]
+            )
+        lines.append(_format_table(rows))
+
+    if summary.conversations:
+        endpoint_clients: dict[str, set[str]] = defaultdict(set)
+        endpoint_bytes: Counter[str] = Counter()
+        endpoint_packets: Counter[str] = Counter()
+        endpoint_hellos: Counter[str] = Counter()
+        endpoint_server_ip: dict[str, str] = {}
+        for conv in summary.conversations:
+            endpoint = f"{conv.server_ip}:{conv.server_port}"
+            endpoint_server_ip[endpoint] = str(conv.server_ip)
+            endpoint_clients[endpoint].add(str(conv.client_ip))
+            endpoint_bytes[endpoint] += int(conv.bytes)
+            endpoint_packets[endpoint] += int(conv.packets)
+            endpoint_hellos[endpoint] += int(getattr(conv, "client_hellos", 0) or 0)
+        ranked_endpoints = sorted(
+            endpoint_bytes.keys(),
+            key=lambda endpoint: (
+                int(endpoint_hellos.get(endpoint, 0)),
+                int(endpoint_bytes.get(endpoint, 0)),
+                int(endpoint_packets.get(endpoint, 0)),
+            ),
+            reverse=True,
+        )
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TLS Destination Hunt Pivots"))
+        rows = [["Service", "Zone", "Clients", "Hellos", "Bytes", "Top SNI", "JA4S"]]
+        endpoint_cap = _limit_value(limit if verbose else min(8, limit))
+        for endpoint in ranked_endpoints[:endpoint_cap]:
+            server_ip = endpoint_server_ip.get(endpoint, "")
+            zone = "public" if _is_public_ip(server_ip) else "private"
+            sni_counter = _nested_counter(
+                getattr(summary, "server_endpoint_sni_counts", {}), endpoint
+            )
+            ja4s_counter = _nested_counter(
+                getattr(summary, "server_endpoint_ja4s_counts", {}), endpoint
+            )
+            rows.append(
+                [
+                    _highlight_public_ips(endpoint),
+                    zone,
+                    str(len(endpoint_clients.get(endpoint, set()))),
+                    str(int(endpoint_hellos.get(endpoint, 0))),
+                    format_bytes_as_mb(int(endpoint_bytes.get(endpoint, 0))),
+                    _top_counter_text(sni_counter, 2, 38),
+                    _top_counter_text(ja4s_counter, 1, 32),
+                ]
+            )
+        lines.append(_format_table(rows))
 
     if (
         getattr(summary, "vt_lookup_enabled", False)
@@ -6663,115 +7003,78 @@ def render_tls_summary(
     else:
         lines.append(muted("No common certificate hygiene issues identified in parsed artifacts."))
 
-    if verbose:
+    if cert_items:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Deterministic TLS Security Checks"))
-
-    detection_items = list(getattr(summary, "detections", []) or [])
-
-    def _matching_tls_detections(keywords: tuple[str, ...]) -> list[dict[str, object]]:
-        matches: list[dict[str, object]] = []
-        for det in detection_items:
-            summary_text = str(det.get("summary", "") or "")
-            details_text = str(det.get("details", "") or "")
-            blob = f"{summary_text} {details_text}".lower()
-            if any(key in blob for key in keywords):
-                matches.append(det)
-        return matches
-
-    def _matching_tls_lines(
-        keywords: tuple[str, ...], limit_lines: int = 4
-    ) -> list[str]:
-        out: list[str] = []
-        for det in _matching_tls_detections(keywords):
-            summary_text = str(det.get("summary", "") or "")
-            details_text = str(det.get("details", "") or "")
-            line = summary_text
-            if details_text:
-                line = f"{summary_text}: {details_text}"
-            out.append(_redact_in_text(line))
-            if len(out) >= limit_lines:
+        lines.append(header("Certificate Forensic Pivots"))
+        hash_width = 64 if verbose else 32
+        rows = [["Service/SNI", "Serial", "SHA256", "SHA1", "Issues"]]
+        seen_hashes: set[str] = set()
+        cert_cap = _limit_value(limit if verbose else min(8, limit))
+        for cert in cert_items:
+            sha256 = str(getattr(cert, "sha256", "") or "").strip()
+            if sha256 and sha256 in seen_hashes:
+                continue
+            if sha256:
+                seen_hashes.add(sha256)
+            issue_tags = _cert_issue_tags(cert)
+            rows.append(
+                [
+                    _truncate_text(
+                        _redact_in_text(
+                            str(
+                                getattr(cert, "sni", "")
+                                or getattr(cert, "dst_ip", "")
+                                or "-"
+                            )
+                        ),
+                        34,
+                    ),
+                    _truncate_text(str(getattr(cert, "serial", "") or "-"), 24),
+                    _truncate_text(sha256 or "-", hash_width),
+                    _truncate_text(str(getattr(cert, "sha1", "") or "-"), 40),
+                    ", ".join(issue_tags) if issue_tags else "none-observed",
+                ]
+            )
+            if len(rows) >= cert_cap + 1:
                 break
-        return out[:limit_lines]
-
-    tls_checks: list[tuple[str, tuple[str, ...]]] = [
-        ("Certificate Pinning Drift", ("certificate pinning drift", "cert rotation")),
-        ("JA3/JA4 Novelty", ("ja3 novelty", "ja4 novelty", "rarity spike")),
-        (
-            "Fingerprint Cardinality Anomalies",
-            ("cardinality anomaly", "ja3 to sni", "sni to ja3"),
-        ),
-        ("Cipher Downgrade Inconsistency", ("cipher downgrade inconsistency",)),
-        (
-            "ALPN Mismatch/Anomalies",
-            ("alpn mismatch", "alpn missing anomaly", "uncommon protocol tokens"),
-        ),
-        ("Certificate Validity Outliers", ("certificate validity outliers",)),
-        ("Issuer/SAN Impersonation", ("impersonation heuristics", "issuer/san")),
-        ("Handshake Periodicity", ("handshake periodicity",)),
-        (
-            "Session Resumption Abuse",
-            ("session resumption-heavy", "session resumption"),
-        ),
-        (
-            "SNI Evasion/Anomaly",
-            (
-                "sni missing",
-                "high-entropy sni",
-                "suspicious sni",
-                "sni uses ip literal",
-            ),
-        ),
-        (
-            "Legacy/Weak TLS Crypto",
-            ("legacy tls versions", "weak tls cipher", "weak tls certificate keys"),
-        ),
-        (
-            "TLS Handshake Failure Pattern",
-            ("tls handshake failures", "without server hello"),
-        ),
-    ]
-
-    if verbose:
-        for label_text, keywords in tls_checks:
-            lines.append(label(label_text))
-            evidence_lines = _matching_tls_lines(keywords)
-            if evidence_lines:
-                lines.append(
-                    warn(
-                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
-                    )
-                )
-                for item in evidence_lines:
-                    lines.append(muted(f"- {item}"))
-            else:
-                lines.append(
-                    ok(
-                        f"No, there is no strong evidence for {label_text.lower()} in this capture."
-                    )
-                )
-
-        tls_total_bytes = sum(max(0, int(conv.bytes)) for conv in summary.conversations)
-        lines.append(_format_kv("TLS Bytes (Conversations)", str(tls_total_bytes)))
-        if summary.conversations:
-            lines.append(
-                _format_kv(
-                    "Avg Bytes / Conversation",
-                    f"{tls_total_bytes / max(len(summary.conversations), 1):.1f}",
-                )
-            )
-            lines.append(
-                _format_kv(
-                    "Avg Packets / Conversation",
-                    f"{sum(int(conv.packets) for conv in summary.conversations) / max(len(summary.conversations), 1):.1f}",
-                )
-            )
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
 
     if getattr(summary, "analysis_notes", None) and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Notes"))
         for note in summary.analysis_notes[: _limit_value(8)]:
             lines.append(muted(f"- {note}"))
+
+    if summary.client_counts and verbose:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Clients"))
+        rows = [["Client", "SNI", "Sessions"]]
+        client_sni_map = getattr(summary, "client_sni_counts", {}) or {}
+        for client, count in summary.client_counts.most_common(limit):
+            sni_counter = client_sni_map.get(client, Counter())
+            sni_text = "-"
+            if sni_counter:
+                top_sni, _scount = sni_counter.most_common(1)[0]
+                extra = len(sni_counter) - 1
+                sni_text = f"{top_sni} (+{extra} more)" if extra > 0 else top_sni
+            rows.append([client, _redact_in_text(sni_text), str(count)])
+        lines.append(_format_table(rows))
+
+    if summary.server_counts and verbose:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Top Servers"))
+        rows = [["Server", "SNI", "Sessions"]]
+        server_sni_map = getattr(summary, "server_sni_counts", {}) or {}
+        for server, count in summary.server_counts.most_common(limit):
+            sni_counter = server_sni_map.get(server, Counter())
+            sni_text = "-"
+            if sni_counter:
+                top_sni, _scount = sni_counter.most_common(1)[0]
+                extra = len(sni_counter) - 1
+                sni_text = f"{top_sni} (+{extra} more)" if extra > 0 else top_sni
+            rows.append([server, _redact_in_text(sni_text), str(count)])
+        lines.append(_format_table(rows))
 
     if verbose:
         lines.append(SUBSECTION_BAR)
@@ -6797,9 +7100,29 @@ def render_tls_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Traffic Statistics"))
         rows = [
-            ["Client", "Server", "Port", "Packets", "Bytes", "First", "Last", "SNI"]
+            [
+                "Client",
+                "Server",
+                "Port",
+                "Packets",
+                "Bytes",
+                "CH/SH",
+                "First",
+                "Last",
+                "SNI",
+                "JA3/JA4",
+                "ALPN",
+            ]
         ]
         for conv in summary.conversations[: _limit_value(limit)]:
+            fp_text = " / ".join(
+                part
+                for part in (
+                    ", ".join(getattr(conv, "ja3", ())[:2]),
+                    ", ".join(getattr(conv, "ja4", ())[:2]),
+                )
+                if part
+            )
             rows.append(
                 [
                     conv.client_ip,
@@ -6807,9 +7130,12 @@ def render_tls_summary(
                     str(conv.server_port),
                     str(conv.packets),
                     str(conv.bytes),
+                    f"{getattr(conv, 'client_hellos', 0)}/{getattr(conv, 'server_hellos', 0)}",
                     format_ts(conv.first_seen),
                     format_ts(conv.last_seen),
                     _truncate_text(_redact_in_text(conv.sni or "-"), 64),
+                    _truncate_text(fp_text or "-", 60),
+                    _truncate_text(", ".join(getattr(conv, "alpn", ())[:4]) or "-", 36),
                 ]
             )
         lines.append(_format_table(rows))
@@ -6853,11 +7179,6 @@ def render_tls_summary(
                     ]
                 )
             lines.append(_format_table(rows))
-    if summary.versions and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("TLS Versions"))
-        lines.append(_counter_table(summary.versions, "Version", limit=_limit_value(limit)))
-
     if summary.cipher_suites and verbose:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Cipher Suites"))
@@ -6926,34 +7247,10 @@ def render_tls_summary(
             if details:
                 lines.append(muted(f"  {details}"))
 
-    if concise_mode:
-        lines.append(SUBSECTION_BAR)
-        lines.append(
-            muted(
-                "Additional TLS context hidden in default view (deterministic checks, risk matrix, conversation stats, cert inventory, versions/ciphers/fingerprints, and artifacts)."
-            )
-        )
-        lines.append(muted("Use `-v` for full TLS forensic detail."))
-
-    if summary.sni_counts and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top SNI"))
-        rows = [["SNI", "Count"]]
-        for sni, count in summary.sni_counts.most_common(_limit_value(limit)):
-            rows.append([_truncate_text(_redact_in_text(str(sni)), 96), str(count)])
-        lines.append(_format_table(rows))
-
     if summary.ja3_counts or summary.ja4_counts or summary.ja4s_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("TLS Fingerprint Intelligence"))
-        # Surface the top fingerprints in the DEFAULT view (not just -v): JA3/JA4
-        # are copy-paste threat-intel lookup keys (abuse.ch, VirusTotal) and the
-        # primary artifact for correlating C2 across rotating IPs. Full list in -v.
-        fp_cap = _limit_value(limit) if verbose else 5
-        if not verbose:
-            lines.append(
-                muted("Top fingerprints (copy to JA3/JA4 threat-intel lookup; -v for all):")
-            )
+        fp_cap = _limit_value(limit)
         if summary.ja3_counts:
             rows = [["JA3", "Count"]]
             for fp, count in summary.ja3_counts.most_common(fp_cap):
@@ -6981,6 +7278,29 @@ def render_tls_summary(
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
+
+
+def render_tls_summary(
+    summary: TlsSummary, limit: int = 12, verbose: bool = False
+) -> str:
+    """Render TLS in full-detail mode by default.
+
+    --tls is a forensic/IR surface, so its report should not require -v to show
+    the deterministic checks, conversations, certificate detail, and artifacts.
+    Temporarily enabling the module verbose flag preserves the existing "full"
+    limit behavior for TLS without changing any other analyzer in chained runs.
+    """
+    del verbose
+    previous_verbose_state = _VERBOSE_OUTPUT
+    if not previous_verbose_state:
+        set_verbose_output(True)
+    try:
+        return _render_tls_summary_impl(
+            summary, limit=_FULL_OUTPUT_LIMIT if limit is not None else limit, verbose=True
+        )
+    finally:
+        if not previous_verbose_state:
+            set_verbose_output(False)
 
 
 def render_aim_summary(
@@ -7367,6 +7687,39 @@ def render_ssh_summary(
             )
         lines.append(_format_table(rows))
 
+    auth_inference = getattr(summary, "auth_inference", None)
+    if auth_inference:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Auth Activity (Inferred from Encrypted Sessions)"))
+        lines.append(
+            muted(
+                "SSH auth is encrypted; outcome is inferred from post-handshake "
+                "traffic volume (sessions ending right after key exchange = likely "
+                "failed/aborted login)."
+            )
+        )
+        rows = [
+            ["Client", "Server:Port", "Sessions", "Likely Fail", "Likely OK", "Client SW", "Assessment"]
+        ]
+        ranked = sorted(
+            auth_inference,
+            key=lambda r: (int(r.get("likely_failed", 0)), int(r.get("sessions", 0))),
+            reverse=True,
+        )
+        for r in ranked[:limit]:
+            rows.append(
+                [
+                    str(r.get("client", "-")),
+                    f"{r.get('server', '-')}:{r.get('port', '-')}",
+                    str(r.get("sessions", 0)),
+                    str(r.get("likely_failed", 0)),
+                    str(r.get("likely_success", 0)),
+                    _truncate_text(str(r.get("client_software", "-")), 24),
+                    str(r.get("verdict", "-")),
+                ]
+            )
+        lines.append(_format_table(rows))
+
     if summary.request_counts or summary.response_counts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Requests & Responses"))
@@ -7443,10 +7796,13 @@ def render_ssh_summary(
         for item in summary.anomalies[:limit]:
             title = str(item.get("title", "Event"))
             details = str(item.get("details", ""))
+            mitre = str(item.get("mitre", "")).strip()
             if details:
                 lines.append(warn(f"- {title}: {details}"))
             else:
                 lines.append(warn(f"- {title}"))
+            if mitre:
+                lines.append(muted(f"    ATT&CK: {mitre}"))
 
     detections = _filtered_detections(summary, verbose)
     if detections:
@@ -7456,6 +7812,9 @@ def render_ssh_summary(
             severity = str(item.get("severity", "info")).lower()
             summary_text = str(item.get("summary", ""))
             details = str(item.get("details", ""))
+            confidence = str(item.get("confidence", "")).strip()
+            mitre = str(item.get("mitre", "")).strip()
+            evidence = item.get("evidence")
             if severity == "critical":
                 marker = danger("[CRIT]")
                 summary_text = danger(summary_text)
@@ -7466,9 +7825,19 @@ def render_ssh_summary(
                 marker = warn("[WARN]")
             else:
                 marker = ok("[INFO]")
-            lines.append(f"{marker} {summary_text}")
+            header_line = f"{marker} {summary_text}"
+            if confidence:
+                header_line += muted(f"  (confidence: {confidence})")
+            lines.append(header_line)
             if details:
                 lines.append(muted(f"  {details}"))
+            if mitre:
+                lines.append(muted(f"  ATT&CK: {mitre}"))
+            if isinstance(evidence, (list, tuple)) and evidence:
+                lines.append(muted("  Evidence:"))
+                for ev in list(evidence)[: _limit_value(8)]:
+                    if ev:
+                        lines.append(muted(f"    - {_truncate_text(str(ev), 110)}"))
 
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
@@ -25429,12 +25798,27 @@ def render_streams_summary(summary: StreamSummary, verbose: bool = False) -> str
             ),
             None,
         )
-    complete_streams = [
+    # Reassembly completeness: does the captured payload have byte gaps? This is
+    # independent of whether the TCP connection ever came up. A SYN-only flow has
+    # no payload and therefore no gaps -- so do NOT read "reassembled cleanly" as
+    # "connection established"; see the connection-state breakdown below.
+    reassembled_clean = [
         rec for rec in summary.streams if not rec.client_gaps and not rec.server_gaps
     ]
-    incomplete_streams = [
+    reassembly_gaps = [
         rec for rec in summary.streams if rec.client_gaps or rec.server_gaps
     ]
+    # Connection state derived from the TCP handshake (streams.py:_conn_state).
+    conn_state_counts: "Counter[str]" = Counter(
+        getattr(rec, "conn_state", "unknown") for rec in summary.streams
+    )
+    established_count = conn_state_counts.get("established", 0)
+    active_count = conn_state_counts.get("active", 0)
+    not_established = sum(
+        count
+        for state, count in conn_state_counts.items()
+        if state not in ("established", "active")
+    )
     all_ordered = sorted(
         summary.streams,
         key=lambda item: (
@@ -25449,8 +25833,38 @@ def render_streams_summary(summary: StreamSummary, verbose: bool = False) -> str
         lines.append(_format_kv("Observed Streams", str(summary.observed_streams)))
     if summary.stream_search:
         lines.append(_format_kv("Search Term", summary.stream_search))
-    lines.append(_format_kv("Complete Streams", str(len(complete_streams))))
-    lines.append(_format_kv("Incomplete Streams", str(len(incomplete_streams))))
+    # Connection state first -- this is what analysts usually mean by "did it
+    # connect". Keep reassembly completeness as a clearly separate metric.
+    lines.append(_format_kv("Established (3-way handshake)", str(established_count)))
+    if active_count:
+        lines.append(
+            _format_kv("Active (mid-capture, no SYN)", str(active_count))
+        )
+    if not_established:
+        breakdown_order = [
+            ("syn-only", "SYN-only/unanswered"),
+            ("refused", "refused (RST)"),
+            ("half-open", "half-open (no final ACK)"),
+            ("reset", "reset"),
+            ("no-handshake", "no handshake captured"),
+            ("unknown", "unknown"),
+        ]
+        parts = [
+            f"{label}={conn_state_counts[state]}"
+            for state, label in breakdown_order
+            if conn_state_counts.get(state)
+        ]
+        detail = f" ({', '.join(parts)})" if parts else ""
+        lines.append(_format_kv("Not Established", f"{not_established}{detail}"))
+        if established_count == 0 and active_count == 0:
+            lines.append(
+                muted(
+                    "No TCP connection in this capture completed a 3-way handshake; "
+                    "the flows below are connection attempts, not sessions."
+                )
+            )
+    lines.append(_format_kv("Reassembled Cleanly", str(len(reassembled_clean))))
+    lines.append(_format_kv("Reassembly Gaps", str(len(reassembly_gaps))))
     if (
         summary.established_only
         and summary.total_streams == 0
@@ -25484,6 +25898,7 @@ def render_streams_summary(summary: StreamSummary, verbose: bool = False) -> str
                 "Traffic",
                 "Hostnames",
                 "Service",
+                "State",
                 "Reassembly",
             ]
         ]
@@ -25498,9 +25913,16 @@ def render_streams_summary(summary: StreamSummary, verbose: bool = False) -> str
             service_text = COMMON_PORTS.get(
                 int(rec.server_port), f"TCP/{int(rec.server_port)}"
             )
-            state_text = "complete"
+            reassembly_text = "complete"
             if rec.client_gaps or rec.server_gaps:
-                state_text = f"gaps c={len(rec.client_gaps)} s={len(rec.server_gaps)}"
+                reassembly_text = (
+                    f"gaps c={len(rec.client_gaps)} s={len(rec.server_gaps)}"
+                )
+            elif not rec.client_payload_preview and not rec.server_payload_preview:
+                # No application payload at all (e.g. SYN-only) -- "complete"
+                # reassembly is vacuous here, so say so plainly.
+                reassembly_text = "no-data"
+            conn_state_text = getattr(rec, "conn_state", "unknown")
             rows.append(
                 [
                     rec.stream_id,
@@ -25511,7 +25933,8 @@ def render_streams_summary(summary: StreamSummary, verbose: bool = False) -> str
                     traffic_text,
                     hostnames_text,
                     service_text,
-                    state_text,
+                    conn_state_text,
+                    reassembly_text,
                 ]
             )
         lines.append(_format_table(rows))
@@ -25577,6 +26000,11 @@ def render_streams_summary(summary: StreamSummary, verbose: bool = False) -> str
             _format_kv(
                 "Client -> Server",
                 f"{selected_stream.client_ip}:{selected_stream.client_port} -> {selected_stream.server_ip}:{selected_stream.server_port}",
+            )
+        )
+        lines.append(
+            _format_kv(
+                "Connection State", getattr(selected_stream, "conn_state", "unknown")
             )
         )
         lines.append(

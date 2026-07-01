@@ -35,3 +35,8 @@ class PcapSummary:
     tcp_packets: int = 0
     retransmissions: int = 0
     retransmission_rate: float = 0.0
+    capture_hardware: Optional[str] = None
+    capture_os: Optional[str] = None
+    capture_application: Optional[str] = None
+    hash_sha256: Optional[str] = None
+    hash_sha1: Optional[str] = None

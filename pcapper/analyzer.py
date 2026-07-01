@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 
+import hashlib
 from collections import Counter, defaultdict
 from numbers import Real
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .pcap_cache import PcapMeta, get_reader
+from .pcap_cache import PcapMeta, get_reader, load_capture_meta
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -157,6 +158,19 @@ def _as_int(value: object | None) -> Optional[int]:
         return None
 
 
+def _hash_capture_file(path: Path) -> tuple[str | None, str | None]:
+    sha256 = hashlib.sha256()
+    sha1 = hashlib.sha1()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                sha256.update(chunk)
+                sha1.update(chunk)
+    except Exception:
+        return None, None
+    return sha256.hexdigest(), sha1.hexdigest()
+
+
 @memoize_analysis
 def analyze_pcap(
     path: Path,
@@ -164,8 +178,16 @@ def analyze_pcap(
     packets: list[object] | None = None,
     meta: PcapMeta | None = None,
 ) -> PcapSummary:
-    file_type = meta.file_type if meta else detect_file_type(path)
-    size_bytes = meta.size_bytes if meta else path.stat().st_size
+    capture_meta = meta
+    if capture_meta is None:
+        try:
+            capture_meta = load_capture_meta(path)
+        except Exception:
+            capture_meta = None
+
+    file_type = capture_meta.file_type if capture_meta else detect_file_type(path)
+    size_bytes = capture_meta.size_bytes if capture_meta else path.stat().st_size
+    hash_sha256, hash_sha1 = _hash_capture_file(path)
     packet_count = 0
     start_ts: Optional[float] = None
     end_ts: Optional[float] = None
@@ -179,7 +201,7 @@ def analyze_pcap(
     )
 
     reader, status, stream, _size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
+        path, packets=packets, meta=capture_meta, show_status=show_status
     )
 
     try:
@@ -287,7 +309,9 @@ def analyze_pcap(
             vlan_ids.update(iface_vlans.get(key, set()))
         return total, sorted(vlan_ids)
 
-    interfaces = meta.interfaces if meta else getattr(reader, "interfaces", None)
+    interfaces = (
+        capture_meta.interfaces if capture_meta else getattr(reader, "interfaces", None)
+    )
     if interfaces and len(interfaces) > 0:
         all_vlan_ids: set[int] = set()
         for vlan_set in iface_vlans.values():
@@ -335,10 +359,10 @@ def analyze_pcap(
                 InterfaceStat(
                     name=_normalize_iface_name(name),
                     linktype=_as_text(linktype)
-                    or _as_text(meta.linktype if meta else None),
+                    or _as_text(capture_meta.linktype if capture_meta else None),
                     snaplen=snaplen
                     if snaplen is not None
-                    else (meta.snaplen if meta else None),
+                    else (capture_meta.snaplen if capture_meta else None),
                     packet_count=iface_count,
                     dropped_packets=_as_int(dropcount),
                     capture_filter=_as_text(capture_filter),
@@ -350,8 +374,12 @@ def analyze_pcap(
                 )
             )
     else:
-        linktype = meta.linktype if meta else getattr(reader, "linktype", None)
-        snaplen = meta.snaplen if meta else getattr(reader, "snaplen", None)
+        linktype = (
+            capture_meta.linktype if capture_meta else getattr(reader, "linktype", None)
+        )
+        snaplen = (
+            capture_meta.snaplen if capture_meta else getattr(reader, "snaplen", None)
+        )
         observed_ifaces = list(iface_counts.keys()) or ["unknown"]
         for iface_key in sorted(observed_ifaces, key=lambda value: str(value)):
             iface_count, vlan_ids = _collect_iface_counts([iface_key])
@@ -385,6 +413,15 @@ def analyze_pcap(
         tcp_packets=tcp_packets,
         retransmissions=retransmissions,
         retransmission_rate=retransmission_rate,
+        capture_hardware=getattr(capture_meta, "capture_hardware", None)
+        if capture_meta
+        else None,
+        capture_os=getattr(capture_meta, "capture_os", None) if capture_meta else None,
+        capture_application=getattr(capture_meta, "capture_application", None)
+        if capture_meta
+        else None,
+        hash_sha256=hash_sha256,
+        hash_sha1=hash_sha1,
     )
 
 
@@ -403,6 +440,11 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
             tcp_packets=0,
             retransmissions=0,
             retransmission_rate=0.0,
+            capture_hardware=None,
+            capture_os=None,
+            capture_application=None,
+            hash_sha256=None,
+            hash_sha1=None,
         )
 
     file_types = {summary.file_type for summary in summaries if summary.file_type}
@@ -435,6 +477,34 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
     merged_retransmission_rate = (
         (merged_retransmissions / merged_tcp_packets) if merged_tcp_packets else 0.0
     )
+
+    def _merge_capture_field(field_name: str) -> str | None:
+        values = sorted(
+            {
+                str(getattr(summary, field_name, "") or "").strip()
+                for summary in summaries
+                if str(getattr(summary, field_name, "") or "").strip()
+            }
+        )
+        if not values:
+            return None
+        if len(values) == 1:
+            return values[0]
+        return "multiple"
+
+    def _merge_hash_field(field_name: str) -> str | None:
+        values = sorted(
+            {
+                str(getattr(summary, field_name, "") or "").strip()
+                for summary in summaries
+                if str(getattr(summary, field_name, "") or "").strip()
+            }
+        )
+        if not values:
+            return None
+        if len(values) == 1:
+            return values[0]
+        return "multiple"
 
     iface_data: dict[str, dict[str, object]] = {}
     for summary in summaries:
@@ -536,4 +606,9 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
         tcp_packets=merged_tcp_packets,
         retransmissions=merged_retransmissions,
         retransmission_rate=merged_retransmission_rate,
+        capture_hardware=_merge_capture_field("capture_hardware"),
+        capture_os=_merge_capture_field("capture_os"),
+        capture_application=_merge_capture_field("capture_application"),
+        hash_sha256=_merge_hash_field("hash_sha256"),
+        hash_sha1=_merge_hash_field("hash_sha1"),
     )
