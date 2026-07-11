@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Iterable
 import ipaddress
 import re
 import struct
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length
+from .utils import is_public_ip as _is_public_ip
+from .utils import beacon_score
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -51,6 +53,38 @@ RPC_INTERFACES = {
     "12345678-1234-abcd-ef00-01234567cffb": "NETLOGON",
     "1ff70682-0a51-30e8-076d-740be8cee98b": "ATSVC (AT Scheduler)",
     "338cd001-2244-31f1-aaaa-900038001003": "WINREG (Remote Registry)",
+    "86d35949-83c9-4044-b424-db363231fd0c": "TSCH (Task Scheduler)",
+    "e3514235-4b06-11d1-ab04-00c04fc2dcd2": "DRSUAPI (Directory Replication)",
+    "3919286a-b10c-11d0-9ba8-00c04fd92ef5": "DSSETUP (LSA DS)",
+    "894de0c0-0d55-461c-bb6c-5f3c6f4b4e30": "NTSVCS (PNP / RemoteRegistry)",
+    "f6beaff7-1e19-4fbb-9f8f-b89e2018337c": "EVENTLOG (Event Log Remoting)",
+    "afa8bd80-7d8a-11c9-bef4-08002b102989": "MGMT (RPC Management)",
+    "76f03f96-cdfd-44fc-a22c-64950a001209": "ITaskSchedulerService (TSCH)",
+    # Coerced-authentication (NTLM relay) vectors.
+    "c681d488-d850-11d0-8c52-00c04fd90f7e": "MS-EFSR (EFSRPC)",
+    "df1941c5-fe89-4e79-bf10-463657acf44d": "MS-EFSR (EFSRPC / lsarpc)",
+    "12345678-1234-abcd-ef00-0123456789ab": "MS-RPRN (Print Spooler)",
+}
+
+# DCE/RPC interfaces abused for remote code execution, persistence, credential
+# theft and lateral movement (the named pipes PsExec/Impacket/wmiexec/secretsdump
+# bind to). DRSUAPI especially = DCSync (ATT&CK T1003.006); SVCCTL = remote
+# service create (T1021.003); ATSVC/TSCH = scheduled task (T1053); WINREG/NTSVCS
+# = remote registry (T1112); EVENTLOG = log manipulation (T1070.001).
+_RPC_HIGH_RISK_INTERFACES = {
+    "367abb81-9844-35f1-ad32-98f038001003": ("SVCCTL (remote service control)", "T1021.003"),
+    "1ff70682-0a51-30e8-076d-740be8cee98b": ("ATSVC (scheduled task)", "T1053.002"),
+    "86d35949-83c9-4044-b424-db363231fd0c": ("TSCH (scheduled task)", "T1053.005"),
+    "76f03f96-cdfd-44fc-a22c-64950a001209": ("TSCH (scheduled task)", "T1053.005"),
+    "338cd001-2244-31f1-aaaa-900038001003": ("WINREG (remote registry)", "T1112"),
+    "894de0c0-0d55-461c-bb6c-5f3c6f4b4e30": ("NTSVCS (remote registry/PnP)", "T1112"),
+    "e3514235-4b06-11d1-ab04-00c04fc2dcd2": ("DRSUAPI (DCSync credential theft)", "T1003.006"),
+    "f6beaff7-1e19-4fbb-9f8f-b89e2018337c": ("EVENTLOG (log manipulation)", "T1070.001"),
+    # EFSRPC = PetitPotam coerced authentication (NTLM relay). The interface is
+    # rarely seen benignly on the wire, so a bind is a strong signal. Both UUIDs
+    # are abused (the second is reachable over the lsarpc pipe). T1187.
+    "c681d488-d850-11d0-8c52-00c04fd90f7e": ("EFSRPC (PetitPotam coercion)", "T1187"),
+    "df1941c5-fe89-4e79-bf10-463657acf44d": ("EFSRPC (PetitPotam coercion)", "T1187"),
 }
 
 SAMR_UUID = "12345778-1234-abcd-ef00-0123456789ac"
@@ -58,11 +92,70 @@ SAMR_UUID = "12345778-1234-abcd-ef00-0123456789ac"
 SAMR_QUERY_USER_OPNUMS = {36, 47}
 
 RPC_OPNUM_MAP: dict[str, dict[int, str]] = {
-    # Basic/common mappings; keep conservative to avoid false attribution.
-    # UUIDs are lower-case, without version suffix.
+    # Operation names for the abused interfaces, so the analyst sees the actual
+    # tradecraft ("SVCCTL::RCreateServiceW") instead of a bare "opnum 12". Only
+    # opnums verified against the MS-protocol specs are mapped — a wrong mapping
+    # would be false evidence, worse than showing the raw opnum. UUIDs are
+    # lower-case, without version suffix.
+    # EPM (MS-RPCE)
     "e1af8308-5d1f-11c9-91a4-08002b14a0fa": {
         3: "ept_map",
         5: "ept_map_auth",
+    },
+    # SVCCTL / MS-SCMR — remote service control (PsExec). T1543.003 / T1021.003.
+    "367abb81-9844-35f1-ad32-98f038001003": {
+        12: "RCreateServiceW",
+        19: "RStartServiceW",
+        24: "RCreateServiceA",
+        31: "RStartServiceA",
+        2: "RDeleteService",
+        1: "RControlService",
+    },
+    # TSCH / MS-TSCH ITaskSchedulerService — scheduled tasks. T1053.005.
+    "86d35949-83c9-4044-b424-db363231fd0c": {
+        1: "SchRpcRegisterTask",
+        12: "SchRpcRun",
+    },
+    # ATSVC / MS-TSCH legacy AT interface. T1053.002.
+    "1ff70682-0a51-30e8-076d-740be8cee98b": {
+        0: "NetrJobAdd",
+        1: "NetrJobDel",
+        2: "NetrJobEnum",
+    },
+    # DRSUAPI / MS-DRSR — replication; opnum 3 is the DCSync vector. T1003.006.
+    "e3514235-4b06-11d1-ab04-00c04fc2dcd2": {
+        0: "DRSBind",
+        1: "DRSUnbind",
+        3: "IDL_DRSGetNCChanges",
+    },
+    # SAMR / MS-SAMR — account/group enumeration (T1087.002) + creation.
+    "12345778-1234-abcd-ef00-0123456789ac": {
+        6: "SamrEnumerateDomainsInSamServer",
+        12: "SamrCreateUserInDomain",
+        13: "SamrEnumerateUsersInDomain",
+        15: "SamrEnumerateAliasesInDomain",
+        17: "SamrLookupNamesInDomain",
+        36: "SamrQueryInformationUser",
+        47: "SamrQueryInformationUser2",
+        50: "SamrCreateUser2InDomain",
+    },
+    # MS-EFSR — PetitPotam coercion; EfsRpcOpenFileRaw (opnum 0) is the classic
+    # trigger, the others are equivalent coercion primitives. T1187.
+    "c681d488-d850-11d0-8c52-00c04fd90f7e": {
+        0: "EfsRpcOpenFileRaw",
+        4: "EfsRpcEncryptFileSrv",
+        5: "EfsRpcDecryptFileSrv",
+        6: "EfsRpcQueryUsersOnFile",
+    },
+    "df1941c5-fe89-4e79-bf10-463657acf44d": {
+        0: "EfsRpcOpenFileRaw",
+    },
+    # MS-RPRN — PrinterBug coercion opnums (RpcRemoteFindFirstPrinterChange*).
+    # Bind alone is NOT flagged high-risk (printing is benign), but naming the
+    # opnum surfaces the coercion primitive when it appears. T1187.
+    "12345678-1234-abcd-ef00-0123456789ab": {
+        62: "RpcRemoteFindFirstPrinterChangeNotification",
+        65: "RpcRemoteFindFirstPrinterChangeNotificationEx",
     },
 }
 
@@ -71,9 +164,16 @@ DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9_.-]{1,64})\b
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 IPV6_RE = re.compile(r"\b(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b")
 MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})\b")
-UNC_SHARE_RE = re.compile(r"\\\\([A-Za-z0-9_.-]{1,64})\\\\([A-Za-z0-9.$_-]{1,64})")
-PIPE_REMOTE_RE = re.compile(r"\\\\([A-Za-z0-9_.-]{1,64})\\\\pipe\\\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE)
-PIPE_LOCAL_RE = re.compile(r"\\\\\\.\\\\pipe\\\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE)
+# UNC / named-pipe paths on the wire use a 2-backslash prefix and single-
+# backslash separators (\\HOST\share, \\HOST\pipe\svcctl, \\.\pipe\atsvc).
+# The separators were previously double-escaped (\\\\ = two literal backslashes
+# in regex), so these never matched and admin-share / PsExec pipe attribution
+# was dead.
+UNC_SHARE_RE = re.compile(r"\\\\([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9.$_-]{1,64})")
+PIPE_REMOTE_RE = re.compile(
+    r"\\\\([A-Za-z0-9_.-]{1,64})\\pipe\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE
+)
+PIPE_LOCAL_RE = re.compile(r"\\\\\.\\pipe\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE)
 PIPE_GENERIC_RE = re.compile(r"\\pipe\\([A-Za-z0-9._$-]{1,64})", re.IGNORECASE)
 
 SAMR_FULLNAME_STOPWORDS = {
@@ -93,9 +193,19 @@ SAMR_FULLNAME_STOPWORDS = {
 SAMR_NAME_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z.'-]{0,40}$")
 
 SUSPICIOUS_STRINGS = [
-    (re.compile(r"powershell|cmd\.exe|wmic|winrs", re.IGNORECASE), "Command execution tooling"),
-    (re.compile(r"mimikatz|cobalt|beacon|meterpreter", re.IGNORECASE), "Malware tooling"),
-    (re.compile(r"rundll32|regsvr32|schtasks|at\s+", re.IGNORECASE), "Execution/persistence tooling"),
+    (
+        re.compile(r"powershell|cmd\.exe|wmic|winrs", re.IGNORECASE),
+        "Command execution tooling",
+    ),
+    (
+        re.compile(r"mimikatz|cobalt|beacon|meterpreter", re.IGNORECASE),
+        "Malware tooling",
+    ),
+    (
+        # `at\s+` matched the English word "at "; restrict to `at \\host`.
+        re.compile(r"rundll32|regsvr32|schtasks|\bat\s+\\\\", re.IGNORECASE),
+        "Execution/persistence tooling",
+    ),
     (re.compile(r"nmap|masscan|sqlmap", re.IGNORECASE), "Recon tooling"),
 ]
 
@@ -149,6 +259,9 @@ class RpcSummary:
     anomalies: list[dict[str, object]]
     artifacts: list[RpcArtifact]
     errors: list[str]
+    deterministic_checks: dict[str, list[str]]
+    threat_hypotheses: list[dict[str, object]]
+    benign_context: list[str]
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
@@ -193,10 +306,20 @@ class RpcSummary:
             "detections": list(self.detections),
             "anomalies": list(self.anomalies),
             "artifacts": [
-                {"kind": item.kind, "detail": item.detail, "src": item.src, "dst": item.dst}
+                {
+                    "kind": item.kind,
+                    "detail": item.detail,
+                    "src": item.src,
+                    "dst": item.dst,
+                }
                 for item in self.artifacts
             ],
             "errors": list(self.errors),
+            "deterministic_checks": {
+                key: list(value) for key, value in self.deterministic_checks.items()
+            },
+            "threat_hypotheses": list(self.threat_hypotheses),
+            "benign_context": list(self.benign_context),
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "duration_seconds": self.duration_seconds,
@@ -225,7 +348,7 @@ def _find_rpc_pdu(payload: bytes | None) -> tuple[Optional[str], int]:
         if minor in (0x00, 0x01):
             ptype = payload[idx + 2]
             if ptype in PDU_TYPE_MAP:
-                data_rep = payload[idx + 4:idx + 8]
+                data_rep = payload[idx + 4 : idx + 8]
                 if data_rep in {b"\x10\x00\x00\x00", b"\x00\x00\x00\x10"}:
                     return PDU_TYPE_MAP.get(ptype, f"0x{ptype:02x}"), idx
         idx = payload.find(b"\x05", idx + 1)
@@ -268,9 +391,9 @@ def _parse_bind_contexts(payload: bytes | None) -> list[tuple[int, str]]:
             idx += 2  # num_trans + reserved
             if idx + 20 > len(payload):
                 break
-            uuid = _decode_uuid_le(payload[idx:idx + 16])
+            uuid = _decode_uuid_le(payload[idx : idx + 16])
             idx += 16
-            vers = struct.unpack("<HH", payload[idx:idx + 4])
+            vers = struct.unpack("<HH", payload[idx : idx + 4])
             idx += 4
             if uuid:
                 iface = f"{uuid} v{vers[0]}.{vers[1]}"
@@ -380,7 +503,9 @@ def _looks_like_samr_fullname(value: str) -> bool:
         return False
     if "," in cleaned:
         parts = [part.strip() for part in cleaned.split(",") if part.strip()]
-        if len(parts) >= 2 and all(SAMR_NAME_TOKEN_RE.match(part) for part in parts[:2]):
+        if len(parts) >= 2 and all(
+            SAMR_NAME_TOKEN_RE.match(part) for part in parts[:2]
+        ):
             return True
     parts = [part for part in cleaned.split() if part]
     if len(parts) < 2:
@@ -403,26 +528,19 @@ def _extract_samr_fullnames(payload: bytes) -> list[str]:
     return names
 
 
-def _beacon_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
-    if avg < 1 or avg > 3600:
-        return None
-    if stddev / avg > 0.15:
-        return None
-    return {"avg": avg, "stddev": stddev}
+def _beacon_score(times: list[float]):
+    return beacon_score(
+        times, min_interval=1.0, max_interval=3600.0, rel_jitter=0.15, abs_jitter_floor=0.0
+    )
 
 
-def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | None = None, meta: object | None = None) -> RpcSummary:
+@memoize_analysis
+def analyze_rpc(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: object | None = None,
+) -> RpcSummary:
     errors: list[str] = []
     if TCP is None and UDP is None:
         errors.append("Scapy IP layers unavailable; install scapy for RPC analysis.")
@@ -454,6 +572,9 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
             anomalies=[],
             artifacts=[],
             errors=errors,
+            deterministic_checks={},
+            threat_hypotheses=[],
+            benign_context=[],
             first_seen=None,
             last_seen=None,
             duration_seconds=None,
@@ -492,6 +613,7 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
     artifacts: list[RpcArtifact] = []
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
+    high_risk_iface_use: dict[tuple[str, str], set[str]] = defaultdict(set)
     pending_calls: dict[tuple[str, str, str, int, int], dict[str, object]] = {}
 
     dst_by_src: dict[str, set[str]] = defaultdict(set)
@@ -511,7 +633,7 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:
@@ -520,16 +642,7 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if not src_ip or not dst_ip:
                 continue
@@ -573,17 +686,17 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
             protocol_counts[proto] += 1
             pdu_counts[pdu_type] += 1
             le = _rpc_is_little_endian(rpc_payload)
-            call_id = _rpc_read_u32(rpc_payload, 12, le) if len(rpc_payload) >= 16 else None
+            call_id = (
+                _rpc_read_u32(rpc_payload, 12, le) if len(rpc_payload) >= 16 else None
+            )
             is_response = pdu_type in RESPONSE_PDU_TYPES
             if is_response:
                 client_ip = dst_ip
                 server_ip = src_ip
-                client_port = dport
                 server_port = sport
             else:
                 client_ip = src_ip
                 server_ip = dst_ip
-                client_port = sport
                 server_port = dport
             server_port = int(server_port or 0)
 
@@ -627,7 +740,19 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
                         display = f"{label} ({iface})" if label else iface
                         interface_counts[display] += 1
                         if label:
-                            artifacts.append(RpcArtifact(kind="interface", detail=f"{label} ({iface})", src=client_ip, dst=server_ip))
+                            artifacts.append(
+                                RpcArtifact(
+                                    kind="interface",
+                                    detail=f"{label} ({iface})",
+                                    src=client_ip,
+                                    dst=server_ip,
+                                )
+                            )
+                        risk = _RPC_HIGH_RISK_INTERFACES.get(uuid.lower())
+                        if risk:
+                            high_risk_iface_use[(risk[0], risk[1])].add(
+                                f"{client_ip} -> {server_ip}"
+                            )
 
             if pdu_type == "request" and len(rpc_payload) >= 24:
                 context_id = _rpc_read_u16(rpc_payload, 20, le) or 0
@@ -644,7 +769,11 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
                 else:
                     command = f"opnum {opnum}"
                 command_counts[command] += 1
-                if call_id is not None and iface_uuid == SAMR_UUID and opnum in SAMR_QUERY_USER_OPNUMS:
+                if (
+                    call_id is not None
+                    and iface_uuid == SAMR_UUID
+                    and opnum in SAMR_QUERY_USER_OPNUMS
+                ):
                     key = (client_ip, server_ip, proto, int(server_port), call_id)
                     pending_calls[key] = {"opnum": opnum}
                     if len(pending_calls) > 2048:
@@ -656,26 +785,36 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
                 if pending and int(pending.get("opnum", -1)) in SAMR_QUERY_USER_OPNUMS:
                     stub_data = _rpc_stub_data(rpc_payload, le)
                     for full_name in _extract_samr_fullnames(stub_data):
-                        samr_key = (full_name.lower(), server_ip, client_ip, int(server_port), proto)
+                        samr_key = (
+                            full_name.lower(),
+                            server_ip,
+                            client_ip,
+                            int(server_port),
+                            proto,
+                        )
                         if samr_key in samr_seen:
                             continue
                         samr_seen.add(samr_key)
-                        samr_fullnames.append({
-                            "full_name": full_name,
-                            "src_ip": server_ip,
-                            "dst_ip": client_ip,
-                            "protocol": proto,
-                            "server_port": int(server_port),
-                            "opnum": int(pending.get("opnum", -1)),
-                        })
+                        samr_fullnames.append(
+                            {
+                                "full_name": full_name,
+                                "src_ip": server_ip,
+                                "dst_ip": client_ip,
+                                "protocol": proto,
+                                "server_port": int(server_port),
+                                "opnum": int(pending.get("opnum", -1)),
+                            }
+                        )
 
             if pdu_offset > 0 and (sport == 445 or dport == 445):
-                artifacts.append(RpcArtifact(
-                    kind="rpc_over_smb",
-                    detail=f"DCE/RPC header at offset {pdu_offset} ({pdu_type})",
-                    src=client_ip,
-                    dst=server_ip,
-                ))
+                artifacts.append(
+                    RpcArtifact(
+                        kind="rpc_over_smb",
+                        detail=f"DCE/RPC header at offset {pdu_offset} ({pdu_type})",
+                        src=client_ip,
+                        dst=server_ip,
+                    )
+                )
 
             for item in _extract_strings(payload, limit=200):
                 plaintext_strings[item] += 1
@@ -702,19 +841,31 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
                         continue
                     share_path = f"\\\\{server}\\{share}"
                     share_counts[share_path] += 1
-                    artifacts.append(RpcArtifact(kind="share", detail=share_path, src=src_ip, dst=dst_ip))
+                    artifacts.append(
+                        RpcArtifact(
+                            kind="share", detail=share_path, src=src_ip, dst=dst_ip
+                        )
+                    )
                 for match in PIPE_REMOTE_RE.finditer(item):
                     pipe_path = f"\\\\{match.group(1)}\\pipe\\{match.group(2)}"
                     if pipe_path not in pipe_paths:
                         pipe_counts[pipe_path] += 1
-                        artifacts.append(RpcArtifact(kind="pipe", detail=pipe_path, src=src_ip, dst=dst_ip))
+                        artifacts.append(
+                            RpcArtifact(
+                                kind="pipe", detail=pipe_path, src=src_ip, dst=dst_ip
+                            )
+                        )
                         pipe_paths.add(pipe_path)
                         pipe_names.add(match.group(2).lower())
                 for match in PIPE_LOCAL_RE.finditer(item):
                     pipe_path = f"\\\\.\\pipe\\{match.group(1)}"
                     if pipe_path not in pipe_paths:
                         pipe_counts[pipe_path] += 1
-                        artifacts.append(RpcArtifact(kind="pipe", detail=pipe_path, src=src_ip, dst=dst_ip))
+                        artifacts.append(
+                            RpcArtifact(
+                                kind="pipe", detail=pipe_path, src=src_ip, dst=dst_ip
+                            )
+                        )
                         pipe_paths.add(pipe_path)
                         pipe_names.add(match.group(1).lower())
                 for match in PIPE_GENERIC_RE.finditer(item):
@@ -723,16 +874,22 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
                     pipe_path = f"\\pipe\\{match.group(1)}"
                     if pipe_path not in pipe_paths:
                         pipe_counts[pipe_path] += 1
-                        artifacts.append(RpcArtifact(kind="pipe", detail=pipe_path, src=src_ip, dst=dst_ip))
+                        artifacts.append(
+                            RpcArtifact(
+                                kind="pipe", detail=pipe_path, src=src_ip, dst=dst_ip
+                            )
+                        )
                         pipe_paths.add(pipe_path)
                 for pattern, reason in SUSPICIOUS_STRINGS:
                     if pattern.search(item):
-                        detections.append({
-                            "severity": "warning",
-                            "summary": f"Suspicious RPC content: {reason}",
-                            "details": f"{src_ip}->{dst_ip} {item[:120]}",
-                            "source": "RPC",
-                        })
+                        detections.append(
+                            {
+                                "severity": "warning",
+                                "summary": f"Suspicious RPC content: {reason}",
+                                "details": f"{src_ip}->{dst_ip} {item[:120]}",
+                                "source": "RPC",
+                            }
+                        )
     except Exception as exc:
         errors.append(str(exc))
     finally:
@@ -742,56 +899,214 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
         except Exception:
             pass
 
+    for (iface_label, attack_id), pairs in high_risk_iface_use.items():
+        sample = ", ".join(sorted(pairs)[:5])
+        # DCSync (DRSUAPI) is credential theft from a DC — rate it highest.
+        severity = "high" if "DCSync" in iface_label else "warning"
+        detections.append(
+            {
+                "severity": severity,
+                "summary": f"High-risk DCE/RPC interface: {iface_label}",
+                "details": (
+                    f"Bind to {iface_label} ({attack_id}) over {len(pairs)} "
+                    f"flow(s): {sample}. This interface is used by remote-exec / "
+                    "lateral-movement / credential-theft tooling (PsExec, "
+                    "Impacket, secretsdump) — confirm it is authorized admin activity."
+                ),
+                "source": "RPC",
+            }
+        )
+
     for src, dsts in dst_by_src.items():
         if len(dsts) >= 20:
-            detections.append({
-                "severity": "warning",
-                "summary": "RPC scanning/probing detected",
-                "details": f"{src} contacted {len(dsts)} RPC endpoints.",
-                "source": "RPC",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "RPC scanning/probing detected",
+                    "details": f"{src} contacted {len(dsts)} RPC endpoints.",
+                    "source": "RPC",
+                }
+            )
 
     for src, count in bind_failures.items():
         if count >= 10:
-            detections.append({
-                "severity": "warning",
-                "summary": "RPC bind failures spike",
-                "details": f"{src} saw {count} bind_nak responses.",
-                "source": "RPC",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "RPC bind failures spike",
+                    "details": f"{src} saw {count} bind_nak responses.",
+                    "source": "RPC",
+                }
+            )
 
     for flow, times in request_times.items():
         score = _beacon_score(times)
         if score:
-            detections.append({
-                "severity": "warning",
-                "summary": "RPC beaconing suspected",
-                "details": f"{flow[0]}->{flow[1]} avg {score['avg']:.1f}s interval.",
-                "source": "RPC",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "RPC beaconing suspected",
+                    "details": f"{flow[0]}->{flow[1]} avg {score['avg']:.1f}s interval.",
+                    "source": "RPC",
+                }
+            )
 
     for flow, resp_bytes in response_bytes.items():
         req_bytes = request_bytes.get(flow, 1)
         if resp_bytes > 50_000 and resp_bytes > req_bytes * 5:
-            detections.append({
-                "severity": "warning",
-                "summary": "RPC data exfiltration suspected",
-                "details": f"{flow[0]}->{flow[1]} response bytes {resp_bytes}.",
-                "source": "RPC",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "RPC data exfiltration suspected",
+                    "details": f"{flow[0]}->{flow[1]} response bytes {resp_bytes}.",
+                    "source": "RPC",
+                }
+            )
+
+    deterministic_checks: dict[str, list[str]] = {
+        "rpc_scanning_fanout": [],
+        "rpc_bind_failure_burst": [],
+        "rpc_public_exposure": [],
+        "rpc_lateral_tooling": [],
+        "rpc_samr_enum_activity": [],
+        "rpc_admin_share_or_pipe_access": [],
+        "rpc_beaconing_pattern": [],
+        "rpc_data_asymmetry_exfil": [],
+    }
+    threat_hypotheses: list[dict[str, object]] = []
+    benign_context: list[str] = []
+
+    for src, dsts in dst_by_src.items():
+        if len(dsts) >= 10:
+            deterministic_checks["rpc_scanning_fanout"].append(
+                f"{src} contacted {len(dsts)} unique RPC endpoints"
+            )
+
+    for src, count in bind_failures.items():
+        if count >= 5:
+            deterministic_checks["rpc_bind_failure_burst"].append(
+                f"{src} received {count} bind_nak responses"
+            )
+
+    for server_ip, count in server_counts.items():
+        if _is_public_ip(server_ip):
+            deterministic_checks["rpc_public_exposure"].append(
+                f"Public RPC server endpoint {server_ip} traffic_count={int(count)}"
+            )
+    for client_ip, count in client_counts.items():
+        if _is_public_ip(client_ip):
+            deterministic_checks["rpc_public_exposure"].append(
+                f"Public RPC client endpoint {client_ip} traffic_count={int(count)}"
+            )
+
+    for cmd, count in command_counts.items():
+        lower = str(cmd).lower()
+        if (
+            any(
+                token in lower for token in ("svcctl", "atsvc", "opnum", "ept_map_auth")
+            )
+            and int(count) > 0
+        ):
+            deterministic_checks["rpc_lateral_tooling"].append(
+                f"RPC command/tooling indicator {cmd} count={int(count)}"
+            )
+    if samr_fullnames:
+        deterministic_checks["rpc_samr_enum_activity"].append(
+            f"SAMR fullname extraction results={len(samr_fullnames)}"
+        )
+
+    for share, count in share_counts.most_common(20):
+        if str(share).split("\\")[-1].endswith("$"):
+            deterministic_checks["rpc_admin_share_or_pipe_access"].append(
+                f"Administrative share access {share} count={int(count)}"
+            )
+    for pipe, count in pipe_counts.most_common(25):
+        if any(
+            token in str(pipe).lower()
+            for token in ("svcctl", "samr", "lsarpc", "winreg", "atsvc")
+        ):
+            deterministic_checks["rpc_admin_share_or_pipe_access"].append(
+                f"Administrative named pipe {pipe} count={int(count)}"
+            )
+
+    for flow, times in request_times.items():
+        score = _beacon_score(times)
+        if score:
+            deterministic_checks["rpc_beaconing_pattern"].append(
+                f"{flow[0]}->{flow[1]} periodic RPC avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s"
+            )
+
+    for flow, resp_bytes in response_bytes.items():
+        req_bytes = request_bytes.get(flow, 1)
+        if resp_bytes > 100_000 and resp_bytes > req_bytes * 5:
+            deterministic_checks["rpc_data_asymmetry_exfil"].append(
+                f"{flow[0]}->{flow[1]} rpc response_bytes={int(resp_bytes)} request_bytes={int(req_bytes)}"
+            )
+
+    if (
+        deterministic_checks["rpc_scanning_fanout"]
+        and deterministic_checks["rpc_bind_failure_burst"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "RPC reconnaissance or endpoint mapper spray with failed bind negotiation",
+                "confidence": "high",
+                "evidence": len(deterministic_checks["rpc_scanning_fanout"])
+                + len(deterministic_checks["rpc_bind_failure_burst"]),
+            }
+        )
+    if (
+        deterministic_checks["rpc_admin_share_or_pipe_access"]
+        and deterministic_checks["rpc_lateral_tooling"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Lateral movement using administrative RPC shares/pipes and service-control interfaces",
+                "confidence": "high",
+                "evidence": len(deterministic_checks["rpc_admin_share_or_pipe_access"])
+                + len(deterministic_checks["rpc_lateral_tooling"]),
+            }
+        )
+    if deterministic_checks["rpc_samr_enum_activity"]:
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Identity discovery via SAMR user-information enumeration",
+                "confidence": "medium",
+                "evidence": len(deterministic_checks["rpc_samr_enum_activity"]),
+            }
+        )
+    if deterministic_checks["rpc_public_exposure"]:
+        threat_hypotheses.append(
+            {
+                "hypothesis": "RPC control surface exposed to public network paths",
+                "confidence": "medium",
+                "evidence": len(deterministic_checks["rpc_public_exposure"]),
+            }
+        )
+
+    if not deterministic_checks["rpc_scanning_fanout"]:
+        benign_context.append("No large RPC endpoint fan-out scan pattern observed")
+    if not deterministic_checks["rpc_bind_failure_burst"]:
+        benign_context.append("No substantial RPC bind_nak failure burst observed")
+    if not deterministic_checks["rpc_data_asymmetry_exfil"]:
+        benign_context.append(
+            "No strong response-heavy RPC byte asymmetry chain observed"
+        )
 
     conversations: list[RpcConversation] = []
     for (src, dst, proto, port), data in conv_map.items():
-        conversations.append(RpcConversation(
-            client_ip=src,
-            server_ip=dst,
-            protocol=proto,
-            server_port=port,
-            packets=int(data["packets"]),
-            bytes=int(data["bytes"]),
-            first_seen=data.get("first_seen"),
-            last_seen=data.get("last_seen"),
-        ))
+        conversations.append(
+            RpcConversation(
+                client_ip=src,
+                server_ip=dst,
+                protocol=proto,
+                server_port=port,
+                packets=int(data["packets"]),
+                bytes=int(data["bytes"]),
+                first_seen=data.get("first_seen"),
+                last_seen=data.get("last_seen"),
+            )
+        )
     conversations.sort(key=lambda c: c.packets, reverse=True)
 
     duration_seconds = None
@@ -826,6 +1141,9 @@ def analyze_rpc(path: Path, show_status: bool = True, packets: list[object] | No
         anomalies=anomalies,
         artifacts=artifacts,
         errors=errors,
+        deterministic_checks={k: v[:80] for k, v in deterministic_checks.items()},
+        threat_hypotheses=threat_hypotheses[:24],
+        benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
@@ -863,6 +1181,9 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
             anomalies=[],
             artifacts=[],
             errors=[],
+            deterministic_checks={},
+            threat_hypotheses=[],
+            benign_context=[],
             first_seen=None,
             last_seen=None,
             duration_seconds=0.0,
@@ -895,6 +1216,9 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
     anomalies: list[dict[str, object]] = []
     artifacts: list[RpcArtifact] = []
     errors: list[str] = []
+    deterministic_checks: dict[str, list[str]] = defaultdict(list)
+    threat_hypotheses: list[dict[str, object]] = []
+    benign_context: list[str] = []
 
     conv_map: dict[tuple[str, str, str, int], dict[str, object]] = {}
     det_seen: set[tuple[str, str, str]] = set()
@@ -931,13 +1255,31 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
         samr_fullnames.extend(getattr(summary, "samr_fullnames", []) or [])
 
         for item in summary.detections:
-            key = (str(item.get("severity", "")), str(item.get("summary", "")), str(item.get("details", "")))
+            key = (
+                str(item.get("severity", "")),
+                str(item.get("summary", "")),
+                str(item.get("details", "")),
+            )
             if key in det_seen:
                 continue
             det_seen.add(key)
             detections.append(item)
         anomalies.extend(summary.anomalies)
         artifacts.extend(summary.artifacts)
+        checks = getattr(summary, "deterministic_checks", {}) or {}
+        if isinstance(checks, dict):
+            for key, values in checks.items():
+                for value in list(values or []):
+                    text = str(value).strip()
+                    if text and text not in deterministic_checks[key]:
+                        deterministic_checks[key].append(text)
+        for item in list(getattr(summary, "threat_hypotheses", []) or []):
+            if item not in threat_hypotheses:
+                threat_hypotheses.append(item)
+        for item in list(getattr(summary, "benign_context", []) or []):
+            text = str(item).strip()
+            if text and text not in benign_context:
+                benign_context.append(text)
         for err in summary.errors:
             if err in err_seen:
                 continue
@@ -957,9 +1299,13 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
                 continue
             current["packets"] = int(current["packets"]) + conv.packets
             current["bytes"] = int(current["bytes"]) + conv.bytes
-            if conv.first_seen is not None and (current["first_seen"] is None or conv.first_seen < current["first_seen"]):
+            if conv.first_seen is not None and (
+                current["first_seen"] is None or conv.first_seen < current["first_seen"]
+            ):
                 current["first_seen"] = conv.first_seen
-            if conv.last_seen is not None and (current["last_seen"] is None or conv.last_seen > current["last_seen"]):
+            if conv.last_seen is not None and (
+                current["last_seen"] is None or conv.last_seen > current["last_seen"]
+            ):
                 current["last_seen"] = conv.last_seen
 
     conversations = [
@@ -1005,6 +1351,11 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
         anomalies=anomalies,
         artifacts=artifacts,
         errors=errors,
+        deterministic_checks={
+            key: values[:80] for key, values in deterministic_checks.items()
+        },
+        threat_hypotheses=threat_hypotheses[:24],
+        benign_context=benign_context[:24],
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,

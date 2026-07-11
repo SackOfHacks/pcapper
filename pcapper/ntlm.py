@@ -1,24 +1,26 @@
 from __future__ import annotations
 
+import base64
+import ipaddress
+import re
+import struct
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Any
-import struct
+from typing import Dict, List, Optional, Set, Tuple
 
 try:
     from scapy.layers.inet import TCP, UDP
-    from scapy.layers.inet6 import IPv6
-    from scapy.layers.l2 import Ether
-    from scapy.packet import Raw, Packet
-    from scapy.utils import PcapReader, PcapNgReader
+    from scapy.packet import Raw
 except ImportError:
     TCP = UDP = Raw = None
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type, safe_float
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
+from .utils import is_public_ip as _is_public_ip
 
 # --- Dataclasses ---
+
 
 @dataclass
 class NtlmSession:
@@ -29,7 +31,7 @@ class NtlmSession:
     username: str = "Unknown"
     domain: str = "Unknown"
     workstation: str = "Unknown"
-    version: str = "Unknown" # NTLMv1, NTLMv2
+    version: str = "Unknown"  # NTLMv1, NTLMv2
     message_type: str = "Unknown"
     ts: float = 0.0
 
@@ -53,14 +55,16 @@ class NtlmArtifact:
     value: str
     description: str
 
+
 @dataclass
 class NtlmAnomaly:
-    severity: str # CRITICAL, HIGH, MEDIUM, LOW
+    severity: str  # CRITICAL, HIGH, MEDIUM, LOW
     title: str
     description: str
     packet_index: int
     src: str
     dst: str
+
 
 @dataclass
 class NtlmAnalysis:
@@ -69,7 +73,7 @@ class NtlmAnalysis:
     total_packets: int = 0
     ntlm_packets: int = 0
     versions: Counter[str] = field(default_factory=Counter)
-    raw_users: Counter[str] = field(default_factory=Counter) # Just names
+    raw_users: Counter[str] = field(default_factory=Counter)  # Just names
     raw_domains: Counter[str] = field(default_factory=Counter)
     raw_workstations: Counter[str] = field(default_factory=Counter)
     sessions: List[NtlmSession] = field(default_factory=list)
@@ -83,6 +87,10 @@ class NtlmAnalysis:
     artifacts: List[NtlmArtifact] = field(default_factory=list)
     anomalies: List[NtlmAnomaly] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    deterministic_checks: Dict[str, List[str]] = field(default_factory=dict)
+    threat_hypotheses: List[Dict[str, object]] = field(default_factory=list)
+    benign_context: List[str] = field(default_factory=list)
+    crackable_hashes: List[Dict[str, str]] = field(default_factory=list)
 
     @property
     def total_sessions(self) -> int:
@@ -97,17 +105,48 @@ class NtlmAnalysis:
         # Returns (domain, username) tuples
         s = set()
         for session in self.sessions:
-            if session.username:
-                s.add((session.domain, session.username))
+            if session.username and session.username not in {"Unknown", "(Anonymous)"}:
+                if session.domain and session.domain != "Unknown":
+                    s.add((session.domain, session.username))
+                else:
+                    s.add(("<NO_DOMAIN>", session.username))
         return s
 
     @property
     def unique_domains(self) -> Set[str]:
-        return set(self.raw_domains.keys())
+        return {name for name in self.raw_domains.keys() if name and name != "Unknown"}
 
     @property
     def unique_workstations(self) -> Set[str]:
-        return set(s.workstation for s in self.sessions if s.workstation and s.workstation != "Unknown")
+        return {
+            s.workstation
+            for s in self.sessions
+            if s.workstation and s.workstation != "Unknown"
+        }
+
+
+def _append_ntlm_artifact(
+    artifacts: List[NtlmArtifact],
+    seen: Set[Tuple[str, str]],
+    *,
+    value: str,
+    description: str,
+) -> None:
+    normalized_value = _clean_ntlm_token(value)
+    if not normalized_value:
+        return
+    if description == "NTLM Target Name":
+        cleaned_target = _sanitize_ntlm_domain(normalized_value)
+        if cleaned_target == "Unknown":
+            cleaned_target = _sanitize_ntlm_workstation(normalized_value)
+        if cleaned_target == "Unknown":
+            return
+        normalized_value = cleaned_target
+    key = (description, normalized_value)
+    if key in seen:
+        return
+    seen.add(key)
+    artifacts.append(NtlmArtifact(value=normalized_value, description=description))
 
 
 # --- Constants ---
@@ -133,7 +172,7 @@ NTLMSSP_NEGOTIATE_ALWAYS_SIGN = 0x00008000
 NTLMSSP_NEGOTIATE_OEM_WORKSTATION_SUPPLIED = 0x00002000
 NTLMSSP_NEGOTIATE_OEM_DOMAIN_SUPPLIED = 0x00001000
 NTLMSSP_NEGOTIATE_ANONYMOUS = 0x00000800
-NTLMSSP_NEGOTIATE_NTLM = 0x00000200 # NTLM v1
+NTLMSSP_NEGOTIATE_NTLM = 0x00000200  # NTLM v1
 NTLMSSP_NEGOTIATE_LM_KEY = 0x00000080
 NTLMSSP_NEGOTIATE_DATAGRAM = 0x00000040
 NTLMSSP_NEGOTIATE_SEAL = 0x00000020
@@ -162,18 +201,22 @@ NTSTATUS_MAP = {
     0xC0000071: "STATUS_PASSWORD_EXPIRED",
     0xC0000072: "STATUS_ACCOUNT_DISABLED",
     0xC0000073: "STATUS_NONE_MAPPED",
-    0xC0000074: "STATUS_INVALID_ACCOUNT_NAME",
-    0xC0000075: "STATUS_USER_EXISTS",
-    0xC0000076: "STATUS_NO_SUCH_USER",
-    0xC0000077: "STATUS_GROUP_EXISTS",
-    0xC0000078: "STATUS_NO_SUCH_GROUP",
-    0xC0000079: "STATUS_MEMBER_IN_GROUP",
-    0xC000007A: "STATUS_MEMBER_NOT_IN_GROUP",
-    0xC000007B: "STATUS_LAST_ADMIN",
-    0xC000007C: "STATUS_WRONG_PASSWORD",
-    0xC000007D: "STATUS_ILL_FORMED_PASSWORD",
-    0xC000007E: "STATUS_PASSWORD_RESTRICTION",
-    0xC000007F: "STATUS_LOGON_FAILURE",
+    # The account/password status names below belong to the 0xC0000062-006D
+    # key range per MS-ERREF; they were previously mis-keyed to 0x74-0x7F
+    # (which are unrelated codes like STATUS_DISK_FULL 0x7F), causing the
+    # auth-failure heuristic to both miscount unrelated statuses and miss the
+    # real STATUS_WRONG_PASSWORD/STATUS_NO_SUCH_USER responses.
+    0xC0000062: "STATUS_INVALID_ACCOUNT_NAME",
+    0xC0000063: "STATUS_USER_EXISTS",
+    0xC0000064: "STATUS_NO_SUCH_USER",
+    0xC0000065: "STATUS_GROUP_EXISTS",
+    0xC0000066: "STATUS_NO_SUCH_GROUP",
+    0xC0000067: "STATUS_MEMBER_IN_GROUP",
+    0xC0000068: "STATUS_MEMBER_NOT_IN_GROUP",
+    0xC0000069: "STATUS_LAST_ADMIN",
+    0xC000006A: "STATUS_WRONG_PASSWORD",
+    0xC000006B: "STATUS_ILL_FORMED_PASSWORD",
+    0xC000006C: "STATUS_PASSWORD_RESTRICTION",
     0xC00000A2: "STATUS_PIPE_NOT_AVAILABLE",
     0xC00000AC: "STATUS_PIPE_BUSY",
     0xC00000B0: "STATUS_PIPE_DISCONNECTED",
@@ -205,12 +248,79 @@ NTSTATUS_MAP = {
     0xC000A00D: "STATUS_BAD_NETWORK_NAME",
 }
 
+_NTLM_VISIBLE_RE = re.compile(r"^[\x20-\x7e]{1,128}$")
+_NTLM_USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._$-]{2,63}$")
+_NTLM_DOMAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{2,63}$")
+_NTLM_WORKSTATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
+
+
+def _clean_ntlm_token(value: str) -> str:
+    text = str(value or "").replace("\x00", "").strip()
+    text = text.strip(" \t\r\n\"'`[]{}()<>,;:!|&*?^%")
+    return text
+
+
+def _looks_like_hex_noise(value: str) -> bool:
+    text = str(value or "")
+    if len(text) < 8 or len(text) % 2 != 0:
+        return False
+    return bool(re.fullmatch(r"[0-9A-Fa-f]+", text))
+
+
+def _sanitize_ntlm_user(value: str) -> str:
+    user = _clean_ntlm_token(value)
+    if not user or user.lower() == "unknown":
+        return "Unknown"
+    if not _NTLM_VISIBLE_RE.fullmatch(user):
+        return "Unknown"
+    if not _NTLM_USER_RE.fullmatch(user):
+        return "Unknown"
+    if _looks_like_hex_noise(user):
+        return "Unknown"
+    if user.isdigit():
+        return "Unknown"
+    return user
+
+
+def _sanitize_ntlm_domain(value: str) -> str:
+    domain = _clean_ntlm_token(value).upper()
+    if not domain or domain == "UNKNOWN":
+        return "Unknown"
+    if not _NTLM_VISIBLE_RE.fullmatch(domain):
+        return "Unknown"
+    if not _NTLM_DOMAIN_RE.fullmatch(domain):
+        return "Unknown"
+    if domain.startswith(".") or domain.endswith(".") or ".." in domain:
+        return "Unknown"
+    if "." in domain:
+        labels = domain.split(".")
+        if len(labels) < 2 or any(len(label) < 2 for label in labels):
+            return "Unknown"
+    elif len(domain) < 5:
+        return "Unknown"
+    if _looks_like_hex_noise(domain):
+        return "Unknown"
+    return domain
+
+
+def _sanitize_ntlm_workstation(value: str) -> str:
+    workstation = _clean_ntlm_token(value)
+    if not workstation or workstation.lower() == "unknown":
+        return "Unknown"
+    if not _NTLM_VISIBLE_RE.fullmatch(workstation):
+        return "Unknown"
+    if not _NTLM_WORKSTATION_RE.fullmatch(workstation):
+        return "Unknown"
+    if _looks_like_hex_noise(workstation):
+        return "Unknown"
+    return workstation
+
 
 def _parse_smb2_status(payload: bytes) -> Optional[str]:
     idx = payload.find(b"\xfeSMB")
     if idx == -1 or len(payload) < idx + 12:
         return None
-    status = struct.unpack("<I", payload[idx + 8:idx + 12])[0]
+    status = struct.unpack("<I", payload[idx + 8 : idx + 12])[0]
     name = NTSTATUS_MAP.get(status)
     if name:
         return f"SMB2_{name}"
@@ -221,7 +331,7 @@ def _parse_smb1_status(payload: bytes) -> Optional[str]:
     idx = payload.find(b"\xffSMB")
     if idx == -1 or len(payload) < idx + 13:
         return None
-    status = struct.unpack("<I", payload[idx + 5:idx + 9])[0]
+    status = struct.unpack("<I", payload[idx + 5 : idx + 9])[0]
     name = NTSTATUS_MAP.get(status)
     if name:
         return f"SMB1_{name}"
@@ -232,8 +342,8 @@ def _parse_smb2_ids(payload: bytes) -> Tuple[Optional[int], Optional[int]]:
     idx = payload.find(b"\xfeSMB")
     if idx == -1 or len(payload) < idx + 48:
         return None, None
-    message_id = struct.unpack("<Q", payload[idx + 24:idx + 32])[0]
-    session_id = struct.unpack("<Q", payload[idx + 40:idx + 48])[0]
+    message_id = struct.unpack("<Q", payload[idx + 24 : idx + 32])[0]
+    session_id = struct.unpack("<Q", payload[idx + 40 : idx + 48])[0]
     return int(message_id), int(session_id)
 
 
@@ -241,9 +351,40 @@ def _parse_smb1_ids(payload: bytes) -> Tuple[Optional[int], Optional[int]]:
     idx = payload.find(b"\xffSMB")
     if idx == -1 or len(payload) < idx + 32:
         return None, None
-    uid = struct.unpack("<H", payload[idx + 28:idx + 30])[0]
-    mid = struct.unpack("<H", payload[idx + 30:idx + 32])[0]
+    uid = struct.unpack("<H", payload[idx + 28 : idx + 30])[0]
+    mid = struct.unpack("<H", payload[idx + 30 : idx + 32])[0]
     return int(uid), int(mid)
+
+
+_HTTP_NTLM_MARKERS = (
+    b"Authorization: NTLM ",
+    b"WWW-Authenticate: NTLM ",
+    b"Proxy-Authorization: NTLM ",
+    b"Proxy-Authenticate: NTLM ",
+)
+
+
+def _extract_http_ntlm(payload: bytes) -> Optional[bytes]:
+    """Decode an HTTP NTLM auth header's base64 token to raw NTLMSSP bytes.
+
+    NTLM-over-HTTP (Exchange, SharePoint, web proxies, internal apps) carries the
+    NTLMSSP message base64-encoded in an Authorization/WWW-Authenticate header, so
+    the raw binary signature scan misses it entirely.
+    """
+    for marker in _HTTP_NTLM_MARKERS:
+        j = payload.find(marker)
+        if j < 0:
+            continue
+        token = payload[j + len(marker) :].split(b"\r\n", 1)[0].strip()
+        if not token:
+            continue
+        try:
+            decoded = base64.b64decode(token, validate=False)
+        except Exception:
+            continue
+        if decoded.startswith(NTLM_SIG):
+            return decoded
+    return None
 
 
 def _parse_http_status(payload: bytes) -> Optional[str]:
@@ -261,57 +402,147 @@ def _parse_http_status(payload: bytes) -> Optional[str]:
         return None
     return None
 
+
 # --- Helpers ---
+
 
 def _read_sec_buffer(data: bytes, offset: int) -> Tuple[int, int, int]:
     # Length (2), Allocated (2), Offset (4)
-    if offset + 8 > len(data): return 0, 0, 0
-    length, alloc, val_offset = struct.unpack("<HHI", data[offset:offset+8])
+    if offset + 8 > len(data):
+        return 0, 0, 0
+    length, alloc, val_offset = struct.unpack("<HHI", data[offset : offset + 8])
     return length, alloc, val_offset
 
+
 def _extract_string(data: bytes, length: int, offset: int, unicode: bool) -> str:
-    if offset + length > len(data): return "Error"
-    raw = data[offset:offset+length]
+    if offset + length > len(data):
+        return "Error"
+    raw = data[offset : offset + length]
     try:
         if unicode:
             return raw.decode("utf-16le")
         else:
             return raw.decode("ascii")
-    except:
+    except UnicodeDecodeError:
         return raw.hex()
+
+
+def _build_netntlm_hash(
+    user: str,
+    domain: str,
+    server_challenge: bytes,
+    lm_resp: bytes,
+    nt_resp: bytes,
+) -> Optional[Dict[str, str]]:
+    """Reconstruct a Hashcat/John-crackable Net-NTLM hash from a captured auth.
+
+    NTLM authentication carries everything needed to crack the account password
+    offline: the server challenge (Type-2) plus the client's NT/LM responses
+    (Type-3). Emitting the hash in the standard tool format lets an IR analyst
+    feed it straight to Hashcat to recover or confirm the password — a core
+    forensic value-add (this is exactly what Responder/Inveigh/ntlmrelayx
+    produce). Returns the hash record, or ``None`` if the inputs are unusable.
+    """
+    if not user or user in ("Unknown", "(Anonymous)") or len(server_challenge) != 8:
+        return None
+    # Hashcat omits a blank domain rather than embedding "Unknown".
+    domain_field = "" if (not domain or domain == "Unknown") else domain
+    chal_hex = server_challenge.hex()
+    if len(nt_resp) > 24:
+        # NetNTLMv2 (hashcat -m 5600):
+        #   user::domain:serverchallenge:NTProofStr:blob
+        nt_proof = nt_resp[:16].hex()
+        blob = nt_resp[16:].hex()
+        return {
+            "username": user,
+            "domain": domain_field,
+            "version": "NTLMv2",
+            "hashcat_mode": "5600",
+            "hash": f"{user}::{domain_field}:{chal_hex}:{nt_proof}:{blob}",
+        }
+    if len(nt_resp) == 24:
+        # NetNTLMv1 (hashcat -m 5500):
+        #   user::domain:LMresponse:NTresponse:serverchallenge
+        if len(lm_resp) != 24:
+            lm_resp = b"\x00" * 24
+        return {
+            "username": user,
+            "domain": domain_field,
+            "version": "NTLMv1",
+            "hashcat_mode": "5500",
+            "hash": f"{user}::{domain_field}:{lm_resp.hex()}:{nt_resp.hex()}:{chal_hex}",
+        }
+    return None
+
 
 # --- Analysis Functions ---
 
+
+@memoize_analysis
 def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
     if TCP is None:
-         return NtlmAnalysis(path, 0.0, 0, 0, Counter(), Counter(), Counter(), Counter(), [], [], ["Scapy unavailable"])
+        return NtlmAnalysis(
+            path,
+            0.0,
+            0,
+            0,
+            Counter(),
+            Counter(),
+            Counter(),
+            Counter(),
+            [],
+            [],
+            ["Scapy unavailable"],
+        )
 
     try:
         reader, status, stream, size_bytes, _file_type = get_reader(
             path, show_status=show_status
         )
     except Exception as exc:
-        return NtlmAnalysis(path, 0.0, 0, 0, Counter(), Counter(), Counter(), Counter(), [], [], [f"Error: {exc}"])
+        return NtlmAnalysis(
+            path,
+            0.0,
+            0,
+            0,
+            Counter(),
+            Counter(),
+            Counter(),
+            Counter(),
+            [],
+            [],
+            [f"Error: {exc}"],
+        )
 
     size_bytes = size_bytes
 
     total_packets = 0
     ntlm_packets = 0
-    
+
     versions = Counter()
     users = Counter()
     domains = Counter()
     workstations = Counter()
-    
+
     sessions: List[NtlmSession] = []
     conversations: Dict[Tuple[str, str, int, int], NtlmConversation] = {}
-    handshake_state: Dict[Tuple[str, str, int, int], Dict[str, Optional[float]]] = defaultdict(lambda: {
-        "negotiate": None,
-        "challenge": None,
-        "authenticate": None,
-    })
+    handshake_state: Dict[Tuple[str, str, int, int], Dict[str, Optional[float]]] = (
+        defaultdict(
+            lambda: {
+                "negotiate": None,
+                "challenge": None,
+                "authenticate": None,
+            }
+        )
+    )
     anomalies: List[NtlmAnomaly] = []
     artifacts: List[NtlmArtifact] = []
+    artifact_seen: Set[Tuple[str, str]] = set()
+    # Server challenge (Type-2) keyed by direction-agnostic connection so the
+    # later Type-3 response on the same TCP flow can be paired to crack-format it.
+    pending_challenges: Dict[Tuple[Tuple[str, int], Tuple[str, int]], bytes] = {}
+    crackable_hashes: List[Dict[str, str]] = []
+    crackable_seen: Set[str] = set()
     errors: List[str] = []
     src_counts = Counter()
     dst_counts = Counter()
@@ -335,29 +566,52 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
 
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", 0))
-            if start_time is None: start_time = ts
+            if start_time is None:
+                start_time = ts
             last_time = ts
-            
-            # Look for NTLM Signature in Raw payload
-            # Can be in TCP or UDP
-            if not pkt.haslayer(Raw): continue
-            
-            payload = bytes(pkt[Raw])
+
+            # Look for the NTLMSSP signature in the L4 payload. Using the TCP/UDP
+            # payload (not just pkt[Raw]) is essential: when NTLM rides a carrier
+            # scapy fully dissects — LDAP/SMB/DCE-RPC binds — the NTLM bytes live
+            # inside that dissected layer and the packet has no Raw layer, so a
+            # Raw-only scan silently drops the Type-2 challenge (and breaks
+            # challenge<->response pairing for hash reconstruction).
+            if pkt.haslayer(TCP):
+                payload = bytes(pkt[TCP].payload)
+            elif pkt.haslayer(UDP):
+                payload = bytes(pkt[UDP].payload)
+            elif pkt.haslayer(Raw):
+                payload = bytes(pkt[Raw])
+            else:
+                continue
+            if not payload:
+                continue
             idx = payload.find(NTLM_SIG)
-            
-            if idx == -1: continue
-            
+
+            if idx == -1:
+                # NTLM-over-HTTP carries the message base64-encoded in an auth
+                # header rather than as raw binary; recover it before giving up.
+                ntlm_data = _extract_http_ntlm(payload)
+                if ntlm_data is None:
+                    continue
+            else:
+                ntlm_data = payload[idx:]
+
             ntlm_packets += 1
-            ntlm_data = payload[idx:]
-            
-            if len(ntlm_data) < 12: continue
-            
+
+            if len(ntlm_data) < 12:
+                continue
+
             # Header
             try:
                 msg_type = struct.unpack("<I", ntlm_data[8:12])[0]
-                
-                src = pkt[0].src if hasattr(pkt[0], 'src') else "0.0.0.0"
-                dst = pkt[0].dst if hasattr(pkt[0], 'dst') else "0.0.0.0"
+
+                # Use the network-layer (IP/IPv6) addresses, not the Ethernet
+                # MACs — hunting/triage needs IPs, and the public-endpoint
+                # exposure check is meaningless against a MAC.
+                src, dst = extract_packet_endpoints(pkt)
+                if not src or not dst:
+                    continue
                 sport = 0
                 dport = 0
                 if pkt.haslayer(TCP):
@@ -365,7 +619,7 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                     dport = pkt[TCP].dport
                 elif pkt.haslayer(UDP):
                     sport = pkt[UDP].sport
-                    dport = pkt[UDP].dport    
+                    dport = pkt[UDP].dport
 
                 src_counts[src] += 1
                 dst_counts[dst] += 1
@@ -389,10 +643,14 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                     convo_key = (src, dst, int(sport), int(dport))
                 convo = conversations.get(convo_key)
                 if convo is None:
-                    convo = NtlmConversation(src_ip=src, dst_ip=dst, src_port=int(sport), dst_port=int(dport))
+                    convo = NtlmConversation(
+                        src_ip=src, dst_ip=dst, src_port=int(sport), dst_port=int(dport)
+                    )
                     conversations[convo_key] = convo
                 convo.packets += 1
-                if convo.first_seen is None or (ts is not None and ts < convo.first_seen):
+                if convo.first_seen is None or (
+                    ts is not None and ts < convo.first_seen
+                ):
                     convo.first_seen = ts
                 if convo.last_seen is None or (ts is not None and ts > convo.last_seen):
                     convo.last_seen = ts
@@ -400,9 +658,10 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                 if msg_type == MSG_TYPE_AUTHENTICATE:
                     # Message Type 3
                     # Sig(8), Type(4), LmResp(8), NtResp(8), Domain(8), User(8), Workstation(8), SessionKey(8), Flags(4)
-                    
-                    if len(ntlm_data) < 64: continue
-                    
+
+                    if len(ntlm_data) < 64:
+                        continue
+
                     # Offsets relative to start of ntlmssp header
                     lm_len, lm_alloc, lm_off = _read_sec_buffer(ntlm_data, 12)
                     nt_len, nt_alloc, nt_off = _read_sec_buffer(ntlm_data, 20)
@@ -411,17 +670,30 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                     ws_len, ws_alloc, ws_off = _read_sec_buffer(ntlm_data, 44)
                     sk_len, sk_alloc, sk_off = _read_sec_buffer(ntlm_data, 52)
                     flags = struct.unpack("<I", ntlm_data[60:64])[0]
-                    
+
                     is_unicode = (flags & NTLMSSP_NEGOTIATE_UNICODE) != 0
-                    
-                    domain = _extract_string(ntlm_data, dom_len, dom_off, is_unicode)
-                    user = _extract_string(ntlm_data, user_len, user_off, is_unicode)
-                    workstation = _extract_string(ntlm_data, ws_len, ws_off, is_unicode)
-                    
-                    users[user] += 1
-                    domains[domain] += 1
-                    workstations[workstation] += 1
-                    
+
+                    domain_raw = _extract_string(
+                        ntlm_data, dom_len, dom_off, is_unicode
+                    )
+                    user_raw = _extract_string(
+                        ntlm_data, user_len, user_off, is_unicode
+                    )
+                    workstation_raw = _extract_string(
+                        ntlm_data, ws_len, ws_off, is_unicode
+                    )
+
+                    domain = _sanitize_ntlm_domain(domain_raw)
+                    user = _sanitize_ntlm_user(user_raw)
+                    workstation = _sanitize_ntlm_workstation(workstation_raw)
+
+                    if user != "Unknown":
+                        users[user] += 1
+                    if domain != "Unknown":
+                        domains[domain] += 1
+                    if workstation != "Unknown":
+                        workstations[workstation] += 1
+
                     # Version Check (Rough heuristic based on response lengths)
                     # NTLMv1: NT Resp is 24 bytes
                     # NTLMv2: NT Resp is > 24 bytes (usually contains HMAC, etc)
@@ -429,69 +701,151 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                     if nt_len == 24:
                         ver = "NTLMv1"
                         versions["NTLMv1"] += 1
-                        anomalies.append(NtlmAnomaly("CRITICAL", "NTLMv1 Auth", f"Legacy NTLMv1 authentication used by {user}", total_packets, src, dst))
+                        user_label = user if user != "Unknown" else "<unknown user>"
+                        anomalies.append(
+                            NtlmAnomaly(
+                                "CRITICAL",
+                                "NTLMv1 Auth",
+                                f"Legacy NTLMv1 authentication used by {user_label}",
+                                total_packets,
+                                src,
+                                dst,
+                            )
+                        )
                     elif nt_len > 24:
                         ver = "NTLMv2"
                         versions["NTLMv2"] += 1
-                        
+
+                    # Reconstruct the crackable Net-NTLM hash by pairing this
+                    # response with the server challenge seen on the same flow.
+                    conn_key = tuple(sorted(((src, int(sport)), (dst, int(dport)))))
+                    server_challenge = pending_challenges.get(conn_key)
+                    if server_challenge and nt_len >= 24:
+                        lm_resp = ntlm_data[lm_off : lm_off + lm_len]
+                        nt_resp = ntlm_data[nt_off : nt_off + nt_len]
+                        record = _build_netntlm_hash(
+                            user, domain, server_challenge, lm_resp, nt_resp
+                        )
+                        if record and record["hash"] not in crackable_seen:
+                            crackable_seen.add(record["hash"])
+                            record["src_ip"] = src
+                            record["dst_ip"] = dst
+                            crackable_hashes.append(record)
+
                     # Check for Null Session / Anonymous
                     if flags & NTLMSSP_NEGOTIATE_ANONYMOUS:
-                        anomalies.append(NtlmAnomaly("HIGH", "Anonymous NTLM", "Anonymous/Null session attempted", total_packets, src, dst))
+                        anomalies.append(
+                            NtlmAnomaly(
+                                "HIGH",
+                                "Anonymous NTLM",
+                                "Anonymous/Null session attempted",
+                                total_packets,
+                                src,
+                                dst,
+                            )
+                        )
                         user = "(Anonymous)"
-                        
-                    sessions.append(NtlmSession(
-                        src_ip=src, dst_ip=dst, src_port=sport, dst_port=dport,
-                        username=user, domain=domain, workstation=workstation, 
-                        version=ver, message_type="Authenticate", ts=ts
-                    ))
+
+                    sessions.append(
+                        NtlmSession(
+                            src_ip=src,
+                            dst_ip=dst,
+                            src_port=sport,
+                            dst_port=dport,
+                            username=user,
+                            domain=domain,
+                            workstation=workstation,
+                            version=ver,
+                            message_type="Authenticate",
+                            ts=ts,
+                        )
+                    )
 
                     request_counts["Authenticate"] += 1
                     convo.requests += 1
                     convo.messages["Authenticate"] += 1
                     handshake_state[convo_key]["authenticate"] = ts
-                    if handshake_state[convo_key]["negotiate"] or handshake_state[convo_key]["challenge"]:
-                        artifacts.append(NtlmArtifact(
+                    if (
+                        handshake_state[convo_key]["negotiate"]
+                        or handshake_state[convo_key]["challenge"]
+                    ):
+                        _append_ntlm_artifact(
+                            artifacts,
+                            artifact_seen,
                             value=f"{src}->{dst}",
-                            description="NTLM handshake completed (Type1/2/3)"
-                        ))
-                    status_code = _parse_smb2_status(payload) or _parse_smb1_status(payload) or _parse_http_status(payload)
+                            description="NTLM handshake completed (Type1/2/3)",
+                        )
+                    status_code = (
+                        _parse_smb2_status(payload)
+                        or _parse_smb1_status(payload)
+                        or _parse_http_status(payload)
+                    )
                     if status_code:
                         status_codes[status_code] += 1
-                    
+
                 elif msg_type == MSG_TYPE_CHALLENGE:
-                     # Message Type 2 (Server Challenge)
-                     response_counts["Challenge"] += 1
-                     convo.responses += 1
-                     convo.messages["Challenge"] += 1
-                     handshake_state[convo_key]["challenge"] = ts
-                     if len(ntlm_data) >= 32:
-                         target_name_len = struct.unpack("<H", ntlm_data[12:14])[0]
-                         target_name_off = struct.unpack("<I", ntlm_data[16:20])[0]
-                         if target_name_len and target_name_off + target_name_len <= len(ntlm_data):
-                             target_name = ntlm_data[target_name_off:target_name_off + target_name_len].decode("utf-16le", errors="ignore")
-                             artifacts.append(NtlmArtifact(value=target_name, description="NTLM Target Name"))
-                     if len(ntlm_data) >= 20:
-                         flags = struct.unpack("<I", ntlm_data[20:24])[0]
-                         if flags & NTLMSSP_NEGOTIATE_NTLM:
-                             versions["NTLMv1"] += 1
-                         if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                             artifacts.append(NtlmArtifact(value="Extended Session Security", description="NTLM Challenge Flag"))
-                     status_code = _parse_smb2_status(payload) or _parse_smb1_status(payload) or _parse_http_status(payload)
-                     if status_code:
-                         status_codes[status_code] += 1
-                     
+                    # Message Type 2 (Server Challenge)
+                    response_counts["Challenge"] += 1
+                    convo.responses += 1
+                    convo.messages["Challenge"] += 1
+                    handshake_state[convo_key]["challenge"] = ts
+                    if len(ntlm_data) >= 32:
+                        # Server challenge is the 8 bytes at offset 24; stash it
+                        # against this flow so the matching Type-3 can be cracked.
+                        conn_key = tuple(
+                            sorted(((src, int(sport)), (dst, int(dport))))
+                        )
+                        pending_challenges[conn_key] = ntlm_data[24:32]
+                        target_name_len = struct.unpack("<H", ntlm_data[12:14])[0]
+                        target_name_off = struct.unpack("<I", ntlm_data[16:20])[0]
+                        if target_name_len and target_name_off + target_name_len <= len(
+                            ntlm_data
+                        ):
+                            target_name = ntlm_data[
+                                target_name_off : target_name_off + target_name_len
+                            ].decode("utf-16le", errors="ignore")
+                            _append_ntlm_artifact(
+                                artifacts,
+                                artifact_seen,
+                                value=target_name,
+                                description="NTLM Target Name",
+                            )
+                    if len(ntlm_data) >= 20:
+                        flags = struct.unpack("<I", ntlm_data[20:24])[0]
+                        if flags & NTLMSSP_NEGOTIATE_NTLM:
+                            versions["NTLMv1"] += 1
+                        if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+                            _append_ntlm_artifact(
+                                artifacts,
+                                artifact_seen,
+                                value="Extended Session Security",
+                                description="NTLM Challenge Flag",
+                            )
+                    status_code = (
+                        _parse_smb2_status(payload)
+                        or _parse_smb1_status(payload)
+                        or _parse_http_status(payload)
+                    )
+                    if status_code:
+                        status_codes[status_code] += 1
+
                 elif msg_type == MSG_TYPE_NEGOTIATE:
-                     # Message Type 1
-                     request_counts["Negotiate"] += 1
-                     convo.requests += 1
-                     convo.messages["Negotiate"] += 1
-                     handshake_state[convo_key]["negotiate"] = ts
-                     if len(ntlm_data) >= 16:
-                         flags = struct.unpack("<I", ntlm_data[12:16])[0]
-                         if flags & NTLMSSP_NEGOTIATE_NTLM:
-                             versions["NTLMv1"] += 1
-                         if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
-                             artifacts.append(NtlmArtifact(value="Extended Session Security", description="NTLM Negotiate Flag"))
+                    # Message Type 1
+                    request_counts["Negotiate"] += 1
+                    convo.requests += 1
+                    convo.messages["Negotiate"] += 1
+                    handshake_state[convo_key]["negotiate"] = ts
+                    if len(ntlm_data) >= 16:
+                        flags = struct.unpack("<I", ntlm_data[12:16])[0]
+                        if flags & NTLMSSP_NEGOTIATE_NTLM:
+                            versions["NTLMv1"] += 1
+                        if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
+                            _append_ntlm_artifact(
+                                artifacts,
+                                artifact_seen,
+                                value="Extended Session Security",
+                                description="NTLM Negotiate Flag",
+                            )
 
             except Exception:
                 pass
@@ -501,10 +855,153 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
     finally:
         status.finish()
         reader.close()
-    
+
     duration = 0.0
     if start_time and last_time:
         duration = last_time - start_time
+
+    deterministic_checks: Dict[str, List[str]] = {
+        "ntlmv1_legacy_authentication": [],
+        "anonymous_or_null_session_attempts": [],
+        "auth_failure_burst": [],
+        "credential_reuse_spread": [],
+        "cross_service_ntlm_usage": [],
+        "public_endpoint_ntlm_activity": [],
+        "incomplete_handshake_patterns": [],
+        "high_volume_ntlm_source": [],
+    }
+    threat_hypotheses: List[Dict[str, object]] = []
+    benign_context: List[str] = []
+
+    ntlmv1_count = int(versions.get("NTLMv1", 0))
+    if ntlmv1_count > 0:
+        deterministic_checks["ntlmv1_legacy_authentication"].append(
+            f"Legacy NTLMv1 authentication observed count={ntlmv1_count}"
+        )
+    anon_count = sum(
+        1 for s in sessions if str(getattr(s, "username", "") or "") == "(Anonymous)"
+    )
+    if anon_count > 0:
+        deterministic_checks["anonymous_or_null_session_attempts"].append(
+            f"Anonymous/null NTLM session attempts observed count={anon_count}"
+        )
+
+    failure_tokens = (
+        "LOGON_FAILURE",
+        "WRONG_PASSWORD",
+        "ACCOUNT_LOCKED_OUT",
+        "ACCESS_DENIED",
+        "NETWORK_ACCESS_DENIED",
+        "INVALID_WORKSTATION",
+        "PASSWORD_EXPIRED",
+        "ACCOUNT_DISABLED",
+    )
+    failure_count = 0
+    for name, count in status_codes.items():
+        upper_name = str(name).upper()
+        if any(token in upper_name for token in failure_tokens):
+            failure_count += int(count)
+    if failure_count > 0:
+        deterministic_checks["auth_failure_burst"].append(
+            f"NTLM authentication failures observed count={failure_count}"
+        )
+
+    by_user_srcs: Dict[str, set[str]] = defaultdict(set)
+    by_user_dsts: Dict[str, set[str]] = defaultdict(set)
+    for s in sessions:
+        user = str(getattr(s, "username", "") or "").strip()
+        if not user or user in {"Unknown", "(Anonymous)"}:
+            continue
+        key = f"{str(getattr(s, 'domain', '') or 'UNKNOWN')}\\{user}".upper()
+        by_user_srcs[key].add(str(getattr(s, "src_ip", "") or ""))
+        by_user_dsts[key].add(str(getattr(s, "dst_ip", "") or ""))
+    for user_key, src_set in by_user_srcs.items():
+        dst_set = by_user_dsts.get(user_key, set())
+        if len(src_set) >= 2 or len(dst_set) >= 3:
+            deterministic_checks["credential_reuse_spread"].append(
+                f"Credential reuse spread user={user_key} src_hosts={len(src_set)} dst_hosts={len(dst_set)}"
+            )
+
+    active_services = [name for name, count in services.items() if int(count) > 0]
+    if len(active_services) >= 2:
+        deterministic_checks["cross_service_ntlm_usage"].append(
+            f"NTLM observed across multiple services ({', '.join(sorted(active_services))})"
+        )
+
+    public_pairs = 0
+    for ip, count in dst_counts.items():
+        if _is_public_ip(ip):
+            public_pairs += int(count)
+            deterministic_checks["public_endpoint_ntlm_activity"].append(
+                f"NTLM traffic to public destination {ip} count={int(count)}"
+            )
+    for ip, count in src_counts.items():
+        if _is_public_ip(ip):
+            deterministic_checks["public_endpoint_ntlm_activity"].append(
+                f"NTLM traffic from public source {ip} count={int(count)}"
+            )
+
+    incomplete_count = 0
+    for _key, hs in handshake_state.items():
+        has_negotiate = hs.get("negotiate") is not None
+        has_challenge = hs.get("challenge") is not None
+        has_authenticate = hs.get("authenticate") is not None
+        if (has_negotiate or has_challenge) and not has_authenticate:
+            incomplete_count += 1
+    if incomplete_count > 0:
+        deterministic_checks["incomplete_handshake_patterns"].append(
+            f"NTLM handshake sequences without authenticate observed count={incomplete_count}"
+        )
+
+    for src, count in src_counts.most_common(10):
+        if int(count) >= 20:
+            deterministic_checks["high_volume_ntlm_source"].append(
+                f"High-volume NTLM source {src} events={int(count)}"
+            )
+
+    if (
+        deterministic_checks["ntlmv1_legacy_authentication"]
+        and deterministic_checks["auth_failure_burst"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Legacy NTLMv1 plus auth failures suggests downgrade-compatible credential attacks",
+                "confidence": "high",
+                "evidence": len(deterministic_checks["ntlmv1_legacy_authentication"])
+                + len(deterministic_checks["auth_failure_burst"]),
+            }
+        )
+    if (
+        deterministic_checks["credential_reuse_spread"]
+        and deterministic_checks["cross_service_ntlm_usage"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Credential reuse across hosts/services suggests relay or lateral movement with shared identities",
+                "confidence": "high",
+                "evidence": len(deterministic_checks["credential_reuse_spread"])
+                + len(deterministic_checks["cross_service_ntlm_usage"]),
+            }
+        )
+    if deterministic_checks["public_endpoint_ntlm_activity"]:
+        threat_hypotheses.append(
+            {
+                "hypothesis": "NTLM observed with public endpoints may indicate exposure, relay, or upstream proxy misuse",
+                "confidence": "medium",
+                "evidence": len(deterministic_checks["public_endpoint_ntlm_activity"]),
+            }
+        )
+
+    if not deterministic_checks["auth_failure_burst"]:
+        benign_context.append("No strong NTLM authentication-failure burst observed")
+    if not deterministic_checks["credential_reuse_spread"]:
+        benign_context.append(
+            "No clear credential reuse spread across multiple source hosts"
+        )
+    if not deterministic_checks["public_endpoint_ntlm_activity"]:
+        benign_context.append(
+            "No NTLM activity involving public Internet endpoints observed"
+        )
 
     return NtlmAnalysis(
         path=path,
@@ -525,5 +1022,9 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
         services=services,
         artifacts=artifacts,
         anomalies=anomalies,
-        errors=errors
+        deterministic_checks={k: v[:60] for k, v in deterministic_checks.items()},
+        threat_hypotheses=threat_hypotheses[:20],
+        benign_context=benign_context[:20],
+        crackable_hashes=crackable_hashes,
+        errors=errors,
     )

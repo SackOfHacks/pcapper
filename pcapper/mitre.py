@@ -1,23 +1,69 @@
 from __future__ import annotations
 
+import ipaddress
+import json
+import os
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-import re
 
 from .ioc import analyze_iocs
 from .threats import analyze_threats
-
 
 _TECHNIQUE_ID_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b", re.IGNORECASE)
 _TACTIC_ID_RE = re.compile(r"\bTA\d{4}\b", re.IGNORECASE)
 _IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _PACKET_RE = re.compile(r"\b(?:pkt|packet)\s*[=:]\s*(\d+)\b", re.IGNORECASE)
 
-ATTACK_ENTERPRISE_VERSION = "ATT&CK Enterprise v15.1"
-ATTACK_ICS_VERSION = "ATT&CK ICS v15.1"
-MAPPING_PACK_VERSION = "pcapper-mitre-ruleset-1.0"
+_DEFAULT_ATTACK_ENTERPRISE_VERSION = "ATT&CK Enterprise v15.1"
+_DEFAULT_ATTACK_ICS_VERSION = "ATT&CK ICS v15.1"
+_DEFAULT_MAPPING_PACK_VERSION = "pcapper-mitre-ruleset-1.1"
+
+
+def _load_mapping_metadata() -> tuple[str, str, str, Optional[str]]:
+    metadata_file = os.getenv("PCAPPER_MITRE_METADATA_FILE", "").strip()
+    if not metadata_file:
+        return (
+            _DEFAULT_ATTACK_ENTERPRISE_VERSION,
+            _DEFAULT_ATTACK_ICS_VERSION,
+            _DEFAULT_MAPPING_PACK_VERSION,
+            None,
+        )
+    try:
+        with Path(metadata_file).expanduser().open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("metadata root is not an object")
+        enterprise = str(
+            data.get("attack_enterprise_version", _DEFAULT_ATTACK_ENTERPRISE_VERSION)
+            or _DEFAULT_ATTACK_ENTERPRISE_VERSION
+        )
+        ics = str(
+            data.get("attack_ics_version", _DEFAULT_ATTACK_ICS_VERSION)
+            or _DEFAULT_ATTACK_ICS_VERSION
+        )
+        pack = str(
+            data.get("mapping_pack_version", _DEFAULT_MAPPING_PACK_VERSION)
+            or _DEFAULT_MAPPING_PACK_VERSION
+        )
+        return enterprise, ics, pack, None
+    except Exception as exc:
+        return (
+            _DEFAULT_ATTACK_ENTERPRISE_VERSION,
+            _DEFAULT_ATTACK_ICS_VERSION,
+            _DEFAULT_MAPPING_PACK_VERSION,
+            f"MITRE mapping metadata unavailable: {type(exc).__name__}: {exc}",
+        )
+
+
+(
+    ATTACK_ENTERPRISE_VERSION,
+    ATTACK_ICS_VERSION,
+    MAPPING_PACK_VERSION,
+    _MAPPING_METADATA_ERROR,
+) = _load_mapping_metadata()
 
 _ENTERPRISE_TACTIC_ORDER: dict[str, int] = {
     "Reconnaissance": 1,
@@ -102,7 +148,6 @@ class MitreSummary:
     host_attack_paths: dict[str, list[str]] = field(default_factory=dict)
     host_roles: dict[str, list[str]] = field(default_factory=dict)
     technique_heat: list[dict[str, object]] = field(default_factory=list)
-    investigation_pivots: list[dict[str, object]] = field(default_factory=list)
     checks: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -114,23 +159,293 @@ class _TechniqueRule:
     technique: str
     technique_id: str
     keywords: tuple[str, ...]
+    context: tuple[str, ...] = ()
+    excluded: tuple[str, ...] = ()
+    min_keyword_hits: int = 1
+    min_score: int = 2
 
 
 _RULES: tuple[_TechniqueRule, ...] = (
-    _TechniqueRule("enterprise", "Reconnaissance", "TA0043", "Active Scanning", "T1595", ("scan", "probing", "recon", "enumeration", "sweep")),
-    _TechniqueRule("enterprise", "Credential Access", "TA0006", "Brute Force", "T1110", ("brute", "password", "credential", "auth failure", "login fail")),
-    _TechniqueRule("enterprise", "Execution", "TA0002", "PowerShell", "T1059.001", ("powershell", "encodedcommand", "-enc", "invoke-webrequest")),
-    _TechniqueRule("enterprise", "Execution", "TA0002", "Windows Management Instrumentation", "T1047", ("wmic", "wmi", "process call create")),
-    _TechniqueRule("enterprise", "Lateral Movement", "TA0008", "Remote Services", "T1021", ("smb", "rdp", "winrm", "ssh", "lateral movement")),
-    _TechniqueRule("enterprise", "Command and Control", "TA0011", "Application Layer Protocol", "T1071", ("beacon", "c2", "command and control", "dns", "http", "https", "quic")),
-    _TechniqueRule("enterprise", "Exfiltration", "TA0010", "Exfiltration Over Alternative Protocol", "T1048", ("exfil", "dns tunneling", "txt-query", "outbound transfer")),
-    _TechniqueRule("enterprise", "Discovery", "TA0007", "Network Service Discovery", "T1046", ("service discovery", "banner", "fingerprint", "open ports")),
-    _TechniqueRule("enterprise", "Resource Development", "TA0042", "Stage Capabilities", "T1587", ("tooling", "malware", "payload", "artifact")),
-    _TechniqueRule("ics", "Discovery", "TA0102", "Network Service Discovery", "T0846", ("ot reconnaissance", "discovery", "enip session", "identity request")),
-    _TechniqueRule("ics", "Lateral Movement", "TA0109", "Remote Services", "T0866", ("engineering workstation", "remote services", "ot protocol traffic")),
-    _TechniqueRule("ics", "Command and Control", "TA0108", "Standard Application Layer Protocol", "T0885", ("modbus", "dnp3", "iec-104", "s7", "opc", "bacnet", "cip", "enip", "mms", "profinet")),
-    _TechniqueRule("ics", "Impair Process Control", "TA0106", "Unauthorized Command Message", "T0855", ("high-risk ot commands", "control/program operations", "write", "operate", "trip", "setpoint")),
-    _TechniqueRule("ics", "Inhibit Response Function", "TA0107", "Denial of Control", "T0813", ("safety plc", "sis", "flood", "impact", "dos", "server error response surge")),
+    _TechniqueRule(
+        "enterprise",
+        "Reconnaissance",
+        "TA0043",
+        "Active Scanning",
+        "T1595",
+        ("scan", "probing", "sweep", "enumeration"),
+        ("ports", "services", "targets"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Credential Access",
+        "TA0006",
+        "Brute Force",
+        "T1110",
+        ("brute", "auth failure", "login fail", "password"),
+        ("attempts", "credential"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Execution",
+        "TA0002",
+        "PowerShell",
+        "T1059.001",
+        ("powershell", "encodedcommand", "-enc", "invoke-webrequest"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Execution",
+        "TA0002",
+        "Windows Management Instrumentation",
+        "T1047",
+        ("wmic", "process call create"),
+        ("wmi",),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Lateral Movement",
+        "TA0008",
+        "Remote Services",
+        "T1021",
+        ("lateral movement", "winrm", "rdp", "smb", "ssh"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Command and Control",
+        "TA0011",
+        "Application Layer Protocol",
+        "T1071",
+        ("beacon", "c2", "command and control"),
+        ("dns", "http", "https", "quic"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Exfiltration",
+        "TA0010",
+        "Exfiltration Over Alternative Protocol",
+        "T1048",
+        ("exfil", "dns tunneling", "outbound transfer"),
+        ("txt-query", "public_destinations"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Discovery",
+        "TA0007",
+        "Network Service Discovery",
+        "T1046",
+        (
+            "service discovery",
+            "open ports",
+            "banner",
+            "fingerprint",
+            "nbns scan",
+            "nbns name scanning",
+            "netbios probe",
+            "probe sweep",
+            "nbstat",
+        ),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Discovery",
+        "TA0007",
+        "Account Discovery",
+        "T1087",
+        (
+            "netlogon enumeration",
+            "netlogon",
+            "logon mailslot",
+            "sam_logon",
+            "user enumeration",
+            "account enumeration",
+        ),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Credential Access",
+        "TA0006",
+        "Adversary-in-the-Middle",
+        "T1557",
+        (
+            "arp spoof",
+            "arp poison",
+            "poisoning",
+            "address impersonation",
+            "mitm",
+            # NBT-NS/LLMNR poisoning + browser takeover = T1557.001.
+            "nbns spoofing",
+            "nbns poison",
+            "name conflict",
+            "rogue master browser",
+            "master browser",
+            "browser election",
+            "role conflict",
+            "role spoofing",
+            "browser reset",
+            "nbt-ns",
+        ),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Credential Access",
+        "TA0006",
+        "OS Credential Dumping",
+        "T1003",
+        ("mimikatz", "sekurlsa", "lsass", "credential dump"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Impact",
+        "TA0040",
+        "Network Denial of Service",
+        "T1498",
+        ("syn flood", "udp flood", "denial of service", "flood"),
+        excluded=("server error",),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Command and Control",
+        "TA0011",
+        "Protocol Tunneling",
+        "T1572",
+        ("protocol tunneling", "tunnel", "vpn tunnel"),
+        ("dns", "icmp", "covert"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "enterprise",
+        "Command and Control",
+        "TA0011",
+        "Ingress Tool Transfer",
+        "T1105",
+        ("malicious file", "file download", "suspicious file", "malware", "payload"),
+        ("artifact", "executable", "download"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "ics",
+        "Discovery",
+        "TA0102",
+        "Remote System Discovery",
+        "T0846",
+        ("ot reconnaissance", "enip session", "identity request", "plc", "scada"),
+        ("discovery",),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "ics",
+        "Lateral Movement",
+        "TA0109",
+        "Exploitation of Remote Services",
+        "T0866",
+        ("engineering workstation", "ot protocol traffic"),
+        ("remote services",),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "ics",
+        "Command and Control",
+        "TA0101",
+        "Standard Application Layer Protocol",
+        "T0869",
+        (
+            "modbus",
+            "dnp3",
+            "iec-104",
+            "s7",
+            "opc",
+            "bacnet",
+            "cip",
+            "enip",
+            "ethernet/ip",
+            "mms",
+            "profinet",
+            "goose",
+        ),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "ics",
+        "Impair Process Control",
+        "TA0106",
+        "Unauthorized Command Message",
+        "T0855",
+        ("high-risk ot commands", "control/program operations", "setpoint", "trip"),
+        ("write", "operate"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "ics",
+        "Impair Process Control",
+        "TA0106",
+        "Program Download",
+        "T0843",
+        ("program download", "firmware", "logic download", "engineering command"),
+        ("program", "download"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "ics",
+        "Inhibit Response Function",
+        "TA0107",
+        "Device Restart/Shutdown",
+        "T0816",
+        ("plc stop", "device restart", "shutdown", "change program state", "cpu stop"),
+        ("stop", "restart", "reset"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "ics",
+        "Inhibit Response Function",
+        "TA0107",
+        "Denial of Service",
+        "T0814",
+        ("safety plc", "sis", "server error response surge"),
+        ("flood", "impact", "dos"),
+        min_score=3,
+    ),
+)
+
+
+# Crown-jewel ICS techniques (Industroyer/FrostyGoop/Stuxnet-grade process and
+# safety impact). Mapping a low-severity, generic "OT control activity" warning
+# to these over-claims, so they require a high/critical source detection — a
+# real unauthorized command / program download / device stop is emitted at
+# high/critical by the OT analyzers, not as a 2-command warning.
+_HIGH_SEVERITY_REQUIRED_TECHNIQUES: frozenset[str] = frozenset(
+    {"T0855", "T0843", "T0816", "T0814", "T0857", "T0889"}
+)
+
+
+_ICS_STRONG_TOKENS: tuple[str, ...] = (
+    "ics",
+    "scada",
+    "plc",
+    "modbus",
+    "dnp3",
+    "iec-104",
+    "s7",
+    "opc",
+    "bacnet",
+    "cip",
+    "enip",
+    "ethernet/ip",
+    "profinet",
+    "mms",
+    "goose",
+    "sv",
 )
 
 
@@ -140,26 +455,46 @@ def _extract_explicit_ids(text: str) -> tuple[list[str], list[str]]:
     return tactic_ids, technique_ids
 
 
-def _rule_from_text(blob: str) -> _TechniqueRule | None:
+def _contains_token(blob: str, token: str) -> bool:
+    if not token:
+        return False
+    escaped = re.escape(token)
+    pattern = rf"(?<![a-z0-9]){escaped}(?![a-z0-9])"
+    return re.search(pattern, blob, re.IGNORECASE) is not None
+
+
+def _rule_from_text(blob: str) -> tuple[_TechniqueRule | None, int]:
     best: tuple[int, _TechniqueRule] | None = None
     for rule in _RULES:
-        score = sum(1 for token in rule.keywords if token in blob)
-        if score <= 0:
+        if any(_contains_token(blob, token) for token in rule.excluded):
+            continue
+        keyword_hits = sum(1 for token in rule.keywords if _contains_token(blob, token))
+        context_hits = sum(1 for token in rule.context if _contains_token(blob, token))
+        if keyword_hits < rule.min_keyword_hits:
+            continue
+        score = (keyword_hits * 3) + context_hits
+        if score < rule.min_score:
             continue
         if best is None or score > best[0]:
             best = (score, rule)
-    return best[1] if best else None
+    if best is None:
+        return None, 0
+    return best[1], best[0]
 
 
 def _matched_keywords(rule: _TechniqueRule | None, blob: str) -> list[str]:
     if rule is None:
         return []
-    found = [token for token in rule.keywords if token in blob]
+    found = [
+        token
+        for token in (rule.keywords + rule.context)
+        if _contains_token(blob, token)
+    ]
     return sorted(set(found))
 
 
 def _infer_framework(blob: str) -> str:
-    if any(token in blob for token in ("ot", "ics", "modbus", "dnp3", "iec-104", "s7", "enip", "cip", "opc", "bacnet", "profinet", "mms")):
+    if any(_contains_token(blob, token) for token in _ICS_STRONG_TOKENS):
         return "ics"
     return "enterprise"
 
@@ -169,8 +504,58 @@ def _normalize_confidence(value: object) -> str:
     if text in {"high", "medium", "low"}:
         return text
     if text in {"critical", "warning", "warn", "info"}:
-        return "high" if text == "critical" else ("medium" if text in {"warning", "warn"} else "low")
-    return "medium"
+        return (
+            "high"
+            if text == "critical"
+            else ("medium" if text in {"warning", "warn"} else "low")
+        )
+    return "low"
+
+
+def _parse_ip(value: str) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return str(ipaddress.ip_address(text))
+    except Exception:
+        return None
+
+
+# File extensions and other suffixes that look domain-shaped in free text
+# (e.g. "forum.php", "beacon.dll") but are not network IOCs.
+_NON_DOMAIN_TLDS = {
+    "php", "html", "htm", "asp", "aspx", "jsp", "js", "css", "json", "xml",
+    "exe", "dll", "sys", "scr", "bat", "ps1", "vbs", "bin", "dat", "tmp",
+    "zip", "rar", "7z", "gz", "tar", "docm", "xlsm", "csv", "pcap", "log",
+    "py", "sh", "txt", "png", "jpg", "gif", "local", "arpa", "lan",
+}
+
+
+def _looks_like_domain(value: str) -> bool:
+    text = str(value or "").strip().lower().rstrip(".")
+    if not text or len(text) > 253:
+        return False
+    # Reject bare ATT&CK identifiers (T1234, TA0001, T1059.001) that appear in
+    # the mapped text, without discarding real domains that happen to start
+    # with 't' (teamviewer.com, twitter.com, target.com, ...).
+    if re.fullmatch(r"ta?\d{3,4}(?:\.\d{3})?", text):
+        return False
+    labels = [part for part in text.split(".") if part]
+    if len(labels) < 2:
+        return False
+    if not all(re.fullmatch(r"[a-z0-9-]{1,63}", part) for part in labels):
+        return False
+    if any(part.startswith("-") or part.endswith("-") for part in labels):
+        return False
+    tld = labels[-1]
+    if not any(ch.isalpha() for ch in tld):
+        return False
+    # A real TLD is at least two characters and alphabetic; reject file
+    # extensions and known non-routable suffixes.
+    if tld in _NON_DOMAIN_TLDS or not re.fullmatch(r"[a-z]{2,}", tld):
+        return False
+    return True
 
 
 def _extract_evidence(item: dict[str, object]) -> list[str]:
@@ -189,12 +574,13 @@ def _extract_iocs(evidence: list[str]) -> list[str]:
     iocs: set[str] = set()
     for entry in evidence:
         for token in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", entry):
-            iocs.add(token)
+            parsed = _parse_ip(token)
+            if parsed:
+                iocs.add(parsed)
         for token in re.findall(r"\b[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b", entry):
             lowered = token.lower()
-            if lowered.startswith("ta") or lowered.startswith("t"):
-                continue
-            iocs.add(lowered)
+            if _looks_like_domain(lowered):
+                iocs.add(lowered)
         for token in re.findall(r"\b[0-9a-fA-F]{32,64}\b", entry):
             iocs.add(token.lower())
     return sorted(iocs)
@@ -203,7 +589,11 @@ def _extract_iocs(evidence: list[str]) -> list[str]:
 def _extract_artifacts(summary_text: str, details: str) -> list[str]:
     artifacts: set[str] = set()
     blob = f"{summary_text} {details}"
-    for match in re.findall(r"\b[\w.-]+\.(?:exe|dll|ps1|bat|zip|7z|rar|docm|xlsm|csv|bin|pcap)\b", blob, re.IGNORECASE):
+    for match in re.findall(
+        r"\b[\w.-]+\.(?:exe|dll|ps1|bat|zip|7z|rar|docm|xlsm|csv|bin|pcap)\b",
+        blob,
+        re.IGNORECASE,
+    ):
         artifacts.add(match)
     return sorted(artifacts)
 
@@ -211,16 +601,79 @@ def _extract_artifacts(summary_text: str, details: str) -> list[str]:
 def _extract_hosts_from_text(text: str) -> set[str]:
     hosts: set[str] = set()
     for ip_token in _IP_RE.findall(text):
-        hosts.add(ip_token)
+        parsed = _parse_ip(ip_token)
+        if parsed:
+            hosts.add(parsed)
     for token in re.findall(r"\b[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b", text):
         lowered = token.lower()
-        if lowered.startswith("ta") or lowered.startswith("t"):
-            continue
-        hosts.add(lowered)
+        if _looks_like_domain(lowered):
+            hosts.add(lowered)
     return hosts
 
 
-def _collect_provenance(item: dict[str, object], evidence: list[str]) -> tuple[list[str], list[str], list[str]]:
+def _extract_detection_times(
+    item: dict[str, object],
+    fallback_first: Optional[float],
+    fallback_last: Optional[float],
+) -> tuple[Optional[float], Optional[float]]:
+    hit_first = item.get("first_seen")
+    hit_last = item.get("last_seen")
+    ts = item.get("ts")
+    time_val = item.get("time")
+
+    parsed_first = None
+    parsed_last = None
+    for value in (hit_first, ts, time_val):
+        parsed = None
+        try:
+            parsed = float(value) if value is not None else None
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            parsed_first = parsed
+            break
+    for value in (hit_last, ts, time_val):
+        parsed = None
+        try:
+            parsed = float(value) if value is not None else None
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            parsed_last = parsed
+            break
+
+    if parsed_first is None:
+        parsed_first = fallback_first
+    if parsed_last is None:
+        parsed_last = fallback_last
+    return parsed_first, parsed_last
+
+
+def _mapping_gate(
+    rule: _TechniqueRule | None,
+    rule_score: int,
+    tactic_ids: list[str],
+    technique_ids: list[str],
+    evidence: list[str],
+    matched_keywords: list[str],
+    confidence: str,
+) -> tuple[bool, str]:
+    if tactic_ids or technique_ids:
+        return True, "explicit ATT&CK ID present"
+    if rule is None:
+        return False, "no matching ATT&CK rule"
+    if rule_score < rule.min_score:
+        return False, f"rule score below threshold ({rule_score}<{rule.min_score})"
+    if len(matched_keywords) < max(1, rule.min_keyword_hits):
+        return False, "insufficient keyword evidence"
+    if not evidence and confidence == "low":
+        return False, "low confidence without evidence"
+    return True, "keyword/context threshold satisfied"
+
+
+def _collect_provenance(
+    item: dict[str, object], evidence: list[str]
+) -> tuple[list[str], list[str], list[str]]:
     packet_refs: set[str] = set()
     flow_refs: set[str] = set()
     host_refs: set[str] = set()
@@ -252,7 +705,9 @@ def _collect_provenance(item: dict[str, object], evidence: list[str]) -> tuple[l
         dst_val = dst_match.group(1) if dst_match else ""
         proto_val = proto_match.group(1).upper() if proto_match else ""
         if src_val and dst_val:
-            flow_refs.add(f"{src_val}->{dst_val}" + (f" {proto_val}" if proto_val else ""))
+            flow_refs.add(
+                f"{src_val}->{dst_val}" + (f" {proto_val}" if proto_val else "")
+            )
 
     return sorted(packet_refs), sorted(flow_refs), sorted(host_refs)
 
@@ -270,7 +725,7 @@ def _host_role_from_hit(hit: MitreHit) -> str:
     if tactic in {"Credential Access"}:
         return "credential"
     if tactic in {"Lateral Movement"}:
-        return "pivot"
+        return "lateral"
     if tactic in {"Command and Control"}:
         return "c2"
     if tactic in {"Exfiltration"}:
@@ -296,6 +751,21 @@ def _confidence_text(rank: int) -> str:
     return "low"
 
 
+# Tactics that represent post-compromise / objective-stage adversary behavior.
+# Their presence matters far more for an intrusion verdict than how many raw
+# detections happened to map (the prior "mapping coverage %" rewarded noisy
+# captures and under-called a single decisive C2/Impact finding).
+_HIGH_IMPACT_TACTICS = {
+    "Lateral Movement",
+    "Command and Control",
+    "Exfiltration",
+    "Impact",
+    "Impair Process Control",
+    "Inhibit Response Function",
+}
+_OT_IMPACT_TACTICS = {"Impair Process Control", "Inhibit Response Function", "Impact"}
+
+
 def _executive_assessment(
     total_detections: int,
     hits: list[MitreHit],
@@ -304,13 +774,34 @@ def _executive_assessment(
     reasons: list[str] = []
     score = 0
 
-    mapped_ratio = (len(hits) / max(total_detections, 1))
-    if mapped_ratio >= 0.6:
+    if not hits:
+        return (
+            "NO MAPPED TTPs",
+            "low",
+            ["No detections mapped to ATT&CK techniques in this capture"],
+        )
+
+    distinct_tactics = {hit.tactic for hit in hits}
+    high_impact = distinct_tactics & _HIGH_IMPACT_TACTICS
+    ot_impact = distinct_tactics & _OT_IMPACT_TACTICS
+
+    # Objective-stage tactics are the strongest intrusion signal.
+    if len(high_impact) >= 2:
+        score += 3
+        reasons.append(
+            f"Multiple objective-stage tactics: {', '.join(sorted(high_impact))}"
+        )
+    elif high_impact:
         score += 2
-        reasons.append(f"High ATT&CK mapping coverage ({mapped_ratio * 100.0:.1f}%)")
-    elif mapped_ratio >= 0.3:
+        reasons.append(f"Objective-stage tactic present: {', '.join(high_impact)}")
+
+    # Kill-chain breadth (distinct tactics observed) indicates progression.
+    if len(distinct_tactics) >= 4:
+        score += 2
+        reasons.append(f"Broad kill-chain coverage ({len(distinct_tactics)} tactics)")
+    elif len(distinct_tactics) >= 2:
         score += 1
-        reasons.append(f"Moderate ATT&CK mapping coverage ({mapped_ratio * 100.0:.1f}%)")
+        reasons.append(f"Multiple kill-chain tactics ({len(distinct_tactics)})")
 
     high_conf_hits = sum(1 for hit in hits if hit.confidence == "high")
     if high_conf_hits >= 3:
@@ -328,15 +819,26 @@ def _executive_assessment(
         score += 1
         reasons.append("Limited cross-source corroboration present")
 
+    if ot_impact:
+        score += 1
+        reasons.append(
+            f"OT process/safety-impact tactic(s) present: {', '.join(sorted(ot_impact))} "
+            "(validate with process telemetry)"
+        )
+
     if sequence_issues:
         score -= 1
         reasons.append(f"Sequence plausibility issues present ({len(sequence_issues)})")
 
-    if score >= 5:
+    if score >= 6:
         return "LIKELY INTRUSION", "high", reasons
     if score >= 3:
         return "POSSIBLE INTRUSION", "medium", reasons
-    return "LOW-CONFIDENCE SIGNAL", "low", reasons if reasons else ["Insufficient corroboration"]
+    return (
+        "LOW-CONFIDENCE SIGNAL",
+        "low",
+        reasons if reasons else ["Insufficient corroboration"],
+    )
 
 
 def _fallback_from_explicit_ids(
@@ -344,9 +846,17 @@ def _fallback_from_explicit_ids(
     technique_ids: list[str],
     framework: str,
     summary_text: str,
-) -> tuple[str, str, str, str]:
-    tactic_id = tactic_ids[0] if tactic_ids else ("TA0108" if framework == "ics" else "TA0007")
-    technique_id = technique_ids[0] if technique_ids else ("T0885" if framework == "ics" else "T1046")
+) -> tuple[str, str, str, str] | None:
+    if not tactic_ids and not technique_ids:
+        return None
+    tactic_id = (
+        tactic_ids[0] if tactic_ids else ("TA0101" if framework == "ics" else "TA0007")
+    )
+    technique_id = (
+        technique_ids[0]
+        if technique_ids
+        else ("T0869" if framework == "ics" else "T1046")
+    )
     tactic = "Mapped Tactic"
     technique = "Mapped Technique"
     for rule in _RULES:
@@ -368,7 +878,9 @@ def _fallback_from_explicit_ids(
 
 def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
     if not summaries:
-        return MitreSummary(path=Path("ALL_PCAPS"), total_detections=0, mapped_detections=0)
+        return MitreSummary(
+            path=Path("ALL_PCAPS"), total_detections=0, mapped_detections=0
+        )
 
     tactic_counts: Counter[str] = Counter()
     technique_counts: Counter[str] = Counter()
@@ -384,7 +896,6 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
     host_attack_paths: dict[str, list[str]] = defaultdict(list)
     host_roles: dict[str, set[str]] = defaultdict(set)
     technique_heat_rows: list[dict[str, object]] = []
-    investigation_pivots: list[dict[str, object]] = []
     merged_checks: dict[str, list[str]] = defaultdict(list)
 
     total_detections = 0
@@ -407,7 +918,6 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
         sequence_issues.extend(summary.sequence_issues)
         alternate_explanations.extend(summary.alternate_explanations)
         technique_heat_rows.extend(summary.technique_heat)
-        investigation_pivots.extend(summary.investigation_pivots)
         for host, chain in summary.host_attack_paths.items():
             host_attack_paths[host].extend(chain)
         for host, roles in summary.host_roles.items():
@@ -417,9 +927,17 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
             for value in values:
                 merged_checks[key].append(value)
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -466,16 +984,29 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
         executive_reasons=executive_reasons,
         sequence_issues=sorted(set(sequence_issues)),
         alternate_explanations=sorted(set(alternate_explanations))[:40],
-        host_attack_paths={key: value[:120] for key, value in sorted(host_attack_paths.items(), key=lambda item: item[0])},
-        host_roles={key: sorted(value) for key, value in sorted(host_roles.items(), key=lambda item: item[0])},
+        host_attack_paths={
+            key: value[:120]
+            for key, value in sorted(
+                host_attack_paths.items(), key=lambda item: item[0]
+            )
+        },
+        host_roles={
+            key: sorted(value)
+            for key, value in sorted(host_roles.items(), key=lambda item: item[0])
+        },
         technique_heat=technique_heat_rows[:300],
-        investigation_pivots=investigation_pivots[:300],
         checks=dedup_checks,
     )
 
 
-def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = None) -> MitreSummary:
-    threat_summary = analyze_threats(path, show_status=show_status)
+def analyze_mitre(
+    path: Path,
+    show_status: bool = True,
+    ioc_file: Path | None = None,
+    threat_summary=None,
+) -> MitreSummary:
+    if threat_summary is None:
+        threat_summary = analyze_threats(path, show_status=show_status)
 
     ioc_summary = None
     ioc_errors: list[str] = []
@@ -501,10 +1032,9 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
     }
     sequence_issues: list[str] = []
     alternate_explanations: list[str] = []
+    gate_reason_by_occurrence: dict[int, str] = {}
 
     previous_node = "Initial Access"
-    previous_stage = 0
-    previous_framework = "enterprise"
 
     for idx, item in enumerate(threat_summary.detections, start=1):
         summary_text = str(item.get("summary", "") or "").strip()
@@ -514,7 +1044,7 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
 
         blob = f"{summary_text} {details}".lower()
         tactic_ids, technique_ids = _extract_explicit_ids(blob)
-        rule = _rule_from_text(blob)
+        rule, rule_score = _rule_from_text(blob)
         framework = _infer_framework(blob)
 
         if rule:
@@ -524,12 +1054,18 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
             technique = rule.technique
             technique_id = rule.technique_id
         else:
-            tactic, tactic_id, technique, technique_id = _fallback_from_explicit_ids(
+            fallback = _fallback_from_explicit_ids(
                 tactic_ids,
                 technique_ids,
                 framework,
                 summary_text,
             )
+            if fallback is None:
+                checks["sequence_plausibility"].append(
+                    f"Detection {idx} left unmapped: no ATT&CK IDs and no high-confidence keyword rule"
+                )
+                continue
+            tactic, tactic_id, technique, technique_id = fallback
 
         matched_keywords = _matched_keywords(rule, blob)
         evidence = _extract_evidence(item)
@@ -537,20 +1073,52 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
         artifacts = _extract_artifacts(summary_text, details)
         packet_refs, flow_refs, host_refs = _collect_provenance(item, evidence)
 
-        stage_index = _tactic_stage_index(framework, tactic)
-        contradictory_signals: list[str] = []
-        if framework == previous_framework and stage_index < previous_stage:
-            message = (
-                f"Sequence anomaly at detection {idx}: {tactic} follows a later-stage tactic "
-                f"(prev_stage={previous_stage}, this_stage={stage_index})."
+        confidence = _normalize_confidence(item.get("confidence"))
+        allowed, gate_reason = _mapping_gate(
+            rule,
+            rule_score,
+            tactic_ids,
+            technique_ids,
+            evidence,
+            matched_keywords,
+            confidence,
+        )
+        if not allowed:
+            checks["sequence_plausibility"].append(
+                f"Detection {idx} left unmapped: {gate_reason}"
             )
-            sequence_issues.append(message)
-            contradictory_signals.append("Tactic order regression")
-            checks["sequence_plausibility"].append(message)
-        previous_stage = stage_index
-        previous_framework = framework
+            continue
 
-        if framework == "ics" and tactic in {"Impair Process Control", "Inhibit Response Function", "Impact"}:
+        # Crown-jewel ICS process/safety-impact techniques require a high or
+        # critical source detection. A low-severity, generic "OT control
+        # activity" warning (which can fire on port collisions in IT captures)
+        # must not be mapped to Industroyer/FrostyGoop-grade techniques.
+        detection_severity = str(item.get("severity", "info") or "info").lower()
+        if (
+            technique_id in _HIGH_SEVERITY_REQUIRED_TECHNIQUES
+            and detection_severity not in {"high", "critical"}
+            and not (tactic_ids or technique_ids)
+        ):
+            checks["sequence_plausibility"].append(
+                f"Detection {idx} not mapped to {technique_id}: high-impact ICS "
+                f"technique requires high/critical severity (was {detection_severity})"
+            )
+            continue
+        gate_reason_by_occurrence[idx] = gate_reason
+
+        hit_first, hit_last = _extract_detection_times(
+            item,
+            threat_summary.first_seen,
+            threat_summary.last_seen,
+        )
+
+        contradictory_signals: list[str] = []
+
+        if framework == "ics" and tactic in {
+            "Impair Process Control",
+            "Inhibit Response Function",
+            "Impact",
+        }:
             checks["ics_process_impact"].append(
                 f"Potential process/safety impact from {technique_id} at occurrence {idx}"
             )
@@ -569,13 +1137,13 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
             procedure=summary_text or "Detection Procedure",
             source=str(item.get("source", "threats") or "threats"),
             severity=str(item.get("severity", "info") or "info").lower(),
-            confidence=_normalize_confidence(item.get("confidence")),
+            confidence=confidence,
             details=details,
             evidence=evidence,
             artifacts=artifacts,
             iocs=iocs,
-            first_seen=threat_summary.first_seen,
-            last_seen=threat_summary.last_seen,
+            first_seen=hit_first,
+            last_seen=hit_last,
             occurrence=idx,
             matched_keywords=matched_keywords,
             contradictory_signals=contradictory_signals,
@@ -594,10 +1162,6 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
         for value in artifacts:
             artifact_counts[value] += 1
 
-        node = f"{tactic} [{technique_id}]"
-        attack_path.append(f"{previous_node} -> {node}")
-        previous_node = node
-
     if hits:
         source_by_technique: dict[str, set[str]] = defaultdict(set)
         for hit in hits:
@@ -605,7 +1169,9 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
 
         enriched_hits: list[MitreHit] = []
         for hit in hits:
-            corroborating_sources = len(source_by_technique.get(hit.technique_id, set()))
+            corroborating_sources = len(
+                source_by_technique.get(hit.technique_id, set())
+            )
             contradictions = list(hit.contradictory_signals)
             if hit.confidence == "high" and corroborating_sources < 2:
                 contradictions.append("High confidence without source corroboration")
@@ -620,6 +1186,7 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
                 f"keywords={','.join(hit.matched_keywords[:5]) or '-'}",
                 f"evidence_items={len(hit.evidence)}",
                 f"sources_for_technique={corroborating_sources}",
+                f"mapping_gate={gate_reason_by_occurrence.get(hit.occurrence, '-')}",
             ]
             if contradictions:
                 rationale_parts.append("contradictions=" + ",".join(contradictions[:3]))
@@ -653,13 +1220,36 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
             )
         hits = enriched_hits
 
+    hits_sorted = sorted(
+        hits,
+        key=lambda item: (
+            item.first_seen is None,
+            item.first_seen if item.first_seen is not None else 0.0,
+            item.occurrence,
+        ),
+    )
     host_attack_paths: dict[str, list[str]] = defaultdict(list)
     host_roles: dict[str, set[str]] = defaultdict(set)
-    for hit in hits:
+    stage_by_host: dict[str, int] = defaultdict(int)
+    for hit in hits_sorted:
         node = f"{hit.tactic} [{hit.technique_id}]"
-        for host in hit.host_refs[:8]:
+        hosts = hit.host_refs[:8] if hit.host_refs else ["GLOBAL"]
+        for host in hosts:
+            stage_index = _tactic_stage_index(hit.framework, hit.tactic)
+            prev = stage_by_host.get(host, 0)
+            if stage_index < prev:
+                msg = (
+                    f"Host {host} sequence regression: {hit.tactic}({stage_index}) "
+                    f"after stage {prev}"
+                )
+                sequence_issues.append(msg)
+                checks["sequence_plausibility"].append(msg)
+            stage_by_host[host] = max(prev, stage_index)
             host_attack_paths[host].append(node)
             host_roles[host].add(_host_role_from_hit(hit))
+            if previous_node != node:
+                attack_path.append(f"{previous_node} -> {node}")
+                previous_node = node
 
     technique_rollup: dict[str, dict[str, object]] = {}
     for hit in hits:
@@ -680,7 +1270,9 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
             },
         )
         row["count"] = int(row.get("count", 0) or 0) + 1
-        row["evidence_count"] = int(row.get("evidence_count", 0) or 0) + len(hit.evidence)
+        row["evidence_count"] = int(row.get("evidence_count", 0) or 0) + len(
+            hit.evidence
+        )
         hosts = row.get("hosts")
         if isinstance(hosts, set):
             for host in hit.host_refs:
@@ -696,7 +1288,9 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
         if isinstance(hit.last_seen, (int, float)):
             if last_seen is None or hit.last_seen > last_seen:
                 row["last_seen"] = hit.last_seen
-        row["confidence_rank"] = max(int(row.get("confidence_rank", 0) or 0), _confidence_rank(hit.confidence))
+        row["confidence_rank"] = max(
+            int(row.get("confidence_rank", 0) or 0), _confidence_rank(hit.confidence)
+        )
 
     technique_heat: list[dict[str, object]] = []
     for row in technique_rollup.values():
@@ -728,21 +1322,6 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
         reverse=True,
     )
 
-    investigation_pivots: list[dict[str, object]] = []
-    for hit in hits[:200]:
-        investigation_pivots.append(
-            {
-                "technique_id": hit.technique_id,
-                "tactic": hit.tactic,
-                "source": hit.source,
-                "hosts": hit.host_refs[:6],
-                "flows": hit.flow_refs[:4],
-                "packets": hit.packet_refs[:6],
-                "iocs": hit.iocs[:6],
-                "artifacts": hit.artifacts[:6],
-            }
-        )
-
     low_conf_count = sum(1 for hit in hits if hit.confidence == "low")
     single_source_count = sum(1 for hit in hits if hit.corroborating_sources <= 1)
     if low_conf_count >= 3:
@@ -754,7 +1333,9 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
             "Several mappings are single-source and should be corroborated with endpoint or IDS telemetry."
         )
     if not sequence_issues:
-        alternate_explanations.append("No ATT&CK sequence order regression was detected in this capture.")
+        alternate_explanations.append(
+            "No ATT&CK sequence order regression was detected in this capture."
+        )
 
     if ioc_summary is not None:
         for value, count in ioc_summary.ip_hits.items():
@@ -768,13 +1349,23 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
 
     duration_seconds = None
     if threat_summary.first_seen is not None and threat_summary.last_seen is not None:
-        duration_seconds = max(0.0, threat_summary.last_seen - threat_summary.first_seen)
+        duration_seconds = max(
+            0.0, threat_summary.last_seen - threat_summary.first_seen
+        )
 
     executive_verdict, executive_confidence, executive_reasons = _executive_assessment(
         len(threat_summary.detections),
         hits,
         sequence_issues,
     )
+
+    all_errors = (
+        list(threat_summary.errors)
+        + list(ioc_errors)
+        + (list(ioc_summary.errors) if ioc_summary else [])
+    )
+    if _MAPPING_METADATA_ERROR:
+        all_errors.append(_MAPPING_METADATA_ERROR)
 
     return MitreSummary(
         path=path,
@@ -788,7 +1379,7 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
         artifact_counts=artifact_counts,
         attack_path=attack_path,
         hits=hits,
-        errors=list(threat_summary.errors) + list(ioc_errors) + (list(ioc_summary.errors) if ioc_summary else []),
+        errors=all_errors,
         first_seen=threat_summary.first_seen,
         last_seen=threat_summary.last_seen,
         duration_seconds=duration_seconds,
@@ -797,9 +1388,16 @@ def analyze_mitre(path: Path, show_status: bool = True, ioc_file: Path | None = 
         executive_reasons=executive_reasons,
         sequence_issues=sequence_issues,
         alternate_explanations=alternate_explanations,
-        host_attack_paths={key: value[:120] for key, value in sorted(host_attack_paths.items(), key=lambda item: item[0])},
-        host_roles={key: sorted(value) for key, value in sorted(host_roles.items(), key=lambda item: item[0])},
+        host_attack_paths={
+            key: value[:120]
+            for key, value in sorted(
+                host_attack_paths.items(), key=lambda item: item[0]
+            )
+        },
+        host_roles={
+            key: sorted(value)
+            for key, value in sorted(host_roles.items(), key=lambda item: item[0])
+        },
         technique_heat=technique_heat,
-        investigation_pivots=investigation_pivots,
         checks={key: values[:80] for key, values in checks.items()},
     )

@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .device_detection import device_fingerprints_from_text
 from .pcap_cache import get_reader
 from .utils import safe_float
-from .device_detection import device_fingerprints_from_text
 
 try:
     from scapy.layers.l2 import Ether  # type: ignore
@@ -77,13 +77,15 @@ class LldpDcpArtifact:
     dst: str
 
 
-def _parse_lldp_tlvs(payload: bytes) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _parse_lldp_tlvs(
+    payload: bytes,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
     chassis = None
     port = None
     sysname = None
     idx = 0
     while idx + 2 <= len(payload):
-        tlv_header = int.from_bytes(payload[idx:idx + 2], "big")
+        tlv_header = int.from_bytes(payload[idx : idx + 2], "big")
         tlv_type = (tlv_header >> 9) & 0x7F
         tlv_len = tlv_header & 0x1FF
         idx += 2
@@ -91,7 +93,7 @@ def _parse_lldp_tlvs(payload: bytes) -> tuple[Optional[str], Optional[str], Opti
             if tlv_type == 0:
                 break
             continue
-        value = payload[idx:idx + tlv_len]
+        value = payload[idx : idx + tlv_len]
         idx += tlv_len
         if tlv_type == 1 and value:
             chassis = value[1:].decode("utf-8", errors="ignore")
@@ -108,11 +110,11 @@ def _decode_dcp_blocks(payload: bytes, offset: int) -> list[tuple[int, int, byte
     while ptr + 4 <= len(payload):
         option = payload[ptr]
         suboption = payload[ptr + 1]
-        block_len = int.from_bytes(payload[ptr + 2:ptr + 4], "big")
+        block_len = int.from_bytes(payload[ptr + 2 : ptr + 4], "big")
         ptr += 4
         if block_len <= 0 or ptr + block_len > len(payload):
             break
-        block = payload[ptr:ptr + block_len]
+        block = payload[ptr : ptr + block_len]
         ptr += block_len
         blocks.append((option, suboption, block))
     return blocks
@@ -173,7 +175,9 @@ def analyze_lldp_dcp(path: Path, show_status: bool = True) -> LldpDcpSummary:
             None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     lldp_packets = 0
     dcp_packets = 0
@@ -226,12 +230,18 @@ def analyze_lldp_dcp(path: Path, show_status: bool = True) -> LldpDcpSummary:
                     port_ids[port] += 1
                 if sysname:
                     system_names[sysname] += 1
-                    for detail in device_fingerprints_from_text(sysname, source="LLDP system name"):
+                    for detail in device_fingerprints_from_text(
+                        sysname, source="LLDP system name"
+                    ):
                         key = f"device:{detail}"
                         if key in seen_device_artifacts:
                             continue
                         seen_device_artifacts.add(key)
-                        artifacts.append(LldpDcpArtifact(kind="device", detail=detail, src=eth.src, dst=eth.dst))
+                        artifacts.append(
+                            LldpDcpArtifact(
+                                kind="device", detail=detail, src=eth.src, dst=eth.dst
+                            )
+                        )
 
             if eth_type == PROFINET_ETHERTYPE and len(payload) >= 2:
                 dcp_packets += 1
@@ -243,12 +253,21 @@ def analyze_lldp_dcp(path: Path, show_status: bool = True) -> LldpDcpSummary:
                         dcp_services[svc] += 1
                     for name in names:
                         dcp_device_names[name] += 1
-                        for detail in device_fingerprints_from_text(name, source="DCP device name"):
+                        for detail in device_fingerprints_from_text(
+                            name, source="DCP device name"
+                        ):
                             key = f"device:{detail}"
                             if key in seen_device_artifacts:
                                 continue
                             seen_device_artifacts.add(key)
-                            artifacts.append(LldpDcpArtifact(kind="device", detail=detail, src=eth.src, dst=eth.dst))
+                            artifacts.append(
+                                LldpDcpArtifact(
+                                    kind="device",
+                                    detail=detail,
+                                    src=eth.src,
+                                    dst=eth.dst,
+                                )
+                            )
                     for ip in ips:
                         dcp_ips[ip] += 1
 
@@ -257,31 +276,43 @@ def analyze_lldp_dcp(path: Path, show_status: bool = True) -> LldpDcpSummary:
         reader.close()
 
     if lldp_packets:
-        detections.append({
-            "severity": "info",
-            "summary": "LLDP asset discovery traffic observed",
-            "details": f"{lldp_packets} LLDP frames detected.",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "LLDP asset discovery traffic observed",
+                "details": f"{lldp_packets} LLDP frames detected.",
+            }
+        )
     if dcp_packets:
-        detections.append({
-            "severity": "info",
-            "summary": "PROFINET DCP discovery traffic observed",
-            "details": f"{dcp_packets} PROFINET DCP frames detected.",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "PROFINET DCP discovery traffic observed",
+                "details": f"{dcp_packets} PROFINET DCP frames detected.",
+            }
+        )
     if len(system_names) >= 25 or len(chassis_ids) >= 25:
-        detections.append({
-            "severity": "warning",
-            "summary": "LLDP Reconnaissance Pattern",
-            "details": f"Large LLDP inventory footprint (systems={len(system_names)} chassis={len(chassis_ids)}).",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "LLDP Reconnaissance Pattern",
+                "details": f"Large LLDP inventory footprint (systems={len(system_names)} chassis={len(chassis_ids)}).",
+            }
+        )
     if dcp_packets >= 500 or len(dcp_frame_ids) >= 20:
-        detections.append({
-            "severity": "warning",
-            "summary": "DCP Activity Spike",
-            "details": f"High DCP activity (frames={dcp_packets} unique_frame_ids={len(dcp_frame_ids)}).",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "DCP Activity Spike",
+                "details": f"High DCP activity (frames={dcp_packets} unique_frame_ids={len(dcp_frame_ids)}).",
+            }
+        )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return LldpDcpSummary(
         path=path,
         total_packets=total_packets,

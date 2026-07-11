@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from .utils import is_valid_ip as _valid_ip, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .utils import beacon_score as _beaconing_score
+import hashlib
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import ipaddress
-import re
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP
@@ -31,22 +33,91 @@ POWERSHELL_HINT_RE = re.compile(
 )
 
 PS_COMMAND_RE = re.compile(r"\b(?:powershell|pwsh)\b[^\r\n]{0,300}", re.IGNORECASE)
-PS_ENCODED_RE = re.compile(r"(?:-enc(?:odedcommand)?|frombase64string)\b", re.IGNORECASE)
+# PowerShell accepts any unambiguous prefix of -EncodedCommand, so attackers use
+# -e / -ec / -enc / -encodedcommand interchangeably (this Emotet cradle uses the
+# bare `powershell -e <base64>`). The detection previously only matched -enc and
+# missed -e/-ec entirely. Require a base64 blob after the short forms so a benign
+# `-e` flag value can't trip it; -encodedcommand and frombase64string stand alone.
+PS_ENCODED_RE = re.compile(
+    r"(?:-e(?:c|nc(?:odedcommand)?)?\s+[A-Za-z0-9+/]{24,}={0,2}"
+    r"|-encodedcommand\b|frombase64string)",
+    re.IGNORECASE,
+)
+# Capture the base64 blob that follows a -EncodedCommand/-enc/-e flag so it can
+# be decoded back to the cleartext command the attacker actually ran. PowerShell
+# requires a 4-aligned base64 string of UTF-16LE bytes; require a decent length
+# to avoid matching short flag values.
+PS_ENCODED_ARG_RE = re.compile(
+    r"-e(?:nc(?:odedcommand)?|c)?\s+([A-Za-z0-9+/]{24,}={0,2})", re.IGNORECASE
+)
+
+
+def _decode_ps_encoded(blob: str) -> Optional[str]:
+    """Decode a PowerShell -EncodedCommand base64 blob to its cleartext command.
+
+    PowerShell encodes the command as UTF-16LE then base64. Returns the decoded
+    text if it looks like a real command (mostly printable), else ``None``.
+    """
+    import base64
+
+    try:
+        raw = base64.b64decode(blob + "=" * (-len(blob) % 4), validate=False)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    # Heuristic: UTF-16LE PowerShell payloads have a NUL in every other byte.
+    text = raw.decode("utf-16le", errors="ignore")
+    if not text:
+        text = raw.decode("latin-1", errors="ignore")
+    printable = sum(1 for ch in text if 32 <= ord(ch) < 127 or ch in "\r\n\t")
+    if not text or printable < len(text) * 0.8 or len(text) < 4:
+        return None
+    return text.strip()
 PS_IEX_RE = re.compile(r"\binvoke-expression\b|\biex\b", re.IGNORECASE)
-PS_DOWNLOAD_RE = re.compile(r"(downloadstring|invoke-webrequest|invoke-restmethod|new-object\s+net\.webclient)", re.IGNORECASE)
+PS_DOWNLOAD_RE = re.compile(
+    r"(downloadstring|invoke-webrequest|invoke-restmethod|new-object\s+net\.webclient)",
+    re.IGNORECASE,
+)
 PS_AMSI_RE = re.compile(r"amsi(?:utils)?|amsiInitFailed|amsiScanBuffer", re.IGNORECASE)
-PS_BYPASS_RE = re.compile(r"-executionpolicy\s+bypass|bypass\s+\w+\s+policy", re.IGNORECASE)
-PS_LM_RE = re.compile(r"(psexec|wmic|winrs|schtasks|at\s+|rundll32|regsvr32)", re.IGNORECASE)
-PS_CRED_RE = re.compile(r"(get-credential|convertto-securestring|asplaintext)", re.IGNORECASE)
-PS_EXFIL_RE = re.compile(r"(compress-archive|convertto-json|invoke-webrequest|out-file|set-content|add-content)", re.IGNORECASE)
-PS_AD_RE = re.compile(r"(get-aduser|get-adcomputer|get-addomain|get-adgroup)", re.IGNORECASE)
-PS_NETDISC_RE = re.compile(r"(test-connection|get-nettcpconnection|get-netipconfiguration|get-netneighbor|get-netroute)", re.IGNORECASE)
+PS_BYPASS_RE = re.compile(
+    r"-executionpolicy\s+bypass|bypass\s+\w+\s+policy", re.IGNORECASE
+)
+PS_LM_RE = re.compile(
+    # `at\s+` matched "that "/"what "/"great " etc. (any "at" + space); restrict
+    # to the `at \\host` remote-scheduling lateral-movement invocation.
+    r"(psexec|wmic|winrs|schtasks|\bat\s+\\\\|rundll32|regsvr32)", re.IGNORECASE
+)
+PS_CRED_RE = re.compile(
+    r"(get-credential|convertto-securestring|asplaintext)", re.IGNORECASE
+)
+PS_EXFIL_RE = re.compile(
+    r"(compress-archive|convertto-json|invoke-webrequest|out-file|set-content|add-content)",
+    re.IGNORECASE,
+)
+PS_AD_RE = re.compile(
+    r"(get-aduser|get-adcomputer|get-addomain|get-adgroup)", re.IGNORECASE
+)
+PS_NETDISC_RE = re.compile(
+    r"(test-connection|get-nettcpconnection|get-netipconfiguration|get-netneighbor|get-netroute)",
+    re.IGNORECASE,
+)
+PS_WINRM_RE = re.compile(
+    r"(winrm|wsman|wsmv|schemas\.microsoft\.com/powershell|schemas\.xmlsoap\.org/ws/)",
+    re.IGNORECASE,
+)
 
 URL_RE = re.compile(r"https?://[^\s'\"]+", re.IGNORECASE)
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})\b")
-HOST_VALUE_RE = re.compile(r"(?:hostname|computername|name)\s*[:=]\s*([A-Za-z0-9_.-]{2,64})", re.IGNORECASE)
+HOST_VALUE_RE = re.compile(
+    r"(?:hostname|computername|name)\s*[:=]\s*([A-Za-z0-9_.-]{2,64})", re.IGNORECASE
+)
 DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9_.-]{1,64})\b")
+
+MAX_PLAINTEXT_UNIQUES = 1200
+MAX_INDICATOR_UNIQUES = 3000
+MAX_TEXT_LEN = 180
 
 
 SUSPICIOUS_PATTERNS = [
@@ -202,26 +273,9 @@ class _SessionState:
             self.hints = Counter()
 
 
-def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
-    results: list[str] = []
-    if not data:
-        return results
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
-
-
-def _extract_utf16le_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
+def _extract_utf16le_strings(
+    data: bytes, min_len: int = 4, max_len: int = 200
+) -> list[str]:
     results: list[str] = []
     if not data:
         return results
@@ -244,7 +298,9 @@ def _extract_utf16le_strings(data: bytes, min_len: int = 4, max_len: int = 200) 
     return results
 
 
-def _direction(src_ip: str, dst_ip: str, sport: int, dport: int) -> tuple[str, str, int, int]:
+def _direction(
+    src_ip: str, dst_ip: str, sport: int, dport: int
+) -> tuple[str, str, int, int]:
     if dport in POWERSHELL_PORTS:
         return src_ip, dst_ip, sport, dport
     if sport in POWERSHELL_PORTS:
@@ -256,33 +312,28 @@ def _direction(src_ip: str, dst_ip: str, sport: int, dport: int) -> tuple[str, s
     return src_ip, dst_ip, sport, dport
 
 
-def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
-    if avg < 5 or avg > 86400:
-        return None
-    if stddev > max(5.0, avg * 0.25):
-        return None
-    return {"avg": avg, "stddev": stddev}
+def _safe_excerpt(value: str, limit: int = MAX_TEXT_LEN) -> str:
+    # Secret/base64 redaction intentionally removed: command excerpts are shown
+    # verbatim so recovered credentials and encoded payloads are fully visible.
+    # The length cap below is a display bound only, not redaction.
+    text = value.strip()
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "..."
+    return text
 
 
-def _valid_ip(value: str) -> bool:
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except Exception:
-        return False
+def _record_bounded(counter: Counter[str], key: str, max_uniques: int) -> None:
+    if key in counter or len(counter) < max_uniques:
+        counter[key] += 1
 
 
+def _indicator_key(label: str, value: str) -> str:
+    snippet = _safe_excerpt(value, limit=90)
+    digest = hashlib.sha1(value.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    return f"{label}: {snippet} [sha1:{digest}]"
+
+
+@memoize_analysis
 def analyze_powershell(
     path: Path,
     show_status: bool = True,
@@ -291,7 +342,9 @@ def analyze_powershell(
 ) -> PowershellSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
-        errors.append("Scapy IP/TCP layers unavailable; install scapy for PowerShell analysis.")
+        errors.append(
+            "Scapy IP/TCP layers unavailable; install scapy for PowerShell analysis."
+        )
         return PowershellSummary(
             path=path,
             total_packets=0,
@@ -377,6 +430,7 @@ def analyze_powershell(
 
     total_packets = 0
     powershell_packets = 0
+    candidate_powershell_packets = 0
     total_bytes = 0
     client_packets = 0
     server_packets = 0
@@ -408,9 +462,12 @@ def analyze_powershell(
     artifacts: list[str] = []
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
+    decoded_ps_commands: Counter[str] = Counter()
     errors = []
 
-    client_times: dict[str, list[float]] = defaultdict(list)
+    # Keyed per (client, server) flow, not per client: a host talking to
+    # several servers would otherwise merge into one series and look "periodic".
+    client_times: dict[tuple[str, str], list[float]] = defaultdict(list)
     client_targets: dict[str, set[str]] = defaultdict(set)
 
     try:
@@ -424,22 +481,13 @@ def analyze_powershell(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 continue
 
-            ip_layer = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-            if ip_layer is None:
-                continue
-
-            src_ip = str(getattr(ip_layer, "src", ""))
-            dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 
@@ -462,12 +510,37 @@ def analyze_powershell(
             if not payload:
                 continue
 
-            strings = _extract_ascii_strings(payload) + _extract_utf16le_strings(payload)
+            strings = _extract_ascii_strings(payload) + _extract_utf16le_strings(
+                payload
+            )
             if not strings:
                 continue
 
-            matched = any(POWERSHELL_HINT_RE.search(value) for value in strings)
-            if not matched:
+            has_port_context = sport in POWERSHELL_PORTS or dport in POWERSHELL_PORTS
+            has_hint = any(POWERSHELL_HINT_RE.search(value) for value in strings)
+            has_winrm_context = any(PS_WINRM_RE.search(value) for value in strings)
+            has_command_shape = any(PS_COMMAND_RE.search(value) for value in strings)
+            has_suspicious_pattern = any(
+                pattern.search(value)
+                for value in strings
+                for pattern, _label in SUSPICIOUS_PATTERNS
+            )
+
+            confidence = 0
+            if has_port_context:
+                confidence += 2
+            if has_winrm_context:
+                confidence += 1
+            if has_hint:
+                confidence += 2
+            if has_command_shape:
+                confidence += 1
+            if has_suspicious_pattern:
+                confidence += 1
+
+            if confidence >= 2:
+                candidate_powershell_packets += 1
+            if confidence < 3:
                 continue
 
             powershell_packets += 1
@@ -518,6 +591,17 @@ def analyze_powershell(
                 )
                 sessions[session_key] = session
 
+            if session.client_mac is None:
+                if src_ip == client_ip and eth_src:
+                    session.client_mac = eth_src
+                elif dst_ip == client_ip and eth_dst:
+                    session.client_mac = eth_dst
+            if session.server_mac is None:
+                if src_ip == server_ip and eth_src:
+                    session.server_mac = eth_src
+                elif dst_ip == server_ip and eth_dst:
+                    session.server_mac = eth_dst
+
             session.packets += 1
             session.bytes += pkt_len
             if ts is not None:
@@ -537,7 +621,7 @@ def analyze_powershell(
                 server_bytes += pkt_len
 
             if ts is not None:
-                client_times[client_ip].append(ts)
+                client_times[(client_ip, server_ip)].append(ts)
             client_targets[client_ip].add(server_ip)
 
             for value in strings:
@@ -545,13 +629,21 @@ def analyze_powershell(
                     continue
 
                 if POWERSHELL_HINT_RE.search(value):
-                    if len(plaintext_strings) < 2000 or value in plaintext_strings:
-                        plaintext_strings[value] += 1
+                    _record_bounded(
+                        plaintext_strings,
+                        _safe_excerpt(value),
+                        MAX_PLAINTEXT_UNIQUES,
+                    )
 
                 cmd_match = PS_COMMAND_RE.search(value)
                 if cmd_match:
                     cmd = cmd_match.group(0).strip()
                     commands[cmd] += 1
+
+                for enc_match in PS_ENCODED_ARG_RE.finditer(value):
+                    decoded = _decode_ps_encoded(enc_match.group(1))
+                    if decoded and len(decoded_ps_commands) < 50:
+                        decoded_ps_commands[_safe_excerpt(decoded)] += 1
 
                 host_match = HOST_VALUE_RE.search(value)
                 if host_match:
@@ -571,15 +663,21 @@ def analyze_powershell(
                 for url in URL_RE.findall(value):
                     urls[url] += 1
 
-                if PS_AD_RE.search(value):
-                    ad_queries[PS_AD_RE.search(value).group(0)] += 1
+                ad_match = PS_AD_RE.search(value)
+                if ad_match:
+                    ad_queries[ad_match.group(0)] += 1
 
-                if PS_NETDISC_RE.search(value):
-                    network_discovery[PS_NETDISC_RE.search(value).group(0)] += 1
+                netdisc_match = PS_NETDISC_RE.search(value)
+                if netdisc_match:
+                    network_discovery[netdisc_match.group(0)] += 1
 
                 for pattern, label in SUSPICIOUS_PATTERNS:
                     if pattern.search(value):
-                        suspicious_indicators[f"{label}: {value}"] += 1
+                        _record_bounded(
+                            suspicious_indicators,
+                            _indicator_key(label, value),
+                            MAX_INDICATOR_UNIQUES,
+                        )
                         session.hints[label] += 1
 
     except Exception as exc:
@@ -622,14 +720,14 @@ def analyze_powershell(
                 }
             )
 
-    for client, times in client_times.items():
+    for (client, server), times in client_times.items():
         score = _beaconing_score(times)
         if score:
             detections.append(
                 {
                     "severity": "warning",
                     "summary": "Possible PowerShell beaconing",
-                    "details": f"{client} interval avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s",
+                    "details": f"{client} -> {server} interval avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s",
                 }
             )
 
@@ -642,12 +740,24 @@ def analyze_powershell(
             }
         )
 
-    if any(PS_ENCODED_RE.search(key) for key in suspicious_indicators.keys()):
+    if decoded_ps_commands:
+        # Decoding the base64 reveals what actually ran — a high-value forensic
+        # artifact. Surface it at HIGH so the decoded command reaches triage.
+        for decoded, count in decoded_ps_commands.most_common(10):
+            suffix = f" (x{count})" if count > 1 else ""
+            detections.append(
+                {
+                    "severity": "high",
+                    "summary": "Decoded PowerShell EncodedCommand",
+                    "details": f"Decoded -EncodedCommand payload{suffix}: {decoded}",
+                }
+            )
+    elif any(PS_ENCODED_RE.search(key) for key in suspicious_indicators.keys()):
         detections.append(
             {
                 "severity": "warning",
                 "summary": "Encoded PowerShell command",
-                "details": "EncodedCommand/FromBase64String observed",
+                "details": "EncodedCommand/FromBase64String observed (base64 not recoverable from capture)",
             }
         )
 
@@ -674,14 +784,24 @@ def analyze_powershell(
             {
                 "title": "Suspicious PowerShell indicators",
                 "details": ", ".join(
-                    f"{name}({count})" for name, count in suspicious_indicators.most_common(6)
+                    f"{name}({count})"
+                    for name, count in suspicious_indicators.most_common(6)
                 ),
             }
         )
 
     if commands:
         for cmd, count in commands.most_common(12):
-            artifacts.append(f"Command: {cmd} ({count})")
+            artifacts.append(f"Command: {_safe_excerpt(cmd)} ({count})")
+
+    if (
+        candidate_powershell_packets
+        and powershell_packets != candidate_powershell_packets
+    ):
+        artifacts.append(
+            "Confidence profile: "
+            f"{powershell_packets}/{candidate_powershell_packets} packets met strict PowerShell confidence"
+        )
 
     if urls:
         artifacts.append("URLs: " + ", ".join(list(urls.keys())[:10]))
@@ -734,7 +854,9 @@ def analyze_powershell(
 
 
 def merge_powershell_summaries(
-    summaries: list[PowershellSummary] | tuple[PowershellSummary, ...] | set[PowershellSummary],
+    summaries: list[PowershellSummary]
+    | tuple[PowershellSummary, ...]
+    | set[PowershellSummary],
 ) -> PowershellSummary:
     summary_list = list(summaries)
     if not summary_list:
@@ -824,9 +946,17 @@ def merge_powershell_summaries(
         total_sessions += summary.total_sessions
 
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         client_counts.update(summary.client_counts)
         server_counts.update(summary.server_counts)

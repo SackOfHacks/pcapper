@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Iterable
-import ipaddress
+from .utils import read_ber_length as _read_ber_length, packet_length
+from .utils import beacon_score
+from .utils import is_public_ip as _is_public_ip
 import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Optional
 
-from .pcap_cache import get_reader
-from .utils import safe_float
 from .device_detection import device_fingerprints_from_text
+from .pcap_cache import get_reader
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -50,9 +52,19 @@ OID_LABELS = {
 }
 
 SUSPICIOUS_PATTERNS = [
-    (re.compile(r"powershell|cmd\.exe|wmic|winrs", re.IGNORECASE), "Command execution tooling"),
-    (re.compile(r"mimikatz|cobalt|beacon|meterpreter", re.IGNORECASE), "Malware tooling"),
-    (re.compile(r"rundll32|regsvr32|schtasks|at\s+", re.IGNORECASE), "Execution/persistence tooling"),
+    (
+        re.compile(r"powershell|cmd\.exe|wmic|winrs", re.IGNORECASE),
+        "Command execution tooling",
+    ),
+    (
+        re.compile(r"mimikatz|cobalt|beacon|meterpreter", re.IGNORECASE),
+        "Malware tooling",
+    ),
+    (
+        # `at\s+` matched the English word "at "; restrict to `at \\host`.
+        re.compile(r"rundll32|regsvr32|schtasks|\bat\s+\\\\", re.IGNORECASE),
+        "Execution/persistence tooling",
+    ),
     (re.compile(r"nmap|masscan|sqlmap", re.IGNORECASE), "Recon tooling"),
 ]
 
@@ -107,6 +119,10 @@ class SnmpSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+    # SNMPv3 USM identities (msgUserName) — the device-management accounts. The
+    # username is cleartext even in authPriv mode, so it's a useful identity
+    # artifact. Defaulted for backward-compatible construction.
+    usm_users: Counter[str] = field(default_factory=Counter)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -161,36 +177,16 @@ class SnmpSummary:
         }
 
 
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
-
-
-def _read_ber_length(payload: bytes, offset: int) -> tuple[Optional[int], int]:
-    if offset >= len(payload):
-        return None, offset
-    first = payload[offset]
-    offset += 1
-    if first < 0x80:
-        return first, offset
-    num_bytes = first & 0x7F
-    if num_bytes == 0 or offset + num_bytes > len(payload):
-        return None, offset
-    length = int.from_bytes(payload[offset:offset + num_bytes], "big")
-    offset += num_bytes
-    return length, offset
-
-
-def _read_tlv(payload: bytes, offset: int) -> tuple[Optional[int], Optional[bytes], int]:
+def _read_tlv(
+    payload: bytes, offset: int
+) -> tuple[Optional[int], Optional[bytes], int]:
     if offset >= len(payload):
         return None, None, offset
     tag = payload[offset]
     length, idx = _read_ber_length(payload, offset + 1)
     if length is None or idx + length > len(payload):
         return None, None, offset
-    value = payload[idx:idx + length]
+    value = payload[idx : idx + length]
     return tag, value, idx + length
 
 
@@ -239,6 +235,39 @@ def _parse_snmp_message(payload: bytes) -> Optional[dict[str, object]]:
         return None
     version_val = int.from_bytes(ver_val, "big", signed=False)
     version = {0: "v1", 1: "v2c", 3: "v3"}.get(version_val, f"v{version_val}")
+
+    # SNMPv3 has a different layout: after the version INTEGER comes
+    # msgGlobalData (SEQUENCE) then msgSecurityParameters (OCTET STRING wrapping
+    # the USM SEQUENCE), NOT a community OCTET STRING. The old code assumed v1/v2c
+    # layout and returned None for every v3 message, so the entire v3/USM layer
+    # was invisible. Parse it separately so v3 is at least counted, with the USM
+    # username/engineID surfaced for triage.
+    if version_val == 3:
+        username = ""
+        engine_id = ""
+        glob_tag, _glob_val, idx = _read_tlv(value, idx)  # msgGlobalData SEQUENCE
+        sec_tag, sec_val, _ = _read_tlv(value, idx)  # msgSecurityParameters
+        if sec_tag == 0x04 and sec_val:
+            usm_tag, usm_val, _ = _read_tlv(sec_val, 0)
+            if usm_tag == 0x30 and usm_val:
+                u = 0
+                eng_tag, eng_v, u = _read_tlv(usm_val, u)  # engineID
+                if eng_tag == 0x04 and eng_v is not None:
+                    engine_id = eng_v.hex()
+                _b_tag, _b, u = _read_tlv(usm_val, u)  # engineBoots
+                _t_tag, _t, u = _read_tlv(usm_val, u)  # engineTime
+                name_tag, name_v, u = _read_tlv(usm_val, u)  # msgUserName
+                if name_tag == 0x04 and name_v is not None:
+                    username = name_v.decode("latin-1", errors="ignore")
+        return {
+            "version": version,
+            "community": "",
+            "pdu": "v3 (USM)",
+            "varbinds": [],
+            "username": username,
+            "engine_id": engine_id,
+        }
+
     comm_tag, comm_val, idx = _read_tlv(value, idx)
     if comm_tag != 0x04 or comm_val is None:
         return None
@@ -250,7 +279,7 @@ def _parse_snmp_message(payload: bytes) -> Optional[dict[str, object]]:
     pdu_len, pdu_idx = _read_ber_length(value, idx + 1)
     if pdu_len is None or pdu_idx + pdu_len > len(value):
         return None
-    pdu_value = value[pdu_idx:pdu_idx + pdu_len]
+    pdu_value = value[pdu_idx : pdu_idx + pdu_len]
     pidx = 0
     _req_tag, _req_val, pidx = _read_tlv(pdu_value, pidx)
     _err_tag, _err_val, pidx = _read_tlv(pdu_value, pidx)
@@ -292,26 +321,19 @@ def _format_mac(value: str) -> Optional[str]:
     return None
 
 
-def _beacon_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
-    if avg < 1 or avg > 3600:
-        return None
-    if stddev / avg > 0.15:
-        return None
-    return {"avg": avg, "stddev": stddev}
+def _beacon_score(times: list[float]):
+    return beacon_score(
+        times, min_interval=1.0, max_interval=3600.0, rel_jitter=0.15, abs_jitter_floor=0.0
+    )
 
 
-def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | None = None, meta: object | None = None) -> SnmpSummary:
+@memoize_analysis
+def analyze_snmp(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: object | None = None,
+) -> SnmpSummary:
     errors: list[str] = []
     if UDP is None and TCP is None:
         errors.append("Scapy IP layers unavailable; install scapy for SNMP analysis.")
@@ -378,6 +400,7 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
     seen_device_artifacts: set[str] = set()
 
     community_by_flow: dict[tuple[str, str], set[str]] = defaultdict(set)
+    usm_users: Counter[str] = Counter()
     dst_by_src: dict[str, set[str]] = defaultdict(set)
     request_times: dict[tuple[str, str], list[float]] = defaultdict(list)
     response_bytes: Counter[tuple[str, str]] = Counter()
@@ -394,7 +417,7 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:
@@ -403,16 +426,7 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if not src_ip or not dst_ip:
                 continue
@@ -463,6 +477,9 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
             varbinds = msg.get("varbinds", [])
 
             version_counts[version] += 1
+            usm_name = str(msg.get("username", "") or "").strip()
+            if usm_name:
+                usm_users[usm_name] += 1
             if community:
                 community_counts[community] += 1
             if pdu:
@@ -473,7 +490,13 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
             dst_by_src[src_ip].add(dst_ip)
             community_by_flow[(src_ip, dst_ip)].add(community)
 
-            if ts is not None and pdu in {"GetRequest", "GetNextRequest", "GetBulkRequest", "SetRequest", "InformRequest"}:
+            if ts is not None and pdu in {
+                "GetRequest",
+                "GetNextRequest",
+                "GetBulkRequest",
+                "SetRequest",
+                "InformRequest",
+            }:
                 request_times[(src_ip, dst_ip)].append(ts)
 
             if pdu in {"GetResponse", "SNMPv2-Trap", "Trap", "Report"}:
@@ -506,47 +529,70 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
                     label = OID_LABELS.get(oid)
                     oid_counts[oid] += 1
                     if label:
-                        artifacts.append(SnmpArtifact(kind=label, detail=value, src=src_ip, dst=dst_ip))
+                        artifacts.append(
+                            SnmpArtifact(
+                                kind=label, detail=value, src=src_ip, dst=dst_ip
+                            )
+                        )
                     if label == "sysName" and value:
                         hostnames[value] += 1
                     if label == "sysDescr" and value:
                         plaintext_strings[_truncate(value, 120)] += 1
                         if "windows" in value.lower():
-                            detections.append({
-                                "severity": "info",
-                                "summary": "Windows SNMP device observed",
-                                "details": f"{src_ip}->{dst_ip} {value[:80]}",
-                                "source": "SNMP",
-                            })
-                        for detail in device_fingerprints_from_text(value, source="SNMP sysDescr"):
+                            detections.append(
+                                {
+                                    "severity": "info",
+                                    "summary": "Windows SNMP device observed",
+                                    "details": f"{src_ip}->{dst_ip} {value[:80]}",
+                                    "source": "SNMP",
+                                }
+                            )
+                        for detail in device_fingerprints_from_text(
+                            value, source="SNMP sysDescr"
+                        ):
                             key = f"device:{detail}"
                             if key in seen_device_artifacts:
                                 continue
                             seen_device_artifacts.add(key)
-                            artifacts.append(SnmpArtifact(kind="device", detail=detail, src=src_ip, dst=dst_ip))
+                            artifacts.append(
+                                SnmpArtifact(
+                                    kind="device", detail=detail, src=src_ip, dst=dst_ip
+                                )
+                            )
                     if label == "ipAdEntAddr" and value:
                         ip_addresses[value] += 1
                     if label == "ifPhysAddress":
                         mac = _format_mac(value)
                         if mac:
                             mac_addresses[mac] += 1
-                    if label in {"hrSWRunName", "hrSWInstalledName", "hrDeviceDescr"} and value:
+                    if (
+                        label in {"hrSWRunName", "hrSWInstalledName", "hrDeviceDescr"}
+                        and value
+                    ):
                         services[_truncate(value, 80)] += 1
-                        for detail in device_fingerprints_from_text(value, source=f"SNMP {label}"):
+                        for detail in device_fingerprints_from_text(
+                            value, source=f"SNMP {label}"
+                        ):
                             key = f"device:{detail}"
                             if key in seen_device_artifacts:
                                 continue
                             seen_device_artifacts.add(key)
-                            artifacts.append(SnmpArtifact(kind="device", detail=detail, src=src_ip, dst=dst_ip))
+                            artifacts.append(
+                                SnmpArtifact(
+                                    kind="device", detail=detail, src=src_ip, dst=dst_ip
+                                )
+                            )
                     if value:
                         for pattern, reason in SUSPICIOUS_PATTERNS:
                             if pattern.search(value):
-                                detections.append({
-                                    "severity": "warning",
-                                    "summary": f"Suspicious SNMP value: {reason}",
-                                    "details": f"{src_ip}->{dst_ip} {value[:120]}",
-                                    "source": "SNMP",
-                                })
+                                detections.append(
+                                    {
+                                        "severity": "warning",
+                                        "summary": f"Suspicious SNMP value: {reason}",
+                                        "details": f"{src_ip}->{dst_ip} {value[:120]}",
+                                        "source": "SNMP",
+                                    }
+                                )
     except Exception as exc:
         errors.append(str(exc))
     finally:
@@ -558,79 +604,95 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
 
     for community in list(community_counts.keys()):
         if community.lower() in {"public", "private"}:
-            detections.append({
-                "severity": "high",
-                "summary": "Default SNMP community string detected",
-                "details": f"Community '{community}' observed; review access controls.",
-                "source": "SNMP",
-            })
+            detections.append(
+                {
+                    "severity": "high",
+                    "summary": "Default SNMP community string detected",
+                    "details": f"Community '{community}' observed; review access controls.",
+                    "source": "SNMP",
+                }
+            )
 
     if pdu_counts.get("SetRequest"):
-        detections.append({
-            "severity": "high",
-            "summary": "SNMP SET operations observed",
-            "details": f"{pdu_counts.get('SetRequest')} SetRequest PDU(s) detected.",
-            "source": "SNMP",
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "SNMP SET operations observed",
+                "details": f"{pdu_counts.get('SetRequest')} SetRequest PDU(s) detected.",
+                "source": "SNMP",
+            }
+        )
 
     if version_counts.get("v1"):
-        detections.append({
-            "severity": "warning",
-            "summary": "Legacy SNMPv1 observed",
-            "details": f"{version_counts.get('v1')} SNMPv1 message(s) detected.",
-            "source": "SNMP",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Legacy SNMPv1 observed",
+                "details": f"{version_counts.get('v1')} SNMPv1 message(s) detected.",
+                "source": "SNMP",
+            }
+        )
 
     for src, dsts in dst_by_src.items():
         if len(dsts) >= 20:
-            detections.append({
-                "severity": "warning",
-                "summary": "SNMP scanning/probing detected",
-                "details": f"{src} contacted {len(dsts)} SNMP endpoints.",
-                "source": "SNMP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SNMP scanning/probing detected",
+                    "details": f"{src} contacted {len(dsts)} SNMP endpoints.",
+                    "source": "SNMP",
+                }
+            )
 
     for (src, dst), comms in community_by_flow.items():
         if len(comms) >= 6:
-            detections.append({
-                "severity": "warning",
-                "summary": "SNMP community brute-force suspected",
-                "details": f"{src} tried {len(comms)} community strings against {dst}.",
-                "source": "SNMP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SNMP community brute-force suspected",
+                    "details": f"{src} tried {len(comms)} community strings against {dst}.",
+                    "source": "SNMP",
+                }
+            )
 
     for flow, times in request_times.items():
         score = _beacon_score(times)
         if score:
-            detections.append({
-                "severity": "warning",
-                "summary": "SNMP beaconing suspected",
-                "details": f"{flow[0]}->{flow[1]} avg {score['avg']:.1f}s interval.",
-                "source": "SNMP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SNMP beaconing suspected",
+                    "details": f"{flow[0]}->{flow[1]} avg {score['avg']:.1f}s interval.",
+                    "source": "SNMP",
+                }
+            )
 
     for flow, resp_bytes in response_bytes.items():
         req_bytes = request_bytes.get(flow, 1)
         if resp_bytes > 50_000 and resp_bytes > req_bytes * 5:
-            detections.append({
-                "severity": "warning",
-                "summary": "SNMP data exfiltration suspected",
-                "details": f"{flow[0]}->{flow[1]} response bytes {resp_bytes}.",
-                "source": "SNMP",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "SNMP data exfiltration suspected",
+                    "details": f"{flow[0]}->{flow[1]} response bytes {resp_bytes}.",
+                    "source": "SNMP",
+                }
+            )
 
     conversations: list[SnmpConversation] = []
     for (src, dst, proto, port), data in conv_map.items():
-        conversations.append(SnmpConversation(
-            client_ip=src,
-            server_ip=dst,
-            protocol=proto,
-            server_port=port,
-            packets=int(data["packets"]),
-            bytes=int(data["bytes"]),
-            first_seen=data.get("first_seen"),
-            last_seen=data.get("last_seen"),
-        ))
+        conversations.append(
+            SnmpConversation(
+                client_ip=src,
+                server_ip=dst,
+                protocol=proto,
+                server_port=port,
+                packets=int(data["packets"]),
+                bytes=int(data["bytes"]),
+                first_seen=data.get("first_seen"),
+                last_seen=data.get("last_seen"),
+            )
+        )
     conversations.sort(key=lambda c: c.packets, reverse=True)
 
     duration_seconds = None
@@ -666,6 +728,7 @@ def analyze_snmp(path: Path, show_status: bool = True, packets: list[object] | N
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        usm_users=usm_users,
     )
 
 
@@ -730,6 +793,7 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
     mac_addresses: Counter[str] = Counter()
     services: Counter[str] = Counter()
     plaintext_strings: Counter[str] = Counter()
+    usm_users: Counter[str] = Counter()
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
     artifacts: list[SnmpArtifact] = []
@@ -766,9 +830,14 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
         mac_addresses.update(summary.mac_addresses)
         services.update(summary.services)
         plaintext_strings.update(summary.plaintext_strings)
+        usm_users.update(getattr(summary, "usm_users", Counter()))
 
         for item in summary.detections:
-            key = (str(item.get("severity", "")), str(item.get("summary", "")), str(item.get("details", "")))
+            key = (
+                str(item.get("severity", "")),
+                str(item.get("summary", "")),
+                str(item.get("details", "")),
+            )
             if key in det_seen:
                 continue
             det_seen.add(key)
@@ -796,9 +865,13 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
                 continue
             current["packets"] = int(current["packets"]) + conv.packets
             current["bytes"] = int(current["bytes"]) + conv.bytes
-            if conv.first_seen is not None and (current["first_seen"] is None or conv.first_seen < current["first_seen"]):
+            if conv.first_seen is not None and (
+                current["first_seen"] is None or conv.first_seen < current["first_seen"]
+            ):
                 current["first_seen"] = conv.first_seen
-            if conv.last_seen is not None and (current["last_seen"] is None or conv.last_seen > current["last_seen"]):
+            if conv.last_seen is not None and (
+                current["last_seen"] is None or conv.last_seen > current["last_seen"]
+            ):
                 current["last_seen"] = conv.last_seen
 
     conversations = [
@@ -845,4 +918,5 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        usm_users=usm_users,
     )

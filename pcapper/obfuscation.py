@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import base64
+import math
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import base64
-import math
-import re
 from urllib.parse import urlparse
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -34,8 +34,19 @@ ENTROPY_HIGH = 7.2
 PRINTABLE_MIN_RATIO = 0.4
 
 ENCRYPTED_PORTS = {
-    22, 443, 465, 853, 993, 995, 1194, 1701, 1723, 3389,
-    8443, 8883, 9443,
+    22,
+    443,
+    465,
+    853,
+    993,
+    995,
+    1194,
+    1701,
+    1723,
+    3389,
+    8443,
+    8883,
+    9443,
 }
 
 DNS_PORTS = {53}
@@ -46,20 +57,57 @@ HEX_RE = re.compile(r"[0-9A-Fa-f]{80,}")
 
 URL_RE = re.compile(r"(?i)\bhttps?://[^\s\"'<>]{6,}")
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-DOMAIN_RE = re.compile(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b")
+DOMAIN_RE = re.compile(
+    r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b"
+)
 EMAIL_RE = re.compile(r"(?i)\b[a-z0-9._%+-]{1,64}@[a-z0-9.-]+\.[a-z]{2,63}\b")
 HASH_RE = re.compile(r"\b[A-Fa-f0-9]{32,64}\b")
 
 ATTACK_MARKERS: list[tuple[re.Pattern[str], str, str]] = [
-    (re.compile(r"(?i)powershell(?:\.exe)?\s+-e(?:n(?:c(?:odedcommand)?)?)?\b|frombase64string"), "T1059.001", "PowerShell Encoded Command"),
-    (re.compile(r"(?i)\bcmd(?:\.exe)?\b|/bin/(?:sh|bash)\b"), "T1059", "Command Shell Invocation"),
-    (re.compile(r"(?i)invoke-webrequest|downloadstring|new-object\s+net\.webclient|curl\s+https?://|wget\s+https?://"), "T1105", "Ingress Tool Transfer"),
-    (re.compile(r"(?i)\b(certutil|bitsadmin|mshta|rundll32|regsvr32|wmic)\b"), "T1218", "Signed Binary Proxy Execution"),
-    (re.compile(r"(?i)\bmimikatz|sekurlsa|lsass\b"), "T1003", "Credential Dumping Indicators"),
-    (re.compile(r"(?i)\bstratum\+tcp://|xmrig|minerd\b"), "T1496", "Resource Hijacking / Mining"),
+    (
+        re.compile(
+            r"(?i)powershell(?:\.exe)?\s+-e(?:n(?:c(?:odedcommand)?)?)?\b|frombase64string"
+        ),
+        "T1059.001",
+        "PowerShell Encoded Command",
+    ),
+    (
+        re.compile(r"(?i)\bcmd(?:\.exe)?\b|/bin/(?:sh|bash)\b"),
+        "T1059",
+        "Command Shell Invocation",
+    ),
+    (
+        re.compile(
+            r"(?i)invoke-webrequest|downloadstring|new-object\s+net\.webclient|curl\s+https?://|wget\s+https?://"
+        ),
+        "T1105",
+        "Ingress Tool Transfer",
+    ),
+    (
+        re.compile(r"(?i)\b(certutil|bitsadmin|mshta|rundll32|regsvr32|wmic)\b"),
+        "T1218",
+        "Signed Binary Proxy Execution",
+    ),
+    (
+        re.compile(r"(?i)\bmimikatz|sekurlsa|lsass\b"),
+        "T1003",
+        "Credential Dumping Indicators",
+    ),
+    (
+        re.compile(r"(?i)\bstratum\+tcp://|xmrig|minerd\b"),
+        "T1496",
+        "Resource Hijacking / Mining",
+    ),
 ]
 
-INTERNAL_DOMAIN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".corp", ".intranet")
+INTERNAL_DOMAIN_SUFFIXES = (
+    ".local",
+    ".lan",
+    ".home",
+    ".internal",
+    ".corp",
+    ".intranet",
+)
 
 
 @dataclass(frozen=True)
@@ -197,6 +245,75 @@ def _printable_ratio(data: bytes) -> float:
     return printable / len(data)
 
 
+# Magic-byte prefixes of content that is high-entropy BY DESIGN (compression /
+# media containers). Such payloads are not covert channels — excluding them
+# removes the dominant false positive on benign web traffic (gzip responses,
+# images, fonts, video) while leaving raw encrypted/packed malware payloads
+# (e.g. an application/octet-stream blob with no recognizable structure) flagged.
+_COMPRESSED_MEDIA_MAGIC = (
+    b"\x1f\x8b",          # gzip
+    b"\x78\x01", b"\x78\x9c", b"\x78\xda",  # zlib/deflate
+    b"\x89PNG",           # PNG
+    b"\xff\xd8\xff",      # JPEG
+    b"GIF87a", b"GIF89a", # GIF
+    b"BM",                # BMP (often low-entropy, harmless to skip)
+    b"PK\x03\x04", b"PK\x05\x06",  # ZIP / Office / JAR / XAP
+    b"Rar!",              # RAR
+    b"7z\xbc\xaf",        # 7z
+    b"RIFF",              # WebP / WAV / AVI
+    b"OggS",              # Ogg
+    b"ID3",               # MP3
+    b"\xff\xfb",          # MP3 frame
+    b"fLaC",              # FLAC
+    b"\x00\x00\x01\xba", b"\x00\x00\x01\xb3",  # MPEG
+    b"wOFF", b"wOF2", b"\x00\x01\x00\x00",  # fonts (WOFF/WOFF2/TTF)
+    b"BZh",               # bzip2
+    b"\xfd7zXZ",          # xz
+)
+
+
+def _looks_compressed_or_media(data: bytes) -> bool:
+    if len(data) < 4:
+        return False
+    if any(data.startswith(magic) for magic in _COMPRESSED_MEDIA_MAGIC):
+        return True
+    # MP4/MOV: "....ftyp" at offset 4.
+    if data[4:8] == b"ftyp":
+        return True
+    return False
+
+
+def _http_declares_compressed_or_media(text: str) -> bool:
+    """True if an HTTP response header block declares a compressed transfer or
+    a media/compressed content type (so its high-entropy body is expected)."""
+    head = text[:1024].lower()
+    if "http/" not in head:
+        return False
+    if "content-encoding:" in head and any(
+        enc in head for enc in ("gzip", "deflate", "br", "compress", "zstd")
+    ):
+        return True
+    if "content-type:" in head and any(
+        ct in head
+        for ct in (
+            "image/",
+            "video/",
+            "audio/",
+            "font/",
+            "application/font",
+            "application/zip",
+            "application/x-gzip",
+            "application/gzip",
+            "application/x-7z",
+            "application/x-rar",
+            "application/java-archive",
+            "application/x-shockwave-flash",
+        )
+    ):
+        return True
+    return False
+
+
 def _is_valid_ipv4(value: str) -> bool:
     parts = value.split(".")
     if len(parts) != 4:
@@ -218,7 +335,9 @@ def _service_port(src_port: Optional[int], dst_port: Optional[int]) -> Optional[
     return dst_port or src_port
 
 
-def _flow_id(proto: str, src: str, src_port: Optional[int], dst: str, dst_port: Optional[int]) -> str:
+def _flow_id(
+    proto: str, src: str, src_port: Optional[int], dst: str, dst_port: Optional[int]
+) -> str:
     src_label = f"{src}:{src_port}" if src_port else src
     dst_label = f"{dst}:{dst_port}" if dst_port else dst
     return f"{proto} {src_label} -> {dst_label}"
@@ -597,8 +716,12 @@ def _extract_decoded_artifacts(
         )
 
 
-def _port_attack_signal(src_port: Optional[int], dst_port: Optional[int]) -> tuple[str, str] | None:
-    ports = {int(port) for port in (src_port, dst_port) if isinstance(port, int) and port > 0}
+def _port_attack_signal(
+    src_port: Optional[int], dst_port: Optional[int]
+) -> tuple[str, str] | None:
+    ports = {
+        int(port) for port in (src_port, dst_port) if isinstance(port, int) and port > 0
+    }
     if ports & DNS_PORTS:
         return "T1071.004", "DNS Application Layer Protocol"
     if ports & WEB_TUNNEL_PORTS:
@@ -606,7 +729,9 @@ def _port_attack_signal(src_port: Optional[int], dst_port: Optional[int]) -> tup
     return None
 
 
-def merge_obfuscation_summaries(summaries: list[ObfuscationSummary]) -> ObfuscationSummary:
+def merge_obfuscation_summaries(
+    summaries: list[ObfuscationSummary],
+) -> ObfuscationSummary:
     if not summaries:
         return _empty_summary(Path("ALL_PCAPS"))
 
@@ -630,9 +755,70 @@ def merge_obfuscation_summaries(summaries: list[ObfuscationSummary]) -> Obfuscat
     detections: list[dict[str, object]] = []
     errors: list[str] = []
 
-    session_map: dict[str, ObfuscationSessionStat] = {}
+    total_sessions = 0
+    suspicious_sessions = 0
+    session_stats: list[ObfuscationSessionStat] = []
     artifacts: list[ObfuscationArtifact] = []
-    artifact_seen: set[tuple[str, str, str, str, str, str, str]] = set()
+
+    def _scoped_flow_id(path: Path, flow_id: str) -> str:
+        label = path.name or str(path)
+        return f"{label}::{flow_id}"
+
+    def _scope_hit(path: Path, hit: ObfuscationHit) -> ObfuscationHit:
+        return ObfuscationHit(
+            kind=hit.kind,
+            proto=hit.proto,
+            flow_id=_scoped_flow_id(path, hit.flow_id),
+            src=hit.src,
+            dst=hit.dst,
+            src_port=hit.src_port,
+            dst_port=hit.dst_port,
+            length=hit.length,
+            entropy=hit.entropy,
+            printable_ratio=hit.printable_ratio,
+            sample=hit.sample,
+            ts=hit.ts,
+            packet_index=hit.packet_index,
+            reasoning=hit.reasoning,
+        )
+
+    def _scope_session(path: Path, session: ObfuscationSessionStat) -> ObfuscationSessionStat:
+        return ObfuscationSessionStat(
+            flow_id=_scoped_flow_id(path, session.flow_id),
+            proto=session.proto,
+            src=session.src,
+            dst=session.dst,
+            src_port=session.src_port,
+            dst_port=session.dst_port,
+            packets=session.packets,
+            payload_bytes=session.payload_bytes,
+            suspicious_packets=session.suspicious_packets,
+            suspicious_payload_bytes=session.suspicious_payload_bytes,
+            high_entropy_hits=session.high_entropy_hits,
+            base64_hits=session.base64_hits,
+            hex_hits=session.hex_hits,
+            first_seen=session.first_seen,
+            last_seen=session.last_seen,
+            duration_seconds=session.duration_seconds,
+            avg_entropy=session.avg_entropy,
+            max_entropy=session.max_entropy,
+        )
+
+    def _scope_artifact(path: Path, artifact: ObfuscationArtifact) -> ObfuscationArtifact:
+        return ObfuscationArtifact(
+            kind=artifact.kind,
+            value=artifact.value,
+            source_kind=artifact.source_kind,
+            src=artifact.src,
+            dst=artifact.dst,
+            src_port=artifact.src_port,
+            dst_port=artifact.dst_port,
+            proto=artifact.proto,
+            flow_id=_scoped_flow_id(path, artifact.flow_id),
+            ts=artifact.ts,
+            confidence=artifact.confidence,
+            reasoning=artifact.reasoning,
+        )
 
     for summary in summaries:
         total_packets += summary.total_packets
@@ -640,13 +826,21 @@ def merge_obfuscation_summaries(summaries: list[ObfuscationSummary]) -> Obfuscat
         suspicious_packets += summary.suspicious_packets
         suspicious_payload_bytes += summary.suspicious_payload_bytes
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
-        high_entropy_hits.extend(summary.high_entropy_hits)
-        base64_hits.extend(summary.base64_hits)
-        hex_hits.extend(summary.hex_hits)
+        high_entropy_hits.extend(_scope_hit(summary.path, hit) for hit in summary.high_entropy_hits)
+        base64_hits.extend(_scope_hit(summary.path, hit) for hit in summary.base64_hits)
+        hex_hits.extend(_scope_hit(summary.path, hit) for hit in summary.hex_hits)
         source_counts.update(summary.source_counts)
         destination_counts.update(summary.destination_counts)
         protocol_counts.update(summary.protocol_counts)
@@ -656,74 +850,20 @@ def merge_obfuscation_summaries(summaries: list[ObfuscationSummary]) -> Obfuscat
         attack_counts.update(summary.attack_counts)
         detections.extend(summary.detections)
         errors.extend(summary.errors)
-
-        for session in summary.session_stats:
-            existing = session_map.get(session.flow_id)
-            if existing is None:
-                session_map[session.flow_id] = session
-                continue
-            packets = existing.packets + session.packets
-            payload_bytes = existing.payload_bytes + session.payload_bytes
-            suspicious_pkts = existing.suspicious_packets + session.suspicious_packets
-            suspicious_bytes = existing.suspicious_payload_bytes + session.suspicious_payload_bytes
-            first_val = existing.first_seen
-            if session.first_seen is not None:
-                first_val = session.first_seen if first_val is None else min(first_val, session.first_seen)
-            last_val = existing.last_seen
-            if session.last_seen is not None:
-                last_val = session.last_seen if last_val is None else max(last_val, session.last_seen)
-            duration = None
-            if first_val is not None and last_val is not None:
-                duration = max(0.0, last_val - first_val)
-            if packets > 0:
-                avg_entropy = (
-                    (existing.avg_entropy * existing.packets) + (session.avg_entropy * session.packets)
-                ) / packets
-            else:
-                avg_entropy = max(existing.avg_entropy, session.avg_entropy)
-            session_map[session.flow_id] = ObfuscationSessionStat(
-                flow_id=session.flow_id,
-                proto=existing.proto,
-                src=existing.src,
-                dst=existing.dst,
-                src_port=existing.src_port,
-                dst_port=existing.dst_port,
-                packets=packets,
-                payload_bytes=payload_bytes,
-                suspicious_packets=suspicious_pkts,
-                suspicious_payload_bytes=suspicious_bytes,
-                high_entropy_hits=existing.high_entropy_hits + session.high_entropy_hits,
-                base64_hits=existing.base64_hits + session.base64_hits,
-                hex_hits=existing.hex_hits + session.hex_hits,
-                first_seen=first_val,
-                last_seen=last_val,
-                duration_seconds=duration,
-                avg_entropy=avg_entropy,
-                max_entropy=max(existing.max_entropy, session.max_entropy),
-            )
-
-        for artifact in summary.artifacts:
-            key = (
-                artifact.kind,
-                artifact.value.lower(),
-                artifact.source_kind,
-                artifact.src,
-                artifact.dst,
-                artifact.proto,
-                artifact.flow_id,
-            )
-            if key in artifact_seen:
-                continue
-            artifact_seen.add(key)
-            if len(artifacts) < MAX_ARTIFACTS:
-                artifacts.append(artifact)
+        total_sessions += summary.total_sessions
+        suspicious_sessions += summary.suspicious_sessions
+        session_stats.extend(_scope_session(summary.path, item) for item in summary.session_stats)
+        artifacts.extend(_scope_artifact(summary.path, item) for item in summary.artifacts)
 
     session_stats = sorted(
-        session_map.values(),
-        key=lambda item: (item.suspicious_packets, item.suspicious_payload_bytes, item.max_entropy),
+        session_stats,
+        key=lambda item: (
+            item.suspicious_packets,
+            item.suspicious_payload_bytes,
+            item.max_entropy,
+        ),
         reverse=True,
-    )[:MAX_SESSIONS]
-    suspicious_sessions = sum(1 for session in session_stats if session.suspicious_packets > 0)
+    )
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
@@ -737,11 +877,11 @@ def merge_obfuscation_summaries(summaries: list[ObfuscationSummary]) -> Obfuscat
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
-        total_sessions=len(session_stats),
+        total_sessions=total_sessions,
         suspicious_sessions=suspicious_sessions,
-        high_entropy_hits=high_entropy_hits[:MAX_HITS],
-        base64_hits=base64_hits[:MAX_HITS],
-        hex_hits=hex_hits[:MAX_HITS],
+        high_entropy_hits=high_entropy_hits,
+        base64_hits=base64_hits,
+        hex_hits=hex_hits,
         source_counts=source_counts,
         destination_counts=destination_counts,
         protocol_counts=protocol_counts,
@@ -756,14 +896,26 @@ def merge_obfuscation_summaries(summaries: list[ObfuscationSummary]) -> Obfuscat
     )
 
 
-def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSummary:
+@memoize_analysis
+def analyze_obfuscation(
+    path: Path,
+    show_status: bool = True,
+    *,
+    packets: list[object] | None = None,
+    meta: object | None = None,
+) -> ObfuscationSummary:
     if TCP is None and UDP is None:
         summary = _empty_summary(path)
         return ObfuscationSummary(
             **{**summary.__dict__, "errors": ["Scapy TCP/UDP unavailable"]},
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    # Reuse the single pre-loaded packet set / file metadata when the CLI passes
+    # them, instead of re-reading the pcap from disk (perf on large captures in
+    # multi-function runs).
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, packets=packets, meta=meta, show_status=show_status
+    )
     total_packets = 0
     total_payload_bytes = 0
     suspicious_packets = 0
@@ -784,6 +936,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
     errors: list[str] = []
 
     flow_state: dict[str, dict[str, object]] = {}
+    # Flows whose payload is high-entropy by design (gzip/compressed/media) and
+    # therefore must NOT be counted as covert-channel/high-entropy hits.
+    expected_he_flows: set[str] = set()
     artifacts: list[ObfuscationArtifact] = []
     artifact_seen: set[tuple[str, str, str, str, str, str, str]] = set()
 
@@ -800,14 +955,7 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
 
             total_packets += 1
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IP].src)  # type: ignore[index]
-                dst_ip = str(pkt[IP].dst)  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IPv6].src)  # type: ignore[index]
-                dst_ip = str(pkt[IPv6].dst)  # type: ignore[index]
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 
@@ -867,11 +1015,21 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
             text = sample.decode("latin-1", errors="ignore")
             packet_suspicious = False
 
+            # Once a flow is identified as compressed/media content, every
+            # subsequent (header-less) high-entropy body segment of that flow is
+            # expected and must be excluded.
+            if flow not in expected_he_flows and (
+                _looks_compressed_or_media(sample)
+                or _http_declares_compressed_or_media(text)
+            ):
+                expected_he_flows.add(flow)
+
             high_entropy_match = (
                 entropy_val >= ENTROPY_HIGH
                 and printable_val <= PRINTABLE_MIN_RATIO
                 and (src_port not in ENCRYPTED_PORTS)
                 and (dst_port not in ENCRYPTED_PORTS)
+                and flow not in expected_he_flows
             )
             if high_entropy_match:
                 packet_suspicious = True
@@ -925,6 +1083,42 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
 
             for match in BASE64_RE.finditer(text):
                 token = match.group(0)
+                # Always decode for IOC/artifact extraction...
+                decoded = _safe_base64_decode(token)
+                ioc_before = sum(ioc_counts.values()) + sum(attack_counts.values())
+                if decoded:
+                    _extract_decoded_artifacts(
+                        decoded,
+                        source_kind="base64",
+                        src=src_ip,
+                        dst=dst_ip,
+                        src_port=src_port,
+                        dst_port=dst_port,
+                        proto=proto,
+                        flow_id=flow,
+                        ts=ts,
+                        artifacts=artifacts,
+                        artifact_seen=artifact_seen,
+                        ioc_counts=ioc_counts,
+                        attack_counts=attack_counts,
+                    )
+                # ...but only treat the token itself as a covert/obfuscation
+                # signal when it decodes to binary-like content (a tunneled
+                # payload) or yields an IOC/attack artifact. Plain base64 of
+                # readable text -- cookies, JWTs, ETags, MIME bodies -- is
+                # ubiquitous and benign, and flagging all of it floods the report.
+                decoded_binary = False
+                if decoded:
+                    printable = sum(
+                        1 for b in decoded if b in (9, 10, 13) or 32 <= b <= 126
+                    )
+                    ratio = printable / len(decoded)
+                    decoded_binary = ratio < 0.75
+                gained_ioc = (
+                    sum(ioc_counts.values()) + sum(attack_counts.values())
+                ) > ioc_before
+                if not (decoded_binary or gained_ioc):
+                    continue
                 if len(base64_hits) < MAX_HITS:
                     base64_hits.append(
                         ObfuscationHit(
@@ -942,18 +1136,29 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
                             ts=ts,
                             packet_index=pkt_index,
                             reasoning=(
-                                f"Base64-like token length {len(token)} detected; decoded for IOC/artifact extraction."
+                                f"Base64 token length {len(token)} decoded to "
+                                + (
+                                    "binary/non-text payload"
+                                    if decoded_binary
+                                    else "content containing IOC/attack indicators"
+                                )
                             ),
                         )
                     )
                 packet_suspicious = True
                 state["base64_hits"] = int(state["base64_hits"]) + 1
                 hit_kind_counts["base64"] += 1
-                decoded = _safe_base64_decode(token)
+                break
+
+            for match in HEX_RE.finditer(text):
+                token = match.group(0)
+                # Always decode for IOC/artifact extraction...
+                decoded = _safe_hex_decode(token)
+                ioc_before = sum(ioc_counts.values()) + sum(attack_counts.values())
                 if decoded:
                     _extract_decoded_artifacts(
                         decoded,
-                        source_kind="base64",
+                        source_kind="hex",
                         src=src_ip,
                         dst=dst_ip,
                         src_port=src_port,
@@ -966,10 +1171,22 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
                         ioc_counts=ioc_counts,
                         attack_counts=attack_counts,
                     )
-                break
-
-            for match in HEX_RE.finditer(text):
-                token = match.group(0)
+                # ...but only treat the token as a covert/obfuscation signal when
+                # it decodes to binary-like content or yields an IOC/attack
+                # artifact. Long hex tokens are common in benign API traffic
+                # (request IDs, ETags, signatures) -- flagging all of them floods
+                # the report (mirrors the base64 gate above).
+                decoded_binary = False
+                if decoded:
+                    printable = sum(
+                        1 for b in decoded if b in (9, 10, 13) or 32 <= b <= 126
+                    )
+                    decoded_binary = (printable / len(decoded)) < 0.75
+                gained_ioc = (
+                    sum(ioc_counts.values()) + sum(attack_counts.values())
+                ) > ioc_before
+                if not (decoded_binary or gained_ioc):
+                    continue
                 if len(hex_hits) < MAX_HITS:
                     hex_hits.append(
                         ObfuscationHit(
@@ -987,37 +1204,27 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
                             ts=ts,
                             packet_index=pkt_index,
                             reasoning=(
-                                f"Hex-like token length {len(token)} detected; decoded for IOC/artifact extraction."
+                                f"Hex token length {len(token)} decoded to "
+                                + (
+                                    "binary/non-text payload"
+                                    if decoded_binary
+                                    else "content containing IOC/attack indicators"
+                                )
                             ),
                         )
                     )
                 packet_suspicious = True
                 state["hex_hits"] = int(state["hex_hits"]) + 1
                 hit_kind_counts["hex"] += 1
-                decoded = _safe_hex_decode(token)
-                if decoded:
-                    _extract_decoded_artifacts(
-                        decoded,
-                        source_kind="hex",
-                        src=src_ip,
-                        dst=dst_ip,
-                        src_port=src_port,
-                        dst_port=dst_port,
-                        proto=proto,
-                        flow_id=flow,
-                        ts=ts,
-                        artifacts=artifacts,
-                        artifact_seen=artifact_seen,
-                        ioc_counts=ioc_counts,
-                        attack_counts=attack_counts,
-                    )
                 break
 
             if packet_suspicious:
                 suspicious_packets += 1
                 suspicious_payload_bytes += len(payload)
                 state["suspicious_packets"] = int(state["suspicious_packets"]) + 1
-                state["suspicious_payload_bytes"] = int(state["suspicious_payload_bytes"]) + len(payload)
+                state["suspicious_payload_bytes"] = int(
+                    state["suspicious_payload_bytes"]
+                ) + len(payload)
                 source_counts[src_ip] += 1
                 destination_counts[dst_ip] += 1
                 protocol_counts[proto] += 1
@@ -1035,7 +1242,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
     for state in flow_state.values():
         packets = int(state["packets"])
         entropy_count = int(state["entropy_count"])
-        avg_entropy = (float(state["entropy_sum"]) / entropy_count) if entropy_count else 0.0
+        avg_entropy = (
+            (float(state["entropy_sum"]) / entropy_count) if entropy_count else 0.0
+        )
         first_ts = state["first_seen"]
         last_ts = state["last_seen"]
         duration = None
@@ -1064,17 +1273,25 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
             )
         )
     session_stats.sort(
-        key=lambda item: (item.suspicious_packets, item.suspicious_payload_bytes, item.max_entropy),
+        key=lambda item: (
+            item.suspicious_packets,
+            item.suspicious_payload_bytes,
+            item.max_entropy,
+        ),
         reverse=True,
     )
     session_stats = session_stats[:MAX_SESSIONS]
-    suspicious_sessions = sum(1 for item in session_stats if item.suspicious_packets > 0)
+    suspicious_sessions = sum(
+        1 for item in session_stats if item.suspicious_packets > 0
+    )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
 
-    session_lookup: dict[str, ObfuscationSessionStat] = {item.flow_id: item for item in session_stats}
+    session_lookup: dict[str, ObfuscationSessionStat] = {
+        item.flow_id: item for item in session_stats
+    }
     detections: list[dict[str, object]] = []
 
     def _hit_evidence(hits: list[ObfuscationHit], limit: int = 6) -> list[str]:
@@ -1085,7 +1302,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
             if session:
                 ratio = 0.0
                 if session.payload_bytes:
-                    ratio = (session.suspicious_payload_bytes / session.payload_bytes) * 100.0
+                    ratio = (
+                        session.suspicious_payload_bytes / session.payload_bytes
+                    ) * 100.0
                 session_bits = (
                     f" session={session.suspicious_packets}/{session.packets}pkt "
                     f"susp_bytes={session.suspicious_payload_bytes}/{session.payload_bytes} ({ratio:.1f}%)"
@@ -1159,7 +1378,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
             )
 
     if ioc_counts:
-        ioc_evidence = [f"{name} ({count})" for name, count in ioc_counts.most_common(8)]
+        ioc_evidence = [
+            f"{name} ({count})" for name, count in ioc_counts.most_common(8)
+        ]
         detections.append(
             {
                 "severity": "high",
@@ -1172,7 +1393,9 @@ def analyze_obfuscation(path: Path, show_status: bool = True) -> ObfuscationSumm
             }
         )
     if attack_counts:
-        attack_evidence = [f"{name} ({count})" for name, count in attack_counts.most_common(8)]
+        attack_evidence = [
+            f"{name} ({count})" for name, count in attack_counts.most_common(8)
+        ]
         detections.append(
             {
                 "severity": "high",

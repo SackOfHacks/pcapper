@@ -1,24 +1,28 @@
 from __future__ import annotations
 
+
+import hashlib
 from collections import Counter, defaultdict
 from numbers import Real
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .pcap_cache import PcapMeta, get_reader
+from .pcap_cache import PcapMeta, get_reader, load_capture_meta
 
 try:
+    from scapy.layers.inet import IP, TCP, UDP  # type: ignore
+    from scapy.layers.inet6 import IPv6  # type: ignore
     from scapy.layers.l2 import Dot1Q, Ether  # type: ignore
-    from scapy.layers.inet import TCP, UDP  # type: ignore
+    from scapy.packet import Raw  # type: ignore
 except Exception:  # pragma: no cover
     Dot1Q = None  # type: ignore
     TCP = UDP = None  # type: ignore
+    IP = IPv6 = Raw = None  # type: ignore
     Ether = None  # type: ignore
 
 from .models import InterfaceStat, PcapSummary
-from .utils import detect_file_type
 from .services import COMMON_PORTS
-
+from .utils import detect_file_type, extract_packet_endpoints, memoize_analysis
 
 IGNORE_LAYERS = {"Raw", "Padding", "NoPayload"}
 
@@ -91,14 +95,32 @@ def _get_iface_key(pkt) -> Optional[object]:
     if iface:
         return iface
 
-    for attr in ("interface", "iface", "ifname", "if_name", "ifindex", "if_index", "if_id", "ifid"):
+    for attr in (
+        "interface",
+        "iface",
+        "ifname",
+        "if_name",
+        "ifindex",
+        "if_index",
+        "if_id",
+        "ifid",
+    ):
         value = getattr(pkt, attr, None)
         if value is not None:
             return value
 
     metadata = getattr(pkt, "metadata", None)
     if isinstance(metadata, dict):
-        for key in ("ifname", "interface", "iface", "if_name", "ifindex", "if_index", "if_id", "ifid"):
+        for key in (
+            "ifname",
+            "interface",
+            "iface",
+            "if_name",
+            "ifindex",
+            "if_index",
+            "if_id",
+            "ifid",
+        ):
             if key in metadata and metadata[key] is not None:
                 return metadata[key]
     return None
@@ -136,23 +158,50 @@ def _as_int(value: object | None) -> Optional[int]:
         return None
 
 
+def _hash_capture_file(path: Path) -> tuple[str | None, str | None]:
+    sha256 = hashlib.sha256()
+    sha1 = hashlib.sha1()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                sha256.update(chunk)
+                sha1.update(chunk)
+    except Exception:
+        return None, None
+    return sha256.hexdigest(), sha1.hexdigest()
+
+
+@memoize_analysis
 def analyze_pcap(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
     meta: PcapMeta | None = None,
 ) -> PcapSummary:
-    file_type = meta.file_type if meta else detect_file_type(path)
-    size_bytes = meta.size_bytes if meta else path.stat().st_size
+    capture_meta = meta
+    if capture_meta is None:
+        try:
+            capture_meta = load_capture_meta(path)
+        except Exception:
+            capture_meta = None
+
+    file_type = capture_meta.file_type if capture_meta else detect_file_type(path)
+    size_bytes = capture_meta.size_bytes if capture_meta else path.stat().st_size
+    hash_sha256, hash_sha1 = _hash_capture_file(path)
     packet_count = 0
     start_ts: Optional[float] = None
     end_ts: Optional[float] = None
     protocol_counts: Counter[str] = Counter()
     iface_counts = defaultdict(int)
     iface_vlans = defaultdict(set)
+    tcp_packets = 0
+    retransmissions = 0
+    seen_seq: defaultdict[tuple[str, str, int, int], set[tuple[int, int]]] = (
+        defaultdict(set)
+    )
 
     reader, status, stream, _size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
+        path, packets=packets, meta=capture_meta, show_status=show_status
     )
 
     try:
@@ -179,6 +228,8 @@ def analyze_pcap(
                 iface_key = "unknown"
             iface_counts[iface_key] += 1
 
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
+
             if Dot1Q is not None:
                 try:
                     if pkt.haslayer(Dot1Q):  # type: ignore[truthy-bool]
@@ -204,6 +255,33 @@ def analyze_pcap(
             if ethertype_proto:
                 protocol_counts[ethertype_proto] += 1
 
+            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+                tcp_packets += 1
+                if src_ip and dst_ip:
+                    try:
+                        tcp_layer = pkt[TCP]  # type: ignore[index]
+                        seq = int(getattr(tcp_layer, "seq", 0) or 0)
+                        sport = int(getattr(tcp_layer, "sport", 0) or 0)
+                        dport = int(getattr(tcp_layer, "dport", 0) or 0)
+                        payload_len = 0
+                        if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
+                            payload_len = len(bytes(pkt[Raw]))  # type: ignore[index]
+                        else:
+                            try:
+                                payload_len = len(bytes(tcp_layer.payload))
+                            except Exception:
+                                payload_len = 0
+                        key = (src_ip, dst_ip, sport, dport)
+                        sig = (seq, payload_len)
+                        if sig in seen_seq[key]:
+                            retransmissions += 1
+                        else:
+                            seen_seq[key].add(sig)
+                        if len(seen_seq[key]) > 20000:
+                            seen_seq[key].clear()
+                    except Exception:
+                        pass
+
             if status.enabled and stream is not None and size_bytes:
                 try:
                     pos = stream.tell()
@@ -218,6 +296,7 @@ def analyze_pcap(
     duration_seconds = None
     if start_ts is not None and end_ts is not None:
         duration_seconds = max(0.0, end_ts - start_ts)
+    retransmission_rate = (retransmissions / tcp_packets) if tcp_packets else 0.0
 
     interface_stats: list[InterfaceStat] = []
 
@@ -230,7 +309,9 @@ def analyze_pcap(
             vlan_ids.update(iface_vlans.get(key, set()))
         return total, sorted(vlan_ids)
 
-    interfaces = meta.interfaces if meta else getattr(reader, "interfaces", None)
+    interfaces = (
+        capture_meta.interfaces if capture_meta else getattr(reader, "interfaces", None)
+    )
     if interfaces and len(interfaces) > 0:
         all_vlan_ids: set[int] = set()
         for vlan_set in iface_vlans.values():
@@ -247,7 +328,9 @@ def analyze_pcap(
             speed = _iface_get(iface, "speed", "if_speed")
             mac = _iface_get(iface, "mac", "if_macaddr", "if_mac")
             os = _iface_get(iface, "os", "if_os")
-            dropcount = _iface_get(iface, "dropcount", "if_dropcount", "if_drops", "if_drop")
+            dropcount = _iface_get(
+                iface, "dropcount", "if_dropcount", "if_drops", "if_drop"
+            )
             capture_filter = _iface_get(iface, "filter", "if_filter")
 
             iface_id = _iface_get(iface, "id", "if_id", "ifid", "if_index", "ifindex")
@@ -275,8 +358,11 @@ def analyze_pcap(
             interface_stats.append(
                 InterfaceStat(
                     name=_normalize_iface_name(name),
-                    linktype=_as_text(linktype) or _as_text(meta.linktype if meta else None),
-                    snaplen=snaplen if snaplen is not None else (meta.snaplen if meta else None),
+                    linktype=_as_text(linktype)
+                    or _as_text(capture_meta.linktype if capture_meta else None),
+                    snaplen=snaplen
+                    if snaplen is not None
+                    else (capture_meta.snaplen if capture_meta else None),
                     packet_count=iface_count,
                     dropped_packets=_as_int(dropcount),
                     capture_filter=_as_text(capture_filter),
@@ -288,8 +374,12 @@ def analyze_pcap(
                 )
             )
     else:
-        linktype = meta.linktype if meta else getattr(reader, "linktype", None)
-        snaplen = meta.snaplen if meta else getattr(reader, "snaplen", None)
+        linktype = (
+            capture_meta.linktype if capture_meta else getattr(reader, "linktype", None)
+        )
+        snaplen = (
+            capture_meta.snaplen if capture_meta else getattr(reader, "snaplen", None)
+        )
         observed_ifaces = list(iface_counts.keys()) or ["unknown"]
         for iface_key in sorted(observed_ifaces, key=lambda value: str(value)):
             iface_count, vlan_ids = _collect_iface_counts([iface_key])
@@ -298,7 +388,8 @@ def analyze_pcap(
                     name=_normalize_iface_name(iface_key),
                     linktype=str(linktype) if linktype is not None else None,
                     snaplen=snaplen,
-                    packet_count=iface_count or (packet_count if packet_count else None),
+                    packet_count=iface_count
+                    or (packet_count if packet_count else None),
                     dropped_packets=None,
                     capture_filter=None,
                     description=None,
@@ -319,6 +410,18 @@ def analyze_pcap(
         duration_seconds=duration_seconds,
         interface_stats=interface_stats,
         protocol_counts=protocol_counts,
+        tcp_packets=tcp_packets,
+        retransmissions=retransmissions,
+        retransmission_rate=retransmission_rate,
+        capture_hardware=getattr(capture_meta, "capture_hardware", None)
+        if capture_meta
+        else None,
+        capture_os=getattr(capture_meta, "capture_os", None) if capture_meta else None,
+        capture_application=getattr(capture_meta, "capture_application", None)
+        if capture_meta
+        else None,
+        hash_sha256=hash_sha256,
+        hash_sha1=hash_sha1,
     )
 
 
@@ -334,6 +437,14 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
             duration_seconds=0.0,
             interface_stats=[],
             protocol_counts=Counter(),
+            tcp_packets=0,
+            retransmissions=0,
+            retransmission_rate=0.0,
+            capture_hardware=None,
+            capture_os=None,
+            capture_application=None,
+            hash_sha256=None,
+            hash_sha1=None,
         )
 
     file_types = {summary.file_type for summary in summaries if summary.file_type}
@@ -341,15 +452,59 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
     merged_size = sum(summary.size_bytes for summary in summaries)
     merged_packets = sum(summary.packet_count for summary in summaries)
 
-    start_values = [summary.start_ts for summary in summaries if summary.start_ts is not None]
+    start_values = [
+        summary.start_ts for summary in summaries if summary.start_ts is not None
+    ]
     end_values = [summary.end_ts for summary in summaries if summary.end_ts is not None]
     merged_start = min(start_values) if start_values else None
     merged_end = max(end_values) if end_values else None
-    merged_duration = sum((summary.duration_seconds or 0.0) for summary in summaries)
+    if merged_start is not None and merged_end is not None:
+        merged_duration = max(0.0, merged_end - merged_start)
+    else:
+        merged_duration = sum(
+            (summary.duration_seconds or 0.0) for summary in summaries
+        )
 
     merged_protocols: Counter[str] = Counter()
     for summary in summaries:
         merged_protocols.update(summary.protocol_counts)
+    merged_tcp_packets = sum(
+        int(getattr(summary, "tcp_packets", 0) or 0) for summary in summaries
+    )
+    merged_retransmissions = sum(
+        int(getattr(summary, "retransmissions", 0) or 0) for summary in summaries
+    )
+    merged_retransmission_rate = (
+        (merged_retransmissions / merged_tcp_packets) if merged_tcp_packets else 0.0
+    )
+
+    def _merge_capture_field(field_name: str) -> str | None:
+        values = sorted(
+            {
+                str(getattr(summary, field_name, "") or "").strip()
+                for summary in summaries
+                if str(getattr(summary, field_name, "") or "").strip()
+            }
+        )
+        if not values:
+            return None
+        if len(values) == 1:
+            return values[0]
+        return "multiple"
+
+    def _merge_hash_field(field_name: str) -> str | None:
+        values = sorted(
+            {
+                str(getattr(summary, field_name, "") or "").strip()
+                for summary in summaries
+                if str(getattr(summary, field_name, "") or "").strip()
+            }
+        )
+        if not values:
+            return None
+        if len(values) == 1:
+            return values[0]
+        return "multiple"
 
     iface_data: dict[str, dict[str, object]] = {}
     for summary in summaries:
@@ -379,7 +534,9 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
                 data["packet_count"] = int(data["packet_count"]) + iface.packet_count
             if iface.dropped_packets is not None:
                 data["has_dropped"] = True
-                data["dropped_packets"] = int(data["dropped_packets"]) + iface.dropped_packets
+                data["dropped_packets"] = (
+                    int(data["dropped_packets"]) + iface.dropped_packets
+                )
             if iface.capture_filter:
                 data["capture_filters"].add(iface.capture_filter)
             if iface.description:
@@ -407,12 +564,28 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
         merged_interfaces.append(
             InterfaceStat(
                 name=name,
-                linktype=linktypes[0] if len(linktypes) == 1 else ("mixed" if linktypes else None),
-                snaplen=snaplens[0] if len(snaplens) == 1 else (max(snaplens) if snaplens else None),
-                packet_count=int(data["packet_count"]) if int(data["packet_count"]) > 0 else None,
-                dropped_packets=int(data["dropped_packets"]) if bool(data["has_dropped"]) else None,
-                capture_filter=(capture_filters[0] if len(capture_filters) == 1 else ("multiple" if capture_filters else None)),
-                description=(descriptions[0] if len(descriptions) == 1 else ("multiple" if descriptions else None)),
+                linktype=linktypes[0]
+                if len(linktypes) == 1
+                else ("mixed" if linktypes else None),
+                snaplen=snaplens[0]
+                if len(snaplens) == 1
+                else (max(snaplens) if snaplens else None),
+                packet_count=int(data["packet_count"])
+                if int(data["packet_count"]) > 0
+                else None,
+                dropped_packets=int(data["dropped_packets"])
+                if bool(data["has_dropped"])
+                else None,
+                capture_filter=(
+                    capture_filters[0]
+                    if len(capture_filters) == 1
+                    else ("multiple" if capture_filters else None)
+                ),
+                description=(
+                    descriptions[0]
+                    if len(descriptions) == 1
+                    else ("multiple" if descriptions else None)
+                ),
                 speed_bps=speeds[0] if len(speeds) == 1 else None,
                 mac=macs[0] if len(macs) == 1 else None,
                 os=oses[0] if len(oses) == 1 else None,
@@ -430,4 +603,12 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
         duration_seconds=merged_duration,
         interface_stats=merged_interfaces,
         protocol_counts=merged_protocols,
+        tcp_packets=merged_tcp_packets,
+        retransmissions=merged_retransmissions,
+        retransmission_rate=merged_retransmission_rate,
+        capture_hardware=_merge_capture_field("capture_hardware"),
+        capture_os=_merge_capture_field("capture_os"),
+        capture_application=_merge_capture_field("capture_application"),
+        hash_sha256=_merge_hash_field("hash_sha256"),
+        hash_sha1=_merge_hash_field("hash_sha1"),
     )

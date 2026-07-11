@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import ipaddress
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
-from collections import Counter, defaultdict
-import ipaddress
 
 from .hosts import HostSummary
 from .services import ServiceSummary
+from .utils import is_public_ip as _is_public
 
 
 @dataclass(frozen=True)
@@ -22,11 +23,6 @@ class CorrelationSummary:
     errors: list[str]
 
 
-def _is_public(ip: str) -> bool:
-    try:
-        return ipaddress.ip_address(ip).is_global
-    except Exception:
-        return False
 
 
 def correlate(
@@ -40,10 +36,12 @@ def correlate(
 
     host_list = list(host_summaries)
     svc_list = list(service_summaries)
-    total_pcaps = len({summary.path for summary in host_list}) or len({summary.path for summary in svc_list})
+    source_paths = {str(summary.path) for summary in host_list}
+    source_paths.update(str(summary.path) for summary in svc_list)
+    total_pcaps = len(source_paths)
 
     for summary in host_list:
-        pcap_name = summary.path.name
+        pcap_name = str(summary.path)
         for host in getattr(summary, "hosts", []) or []:
             ip = str(getattr(host, "ip", "") or "")
             if not ip:
@@ -54,7 +52,7 @@ def correlate(
                 errors.append(err)
 
     for summary in svc_list:
-        pcap_name = summary.path.name
+        pcap_name = str(summary.path)
         for asset in getattr(summary, "assets", []) or []:
             ip = str(getattr(asset, "ip", "") or "")
             port = int(getattr(asset, "port", 0) or 0)
@@ -71,7 +69,9 @@ def correlate(
     service_counts = Counter({svc: len(pcaps) for svc, pcaps in service_map.items()})
 
     detections: list[dict[str, object]] = []
-    public_reused = [ip for ip, count in host_counts.items() if count >= min_count and _is_public(ip)]
+    public_reused = [
+        ip for ip, count in host_counts.items() if count >= min_count and _is_public(ip)
+    ]
     if public_reused:
         detections.append(
             {
@@ -82,7 +82,9 @@ def correlate(
             }
         )
 
-    repeated_services = [svc for svc, count in service_counts.items() if count >= min_count]
+    repeated_services = [
+        svc for svc, count in service_counts.items() if count >= min_count
+    ]
     if repeated_services:
         detections.append(
             {

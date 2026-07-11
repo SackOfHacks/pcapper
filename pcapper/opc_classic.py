@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import uuid
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -53,9 +53,23 @@ class OpcClassicSummary:
 
 def analyze_opc_classic(path: Path, show_status: bool = True) -> OpcClassicSummary:
     if TCP is None:
-        return OpcClassicSummary(path, 0, 0, Counter(), Counter(), Counter(), [], ["Scapy TCP unavailable"], None, None, None)
+        return OpcClassicSummary(
+            path,
+            0,
+            0,
+            Counter(),
+            Counter(),
+            Counter(),
+            [],
+            ["Scapy TCP unavailable"],
+            None,
+            None,
+            None,
+        )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     opc_packets = 0
     interface_counts: Counter[str] = Counter()
@@ -99,14 +113,7 @@ def analyze_opc_classic(path: Path, show_status: bool = True) -> OpcClassicSumma
             if not matched:
                 continue
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IP].src)  # type: ignore[index]
-                dst_ip = str(pkt[IP].dst)  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IPv6].src)  # type: ignore[index]
-                dst_ip = str(pkt[IPv6].dst)  # type: ignore[index]
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if src_ip and dst_ip:
                 client_counts[src_ip] += 1
                 server_counts[dst_ip] += 1
@@ -118,13 +125,19 @@ def analyze_opc_classic(path: Path, show_status: bool = True) -> OpcClassicSumma
         reader.close()
 
     if opc_packets:
-        detections.append({
-            "severity": "info",
-            "summary": "OPC Classic (DCOM) indicators observed",
-            "details": f"{opc_packets} packets with OPC Classic interface UUIDs detected.",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "OPC Classic (DCOM) indicators observed",
+                "details": f"{opc_packets} packets with OPC Classic interface UUIDs detected.",
+            }
+        )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return OpcClassicSummary(
         path=path,
         total_packets=total_packets,

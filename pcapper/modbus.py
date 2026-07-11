@@ -1,23 +1,25 @@
 from __future__ import annotations
 
+from .utils import is_private_ip as _is_private_ip, packet_length, memoize_analysis
+from .utils import is_public_ip as _is_public_ip
+import math
+import re
+import struct
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-import ipaddress
-import math
-import struct
 
 try:
-    from scapy.layers.inet import TCP, IP
+    from scapy.layers.inet import IP, TCP
     from scapy.packet import Raw
 except ImportError:
     TCP = IP = Raw = None
 
-from .pcap_cache import get_reader
-from .equipment import equipment_artifacts
 from .device_detection import device_fingerprint_from_fields
-from .utils import detect_file_type, safe_float
+from .equipment import equipment_artifacts
+from .pcap_cache import get_reader
+from .utils import extract_packet_endpoints, safe_float
 
 # --- Constants ---
 
@@ -43,14 +45,37 @@ FUNC_NAMES = {
     22: "Mask Write Register",
     23: "Read/Write Multiple Registers",
     24: "Read FIFO Queue",
-    43: "Encapsulated Interface Transport (Read Device ID)"
+    43: "Encapsulated Interface Transport (Read Device ID)",
 }
 
 WRITE_FUNCTIONS = {5, 6, 15, 16, 21, 22, 23}
 DIAGNOSTIC_FUNCTIONS = {8, 43}
+
+# FC8 (Diagnostics) sub-function codes that have operational/forensic impact.
+DANGEROUS_DIAG_SUBFUNCS = {
+    0x0001: "Restart Communications",
+    0x0004: "Force Listen-Only Mode",
+    0x000A: "Clear Counters & Diagnostic Register",
+}
 ENUMERATION_FUNCTIONS = {17, 43}
 
+# Public function codes defined by the Modbus Application Protocol spec (v1.1b3).
+# Anything outside this set that is not a known vendor range is treated as a
+# protocol violation (fuzzing / exploitation / non-compliant client).
+PUBLIC_FUNCTION_CODES = {1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 15, 16, 17, 20, 21, 22, 23, 24, 43}
+# Read function codes (used to build the read side of the register map + the
+# read-then-write recon->manipulate correlation).
+READ_FUNCTIONS = {1, 2, 3, 4}
+
 WRITE_BASELINE_MIN = 10
+
+# Pairing / orphan / phantom thresholds — kept conservative so pre-established
+# sessions and capture cut-off (requests/responses whose counterpart falls
+# outside the capture window) don't produce spurious DoS/injection findings.
+PAIRING_MIN_COUNT = 20
+PAIRING_MIN_RATIO = 0.2
+STATIC_TRANSID_MIN_REQ = 20
+STATIC_TRANSID_MAX_DISTINCT = 2
 
 EXCEPTION_CODES = {
     1: "Illegal Function",
@@ -61,7 +86,7 @@ EXCEPTION_CODES = {
     6: "Server Device Busy",
     8: "Memory Parity Error",
     10: "Gateway Path Unavailable",
-    11: "Gateway Target Device Failed to Respond"
+    11: "Gateway Target Device Failed to Respond",
 }
 
 PACKET_BUCKETS = [
@@ -85,6 +110,7 @@ FLOW_BUCKETS = [
 
 # --- Dataclasses ---
 
+
 @dataclass
 class ModbusMessage:
     ts: float
@@ -103,9 +129,10 @@ class ModbusMessage:
     detail: Optional[str] = None
     direction: Optional[str] = None
 
+
 @dataclass
 class ModbusAnomaly:
-    severity: str # CRITICAL, HIGH, MEDIUM, LOW
+    severity: str  # CRITICAL, HIGH, MEDIUM, LOW
     title: str
     description: str
     src: str
@@ -121,6 +148,7 @@ class ModbusArtifact:
     dst: str
     ts: float
 
+
 @dataclass
 class ModbusAnalysis:
     path: Path
@@ -130,12 +158,12 @@ class ModbusAnalysis:
     total_bytes: int = 0
     modbus_bytes: int = 0
     modbus_payload_bytes: int = 0
-    
+
     # Statistics
     func_counts: Counter[str] = field(default_factory=Counter)
     unit_ids: Counter[int] = field(default_factory=Counter)
-    src_ips: Counter[str] = field(default_factory=Counter) # Client IPs usually
-    dst_ips: Counter[str] = field(default_factory=Counter) # Server/PLC IPs
+    src_ips: Counter[str] = field(default_factory=Counter)  # Client IPs usually
+    dst_ips: Counter[str] = field(default_factory=Counter)  # Server/PLC IPs
     client_bytes: Counter[str] = field(default_factory=Counter)
     server_bytes: Counter[str] = field(default_factory=Counter)
     endpoint_packets: Counter[str] = field(default_factory=Counter)
@@ -146,25 +174,50 @@ class ModbusAnalysis:
     packet_size_stats: Dict[str, float] = field(default_factory=dict)
     payload_size_stats: Dict[str, float] = field(default_factory=dict)
     flow_duration_buckets: Dict[str, Counter[str]] = field(default_factory=dict)
-    
+
+    # Baseline / inventory (forensics + threat-hunting framing)
+    first_seen: Dict[str, float] = field(default_factory=dict)
+    register_map: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    session_cadence: List[dict[str, object]] = field(default_factory=list)
+    rtt_by_server: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    pairing: Dict[str, int] = field(default_factory=dict)
+
     # Activity
     messages: List[ModbusMessage] = field(default_factory=list)
     artifacts: List[ModbusArtifact] = field(default_factory=list)
     anomalies: List[ModbusAnomaly] = field(default_factory=list)
     value_changes: List[dict[str, object]] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
-    
+
+    @property
+    def masters(self) -> List[str]:
+        """Source IPs that issued Modbus requests (the polling masters)."""
+        return list(self.src_ips.keys())
+
+    @property
+    def write_count(self) -> int:
+        total = 0
+        for name, cnt in self.func_counts.items():
+            if "write" in name.lower():
+                total += cnt
+        return total
+
+    @property
+    def exception_count(self) -> int:
+        return sum(1 for m in self.messages if m.is_exception)
+
     @property
     def unique_clients(self) -> int:
         return len(self.src_ips)
-    
+
     @property
     def unique_servers(self) -> int:
         return len(self.dst_ips)
-        
+
     @property
     def error_rate(self) -> float:
-        if not self.messages: return 0.0
+        if not self.messages:
+            return 0.0
         errs = sum(1 for m in self.messages if m.is_exception)
         return (errs / len(self.messages)) * 100
 
@@ -211,20 +264,6 @@ def _bucketize_duration(duration: float) -> str:
     return ">30m"
 
 
-def _is_private_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_private
-    except Exception:
-        return False
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
-
-
 def _modbus_reg_type(func_code: int) -> Optional[str]:
     if func_code in {1, 5, 15}:
         return "coil"
@@ -237,7 +276,9 @@ def _modbus_reg_type(func_code: int) -> Optional[str]:
     return None
 
 
-def _format_register_range(reg_type: Optional[str], addr: Optional[int], qty: Optional[int]) -> str:
+def _format_register_range(
+    reg_type: Optional[str], addr: Optional[int], qty: Optional[int]
+) -> str:
     if addr is None:
         return ""
     if qty is None or qty <= 1:
@@ -245,7 +286,9 @@ def _format_register_range(reg_type: Optional[str], addr: Optional[int], qty: Op
     return f"{reg_type or 'register'}[{addr}-{addr + max(qty - 1, 0)}]"
 
 
-def _parse_modbus_request_info(func_code: int, pdu: bytes) -> tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
+def _parse_modbus_request_info(
+    func_code: int, pdu: bytes
+) -> tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
     if not pdu:
         return None, None, None, None
     try:
@@ -265,7 +308,7 @@ def _parse_modbus_request_info(func_code: int, pdu: bytes) -> tuple[Optional[str
             qty = int.from_bytes(pdu[3:5], "big")
             byte_count = pdu[5]
             detail = f"{_format_register_range(reg_type, addr, qty)} qty={qty} bytes={byte_count}"
-            data = pdu[6:6 + byte_count] if len(pdu) >= 6 + byte_count else pdu[6:]
+            data = pdu[6 : 6 + byte_count] if len(pdu) >= 6 + byte_count else pdu[6:]
             if func_code == 15 and data:
                 set_bits = sum(bin(b).count("1") for b in data)
                 detail = f"{detail} set={set_bits}/{qty}"
@@ -273,7 +316,7 @@ def _parse_modbus_request_info(func_code: int, pdu: bytes) -> tuple[Optional[str
                 values = []
                 for idx in range(0, min(len(data), 12), 2):
                     if idx + 2 <= len(data):
-                        values.append(int.from_bytes(data[idx:idx + 2], "big"))
+                        values.append(int.from_bytes(data[idx : idx + 2], "big"))
                 if values:
                     preview = ", ".join(str(v) for v in values[:6])
                     detail = f"{detail} values=[{preview}]"
@@ -318,19 +361,23 @@ def _parse_modbus_response_detail(func_code: int, pdu: bytes) -> Optional[str]:
         reg_type = _modbus_reg_type(func_code)
         if func_code in {1, 2} and len(pdu) >= 2:
             byte_count = pdu[1]
-            data = pdu[2:2 + byte_count]
+            data = pdu[2 : 2 + byte_count]
             set_bits = sum(bin(b).count("1") for b in data)
             total_bits = byte_count * 8
-            return f"{reg_type or 'bits'} bytes={byte_count} set={set_bits}/{total_bits}"
+            return (
+                f"{reg_type or 'bits'} bytes={byte_count} set={set_bits}/{total_bits}"
+            )
         if func_code in {3, 4} and len(pdu) >= 2:
             byte_count = pdu[1]
-            data = pdu[2:2 + byte_count]
+            data = pdu[2 : 2 + byte_count]
             regs = []
             for idx in range(0, min(len(data), 16), 2):
                 if idx + 2 <= len(data):
-                    regs.append(int.from_bytes(data[idx:idx + 2], "big"))
+                    regs.append(int.from_bytes(data[idx : idx + 2], "big"))
             preview = ", ".join(str(r) for r in regs[:6])
-            return f"{reg_type or 'registers'} count={byte_count // 2} values=[{preview}]"
+            return (
+                f"{reg_type or 'registers'} count={byte_count // 2} values=[{preview}]"
+            )
         if func_code in {5, 6} and len(pdu) >= 5:
             addr = int.from_bytes(pdu[1:3], "big")
             value = int.from_bytes(pdu[3:5], "big")
@@ -349,7 +396,7 @@ def _parse_modbus_response_detail(func_code: int, pdu: bytes) -> Optional[str]:
             return f"readwrite_response bytes={byte_count}"
         if func_code == 17 and len(pdu) >= 2:
             byte_count = pdu[1]
-            text = pdu[2:2 + byte_count].decode("ascii", errors="ignore").strip()
+            text = pdu[2 : 2 + byte_count].decode("ascii", errors="ignore").strip()
             return f"server_id={text}" if text else "server_id"
         if func_code == 43 and len(pdu) >= 3:
             mei_type = pdu[1]
@@ -381,7 +428,7 @@ def _parse_device_id_response(pdu: bytes) -> dict[str, str]:
         idx += 2
         if idx + length > len(pdu):
             break
-        raw = pdu[idx:idx + length]
+        raw = pdu[idx : idx + length]
         idx += length
         value = raw.decode("latin-1", errors="ignore").strip()
         if not value:
@@ -391,10 +438,8 @@ def _parse_device_id_response(pdu: bytes) -> dict[str, str]:
             fields[key] = value
     return fields
 
-def _parse_modbus_request_detail(func_code: int, pdu: bytes) -> str | None:
-    detail, _, _, _ = _parse_modbus_request_info(func_code, pdu)
-    return detail
 
+@memoize_analysis
 def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     if TCP is None:
         return ModbusAnalysis(
@@ -411,19 +456,12 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
             path=path,
             errors=[f"Error: {e}"],
         )
-    # Attempt to find file handle for progress
-    # for attr in ("fd", "f", "fh", "_fh", "_file", "file"):
-    #    candidate = getattr(reader, attr, None)
-    #    if candidate is not None:
-    #        stream = candidate
-    #        break
-
     total_packets = 0
     modbus_packets = 0
     total_bytes = 0
     modbus_bytes = 0
     modbus_payload_bytes = 0
-    
+
     func_counts = Counter()
     unit_ids = Counter()
     src_ips = Counter()
@@ -437,7 +475,7 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     payload_size_hist = Counter()
     packet_size_samples: List[int] = []
     payload_size_samples: List[int] = []
-    
+
     messages: List[ModbusMessage] = []
     artifacts: List[ModbusArtifact] = []
     anomalies: List[ModbusAnomaly] = []
@@ -446,10 +484,12 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     start_time = None
     last_time = None
 
-    flow_map: Dict[Tuple[str, str, int, int], Dict[str, Optional[float]]] = defaultdict(lambda: {
-        "first": None,
-        "last": None,
-    })
+    flow_map: Dict[Tuple[str, str, int, int], Dict[str, Optional[float]]] = defaultdict(
+        lambda: {
+            "first": None,
+            "last": None,
+        }
+    )
     session_last_ts: Dict[str, float] = {}
     session_intervals: Dict[str, List[float]] = defaultdict(list)
     src_dst_counts: Dict[str, Counter[str]] = defaultdict(Counter)
@@ -457,11 +497,12 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     src_responses: Counter[str] = Counter()
     src_unit_ids: Dict[str, Set[int]] = defaultdict(set)
     src_dst_payload_bytes: Dict[str, Counter[str]] = defaultdict(Counter)
-    
+
     # Aggregate noisy anomalies
     write_events = Counter()
     exception_events = Counter()
     diagnostic_events = Counter()
+    dangerous_diag_events: Counter = Counter()
     enumeration_events = Counter()
     reserved_events = Counter()
     write_details: Dict[Tuple[str, int, str, str], str] = {}
@@ -472,8 +513,44 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
     asset_write_targets: Dict[Tuple[str, int], Set[str]] = defaultdict(set)
     asset_write_counts: Counter[Tuple[str, int]] = Counter()
     write_target_anoms_seen: Set[str] = set()
+    # Cap distinct "new write target" anomalies per asset — a controller that
+    # legitimately writes hundreds of registers would otherwise emit one finding
+    # per range and flood the cap. After the cap we still count (see summary).
+    asset_write_anom_emitted: Counter[Tuple[str, int]] = Counter()
+    WRITE_TARGET_ANOM_CAP = 8
     last_values: Dict[Tuple[str, int, str, int], int] = {}
     value_changes: List[dict[str, object]] = []
+
+    # --- Baseline / inventory / pairing state (features 2-8) ---
+    first_seen: Dict[str, float] = {}
+    # register_map[(dst_ip, unit_id)] -> read/write address activity
+    register_map: Dict[Tuple[str, int], Dict[str, object]] = defaultdict(
+        lambda: {
+            "read_addrs": Counter(),
+            "write_addrs": Counter(),
+            "read_min": None,
+            "read_max": None,
+            "write_min": None,
+            "write_max": None,
+            "read_count": 0,
+            "write_count": 0,
+        }
+    )
+    # Registers that have been READ on a target — used for the FrostyGoop-style
+    # read-then-write (recon -> manipulate) correlation.
+    read_registers_seen: Set[Tuple[str, int, str, int]] = set()
+    read_then_write_events: Counter[Tuple[str, str, int]] = Counter()
+    # Request/response pairing keyed by TCP connection + transaction id + unit.
+    pending_tx: Dict[Tuple[str, int, str, int, int], float] = {}
+    rtt_samples: Dict[str, List[int]] = defaultdict(list)
+    matched_tx = 0
+    phantom_responses: Counter[str] = Counter()
+    # trans-id monotonicity per connection (static id = replay/injection tell)
+    conn_transids: Dict[Tuple[str, int, str], Set[int]] = defaultdict(set)
+    conn_req_count: Counter[Tuple[str, int, str]] = Counter()
+    # protocol violations
+    malformed_mbap: Counter[str] = Counter()
+    reserved_fc_events: Counter[Tuple[int, str, str]] = Counter()
 
     try:
         with status as pbar:
@@ -489,12 +566,13 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                         pass
 
                 total_packets += 1
-                pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+                pkt_len = packet_length(pkt)
                 total_bytes += pkt_len
                 ts = safe_float(getattr(pkt, "time", 0))
-                if start_time is None: start_time = ts
+                if start_time is None:
+                    start_time = ts
                 last_time = ts
-                
+
                 has_tcp = False
                 sport = 0
                 dport = 0
@@ -502,12 +580,9 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
 
                 if pkt.haslayer(TCP):
                     has_tcp = True
-                    # Debug Check
-                    # print(f"DEBUG: Pkt {total_packets} TCP Sport={pkt[TCP].sport} Dport={pkt[TCP].dport}")
-
                     sport = int(pkt[TCP].sport)
                     dport = int(pkt[TCP].dport)
-                    
+
                     # Check for Payload (Using generic payload access)
                     payload_obj = pkt[TCP].payload
                     payload = bytes(payload_obj) if payload_obj else b""
@@ -520,7 +595,9 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                     # Fallback: parse TCP from raw bytes if scapy didn't dissect layers
                     try:
                         raw = bytes(pkt)
-                        if len(raw) >= 34 and raw[12:14] == b"\x08\x00":  # Ethernet + IPv4
+                        if (
+                            len(raw) >= 34 and raw[12:14] == b"\x08\x00"
+                        ):  # Ethernet + IPv4
                             ihl = (raw[14] & 0x0F) * 4
                             proto = raw[23]
                             if proto == 6:  # TCP
@@ -529,24 +606,32 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                 tcp_start = ip_start + ihl
                                 if len(raw) >= tcp_start + 20:
                                     data_offset = (raw[tcp_start + 12] >> 4) * 4
-                                    sport = int.from_bytes(raw[tcp_start:tcp_start + 2], "big")
-                                    dport = int.from_bytes(raw[tcp_start + 2:tcp_start + 4], "big")
+                                    sport = int.from_bytes(
+                                        raw[tcp_start : tcp_start + 2], "big"
+                                    )
+                                    dport = int.from_bytes(
+                                        raw[tcp_start + 2 : tcp_start + 4], "big"
+                                    )
                                     payload_start = tcp_start + data_offset
                                     ip_end = ip_start + total_len
-                                    payload = raw[payload_start:ip_end] if ip_end <= len(raw) else raw[payload_start:]
+                                    payload = (
+                                        raw[payload_start:ip_end]
+                                        if ip_end <= len(raw)
+                                        else raw[payload_start:]
+                                    )
                                     has_tcp = True
                     except Exception:
                         pass
 
                 if not has_tcp:
                     continue
-                
+
                 # Header Check (MBAP)
                 is_modbus = False
-                
+
                 # 1. Port-based check
                 if sport == MODBUS_TCP_PORT or dport == MODBUS_TCP_PORT:
-                     is_modbus = True
+                    is_modbus = True
 
                 # 2. Heuristic check (if not standard port)
                 if not is_modbus and payload and len(payload) >= 8:
@@ -557,11 +642,11 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                         if proto_id == 0:
                             # Verify length consistency
                             remaining = len(payload) - 6
-                            if length >= remaining: 
+                            if length >= remaining:
                                 is_modbus = True
-                    except:
+                    except (TypeError, ValueError, struct.error):
                         pass
-                
+
                 if not is_modbus:
                     continue
                 if (sport != MODBUS_TCP_PORT and dport != MODBUS_TCP_PORT) and payload:
@@ -569,6 +654,21 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
 
                 modbus_packets += 1
                 modbus_bytes += pkt_len
+
+                # Protocol-violation DPI: on the well-known port the MBAP
+                # protocol id MUST be 0. A non-zero value = malformed frame,
+                # non-Modbus tunnelled over 502, or a fuzzing/exploit attempt.
+                if (
+                    (sport == MODBUS_TCP_PORT or dport == MODBUS_TCP_PORT)
+                    and payload
+                    and len(payload) >= 4
+                ):
+                    try:
+                        if int.from_bytes(payload[2:4], "big") != PROTOCOL_ID_MODBUS:
+                            s_raw, d_raw = extract_packet_endpoints(pkt)
+                            malformed_mbap[f"{s_raw or '?'} -> {d_raw or '?'}"] += 1
+                    except Exception:
+                        pass
 
                 if not payload or len(payload) < 8:
                     continue
@@ -578,7 +678,9 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                     parsed_any = False
                     while offset + 7 <= len(payload):
                         try:
-                            trans_id, proto_id, length, unit_id = struct.unpack(">HHHB", payload[offset:offset + 7])
+                            trans_id, proto_id, length, unit_id = struct.unpack(
+                                ">HHHB", payload[offset : offset + 7]
+                            )
                         except struct.error:
                             break
 
@@ -596,7 +698,7 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
 
                         pdu_start = offset + 7
                         pdu_len = length - 1
-                        pdu = payload[pdu_start:pdu_start + pdu_len]
+                        pdu = payload[pdu_start : pdu_start + pdu_len]
                         offset += frame_len
 
                         if not pdu:
@@ -616,7 +718,9 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                             original_func = func_code & 0x7F
                             if len(pdu) > 1:
                                 exception_code = pdu[1]
-                                exception_desc = EXCEPTION_CODES.get(exception_code, "Unknown Exception")
+                                exception_desc = EXCEPTION_CODES.get(
+                                    exception_code, "Unknown Exception"
+                                )
 
                         func_name = FUNC_NAMES.get(original_func)
                         if not func_name:
@@ -624,14 +728,37 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                         func_counts[func_name] += 1
                         unit_ids[unit_id] += 1
 
-                        is_server_response = (sport == MODBUS_TCP_PORT)
+                        is_server_response = sport == MODBUS_TCP_PORT
 
-                        if IP is not None and pkt.haslayer(IP):
-                            src_ip = pkt[IP].src
-                            dst_ip = pkt[IP].dst
+                        src_raw, dst_raw = extract_packet_endpoints(pkt)
+                        if src_raw and dst_raw:
+                            src_ip = src_raw
+                            dst_ip = dst_raw
                         else:
-                            src_ip = pkt[0].src if hasattr(pkt[0], 'src') else "0.0.0.0"
-                            dst_ip = pkt[0].dst if hasattr(pkt[0], 'dst') else "0.0.0.0"
+                            src_ip = (
+                                pkt[0].src if hasattr(pkt[0], "src") else "0.0.0.0"
+                            )
+                            dst_ip = (
+                                pkt[0].dst if hasattr(pkt[0], "dst") else "0.0.0.0"
+                            )
+
+                        # First-seen ledger (baseline / new-asset framing).
+                        if ts is not None:
+                            first_seen.setdefault(src_ip, ts)
+                            first_seen.setdefault(dst_ip, ts)
+
+                        # Protocol violation: function code that is neither a
+                        # public Modbus code nor a documented vendor/user-defined
+                        # code (65-72, 100-110). These strictly-reserved codes
+                        # signal fuzzing / a non-compliant or malicious client.
+                        # Vendor codes are still surfaced (LOW) via reserved_events.
+                        if (
+                            not is_exception
+                            and original_func not in PUBLIC_FUNCTION_CODES
+                            and not (65 <= original_func <= 72)
+                            and not (100 <= original_func <= 110)
+                        ):
+                            reserved_fc_events[(original_func, src_ip, dst_ip)] += 1
 
                         request_detail = None
                         if not is_server_response:
@@ -645,34 +772,118 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                             if pdu:
                                 src_dst_payload_bytes[src_ip][dst_ip] += len(pdu)
 
-                            request_detail, reg_type, addr, qty = _parse_modbus_request_info(original_func, pdu)
+                            # --- Request/response pairing + trans-id sanity ---
+                            conn_key = (src_ip, sport, dst_ip)
+                            conn_transids[conn_key].add(trans_id)
+                            conn_req_count[conn_key] += 1
+                            tx_key = (src_ip, sport, dst_ip, trans_id, unit_id)
+                            if ts is not None and len(pending_tx) < 200000:
+                                pending_tx[tx_key] = ts
+
+                            request_detail, reg_type, addr, qty = (
+                                _parse_modbus_request_info(original_func, pdu)
+                            )
+
+                            # --- Register/coil map: read side (process fingerprint) ---
+                            if (
+                                original_func in READ_FUNCTIONS
+                                and reg_type
+                                and addr is not None
+                            ):
+                                rmap = register_map[(dst_ip, unit_id)]
+                                span = int(qty or 1)
+                                rmap["read_count"] = int(rmap["read_count"]) + 1  # type: ignore[arg-type]
+                                ra = rmap["read_addrs"]
+                                if isinstance(ra, Counter) and len(ra) < 4096:
+                                    ra[addr] += 1
+                                lo, hi = addr, addr + max(span - 1, 0)
+                                rmap["read_min"] = (
+                                    lo if rmap["read_min"] is None
+                                    else min(int(rmap["read_min"]), lo)  # type: ignore[arg-type]
+                                )
+                                rmap["read_max"] = (
+                                    hi if rmap["read_max"] is None
+                                    else max(int(rmap["read_max"]), hi)  # type: ignore[arg-type]
+                                )
+                                for a_off in range(min(span, 256)):
+                                    read_registers_seen.add(
+                                        (dst_ip, unit_id, reg_type, addr + a_off)
+                                    )
 
                             # Check for Write Operations (Risk)
                             if original_func in WRITE_FUNCTIONS:
                                 write_events[(func_name, unit_id, src_ip, dst_ip)] += 1
                                 src_write_requests[src_ip] += 1
                                 if request_detail:
-                                    write_details[(func_name, unit_id, src_ip, dst_ip)] = request_detail
+                                    write_details[
+                                        (func_name, unit_id, src_ip, dst_ip)
+                                    ] = request_detail
                                     artifact_key = f"write:{func_name}:{request_detail}:{src_ip}:{dst_ip}"
-                                    if artifact_key not in seen_artifacts and len(artifacts) < 200:
+                                    if (
+                                        artifact_key not in seen_artifacts
+                                        and len(artifacts) < 200
+                                    ):
                                         seen_artifacts.add(artifact_key)
-                                        artifacts.append(ModbusArtifact(
-                                            kind="write",
-                                            detail=f"{func_name} {request_detail}",
-                                            src=src_ip,
-                                            dst=dst_ip,
-                                            ts=ts or 0.0,
-                                        ))
+                                        artifacts.append(
+                                            ModbusArtifact(
+                                                kind="write",
+                                                detail=f"{func_name} {request_detail}",
+                                                src=src_ip,
+                                                dst=dst_ip,
+                                                ts=ts or 0.0,
+                                            )
+                                        )
                                 asset_key = (dst_ip, unit_id)
                                 asset_write_counts[asset_key] += 1
+
+                                # --- Register/coil map: write side + FrostyGoop
+                                # read-then-write (recon -> manipulate) correlation ---
+                                if reg_type and addr is not None:
+                                    wmap = register_map[(dst_ip, unit_id)]
+                                    span = int(qty or 1)
+                                    wmap["write_count"] = int(wmap["write_count"]) + 1  # type: ignore[arg-type]
+                                    wa = wmap["write_addrs"]
+                                    if isinstance(wa, Counter) and len(wa) < 4096:
+                                        wa[addr] += 1
+                                    lo, hi = addr, addr + max(span - 1, 0)
+                                    wmap["write_min"] = (
+                                        lo if wmap["write_min"] is None
+                                        else min(int(wmap["write_min"]), lo)  # type: ignore[arg-type]
+                                    )
+                                    wmap["write_max"] = (
+                                        hi if wmap["write_max"] is None
+                                        else max(int(wmap["write_max"]), hi)  # type: ignore[arg-type]
+                                    )
+                                    for a_off in range(min(span, 256)):
+                                        if (
+                                            dst_ip,
+                                            unit_id,
+                                            reg_type,
+                                            addr + a_off,
+                                        ) in read_registers_seen:
+                                            read_then_write_events[
+                                                (src_ip, dst_ip, unit_id)
+                                            ] += 1
+                                            break
+
                                 target = _format_register_range(reg_type, addr, qty)
                                 if target:
                                     if target not in asset_write_targets[asset_key]:
                                         asset_write_targets[asset_key].add(target)
-                                        if asset_write_counts[asset_key] >= WRITE_BASELINE_MIN:
+                                        if (
+                                            asset_write_counts[asset_key]
+                                            >= WRITE_BASELINE_MIN
+                                        ):
                                             anomaly_key = f"{asset_key}:{target}"
-                                            if anomaly_key not in write_target_anoms_seen and len(anomalies) < max_anomalies:
+                                            if (
+                                                anomaly_key
+                                                not in write_target_anoms_seen
+                                                and asset_write_anom_emitted[asset_key]
+                                                < WRITE_TARGET_ANOM_CAP
+                                                and len(anomalies) < max_anomalies
+                                            ):
                                                 write_target_anoms_seen.add(anomaly_key)
+                                                asset_write_anom_emitted[asset_key] += 1
                                                 anomalies.append(
                                                     ModbusAnomaly(
                                                         severity="MEDIUM",
@@ -689,7 +900,11 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                         value = int.from_bytes(pdu[3:5], "big")
                                         key = (dst_ip, unit_id, reg_type, addr)
                                         prev = last_values.get(key)
-                                        if prev is not None and prev != value and len(value_changes) < 200:
+                                        if (
+                                            prev is not None
+                                            and prev != value
+                                            and len(value_changes) < 200
+                                        ):
                                             value_changes.append(
                                                 {
                                                     "target": f"{dst_ip} Unit {unit_id} {reg_type}[{addr}]",
@@ -704,19 +919,34 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                         last_values[key] = value
                                     elif original_func in {15, 16} and len(pdu) >= 6:
                                         byte_count = pdu[5]
-                                        data = pdu[6:6 + byte_count]
+                                        data = pdu[6 : 6 + byte_count]
                                         if reg_type == "coil":
                                             total = int(qty or 0)
-                                            for bit_index in range(min(total, max_values)):
+                                            for bit_index in range(
+                                                min(total, max_values)
+                                            ):
                                                 byte_idx = bit_index // 8
                                                 bit_off = bit_index % 8
                                                 if byte_idx >= len(data):
                                                     break
-                                                value = 1 if (data[byte_idx] >> bit_off) & 1 else 0
+                                                value = (
+                                                    1
+                                                    if (data[byte_idx] >> bit_off) & 1
+                                                    else 0
+                                                )
                                                 target_idx = addr + bit_index
-                                                key = (dst_ip, unit_id, reg_type, target_idx)
+                                                key = (
+                                                    dst_ip,
+                                                    unit_id,
+                                                    reg_type,
+                                                    target_idx,
+                                                )
                                                 prev = last_values.get(key)
-                                                if prev is not None and prev != value and len(value_changes) < 200:
+                                                if (
+                                                    prev is not None
+                                                    and prev != value
+                                                    and len(value_changes) < 200
+                                                ):
                                                     value_changes.append(
                                                         {
                                                             "target": f"{dst_ip} Unit {unit_id} {reg_type}[{target_idx}]",
@@ -731,16 +961,29 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                                 last_values[key] = value
                                     elif original_func == 23 and len(pdu) >= 10:
                                         byte_count = pdu[9]
-                                        data = pdu[10:10 + byte_count]
-                                        for idx in range(min(int(qty or 0), max_values)):
+                                        data = pdu[10 : 10 + byte_count]
+                                        for idx in range(
+                                            min(int(qty or 0), max_values)
+                                        ):
                                             start = idx * 2
                                             if start + 2 > len(data):
                                                 break
-                                            value = int.from_bytes(data[start:start + 2], "big")
+                                            value = int.from_bytes(
+                                                data[start : start + 2], "big"
+                                            )
                                             target_idx = addr + idx
-                                            key = (dst_ip, unit_id, reg_type, target_idx)
+                                            key = (
+                                                dst_ip,
+                                                unit_id,
+                                                reg_type,
+                                                target_idx,
+                                            )
                                             prev = last_values.get(key)
-                                            if prev is not None and prev != value and len(value_changes) < 200:
+                                            if (
+                                                prev is not None
+                                                and prev != value
+                                                and len(value_changes) < 200
+                                            ):
                                                 value_changes.append(
                                                     {
                                                         "target": f"{dst_ip} Unit {unit_id} {reg_type}[{target_idx}]",
@@ -753,34 +996,29 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                                     }
                                                 )
                                             last_values[key] = value
-                                        else:
-                                            for idx in range(min(int(qty or 0), max_values)):
-                                                start = idx * 2
-                                                if start + 2 > len(data):
-                                                    break
-                                                value = int.from_bytes(data[start:start + 2], "big")
-                                                target_idx = addr + idx
-                                                key = (dst_ip, unit_id, reg_type, target_idx)
-                                                prev = last_values.get(key)
-                                                if prev is not None and prev != value and len(value_changes) < 200:
-                                                    value_changes.append(
-                                                        {
-                                                            "target": f"{dst_ip} Unit {unit_id} {reg_type}[{target_idx}]",
-                                                            "old": prev,
-                                                            "new": value,
-                                                            "src": src_ip,
-                                                            "dst": dst_ip,
-                                                            "ts": ts,
-                                                            "func": func_name,
-                                                        }
-                                                    )
-                                                last_values[key] = value
 
                             # Diagnostic functions can be risky
                             if original_func in DIAGNOSTIC_FUNCTIONS:
                                 diagnostic_events[(func_name, src_ip, dst_ip)] += 1
+                                # FC8 sub-functions that disrupt the slave or
+                                # erase forensic counters are high-signal
+                                # (Restart=ATT&CK T0816, Force Listen-Only=
+                                # denial of comms, Clear Counters=anti-forensics).
+                                if original_func == 8 and request_detail:
+                                    m = re.search(r"subfunc=0x([0-9a-fA-F]+)", request_detail)
+                                    if m:
+                                        sub = int(m.group(1), 16)
+                                        sub_label = DANGEROUS_DIAG_SUBFUNCS.get(sub)
+                                        if sub_label:
+                                            dangerous_diag_events[
+                                                (sub_label, src_ip, dst_ip)
+                                            ] += 1
 
-                            if original_func == 43 and request_detail and request_detail.startswith("mei=0x0e"):
+                            if (
+                                original_func == 43
+                                and request_detail
+                                and request_detail.startswith("mei=0x0e")
+                            ):
                                 enumeration_events[(func_name, src_ip, dst_ip)] += 1
                             elif original_func in ENUMERATION_FUNCTIONS:
                                 enumeration_events[(func_name, src_ip, dst_ip)] += 1
@@ -789,9 +1027,22 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                 reserved_events[(original_func, src_ip, dst_ip)] += 1
 
                         else:
-                            dst_ips[src_ip] += 1 # Server is source
+                            dst_ips[src_ip] += 1  # Server is source
                             server_bytes[src_ip] += pkt_len
                             src_responses[src_ip] += 1
+
+                            # --- Pairing: match this response to a pending
+                            # request on the same connection + trans-id + unit.
+                            # RTT per server; unmatched = phantom (injection). ---
+                            resp_key = (dst_ip, dport, src_ip, trans_id, unit_id)
+                            req_ts = pending_tx.pop(resp_key, None)
+                            if req_ts is not None:
+                                matched_tx += 1
+                                if ts is not None:
+                                    rtt_ms = int(max(0.0, (ts - req_ts)) * 1000)
+                                    _append_sample(rtt_samples[src_ip], rtt_ms)
+                            else:
+                                phantom_responses[src_ip] += 1
 
                         endpoint_packets[src_ip] += 1
                         endpoint_packets[dst_ip] += 1
@@ -805,8 +1056,15 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                         _append_sample(packet_size_samples, pkt_len)
                         _append_sample(payload_size_samples, payload_len)
 
-                        if pdu:
-                            endpoints = service_endpoints.setdefault(func_name, Counter())
+                        # Attribute the service to the request (client -> server)
+                        # direction only. Counting the response direction too
+                        # listed both "A -> B" and "B -> A" for the same logical
+                        # exchange; the client->server view with request counts is
+                        # the meaningful one for triage.
+                        if pdu and not is_server_response:
+                            endpoints = service_endpoints.setdefault(
+                                func_name, Counter()
+                            )
                             endpoints[f"{src_ip} -> {dst_ip}"] += 1
 
                         for kind, detail in equipment_artifacts(payload):
@@ -815,13 +1073,15 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                 continue
                             seen_artifacts.add(key)
                             if len(artifacts) < 200:
-                                artifacts.append(ModbusArtifact(
-                                    kind=kind,
-                                    detail=detail,
-                                    src=src_ip,
-                                    dst=dst_ip,
-                                    ts=ts or 0.0,
-                                ))
+                                artifacts.append(
+                                    ModbusArtifact(
+                                        kind=kind,
+                                        detail=detail,
+                                        src=src_ip,
+                                        dst=dst_ip,
+                                        ts=ts or 0.0,
+                                    )
+                                )
 
                         if is_server_response and original_func == 43 and pdu:
                             device_fields = _parse_device_id_response(pdu)
@@ -830,7 +1090,8 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                     {
                                         "vendor": device_fields.get("vendor"),
                                         "model": device_fields.get("model"),
-                                        "product": device_fields.get("product") or device_fields.get("product_code"),
+                                        "product": device_fields.get("product")
+                                        or device_fields.get("product_code"),
                                         "firmware": device_fields.get("revision"),
                                         "software": device_fields.get("user_app"),
                                     },
@@ -838,15 +1099,20 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                                 )
                                 if detail:
                                     key = f"device:{detail}"
-                                    if key not in seen_artifacts and len(artifacts) < 200:
+                                    if (
+                                        key not in seen_artifacts
+                                        and len(artifacts) < 200
+                                    ):
                                         seen_artifacts.add(key)
-                                        artifacts.append(ModbusArtifact(
-                                            kind="device",
-                                            detail=detail,
-                                            src=src_ip,
-                                            dst=dst_ip,
-                                            ts=ts or 0.0,
-                                        ))
+                                        artifacts.append(
+                                            ModbusArtifact(
+                                                kind="device",
+                                                detail=detail,
+                                                src=src_ip,
+                                                dst=dst_ip,
+                                                ts=ts or 0.0,
+                                            )
+                                        )
 
                         flow_key = (src_ip, dst_ip, sport, dport)
                         flow = flow_map[flow_key]
@@ -865,32 +1131,52 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
                             session_last_ts[session_key] = ts
 
                         if is_exception:
-                            exception_events[(exception_code, exception_desc, original_func, src_ip, dst_ip)] += 1
+                            exception_events[
+                                (
+                                    exception_code,
+                                    exception_desc,
+                                    original_func,
+                                    src_ip,
+                                    dst_ip,
+                                )
+                            ] += 1
 
                         # Store message (limit to reasonable number if memory constraint, but user wants details)
                         response_detail = None
                         if is_server_response and not is_exception:
-                            response_detail = _parse_modbus_response_detail(original_func, pdu)
+                            response_detail = _parse_modbus_response_detail(
+                                original_func, pdu
+                            )
 
-                        messages.append(ModbusMessage(
-                            ts=ts,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            src_port=sport,
-                            dst_port=dport,
-                            trans_id=trans_id,
-                            unit_id=unit_id,
-                            func_code=func_code,
-                            func_name=func_name,
-                            is_exception=is_exception,
-                            exception_code=exception_code,
-                            exception_desc=exception_desc,
-                            payload_len=len(pdu),
-                            detail=request_detail if not is_server_response else response_detail,
-                            direction="response" if is_server_response else "request",
-                        ))
+                        messages.append(
+                            ModbusMessage(
+                                ts=ts,
+                                src_ip=src_ip,
+                                dst_ip=dst_ip,
+                                src_port=sport,
+                                dst_port=dport,
+                                trans_id=trans_id,
+                                unit_id=unit_id,
+                                func_code=func_code,
+                                func_name=func_name,
+                                is_exception=is_exception,
+                                exception_code=exception_code,
+                                exception_desc=exception_desc,
+                                payload_len=len(pdu),
+                                detail=request_detail
+                                if not is_server_response
+                                else response_detail,
+                                direction="response"
+                                if is_server_response
+                                else "request",
+                            )
+                        )
 
-                    if not parsed_any and sport != MODBUS_TCP_PORT and dport != MODBUS_TCP_PORT:
+                    if (
+                        not parsed_any
+                        and sport != MODBUS_TCP_PORT
+                        and dport != MODBUS_TCP_PORT
+                    ):
                         modbus_packets -= 1
 
                 except struct.error:
@@ -905,7 +1191,7 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
             reader.close()
         except Exception:
             pass
-    
+
     duration = 0.0
     if start_time is not None and last_time is not None:
         duration = last_time - start_time
@@ -937,79 +1223,167 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
         suffix = f" (x{count})" if count > 1 else ""
         detail = write_details.get((func_name, unit_id, src_ip, dst_ip))
         detail_text = f" [{detail}]" if detail else ""
-        anomalies.append(ModbusAnomaly(
-            severity="HIGH",
-            title="Modbus Write Operation",
-            description=f"Write command ({func_name}) sent to Unit ID {unit_id}{suffix}{detail_text}",
-            src=src_ip,
-            dst=dst_ip,
-            ts=0.0,
-        ))
+        # A coil write (FC 5/15) forces a digital OUTPUT on/off — direct
+        # manipulation of a physical actuator (valve/relay/motor), i.e. ATT&CK
+        # for ICS T0831 Manipulation of Control. Register writes (FC 6/16/22/23)
+        # change setpoints/parameters = T0836 Modify Parameter. The title drives
+        # the ATT&CK mapping (the shared keyword map routes "force" -> T0831), so
+        # name coil writes distinctly.
+        is_coil = "coil" in func_name.lower()
+        write_title = (
+            "Modbus Coil Force (output manipulation)"
+            if is_coil
+            else "Modbus Write Operation"
+        )
+        anomalies.append(
+            ModbusAnomaly(
+                severity="HIGH",
+                title=write_title,
+                description=f"Write command ({func_name}) sent to Unit ID {unit_id}{suffix}{detail_text}",
+                src=src_ip,
+                dst=dst_ip,
+                ts=0.0,
+            )
+        )
         if unit_id == 0:
             if len(anomalies) < max_anomalies:
-                anomalies.append(ModbusAnomaly(
-                    severity="CRITICAL",
-                    title="Modbus Broadcast Write",
-                    description=f"Broadcast write using {func_name} to Unit ID 0{suffix}{detail_text}",
-                    src=src_ip,
-                    dst=dst_ip,
-                    ts=0.0,
-                ))
+                anomalies.append(
+                    ModbusAnomaly(
+                        severity="CRITICAL",
+                        title="Modbus Broadcast Write",
+                        description=f"Broadcast write using {func_name} to Unit ID 0{suffix}{detail_text}",
+                        src=src_ip,
+                        dst=dst_ip,
+                        ts=0.0,
+                    )
+                )
+
+    for (sub_label, src_ip, dst_ip), count in dangerous_diag_events.items():
+        if len(anomalies) >= max_anomalies:
+            break
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(
+            ModbusAnomaly(
+                severity="HIGH",
+                title="Modbus Diagnostic Control",
+                description=(
+                    f"FC8 diagnostic sub-function '{sub_label}'{suffix} — disrupts "
+                    "the slave or clears diagnostic counters (T0816/anti-forensics)."
+                ),
+                src=src_ip,
+                dst=dst_ip,
+                ts=0.0,
+            )
+        )
 
     for (func_name, src_ip, dst_ip), count in diagnostic_events.items():
         suffix = f" (x{count})" if count > 1 else ""
         if len(anomalies) < max_anomalies:
-            anomalies.append(ModbusAnomaly(
-                severity="LOW",
-                title="Modbus Diagnostic/Info",
-                description=f"Diagnostic or identity request ({func_name}){suffix}",
-                src=src_ip,
-                dst=dst_ip,
-                ts=0.0,
-            ))
+            anomalies.append(
+                ModbusAnomaly(
+                    severity="LOW",
+                    title="Modbus Diagnostic/Info",
+                    description=f"Diagnostic or identity request ({func_name}){suffix}",
+                    src=src_ip,
+                    dst=dst_ip,
+                    ts=0.0,
+                )
+            )
 
+    # The dominant master (top request source) enumerating its own devices is
+    # routine HMI/SCADA identity polling; the same recon from any *other* source
+    # is active discovery worth elevating (T0888 Remote System Information
+    # Discovery) — the shape of a foothold host mapping the OT segment.
+    top_master = src_ips.most_common(1)[0][0] if src_ips else None
     for (func_name, src_ip, dst_ip), count in enumeration_events.items():
         if len(anomalies) >= max_anomalies:
             break
         suffix = f" (x{count})" if count > 1 else ""
-        anomalies.append(ModbusAnomaly(
-            severity="LOW",
-            title="Modbus Enumeration",
-            description=f"Device identity discovery ({func_name}){suffix}",
-            src=src_ip,
-            dst=dst_ip,
-            ts=0.0,
-        ))
+        off_baseline = top_master is not None and src_ip != top_master
+        anomalies.append(
+            ModbusAnomaly(
+                severity="MEDIUM" if off_baseline else "LOW",
+                title="Modbus Enumeration",
+                description=(
+                    f"Device identity discovery ({func_name}){suffix}"
+                    + (
+                        " from a non-primary source — active OT discovery (T0888)."
+                        if off_baseline
+                        else ""
+                    )
+                ),
+                src=src_ip,
+                dst=dst_ip,
+                ts=0.0,
+            )
+        )
 
     for (func_code, src_ip, dst_ip), count in reserved_events.items():
         if len(anomalies) >= max_anomalies:
             break
         suffix = f" (x{count})" if count > 1 else ""
-        anomalies.append(ModbusAnomaly(
-            severity="LOW",
-            title="Modbus Proprietary Function",
-            description=f"Reserved/proprietary function {func_code}{suffix}",
-            src=src_ip,
-            dst=dst_ip,
-            ts=0.0,
-        ))
+        anomalies.append(
+            ModbusAnomaly(
+                severity="LOW",
+                title="Modbus Proprietary Function",
+                description=f"Reserved/proprietary function {func_code}{suffix}",
+                src=src_ip,
+                dst=dst_ip,
+                ts=0.0,
+            )
+        )
 
-    for (exc_code, exc_desc, original_func, src_ip, dst_ip), count in exception_events.items():
+    # Re-bucket exceptions by (exc_desc, src, dst). The raw key also carries the
+    # requesting function code, so a capture that exercises many functions
+    # against one endpoint produces dozens of near-identical findings that bury
+    # the real signal. For triage the relevant fact is "endpoint X returned N
+    # <type> exceptions (probe/fuzz/misconfig)"; the per-function breakdown is
+    # detail folded into the description and total count.
+    exc_rollup: dict[tuple[str, str, str], dict[str, object]] = {}
+    for (
+        exc_code,
+        exc_desc,
+        original_func,
+        src_ip,
+        dst_ip,
+    ), count in exception_events.items():
+        key = (str(exc_desc), str(src_ip), str(dst_ip))
+        entry = exc_rollup.setdefault(
+            key, {"count": 0, "funcs": set(), "code": exc_code}
+        )
+        entry["count"] = int(entry["count"]) + int(count)
+        funcs = entry["funcs"]
+        if isinstance(funcs, set):
+            funcs.add(original_func)
+    for (exc_desc, src_ip, dst_ip), entry in sorted(
+        exc_rollup.items(), key=lambda kv: -int(kv[1]["count"])
+    ):
         if len(anomalies) >= max_anomalies:
             break
-        suffix = f" (x{count})" if count > 1 else ""
-        desc_text = f"Exception {exc_code} ({exc_desc}) for Function {original_func}{suffix}"
+        total = int(entry["count"])
+        funcs = entry["funcs"] if isinstance(entry["funcs"], set) else set()
+        func_note = (
+            f" across {len(funcs)} function code(s)"
+            if len(funcs) > 1
+            else (f" for Function {next(iter(funcs))}" if funcs else "")
+        )
+        count_note = f" (x{total})" if total > 1 else ""
+        desc_text = (
+            f"Exception {entry['code']} ({exc_desc}){func_note}{count_note}"
+        )
         severity = "MEDIUM"
         if exc_desc in {"Illegal Function", "Illegal Data Address"}:
             severity = "HIGH"
-        anomalies.append(ModbusAnomaly(
-            severity=severity,
-            title="Modbus Exception",
-            description=desc_text,
-            src=src_ip,
-            dst=dst_ip,
-            ts=0.0,
-        ))
+        anomalies.append(
+            ModbusAnomaly(
+                severity=severity,
+                title="Modbus Exception",
+                description=desc_text,
+                src=src_ip,
+                dst=dst_ip,
+                ts=0.0,
+            )
+        )
 
     for src_ip, dsts in src_dst_counts.items():
         unique_dsts = len(dsts)
@@ -1017,39 +1391,49 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
         resp_count = src_responses.get(src_ip, 0)
         if unique_dsts >= 20 and req_count > resp_count * 2:
             if len(anomalies) < max_anomalies:
-                anomalies.append(ModbusAnomaly(
-                    severity="MEDIUM",
-                    title="Modbus Scanning/Probing",
-                    description=f"Source contacted {unique_dsts} endpoints with low response rate.",
-                    src=src_ip,
-                    dst="*",
-                    ts=0.0,
-                ))
+                anomalies.append(
+                    ModbusAnomaly(
+                        severity="MEDIUM",
+                        title="Modbus Scanning/Probing",
+                        description=f"Source contacted {unique_dsts} endpoints with low response rate.",
+                        src=src_ip,
+                        dst="*",
+                        ts=0.0,
+                    )
+                )
 
         unit_count = len(src_unit_ids.get(src_ip, set()))
         if unit_count >= 20:
             if len(anomalies) < max_anomalies:
-                anomalies.append(ModbusAnomaly(
-                    severity="MEDIUM",
-                    title="Modbus Unit ID Scan",
-                    description=f"Source probed {unit_count} Unit IDs.",
-                    src=src_ip,
-                    dst="*",
-                    ts=0.0,
-                ))
+                anomalies.append(
+                    ModbusAnomaly(
+                        severity="MEDIUM",
+                        title="Modbus Unit ID Scan",
+                        description=f"Source probed {unit_count} Unit IDs.",
+                        src=src_ip,
+                        dst="*",
+                        ts=0.0,
+                    )
+                )
 
     for src_ip, dsts in src_dst_payload_bytes.items():
         for dst_ip, byte_count in dsts.items():
-            if byte_count >= 1_000_000 and _is_public_ip(dst_ip) and _is_private_ip(src_ip):
+            if (
+                byte_count >= 1_000_000
+                and _is_public_ip(dst_ip)
+                and _is_private_ip(src_ip)
+            ):
                 if len(anomalies) < max_anomalies:
-                    anomalies.append(ModbusAnomaly(
-                        severity="HIGH",
-                        title="Possible Modbus Data Exfiltration",
-                        description=f"{byte_count} bytes sent to public IP.",
-                        src=src_ip,
-                        dst=dst_ip,
-                        ts=0.0,
-                    ))
+                    anomalies.append(
+                        ModbusAnomaly(
+                            severity="HIGH",
+                            title="Possible Modbus Data Exfiltration",
+                            description=f"{byte_count} bytes sent to public IP.",
+                            src=src_ip,
+                            dst=dst_ip,
+                            ts=0.0,
+                        )
+                    )
 
     for session_key, intervals in session_intervals.items():
         if len(intervals) < 6:
@@ -1064,51 +1448,273 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
             src_ip = src_part.split(":", 1)[0]
             dst_ip = dst_part.split(":", 1)[0]
             if len(anomalies) < max_anomalies:
-                anomalies.append(ModbusAnomaly(
-                    severity="LOW",
-                    title="Possible Modbus Beaconing",
-                    description=f"Regular interval traffic (~{avg:.2f}s) observed.",
-                    src=src_ip,
-                    dst=dst_ip,
-                    ts=0.0,
-                ))
+                anomalies.append(
+                    ModbusAnomaly(
+                        severity="LOW",
+                        title="Possible Modbus Beaconing",
+                        description=f"Regular interval traffic (~{avg:.2f}s) observed.",
+                        src=src_ip,
+                        dst=dst_ip,
+                        ts=0.0,
+                    )
+                )
 
     for src_ip, count in src_write_requests.items():
         req_count = src_requests.get(src_ip, 0)
         ratio = (count / req_count) if req_count else 0.0
         if count >= 20 and ratio >= 0.3 and len(anomalies) < max_anomalies:
-            anomalies.append(ModbusAnomaly(
-                severity="HIGH",
-                title="Modbus Write Burst",
-                description=f"{count} write requests ({ratio:.0%} of client traffic).",
-                src=src_ip,
-                dst="*",
-                ts=0.0,
-            ))
+            anomalies.append(
+                ModbusAnomaly(
+                    severity="HIGH",
+                    title="Modbus Write Burst",
+                    description=f"{count} write requests ({ratio:.0%} of client traffic).",
+                    src=src_ip,
+                    dst="*",
+                    ts=0.0,
+                )
+            )
 
     if nonstandard_port_counts:
         for session, count in nonstandard_port_counts.most_common(6):
             if len(anomalies) >= max_anomalies:
                 break
-            anomalies.append(ModbusAnomaly(
-                severity="MEDIUM",
-                title="Modbus on Non-Standard Port",
-                description=f"Modbus signature observed on {session} ({count} packets).",
-                src="*",
-                dst="*",
-                ts=0.0,
-            ))
+            anomalies.append(
+                ModbusAnomaly(
+                    severity="MEDIUM",
+                    title="Modbus on Non-Standard Port",
+                    description=f"Modbus signature observed on {session} ({count} packets).",
+                    src="*",
+                    dst="*",
+                    ts=0.0,
+                )
+            )
 
     public_endpoints = [ip for ip in set(src_ips) | set(dst_ips) if _is_public_ip(ip)]
     if public_endpoints and len(anomalies) < max_anomalies:
-        anomalies.append(ModbusAnomaly(
-            severity="HIGH",
-            title="Modbus Exposure to Public IP",
-            description=f"Modbus traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-            src="*",
-            dst="*",
-            ts=0.0,
-        ))
+        anomalies.append(
+            ModbusAnomaly(
+                severity="HIGH",
+                title="Modbus Exposure to Public IP",
+                description=f"Modbus traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
+                src="*",
+                dst="*",
+                ts=0.0,
+            )
+        )
+
+    # --- FrostyGoop-style read-then-write (recon -> manipulate) ---
+    # A write to a register the same actor was previously reading is the exact
+    # shape of FrostyGoop (FC3 read + FC6/16 write of ENCO controller registers)
+    # and of a manual operator hijack: learn the current value, then overwrite.
+    for (src_ip, dst_ip, unit_id), count in read_then_write_events.items():
+        if len(anomalies) >= max_anomalies:
+            break
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(
+            ModbusAnomaly(
+                severity="HIGH",
+                title="Modbus Read-then-Write (recon+manipulate)",
+                description=(
+                    f"{src_ip} wrote to a register on {dst_ip} Unit {unit_id} that it "
+                    f"had previously read{suffix} — read-current-then-overwrite pattern "
+                    "(FrostyGoop FC3+FC6/16 signature / operator hijack). Confirm the "
+                    "source is an authorized master acting in a change window."
+                ),
+                src=src_ip,
+                dst=dst_ip,
+                ts=0.0,
+            )
+        )
+
+    # --- Malformed MBAP (protocol violation / fuzzing) ---
+    for session, count in malformed_mbap.most_common(6):
+        if len(anomalies) >= max_anomalies:
+            break
+        anomalies.append(
+            ModbusAnomaly(
+                severity="MEDIUM",
+                title="Modbus Malformed Frame",
+                description=(
+                    f"{count} frame(s) on port 502 with a non-zero MBAP protocol id "
+                    f"({session}) — malformed/non-compliant Modbus, tunnelled traffic, "
+                    "or a fuzzing/exploitation attempt."
+                ),
+                src="*",
+                dst="*",
+                ts=0.0,
+            )
+        )
+
+    # --- Strictly-reserved function codes (protocol violation) ---
+    for (fc, src_ip, dst_ip), count in reserved_fc_events.items():
+        if len(anomalies) >= max_anomalies:
+            break
+        suffix = f" (x{count})" if count > 1 else ""
+        anomalies.append(
+            ModbusAnomaly(
+                severity="MEDIUM",
+                title="Modbus Protocol Violation",
+                description=(
+                    f"Reserved/undefined function code {fc}{suffix} — outside the public "
+                    "spec and known vendor ranges (fuzzing / non-compliant client)."
+                ),
+                src=src_ip,
+                dst=dst_ip,
+                ts=0.0,
+            )
+        )
+
+    # --- Pairing-derived findings: orphan requests + phantom responses ---
+    orphan_by_server: Counter[str] = Counter()
+    for (c_ip, c_port, s_ip, t_id, u_id) in pending_tx:
+        orphan_by_server[s_ip] += 1
+    for s_ip, orphan_ct in orphan_by_server.items():
+        total_req = sum(v for k, v in conn_req_count.items() if k[2] == s_ip)
+        ratio = (orphan_ct / total_req) if total_req else 0.0
+        if (
+            orphan_ct >= PAIRING_MIN_COUNT
+            and ratio >= PAIRING_MIN_RATIO
+            and len(anomalies) < max_anomalies
+        ):
+            anomalies.append(
+                ModbusAnomaly(
+                    severity="MEDIUM",
+                    title="Modbus Unanswered Requests",
+                    description=(
+                        f"{orphan_ct} request(s) to {s_ip} ({ratio:.0%} of its traffic) "
+                        "received no response — possible PLC outage, comms disruption, "
+                        "or denial of service (T0814). Rule out capture cut-off first."
+                    ),
+                    src="*",
+                    dst=s_ip,
+                    ts=0.0,
+                )
+            )
+    for s_ip, ph_ct in phantom_responses.items():
+        total_resp = src_responses.get(s_ip, 0)
+        ratio = (ph_ct / total_resp) if total_resp else 0.0
+        if (
+            ph_ct >= PAIRING_MIN_COUNT
+            and ratio >= PAIRING_MIN_RATIO
+            and len(anomalies) < max_anomalies
+        ):
+            anomalies.append(
+                ModbusAnomaly(
+                    severity="MEDIUM",
+                    title="Modbus Unsolicited Responses",
+                    description=(
+                        f"{ph_ct} response(s) from {s_ip} ({ratio:.0%}) had no matching "
+                        "request in-capture — possible response injection/spoofing "
+                        "(T0856 Spoof Reporting Message). Rule out capture start first."
+                    ),
+                    src=s_ip,
+                    dst="*",
+                    ts=0.0,
+                )
+            )
+
+    # --- Static transaction id per connection (replay / injection tell) ---
+    for conn_key, tids in conn_transids.items():
+        req_ct = conn_req_count.get(conn_key, 0)
+        if (
+            req_ct >= STATIC_TRANSID_MIN_REQ
+            and len(tids) <= STATIC_TRANSID_MAX_DISTINCT
+            and len(anomalies) < max_anomalies
+        ):
+            c_ip, c_port, s_ip = conn_key
+            anomalies.append(
+                ModbusAnomaly(
+                    severity="MEDIUM",
+                    title="Modbus Static Transaction ID",
+                    description=(
+                        f"{c_ip}:{c_port} -> {s_ip} issued {req_ct} requests using only "
+                        f"{len(tids)} distinct transaction id(s) — a compliant master "
+                        "increments per request; static ids suggest replayed or "
+                        "injected frames from a crafted client."
+                    ),
+                    src=c_ip,
+                    dst=s_ip,
+                    ts=0.0,
+                )
+            )
+
+    # --- Multiple masters (new/rogue-master hunt hypothesis) ---
+    request_masters = [ip for ip, ct in src_ips.items() if ct > 0]
+    if len(request_masters) > 1 and len(anomalies) < max_anomalies:
+        ranked_masters = sorted(request_masters, key=lambda ip: -src_ips.get(ip, 0))
+        anomalies.append(
+            ModbusAnomaly(
+                severity="MEDIUM",
+                title="Multiple Modbus Masters",
+                description=(
+                    f"{len(request_masters)} source IPs issued Modbus requests "
+                    f"({', '.join(ranked_masters[:5])}). The set of masters is normally "
+                    "small and stable — validate any master that is not a known SCADA/HMI "
+                    "or engineering station (new-master hunt hypothesis)."
+                ),
+                src="*",
+                dst="*",
+                ts=0.0,
+            )
+        )
+
+    # --- Derive baseline outputs (cadence / RTT / pairing / register map) ---
+    session_cadence: List[dict[str, object]] = []
+    for session_key, intervals in session_intervals.items():
+        if len(intervals) < 3:
+            continue
+        ordered = sorted(intervals)
+        avg = sum(ordered) / len(ordered)
+        median = ordered[len(ordered) // 2]
+        variance = sum((x - avg) ** 2 for x in ordered) / len(ordered)
+        cv = (math.sqrt(variance) / avg) if avg > 0 else 0.0
+        session_cadence.append(
+            {
+                "session": session_key,
+                "count": len(intervals) + 1,
+                "avg": avg,
+                "median": median,
+                "cv": cv,
+                "regular": cv <= 0.2,
+            }
+        )
+    session_cadence.sort(key=lambda d: -int(d.get("count", 0)))
+
+    rtt_by_server: Dict[str, Dict[str, float]] = {}
+    for s_ip, samples in rtt_samples.items():
+        if samples:
+            rtt_by_server[s_ip] = _stats_from_samples(samples)
+
+    pairing = {
+        "matched": matched_tx,
+        "orphan_requests": len(pending_tx),
+        "phantom_responses": int(sum(phantom_responses.values())),
+        "static_transid_conns": sum(
+            1
+            for k, tids in conn_transids.items()
+            if conn_req_count.get(k, 0) >= STATIC_TRANSID_MIN_REQ
+            and len(tids) <= STATIC_TRANSID_MAX_DISTINCT
+        ),
+    }
+
+    register_map_out: Dict[str, Dict[str, object]] = {}
+    for (dst_ip, unit_id), rec in register_map.items():
+        read_addrs = rec["read_addrs"] if isinstance(rec["read_addrs"], Counter) else Counter()
+        write_addrs = rec["write_addrs"] if isinstance(rec["write_addrs"], Counter) else Counter()
+        register_map_out[f"{dst_ip}|{unit_id}"] = {
+            "dst": dst_ip,
+            "unit": unit_id,
+            "read_count": int(rec["read_count"]),  # type: ignore[arg-type]
+            "write_count": int(rec["write_count"]),  # type: ignore[arg-type]
+            "read_min": rec["read_min"],
+            "read_max": rec["read_max"],
+            "write_min": rec["write_min"],
+            "write_max": rec["write_max"],
+            "read_hot": read_addrs.most_common(5),
+            "write_hot": write_addrs.most_common(5),
+            "distinct_read_addrs": len(read_addrs),
+            "distinct_write_addrs": len(write_addrs),
+        }
 
     return ModbusAnalysis(
         path=path,
@@ -1132,9 +1738,14 @@ def analyze_modbus(path: Path, show_status: bool = True) -> ModbusAnalysis:
         packet_size_stats=packet_size_stats,
         payload_size_stats=payload_size_stats,
         flow_duration_buckets=flow_duration_buckets,
+        first_seen=first_seen,
+        register_map=register_map_out,
+        session_cadence=session_cadence,
+        rtt_by_server=rtt_by_server,
+        pairing=pairing,
         messages=messages,
         artifacts=artifacts,
         anomalies=anomalies,
         value_changes=value_changes,
-        errors=errors
+        errors=errors,
     )

@@ -28,6 +28,7 @@ htmlcov/
 
 # Editor / OS
 .DS_Store
+.claude/
 .idea/
 .vscode/
 

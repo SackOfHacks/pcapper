@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from pathlib import Path
 import ipaddress
 import re
+from pathlib import Path
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
-from .opcode_models import load_opcode_model, format_opcode
+from .industrial_helpers import (
+    append_public_exposure_anomaly,
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_port_protocol,
+)
+from .opcode_models import format_opcode, load_opcode_model
 
 NIAGARA_PORTS = {1911, 4911}
 NIAGARA_MODEL_PATH = Path(__file__).with_name("niagara_opcodes.json")
@@ -23,7 +28,9 @@ NIAGARA_KEYWORDS = {
 }
 
 ORD_PATTERN = re.compile(r"ord:[^\\s\\x00]+", re.IGNORECASE)
-OPCODE_PATTERN = re.compile(r"(?:opcode|op)\\s*[:=]\\s*(0x[0-9a-fA-F]+|\\d+)", re.IGNORECASE)
+OPCODE_PATTERN = re.compile(
+    r"(?:opcode|op)\\s*[:=]\\s*(0x[0-9a-fA-F]+|\\d+)", re.IGNORECASE
+)
 
 
 def _load_model() -> object | None:
@@ -65,9 +72,13 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
     return artifacts
 
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
-    if any(cmd in {"Niagara Put", "Niagara Delete", "Niagara Invoke"} for cmd in commands):
+    if any(
+        cmd in {"Niagara Put", "Niagara Delete", "Niagara Invoke"} for cmd in commands
+    ):
         anomalies.append(
             IndustrialAnomaly(
                 severity="HIGH",
@@ -92,22 +103,5 @@ def analyze_niagara(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         enable_enrichment=True,
         show_status=show_status,
     )
-    public_endpoints = []
-    for ip_value in set(analysis.src_ips) | set(analysis.dst_ips):
-        try:
-            if ipaddress.ip_address(ip_value).is_global:
-                public_endpoints.append(ip_value)
-        except Exception:
-            continue
-    if public_endpoints and len(analysis.anomalies) < 200:
-        analysis.anomalies.append(
-            IndustrialAnomaly(
-                severity="HIGH",
-                title="Niagara Exposure to Public IP",
-                description=f"Niagara Fox traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
-                src="*",
-                dst="*",
-                ts=0.0,
-            )
-        )
+    append_public_exposure_anomaly(analysis, "Niagara")
     return analysis

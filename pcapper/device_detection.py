@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-
 _DEVICE_HINT_RE = re.compile(
     r"(?i)\b("
     r"firmware|fw|software|sw|version|ver|revision|rev|build|"
@@ -19,9 +18,15 @@ _DEVICE_HINT_RE = re.compile(
 )
 
 _VENDOR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\ballen[- ]?bradley\b|\brockwell\b", re.IGNORECASE), "Rockwell Automation / Allen-Bradley"),
+    (
+        re.compile(r"\ballen[- ]?bradley\b|\brockwell\b", re.IGNORECASE),
+        "Rockwell Automation / Allen-Bradley",
+    ),
     (re.compile(r"\bsiemens\b", re.IGNORECASE), "Siemens"),
-    (re.compile(r"\bschneider\b|\bmodicon\b|\btelemechanique\b", re.IGNORECASE), "Schneider Electric"),
+    (
+        re.compile(r"\bschneider\b|\bmodicon\b|\btelemechanique\b", re.IGNORECASE),
+        "Schneider Electric",
+    ),
     (re.compile(r"\bomron\b", re.IGNORECASE), "Omron"),
     (re.compile(r"\bmitsubishi\b", re.IGNORECASE), "Mitsubishi Electric"),
     (re.compile(r"\byokogawa\b", re.IGNORECASE), "Yokogawa"),
@@ -56,7 +61,10 @@ _DEVICE_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bdcs\b", re.IGNORECASE), "DCS"),
     (re.compile(r"\bied\b|intelligent electronic device", re.IGNORECASE), "IED"),
     (re.compile(r"\brelay\b|protection relay", re.IGNORECASE), "Protection Relay"),
-    (re.compile(r"\bvfd\b|variable frequency drive|drive\b", re.IGNORECASE), "Drive/VFD"),
+    (
+        re.compile(r"\bvfd\b|variable frequency drive|drive\b", re.IGNORECASE),
+        "Drive/VFD",
+    ),
     (re.compile(r"\brouter\b", re.IGNORECASE), "Router"),
     (re.compile(r"\bswitch\b", re.IGNORECASE), "Switch"),
     (re.compile(r"\bfirewall\b", re.IGNORECASE), "Firewall"),
@@ -74,7 +82,10 @@ _OS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bUbuntu\s*([0-9.]+)?", re.IGNORECASE), "Ubuntu"),
     (re.compile(r"\bDebian\s*([0-9.]+)?", re.IGNORECASE), "Debian"),
     (re.compile(r"\bCentOS\s*([0-9.]+)?", re.IGNORECASE), "CentOS"),
-    (re.compile(r"\bRed Hat(?: Enterprise Linux)?\s*([0-9.]+)?", re.IGNORECASE), "Red Hat"),
+    (
+        re.compile(r"\bRed Hat(?: Enterprise Linux)?\s*([0-9.]+)?", re.IGNORECASE),
+        "Red Hat",
+    ),
     (re.compile(r"\bLinux\b(?:[^0-9]*([0-9.]+))?", re.IGNORECASE), "Linux"),
     (re.compile(r"\bmacOS\s*([0-9.]+)?", re.IGNORECASE), "macOS"),
     (re.compile(r"\bDarwin\s*([0-9.]+)?", re.IGNORECASE), "macOS"),
@@ -91,16 +102,45 @@ _OS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 _VERSION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?i)\b(?:firmware|fw)\b[:= ]+v?([A-Za-z0-9._-]{1,32})"), "firmware"),
     (re.compile(r"(?i)\b(?:software|sw)\b[:= ]+v?([A-Za-z0-9._-]{1,32})"), "software"),
-    (re.compile(r"(?i)\b(?:os|operating system)\b[:= ]+v?([A-Za-z0-9._-]{1,32})"), "os"),
-    (re.compile(r"(?i)\b(?:version|ver|rev|revision|build)\b[:= ]+v?([A-Za-z0-9._-]{1,32})"), "version"),
+    (
+        re.compile(r"(?i)\b(?:os|operating system)\b[:= ]+v?([A-Za-z0-9._-]{1,32})"),
+        "os",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(?:version|ver|rev|revision|build)\b[:= ]+v?([A-Za-z0-9._-]{1,32})"
+        ),
+        "version",
+    ),
 ]
 
 _MODEL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"(?i)\bmodel(?:\s*no\.|number)?\s*[:= ]+([A-Za-z0-9][A-Za-z0-9 _./\\-]{1,48})"), "model"),
-    (re.compile(r"(?i)\bproduct(?:\s*name|code)?\s*[:= ]+([A-Za-z0-9][A-Za-z0-9 _./\\-]{1,48})"), "product"),
-    (re.compile(r"(?i)\bdevice\s*[:= ]+([A-Za-z0-9][A-Za-z0-9 _./\\-]{1,48})"), "model"),
-    (re.compile(r"(?i)\border\s*code\s*[:= ]+([A-Za-z0-9][A-Za-z0-9 _./\\-]{1,48})"), "order_code"),
-    (re.compile(r"(?i)\bcatalog(?:\s*no\.|#)?\s*[:= ]+([A-Za-z0-9][A-Za-z0-9 _./\\-]{1,48})"), "catalog"),
+    (
+        re.compile(
+            r"(?i)\bmodel(?:\s*no\.|number)?\s*[:= ]+([A-Za-z0-9][A-Za-z0-9 _./\\-]{1,48})"
+        ),
+        "model",
+    ),
+    (
+        re.compile(
+            r"(?i)\bproduct(?:\s*name|code)?\s*[:= ]+([A-Za-z0-9][A-Za-z0-9 _./\\-]{1,48})"
+        ),
+        "product",
+    ),
+    (
+        re.compile(r"(?i)\bdevice\s*[:= ]+([A-Za-z0-9][A-Za-z0-9 _./\\-]{1,48})"),
+        "model",
+    ),
+    (
+        re.compile(r"(?i)\border\s*code\s*[:= ]+([A-Za-z0-9][A-Za-z0-9 _./\\-]{1,48})"),
+        "order_code",
+    ),
+    (
+        re.compile(
+            r"(?i)\bcatalog(?:\s*no\.|#)?\s*[:= ]+([A-Za-z0-9][A-Za-z0-9 _./\\-]{1,48})"
+        ),
+        "catalog",
+    ),
 ]
 
 _SOFTWARE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -197,7 +237,9 @@ def extract_device_fields(text: str) -> dict[str, str]:
     return fields
 
 
-def format_device_detail(fields: dict[str, object], source: str | None = None) -> str | None:
+def format_device_detail(
+    fields: dict[str, object], source: str | None = None
+) -> str | None:
     if not fields:
         return None
 
@@ -240,7 +282,9 @@ def device_fingerprints_from_text(text: str, source: str | None = None) -> list[
     return [detail] if detail else []
 
 
-def device_fingerprint_from_fields(fields: dict[str, object], source: str | None = None) -> str | None:
+def device_fingerprint_from_fields(
+    fields: dict[str, object], source: str | None = None
+) -> str | None:
     return format_device_detail(fields, source=source)
 
 

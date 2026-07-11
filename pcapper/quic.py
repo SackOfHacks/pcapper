@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, UDP  # type: ignore
@@ -40,11 +40,23 @@ def _looks_like_quic(payload: bytes) -> bool:
     if not payload:
         return False
     first = payload[0]
-    # QUIC long header has 0x80 bit set
-    if first & 0x80:
-        return True
-    # short header has 0x40 bit set and fixed bit 0x40; check for 0x40 or 0x50+ variants
-    return (first & 0x40) == 0x40
+    # Long header: Header-Form (0x80) AND Fixed (0x40) bits set, plus a
+    # recognized 32-bit version. Requiring the fixed bit + version rejects STUN/
+    # DTLS/other UDP on the same port whose first byte merely had 0x80 set.
+    if (first & 0xC0) == 0xC0:
+        if len(payload) < 5:
+            return False
+        version = int.from_bytes(payload[1:5], "big")
+        return (
+            version == 0x00000000  # Version Negotiation
+            or version == 0x00000001  # QUIC v1 (RFC 9000)
+            or version == 0x6B3343CF  # QUIC v2 (RFC 9369)
+            or (version >> 16) == 0xFF00  # IETF drafts ff0000xx
+            or (version & 0x0F0F0F0F) == 0x0A0A0A0A  # forced version negotiation
+        )
+    # Short header: Header-Form bit clear, Fixed bit set. Can't validate further
+    # statelessly; already gated to QUIC ports by the caller.
+    return (first & 0xC0) == 0x40
 
 
 def _parse_version(payload: bytes) -> Optional[str]:
@@ -56,11 +68,27 @@ def _parse_version(payload: bytes) -> Optional[str]:
     return f"0x{version:08x}"
 
 
+@memoize_analysis
 def analyze_quic(path: Path, show_status: bool = True) -> QuicSummary:
     if UDP is None:
-        return QuicSummary(path, 0, 0, Counter(), Counter(), Counter(), Counter(), [], ["Scapy UDP unavailable"], None, None, None)
+        return QuicSummary(
+            path,
+            0,
+            0,
+            Counter(),
+            Counter(),
+            Counter(),
+            Counter(),
+            [],
+            ["Scapy UDP unavailable"],
+            None,
+            None,
+            None,
+        )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     quic_packets = 0
     clients: Counter[str] = Counter()
@@ -101,14 +129,7 @@ def analyze_quic(path: Path, show_status: bool = True) -> QuicSummary:
             if not _looks_like_quic(payload):
                 continue
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IP].src)  # type: ignore[index]
-                dst_ip = str(pkt[IP].dst)  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IPv6].src)  # type: ignore[index]
-                dst_ip = str(pkt[IPv6].dst)  # type: ignore[index]
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 
@@ -130,13 +151,19 @@ def analyze_quic(path: Path, show_status: bool = True) -> QuicSummary:
         reader.close()
 
     if quic_packets:
-        detections.append({
-            "severity": "info",
-            "summary": "QUIC traffic observed",
-            "details": f"{quic_packets} QUIC-like packets detected; check for HTTP/3 usage.",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "QUIC traffic observed",
+                "details": f"{quic_packets} QUIC-like packets detected; check for HTTP/3 usage.",
+            }
+        )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return QuicSummary(
         path=path,
         total_packets=total_packets,

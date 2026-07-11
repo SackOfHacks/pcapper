@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import sys
 
-
 ANSI_RESET = "\x1b[0m"
 ANSI_BOLD = "\x1b[1m"
 ANSI_DIM = "\x1b[2m"
@@ -35,7 +34,13 @@ def use_color(enabled: bool | None = None) -> bool:
         return False
 
 
-def colorize(text: str, color: str | None, enabled: bool | None = None, bold: bool = False, dim: bool = False) -> str:
+def colorize(
+    text: str,
+    color: str | None,
+    enabled: bool | None = None,
+    bold: bool = False,
+    dim: bool = False,
+) -> str:
     if not use_color(enabled) or color is None:
         return text
     parts = []
@@ -100,7 +105,46 @@ def danger_bg(text: str, enabled: bool | None = None) -> str:
     return f"{ANSI_RED_BG}{ANSI_WHITE}{ANSI_BOLD}{text}{ANSI_RESET}"
 
 
-def warn_bg(text: str, enabled: bool | None = None) -> str:
+def suspicious_bg(text: str, enabled: bool | None = None) -> str:
     if not use_color(enabled):
         return text
-    return f"{ANSI_RED_BG}{ANSI_BLACK}{ANSI_BOLD}{text}{ANSI_RESET}"
+    return f"{ANSI_YELLOW_BG}{ANSI_BLACK}{ANSI_BOLD}{text}{ANSI_RESET}"
+
+
+# Canonical severity → color/label mapping. Analyzer modules emit severities in
+# several vocabularies (HIGH/MEDIUM/LOW, critical/high/warning/info, etc.);
+# route them all through these helpers so a "critical" or "medium" finding is
+# never accidentally rendered benign-green by an if/elif chain that only
+# matched "high"/"warning".
+_SEVERITY_RANK = {
+    "critical": 4,
+    "high": 3,
+    "medium": 2,
+    "warning": 2,
+    "warn": 2,
+    "low": 1,
+    "info": 0,
+    "informational": 0,
+}
+
+
+def normalize_severity(value: object) -> str:
+    return str(value if value is not None else "").strip().lower()
+
+
+def severity_rank(value: object) -> int:
+    return _SEVERITY_RANK.get(normalize_severity(value), 0)
+
+
+def severity_label(value: object) -> str:
+    text = str(value if value is not None else "").strip()
+    return text.upper() if text else "INFO"
+
+
+def severity_color(text: str, value: object, enabled: bool | None = None) -> str:
+    rank = severity_rank(value)
+    if rank >= 3:  # high / critical
+        return danger(text, enabled)
+    if rank == 2:  # medium / warning
+        return warn(text, enabled)
+    return muted(text, enabled)  # low / info / unknown

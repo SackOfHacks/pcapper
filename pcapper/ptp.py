@@ -78,7 +78,9 @@ def _parse_ptp_sequence(payload: bytes) -> Optional[int]:
 
 
 def analyze_ptp(path: Path, show_status: bool = True) -> PtpSummary:
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     ptp_packets = 0
     msg_types: Counter[str] = Counter()
@@ -138,7 +140,10 @@ def analyze_ptp(path: Path, show_status: bool = True) -> PtpSummary:
                 udp = pkt[UDP]  # type: ignore[index]
                 sport = int(getattr(udp, "sport", 0) or 0)
                 dport = int(getattr(udp, "dport", 0) or 0)
-                if sport in {PTP_EVENT_PORT, PTP_GENERAL_PORT} or dport in {PTP_EVENT_PORT, PTP_GENERAL_PORT}:
+                if sport in {PTP_EVENT_PORT, PTP_GENERAL_PORT} or dport in {
+                    PTP_EVENT_PORT,
+                    PTP_GENERAL_PORT,
+                }:
                     is_ptp = True
                     payload = bytes(getattr(udp, "payload", b""))
                     if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
@@ -164,11 +169,13 @@ def analyze_ptp(path: Path, show_status: bool = True) -> PtpSummary:
                     seq_key = (str(getattr(pkt, "src", "?")), domain)
                     prev_seq = seq_state.get(seq_key)
                     if prev_seq is not None and seq_id < prev_seq:
-                        detections.append({
-                            "severity": "warning",
-                            "summary": "PTP Sequence Decrease",
-                            "details": f"{seq_key[0]} domain {domain} seqId decreased {prev_seq}->{seq_id}.",
-                        })
+                        detections.append(
+                            {
+                                "severity": "warning",
+                                "summary": "PTP Sequence Decrease",
+                                "details": f"{seq_key[0]} domain {domain} seqId decreased {prev_seq}->{seq_id}.",
+                            }
+                        )
                     seq_state[seq_key] = seq_id
                 src_key = str(getattr(pkt, "src", "?"))
                 if src_macs:
@@ -184,26 +191,36 @@ def analyze_ptp(path: Path, show_status: bool = True) -> PtpSummary:
         reader.close()
 
     if ptp_packets:
-        detections.append({
-            "severity": "info",
-            "summary": "PTP time-sync traffic observed",
-            "details": f"{ptp_packets} PTP packets detected (UDP 319/320 or L2).",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "PTP time-sync traffic observed",
+                "details": f"{ptp_packets} PTP packets detected (UDP 319/320 or L2).",
+            }
+        )
     for src, types in src_msg_types.items():
         if "Management" in types and len(types) >= 4:
-            detections.append({
-                "severity": "warning",
-                "summary": "PTP Management Activity",
-                "details": f"{src} used Management messages alongside {len(types)} PTP types (potential time control).",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "PTP Management Activity",
+                    "details": f"{src} used Management messages alongside {len(types)} PTP types (potential time control).",
+                }
+            )
     if unicast_dsts:
-        detections.append({
-            "severity": "warning",
-            "summary": "PTP Unicast Destinations",
-            "details": f"Unicast PTP MAC destinations observed: {', '.join(sorted(unicast_dsts)[:5])}.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "PTP Unicast Destinations",
+                "details": f"Unicast PTP MAC destinations observed: {', '.join(sorted(unicast_dsts)[:5])}.",
+            }
+        )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return PtpSummary(
         path=path,
         total_packets=total_packets,

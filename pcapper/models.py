@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from collections import Counter
 
 
 @dataclass(frozen=True)
@@ -32,3 +32,11 @@ class PcapSummary:
     duration_seconds: Optional[float]
     interface_stats: list[InterfaceStat]
     protocol_counts: Counter[str]
+    tcp_packets: int = 0
+    retransmissions: int = 0
+    retransmission_rate: float = 0.0
+    capture_hardware: Optional[str] = None
+    capture_os: Optional[str] = None
+    capture_application: Optional[str] = None
+    hash_sha256: Optional[str] = None
+    hash_sha1: Optional[str] = None

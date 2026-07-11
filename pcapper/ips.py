@@ -1,20 +1,32 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-from functools import lru_cache
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Iterable, Optional
+
+from .utils import shannon_entropy as _shannon_entropy, tcp_flags_int as _tcp_flags_int
+from .utils import is_public_ip as _is_public_ip
+import hashlib
 import ipaddress
 import json
 import os
-import urllib.request
 import urllib.error
-import hashlib
-import math
+import urllib.request
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+from typing import Iterable, Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float, detect_file_type, safe_read_text, counter_inc, setdict_add, set_add_cap
+from .tls_fingerprints import (
+    _coerce_int_list,
+    _extract_alpn,
+    _extract_sni,
+    _iter_tls_extensions,
+    _ja3_from_client_hello,
+    _ja4_from_client_hello,
+    _ja4s_from_server_hello,
+    _tls_extension_type,
+)
+from .utils import counter_inc, memoize_analysis, packet_length, safe_float, safe_read_text, set_add_cap, setdict_add
 
 MAX_ENDPOINTS = int(os.getenv("PCAPPER_MAX_ENDPOINTS", "20000"))
 MAX_CONVERSATIONS = int(os.getenv("PCAPPER_MAX_CONVERSATIONS", "50000"))
@@ -42,8 +54,9 @@ except Exception:  # pragma: no cover
     ICMP = None  # type: ignore
 
 try:
-    from scapy.layers.l2 import Ether  # type: ignore
+    from scapy.layers.l2 import ARP, Ether  # type: ignore
 except Exception:  # pragma: no cover
+    ARP = None  # type: ignore
     Ether = None  # type: ignore
 
 try:
@@ -67,7 +80,10 @@ except Exception:  # pragma: no cover
     TLSClientHello = None  # type: ignore
 
 try:
-    from scapy.layers.tls.handshake import TLSServerHello, TLSCertificate  # type: ignore
+    from scapy.layers.tls.handshake import (  # type: ignore
+        TLSCertificate,
+        TLSServerHello,
+    )
 except Exception:  # pragma: no cover
     TLSServerHello = None  # type: ignore
     TLSCertificate = None  # type: ignore
@@ -128,6 +144,7 @@ class IpSummary:
     dst_counts: Counter[str]
     ip_category_counts: Counter[str]
     ip_mac_counts: dict[str, Counter[str]]
+    ip_hostnames: dict[str, Counter[str]]
     endpoints: list[IpEndpoint]
     conversations: list[IpConversation]
     first_seen: Optional[float]
@@ -146,21 +163,102 @@ class IpSummary:
     intel_findings: list[dict[str, object]]
     detections: list[dict[str, object]]
     errors: list[str]
+    confirmed_tcp_service_ports: dict[str, list[int]] = field(default_factory=dict)
     analyst_verdict: str = ""
     analyst_confidence: str = "low"
     analyst_reasons: list[str] = field(default_factory=list)
+    # Browser (MS-BRWS) announced identity per IP.
+    ip_roles: dict[str, list[str]] = field(default_factory=dict)
+    ip_os: dict[str, str] = field(default_factory=dict)
     deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
     exposure_profiles: list[dict[str, object]] = field(default_factory=list)
     priority_asset_profiles: list[dict[str, object]] = field(default_factory=list)
     infrastructure_clusters: list[dict[str, object]] = field(default_factory=list)
     intent_profiles: list[dict[str, object]] = field(default_factory=list)
     corroborated_findings: list[dict[str, object]] = field(default_factory=list)
-    investigation_pivots: list[dict[str, object]] = field(default_factory=list)
-    risk_matrix: list[dict[str, str]] = field(default_factory=list)
     false_positive_context: list[str] = field(default_factory=list)
+    # Per-IP geo/ASN/org enrichment (MaxMind DB and/or online lookup). Keyed by
+    # IP -> {country, city, asn, org, hosting, proxy, source}.
+    ip_enrichment: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
-def _build_ips_hunting_context(
+def _enrich_ips_online(
+    ips: list[str], timeout: float = 6.0
+) -> tuple[dict[str, dict[str, str]], list[str]]:
+    """Look up geo/ASN/org for public IPs via the free ip-api.com batch API
+    (no key, <=100 IPs/request). Opt-in (--ip-geo) because it sends the observed
+    public IPs to a third party. Flags hosting/proxy/mobile networks, which is
+    high-value triage context (bulletproof hosting, VPN/anonymizer egress)."""
+    out: dict[str, dict[str, str]] = {}
+    errors: list[str] = []
+    fields = "status,country,countryCode,regionName,city,isp,org,as,asname,hosting,proxy,mobile,query"
+    unique = [ip for ip in dict.fromkeys(ips) if ip]
+    for i in range(0, len(unique), 100):
+        batch = unique[i : i + 100]
+        body = json.dumps(
+            [{"query": ip, "fields": fields, "lang": "en"} for ip in batch]
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            "http://ip-api.com/batch",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError) as exc:
+            errors.append(f"ip-api.com lookup failed: {exc}")
+            break
+        if not isinstance(payload, list):
+            continue
+        for entry in payload:
+            if not isinstance(entry, dict) or entry.get("status") != "success":
+                continue
+            ip = str(entry.get("query", ""))
+            if not ip:
+                continue
+            geo_parts = [
+                str(p)
+                for p in (entry.get("city"), entry.get("regionName"), entry.get("country"))
+                if p
+            ]
+            asn_field = str(entry.get("as", "") or "")
+            org = str(entry.get("org", "") or entry.get("isp", "") or entry.get("asname", "") or "")
+            out[ip] = {
+                "country": str(entry.get("country", "") or ""),
+                "country_code": str(entry.get("countryCode", "") or ""),
+                "geo": ", ".join(geo_parts),
+                "asn": asn_field,
+                "org": org,
+                "hosting": "yes" if entry.get("hosting") else "",
+                "proxy": "yes" if entry.get("proxy") else "",
+                "mobile": "yes" if entry.get("mobile") else "",
+                "source": "ip-api.com",
+            }
+    return out, errors
+
+
+def _tcp_is_syn(flags: object) -> bool:
+    value = _tcp_flags_int(flags)
+    return bool(value & 0x02) and not bool(value & 0x10)
+
+
+def _tcp_is_synack(flags: object) -> bool:
+    value = _tcp_flags_int(flags)
+    return bool(value & 0x02) and bool(value & 0x10)
+
+
+def _tcp_is_final_handshake_ack(flags: object) -> bool:
+    value = _tcp_flags_int(flags)
+    return (
+        bool(value & 0x10)
+        and not bool(value & 0x02)
+        and not bool(value & 0x04)
+        and not bool(value & 0x01)
+    )
+
+
+def _build_ips_enrichment(
     *,
     endpoints: list[IpEndpoint],
     conversations: list[IpConversation],
@@ -169,280 +267,165 @@ def _build_ips_hunting_context(
     intel_findings: list[dict[str, object]],
     detections: list[dict[str, object]],
 ) -> dict[str, object]:
-    checks: dict[str, list[str]] = {
-        "indicator_quality_gate": [],
-        "recency_and_persistence": [],
-        "boundary_cross_zone_contact": [],
-        "internal_critical_asset_contact": [],
-        "corroborated_multi_signal_hit": [],
-        "infrastructure_clustering": [],
-        "intent_heuristics": [],
-        "evidence_provenance": [],
-    }
+    _ = (endpoints,)
+    checks: dict[str, list[str]] = defaultdict(list)
 
-    exposure_profiles: list[dict[str, object]] = []
-    priority_asset_profiles: list[dict[str, object]] = []
-    infrastructure_clusters: list[dict[str, object]] = []
-    intent_profiles: list[dict[str, object]] = []
-    corroborated_findings: list[dict[str, object]] = []
-    pivots: list[dict[str, object]] = []
-
-    score_by_ip: defaultdict[str, int] = defaultdict(int)
-    reasons_by_ip: defaultdict[str, list[str]] = defaultdict(list)
-    endpoint_map = {ep.ip: ep for ep in endpoints}
-
-    intel_by_ip: defaultdict[str, list[dict[str, object]]] = defaultdict(list)
-    for finding in intel_findings:
-        ip_value = str(finding.get("ip", "") or "")
-        if ip_value:
-            intel_by_ip[ip_value].append(finding)
-
-    for ip_value, findings in intel_by_ip.items():
-        quality = 0
-        details: list[str] = []
-        for finding in findings:
-            source = str(finding.get("source", ""))
-            if source == "AbuseIPDB":
-                score = int(finding.get("score", 0) or 0)
-                reports = int(finding.get("reports", 0) or 0)
-                if score >= 50:
-                    quality += 2
-                elif score >= 20:
-                    quality += 1
-                details.append(f"AbuseIPDB score={score} reports={reports}")
-            elif source == "OTX":
-                pulses = int(finding.get("pulses", 0) or 0)
-                quality += 2 if pulses >= 5 else 1
-                details.append(f"OTX pulses={pulses}")
-            elif source == "VirusTotal":
-                malicious = int(finding.get("malicious", 0) or 0)
-                suspicious = int(finding.get("suspicious", 0) or 0)
-                quality += 2 if malicious > 0 else 1 if suspicious > 0 else 0
-                details.append(f"VT malicious={malicious} suspicious={suspicious}")
-
-        if quality > 0:
-            checks["indicator_quality_gate"].append(f"{ip_value} quality={quality} {'; '.join(details[:3])}")
-            score_by_ip[ip_value] += quality
-            reasons_by_ip[ip_value].append("Threat-intel quality score above threshold")
-
-    for conv in conversations:
-        src_private = not _is_public_ip(conv.src)
-        dst_public = _is_public_ip(conv.dst)
-        conv_duration = None
-        if conv.first_seen is not None and conv.last_seen is not None:
-            conv_duration = max(0.0, float(conv.last_seen) - float(conv.first_seen))
-
-        checks["evidence_provenance"].append(
-            f"{conv.src}->{conv.dst} proto={conv.protocol} packets={conv.packets} bytes={conv.bytes} first={conv.first_seen} last={conv.last_seen} ports={','.join(str(p) for p in conv.ports[:8]) or '-'}"
+    # Indicator quality gate: external IOC hits (AbuseIPDB/OTX/VT) and TLS
+    # reputation/cert IOC matches are high-quality, low-FP signals.
+    for finding in intel_findings or []:
+        ip = str(finding.get("ip", "?"))
+        bits = []
+        if finding.get("score"):
+            bits.append(f"AbuseIPDB score {finding.get('score')}")
+        if finding.get("pulses"):
+            bits.append(f"OTX pulses {finding.get('pulses')}")
+        if finding.get("malicious") or finding.get("suspicious"):
+            bits.append(
+                f"VT malicious={finding.get('malicious', 0)}/suspicious={finding.get('suspicious', 0)}"
+            )
+        checks["indicator_quality_gate"].append(
+            f"{ip}: {', '.join(bits) if bits else 'threat-intel hit'}"
         )
 
-        if src_private and dst_public:
-            checks["boundary_cross_zone_contact"].append(
-                f"{conv.src}->{conv.dst} {conv.protocol} packets={conv.packets}"
-            )
-            exposure_profiles.append(
-                {
-                    "src": conv.src,
-                    "dst": conv.dst,
-                    "protocol": conv.protocol,
-                    "direction": "outbound",
-                    "packets": conv.packets,
-                    "bytes": conv.bytes,
-                    "confidence": "high" if conv.packets >= 100 else "medium",
-                }
-            )
-            score_by_ip[conv.src] += 1
-            reasons_by_ip[conv.src].append("Cross-zone outbound contact")
+    # Intent heuristics from the analyzer's already-thresholded detections.
+    for det in detections or []:
+        sev = str(det.get("severity", "info")).lower()
+        summary_text = str(det.get("summary", ""))
+        blob = summary_text.lower()
+        ev = summary_text + (f" — {det.get('details','')}" if det.get("details") else "")
+        if any(
+            t in blob
+            for t in ("port scanning", "scan", "sweep", "lateral movement", "fan-out", "fan-in")
+        ):
+            if sev != "info":
+                checks["intent_heuristics"].append(ev)
+        if any(t in blob for t in ("reputation", "certificate risk", "fingerprint reputation")):
+            checks["indicator_quality_gate"].append(ev)
 
-        if conv_duration and conv_duration >= 900 and conv.packets >= 20:
-            checks["recency_and_persistence"].append(
-                f"{conv.src}->{conv.dst} persistent window={conv_duration:.1f}s packets={conv.packets}"
+    # Corroborated multi-signal hit: an IP that appears in two or more
+    # independent signal sources (scan profile / lateral movement / intel).
+    signal_sources: dict[str, set[str]] = defaultdict(set)
+    for prof in suspicious_port_profiles or []:
+        src = str(prof.get("src", ""))
+        if src:
+            signal_sources[src].add("port-scan")
+    for lm in lateral_movement_scores or []:
+        ip = str(lm.get("ip", ""))
+        if ip:
+            signal_sources[ip].add("lateral-movement")
+    for finding in intel_findings or []:
+        ip = str(finding.get("ip", ""))
+        if ip:
+            signal_sources[ip].add("threat-intel")
+    for ip, sources in signal_sources.items():
+        if len(sources) >= 2:
+            checks["corroborated_multi_signal_hit"].append(
+                f"{ip}: {', '.join(sorted(sources))}"
             )
 
-        if any(p in {3389, 445, 5985, 5986, 22, 23, 135, 139} for p in conv.ports):
+    if suspicious_port_profiles:
+        for prof in suspicious_port_profiles[:5]:
             checks["intent_heuristics"].append(
-                f"{conv.src}->{conv.dst} admin ports observed {','.join(str(p) for p in conv.ports[:6])}"
-            )
-            intent_profiles.append(
-                {
-                    "src": conv.src,
-                    "dst": conv.dst,
-                    "protocol": conv.protocol,
-                    "ports": conv.ports[:8],
-                    "intent": "admin-lateral" if not _is_public_ip(conv.dst) else "admin-external",
-                    "confidence": "medium",
-                }
+                f"{prof.get('src','?')}: {prof.get('type','scan')} "
+                f"({prof.get('unique_ports',0)} ports / {prof.get('unique_dsts',0)} hosts)"
             )
 
-    for item in suspicious_port_profiles:
-        src = str(item.get("src", "-"))
-        checks["intent_heuristics"].append(
-            f"{src} profile={item.get('type', '-')} ports={item.get('unique_ports', '-')}, targets={item.get('unique_dsts', '-')}"
-        )
-        score_by_ip[src] += 1
-        reasons_by_ip[src].append("Suspicious port scanning profile")
+    # Boundary cross-zone contact, but only for IPs already flagged by another
+    # signal — private<->public contact alone is normal internet traffic and
+    # would fire on every capture, so it is reported as corroborating context.
+    def _is_priv(addr: str) -> bool:
+        try:
+            return ipaddress.ip_address(addr).is_private
+        except Exception:
+            return False
 
-    for item in lateral_movement_scores:
-        ip_value = str(item.get("ip", "-"))
-        score = float(item.get("score", 0) or 0)
-        if score >= 3.0:
-            checks["internal_critical_asset_contact"].append(
-                f"{ip_value} lateral_score={score} peers={item.get('peers', '-')} ports={item.get('ports', '-')}"
-            )
-            priority_asset_profiles.append(
-                {
-                    "ip": ip_value,
-                    "score": score,
-                    "peers": item.get("peers", 0),
-                    "ports": item.get("ports", 0),
-                    "packets_sent": item.get("packets_sent", 0),
-                    "confidence": "high" if score >= 5 else "medium",
-                }
-            )
-            score_by_ip[ip_value] += 2
-            reasons_by_ip[ip_value].append("Lateral movement posture score")
+    def _is_global_unicast(addr: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(addr)
+            return ip.is_global and not ip.is_multicast
+        except Exception:
+            return False
 
-    cluster_by_asn: defaultdict[str, list[str]] = defaultdict(list)
-    for ep in endpoints:
-        if ep.asn and _is_public_ip(ep.ip):
-            cluster_by_asn[str(ep.asn)].append(ep.ip)
-    for asn_label, ips in cluster_by_asn.items():
-        if len(ips) >= 2:
-            checks["infrastructure_clustering"].append(
-                f"ASN cluster {asn_label} with {len(ips)} IPs"
-            )
-            infrastructure_clusters.append(
-                {
-                    "cluster": asn_label,
-                    "ip_count": len(ips),
-                    "ips": sorted(ips)[:10],
-                    "confidence": "medium",
-                }
+    flagged_ips = set(signal_sources.keys())
+    if flagged_ips:
+        boundary_seen: set[frozenset[str]] = set()
+        for conv in conversations or []:
+            s, d = str(conv.src), str(conv.dst)
+            if not (s in flagged_ips or d in flagged_ips):
+                continue
+            if not (
+                (_is_priv(s) and _is_global_unicast(d))
+                or (_is_priv(d) and _is_global_unicast(s))
+            ):
+                continue
+            pair = frozenset((s, d))
+            if pair in boundary_seen:
+                continue
+            boundary_seen.add(pair)
+            checks["boundary_cross_zone_contact"].append(
+                f"{s} <-> {d} ({conv.protocol})"
             )
 
-    high_like = sum(1 for det in detections if str(det.get("severity", "")).lower() in {"critical", "high", "warning"})
-    if high_like >= 3:
-        checks["corroborated_multi_signal_hit"].append(
-            f"multiple IPS detections observed count={high_like}"
-        )
+    provenance = []
+    if intel_findings:
+        provenance.append(f"external threat-intel ({len(intel_findings)})")
+    if suspicious_port_profiles:
+        provenance.append(f"port-scan profiles ({len(suspicious_port_profiles)})")
+    if lateral_movement_scores:
+        provenance.append(f"lateral-movement scoring ({len(lateral_movement_scores)})")
+    if detections:
+        provenance.append(f"IP detections ({len(detections)})")
+    if provenance:
+        checks["evidence_provenance"].append("; ".join(provenance))
 
-    for ip_value, score in sorted(score_by_ip.items(), key=lambda item: item[1], reverse=True):
-        reasons = list(dict.fromkeys(reasons_by_ip.get(ip_value, [])))
-        corroborated_findings.append(
-            {
-                "ip": ip_value,
-                "score": score,
-                "confidence": "high" if score >= 6 else "medium" if score >= 3 else "low",
-                "reasons": reasons[:4],
-            }
-        )
+    score = 0
+    reasons: list[str] = []
+    if checks.get("indicator_quality_gate"):
+        score += 3
+        reasons.append("High-quality threat indicator (external IOC / TLS reputation / cert IOC)")
+    if checks.get("corroborated_multi_signal_hit"):
+        score += 3
+        reasons.append("An IP is implicated by multiple independent signals")
+    if suspicious_port_profiles:
+        score += 2
+        reasons.append("Port-scanning profile(s) observed")
+    # Broad internal fan-out alone is too often benign infrastructure (a DNS/AD
+    # server, a monitoring poller, OT discovery such as BACnet Who-Is) to drive
+    # a verdict on its own — `peers` counts inbound contacts too. It only scores
+    # when corroborated by another signal (handled by corroborated_multi_signal_hit);
+    # standalone it is shown as context under intent_heuristics.
+    if lateral_movement_scores:
+        reasons.append("Broad internal fan-out observed (context; verify against --tcp/--smb)")
+    high_ct = sum(
+        1 for d in (detections or []) if str(d.get("severity", "")).lower() in {"high", "critical"}
+    )
+    if high_ct:
+        reasons.append(f"High-severity IP detections: {high_ct}")
 
-    for conv in sorted(conversations, key=lambda c: c.bytes, reverse=True):
-        reasons = reasons_by_ip.get(conv.src, []) + reasons_by_ip.get(conv.dst, [])
-        if not reasons:
-            continue
-        pivots.append(
-            {
-                "flow": f"{conv.src}->{conv.dst}",
-                "protocol": conv.protocol,
-                "packets": conv.packets,
-                "bytes": conv.bytes,
-                "first_seen": conv.first_seen,
-                "last_seen": conv.last_seen,
-                "ports": conv.ports[:8],
-                "reasons": list(dict.fromkeys(reasons))[:4],
-            }
-        )
-
-    verdict_score = 0
-    verdict_score += 2 if checks["indicator_quality_gate"] else 0
-    verdict_score += 2 if checks["corroborated_multi_signal_hit"] else 0
-    verdict_score += 2 if checks["internal_critical_asset_contact"] else 0
-    verdict_score += 1 if checks["boundary_cross_zone_contact"] else 0
-    verdict_score += 1 if checks["intent_heuristics"] else 0
-    verdict_score += 1 if checks["infrastructure_clustering"] else 0
-
-    analyst_reasons: list[str] = []
-    if checks["indicator_quality_gate"]:
-        analyst_reasons.append("Threat-intel indicators passed quality threshold")
-    if checks["internal_critical_asset_contact"]:
-        analyst_reasons.append("Lateral/critical asset contact indicators detected")
-    if checks["boundary_cross_zone_contact"]:
-        analyst_reasons.append("Cross-zone IP contact with external infrastructure observed")
-    if checks["corroborated_multi_signal_hit"]:
-        analyst_reasons.append("Multiple IPS anomaly signals corroborate risk")
-
-    if verdict_score >= 8:
-        verdict = "YES - HIGH-CONFIDENCE MALICIOUS OR COMPROMISED IP-LEVEL ACTIVITY DETECTED"
+    if score >= 6:
+        verdict = "YES - high-confidence malicious IP activity (corroborated intel / scanning / lateral movement) is present."
         confidence = "high"
-    elif verdict_score >= 5:
-        verdict = "LIKELY - MULTIPLE CORROBORATING IP RISK INDICATORS DETECTED"
+    elif score >= 4:
+        verdict = "LIKELY - suspicious IP activity with attack indicators is present."
         confidence = "medium"
-    elif verdict_score >= 2:
-        verdict = "POSSIBLE - IP RISK SIGNALS REQUIRE VALIDATION"
-        confidence = "medium"
-    else:
-        verdict = "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE IP ABUSE PATTERN"
+    elif score >= 2:
+        verdict = "POSSIBLE - notable IP activity (recon / lateral movement) observed; corroboration recommended."
         confidence = "low"
-
-    risk_matrix: list[dict[str, str]] = [
-        {
-            "category": "Indicator Quality",
-            "risk": "High" if checks["indicator_quality_gate"] else "None",
-            "confidence": "High" if checks["indicator_quality_gate"] else "Low",
-            "evidence": str(len(checks["indicator_quality_gate"])) if checks["indicator_quality_gate"] else "No matching detections",
-        },
-        {
-            "category": "Boundary Exposure",
-            "risk": "Medium" if checks["boundary_cross_zone_contact"] else "None",
-            "confidence": "Medium" if checks["boundary_cross_zone_contact"] else "Low",
-            "evidence": str(len(checks["boundary_cross_zone_contact"])) if checks["boundary_cross_zone_contact"] else "No matching detections",
-        },
-        {
-            "category": "Critical Asset Contact",
-            "risk": "High" if checks["internal_critical_asset_contact"] else "None",
-            "confidence": "High" if checks["internal_critical_asset_contact"] else "Low",
-            "evidence": str(len(checks["internal_critical_asset_contact"])) if checks["internal_critical_asset_contact"] else "No matching detections",
-        },
-        {
-            "category": "Infrastructure Clustering",
-            "risk": "Medium" if checks["infrastructure_clustering"] else "None",
-            "confidence": "Medium" if checks["infrastructure_clustering"] else "Low",
-            "evidence": str(len(checks["infrastructure_clustering"])) if checks["infrastructure_clustering"] else "No matching detections",
-        },
-        {
-            "category": "Intent Heuristics",
-            "risk": "Medium" if checks["intent_heuristics"] else "None",
-            "confidence": "Medium" if checks["intent_heuristics"] else "Low",
-            "evidence": str(len(checks["intent_heuristics"])) if checks["intent_heuristics"] else "No matching detections",
-        },
-    ]
-
-    false_positive_context: list[str] = []
-    if checks["indicator_quality_gate"]:
-        false_positive_context.append("Threat-intel indicators can include stale or shared-hosting infrastructure")
-    if checks["boundary_cross_zone_contact"] and not checks["corroborated_multi_signal_hit"]:
-        false_positive_context.append("Boundary crossings may reflect legitimate external services or updates")
-    if checks["infrastructure_clustering"]:
-        false_positive_context.append("ASN clustering can include CDN/ISP concentration rather than adversary control")
-    if not checks["intent_heuristics"]:
-        false_positive_context.append("No strong intent heuristics crossed current thresholds")
+    elif score >= 1:
+        verdict = "LOW SIGNAL - minor IP anomalies present but not strongly corroborated."
+        confidence = "low"
+    else:
+        verdict = ""
+        confidence = "low"
+    if not reasons and verdict:
+        reasons.append("IP intelligence heuristics crossed threshold")
 
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
-        "analyst_reasons": analyst_reasons if analyst_reasons else ["No high-confidence IPS threat heuristic crossed threshold"],
-        "deterministic_checks": checks,
-        "exposure_profiles": exposure_profiles[:40],
-        "priority_asset_profiles": priority_asset_profiles[:40],
-        "infrastructure_clusters": infrastructure_clusters[:40],
-        "intent_profiles": intent_profiles[:40],
-        "corroborated_findings": corroborated_findings[:40],
-        "investigation_pivots": pivots[:40],
-        "risk_matrix": risk_matrix,
-        "false_positive_context": false_positive_context[:8],
+        "analyst_reasons": reasons,
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
     }
-
 
 def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     summary_list = list(summaries)
@@ -461,6 +444,7 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
             dst_counts=Counter(),
             ip_category_counts=Counter(),
             ip_mac_counts={},
+            ip_hostnames={},
             endpoints=[],
             conversations=[],
             first_seen=None,
@@ -487,14 +471,15 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     duration_seconds = 0.0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
-    skipped_endpoints = 0
-    skipped_conversations = 0
 
     protocol_counts: Counter[str] = Counter()
     src_counts: Counter[str] = Counter()
     dst_counts: Counter[str] = Counter()
     ip_category_counts: Counter[str] = Counter()
     ip_mac_counts: dict[str, Counter[str]] = {}
+    ip_hostnames: dict[str, Counter[str]] = {}
+    ip_roles: dict[str, list[str]] = {}
+    ip_os: dict[str, str] = {}
     ja3_counts: Counter[str] = Counter()
     ja4_counts: Counter[str] = Counter()
     ja4s_counts: Counter[str] = Counter()
@@ -517,6 +502,7 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     errors: list[str] = []
 
     rep_hits: dict[tuple[str, str, str], int] = defaultdict(int)
+    confirmed_tcp_service_ports: dict[str, set[int]] = defaultdict(set)
 
     for summary in summary_list:
         total_packets += summary.total_packets
@@ -539,10 +525,23 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
         for ip_value, counter in summary.ip_mac_counts.items():
             existing = ip_mac_counts.setdefault(ip_value, Counter())
             existing.update(counter)
+        for ip_value, counter in summary.ip_hostnames.items():
+            existing = ip_hostnames.setdefault(ip_value, Counter())
+            existing.update(counter)
+        for ip_value, roles in (getattr(summary, "ip_roles", {}) or {}).items():
+            ip_roles.setdefault(ip_value, list(roles))
+        for ip_value, os_text in (getattr(summary, "ip_os", {}) or {}).items():
+            ip_os.setdefault(ip_value, os_text)
         ja3_counts.update(summary.ja3_counts)
         ja4_counts.update(summary.ja4_counts)
         ja4s_counts.update(summary.ja4s_counts)
         sni_counts.update(summary.sni_counts)
+        for ip_text, ports in (summary.confirmed_tcp_service_ports or {}).items():
+            confirmed_tcp_service_ports[ip_text].update(
+                int(port)
+                for port in list(ports or [])
+                if isinstance(port, int) or str(port).isdigit()
+            )
 
         all_ips.update(summary.src_counts.keys())
         all_ips.update(summary.dst_counts.keys())
@@ -638,9 +637,13 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
 
             cur_first = entry["first_seen"]
             cur_last = entry["last_seen"]
-            if conv.first_seen is not None and (cur_first is None or conv.first_seen < cur_first):
+            if conv.first_seen is not None and (
+                cur_first is None or conv.first_seen < cur_first
+            ):
                 entry["first_seen"] = conv.first_seen
-            if conv.last_seen is not None and (cur_last is None or conv.last_seen > cur_last):
+            if conv.last_seen is not None and (
+                cur_last is None or conv.last_seen > cur_last
+            ):
                 entry["last_seen"] = conv.last_seen
 
     endpoint_rows: list[IpEndpoint] = []
@@ -699,7 +702,12 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
         for (rep_type, fingerprint, label), count in rep_hits.items()
     ]
 
-    hunting_context = _build_ips_hunting_context(
+    ip_enrichment: dict[str, dict[str, str]] = {}
+    for summary in summary_list:
+        for ip_text, rec in (getattr(summary, "ip_enrichment", {}) or {}).items():
+            ip_enrichment.setdefault(ip_text, dict(rec))
+
+    enrichment = _build_ips_enrichment(
         endpoints=endpoint_rows,
         conversations=conversation_rows,
         suspicious_port_profiles=suspicious_port_profiles,
@@ -722,6 +730,7 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
         dst_counts=dst_counts,
         ip_category_counts=ip_category_counts,
         ip_mac_counts=ip_mac_counts,
+        ip_hostnames=ip_hostnames,
         endpoints=endpoint_rows,
         conversations=conversation_rows,
         first_seen=first_seen,
@@ -740,18 +749,36 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
         intel_findings=intel_findings,
         detections=detections,
         errors=errors,
-        analyst_verdict=str(hunting_context.get("analyst_verdict", "") or ""),
-        analyst_confidence=str(hunting_context.get("analyst_confidence", "low") or "low"),
-        analyst_reasons=list(hunting_context.get("analyst_reasons", []) or []),
-        deterministic_checks=dict(hunting_context.get("deterministic_checks", {}) or {}),
-        exposure_profiles=list(hunting_context.get("exposure_profiles", []) or []),
-        priority_asset_profiles=list(hunting_context.get("priority_asset_profiles", []) or []),
-        infrastructure_clusters=list(hunting_context.get("infrastructure_clusters", []) or []),
-        intent_profiles=list(hunting_context.get("intent_profiles", []) or []),
-        corroborated_findings=list(hunting_context.get("corroborated_findings", []) or []),
-        investigation_pivots=list(hunting_context.get("investigation_pivots", []) or []),
-        risk_matrix=list(hunting_context.get("risk_matrix", []) or []),
-        false_positive_context=list(hunting_context.get("false_positive_context", []) or []),
+        confirmed_tcp_service_ports={
+            ip_text: sorted(list(ports))
+            for ip_text, ports in confirmed_tcp_service_ports.items()
+            if ports
+        },
+        analyst_verdict=str(enrichment.get("analyst_verdict", "") or ""),
+        analyst_confidence=str(
+            enrichment.get("analyst_confidence", "low") or "low"
+        ),
+        analyst_reasons=list(enrichment.get("analyst_reasons", []) or []),
+        ip_roles=ip_roles,
+        ip_os=ip_os,
+        deterministic_checks=dict(
+            enrichment.get("deterministic_checks", {}) or {}
+        ),
+        exposure_profiles=list(enrichment.get("exposure_profiles", []) or []),
+        priority_asset_profiles=list(
+            enrichment.get("priority_asset_profiles", []) or []
+        ),
+        infrastructure_clusters=list(
+            enrichment.get("infrastructure_clusters", []) or []
+        ),
+        intent_profiles=list(enrichment.get("intent_profiles", []) or []),
+        corroborated_findings=list(
+            enrichment.get("corroborated_findings", []) or []
+        ),
+        false_positive_context=list(
+            enrichment.get("false_positive_context", []) or []
+        ),
+        ip_enrichment=ip_enrichment,
     )
 
 
@@ -785,198 +812,12 @@ def _classify_ip(ip_text: str) -> list[str]:
     return categories
 
 
-def _shannon_entropy(value: str) -> float:
-    if not value:
-        return 0.0
-    freq = Counter(value)
-    total = len(value)
-    return -sum((count / total) * math.log2(count / total) for count in freq.values())
 
 
-def _is_grease(value: int) -> bool:
-    return (value & 0x0f0f) == 0x0a0a
 
 
-def _coerce_int_list(values: object) -> list[int]:
-    if values is None:
-        return []
-    if isinstance(values, (list, tuple, set)):
-        out = []
-        for item in values:
-            try:
-                out.append(int(item))
-            except Exception:
-                continue
-        return out
-    try:
-        return [int(values)]
-    except Exception:
-        return []
 
-
-def _iter_tls_extensions(client_hello) -> list[object]:
-    exts = getattr(client_hello, "ext", None)
-    if exts is None:
-        exts = getattr(client_hello, "extensions", None)
-    if exts is None:
-        return []
-    try:
-        return list(exts)
-    except Exception:
-        return []
-
-
-def _tls_extension_type(ext: object) -> Optional[int]:
-    for attr in ("type", "ext_type", "etype", "extension_type"):
-        value = getattr(ext, attr, None)
-        if value is not None:
-            try:
-                return int(value)
-            except Exception:
-                continue
-    return None
-
-
-def _extract_sni(ext: object) -> Optional[str]:
-    name = ext.__class__.__name__
-    if "ServerName" not in name and "SNI" not in name:
-        return None
-    for attr in ("servernames", "server_names", "server_name", "names"):
-        names = getattr(ext, attr, None)
-        if names:
-            try:
-                if isinstance(names, (list, tuple)):
-                    first = names[0]
-                else:
-                    first = names
-                candidate = getattr(first, "servername", None) or getattr(first, "name", None) or first
-                if isinstance(candidate, bytes):
-                    return candidate.decode("utf-8", errors="ignore").strip(".")
-                return str(candidate).strip(".")
-            except Exception:
-                return None
-    return None
-
-
-def _extract_alpn(ext: object) -> list[str]:
-    name = ext.__class__.__name__
-    if "ALPN" not in name and "ApplicationLayerProtocol" not in name:
-        return []
-    for attr in ("protocols", "alpn_protocols"):
-        protocols = getattr(ext, attr, None)
-        if protocols:
-            out: list[str] = []
-            for proto in protocols:
-                if isinstance(proto, bytes):
-                    out.append(proto.decode("utf-8", errors="ignore"))
-                else:
-                    out.append(str(proto))
-            return out
-    return []
-
-
-def _ja3_from_client_hello(client_hello) -> Optional[str]:
-    version = getattr(client_hello, "version", None)
-    if version is None:
-        return None
-    try:
-        version_val = int(version)
-    except Exception:
-        return None
-
-    ciphers = []
-    for attr in ("ciphers", "cipher_suites", "ciphersuites"):
-        ciphers = _coerce_int_list(getattr(client_hello, attr, None))
-        if ciphers:
-            break
-    ciphers = [c for c in ciphers if not _is_grease(c)]
-
-    exts = _iter_tls_extensions(client_hello)
-    ext_types = []
-    curves = []
-    ec_points = []
-    for ext in exts:
-        ext_type = _tls_extension_type(ext)
-        if ext_type is not None and not _is_grease(ext_type):
-            ext_types.append(ext_type)
-
-        for attr in ("groups", "supported_groups", "elliptic_curves"):
-            groups = _coerce_int_list(getattr(ext, attr, None))
-            if groups:
-                curves.extend(groups)
-                break
-
-        for attr in ("ecpl", "ec_point_formats", "formats", "ec_points"):
-            points = _coerce_int_list(getattr(ext, attr, None))
-            if points:
-                ec_points.extend(points)
-                break
-
-    curves = [c for c in curves if not _is_grease(c)]
-    ec_points = [p for p in ec_points if not _is_grease(p)]
-
-    def _join(values: list[int]) -> str:
-        return "-".join(str(v) for v in values)
-
-    ja3_str = f"{version_val},{_join(ciphers)},{_join(ext_types)},{_join(curves)},{_join(ec_points)}"
-    return ja3_str
-
-
-def _ja4_from_client_hello(client_hello, sni: Optional[str], alpn: list[str]) -> Optional[str]:
-    version = getattr(client_hello, "version", None)
-    if version is None:
-        return None
-    try:
-        version_val = int(version)
-    except Exception:
-        return None
-
-    ciphers = []
-    for attr in ("ciphers", "cipher_suites", "ciphersuites"):
-        ciphers = _coerce_int_list(getattr(client_hello, attr, None))
-        if ciphers:
-            break
-    ciphers = [c for c in ciphers if not _is_grease(c)]
-    first_cipher = str(ciphers[0]) if ciphers else "0"
-
-    ext_types = []
-    for ext in _iter_tls_extensions(client_hello):
-        ext_type = _tls_extension_type(ext)
-        if ext_type is not None and not _is_grease(ext_type):
-            ext_types.append(ext_type)
-    ext_str = "-".join(str(v) for v in ext_types)
-    ext_hash = hashlib.sha256(ext_str.encode("utf-8", errors="ignore")).hexdigest()[:8]
-
-    alpn_token = alpn[0] if alpn else "na"
-    sni_flag = "s" if sni else "n"
-    return f"t{version_val}{sni_flag}-{alpn_token}-{first_cipher}-{ext_hash}"
-
-
-def _ja4s_from_server_hello(server_hello) -> Optional[str]:
-    version = getattr(server_hello, "version", None)
-    if version is None:
-        return None
-    try:
-        version_val = int(version)
-    except Exception:
-        return None
-
-    cipher = getattr(server_hello, "cipher", None)
-    try:
-        cipher_val = int(cipher) if cipher is not None else 0
-    except Exception:
-        cipher_val = 0
-
-    ext_types = []
-    for ext in _iter_tls_extensions(server_hello):
-        ext_type = _tls_extension_type(ext)
-        if ext_type is not None and not _is_grease(ext_type):
-            ext_types.append(ext_type)
-    ext_str = "-".join(str(v) for v in ext_types)
-    ext_hash = hashlib.sha256(ext_str.encode("utf-8", errors="ignore")).hexdigest()[:8]
-    return f"s{version_val}-{cipher_val}-{ext_hash}"
-
-
+# JA3/JA4/JA4S construction lives in tls_fingerprints (shared with tls.py).
 def _load_reputation_list(path_value: Optional[str]) -> dict[str, str]:
     if not path_value:
         return {}
@@ -1049,10 +890,10 @@ def _tls_cert_risks_from_payload(cert_payload: object) -> list[dict[str, object]
         if subject == issuer:
             risks.append({"type": "self_signed", "details": subject})
 
-        now = getattr(cert, "not_valid_before", None)
         current = None
         try:
             from datetime import datetime, timezone
+
             current = datetime.now(timezone.utc)
         except Exception:
             current = None
@@ -1081,21 +922,15 @@ def _tls_cert_risks_from_payload(cert_payload: object) -> list[dict[str, object]
     return risks
 
 
-def _is_public_ip(ip_text: str) -> bool:
-    try:
-        addr = ipaddress.ip_address(ip_text)
-        return addr.is_global
-    except ValueError:
-        return False
-
-
 def _load_geoip_readers() -> tuple[object | None, object | None, list[str]]:
     errors: list[str] = []
     city_db = os.environ.get("PCAPPER_GEOIP_CITY_DB")
     asn_db = os.environ.get("PCAPPER_GEOIP_ASN_DB")
 
     if (city_db or asn_db) and ("geoip2" not in globals() or geoip2 is None):  # type: ignore[truthy-bool]
-        errors.append("GeoIP DB configured but geoip2 is not installed (pip install geoip2).")
+        errors.append(
+            "GeoIP DB configured but geoip2 is not installed (pip install geoip2)."
+        )
         return None, None, errors
     city_reader = None
     asn_reader = None
@@ -1113,7 +948,9 @@ def _load_geoip_readers() -> tuple[object | None, object | None, list[str]]:
     return city_reader, asn_reader, errors
 
 
-def _geoip_lookup(ip_text: str, city_reader: object | None, asn_reader: object | None) -> tuple[Optional[str], Optional[str]]:
+def _geoip_lookup(
+    ip_text: str, city_reader: object | None, asn_reader: object | None
+) -> tuple[Optional[str], Optional[str]]:
     geo_label = None
     asn_label = None
 
@@ -1148,7 +985,9 @@ def _geoip_lookup(ip_text: str, city_reader: object | None, asn_reader: object |
     return geo_label, asn_label
 
 
-def _fetch_json(url: str, headers: dict[str, str], timeout: float = 5.0) -> Optional[dict[str, object]]:
+def _fetch_json(
+    url: str, headers: dict[str, str], timeout: float = 5.0
+) -> Optional[dict[str, object]]:
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1230,12 +1069,17 @@ def _infer_protocol(pkt) -> str:
         return "ICMP"
     if ICMPv6 is not None and pkt.haslayer(ICMPv6):  # type: ignore[truthy-bool]
         return "ICMPv6"
+    if ARP is not None and pkt.haslayer(ARP):  # type: ignore[truthy-bool]
+        return "ARP"
     return "OTHER"
 
 
-def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
+@memoize_analysis
+def analyze_ips(
+    path: Path, show_status: bool = True, geo_lookup: bool = False
+) -> IpSummary:
     errors: list[str] = []
-    if IP is None and IPv6 is None:
+    if IP is None and IPv6 is None and ARP is None:
         errors.append("Scapy IP layers unavailable; install scapy for IP analysis.")
         return IpSummary(
             path=path,
@@ -1251,6 +1095,7 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
             dst_counts=Counter(),
             ip_category_counts=Counter(),
             ip_mac_counts={},
+            ip_hostnames={},
             endpoints=[],
             conversations=[],
             first_seen=None,
@@ -1282,26 +1127,31 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
     dst_counts: Counter[str] = Counter()
     ip_category_counts: Counter[str] = Counter()
     ip_mac_counts: dict[str, Counter[str]] = defaultdict(Counter)
+    ip_hostnames: dict[str, Counter[str]] = defaultdict(Counter)
 
-    endpoints: dict[str, dict[str, object]] = defaultdict(lambda: {
-        "packets_sent": 0,
-        "packets_recv": 0,
-        "bytes_sent": 0,
-        "bytes_recv": 0,
-        "protocols": set(),
-        "peers": set(),
-        "ports": set(),
-        "first_seen": None,
-        "last_seen": None,
-    })
+    endpoints: dict[str, dict[str, object]] = defaultdict(
+        lambda: {
+            "packets_sent": 0,
+            "packets_recv": 0,
+            "bytes_sent": 0,
+            "bytes_recv": 0,
+            "protocols": set(),
+            "peers": set(),
+            "ports": set(),
+            "first_seen": None,
+            "last_seen": None,
+        }
+    )
 
-    conversations: dict[tuple[str, str, str], dict[str, object]] = defaultdict(lambda: {
-        "packets": 0,
-        "bytes": 0,
-        "ports": set(),
-        "first_seen": None,
-        "last_seen": None,
-    })
+    conversations: dict[tuple[str, str, str], dict[str, object]] = defaultdict(
+        lambda: {
+            "packets": 0,
+            "bytes": 0,
+            "ports": set(),
+            "first_seen": None,
+            "last_seen": None,
+        }
+    )
 
     unique_ips: set[str] = set()
     src_ips: set[str] = set()
@@ -1314,6 +1164,10 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
     src_to_dsts: dict[str, set[str]] = defaultdict(set)
     dst_to_ports: dict[str, set[int]] = defaultdict(set)
     dst_to_srcs: dict[str, set[str]] = defaultdict(set)
+    syn_seen: set[tuple[str, str, int, int]] = set()
+    syn_ack_seen: set[tuple[str, str, int, int]] = set()
+    handshake_complete: set[tuple[str, str, int, int]] = set()
+    confirmed_tcp_service_ports: dict[str, set[int]] = defaultdict(set)
 
     tls_client_hellos = 0
     ja3_counts: Counter[str] = Counter()
@@ -1367,6 +1221,14 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                     set_add_cap(ipv6_set, src_ip, max_size=MAX_UNIQUE_IPS)
                 if dst_ip:
                     set_add_cap(ipv6_set, dst_ip, max_size=MAX_UNIQUE_IPS)
+            elif ARP is not None and pkt.haslayer(ARP):  # type: ignore[truthy-bool]
+                arp_layer = pkt[ARP]  # type: ignore[index]
+                src_ip = str(getattr(arp_layer, "psrc", ""))
+                dst_ip = str(getattr(arp_layer, "pdst", ""))
+                if src_ip:
+                    set_add_cap(ipv4_set, src_ip, max_size=MAX_UNIQUE_IPS)
+                if dst_ip:
+                    set_add_cap(ipv4_set, dst_ip, max_size=MAX_UNIQUE_IPS)
             else:
                 continue
 
@@ -1379,10 +1241,23 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 _record_mac(dst_ip, str(getattr(eth_layer, "dst", "")))
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
-            protocol = _infer_protocol(pkt)
+            # Dissect TCP/UDP once per packet; reused for protocol inference,
+            # conversation tracking, and the per-endpoint loop below.
+            tcp_layer = pkt.getlayer(TCP) if TCP is not None else None  # type: ignore[arg-type]
+            udp_layer = (
+                pkt.getlayer(UDP)  # type: ignore[arg-type]
+                if UDP is not None and tcp_layer is None
+                else None
+            )
+            if tcp_layer is not None:
+                protocol = "TCP"
+            elif udp_layer is not None:
+                protocol = "UDP"
+            else:
+                protocol = _infer_protocol(pkt)
             counter_inc(protocol_counts, protocol)
 
             set_add_cap(unique_ips, src_ip, max_size=MAX_UNIQUE_IPS)
@@ -1407,7 +1282,10 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
 
             conv_key = (src_ip, dst_ip, protocol)
             conv = None
-            if conv_key not in conversations and len(conversations) >= MAX_CONVERSATIONS:
+            if (
+                conv_key not in conversations
+                and len(conversations) >= MAX_CONVERSATIONS
+            ):
                 skipped_conversations += 1
                 conv = None
             else:
@@ -1421,21 +1299,49 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 if conv["last_seen"] is None or ts > conv["last_seen"]:  # type: ignore[operator]
                     conv["last_seen"] = ts
 
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                tcp_layer = pkt[TCP]  # type: ignore[index]
+            if tcp_layer is not None:
                 sport = getattr(tcp_layer, "sport", None)
                 dport = getattr(tcp_layer, "dport", None)
+                flags = getattr(tcp_layer, "flags", 0)
                 if conv is not None and sport is not None:
                     set_add_cap(conv["ports"], int(sport), max_size=MAX_SET_VALUES)
                 if conv is not None and dport is not None:
                     set_add_cap(conv["ports"], int(dport), max_size=MAX_SET_VALUES)
                 if sport is not None and dport is not None:
-                    setdict_add(src_to_ports, src_ip, int(dport), max_values=MAX_SET_VALUES)
-                    setdict_add(src_to_dsts, src_ip, dst_ip, max_values=MAX_SET_VALUES)
-                    setdict_add(dst_to_ports, dst_ip, int(dport), max_values=MAX_SET_VALUES)
+                    flow_key = (src_ip, dst_ip, int(sport), int(dport))
+                    reverse_key = (dst_ip, src_ip, int(dport), int(sport))
+                    if _tcp_is_syn(flags):
+                        syn_seen.add(flow_key)
+                    elif _tcp_is_synack(flags):
+                        if reverse_key in syn_seen:
+                            syn_ack_seen.add(reverse_key)
+                    elif _tcp_is_final_handshake_ack(flags):
+                        if flow_key in syn_seen and flow_key in syn_ack_seen:
+                            handshake_complete.add(flow_key)
+
+                    if flow_key in handshake_complete:
+                        confirmed_tcp_service_ports[dst_ip].add(int(dport))
+                    elif reverse_key in handshake_complete:
+                        confirmed_tcp_service_ports[src_ip].add(int(sport))
+
+                    # Only count CLIENT-INITIATED flows toward scan/sweep
+                    # profiling: a scanner connects FROM an ephemeral source port
+                    # TO target ports, whereas a server RESPONDS from its service
+                    # port to the client's ephemeral port. Without this guard a
+                    # DNS/HTTP server's replies (sport 53/80 -> many client
+                    # ephemeral dports) are mislabeled as a high-port sweep.
+                    if int(sport) >= 1024:
+                        setdict_add(
+                            src_to_ports, src_ip, int(dport), max_values=MAX_SET_VALUES
+                        )
+                        setdict_add(
+                            src_to_dsts, src_ip, dst_ip, max_values=MAX_SET_VALUES
+                        )
+                    setdict_add(
+                        dst_to_ports, dst_ip, int(dport), max_values=MAX_SET_VALUES
+                    )
                     setdict_add(dst_to_srcs, dst_ip, src_ip, max_values=MAX_SET_VALUES)
-            elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                udp_layer = pkt[UDP]  # type: ignore[index]
+            elif udp_layer is not None:
                 sport = getattr(udp_layer, "sport", None)
                 dport = getattr(udp_layer, "dport", None)
                 if conv is not None and sport is not None:
@@ -1443,9 +1349,19 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 if conv is not None and dport is not None:
                     set_add_cap(conv["ports"], int(dport), max_size=MAX_SET_VALUES)
                 if sport is not None and dport is not None:
-                    setdict_add(src_to_ports, src_ip, int(dport), max_values=MAX_SET_VALUES)
-                    setdict_add(src_to_dsts, src_ip, dst_ip, max_values=MAX_SET_VALUES)
-                    setdict_add(dst_to_ports, dst_ip, int(dport), max_values=MAX_SET_VALUES)
+                    # Client-initiated only (see TCP note above) — keeps a UDP
+                    # service (DNS:53) responding to clients from registering as a
+                    # high-port sweep.
+                    if int(sport) >= 1024:
+                        setdict_add(
+                            src_to_ports, src_ip, int(dport), max_values=MAX_SET_VALUES
+                        )
+                        setdict_add(
+                            src_to_dsts, src_ip, dst_ip, max_values=MAX_SET_VALUES
+                        )
+                    setdict_add(
+                        dst_to_ports, dst_ip, int(dport), max_values=MAX_SET_VALUES
+                    )
                     setdict_add(dst_to_srcs, dst_ip, src_ip, max_values=MAX_SET_VALUES)
 
             for ip_text, direction in ((src_ip, "sent"), (dst_ip, "recv")):
@@ -1464,14 +1380,16 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 peer = dst_ip if ip_text == src_ip else src_ip
                 set_add_cap(entry["peers"], peer, max_size=MAX_SET_VALUES)
 
-                if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                    tcp_layer = pkt[TCP]  # type: ignore[index]
-                    port = getattr(tcp_layer, "sport" if ip_text == src_ip else "dport", None)
+                if tcp_layer is not None:
+                    port = getattr(
+                        tcp_layer, "sport" if ip_text == src_ip else "dport", None
+                    )
                     if port is not None:
                         set_add_cap(entry["ports"], int(port), max_size=MAX_SET_VALUES)
-                elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                    udp_layer = pkt[UDP]  # type: ignore[index]
-                    port = getattr(udp_layer, "sport" if ip_text == src_ip else "dport", None)
+                elif udp_layer is not None:
+                    port = getattr(
+                        udp_layer, "sport" if ip_text == src_ip else "dport", None
+                    )
                     if port is not None:
                         set_add_cap(entry["ports"], int(port), max_size=MAX_SET_VALUES)
 
@@ -1495,10 +1413,13 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 if sni_val:
                     sni_counts[sni_val] += 1
                     sni_entropy[sni_val] = _shannon_entropy(sni_val)
+                    ip_hostnames[dst_ip][str(sni_val).strip(".").lower()] += 1
 
                 ja3 = _ja3_from_client_hello(client_hello)
                 if ja3:
-                    ja3_hash = hashlib.md5(ja3.encode("utf-8", errors="ignore")).hexdigest()
+                    ja3_hash = hashlib.md5(
+                        ja3.encode("utf-8", errors="ignore")
+                    ).hexdigest()
                     ja3_counts[ja3_hash] += 1
 
                 ja4 = _ja4_from_client_hello(client_hello, sni_val, alpn_vals)
@@ -1507,7 +1428,11 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
 
             if TLSServerHello is not None and pkt.haslayer(TLSServerHello):  # type: ignore[truthy-bool]
                 server_hello = pkt[TLSServerHello]  # type: ignore[index]
-                ja4s = _ja4s_from_server_hello(server_hello)
+                server_alpn: list[str] = []
+                for ext in _iter_tls_extensions(server_hello):
+                    if not server_alpn:
+                        server_alpn = _extract_alpn(ext)
+                ja4s = _ja4s_from_server_hello(server_hello, server_alpn)
                 if ja4s:
                     ja4s_counts[ja4s] += 1
 
@@ -1518,11 +1443,13 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                     key = (src_ip, dst_ip, str(len(risks)))
                     if key not in cert_seen:
                         cert_seen.add(key)
-                        tls_cert_risks.append({
-                            "src": src_ip,
-                            "dst": dst_ip,
-                            "risks": risks,
-                        })
+                        tls_cert_risks.append(
+                            {
+                                "src": src_ip,
+                                "dst": dst_ip,
+                                "risks": risks,
+                            }
+                        )
     finally:
         status.finish()
         reader.close()
@@ -1531,78 +1458,188 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
     if skipped_endpoints:
-        errors.append(f"Endpoint cap reached; {skipped_endpoints} endpoint updates skipped.")
+        errors.append(
+            f"Endpoint cap reached; {skipped_endpoints} endpoint updates skipped."
+        )
     if skipped_conversations:
-        errors.append(f"Conversation cap reached; {skipped_conversations} conversation updates skipped.")
+        errors.append(
+            f"Conversation cap reached; {skipped_conversations} conversation updates skipped."
+        )
     if len(unique_ips) >= MAX_UNIQUE_IPS:
         errors.append("Unique IP cap reached; additional IPs not counted.")
 
     endpoint_rows: list[IpEndpoint] = []
     for ip_text, data in endpoints.items():
-        endpoint_rows.append(IpEndpoint(
-            ip=ip_text,
-            packets_sent=int(data["packets_sent"]),
-            packets_recv=int(data["packets_recv"]),
-            bytes_sent=int(data["bytes_sent"]),
-            bytes_recv=int(data["bytes_recv"]),
-            protocols=sorted(list(data["protocols"])),
-            peers=sorted(list(data["peers"])),
-            ports=sorted(list(data["ports"])),
-            first_seen=data["first_seen"],
-            last_seen=data["last_seen"],
-            geo=None,
-            asn=None,
-        ))
+        endpoint_rows.append(
+            IpEndpoint(
+                ip=ip_text,
+                packets_sent=int(data["packets_sent"]),
+                packets_recv=int(data["packets_recv"]),
+                bytes_sent=int(data["bytes_sent"]),
+                bytes_recv=int(data["bytes_recv"]),
+                protocols=sorted(list(data["protocols"])),
+                peers=sorted(list(data["peers"])),
+                ports=sorted(list(data["ports"])),
+                first_seen=data["first_seen"],
+                last_seen=data["last_seen"],
+                geo=None,
+                asn=None,
+            )
+        )
 
     conversation_rows: list[IpConversation] = []
     for (src_ip, dst_ip, protocol), data in conversations.items():
-        conversation_rows.append(IpConversation(
-            src=src_ip,
-            dst=dst_ip,
-            protocol=protocol,
-            packets=int(data["packets"]),
-            bytes=int(data["bytes"]),
-            first_seen=data["first_seen"],
-            last_seen=data["last_seen"],
-            ports=sorted(list(data["ports"])),
-        ))
+        conversation_rows.append(
+            IpConversation(
+                src=src_ip,
+                dst=dst_ip,
+                protocol=protocol,
+                packets=int(data["packets"]),
+                bytes=int(data["bytes"]),
+                first_seen=data["first_seen"],
+                last_seen=data["last_seen"],
+                ports=sorted(list(data["ports"])),
+            )
+        )
+
+    def _is_scan_target(addr: str) -> bool:
+        # A real scan/sweep targets unicast hosts. Broadcast/multicast/link-local
+        # destinations are service-discovery chatter (mDNS/SSDP/NAT-PMP), not
+        # scan targets, and must not count toward the destination breadth.
+        try:
+            ip = ipaddress.ip_address(addr)
+        except Exception:
+            return False
+        if ip.is_multicast or ip.is_link_local or ip.is_loopback or ip.is_unspecified:
+            return False
+        if str(addr).endswith(".255") or str(addr).endswith(".0"):
+            return False
+        return True
+
+    def _dst_is_internal(addr: str) -> bool:
+        try:
+            ip = ipaddress.ip_address(addr)
+            return ip.is_private and not (
+                ip.is_link_local or ip.is_multicast or ip.is_loopback
+            )
+        except Exception:
+            return False
 
     suspicious_port_profiles: list[dict[str, object]] = []
     for src_ip, ports in src_to_ports.items():
         unique_ports = len(ports)
-        unique_dsts = len(src_to_dsts.get(src_ip, set()))
+        dsts = {d for d in src_to_dsts.get(src_ip, set()) if _is_scan_target(str(d))}
+        unique_dsts = len(dsts)
         high_ports = sum(1 for p in ports if p >= 1024)
+        # Distinguish internal-network reconnaissance from ordinary outbound
+        # client egress: a host connecting to many PUBLIC hosts on high ports
+        # (P2P, CDN, app traffic) is not scanning. Flag only when destinations
+        # are substantially internal, or it is a vertical scan (many ports per
+        # host = port enumeration), which is suspicious against any target.
+        internal_dsts = sum(1 for d in dsts if _dst_is_internal(str(d)))
+        internal_frac = internal_dsts / max(unique_dsts, 1)
+        ports_per_dst = unique_ports / max(unique_dsts, 1)
+        is_internal_recon = internal_frac >= 0.5
+        is_vertical_scan = ports_per_dst >= 10
+        if not (is_internal_recon or is_vertical_scan):
+            continue
         if unique_ports >= 100 and unique_dsts >= 10:
-            suspicious_port_profiles.append({
-                "type": "broad_scan",
-                "src": src_ip,
-                "unique_ports": unique_ports,
-                "unique_dsts": unique_dsts,
-                "high_ports": high_ports,
-            })
-        elif unique_ports >= 50 and unique_dsts >= 3 and high_ports / max(unique_ports, 1) > 0.8:
-            suspicious_port_profiles.append({
-                "type": "high_port_sweep",
-                "src": src_ip,
-                "unique_ports": unique_ports,
-                "unique_dsts": unique_dsts,
-                "high_ports": high_ports,
-            })
+            suspicious_port_profiles.append(
+                {
+                    "type": "broad_scan",
+                    "src": src_ip,
+                    "unique_ports": unique_ports,
+                    "unique_dsts": unique_dsts,
+                    "high_ports": high_ports,
+                }
+            )
+        elif (
+            unique_ports >= 50
+            and unique_dsts >= 3
+            and high_ports / max(unique_ports, 1) > 0.8
+        ):
+            suspicious_port_profiles.append(
+                {
+                    "type": "high_port_sweep",
+                    "src": src_ip,
+                    "unique_ports": unique_ports,
+                    "unique_dsts": unique_dsts,
+                    "high_ports": high_ports,
+                }
+            )
+        elif is_vertical_scan and unique_ports >= 50:
+            # Vertical scan: one/few targets enumerated across many ports — the
+            # most common nmap-style port scan, which the broad/sweep thresholds
+            # (needing >=3 destinations) miss entirely.
+            suspicious_port_profiles.append(
+                {
+                    "type": "vertical_scan",
+                    "src": src_ip,
+                    "unique_ports": unique_ports,
+                    "unique_dsts": unique_dsts,
+                    "high_ports": high_ports,
+                }
+            )
+
+    # Lateral movement is INTERNAL host-to-host spread. Scoring on ALL peers
+    # (the old behavior) made any workstation browsing many public HTTPS sites
+    # look like lateral movement; only private<->private reach counts, gated on
+    # contacting several distinct internal hosts.
+    def _is_real_internal_host(addr: str, self_ip: str) -> bool:
+        # A genuine lateral-movement target: an RFC1918 unicast host that is not
+        # the endpoint itself, the broadcast/network address, link-local
+        # (169.254), loopback, multicast, or the unspecified address. Counting
+        # those inflated the score with gateways/broadcast/self and produced
+        # false lateral-movement verdicts on ordinary hosts.
+        if addr == self_ip:
+            return False
+        try:
+            ip = ipaddress.ip_address(addr)
+        except Exception:
+            return False
+        if not ip.is_private:
+            return False
+        if (
+            ip.is_link_local
+            or ip.is_loopback
+            or ip.is_multicast
+            or ip.is_unspecified
+            or ip.is_reserved
+        ):
+            return False
+        if str(addr).endswith(".255") or str(addr).endswith(".0"):
+            return False
+        return True
 
     lateral_movement_scores: list[dict[str, object]] = []
     for endpoint in endpoint_rows:
-        if not _is_public_ip(endpoint.ip):
-            unique_peers = len(endpoint.peers)
-            unique_ports = len(endpoint.ports)
-            score = (unique_peers / 25.0) + (unique_ports / 50.0) + (endpoint.packets_sent / 5000.0)
-            if score >= 3.0:
-                lateral_movement_scores.append({
-                    "ip": endpoint.ip,
-                    "score": round(score, 2),
-                    "peers": unique_peers,
-                    "ports": unique_ports,
-                    "packets_sent": endpoint.packets_sent,
-                })
+        # The actor must itself be a real internal unicast host that actually
+        # initiated traffic — broadcast/multicast addresses and passive
+        # receive-only endpoints (packets_sent == 0, e.g. a host that merely
+        # received LAN broadcasts from many sources) are not lateral movers.
+        if not _is_real_internal_host(endpoint.ip, ""):
+            continue
+        if endpoint.packets_sent <= 0:
+            continue
+        internal_peers = sum(
+            1 for p in endpoint.peers if _is_real_internal_host(p, endpoint.ip)
+        )
+        unique_ports = len(endpoint.ports)
+        # Lateral movement is BREADTH of internal reach, not packet volume: a
+        # chatty node (OT cyclic polling, a busy server) sends huge volumes to a
+        # few peers and must not score. Require contact with many distinct
+        # internal hosts; small (<10-host) spread is left to --tcp/--smb/--threats.
+        score = (internal_peers / 10.0) + (unique_ports / 50.0)
+        if internal_peers >= 10:
+                lateral_movement_scores.append(
+                    {
+                        "ip": endpoint.ip,
+                        "score": round(score, 2),
+                        "peers": internal_peers,
+                        "ports": unique_ports,
+                        "packets_sent": endpoint.packets_sent,
+                    }
+                )
 
     intel_findings: list[dict[str, object]] = []
     ja_reputation_hits: list[dict[str, object]] = []
@@ -1618,7 +1655,9 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
     opt_in_raw = os.environ.get("PCAPPER_INTEL_OPT_IN", "0").strip().lower()
     opt_in = opt_in_raw in {"1", "true", "yes", "y"}
     if not opt_in and (abuse_key or otx_key or vt_key):
-        errors.append("External IP intelligence lookups disabled; set PCAPPER_INTEL_OPT_IN=1 to enable.")
+        errors.append(
+            "External IP intelligence lookups disabled; set PCAPPER_INTEL_OPT_IN=1 to enable."
+        )
         abuse_key = None
         otx_key = None
         vt_key = None
@@ -1646,76 +1685,125 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
         if abuse_key:
             abuse_data = _abuseipdb_lookup(endpoint.ip, abuse_key)
             if abuse_data and abuse_data.get("score"):
-                intel_findings.append({
-                    "ip": endpoint.ip,
-                    **abuse_data,
-                })
+                intel_findings.append(
+                    {
+                        "ip": endpoint.ip,
+                        **abuse_data,
+                    }
+                )
 
         if otx_key:
             otx_data = _otx_lookup(endpoint.ip, otx_key)
             if otx_data and otx_data.get("pulses"):
-                intel_findings.append({
-                    "ip": endpoint.ip,
-                    **otx_data,
-                })
+                intel_findings.append(
+                    {
+                        "ip": endpoint.ip,
+                        **otx_data,
+                    }
+                )
 
         if vt_key:
             vt_data = _virustotal_lookup(endpoint.ip, vt_key)
             if vt_data and (vt_data.get("malicious") or vt_data.get("suspicious")):
-                intel_findings.append({
-                    "ip": endpoint.ip,
-                    **vt_data,
-                })
+                intel_findings.append(
+                    {
+                        "ip": endpoint.ip,
+                        **vt_data,
+                    }
+                )
 
     if enriched:
         updated_rows: list[IpEndpoint] = []
         for endpoint in endpoint_rows:
             geo_label, asn_label = enriched.get(endpoint.ip, (None, None))
-            updated_rows.append(IpEndpoint(
-                ip=endpoint.ip,
-                packets_sent=endpoint.packets_sent,
-                packets_recv=endpoint.packets_recv,
-                bytes_sent=endpoint.bytes_sent,
-                bytes_recv=endpoint.bytes_recv,
-                protocols=endpoint.protocols,
-                peers=endpoint.peers,
-                ports=endpoint.ports,
-                first_seen=endpoint.first_seen,
-                last_seen=endpoint.last_seen,
-                geo=geo_label,
-                asn=asn_label,
-            ))
+            updated_rows.append(
+                IpEndpoint(
+                    ip=endpoint.ip,
+                    packets_sent=endpoint.packets_sent,
+                    packets_recv=endpoint.packets_recv,
+                    bytes_sent=endpoint.bytes_sent,
+                    bytes_recv=endpoint.bytes_recv,
+                    protocols=endpoint.protocols,
+                    peers=endpoint.peers,
+                    ports=endpoint.ports,
+                    first_seen=endpoint.first_seen,
+                    last_seen=endpoint.last_seen,
+                    geo=geo_label,
+                    asn=asn_label,
+                )
+            )
         endpoint_rows = updated_rows
+
+    # Build the per-IP geo/ASN/org enrichment map. MaxMind (offline) results come
+    # first; the opt-in online ip-api.com lookup fills the rest (and adds org /
+    # hosting / proxy context MaxMind alone does not provide).
+    ip_enrichment: dict[str, dict[str, str]] = {}
+    for ip_text, (geo_label, asn_label) in enriched.items():
+        rec: dict[str, str] = {"source": "maxmind"}
+        if geo_label:
+            rec["geo"] = geo_label
+        if asn_label:
+            rec["asn"] = asn_label
+        if rec.get("geo") or rec.get("asn"):
+            ip_enrichment[ip_text] = rec
+    if geo_lookup:
+        public_ips = [e.ip for e in endpoint_rows if _is_public_ip(e.ip)]
+        # Prioritise the highest-volume public peers within the rate-limit window.
+        public_ips = sorted(
+            public_ips,
+            key=lambda ip: next(
+                (
+                    e.bytes_sent + e.bytes_recv
+                    for e in endpoint_rows
+                    if e.ip == ip
+                ),
+                0,
+            ),
+            reverse=True,
+        )[:100]
+        online, online_errors = _enrich_ips_online(public_ips)
+        errors.extend(online_errors)
+        for ip_text, rec in online.items():
+            existing = ip_enrichment.get(ip_text, {})
+            # Online org/hosting/proxy augment MaxMind geo/asn.
+            merged = {**rec, **{k: v for k, v in existing.items() if v}}
+            ip_enrichment[ip_text] = merged
 
     if ja3_rep:
         for ja3_hash, count in ja3_counts.items():
             if ja3_hash in ja3_rep:
-                ja_reputation_hits.append({
-                    "type": "JA3",
-                    "fingerprint": ja3_hash,
-                    "label": ja3_rep[ja3_hash],
-                    "count": count,
-                })
+                ja_reputation_hits.append(
+                    {
+                        "type": "JA3",
+                        "fingerprint": ja3_hash,
+                        "label": ja3_rep[ja3_hash],
+                        "count": count,
+                    }
+                )
 
     if ja4_rep:
         for ja4_hash, count in ja4_counts.items():
             if ja4_hash in ja4_rep:
-                ja_reputation_hits.append({
-                    "type": "JA4",
-                    "fingerprint": ja4_hash,
-                    "label": ja4_rep[ja4_hash],
-                    "count": count,
-                })
+                ja_reputation_hits.append(
+                    {
+                        "type": "JA4",
+                        "fingerprint": ja4_hash,
+                        "label": ja4_rep[ja4_hash],
+                        "count": count,
+                    }
+                )
 
     if ja4s_rep:
         for ja4s_hash, count in ja4s_counts.items():
             if ja4s_hash in ja4s_rep:
-                ja_reputation_hits.append({
-                    "type": "JA4S",
-                    "fingerprint": ja4s_hash,
-                    "label": ja4s_rep[ja4s_hash],
-                    "count": count,
-                })
+                ja_reputation_hits.append(
+                    {
+                        "type": "JA4S",
+                        "fingerprint": ja4s_hash,
+                        "label": ja4s_rep[ja4s_hash],
+                        "count": count,
+                    }
+                )
 
     if geo_reader is not None:
         try:
@@ -1728,13 +1816,36 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
         except Exception:
             pass
 
+    # Enrich IP->hostname mapping using the dedicated hostname analyzer so
+    # --ips is not limited to TLS SNI-only hostname signals.
+    try:
+        from .hostname import analyze_hostname
+
+        hostname_summary = analyze_hostname(
+            path,
+            target_ip=None,
+            show_status=False,
+            include_related=False,
+        )
+        for finding in list(getattr(hostname_summary, "findings", []) or []):
+            mapped_ip = str(getattr(finding, "mapped_ip", "") or "").strip()
+            hostname = str(getattr(finding, "hostname", "") or "").strip().lower()
+            if not mapped_ip or not hostname:
+                continue
+            ip_hostnames[mapped_ip][hostname] += int(getattr(finding, "count", 1) or 1)
+    except Exception:
+        # Keep IPS resilient; fallback to in-band hostname signals only.
+        pass
+
     detections: list[dict[str, object]] = []
     if total_packets == 0:
-        detections.append({
-            "severity": "info",
-            "summary": "No IP traffic detected",
-            "details": "No IPv4/IPv6 packets observed in capture.",
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "No IP traffic detected",
+                "details": "No IPv4/IPv6 packets observed in capture.",
+            }
+        )
     else:
         if tls_client_hellos > 0:
             high_entropy_sni = [
@@ -1743,104 +1854,165 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
                 if entropy >= 4.0 and len(sni) >= 12
             ]
             if high_entropy_sni:
-                sample = ", ".join(f"{name}({entropy:.2f})" for name, entropy in high_entropy_sni[:5])
-                detections.append({
-                    "severity": "warning",
-                    "summary": "High-entropy TLS SNI values detected",
-                    "details": f"Potential DGA or tunneling indicators: {sample}",
-                })
+                sample = ", ".join(
+                    f"{name}({entropy:.2f})" for name, entropy in high_entropy_sni[:5]
+                )
+                detections.append(
+                    {
+                        "severity": "warning",
+                        "summary": "High-entropy TLS SNI values detected",
+                        "details": f"Potential DGA or tunneling indicators: {sample}",
+                    }
+                )
 
             if len(ja3_counts) > 100:
-                detections.append({
-                    "severity": "info",
-                    "summary": "High JA3 diversity",
-                    "details": f"Observed {len(ja3_counts)} unique JA3 hashes; may indicate client variety or evasion.",
-                })
+                detections.append(
+                    {
+                        "severity": "info",
+                        "summary": "High JA3 diversity",
+                        "details": f"Observed {len(ja3_counts)} unique JA3 hashes; may indicate client variety or evasion.",
+                    }
+                )
 
         if suspicious_port_profiles:
-            detections.append({
-                "severity": "warning",
-                "summary": "Suspicious port scanning profiles observed",
-                "details": f"{len(suspicious_port_profiles)} source(s) show broad/high-port sweep behavior.",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Suspicious port scanning profiles observed",
+                    "details": f"{len(suspicious_port_profiles)} source(s) show broad/high-port sweep behavior.",
+                }
+            )
 
         if lateral_movement_scores:
-            top_lm = sorted(lateral_movement_scores, key=lambda x: x.get("score", 0), reverse=True)[:5]
+            top_lm = sorted(
+                lateral_movement_scores, key=lambda x: x.get("score", 0), reverse=True
+            )[:5]
             details = ", ".join(f"{item['ip']}({item['score']})" for item in top_lm)
-            detections.append({
-                "severity": "warning",
-                "summary": "Potential lateral movement patterns",
-                "details": f"High internal fan-out/port reach: {details}",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Potential lateral movement patterns",
+                    "details": f"High internal fan-out/port reach: {details}",
+                }
+            )
 
         if ja_reputation_hits:
-            detections.append({
-                "severity": "warning",
-                "summary": "TLS fingerprint reputation hits",
-                "details": f"{len(ja_reputation_hits)} JA3/JA4/JA4S matches found.",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "TLS fingerprint reputation hits",
+                    "details": f"{len(ja_reputation_hits)} JA3/JA4/JA4S matches found.",
+                }
+            )
 
         if tls_cert_risks:
-            detections.append({
-                "severity": "warning",
-                "summary": "TLS certificate risk indicators",
-                "details": f"{len(tls_cert_risks)} certificate risk observations.",
-            })
-        for category in ("broadcast", "multicast", "loopback", "link_local", "unspecified"):
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "TLS certificate risk indicators",
+                    "details": f"{len(tls_cert_risks)} certificate risk observations.",
+                }
+            )
+        for category in (
+            "broadcast",
+            "multicast",
+            "loopback",
+            "link_local",
+            "unspecified",
+        ):
             if ip_category_counts.get(category, 0) > 0:
-                detections.append({
-                    "severity": "warning" if category in ("broadcast", "loopback", "unspecified") else "info",
-                    "summary": f"{category.replace('_', ' ').title()} traffic observed",
-                    "details": f"{ip_category_counts.get(category, 0)} packets involved in {category} addressing.",
-                })
+                detections.append(
+                    {
+                        "severity": "warning"
+                        if category in ("broadcast", "loopback", "unspecified")
+                        else "info",
+                        "summary": f"{category.replace('_', ' ').title()} traffic observed",
+                        "details": f"{ip_category_counts.get(category, 0)} packets involved in {category} addressing.",
+                    }
+                )
 
-        if duration_seconds and duration_seconds > 0:
+        # Sustained high rate only — guard against a few packets in a sub-second
+        # capture producing a meaningless pkt/s via a near-zero duration.
+        if duration_seconds and duration_seconds >= 1.0:
             top_src = src_counts.most_common(1)
             if top_src:
                 src_ip, src_count = top_src[0]
                 src_rate = src_count / duration_seconds
-                if src_rate > 5000:
-                    detections.append({
-                        "severity": "warning",
-                        "summary": "High packet rate from a single source",
-                        "details": f"{src_ip} sent {src_count} packets (~{src_rate:.1f} pkt/s).",
-                        "top_sources": src_counts.most_common(3),
-                    })
+                if src_rate > 5000 and src_count >= 1000:
+                    detections.append(
+                        {
+                            "severity": "warning",
+                            "summary": "High packet rate from a single source",
+                            "details": f"{src_ip} sent {src_count} packets (~{src_rate:.1f} pkt/s).",
+                            "top_sources": src_counts.most_common(3),
+                        }
+                    )
 
         for endpoint in endpoint_rows:
             if len(endpoint.peers) > 200:
-                detections.append({
-                    "severity": "warning",
-                    "summary": "High fan-out detected",
-                    "details": f"{endpoint.ip} communicated with {len(endpoint.peers)} unique peers.",
-                    "top_sources": [(endpoint.ip, len(endpoint.peers))],
-                })
+                detections.append(
+                    {
+                        "severity": "warning",
+                        "summary": "High fan-out detected",
+                        "details": f"{endpoint.ip} communicated with {len(endpoint.peers)} unique peers.",
+                        "top_sources": [(endpoint.ip, len(endpoint.peers))],
+                    }
+                )
                 break
 
         for endpoint in endpoint_rows:
             inbound_peers = len(endpoint.peers)
             if inbound_peers > 200 and endpoint.packets_recv > endpoint.packets_sent:
-                detections.append({
-                    "severity": "warning",
-                    "summary": "High fan-in detected",
-                    "details": f"{endpoint.ip} received traffic from {inbound_peers} unique peers.",
-                    "top_destinations": [(endpoint.ip, inbound_peers)],
-                })
+                detections.append(
+                    {
+                        "severity": "warning",
+                        "summary": "High fan-in detected",
+                        "details": f"{endpoint.ip} received traffic from {inbound_peers} unique peers.",
+                        "top_destinations": [(endpoint.ip, inbound_peers)],
+                    }
+                )
                 break
 
         if total_bytes > 0:
-            sorted_endpoints = sorted(endpoint_rows, key=lambda e: e.bytes_sent + e.bytes_recv, reverse=True)
+            sorted_endpoints = sorted(
+                endpoint_rows, key=lambda e: e.bytes_sent + e.bytes_recv, reverse=True
+            )
             if sorted_endpoints:
                 top_endpoint = sorted_endpoints[0]
-                share = (top_endpoint.bytes_sent + top_endpoint.bytes_recv) / total_bytes
+                share = (
+                    top_endpoint.bytes_sent + top_endpoint.bytes_recv
+                ) / total_bytes
                 if share > 0.5:
-                    detections.append({
-                        "severity": "info",
-                        "summary": "Traffic concentration on a single host",
-                        "details": f"{top_endpoint.ip} accounts for {share * 100:.1f}% of IP bytes.",
-                    })
+                    detections.append(
+                        {
+                            "severity": "info",
+                            "summary": "Traffic concentration on a single host",
+                            "details": f"{top_endpoint.ip} accounts for {share * 100:.1f}% of IP bytes.",
+                        }
+                    )
 
-    hunting_context = _build_ips_hunting_context(
+    # Browser (MS-BRWS) announced identity — enrich per-IP hostname, roles, OS
+    # so the IP Host Details view names hosts and flags directory infrastructure.
+    ip_roles: dict[str, list[str]] = {}
+    ip_os: dict[str, str] = {}
+    try:
+        from .netbios import analyze_netbios, collect_netbios_host_intel
+
+        _nb_intel = collect_netbios_host_intel(analyze_netbios(path, show_status=False))
+    except Exception:
+        _nb_intel = {}
+    for _bip, _facts in _nb_intel.items():
+        _hn = str(_facts.get("hostname", "") or "").strip()
+        if _hn:
+            ip_hostnames[_bip][_hn] += 1
+        _roles = [str(r) for r in _facts.get("roles", []) or []]
+        if _roles:
+            ip_roles[_bip] = _roles
+        _os = str(_facts.get("os", "") or "")
+        if _os:
+            ip_os[_bip] = _os
+
+    enrichment = _build_ips_enrichment(
         endpoints=endpoint_rows,
         conversations=conversation_rows,
         suspicious_port_profiles=suspicious_port_profiles,
@@ -1863,6 +2035,7 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
         dst_counts=dst_counts,
         ip_category_counts=ip_category_counts,
         ip_mac_counts=ip_mac_counts,
+        ip_hostnames=dict(ip_hostnames),
         endpoints=endpoint_rows,
         conversations=conversation_rows,
         first_seen=first_seen,
@@ -1881,16 +2054,34 @@ def analyze_ips(path: Path, show_status: bool = True) -> IpSummary:
         intel_findings=intel_findings,
         detections=detections,
         errors=errors,
-        analyst_verdict=str(hunting_context.get("analyst_verdict", "") or ""),
-        analyst_confidence=str(hunting_context.get("analyst_confidence", "low") or "low"),
-        analyst_reasons=list(hunting_context.get("analyst_reasons", []) or []),
-        deterministic_checks=dict(hunting_context.get("deterministic_checks", {}) or {}),
-        exposure_profiles=list(hunting_context.get("exposure_profiles", []) or []),
-        priority_asset_profiles=list(hunting_context.get("priority_asset_profiles", []) or []),
-        infrastructure_clusters=list(hunting_context.get("infrastructure_clusters", []) or []),
-        intent_profiles=list(hunting_context.get("intent_profiles", []) or []),
-        corroborated_findings=list(hunting_context.get("corroborated_findings", []) or []),
-        investigation_pivots=list(hunting_context.get("investigation_pivots", []) or []),
-        risk_matrix=list(hunting_context.get("risk_matrix", []) or []),
-        false_positive_context=list(hunting_context.get("false_positive_context", []) or []),
+        confirmed_tcp_service_ports={
+            ip_text: sorted(list(ports))
+            for ip_text, ports in confirmed_tcp_service_ports.items()
+            if ports
+        },
+        analyst_verdict=str(enrichment.get("analyst_verdict", "") or ""),
+        analyst_confidence=str(
+            enrichment.get("analyst_confidence", "low") or "low"
+        ),
+        analyst_reasons=list(enrichment.get("analyst_reasons", []) or []),
+        ip_roles=ip_roles,
+        ip_os=ip_os,
+        deterministic_checks=dict(
+            enrichment.get("deterministic_checks", {}) or {}
+        ),
+        exposure_profiles=list(enrichment.get("exposure_profiles", []) or []),
+        priority_asset_profiles=list(
+            enrichment.get("priority_asset_profiles", []) or []
+        ),
+        infrastructure_clusters=list(
+            enrichment.get("infrastructure_clusters", []) or []
+        ),
+        intent_profiles=list(enrichment.get("intent_profiles", []) or []),
+        corroborated_findings=list(
+            enrichment.get("corroborated_findings", []) or []
+        ),
+        false_positive_context=list(
+            enrichment.get("false_positive_context", []) or []
+        ),
+        ip_enrichment=ip_enrichment,
     )

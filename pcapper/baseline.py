@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
-from collections import Counter
 
 from .hosts import HostSummary, merge_hosts_summaries
-from .services import ServiceSummary, merge_services_summaries
 from .ot_commands import OtCommandSummary
+from .services import ServiceSummary, merge_services_summaries
 from .utils import safe_read_text
 
 
@@ -72,7 +72,9 @@ class BaselineDelta:
         )
 
 
-def _merge_ot_commands(summaries: Iterable[OtCommandSummary]) -> OtCommandSummary | None:
+def _merge_ot_commands(
+    summaries: Iterable[OtCommandSummary],
+) -> OtCommandSummary | None:
     summary_list = [item for item in summaries if item is not None]
     if not summary_list:
         return None
@@ -137,8 +139,12 @@ def build_baseline(
     created_at = datetime.now(timezone.utc).isoformat()
     notes: list[str] = []
 
-    host_summary = merge_hosts_summaries(list(host_summaries)) if host_summaries else None
-    service_summary = merge_services_summaries(list(service_summaries)) if service_summaries else None
+    host_summary = (
+        merge_hosts_summaries(list(host_summaries)) if host_summaries else None
+    )
+    service_summary = (
+        merge_services_summaries(list(service_summaries)) if service_summaries else None
+    )
     ot_summary = _merge_ot_commands(list(ot_summaries)) if ot_summaries else None
 
     hosts: list[dict[str, object]] = []
@@ -168,7 +174,7 @@ def build_baseline(
                 }
             )
     else:
-        notes.append("Host inventory unavailable (enable --hosts).")
+        notes.append("Host inventory unavailable in current CLI mode.")
 
     if service_summary and service_summary.assets:
         for asset in service_summary.assets:
@@ -186,7 +192,9 @@ def build_baseline(
         notes.append("Service inventory unavailable (enable --services).")
 
     if ot_summary:
-        ot_commands = {str(k): int(v) for k, v in (ot_summary.command_counts or {}).items()}
+        ot_commands = {
+            str(k): int(v) for k, v in (ot_summary.command_counts or {}).items()
+        }
         control_targets = {
             str(proto): {str(target): int(count) for target, count in targets.items()}
             for proto, targets in (ot_summary.control_targets or {}).items()
@@ -223,7 +231,9 @@ def _service_key(service: dict[str, object]) -> tuple[str, int, str]:
     )
 
 
-def compare_baseline(current: BaselineSnapshot, baseline: BaselineSnapshot) -> BaselineDelta:
+def compare_baseline(
+    current: BaselineSnapshot, baseline: BaselineSnapshot
+) -> BaselineDelta:
     base_hosts = {str(item.get("ip", "")): item for item in baseline.hosts}
     curr_hosts = {str(item.get("ip", "")): item for item in current.hosts}
 
@@ -271,19 +281,22 @@ def compare_baseline(current: BaselineSnapshot, baseline: BaselineSnapshot) -> B
         if len(changes) > 1:
             host_changes.append(changes)
 
-    base_services = { _service_key(item): item for item in baseline.services }
-    curr_services = { _service_key(item): item for item in current.services }
+    base_services = {_service_key(item): item for item in baseline.services}
+    curr_services = {_service_key(item): item for item in current.services}
 
-    new_services = [curr_services[key] for key in curr_services.keys() - base_services.keys()]
-    missing_services = [base_services[key] for key in base_services.keys() - curr_services.keys()]
+    new_services = [
+        curr_services[key] for key in curr_services.keys() - base_services.keys()
+    ]
+    missing_services = [
+        base_services[key] for key in base_services.keys() - curr_services.keys()
+    ]
     service_changes: list[dict[str, object]] = []
     for key in curr_services.keys() & base_services.keys():
         base = base_services[key]
         curr = curr_services[key]
-        if (
-            str(base.get("service", "") or "") != str(curr.get("service", "") or "")
-            or str(base.get("software", "") or "") != str(curr.get("software", "") or "")
-        ):
+        if str(base.get("service", "") or "") != str(
+            curr.get("service", "") or ""
+        ) or str(base.get("software", "") or "") != str(curr.get("software", "") or ""):
             service_changes.append(
                 {
                     "ip": key[0],
@@ -299,7 +312,9 @@ def compare_baseline(current: BaselineSnapshot, baseline: BaselineSnapshot) -> B
     base_commands = Counter({str(k): int(v) for k, v in baseline.ot_commands.items()})
     curr_commands = Counter({str(k): int(v) for k, v in current.ot_commands.items()})
     new_ot_commands = sorted([cmd for cmd in curr_commands if cmd not in base_commands])
-    missing_ot_commands = sorted([cmd for cmd in base_commands if cmd not in curr_commands])
+    missing_ot_commands = sorted(
+        [cmd for cmd in base_commands if cmd not in curr_commands]
+    )
     ot_command_changes: list[dict[str, object]] = []
     for cmd in curr_commands.keys() & base_commands.keys():
         base_val = base_commands.get(cmd, 0)
@@ -309,7 +324,12 @@ def compare_baseline(current: BaselineSnapshot, baseline: BaselineSnapshot) -> B
             continue
         if abs(diff) >= 5 and abs(diff) / max(base_val, 1) >= 0.5:
             ot_command_changes.append(
-                {"command": cmd, "baseline": base_val, "current": curr_val, "delta": diff}
+                {
+                    "command": cmd,
+                    "baseline": base_val,
+                    "current": curr_val,
+                    "delta": diff,
+                }
             )
 
     base_targets = set()
@@ -348,6 +368,7 @@ def load_baseline(path: Path) -> BaselineSnapshot:
     if not raw:
         raise ValueError(f"Baseline file is empty: {path}")
     import json
+
     data = json.loads(raw)
     return BaselineSnapshot(
         created_at=str(data.get("created_at") or ""),
@@ -355,9 +376,13 @@ def load_baseline(path: Path) -> BaselineSnapshot:
         sources=[str(item) for item in (data.get("sources") or [])],
         hosts=list(data.get("hosts") or []),
         services=list(data.get("services") or []),
-        ot_commands={str(k): int(v) for k, v in (data.get("ot_commands") or {}).items()},
+        ot_commands={
+            str(k): int(v) for k, v in (data.get("ot_commands") or {}).items()
+        },
         control_targets={
-            str(proto): {str(target): int(count) for target, count in (targets or {}).items()}
+            str(proto): {
+                str(target): int(count) for target, count in (targets or {}).items()
+            }
             for proto, targets in (data.get("control_targets") or {}).items()
         },
         notes=list(data.get("notes") or []),

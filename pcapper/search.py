@@ -5,12 +5,12 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, get_reader
-from .utils import safe_float, decode_payload
+from .utils import decode_payload, safe_float, extract_packet_endpoints, get_packet_ports as _get_ports
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
-    from scapy.packet import Raw, Packet  # type: ignore
+    from scapy.packet import Packet, Raw  # type: ignore
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
     Packet = object  # type: ignore
@@ -41,25 +41,8 @@ class SearchSummary:
 
 
 def _get_ip_pair(pkt: Packet) -> tuple[str, str]:
-    if IP is not None and IP in pkt:
-        return pkt[IP].src, pkt[IP].dst
-    if IPv6 is not None and IPv6 in pkt:
-        return pkt[IPv6].src, pkt[IPv6].dst
-    return "0.0.0.0", "0.0.0.0"
-
-
-def _get_ports(pkt: Packet) -> tuple[Optional[int], Optional[int], str]:
-    if TCP is not None and TCP in pkt:
-        try:
-            return int(pkt[TCP].sport), int(pkt[TCP].dport), "TCP"
-        except Exception:
-            return None, None, "TCP"
-    if UDP is not None and UDP in pkt:
-        try:
-            return int(pkt[UDP].sport), int(pkt[UDP].dport), "UDP"
-        except Exception:
-            return None, None, "UDP"
-    return None, None, "OTHER"
+    src_ip, dst_ip = extract_packet_endpoints(pkt)
+    return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
 
 def _extract_payload(pkt: Packet) -> bytes:
@@ -150,7 +133,9 @@ def analyze_search(
             path, packets=packets, meta=meta, show_status=show_status
         )
     except Exception as exc:
-        return SearchSummary(path, query, 0, 0, [], False, [f"Error opening pcap: {exc}"])
+        return SearchSummary(
+            path, query, 0, 0, [], False, [f"Error opening pcap: {exc}"]
+        )
 
     total_packets = 0
     matches = 0

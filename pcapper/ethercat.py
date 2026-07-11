@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .industrial_helpers import IndustrialAnalysis, IndustrialAnomaly, analyze_ethertype_protocol
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_ethertype_protocol,
+)
 
 ETHERCAT_ETHERTYPE = 0x88A4
 
@@ -35,6 +39,13 @@ WRITE_COMMANDS = {
     "ARMW",
     "FRMW",
 }
+
+# LWR/LRW are the *cyclic* logical process-data exchange — in a running EtherCAT
+# network the master issues them every bus cycle (~1 ms), so flagging each as a
+# write anomaly floods the list with thousands of baseline operations (198 hit
+# the cap on a normal capture, burying the real findings like FoE firmware
+# transfer). Only acyclic/configuration writes are treated as notable.
+ACYCLIC_WRITE_COMMANDS = WRITE_COMMANDS - {"LWR", "LRW"}
 
 MAILBOX_TYPES = {
     0x01: "CoE",
@@ -76,7 +87,7 @@ def _parse_datagrams(payload: bytes) -> list[tuple[str, bytes]]:
         while idx + 10 <= len(payload):
             cmd = payload[idx]
             cmd_name = ETHERCAT_CMDS.get(cmd, f"CMD 0x{cmd:02x}")
-            length = int.from_bytes(payload[idx + 6:idx + 8], "little") & 0x07FF
+            length = int.from_bytes(payload[idx + 6 : idx + 8], "little") & 0x07FF
             data_start = idx + 10
             data_end = data_start + length
             if data_end + 2 > len(payload):
@@ -112,6 +123,7 @@ def _parse_mailbox(data: bytes) -> list[str]:
         commands.append(f"SoE {SOE_OPCODES.get(opcode, f'0x{opcode:02x}')}")
     return commands
 
+
 def _parse_commands(payload: bytes) -> list[str]:
     if not payload:
         return []
@@ -124,24 +136,28 @@ def _parse_commands(payload: bytes) -> list[str]:
         commands.append(ETHERCAT_CMDS.get(cmd, f"CMD 0x{cmd:02x}"))
     return commands
 
-def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]) -> list[IndustrialAnomaly]:
+
+def _detect_anomalies(
+    payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
+) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
-    if any(cmd in WRITE_COMMANDS for cmd in commands):
-        anomalies.append(
-            IndustrialAnomaly(
-                severity="MEDIUM",
-                title="EtherCAT Write Operation",
-                description="EtherCAT write/control command observed.",
-                src=src_ip,
-                dst=dst_ip,
-                ts=ts,
-            )
-        )
+    # Raw EtherCAT writes (LWR/LRW cyclic process data AND FPWR/APWR mailbox
+    # writes) are the protocol's normal high-frequency transport — a running bus
+    # issues tens of thousands per capture, so a per-packet "Write Operation"
+    # anomaly just floods the cap and buries the real findings. The
+    # security-relevant *application-layer* actions are surfaced by the mailbox
+    # detections below (FoE firmware transfer, EoE tunneling, etc.); raw writes
+    # are not flagged. (ACYCLIC_WRITE_COMMANDS / WRITE_COMMANDS remain available
+    # for the write-volume statistics.)
     if any(cmd.startswith("Mailbox FoE") for cmd in commands):
         severity = "HIGH"
         detail = "FoE mailbox activity observed."
-        if any("FoE WRQ" in cmd or "FoE DATA" in cmd for cmd in commands):
-            detail = "FoE file transfer/write activity observed (possible firmware update)."
+        foe_write = any("FoE WRQ" in cmd or "FoE DATA" in cmd for cmd in commands)
+        if foe_write:
+            detail = (
+                "FoE file transfer/write activity observed (possible firmware update)."
+            )
+        foe_cmds = [cmd for cmd in commands if cmd.startswith("Mailbox FoE")]
         anomalies.append(
             IndustrialAnomaly(
                 severity=severity,
@@ -150,6 +166,11 @@ def _detect_anomalies(payload: bytes, src_ip: str, dst_ip: str, ts: float, comma
                 src=src_ip,
                 dst=dst_ip,
                 ts=ts,
+                # File-over-EtherCAT write = firmware/file load to a slave device.
+                attack="T0857 System Firmware",
+                evidence=[", ".join(foe_cmds[:6]), f"{src_ip} -> {dst_ip}"]
+                if foe_cmds
+                else [f"{src_ip} -> {dst_ip}"],
             )
         )
     if any(cmd.startswith("Mailbox CoE") for cmd in commands):

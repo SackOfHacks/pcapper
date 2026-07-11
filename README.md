@@ -79,8 +79,8 @@ python -m pcapper capture.pcap --timeline -ip 10.0.0.5 --protocols --services
 # 3) ATT&CK + IDS corroboration
 python -m pcapper capture.pcap --mitre --suricata
 
-# 4) Exfiltration and artifact hunt
-python -m pcapper capture.pcap --exfil --files --ftp --http
+# 4) Exfiltration, file transfer, and messaging/email artifact hunt
+python -m pcapper capture.pcap --exfil --files --ftp --http --aim --email
 
 # 5) OT/ICS deep-dive
 python -m pcapper capture.pcap --modbus --dnp3 --iec104 --s7 --ot-commands --safety
@@ -113,9 +113,9 @@ flowchart LR
 | Hunt C2 or beaconing behavior | `--beacon --dns --tls --quic` |
 | Map findings to ATT&CK | `--mitre` |
 | Corroborate with IDS alerts | `--suricata` |
-| Investigate data theft | `--exfil --files --ftp --http` |
+| Investigate data theft and transferred artifacts | `--exfil --files --ftp --http --aim --email` |
 | Investigate identity abuse | `--kerberos --ldap --ntlm --domain --creds` |
-| Track lateral movement | `--hosts --services --protocols --tcp --timeline -ip <host>` |
+| Track lateral movement | `--hostnames --services --protocols --tcp --timeline -ip <host>` |
 | Run OT/ICS-specific triage | `--modbus --dnp3 --iec104 --s7 --ot-commands --safety` |
 | Build IR exports and evidence packs | `--json --csv --sqlite --case-dir` |
 
@@ -180,19 +180,80 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
-## Current Release: v1.6.0
+## What's New in v2.1.0 🔥
 
-Latest additions in this release:
-- MITRE ATT&CK mapping (`--mitre`) across Enterprise + ICS with technique heat, host chains, and attack-path visualization.
-- Suricata IDS integration (`--suricata`) with rule/config controls and deterministic coverage checks.
-- TCP stream carving (`--carve`) with signature-based extraction.
-- Obfuscation/tunneling heuristics (`--obfuscation`) for high-entropy and encoded payloads.
-- Cross-PCAP correlation (`--correlate`) for repeated hosts/services.
-- Case provenance metadata (`case.json`) with hashes, timestamps, and analyst attribution.
-- Control-loop validation (`--control-loop`) for Modbus/DNP3 value change behavior.
-- Safety PLC/SIS protocol detection (`--safety`) with Triconex/TriStation heuristics.
-- Baseline snapshot and drift comparison (`--baseline-save`, `--baseline-compare`).
-- Rule-pack evaluation (`--rules`) and IOC enrichment (`--ioc-file`).
+**v2.1.0 is the identity, asset-intelligence & OT-accuracy release.** pcapper now reads the wire the way an analyst does — *who is this host, what does it announce itself as, and is this actually notable* — and it stops crying wolf on quiet industrial segments.
+
+- 🪪 **Full NetBIOS Browser (MS-BRWS) dissection** — the browser Mailslot is decoded, not counted. Every announcement hands you a host's **name, OS, server ROLES (Domain Controller / SQL / print / master browser), comment, and domain** — passive asset inventory + OS fingerprinting with zero probing. Plus a scored verdict and browser attack detections: **rogue master browser / forced-election takeover, PDC role conflict, NETLOGON user-enumeration** — mapped to **MITRE T1557 / T1046 / T1087** and rolled up in `--threats` and `--mitre`.
+- 🧠 **Browser intelligence wired into 8 analyzers** — hostname / OS / roles / domain / DC identity now light up `--hostdetails`, `--domain`, `--hostnames`, `--ips`, `--overview`, `--compromised`, `--threats`, and `--mitre`. `--domain` maps your Active Directory (domain + DC roster) **with no Kerberos or LDAP traffic at all**, and a compromised DC is escalated as a crown-jewel.
+- 🔬 **`--hostdetails` is now a full host-forensics dossier** — one `-ip` gives you identity + roles, usernames, services, web requests, **remote services out (with C2/remote-access flagging), remote access *in* (inbound RDP/SSH/VNC/WinRM/SMB with the connecting peer), authentication activity, TLS/JA3 fingerprints, SMB share access, email, peer geo/ASN/IOC intel**, DNS, and downloaded files with hashes.
+- 🎯 **Systematic OT/DCS false-positive kill** — a benign Foxboro-DCS baseline (broadcast ARP + browser Mailslot, two DCs, no TCP) used to trip nearly every verdict engine. `--scan`, `--arp`, `--beacon`, `--protocols`, `--overview`, `--threats`, and `--mitre` are now segment-hub-, broadcast/multicast-, and rate-aware — a gateway/DC ARPing its subnet is *baseline*, not an "Nmap sweep" or "CRITICAL C2 beacon."
+
+> Full detail in [CHANGELOG.md](CHANGELOG.md).
+
+### Preview: a host tells you exactly what it is
+
+```text
+$ python -m pcapper capture.pcap --netbios
+
+Announced Hosts & Roles (Browser / MS-BRWS)
+Host    IP            OS                                Domain  Roles                                       Comment
+0001DC  10.217.34.1   Windows 7 / Server 2008 R2 (6.1)  FOX     Server, Domain Controller (PDC), DFS Root   Domain Controller
+0002DC  10.217.34.2   Windows 7 / Server 2008 R2 (6.1)  FOX     Server, SQL Server, Backup DC, DFS Root     -
+
+$ python -m pcapper capture.pcap --hostdetails -ip 10.217.34.1
+
+Host Identity
+Hostname                 : 0001DC
+Inferred OS / Device     : Windows 7 / Server 2008 R2 (6.1)
+Announced Roles (Browser): Server, Domain Controller (PDC), Time Source, DFS Root, Terminal Server
+Domain / Workgroup       : FOX
+```
+
+## What's New in v2.0.0 🚀
+
+**v2.0.0 is the threat-hunt / incident-response release** — pcapper graduated from "PCAP analysis" to a full **threat-hunting, forensics, and IR/triage platform** for IT *and* OT/ICS. Every analyzer was reviewed function-by-function so it now reads like an analyst's notebook: a verdict, the evidence, and the ATT&CK technique — never a raw packet dump.
+
+- 🎯 **IT→OT pivot detection** — the #1 industrial intrusion pattern, caught automatically. A remote login (SSH/RDP/WinRM/…) that lands on a host which then issues an OT command to another device is flagged **CRITICAL** across `--threats`, `--overview`, `--compromised`, and shown inline on the `--timeline`.
+- 🛰️ **"Remote IN" timeline events** — inbound remote-access sessions to your focus host, colored by risk (external = CRITICAL, internal = HIGH), so the foothold shows up *before* the control action it enabled.
+- 🔐 **Encrypted-traffic hunting** — JA3/JA4 malware-fingerprint matching, Cobalt Strike default-cert IOCs, **DoH-over-TLS via resolver SNI**, and crackable **Net-NTLM hash** reconstruction (Hashcat-ready).
+- 🏭 **OT/ICS firepower** — ~15 new/expanded industrial analyzers (Synchrophasor/C37.118, BSAP, Genisys, EtherCAT, Modicon UMAS, MELSEC, …), accurate **ATT&CK-for-ICS** mapping with evidence, and full OT output by default.
+- 🧹 **Big correctness + FP audit** — revived several silently-dead detectors (PsExec admin-share/pipe, WMI persistence, Modicon CPU start/stop) and cut a swath of false positives, all validated against ground-truth captures.
+- ⚡ **Faster & leaner** — sub-analyzer memoization (~13%+ faster on OT captures, byte-identical output) and ~2,000 lines of de-duplication.
+
+> See the full breakdown in [CHANGELOG.md](CHANGELOG.md).
+
+### Preview: catching an IT→OT pivot
+
+```text
+$ python -m pcapper attack.pcap -ip 10.0.0.10 --timeline
+
+Activity Timeline
+Time                        | Category   | Summary
+2023-11-14T22:13:20.200000Z | Remote IN  | [CRITICAL] Inbound SSH remote access (external/public source)
+                            |            |   45.137.21.9 -> 10.0.0.10:22 (SSH) established
+2023-11-14T22:13:25.300000Z | Modbus     | [OT Control] Modbus Write Single Register
+                            |            |   10.0.0.10 -> 10.0.0.20:502 unit 1 Write Single Register
+
+$ python -m pcapper attack.pcap --threats
+
+Most Likely Scenarios
+Sev   Source   Detection                                    Top Source      Top Destination
+CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0.0.20(1)
+  Host 10.0.0.10 accepted inbound SSH remote access from 45.137.21.9 (external/public
+  source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
+```
+
+## Current Release: v2.1.0
+
+Headline additions in this release:
+- **Full NetBIOS Browser (MS-BRWS) protocol dissection** in `--netbios` — announced host names, OS, server roles (DC/SQL/print/master browser), comments and domain, a scored verdict, and browser attack detections (rogue master browser, election storm, PDC conflict, NETLOGON enumeration) mapped to MITRE T1557 / T1046 / T1087.
+- **Browser-derived host intelligence propagated to 8 analyzers** (`--hostdetails`, `--domain`, `--hostnames`, `--ips`, `--overview`, `--compromised`, `--threats`, `--mitre`) — passive AD/DC discovery with no Kerberos/LDAP required.
+- **`--hostdetails` expanded into a full host dossier** — inbound + outbound remote access (with C2/remote-access flagging), authentication activity, TLS/JA3, SMB share access, email, and peer geo/ASN/IOC intelligence, alongside the existing identity/services/web/DNS/files.
+- **Systematic OT/DCS false-positive elimination** — a shared unicast/broadcast gate plus segment-hub-role and rate awareness across `--scan`, `--arp`, `--beacon`, `--protocols`, `--overview`, `--threats`, and `--mitre` so a gateway/DC's routine ARP and Mailslot broadcast reads as baseline, not recon or C2.
+- `--scan` and `--overview` now always render at full depth (no `-v` needed, no truncation footer); `--overview` "Notable Flows" is notability-aware instead of top-by-volume.
+
+*Previous milestone (v2.0.x):* IT→OT pivot detection and "Remote IN" timeline events, CIP/EtherNet-IP timeline entries, DoH-over-SNI detection, per-analyzer Analyst Verdict + ATT&CK mapping, revived dead detectors, and sub-analyzer memoization performance work.
 
 ## OT/ICS Command Center
 
@@ -249,8 +310,8 @@ python -m pcapper ~/Downloads/pcaps/MIME11.pcap --ips
 python -m pcapper ~/Downloads/pcaps/ --arp
 python -m pcapper ~/Downloads/pcaps/ --dhcp --no-status
 python -m pcapper ~/Downloads/pcaps/Un* --arp
-python -m pcapper "~/Downloads/pcaps/Un*" --summarize --ips
-python -m pcapper one.pcap two.pcapng ~/Downloads/pcaps/ --summarize --timeline -ip 10.182.207.28
+python -m pcapper "~/Downloads/pcaps/Un*" -summarize --ips
+python -m pcapper one.pcap two.pcapng ~/Downloads/pcaps/ -summarize --timeline -ip 10.182.207.28
 ```
 
 ## Quick Demo
@@ -285,12 +346,12 @@ Client                   Server                   Start                     End 
 ```
 
 Secrets/credentials are displayed in reports by default.
-Exports (JSON/CSV/SQLite) are unredacted by default; use `--export-redact` to force export redaction when needed.
+Exports (JSON/CSV/SQLite) include full values by default.
 Use `-v/--verbose` to include additional evidence lines in summaries (for example file artifacts, LDAP anomalies, and OT/ICS command details).
 
 ## Summarize behavior
 
-Use `--summarize` to aggregate selected analyses across all resolved target pcaps.
+Use `-summarize` (single dash) to aggregate selected analyses across all resolved target pcaps.
 
 - Summarize renders merged rollup output only (no per‑pcap sections).
 - Recursive directory traversal is enabled only with `-r/--recursive`.
@@ -362,7 +423,7 @@ python -m pcapper capture.pcap --files
 Correlate repeated hosts/services across multiple pcaps.
 
 ```bash
-python -m pcapper captures/*.pcap --correlate --summarize
+python -m pcapper captures/*.pcap --correlate -summarize
 ```
 
 ## Case Metadata
@@ -511,19 +572,16 @@ python -m pcapper --help
 - `--correlate`
 - `--correlate-min N`
 - `--csv PATH`
+- `--decode INPUT`
 - `--decrypt`
 - `--decrypt-limit N`
 - `--decrypt-out DIR`
-- `--export-redact`
-- `--extract FILENAME`
-- `--follow FLOW`
-- `--follow-id STREAM_ID`
+- `--cache-mb MB`
 - `--ioc-file PATH`
 - `--json PATH`
 - `--list-plugins`
 - `--log-file PATH`
 - `--log-json`
-- `--lookup-stream-id STREAM_ID`
 - `--no-color`
 - `--no-status`
 - `--packet N`
@@ -540,67 +598,95 @@ python -m pcapper --help
 - `--timeline-bins N`
 - `--timeline-storyline-off`
 - `--tls-keylog PATH`
-- `-categories, --timeline-categories LIST`
+- `-aes KEY`
 - `-case`
+- `-categories, --timeline-categories LIST`
+- `-established`
+- `-exe`
+- `-extract FILENAME`
+- `-hash FILENAME`
+- `-high`
+- `-host`
+- `-id STREAM_ID`
 - `-ip TIMELINE_IP`
-- `-l, --limit-protocols`
+- `-l, --limit-protocols N`
+- `-mac LOOKUP_MAC`
+- `-name HOSTNAME`
+- `-port STREAM_PORT`
+- `-post`
 - `-r, --recursive`
-- `-raw`
-- `-summarize, --summarize`
+- `-raw` (shows `-view`/`--packet` output as raw text, no ASCII/HEX framing)
+- `-rsa KEY_OR_@PATH`
+- `-search TERM`
+- `-summarize`
 - `-v, --verbose`
+- `-view FILENAME`
 - `-vt, --vt`
-- `--view FILENAME`
+- `-xor KEY`
 
 ### IT/Enterprise functions (alphabetical)
 
+- `--aim`
 - `--arp`
 - `--beacon`
 - `--certificates`
-- `--creds`
 - `--compromised`
+- `--creds`
 - `--ctf`
 - `--dhcp`
 - `--dns`
 - `--domain`
+- `--email`
 - `--encrypted-dns`
 - `--exfil`
 - `--files`
 - `--ftp`
 - `--health`
 - `--hostdetails`
-- `--hostname`
-- `--hosts`
+- `--hostnames`
 - `--http`
 - `--http2`
 - `--icmp`
 - `--ioc`
+- `--ip`
 - `--ips`
 - `--kerberos`
 - `--ldap`
+- `--mac`
+- `--malware`
 - `--mitre`
 - `--netbios`
 - `--nfs`
 - `--ntlm`
 - `--ntp`
 - `--obfuscation`
+- `--overview`
 - `--opc-classic`
 - `--pcapmeta`
 - `--powershell`
 - `--protocols`
+- `--qos`
 - `--quic`
 - `--rdp`
-- `--rpc`
 - `--routing`
+- `--rpc`
+- `--scan`
 - `--secrets`
 - `--services`
 - `--sizes`
 - `--smb`
-- `--smtp`
 - `--snmp`
+- `--ssdp`
 - `--ssh`
 - `--streams`
 - `--strings`
 - `--suricata`
+- `--suricata-config`
+- `--suricata-eve-types`
+- `--suricata-only-sid`
+- `--suricata-rules`
+- `--suricata-strict`
+- `--suricata-suppress-sid`
 - `--syslog`
 - `--tcp`
 - `--teamviewer`
@@ -608,14 +694,17 @@ python -m pcapper --help
 - `--threats`
 - `--timeline`
 - `--tls`
+- `--tlsm`
 - `--udp`
 - `--vlan`
 - `--vnc`
 - `--vpn`
+- `--webrequests`
 - `--winrm`
+- `--wlan`
 - `--wmic`
 
-Count: 60 flags
+Count: 78 flags
 
 ### OT/ICS/Industrial functions (alphabetical)
 
@@ -676,6 +765,8 @@ Count: 40 flags
 - Set `PCAPPER_QUOTE` to override the banner quote, or `PCAPPER_QUOTE_SEED` for deterministic rotation.
 - Output ordering is deterministic by default; set `PCAPPER_DETERMINISTIC=0` to restore Python's default Counter tie ordering.
 - Use `--self-check` for a quick dependency and environment check, and `--list-plugins` to inspect loaded plugins.
+- Chained steps (e.g. `--ssh --tls --dns`) parse the capture once and share the packet list across all analyzers. Captures are held in memory when they fit the cache budget (default 256 MB total / 64 MB per file; chained runs raise the per-file limit to the total budget). For larger captures, raise the budget with `--cache-mb` (e.g. `--cache-mb 1024`) so multi-step runs avoid re-parsing the file per step — parsed packets occupy roughly 5–10x the file size in RAM. Env equivalents: `PCAPPER_CACHE_MAX_BYTES`, `PCAPPER_CACHE_FILE_MAX_BYTES`, `PCAPPER_CACHE_ENABLED=0`.
+- Analyzers invoked multiple times in one run (top-level step plus internal fan-out from `--threats`, `--overview`, `--hostdetails`, `--ips`, `--files`) are computed once and replayed from an in-memory result cache. Disable with `PCAPPER_ANALYSIS_MEMO=0`.
 
 ## License
 

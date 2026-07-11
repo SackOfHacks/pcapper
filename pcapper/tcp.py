@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+from .utils import is_private_ip as _is_private_ip
+from .utils import is_public_ip as _is_public_ip
+import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-import ipaddress
-import math
 
-from .pcap_cache import get_reader
-from .utils import safe_float
-from .http import analyze_http
 from .files import analyze_files
-from .services import analyze_services
+from .http import analyze_http
+from .pcap_cache import get_reader
 from .progress import run_with_busy_status
+from .services import analyze_services
+from .utils import extract_packet_endpoints, format_duration, format_ts, memoize_analysis, packet_length, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -93,8 +94,6 @@ class TcpSummary:
     role_drift_profiles: list[dict[str, object]] = field(default_factory=list)
     transport_abuse_profiles: list[dict[str, object]] = field(default_factory=list)
     corroborated_findings: list[dict[str, object]] = field(default_factory=list)
-    investigation_pivots: list[dict[str, object]] = field(default_factory=list)
-    risk_matrix: list[dict[str, str]] = field(default_factory=list)
     false_positive_context: list[str] = field(default_factory=list)
 
 
@@ -144,21 +143,7 @@ def _stats_from_samples(samples: list[int]) -> dict[str, float]:
     }
 
 
-def _is_private_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_private
-    except Exception:
-        return False
-
-
-def _is_public_ip(value: str) -> bool:
-    try:
-        return ipaddress.ip_address(value).is_global
-    except Exception:
-        return False
-
-
-def _build_tcp_hunting_context(
+def _build_tcp_enrichment(
     *,
     tcp_packets: int,
     conversations: list[TcpConversation],
@@ -171,368 +156,111 @@ def _build_tcp_hunting_context(
     src_port_dsts: dict[tuple[str, int], set[str]],
     outbound_flow_bytes: Counter[tuple[str, str]],
 ) -> dict[str, object]:
-    checks: dict[str, list[str]] = {
-        "session_state_integrity": [],
-        "handshake_asymmetry_or_recon": [],
-        "rst_teardown_abuse": [],
-        "tcp_periodic_cadence": [],
-        "lateral_movement_surface": [],
-        "egress_exfil_outlier": [],
-        "service_role_drift": [],
-        "transport_window_or_retrans_abuse": [],
-        "cross_signal_corroboration": [],
-        "evidence_provenance": [],
-    }
+    _ = (
+        tcp_packets,
+        conversations,
+        retrans_counts,
+        zero_window_counts,
+        small_window_counts,
+        src_to_ports,
+        src_to_dsts,
+        src_port_dsts,
+    )
+    checks: dict[str, list[str]] = defaultdict(list)
 
-    session_profiles: list[dict[str, object]] = []
-    recon_profiles: list[dict[str, object]] = []
-    teardown_profiles: list[dict[str, object]] = []
-    cadence_profiles: list[dict[str, object]] = []
-    lateral_profiles: list[dict[str, object]] = []
-    egress_profiles: list[dict[str, object]] = []
-    role_profiles: list[dict[str, object]] = []
-    transport_profiles: list[dict[str, object]] = []
-    corroborated_findings: list[dict[str, object]] = []
-    pivots: list[dict[str, object]] = []
-
-    admin_ports = {22, 23, 135, 139, 445, 3389, 5985, 5986}
-    host_scores: defaultdict[str, int] = defaultdict(int)
-    host_reasons: defaultdict[str, list[str]] = defaultdict(list)
-
-    for convo in conversations:
-        duration = None
-        if convo.first_seen is not None and convo.last_seen is not None:
-            duration = max(0.0, float(convo.last_seen) - float(convo.first_seen))
-        pps = (float(convo.packets) / duration) if duration and duration > 0 else 0.0
-        avg_pkt = (float(convo.bytes) / float(convo.packets)) if convo.packets > 0 else 0.0
-
-        checks["evidence_provenance"].append(
-            f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port} packets={convo.packets} bytes={convo.bytes} syn={convo.syn} syn_ack={convo.syn_ack} rst={convo.rst} fin={convo.fin}"
-        )
-
-        if convo.syn > 0 and convo.syn_ack == 0:
-            checks["session_state_integrity"].append(
-                f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port} has SYN without SYN-ACK"
-            )
-            session_profiles.append(
-                {
-                    "flow": f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port}",
-                    "issue": "SYN without SYN-ACK",
-                    "packets": convo.packets,
-                    "confidence": "medium",
-                }
-            )
-            host_scores[convo.src_ip] += 1
-            host_reasons[convo.src_ip].append("Repeated failed handshakes")
-
-        if convo.ack > 0 and (convo.syn + convo.syn_ack) == 0:
-            checks["session_state_integrity"].append(
-                f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port} ACK traffic without observed handshake"
-            )
-            session_profiles.append(
-                {
-                    "flow": f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port}",
-                    "issue": "Mid-stream ACK without handshake",
-                    "packets": convo.packets,
-                    "confidence": "low",
-                }
-            )
-
-        if convo.rst >= max(5, convo.fin * 3):
-            checks["rst_teardown_abuse"].append(
-                f"{convo.src_ip}->{convo.dst_ip} rst={convo.rst} fin={convo.fin}"
-            )
-            teardown_profiles.append(
-                {
-                    "flow": f"{convo.src_ip}->{convo.dst_ip}:{convo.dst_port}",
-                    "rst": convo.rst,
-                    "fin": convo.fin,
-                    "confidence": "medium",
-                }
-            )
-            host_scores[convo.src_ip] += 1
-            host_reasons[convo.src_ip].append("Abnormal connection teardowns")
-
-        if duration and duration >= 900 and convo.packets >= 30 and pps <= 0.2 and avg_pkt <= 512:
-            checks["tcp_periodic_cadence"].append(
-                f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port} packets={convo.packets} duration={duration:.1f}s pps={pps:.3f}"
-            )
-            cadence_profiles.append(
-                {
-                    "flow": f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port}",
-                    "packets": convo.packets,
-                    "duration_s": f"{duration:.1f}",
-                    "pps": f"{pps:.3f}",
-                    "avg_packet": f"{avg_pkt:.1f}",
-                }
-            )
-            host_scores[convo.src_ip] += 1
-            host_reasons[convo.src_ip].append("Low-and-slow TCP cadence")
-
-        src_private = _is_private_ip(convo.src_ip)
-        dst_private = _is_private_ip(convo.dst_ip)
-        if src_private and dst_private and convo.dst_port in admin_ports:
-            checks["lateral_movement_surface"].append(
-                f"{convo.src_ip}->{convo.dst_ip}:{convo.dst_port} internal admin flow"
-            )
-            lateral_profiles.append(
-                {
-                    "source": convo.src_ip,
-                    "targets": 1,
-                    "admin_ports": str(convo.dst_port),
-                    "confidence": "medium",
-                }
-            )
-            host_scores[convo.src_ip] += 1
-            host_reasons[convo.src_ip].append("Internal administrative east-west movement")
-
-        if src_private and _is_public_ip(convo.dst_ip) and convo.dst_port in admin_ports:
-            checks["service_role_drift"].append(
-                f"{convo.src_ip} initiates admin protocol to public {convo.dst_ip}:{convo.dst_port}"
-            )
-            role_profiles.append(
-                {
-                    "host": convo.src_ip,
-                    "dst": convo.dst_ip,
-                    "port": convo.dst_port,
-                    "reason": "internal host using admin protocol toward public edge",
-                    "confidence": "high",
-                }
-            )
-            host_scores[convo.src_ip] += 2
-            host_reasons[convo.src_ip].append("Role drift to public admin service")
-
-    for src_ip, ports in src_to_ports.items():
-        dsts = src_to_dsts.get(src_ip, set())
-        if len(ports) >= 50 and len(dsts) >= 5:
-            checks["handshake_asymmetry_or_recon"].append(
-                f"{src_ip} fan-out ports={len(ports)} destinations={len(dsts)}"
-            )
-            recon_profiles.append(
-                {
-                    "source": src_ip,
-                    "unique_ports": len(ports),
-                    "targets": len(dsts),
-                    "confidence": "high" if len(ports) >= 100 else "medium",
-                }
-            )
-            host_scores[src_ip] += 2
-            host_reasons[src_ip].append("Scan-like fan-out behavior")
-
-    for src_ip, ports in src_to_ports.items():
-        admin_seen = sorted(int(p) for p in ports if int(p) in admin_ports)
-        dsts = src_to_dsts.get(src_ip, set())
-        if admin_seen and len(dsts) >= 3:
-            lateral_profiles.append(
-                {
-                    "source": src_ip,
-                    "targets": len(dsts),
-                    "admin_ports": ",".join(str(p) for p in admin_seen[:8]),
-                    "confidence": "high" if len(dsts) >= 8 else "medium",
-                }
-            )
-
-    for (src_ip, dport), dsts in src_port_dsts.items():
-        if len(dsts) >= 50:
-            checks["handshake_asymmetry_or_recon"].append(
-                f"{src_ip} host sweep on port {dport} targets={len(dsts)}"
-            )
-            recon_profiles.append(
-                {
-                    "source": src_ip,
-                    "port": dport,
-                    "targets": len(dsts),
-                    "confidence": "high" if len(dsts) >= 100 else "medium",
-                }
-            )
-            host_scores[src_ip] += 2
-            host_reasons[src_ip].append("Host sweep behavior")
-
-    for host, count in retrans_counts.items():
-        if count > 100:
-            checks["transport_window_or_retrans_abuse"].append(
-                f"{host} retransmissions={count}"
-            )
-            transport_profiles.append(
-                {
-                    "host": host,
-                    "type": "retransmissions",
-                    "count": count,
-                    "confidence": "medium",
-                }
-            )
-            host_scores[host] += 1
-            host_reasons[host].append("High retransmission volume")
-
-    for host, count in zero_window_counts.items():
-        if count > 20:
-            checks["transport_window_or_retrans_abuse"].append(
-                f"{host} zero_window={count}"
-            )
-            transport_profiles.append(
-                {
-                    "host": host,
-                    "type": "zero_window",
-                    "count": count,
-                    "confidence": "medium",
-                }
-            )
-
-    for host, count in small_window_counts.items():
-        if count > 100:
-            checks["transport_window_or_retrans_abuse"].append(
-                f"{host} small_window={count}"
-            )
-
-    for (src_ip, dst_ip), byte_count in outbound_flow_bytes.items():
-        if byte_count >= 10_000_000:
-            checks["egress_exfil_outlier"].append(
-                f"{src_ip}->{dst_ip} outbound_bytes={byte_count}"
-            )
-            egress_profiles.append(
-                {
-                    "src": src_ip,
-                    "dst": dst_ip,
-                    "bytes": byte_count,
-                    "confidence": "high" if byte_count >= 50_000_000 else "medium",
-                }
-            )
-            host_scores[src_ip] += 2
-            host_reasons[src_ip].append("Large outbound TCP transfer")
-
-    by_severity: Counter[str] = Counter(str(item.get("severity", "info")).lower() for item in detections)
-    if by_severity.get("high", 0) + by_severity.get("critical", 0) >= 2:
-        checks["cross_signal_corroboration"].append(
-            f"multiple high-severity TCP detections observed={by_severity.get('high', 0) + by_severity.get('critical', 0)}"
-        )
-
-    for host, score in sorted(host_scores.items(), key=lambda item: item[1], reverse=True):
-        reasons = list(dict.fromkeys(host_reasons.get(host, [])))
-        corroborated_findings.append(
-            {
-                "host": host,
-                "score": score,
-                "confidence": "high" if score >= 6 else "medium" if score >= 3 else "low",
-                "reasons": reasons[:4],
-            }
-        )
-
-    for convo in sorted(conversations, key=lambda c: c.bytes, reverse=True):
-        reasons = host_reasons.get(convo.src_ip, [])
-        if not reasons:
+    # Map the analyzer's already-thresholded detections to triage categories
+    # (reusing validated detections keeps false positives low).
+    for det in detections:
+        if str(det.get("severity", "info")).lower() == "info":
             continue
-        pivots.append(
-            {
-                "flow": f"{convo.src_ip}:{convo.src_port}->{convo.dst_ip}:{convo.dst_port}",
-                "packets": convo.packets,
-                "bytes": convo.bytes,
-                "syn": convo.syn,
-                "syn_ack": convo.syn_ack,
-                "rst": convo.rst,
-                "first_seen": convo.first_seen,
-                "last_seen": convo.last_seen,
-                "reasons": list(dict.fromkeys(reasons))[:4],
-            }
-        )
+        summary_text = str(det.get("summary", ""))
+        blob = summary_text.lower()
+        ev = summary_text + (f" — {det.get('details','')}" if det.get("details") else "")
+        if any(
+            t in blob
+            for t in (
+                "port scan",
+                "port sweep",
+                "probing",
+                "without syn-ack",
+                "syn flood",
+                "null scan",
+                "fin scan",
+                "xmas scan",
+                "ack scan",
+                "land attack",
+            )
+        ):
+            checks["handshake_asymmetry_or_recon"].append(ev)
+        if "host sweep" in blob:
+            checks["lateral_movement_surface"].append(ev)
+        if "rst" in blob:
+            checks["rst_teardown_abuse"].append(ev)
+        if any(t in blob for t in ("retransmission", "zero-window", "small-window")):
+            checks["transport_window_or_retrans_abuse"].append(ev)
+        if "beacon" in blob or "periodic" in blob or "cadence" in blob:
+            checks["tcp_periodic_cadence"].append(ev)
 
-    verdict_score = 0
-    verdict_score += 2 if checks["handshake_asymmetry_or_recon"] else 0
-    verdict_score += 2 if checks["lateral_movement_surface"] else 0
-    verdict_score += 2 if checks["egress_exfil_outlier"] else 0
-    verdict_score += 1 if checks["session_state_integrity"] else 0
-    verdict_score += 1 if checks["rst_teardown_abuse"] else 0
-    verdict_score += 1 if checks["transport_window_or_retrans_abuse"] else 0
-    verdict_score += 1 if checks["service_role_drift"] else 0
-    verdict_score += 1 if checks["cross_signal_corroboration"] else 0
+    # Egress exfil outlier: a large sustained outbound transfer to a public host.
+    # Conservative threshold so ordinary downloads/uploads don't fire.
+    for (src, dst), nbytes in (outbound_flow_bytes or {}).items():
+        if nbytes >= 100 * 1024 * 1024 and _is_public_ip(str(dst)):
+            checks["egress_exfil_outlier"].append(
+                f"{src} -> {dst}: {nbytes / (1024 * 1024):.0f} MB outbound to public host"
+            )
 
+    score = 0
     reasons: list[str] = []
-    if checks["handshake_asymmetry_or_recon"]:
-        reasons.append("Handshake asymmetry and recon-like fan-out detected")
-    if checks["lateral_movement_surface"]:
-        reasons.append("East-west administrative TCP movement detected")
-    if checks["egress_exfil_outlier"]:
-        reasons.append("Large egress TCP transfer outlier detected")
-    if checks["service_role_drift"]:
-        reasons.append("TCP role drift toward public administrative services detected")
-    if checks["cross_signal_corroboration"]:
-        reasons.append("Multiple independent TCP detections corroborate risk")
+    if checks.get("egress_exfil_outlier"):
+        score += 3
+        reasons.append("Large outbound transfer to a public host (possible exfiltration)")
+    if checks.get("lateral_movement_surface"):
+        score += 2
+        reasons.append("Host-sweep / lateral-movement surface observed")
+    if checks.get("handshake_asymmetry_or_recon"):
+        score += 2
+        reasons.append("TCP reconnaissance (port scan / sweep / SYN probing)")
+    if checks.get("tcp_periodic_cadence"):
+        score += 2
+        reasons.append("Periodic TCP cadence (possible beaconing)")
+    if checks.get("rst_teardown_abuse"):
+        score += 1
+        reasons.append("Elevated RST/teardown activity")
+    high_ct = sum(
+        1
+        for d in detections
+        if str(d.get("severity", "")).lower() in {"high", "critical"}
+    )
+    if high_ct:
+        reasons.append(f"High-severity TCP detections: {high_ct}")
 
-    if verdict_score >= 8:
-        verdict = "YES - HIGH-CONFIDENCE TCP ABUSE OR LATERAL-MOVEMENT PATTERN DETECTED"
+    if score >= 6:
+        verdict = "YES - high-confidence malicious TCP behavior (exfil / scanning / lateral movement) is present."
         confidence = "high"
-    elif verdict_score >= 5:
-        verdict = "LIKELY - MULTIPLE CORROBORATING TCP RISK INDICATORS DETECTED"
+    elif score >= 4:
+        verdict = "LIKELY - suspicious TCP behavior with attack indicators is present."
         confidence = "medium"
-    elif verdict_score >= 2:
-        verdict = "POSSIBLE - TCP RISK SIGNALS REQUIRE VALIDATION"
-        confidence = "medium"
-    else:
-        verdict = "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE TCP ABUSE PATTERN"
+    elif score >= 2:
+        verdict = "POSSIBLE - notable TCP behavior (recon/teardown) observed; corroboration recommended."
         confidence = "low"
+    elif score >= 1:
+        verdict = "LOW SIGNAL - minor TCP anomalies present but not strongly corroborated."
+        confidence = "low"
+    else:
+        verdict = ""
+        confidence = "low"
+    if not reasons and verdict:
+        reasons.append("TCP anomaly heuristics crossed threshold")
 
-    risk_matrix: list[dict[str, str]] = [
-        {
-            "category": "Session State Integrity",
-            "risk": "Medium" if checks["session_state_integrity"] else "None",
-            "confidence": "Medium" if checks["session_state_integrity"] else "Low",
-            "evidence": str(len(checks["session_state_integrity"])) if checks["session_state_integrity"] else "No matching detections",
-        },
-        {
-            "category": "Recon / Handshake Asymmetry",
-            "risk": "High" if checks["handshake_asymmetry_or_recon"] else "None",
-            "confidence": "High" if checks["handshake_asymmetry_or_recon"] else "Low",
-            "evidence": str(len(checks["handshake_asymmetry_or_recon"])) if checks["handshake_asymmetry_or_recon"] else "No matching detections",
-        },
-        {
-            "category": "Lateral Movement Surface",
-            "risk": "High" if checks["lateral_movement_surface"] else "None",
-            "confidence": "Medium" if checks["lateral_movement_surface"] else "Low",
-            "evidence": str(len(checks["lateral_movement_surface"])) if checks["lateral_movement_surface"] else "No matching detections",
-        },
-        {
-            "category": "Egress Exfil Outlier",
-            "risk": "High" if checks["egress_exfil_outlier"] else "None",
-            "confidence": "High" if checks["egress_exfil_outlier"] else "Low",
-            "evidence": str(len(checks["egress_exfil_outlier"])) if checks["egress_exfil_outlier"] else "No matching detections",
-        },
-        {
-            "category": "Transport Abuse (Retrans/Window)",
-            "risk": "Medium" if checks["transport_window_or_retrans_abuse"] else "None",
-            "confidence": "Medium" if checks["transport_window_or_retrans_abuse"] else "Low",
-            "evidence": str(len(checks["transport_window_or_retrans_abuse"])) if checks["transport_window_or_retrans_abuse"] else "No matching detections",
-        },
-    ]
-
-    fp_context: list[str] = []
-    if checks["handshake_asymmetry_or_recon"]:
-        fp_context.append("Scan-like fan-out may reflect approved vulnerability scanning windows")
-    if checks["egress_exfil_outlier"]:
-        fp_context.append("Large outbound transfer may reflect backup, replication, or patch distribution")
-    if checks["tcp_periodic_cadence"]:
-        fp_context.append("Periodic TCP cadence can be caused by health checks and telemetry agents")
-    if not checks["session_state_integrity"]:
-        fp_context.append("No strong deterministic TCP state-integrity violations were observed")
 
     return {
         "analyst_verdict": verdict,
         "analyst_confidence": confidence,
-        "analyst_reasons": reasons if reasons else ["No high-confidence TCP threat heuristic crossed threshold"],
-        "deterministic_checks": checks,
-        "session_integrity_profiles": session_profiles[:40],
-        "recon_profiles": recon_profiles[:40],
-        "teardown_profiles": teardown_profiles[:40],
-        "cadence_profiles": cadence_profiles[:40],
-        "lateral_movement_profiles": lateral_profiles[:40],
-        "egress_outlier_profiles": egress_profiles[:40],
-        "role_drift_profiles": role_profiles[:40],
-        "transport_abuse_profiles": transport_profiles[:40],
-        "corroborated_findings": corroborated_findings[:40],
-        "investigation_pivots": pivots[:40],
-        "risk_matrix": risk_matrix,
-        "false_positive_context": fp_context[:8],
+        "analyst_reasons": reasons,
+        "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
     }
 
-
+@memoize_analysis
 def analyze_tcp(
     path: Path,
     show_status: bool = True,
@@ -592,17 +320,19 @@ def analyze_tcp(
     tcp_packets = 0
     tcp_bytes = 0
     tcp_payload_bytes = 0
-    conversations: dict[tuple[str, str, int, int], dict[str, object]] = defaultdict(lambda: {
-        "packets": 0,
-        "bytes": 0,
-        "syn": 0,
-        "syn_ack": 0,
-        "rst": 0,
-        "fin": 0,
-        "ack": 0,
-        "first_seen": None,
-        "last_seen": None,
-    })
+    conversations: dict[tuple[str, str, int, int], dict[str, object]] = defaultdict(
+        lambda: {
+            "packets": 0,
+            "bytes": 0,
+            "syn": 0,
+            "syn_ack": 0,
+            "rst": 0,
+            "fin": 0,
+            "ack": 0,
+            "first_seen": None,
+            "last_seen": None,
+        }
+    )
 
     client_counts: Counter[str] = Counter()
     client_bytes: Counter[str] = Counter()
@@ -627,18 +357,26 @@ def analyze_tcp(
     src_port_dsts: dict[tuple[str, int], set[str]] = defaultdict(set)
     syn_triplet_counts: Counter[tuple[str, str, int]] = Counter()
     syn_ack_triplet_counts: Counter[tuple[str, str, int]] = Counter()
+    syn_ack_service_counts: Counter[tuple[str, int]] = Counter()
+    null_scan_triplet_counts: Counter[tuple[str, str, int]] = Counter()
+    fin_scan_triplet_counts: Counter[tuple[str, str, int]] = Counter()
+    xmas_scan_triplet_counts: Counter[tuple[str, str, int]] = Counter()
+    ack_probe_triplet_counts: Counter[tuple[str, str, int]] = Counter()
+    land_attack_packets = 0
     retrans_counts: Counter[str] = Counter()
     zero_window_counts: Counter[str] = Counter()
     small_window_counts: Counter[str] = Counter()
     flow_seq_seen: dict[tuple[str, str, int, int], set[int]] = defaultdict(set)
     retrans_bins: Counter[int] = Counter()
     outbound_flow_bytes: Counter[tuple[str, str]] = Counter()
-    beacon_trackers: dict[tuple[str, str, int, int], dict[str, object]] = defaultdict(lambda: {
-        "last_ts": None,
-        "intervals": [],
-        "payloads": [],
-        "count": 0,
-    })
+    beacon_trackers: dict[tuple[str, str, int, int], dict[str, object]] = defaultdict(
+        lambda: {
+            "last_ts": None,
+            "intervals": [],
+            "payloads": [],
+            "count": 0,
+        }
+    )
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -654,20 +392,11 @@ def analyze_tcp(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if src_ip and dst_ip and ts is not None:
                 if first_seen is None or ts < first_seen:
@@ -687,6 +416,37 @@ def analyze_tcp(
             flags_val = int(flags)
             seq = int(getattr(tcp_layer, "seq", 0))
             window = int(getattr(tcp_layer, "window", 0))
+            # Derive the true TCP segment data length from the IP length fields.
+            # bytes(tcp_layer.payload) is wrong for small frames: scapy attaches
+            # Ethernet padding (frames are padded to the 60-byte minimum) as a
+            # Padding layer under TCP, so a data-less scan packet (NULL/FIN/Xmas/
+            # ACK) reports a non-zero payload and the `payload_len == 0` scan
+            # checks silently never fire. IP header math is immune to padding.
+            payload_len = 0
+            try:
+                ip4 = pkt.getlayer(IP) if IP is not None else None
+                if ip4 is not None and getattr(ip4, "ihl", None):
+                    payload_len = max(
+                        0,
+                        int(getattr(ip4, "len", 0))
+                        - int(ip4.ihl) * 4
+                        - int(getattr(tcp_layer, "dataofs", 5)) * 4,
+                    )
+                else:
+                    ip6 = pkt.getlayer(IPv6) if IPv6 is not None else None
+                    if ip6 is not None and getattr(ip6, "plen", None) is not None:
+                        payload_len = max(
+                            0,
+                            int(ip6.plen)
+                            - int(getattr(tcp_layer, "dataofs", 5)) * 4,
+                        )
+                    else:
+                        payload_len = len(bytes(tcp_layer.payload))
+            except Exception:
+                try:
+                    payload_len = len(bytes(tcp_layer.payload))
+                except Exception:
+                    payload_len = 0
 
             client_key = src_ip or "-"
             server_key = dst_ip or "-"
@@ -737,6 +497,7 @@ def analyze_tcp(
                 convo["syn_ack"] = int(convo["syn_ack"]) + 1
                 if src_ip and dst_ip:
                     syn_ack_triplet_counts[(dst_ip, src_ip, sport)] += 1
+                    syn_ack_service_counts[(src_ip, sport)] += 1
             if flags_val & 0x04:
                 convo["rst"] = int(convo["rst"]) + 1
                 rst_counts[client_key] += 1
@@ -745,11 +506,24 @@ def analyze_tcp(
             if flags_val & 0x10:
                 convo["ack"] = int(convo["ack"]) + 1
 
-            payload_len = 0
-            try:
-                payload_len = len(bytes(tcp_layer.payload))
-            except Exception:
-                payload_len = 0
+            # Common TCP scan/flood indicators.
+            if src_ip and dst_ip:
+                triplet_key = (src_ip, dst_ip, dport)
+                if flags_val == 0:
+                    null_scan_triplet_counts[triplet_key] += 1
+                elif flags_val == 0x01 and payload_len == 0:
+                    fin_scan_triplet_counts[triplet_key] += 1
+                elif (
+                    (flags_val & 0x29) == 0x29
+                    and (flags_val & 0x16) == 0
+                    and payload_len == 0
+                ):
+                    xmas_scan_triplet_counts[triplet_key] += 1
+                elif flags_val == 0x10 and payload_len == 0:
+                    ack_probe_triplet_counts[triplet_key] += 1
+                if src_ip == dst_ip and sport == dport and (flags_val & 0x02):
+                    land_attack_packets += 1
+
             tcp_payload_bytes += payload_len
             packet_size_hist[_bucketize(pkt_len)] += 1
             payload_size_hist[_bucketize(payload_len)] += 1
@@ -794,127 +568,313 @@ def analyze_tcp(
 
     conversation_rows: list[TcpConversation] = []
     for (src_ip, dst_ip, sport, dport), data in conversations.items():
-        conversation_rows.append(TcpConversation(
-            src_ip=src_ip,
-            dst_ip=dst_ip,
-            src_port=sport,
-            dst_port=dport,
-            packets=int(data["packets"]),
-            bytes=int(data["bytes"]),
-            syn=int(data["syn"]),
-            syn_ack=int(data["syn_ack"]),
-            rst=int(data["rst"]),
-            fin=int(data["fin"]),
-            ack=int(data["ack"]),
-            first_seen=data["first_seen"],
-            last_seen=data["last_seen"],
-        ))
+        conversation_rows.append(
+            TcpConversation(
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                src_port=sport,
+                dst_port=dport,
+                packets=int(data["packets"]),
+                bytes=int(data["bytes"]),
+                syn=int(data["syn"]),
+                syn_ack=int(data["syn_ack"]),
+                rst=int(data["rst"]),
+                fin=int(data["fin"]),
+                ack=int(data["ack"]),
+                first_seen=data["first_seen"],
+                last_seen=data["last_seen"],
+            )
+        )
 
     def _busy(desc: str, func, *args, **kwargs):
-        return run_with_busy_status(path, show_status, f"TCP: {desc}", func, *args, **kwargs)
+        return run_with_busy_status(
+            path, show_status, f"TCP: {desc}", func, *args, **kwargs
+        )
 
-    http_summary = _busy("HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta)
+    http_summary = _busy(
+        "HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta
+    )
     file_summary = _busy("Files", analyze_files, path, show_status=False)
     services_summary = _busy("Services", analyze_services, path, show_status=False)
 
     detections: list[dict[str, object]] = []
     if tcp_packets and (sum(rst_counts.values()) / max(tcp_packets, 1)) > 0.2:
-        detections.append({
-            "severity": "warning",
-            "summary": "High TCP RST rate",
-            "details": f"RST packets: {sum(rst_counts.values())} of {tcp_packets}",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "High TCP RST rate",
+                "details": f"RST packets: {sum(rst_counts.values())} of {tcp_packets}",
+            }
+        )
 
     syn_only = sum(syn_counts.values()) - sum(int(c.syn_ack) for c in conversation_rows)
     if syn_only > 50:
-        detections.append({
-            "severity": "warning",
-            "summary": "High SYN without SYN-ACK",
-            "details": f"Potential scan or blocked services (SYN-only: {syn_only}).",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "High SYN without SYN-ACK",
+                "details": f"Potential scan or blocked services (SYN-only: {syn_only}).",
+            }
+        )
+
+    # Directional initiator view for scan/probing determinations.
+    syn_src_to_ports: dict[str, set[int]] = defaultdict(set)
+    syn_src_to_dsts: dict[str, set[str]] = defaultdict(set)
+    syn_src_dst_ports: dict[tuple[str, str], set[int]] = defaultdict(set)
+    syn_src_port_dsts: dict[tuple[str, int], set[str]] = defaultdict(set)
+    for (src_ip, dst_ip, dport), syn_count in syn_triplet_counts.items():
+        if syn_count <= 0:
+            continue
+        syn_src_to_ports[src_ip].add(dport)
+        syn_src_to_dsts[src_ip].add(dst_ip)
+        syn_src_dst_ports[(src_ip, dst_ip)].add(dport)
+        syn_src_port_dsts[(src_ip, dport)].add(dst_ip)
+
+    # SYN flood indicator (including distributed sources) by target service.
+    syn_target_counts: Counter[tuple[str, int]] = Counter()
+    syn_ack_target_counts: Counter[tuple[str, int]] = Counter()
+    for (src_ip, dst_ip, dport), count in syn_triplet_counts.items():
+        syn_target_counts[(dst_ip, dport)] += int(count)
+    syn_ack_target_counts.update(syn_ack_service_counts)
+    syn_flood_hits: list[str] = []
+    for (dst_ip, dport), syn_total in syn_target_counts.items():
+        if syn_total < 200:
+            continue
+        syn_ack_total = syn_ack_target_counts.get((dst_ip, dport), 0)
+        ack_ratio = syn_ack_total / max(syn_total, 1)
+        if ack_ratio <= 0.2:
+            syn_flood_hits.append(
+                f"{dst_ip}:{dport} SYN={syn_total} SYN-ACK={syn_ack_total} ({ack_ratio:.1%})"
+            )
+    if syn_flood_hits:
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Potential TCP SYN flood",
+                "details": "; ".join(syn_flood_hits[:5]),
+            }
+        )
 
     total_retrans = sum(retrans_counts.values())
     if total_retrans > 100:
-        top_retrans = ", ".join(f"{ip}({count})" for ip, count in retrans_counts.most_common(5))
-        detections.append({
-            "severity": "warning",
-            "summary": "TCP retransmission spikes",
-            "details": f"Total retransmissions: {total_retrans}. Top sources: {top_retrans}",
-        })
+        top_retrans = ", ".join(
+            f"{ip}({count})" for ip, count in retrans_counts.most_common(5)
+        )
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "TCP retransmission spikes",
+                "details": f"Total retransmissions: {total_retrans}. Top sources: {top_retrans}",
+            }
+        )
 
     total_zero_window = sum(zero_window_counts.values())
     if total_zero_window > 20:
-        top_zero = ", ".join(f"{ip}({count})" for ip, count in zero_window_counts.most_common(5))
-        detections.append({
-            "severity": "warning",
-            "summary": "TCP zero-window events",
-            "details": f"Total zero-window packets: {total_zero_window}. Top sources: {top_zero}",
-        })
+        top_zero = ", ".join(
+            f"{ip}({count})" for ip, count in zero_window_counts.most_common(5)
+        )
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "TCP zero-window events",
+                "details": f"Total zero-window packets: {total_zero_window}. Top sources: {top_zero}",
+            }
+        )
 
     total_small_window = sum(small_window_counts.values())
     if total_small_window > 100:
-        top_small = ", ".join(f"{ip}({count})" for ip, count in small_window_counts.most_common(5))
-        detections.append({
-            "severity": "info",
-            "summary": "TCP small-window anomalies",
-            "details": f"Total small-window packets: {total_small_window}. Top sources: {top_small}",
-        })
+        top_small = ", ".join(
+            f"{ip}({count})" for ip, count in small_window_counts.most_common(5)
+        )
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "TCP small-window anomalies",
+                "details": f"Total small-window packets: {total_small_window}. Top sources: {top_small}",
+            }
+        )
 
     broad_scans = []
-    for src_ip, ports in src_to_ports.items():
-        if len(ports) >= 50 and len(src_to_dsts.get(src_ip, set())) >= 5:
+    for src_ip, ports in syn_src_to_ports.items():
+        if len(ports) >= 50 and len(syn_src_to_dsts.get(src_ip, set())) >= 5:
             broad_scans.append(src_ip)
     if broad_scans:
-        detections.append({
-            "severity": "high",
-            "summary": "Potential TCP port scan activity",
-            "details": ", ".join(broad_scans[:5]),
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Potential TCP port scan activity",
+                "details": ", ".join(broad_scans[:5]),
+            }
+        )
 
-    port_sweeps = []
-    for (src_ip, dst_ip), ports in src_dst_ports.items():
-        if len(ports) >= 50:
-            port_sweeps.append(f"{src_ip} -> {dst_ip} ({len(ports)} ports)")
+    port_sweep_rows: list[tuple[str, str, int]] = []
+    scanner_candidates = {
+        src_ip
+        for src_ip, ports in syn_src_to_ports.items()
+        if len(ports) >= 50 or len(syn_src_to_dsts.get(src_ip, set())) >= 5
+    }
+    for (src_ip, dst_ip), ports in syn_src_dst_ports.items():
+        if len(ports) >= 50 and src_ip in scanner_candidates:
+            port_sweep_rows.append((src_ip, dst_ip, len(ports)))
+    port_sweeps = [
+        f"{src_ip} -> {dst_ip} ({port_count} ports)"
+        for src_ip, dst_ip, port_count in sorted(
+            port_sweep_rows, key=lambda item: (-item[2], item[0], item[1])
+        )
+    ]
     if port_sweeps:
-        detections.append({
-            "severity": "high",
-            "summary": "Potential TCP port sweep",
-            "details": ", ".join(port_sweeps[:5]),
-        })
+        sweep_sources = Counter(src for src, _dst, _count in port_sweep_rows)
+        sweep_dsts = Counter(dst for _src, dst, _count in port_sweep_rows)
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Potential TCP port sweep",
+                "details": (
+                    f"{len(port_sweep_rows)} src->dst pair(s) reached >=50 destination ports from "
+                    f"{len(sweep_sources)} scanner source(s)."
+                ),
+                "top_sources": sweep_sources.most_common(5),
+                "top_destinations": sweep_dsts.most_common(5),
+                "evidence": port_sweeps[:12],
+            }
+        )
 
+    # A single client opening SYNs to many hosts on the same port is a host
+    # sweep — but on ordinary web ports that pattern is indistinguishable from
+    # normal browsing. The discriminator is handshake completion: browsers
+    # complete the TLS/HTTP handshake (SYN-ACK returned) while a scanner mostly
+    # leaves SYNs unanswered. So for web ports only flag when the established
+    # ratio is low; on non-web ports a 50+ host fanout is suspicious regardless.
+    _WEB_SWEEP_PORTS = {80, 443, 8000, 8080, 8443}
     host_sweeps = []
-    for (src_ip, dport), dsts in src_port_dsts.items():
-        if len(dsts) >= 50:
-            host_sweeps.append(f"{src_ip} -> *:{dport} ({len(dsts)} hosts)")
+    for (src_ip, dport), dsts in syn_src_port_dsts.items():
+        if len(dsts) < 50:
+            continue
+        if dport in _WEB_SWEEP_PORTS:
+            established = sum(
+                1
+                for d in dsts
+                if syn_ack_triplet_counts.get((src_ip, d, dport), 0) > 0
+            )
+            if established / max(len(dsts), 1) > 0.5:
+                continue  # most handshakes completed -> normal browsing, not a sweep
+        host_sweeps.append(f"{src_ip} -> *:{dport} ({len(dsts)} hosts)")
     if host_sweeps:
-        detections.append({
-            "severity": "warning",
-            "summary": "Potential TCP host sweep",
-            "details": ", ".join(host_sweeps[:5]),
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Potential TCP host sweep",
+                "details": ", ".join(host_sweeps[:5]),
+            }
+        )
 
-    brute_force = []
+    # High SYN count with almost no SYN-ACK means connections are not
+    # establishing — that is connection probing/half-open scanning (or a dead
+    # service / SYN flood), NOT credential brute-force, which requires
+    # completed handshakes before any login attempt. Labeling it "brute-force"
+    # mischaracterizes the activity (e.g. an OT host sweeping EtherNet/IP
+    # devices on 44818 is recon, not a credential attack).
+    probing = []
     for key, syn_count in syn_triplet_counts.items():
         if syn_count < 50:
             continue
         syn_ack = syn_ack_triplet_counts.get(key, 0)
         if syn_ack / max(syn_count, 1) <= 0.1:
             src_ip, dst_ip, dport = key
-            brute_force.append(f"{src_ip} -> {dst_ip}:{dport} ({syn_count} SYN)")
-    if brute_force:
-        detections.append({
-            "severity": "high",
-            "summary": "Potential TCP brute-force/credential probing",
-            "details": ", ".join(brute_force[:5]),
-        })
+            probing.append(f"{src_ip} -> {dst_ip}:{dport} ({syn_count} SYN)")
+    if probing:
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Potential TCP connection probing (unanswered SYNs)",
+                "details": ", ".join(probing[:5]),
+            }
+        )
+
+    def _scan_source_hits(
+        triplet_counts: Counter[tuple[str, str, int]],
+        *,
+        min_packets: int,
+        min_targets: int,
+    ) -> list[str]:
+        by_src_packets: Counter[str] = Counter()
+        by_src_targets: dict[str, set[tuple[str, int]]] = defaultdict(set)
+        for (src_ip, dst_ip, dport), count in triplet_counts.items():
+            by_src_packets[src_ip] += int(count)
+            by_src_targets[src_ip].add((dst_ip, dport))
+        hits: list[str] = []
+        for src_ip, pkt_count in by_src_packets.most_common():
+            targets = len(by_src_targets.get(src_ip, set()))
+            if pkt_count >= min_packets and targets >= min_targets:
+                hits.append(f"{src_ip} packets={pkt_count} targets={targets}")
+        return hits
+
+    null_scan_hits = _scan_source_hits(
+        null_scan_triplet_counts, min_packets=40, min_targets=15
+    )
+    if null_scan_hits:
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Potential TCP NULL scan activity",
+                "details": "; ".join(null_scan_hits[:5]),
+            }
+        )
+
+    fin_scan_hits = _scan_source_hits(
+        fin_scan_triplet_counts, min_packets=40, min_targets=15
+    )
+    if fin_scan_hits:
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Potential TCP FIN scan activity",
+                "details": "; ".join(fin_scan_hits[:5]),
+            }
+        )
+
+    xmas_scan_hits = _scan_source_hits(
+        xmas_scan_triplet_counts, min_packets=30, min_targets=10
+    )
+    if xmas_scan_hits:
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Potential TCP Xmas scan activity",
+                "details": "; ".join(xmas_scan_hits[:5]),
+            }
+        )
+
+    ack_probe_hits = _scan_source_hits(
+        ack_probe_triplet_counts, min_packets=80, min_targets=20
+    )
+    if ack_probe_hits:
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Potential TCP ACK scan/probe activity",
+                "details": "; ".join(ack_probe_hits[:5]),
+            }
+        )
+
+    if land_attack_packets > 0:
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Potential TCP LAND attack pattern",
+                "details": f"Observed {land_attack_packets} packet(s) with identical src/dst IP and port.",
+            }
+        )
 
     zero_ratio = zero_payload_packets / max(tcp_packets, 1)
     if tcp_packets >= 500 and zero_ratio >= 0.7:
-        detections.append({
-            "severity": "warning",
-            "summary": "High rate of empty TCP payloads",
-            "details": f"{zero_payload_packets}/{tcp_packets} TCP packets have zero-length payloads.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "High rate of empty TCP payloads",
+                "details": f"{zero_payload_packets}/{tcp_packets} TCP packets have zero-length payloads.",
+            }
+        )
 
     beacon_hits = []
     for (src_ip, dst_ip, sport, dport), tracker in beacon_trackers.items():
@@ -925,7 +885,9 @@ def analyze_tcp(
         mean_interval = sum(intervals) / max(len(intervals), 1)
         if mean_interval <= 1.0:
             continue
-        variance = sum((val - mean_interval) ** 2 for val in intervals) / max(len(intervals), 1)
+        variance = sum((val - mean_interval) ** 2 for val in intervals) / max(
+            len(intervals), 1
+        )
         std_dev = math.sqrt(variance)
         cv = std_dev / mean_interval if mean_interval > 0 else 1.0
         if cv >= 0.2:
@@ -933,13 +895,17 @@ def analyze_tcp(
         payload_mean = sum(payloads) / max(len(payloads), 1) if payloads else 0
         if payload_mean > 1024:
             continue
-        beacon_hits.append(f"{src_ip}:{sport} -> {dst_ip}:{dport} ({mean_interval:.2f}s avg)")
+        beacon_hits.append(
+            f"{src_ip}:{sport} -> {dst_ip}:{dport} ({mean_interval:.2f}s avg)"
+        )
     if beacon_hits:
-        detections.append({
-            "severity": "high",
-            "summary": "Possible TCP beaconing",
-            "details": ", ".join(beacon_hits[:5]),
-        })
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Possible TCP beaconing",
+                "details": ", ".join(beacon_hits[:5]),
+            }
+        )
 
     if outbound_flow_bytes:
         top_outbound = outbound_flow_bytes.most_common(1)[0]
@@ -947,11 +913,14 @@ def analyze_tcp(
             flow_src, flow_dst = top_outbound[0]
             flow_bytes = int(top_outbound[1])
             flow_conversations = [
-                convo for convo in conversation_rows
+                convo
+                for convo in conversation_rows
                 if convo.src_ip == flow_src and convo.dst_ip == flow_dst
             ]
             flow_packets = sum(convo.packets for convo in flow_conversations)
-            flow_port_counts: Counter[int] = Counter(convo.dst_port for convo in flow_conversations)
+            flow_port_counts: Counter[int] = Counter(
+                convo.dst_port for convo in flow_conversations
+            )
 
             flow_first_values = [
                 float(convo.first_seen)
@@ -972,27 +941,38 @@ def analyze_tcp(
             evidence: list[str] = []
             if flow_port_counts:
                 top_ports = ", ".join(
-                    f"{port}({count})" for port, count in flow_port_counts.most_common(8)
+                    f"{port}({count})"
+                    for port, count in flow_port_counts.most_common(8)
                 )
                 evidence.append(f"ports={top_ports}")
             if flow_first_seen is not None and flow_last_seen is not None:
                 evidence.append(
-                    f"window={flow_first_seen:.3f}->{flow_last_seen:.3f} duration={flow_duration:.1f}s"
+                    f"window={format_ts(flow_first_seen)}->{format_ts(flow_last_seen)} "
+                    f"duration={format_duration(flow_duration)}"
                 )
 
             http_flow_downloads = [
-                entry for entry in getattr(http_summary, "downloads", [])
-                if str(entry.get("src", "")) == flow_src and str(entry.get("dst", "")) == flow_dst
+                entry
+                for entry in getattr(http_summary, "downloads", [])
+                if str(entry.get("src", "")) == flow_src
+                and str(entry.get("dst", "")) == flow_dst
             ]
             for entry in http_flow_downloads[:6]:
                 filename = str(entry.get("filename", "-") or "-")
                 content_type = str(entry.get("content_type", "-") or "-")
                 size_value = entry.get("size")
-                size_text = str(size_value) if isinstance(size_value, int) and size_value >= 0 else "-"
-                evidence.append(f"http_download {filename} size={size_text} ctype={content_type}")
+                size_text = (
+                    str(size_value)
+                    if isinstance(size_value, int) and size_value >= 0
+                    else "-"
+                )
+                evidence.append(
+                    f"http_download {filename} size={size_text} ctype={content_type}"
+                )
 
             file_flow_artifacts = [
-                artifact for artifact in getattr(file_summary, "artifacts", [])
+                artifact
+                for artifact in getattr(file_summary, "artifacts", [])
                 if str(getattr(artifact, "src_ip", "")) == flow_src
                 and str(getattr(artifact, "dst_ip", "")) == flow_dst
             ]
@@ -1001,27 +981,33 @@ def analyze_tcp(
                 file_type = str(getattr(artifact, "file_type", "UNKNOWN") or "UNKNOWN")
                 protocol = str(getattr(artifact, "protocol", "-") or "-")
                 size_bytes = getattr(artifact, "size_bytes", None)
-                size_text = str(size_bytes) if isinstance(size_bytes, int) and size_bytes >= 0 else "-"
+                size_text = (
+                    str(size_bytes)
+                    if isinstance(size_bytes, int) and size_bytes >= 0
+                    else "-"
+                )
                 evidence.append(
                     f"file_artifact {protocol} {filename} type={file_type} size={size_text}"
                 )
 
-            detections.append({
-                "severity": "high",
-                "summary": "Large outbound TCP transfer",
-                "details": f"{flow_src} -> {flow_dst} sent {flow_bytes} bytes.",
-                "top_sources": [(flow_src, flow_packets or 1)],
-                "top_destinations": [(flow_dst, flow_packets or 1)],
-                "transfer_src": flow_src,
-                "transfer_dst": flow_dst,
-                "transfer_bytes": flow_bytes,
-                "transfer_packets": flow_packets,
-                "transfer_ports": flow_port_counts.most_common(10),
-                "transfer_first_seen": flow_first_seen,
-                "transfer_last_seen": flow_last_seen,
-                "transfer_duration": flow_duration,
-                "evidence": evidence[:10],
-            })
+            detections.append(
+                {
+                    "severity": "high",
+                    "summary": "Large outbound TCP transfer",
+                    "details": f"{flow_src} -> {flow_dst} sent {flow_bytes} bytes.",
+                    "top_sources": [(flow_src, flow_packets or 1)],
+                    "top_destinations": [(flow_dst, flow_packets or 1)],
+                    "transfer_src": flow_src,
+                    "transfer_dst": flow_dst,
+                    "transfer_bytes": flow_bytes,
+                    "transfer_packets": flow_packets,
+                    "transfer_ports": flow_port_counts.most_common(10),
+                    "transfer_first_seen": flow_first_seen,
+                    "transfer_last_seen": flow_last_seen,
+                    "transfer_duration": flow_duration,
+                    "evidence": evidence[:10],
+                }
+            )
 
     artifacts: list[str] = []
     for ip, count in client_counts.most_common(5):
@@ -1042,26 +1028,28 @@ def analyze_tcp(
         if asset.protocol.upper() != "TCP":
             continue
         clients_preview = ", ".join(sorted(asset.clients)[:5]) if asset.clients else "-"
-        service_rows.append({
-            "service": asset.service_name,
-            "port": asset.port,
-            "count": asset.packets,
-            "proto": asset.protocol,
-            "endpoint": asset.ip,
-            "clients": clients_preview,
-            "client_count": len(asset.clients),
-        })
+        service_rows.append(
+            {
+                "service": asset.service_name,
+                "port": asset.port,
+                "count": asset.packets,
+                "proto": asset.protocol,
+                "endpoint": asset.ip,
+                "clients": clients_preview,
+                "client_count": len(asset.clients),
+            }
+        )
 
-    context = _build_tcp_hunting_context(
+    context = _build_tcp_enrichment(
         tcp_packets=tcp_packets,
         conversations=sorted(conversation_rows, key=lambda c: c.packets, reverse=True),
         detections=detections,
         retrans_counts=retrans_counts,
         zero_window_counts=zero_window_counts,
         small_window_counts=small_window_counts,
-        src_to_ports=src_to_ports,
-        src_to_dsts=src_to_dsts,
-        src_port_dsts=src_port_dsts,
+        src_to_ports=syn_src_to_ports,
+        src_to_dsts=syn_src_to_dsts,
+        src_port_dsts=syn_src_port_dsts,
         outbound_flow_bytes=outbound_flow_bytes,
     )
 
@@ -1100,27 +1088,40 @@ def analyze_tcp(
         services=service_rows,
         detections=detections,
         artifacts=artifacts,
-        errors=errors + http_summary.errors + file_summary.errors + services_summary.errors,
+        errors=errors
+        + http_summary.errors
+        + file_summary.errors
+        + services_summary.errors,
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
         analyst_verdict=str(context.get("analyst_verdict", "")),
         analyst_confidence=str(context.get("analyst_confidence", "low")),
-        analyst_reasons=[str(v) for v in list(context.get("analyst_reasons", []) or [])],
+        analyst_reasons=[
+            str(v) for v in list(context.get("analyst_reasons", []) or [])
+        ],
         deterministic_checks={
             str(key): [str(v) for v in list(values or [])]
-            for key, values in dict(context.get("deterministic_checks", {}) or {}).items()
+            for key, values in dict(
+                context.get("deterministic_checks", {}) or {}
+            ).items()
         },
-        session_integrity_profiles=list(context.get("session_integrity_profiles", []) or []),
+        session_integrity_profiles=list(
+            context.get("session_integrity_profiles", []) or []
+        ),
         recon_profiles=list(context.get("recon_profiles", []) or []),
         teardown_profiles=list(context.get("teardown_profiles", []) or []),
         cadence_profiles=list(context.get("cadence_profiles", []) or []),
-        lateral_movement_profiles=list(context.get("lateral_movement_profiles", []) or []),
+        lateral_movement_profiles=list(
+            context.get("lateral_movement_profiles", []) or []
+        ),
         egress_outlier_profiles=list(context.get("egress_outlier_profiles", []) or []),
         role_drift_profiles=list(context.get("role_drift_profiles", []) or []),
-        transport_abuse_profiles=list(context.get("transport_abuse_profiles", []) or []),
+        transport_abuse_profiles=list(
+            context.get("transport_abuse_profiles", []) or []
+        ),
         corroborated_findings=list(context.get("corroborated_findings", []) or []),
-        investigation_pivots=list(context.get("investigation_pivots", []) or []),
-        risk_matrix=[dict(item) for item in list(context.get("risk_matrix", []) or []) if isinstance(item, dict)],
-        false_positive_context=[str(v) for v in list(context.get("false_positive_context", []) or [])],
+        false_positive_context=[
+            str(v) for v in list(context.get("false_positive_context", []) or [])
+        ],
     )

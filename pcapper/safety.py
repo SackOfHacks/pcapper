@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import ipaddress
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections import Counter
 from typing import Optional
-import ipaddress
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -20,7 +20,9 @@ except Exception:  # pragma: no cover
 
 
 SAFETY_PORTS: dict[int, str] = {
-    1502: "Triconex/TriStation",
+    1500: "Triconex TSAA",        # Triconex System Access Application
+    1501: "Triconex TSAA",
+    1502: "Triconex/TriStation",  # the engineering protocol Triton/TRISIS abused
 }
 
 
@@ -105,7 +107,9 @@ def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
             errors=["Scapy TCP/UDP unavailable"],
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     hits: list[SafetyHit] = []
     source_counts: Counter[str] = Counter()
@@ -125,14 +129,7 @@ def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", None))
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IP].src)  # type: ignore[index]
-                dst_ip = str(pkt[IP].dst)  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IPv6].src)  # type: ignore[index]
-                dst_ip = str(pkt[IPv6].dst)  # type: ignore[index]
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 
@@ -186,13 +183,27 @@ def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
 
     detections: list[dict[str, object]] = []
     if hits:
-        public_hits = [hit for hit in hits if _is_public(hit.src) or _is_public(hit.dst)]
+        public_hits = [
+            hit for hit in hits if _is_public(hit.src) or _is_public(hit.dst)
+        ]
         severity = "high" if public_hits else "warning"
+        # When public endpoints drive the high-severity escalation, show them
+        # first in the evidence sample — otherwise hits[:8] can omit the very
+        # hosts the "Public endpoints observed" claim is about.
+        ordered_hits = public_hits + [
+            hit for hit in hits if not (_is_public(hit.src) or _is_public(hit.dst))
+        ]
         evidence = [
             f"{hit.protocol} {hit.src}:{hit.src_port}->{hit.dst}:{hit.dst_port} {hit.service}"
-            for hit in hits[:8]
+            for hit in ordered_hits[:8]
         ]
-        details = f"{len(hits)} packet(s) across {len(service_counts)} safety service(s)."
+        details = (
+            f"{len(hits)} packet(s) across {len(service_counts)} safety service(s). "
+            "Safety Instrumented Systems are the highest-consequence OT target "
+            "(Triton/TRISIS) — any TriStation/SIS engineering traffic from a "
+            "non-engineering host, or program-download activity, warrants "
+            "investigation (ATT&CK ICS T0843 Program Download to a SIS)."
+        )
         if public_hits:
             details = f"{details} Public endpoints observed."
         detections.append(

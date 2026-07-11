@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import json
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from collections import Counter
-import re
-import json
 
-from .pcap_cache import get_reader
-from .utils import safe_float, safe_read_text
 from .files import analyze_files
+from .pcap_cache import get_reader
+from .utils import safe_float, safe_read_text, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -21,6 +21,43 @@ except Exception:  # pragma: no cover
     UDP = None  # type: ignore
     IPv6 = None  # type: ignore
     Raw = None  # type: ignore
+
+try:
+    from scapy.layers.dns import DNS  # type: ignore
+except Exception:  # pragma: no cover
+    DNS = None  # type: ignore
+
+
+def _extract_dns_names(pkt) -> list[str]:
+    """Decoded DNS query/answer names (dotted, lowercased). Needed because DNS
+    on the wire uses length-prefixed labels, so a dotted IOC domain never
+    matches the raw packet bytes via substring search."""
+    if DNS is None:
+        return []
+    try:
+        if not pkt.haslayer(DNS):  # type: ignore[truthy-bool]
+            return []
+        dns = pkt[DNS]  # type: ignore[index]
+    except Exception:
+        return []
+    names: list[str] = []
+    for section in ("qd", "an"):
+        recs = getattr(dns, section, None)
+        if not recs:
+            continue
+        if not isinstance(recs, (list, tuple)):
+            recs = [recs]
+        for rr in recs:
+            try:
+                name = getattr(rr, "qname", None) or getattr(rr, "rrname", None)
+            except Exception:
+                name = None
+            if not name:
+                continue
+            if isinstance(name, (bytes, bytearray)):
+                name = name.decode("latin-1", errors="ignore")
+            names.append(str(name).rstrip(".").lower())
+    return names
 
 
 @dataclass(frozen=True)
@@ -42,7 +79,9 @@ class IocSummary:
     avg_confidence: Optional[float] = None
 
 
-def _load_iocs(path: Path, errors: list[str] | None = None) -> tuple[set[str], set[str], set[str], dict[str, dict[str, object]]]:
+def _load_iocs(
+    path: Path, errors: list[str] | None = None
+) -> tuple[set[str], set[str], set[str], dict[str, dict[str, object]]]:
     ips: set[str] = set()
     domains: set[str] = set()
     hashes: set[str] = set()
@@ -78,7 +117,9 @@ def _load_iocs(path: Path, errors: list[str] | None = None) -> tuple[set[str], s
                     value = str(item.get("value") or "").strip()
                     if not value:
                         continue
-                    kind = str(item.get("type") or item.get("kind") or "").strip().lower()
+                    kind = (
+                        str(item.get("type") or item.get("kind") or "").strip().lower()
+                    )
                     if not kind:
                         if re.fullmatch(r"[0-9a-fA-F]{32,64}", value):
                             kind = "hash"
@@ -143,9 +184,36 @@ def _extract_payload(pkt) -> bytes:
     return b""
 
 
+def _compile_domain_patterns(domains: set[str]) -> list[tuple[str, "re.Pattern[str]"]]:
+    """Compile label-boundary patterns for IOC domains.
+
+    A bare substring test ("domain in text") matches inside unrelated names —
+    IOC "ic.com" would hit "magic.com". Require that the match is not
+    preceded or followed by a hostname character, so "evil.com" still matches
+    "sub.evil.com" (preceded by ".") but not "evilx.com" or "notevil.community".
+    """
+    patterns: list[tuple[str, "re.Pattern[str]"]] = []
+    for domain in domains:
+        try:
+            patterns.append(
+                (
+                    domain,
+                    re.compile(
+                        r"(?<![a-z0-9-])"
+                        + re.escape(domain)
+                        + r"(?![a-z0-9-])"
+                    ),
+                )
+            )
+        except Exception:
+            continue
+    return patterns
+
+
 def analyze_iocs(path: Path, ioc_path: Path, show_status: bool = True) -> IocSummary:
     errors: list[str] = []
     ips, domains, hashes, meta = _load_iocs(ioc_path, errors=errors)
+    domain_patterns = _compile_domain_patterns(domains)
     ip_hits: Counter[str] = Counter()
     domain_hits: Counter[str] = Counter()
     hash_hits: Counter[str] = Counter()
@@ -160,7 +228,9 @@ def analyze_iocs(path: Path, ioc_path: Path, show_status: bool = True) -> IocSum
         if md5 and md5.lower() in hashes:
             hash_hits[md5.lower()] += 1
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
     total_packets = 0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -182,26 +252,28 @@ def analyze_iocs(path: Path, ioc_path: Path, show_status: bool = True) -> IocSum
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IP].src)  # type: ignore[index]
-                dst_ip = str(pkt[IP].dst)  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IPv6].src)  # type: ignore[index]
-                dst_ip = str(pkt[IPv6].dst)  # type: ignore[index]
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
 
             if src_ip and src_ip in ips:
                 ip_hits[src_ip] += 1
             if dst_ip and dst_ip in ips:
                 ip_hits[dst_ip] += 1
 
-            if domains:
+            if domain_patterns:
                 payload = _extract_payload(pkt)
                 if payload:
                     text = payload.decode("latin-1", errors="ignore").lower()
-                    for domain in domains:
-                        if domain in text:
+                    for domain, pattern in domain_patterns:
+                        # Cheap substring pre-filter before the boundary check.
+                        if domain in text and pattern.search(text):
+                            domain_hits[domain] += 1
+                # DNS query/answer names are length-prefix encoded on the wire,
+                # so the raw-payload search above can't see them -- match the
+                # decoded names explicitly (TLS SNI is contiguous and is already
+                # covered by the payload search).
+                for dns_name in _extract_dns_names(pkt):
+                    for domain, _pattern in domain_patterns:
+                        if domain == dns_name or dns_name.endswith("." + domain):
                             domain_hits[domain] += 1
 
     finally:
@@ -209,73 +281,95 @@ def analyze_iocs(path: Path, ioc_path: Path, show_status: bool = True) -> IocSum
         reader.close()
 
     if ip_hits:
-        def _format_hit(value: str, count: int) -> str:
-            entry = meta.get(value)
-            if not entry:
-                return f"{value} ({count})"
-            parts = []
-            if entry.get("source"):
-                parts.append(f"src={entry.get('source')}")
-            if entry.get("confidence") is not None:
-                parts.append(f"conf={int(entry.get('confidence') or 0)}")
-            mitre = entry.get("mitre") or []
-            if mitre:
-                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
-            suffix = f" ({count})"
-            if parts:
-                suffix = f" ({count}, {', '.join(parts)})"
-            return f"{value}{suffix}"
-        detections.append({
-            "severity": "high",
-            "summary": "IOC IP match",
-            "details": "; ".join(_format_hit(ip, count) for ip, count in ip_hits.most_common(5)),
-        })
-    if domain_hits:
-        def _format_hit(value: str, count: int) -> str:
-            entry = meta.get(value)
-            if not entry:
-                return f"{value} ({count})"
-            parts = []
-            if entry.get("source"):
-                parts.append(f"src={entry.get('source')}")
-            if entry.get("confidence") is not None:
-                parts.append(f"conf={int(entry.get('confidence') or 0)}")
-            mitre = entry.get("mitre") or []
-            if mitre:
-                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
-            suffix = f" ({count})"
-            if parts:
-                suffix = f" ({count}, {', '.join(parts)})"
-            return f"{value}{suffix}"
-        detections.append({
-            "severity": "high",
-            "summary": "IOC domain match",
-            "details": "; ".join(_format_hit(dom, count) for dom, count in domain_hits.most_common(5)),
-        })
-    if hash_hits:
-        def _format_hit(value: str, count: int) -> str:
-            entry = meta.get(value)
-            if not entry:
-                return f"{value} ({count})"
-            parts = []
-            if entry.get("source"):
-                parts.append(f"src={entry.get('source')}")
-            if entry.get("confidence") is not None:
-                parts.append(f"conf={int(entry.get('confidence') or 0)}")
-            mitre = entry.get("mitre") or []
-            if mitre:
-                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
-            suffix = f" ({count})"
-            if parts:
-                suffix = f" ({count}, {', '.join(parts)})"
-            return f"{value}{suffix}"
-        detections.append({
-            "severity": "critical",
-            "summary": "IOC hash match",
-            "details": "; ".join(_format_hit(h, count) for h, count in hash_hits.most_common(5)),
-        })
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+        def _format_hit(value: str, count: int) -> str:
+            entry = meta.get(value)
+            if not entry:
+                return f"{value} ({count})"
+            parts = []
+            if entry.get("source"):
+                parts.append(f"src={entry.get('source')}")
+            if entry.get("confidence") is not None:
+                parts.append(f"conf={int(entry.get('confidence') or 0)}")
+            mitre = entry.get("mitre") or []
+            if mitre:
+                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
+            suffix = f" ({count})"
+            if parts:
+                suffix = f" ({count}, {', '.join(parts)})"
+            return f"{value}{suffix}"
+
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "IOC IP match",
+                "details": "; ".join(
+                    _format_hit(ip, count) for ip, count in ip_hits.most_common(5)
+                ),
+            }
+        )
+    if domain_hits:
+
+        def _format_hit(value: str, count: int) -> str:
+            entry = meta.get(value)
+            if not entry:
+                return f"{value} ({count})"
+            parts = []
+            if entry.get("source"):
+                parts.append(f"src={entry.get('source')}")
+            if entry.get("confidence") is not None:
+                parts.append(f"conf={int(entry.get('confidence') or 0)}")
+            mitre = entry.get("mitre") or []
+            if mitre:
+                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
+            suffix = f" ({count})"
+            if parts:
+                suffix = f" ({count}, {', '.join(parts)})"
+            return f"{value}{suffix}"
+
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "IOC domain match",
+                "details": "; ".join(
+                    _format_hit(dom, count) for dom, count in domain_hits.most_common(5)
+                ),
+            }
+        )
+    if hash_hits:
+
+        def _format_hit(value: str, count: int) -> str:
+            entry = meta.get(value)
+            if not entry:
+                return f"{value} ({count})"
+            parts = []
+            if entry.get("source"):
+                parts.append(f"src={entry.get('source')}")
+            if entry.get("confidence") is not None:
+                parts.append(f"conf={int(entry.get('confidence') or 0)}")
+            mitre = entry.get("mitre") or []
+            if mitre:
+                parts.append(f"mitre={','.join(str(m) for m in mitre[:3])}")
+            suffix = f" ({count})"
+            if parts:
+                suffix = f" ({count}, {', '.join(parts)})"
+            return f"{value}{suffix}"
+
+        detections.append(
+            {
+                "severity": "critical",
+                "summary": "IOC hash match",
+                "details": "; ".join(
+                    _format_hit(h, count) for h, count in hash_hits.most_common(5)
+                ),
+            }
+        )
+
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     source_counts: Counter[str] = Counter()
     tag_counts: Counter[str] = Counter()
     mitre_counts: Counter[str] = Counter()

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import re
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, extract_packet_endpoints, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .utils import beacon_score as _beaconing_score
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -24,11 +25,53 @@ except Exception:  # pragma: no cover
 
 VNC_PORTS = {5900, 5901, 5902, 5903, 5904, 5905, 5906, 5907, 5908, 5909, 5800}
 VNC_BANNER_RE = re.compile(r"(RFB\s+\d+\.\d+)")
-VNC_AUTH_RE = re.compile(r"VNC Authentication|None|Tight|Ultra|RealVNC", re.IGNORECASE)
+# RFB security types are BINARY bytes negotiated in the handshake (NOT text), so
+# they must be parsed from the handshake — matching the words "None"/"Tight" in
+# arbitrary framebuffer/clipboard text produced constant false "no auth" alerts.
+VNC_SECURITY_TYPES = {
+    0: "Invalid",
+    1: "None (no authentication)",
+    2: "VNC Authentication (DES challenge-response)",
+    5: "RA2",
+    6: "RA2ne",
+    16: "Tight",
+    17: "Ultra",
+    18: "TLS",
+    19: "VeNCrypt",
+    20: "SASL",
+    30: "Apple Remote Desktop",
+}
+
+
+def _parse_rfb_version(payload: bytes) -> Optional[tuple[int, int]]:
+    """Parse an 'RFB 003.008\\n' ProtocolVersion (exactly 12 bytes)."""
+    if len(payload) < 12 or not payload.startswith(b"RFB "):
+        return None
+    try:
+        major = int(payload[4:7])
+        minor = int(payload[8:11])
+        return (major, minor)
+    except (ValueError, IndexError):
+        return None
+
+
+def _parse_rfb_security_types(payload: bytes, version: tuple[int, int]) -> list[int]:
+    """Parse the server's security-type message. RFB 3.3 sends a single 4-byte
+    big-endian type; RFB 3.7+ sends [count][type bytes]."""
+    if not payload:
+        return []
+    if version <= (3, 3):
+        if len(payload) >= 4:
+            return [int.from_bytes(payload[:4], "big")]
+        return []
+    count = payload[0]
+    if count == 0 or count > 13 or len(payload) < 1 + count:
+        return []
+    return list(payload[1 : 1 + count])
 
 SUSPICIOUS_PLAINTEXT = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential indicator"),
-    (re.compile(r"user(name)?\s*[:=]", re.IGNORECASE), "User indicator"),
+    (re.compile(r"(?<![\w-])user(name)?\s*[:=]\s*\S", re.IGNORECASE), "User indicator"),
     (re.compile(r"vncpasswd|x11vnc|tigervnc", re.IGNORECASE), "VNC tooling"),
     (re.compile(r"wget\s+|curl\s+|tftp\s+", re.IGNORECASE), "File transfer tooling"),
 ]
@@ -167,25 +210,10 @@ class _SessionState:
     last_seen: Optional[float] = None
     client_banner: Optional[str] = None
     server_banner: Optional[str] = None
-
-
-def _extract_ascii_strings(data: bytes, min_len: int = 4, max_len: int = 200) -> list[str]:
-    results: list[str] = []
-    if not data:
-        return results
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
+    # RFB handshake state for binary security-type parsing.
+    rfb_version: tuple[int, int] = (0, 0)
+    rfb_stage: int = 0  # 0=init, 1=server-version, 2=client-version, 3=sec-types parsed
+    vnc_security: str = ""
 
 
 def _scan_plaintext(
@@ -207,14 +235,16 @@ def _scan_plaintext(
                 suspicious_counter[f"{reason}: {item}"] += 1
         for match in FILE_NAME_RE.findall(item):
             file_counter[match] += 1
-        auth_match = VNC_AUTH_RE.search(item)
-        if auth_match:
-            auth_types[auth_match.group(0)] += 1
+        # NOTE: VNC security types are parsed from the binary RFB handshake (see
+        # the analyze loop), NOT matched as text here — matching "None"/"Tight"
+        # in framebuffer/clipboard text caused constant false "no auth" alerts.
         if "RFB" in item:
             artifacts.append(item)
 
 
-def _direction(src_ip: str, dst_ip: str, sport: int, dport: int) -> tuple[str, str, int, int]:
+def _direction(
+    src_ip: str, dst_ip: str, sport: int, dport: int
+) -> tuple[str, str, int, int]:
     if dport in VNC_PORTS:
         return src_ip, dst_ip, sport, dport
     if sport in VNC_PORTS:
@@ -226,25 +256,6 @@ def _direction(src_ip: str, dst_ip: str, sport: int, dport: int) -> tuple[str, s
     return src_ip, dst_ip, sport, dport
 
 
-def _beaconing_score(times: list[float]) -> Optional[dict[str, float]]:
-    if len(times) < 5:
-        return None
-    times_sorted = sorted(times)
-    deltas = [b - a for a, b in zip(times_sorted, times_sorted[1:]) if b > a]
-    if len(deltas) < 4:
-        return None
-    avg = sum(deltas) / len(deltas)
-    if avg <= 0:
-        return None
-    variance = sum((d - avg) ** 2 for d in deltas) / len(deltas)
-    stddev = variance ** 0.5
-    if avg < 5 or avg > 86400:
-        return None
-    if stddev > max(5.0, avg * 0.25):
-        return None
-    return {"avg": avg, "stddev": stddev}
-
-
 def analyze_vnc(
     path: Path,
     show_status: bool = True,
@@ -253,7 +264,9 @@ def analyze_vnc(
 ) -> VncSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
-        errors.append("Scapy IP/TCP layers unavailable; install scapy for VNC analysis.")
+        errors.append(
+            "Scapy IP/TCP layers unavailable; install scapy for VNC analysis."
+        )
         return VncSummary(
             path=path,
             total_packets=0,
@@ -334,22 +347,13 @@ def analyze_vnc(
                     pass
 
             total_packets += 1
-            pkt_len = int(len(pkt)) if hasattr(pkt, "__len__") else 0
+            pkt_len = packet_length(pkt)
             total_bytes += pkt_len
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 continue
 
-            ip_layer = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-            if ip_layer is None:
-                continue
-
-            src_ip = str(getattr(ip_layer, "src", ""))
-            dst_ip = str(getattr(ip_layer, "dst", ""))
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 
@@ -458,6 +462,26 @@ def analyze_vnc(
                 except Exception:
                     text = ""
 
+            # ---- RFB handshake security-type parsing (binary) ----------------
+            from_server = src_ip == server_ip
+            ver = _parse_rfb_version(payload)
+            if ver is not None:
+                session.rfb_version = ver
+                # Server sends its version first, then the client echoes its own.
+                if from_server and session.rfb_stage == 0:
+                    session.rfb_stage = 1
+                elif not from_server and session.rfb_stage in (0, 1):
+                    session.rfb_stage = 2
+            elif from_server and session.rfb_stage == 2 and not session.vnc_security:
+                # First server payload after the version exchange = security types.
+                sec_types = _parse_rfb_security_types(payload, session.rfb_version)
+                if sec_types:
+                    session.rfb_stage = 3
+                    for st in sec_types:
+                        name = VNC_SECURITY_TYPES.get(st, f"Security Type {st}")
+                        session.vnc_security = name
+                        auth_types[name] += 1
+
             if text:
                 banner = VNC_BANNER_RE.search(text)
                 if banner:
@@ -468,7 +492,14 @@ def analyze_vnc(
                     else:
                         session.server_banner = session.server_banner or value
                         server_banners[value] += 1
-                _scan_plaintext(payload, plaintext_strings, suspicious_plaintext, file_artifacts, artifacts, auth_types)
+                _scan_plaintext(
+                    payload,
+                    plaintext_strings,
+                    suspicious_plaintext,
+                    file_artifacts,
+                    artifacts,
+                    auth_types,
+                )
 
     except Exception as exc:
         errors.append(str(exc))
@@ -507,75 +538,113 @@ def analyze_vnc(
             short_session_by_client[session.client_ip] += 1
             short_session_targets[session.client_ip].add(session.server_ip)
         if session.first_seen is not None:
-            pair_first_seen[(session.client_ip, session.server_ip)].append(session.first_seen)
+            pair_first_seen[(session.client_ip, session.server_ip)].append(
+                session.first_seen
+            )
 
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
-    non_standard_ports = [port for port in server_ports if port not in {5900, 5901, 5800}]
+    non_standard_ports = [port for port in server_ports if port not in VNC_PORTS]
     if non_standard_ports:
-        detections.append({
-            "severity": "info",
-            "summary": "VNC observed on non-standard ports",
-            "details": ", ".join(str(port) for port in sorted(non_standard_ports)),
-        })
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "VNC observed on non-standard ports",
+                "details": ", ".join(str(port) for port in sorted(non_standard_ports)),
+            }
+        )
 
     if auth_types:
-        if any(name.lower() == "none" for name in auth_types):
-            detections.append({
-                "severity": "warning",
-                "summary": "VNC sessions with no authentication detected",
-                "details": "RFB authentication scheme indicates 'None'.",
-            })
+        if any("no authentication" in name.lower() for name in auth_types):
+            detections.append(
+                {
+                    "severity": "high",
+                    "summary": "VNC server offering NO authentication",
+                    "details": (
+                        "RFB security type 1 (None) negotiated — the VNC server "
+                        "grants remote screen/keyboard/mouse control with no "
+                        "password. Anyone who can reach the port has full control "
+                        "(ATT&CK T1021.005 Remote Services: VNC)."
+                    ),
+                }
+            )
+        if any("DES challenge-response" in name for name in auth_types):
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "VNC using weak DES challenge-response auth",
+                    "details": (
+                        "RFB security type 2 (VNC Authentication) uses a DES "
+                        "challenge/response limited to an 8-character password — "
+                        "the captured challenge/response is offline-crackable."
+                    ),
+                }
+            )
 
     if suspicious_plaintext:
-        detections.append({
-            "severity": "warning",
-            "summary": "Suspicious plaintext strings observed in VNC payloads",
-            "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Suspicious plaintext strings observed in VNC payloads",
+                "details": "Potential credentials, tooling, or sensitive strings in cleartext.",
+            }
+        )
 
     for (client_ip, server_ip), count in short_session_counts.items():
         if count >= 20:
-            anomalies.append({
-                "title": "Potential brute force or probing",
-                "details": f"{client_ip} -> {server_ip} short sessions: {count}",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential brute force or probing",
+                    "details": f"{client_ip} -> {server_ip} short sessions: {count}",
+                }
+            )
 
     for client_ip, count in short_session_by_client.items():
         targets = short_session_targets.get(client_ip, set())
         if count >= 30 and len(targets) >= 10:
-            anomalies.append({
-                "title": "Potential VNC scanning",
-                "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
-            })
+            anomalies.append(
+                {
+                    "title": "Potential VNC scanning",
+                    "details": f"{client_ip} short sessions: {count} across {len(targets)} servers",
+                }
+            )
 
     for (client_ip, server_ip), times in pair_first_seen.items():
         score = _beaconing_score(times)
         if score:
-            detections.append({
-                "severity": "info",
-                "summary": "Potential VNC beaconing",
-                "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
-            })
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "Potential VNC beaconing",
+                    "details": f"{client_ip} -> {server_ip} avg interval {score['avg']:.1f}s, stddev {score['stddev']:.1f}s",
+                }
+            )
 
     for session in sessions.values():
-        if session.client_bytes >= 50 * 1024 * 1024 and session.client_bytes > session.server_bytes * 3:
-            detections.append({
-                "severity": "warning",
-                "summary": "Potential VNC data upload/exfiltration",
-                "details": (
-                    f"{session.client_ip} -> {session.server_ip} "
-                    f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
-                ),
-            })
+        if (
+            session.client_bytes >= 50 * 1024 * 1024
+            and session.client_bytes > session.server_bytes * 3
+        ):
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "Potential VNC data upload/exfiltration",
+                    "details": (
+                        f"{session.client_ip} -> {session.server_ip} "
+                        f"client->server {session.client_bytes / (1024 * 1024):.1f} MB"
+                    ),
+                }
+            )
         if session.last_seen is not None and session.first_seen is not None:
             duration = session.last_seen - session.first_seen
             if duration >= 4 * 3600:
-                anomalies.append({
-                    "title": "Long-lived VNC session",
-                    "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
-                })
+                anomalies.append(
+                    {
+                        "title": "Long-lived VNC session",
+                        "details": f"{session.client_ip} -> {session.server_ip} duration {duration:.0f}s",
+                    }
+                )
 
     total_sessions = len(conversations)
 
@@ -694,9 +763,17 @@ def merge_vnc_summaries(
         total_sessions += summary.total_sessions
 
         if summary.first_seen is not None:
-            first_seen = summary.first_seen if first_seen is None else min(first_seen, summary.first_seen)
+            first_seen = (
+                summary.first_seen
+                if first_seen is None
+                else min(first_seen, summary.first_seen)
+            )
         if summary.last_seen is not None:
-            last_seen = summary.last_seen if last_seen is None else max(last_seen, summary.last_seen)
+            last_seen = (
+                summary.last_seen
+                if last_seen is None
+                else max(last_seen, summary.last_seen)
+            )
 
         client_counts.update(summary.client_counts)
         server_counts.update(summary.server_counts)

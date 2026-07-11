@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
-from .utils import safe_float
+from .utils import safe_float, extract_packet_endpoints
 
 try:
     from scapy.layers.inet import IP, UDP  # type: ignore
@@ -52,9 +52,25 @@ def _mode_name(value: int) -> str:
 
 def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
     if UDP is None:
-        return NtpSummary(path, 0, 0, Counter(), Counter(), Counter(), Counter(), Counter(), [], ["Scapy UDP unavailable"], None, None, None)
+        return NtpSummary(
+            path,
+            0,
+            0,
+            Counter(),
+            Counter(),
+            Counter(),
+            Counter(),
+            Counter(),
+            [],
+            ["Scapy UDP unavailable"],
+            None,
+            None,
+            None,
+        )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(path, show_status=show_status)
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, show_status=show_status
+    )
 
     total_packets = 0
     ntp_packets = 0
@@ -93,14 +109,7 @@ def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
             if sport != NTP_PORT and dport != NTP_PORT:
                 continue
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IP].src)  # type: ignore[index]
-                dst_ip = str(pkt[IP].dst)  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IPv6].src)  # type: ignore[index]
-                dst_ip = str(pkt[IPv6].dst)  # type: ignore[index]
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 
@@ -109,7 +118,6 @@ def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
             if len(payload) < 2:
                 continue
             first_byte = payload[0]
-            li = (first_byte >> 6) & 0x3
             version = (first_byte >> 3) & 0x7
             mode = first_byte & 0x7
             mode_name = _mode_name(mode)
@@ -131,20 +139,43 @@ def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
         reader.close()
 
     if ntp_packets and mode_counts.get("control", 0) > 0:
-        detections.append({
-            "severity": "warning",
-            "summary": "NTP control mode traffic detected",
-            "details": "Control mode traffic can indicate management or misuse on NTP services.",
-        })
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "NTP control mode traffic detected",
+                "details": "Control mode traffic can indicate management or misuse on NTP services.",
+            }
+        )
+    # Mode 7 (private) carries the monlist / ntpdc queries that are the classic
+    # NTP amplification / reflection DDoS vector (CVE-2013-5211): a tiny request
+    # elicits a large response, letting the server be abused as a reflector.
+    if ntp_packets and mode_counts.get("private", 0) > 0:
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "NTP mode 7 (private/monlist) traffic detected",
+                "details": (
+                    "Mode 7 private-mode NTP (ntpdc/monlist) observed — the "
+                    "amplification/reflection DDoS vector (CVE-2013-5211). "
+                    "Confirm the server restricts or disables mode 7."
+                ),
+            }
+        )
     if ntp_packets and stratum_counts:
         if any(stratum >= 16 for stratum in stratum_counts.keys()):
-            detections.append({
-                "severity": "warning",
-                "summary": "NTP stratum 16/unsynchronized observed",
-                "details": "Stratum 16 indicates unsynchronized sources; investigate NTP health.",
-            })
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "NTP stratum 16/unsynchronized observed",
+                    "details": "Stratum 16 indicates unsynchronized sources; investigate NTP health.",
+                }
+            )
 
-    duration = (last_seen - first_seen) if first_seen is not None and last_seen is not None else None
+    duration = (
+        (last_seen - first_seen)
+        if first_seen is not None and last_seen is not None
+        else None
+    )
     return NtpSummary(
         path=path,
         total_packets=total_packets,
