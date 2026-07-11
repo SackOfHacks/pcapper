@@ -36,6 +36,7 @@ from .cip import (
     _parse_cip_message,
     _parse_multiple_service_packet,
     _parse_tag_payload,
+    parse_multiple_service_subrequests,
 )
 from .cip import (
     _parse_enip_details as _parse_enip_details_base,
@@ -51,6 +52,21 @@ ENIP_UDP_PORT = 2222
 ENIP_SECURITY_PORT = CIP_SECURITY_PORT
 # Hoisted out of the per-packet loop (was rebuilt for every packet).
 _ENIP_PORTS = frozenset({ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT})
+
+# Symbolic-tag read services — the bread-and-butter of SCADA polling. These are
+# NORMAL, not "suspicious": counting every Read_Tag as suspicious (via the
+# shared ENUMERATION_SERVICE_CODES, which lumps 0x4C/0x52 in with attribute
+# discovery) mislabels benign polling on a clean capture.
+READ_TAG_SERVICE_CODES = frozenset({0x4C, 0x52})
+# Object/attribute discovery reads — informational recon reads; benign from an
+# operational master, worth attention only from an off-baseline source.
+DISCOVERY_SERVICE_CODES = frozenset({0x01, 0x03, 0x0E, 0x11, 0x55})
+# Genuinely notable-but-not-confirmed services: attribute writes, connection
+# setup, object lifecycle, program upload. These feed the "Suspicious" tier of
+# the risk overview (distinct from HIGH_RISK writes/control/program-download).
+SUSPICIOUS_SERVICE_CODES = frozenset({0x02, 0x04, 0x10, 0x54, 0x73})
+# ForwardOpen / large ForwardOpen — connection establishment.
+FORWARD_OPEN_SERVICE_CODES = frozenset({0x54, 0x5B})
 
 ENIP_COMMANDS = {
     0x0001: "NOP",
@@ -168,6 +184,39 @@ class ENIPAnalysis:
     anomalies: list[IndustrialAnomaly] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     identities: list[IdentityInfo] = field(default_factory=list)
+    # Forensic baseline / inventory (mirrors the --modbus upgrade)
+    enumeration_services: Counter[str] = field(default_factory=Counter)
+    tag_reads: Counter[str] = field(default_factory=Counter)
+    tag_writes: Counter[str] = field(default_factory=Counter)
+    tag_endpoints: dict[str, Counter[str]] = field(default_factory=dict)
+    first_seen: dict[str, float] = field(default_factory=dict)
+    cip_success: int = 0
+    cip_errors: int = 0
+    error_status_counts: Counter[str] = field(default_factory=Counter)
+    connections: list[dict[str, object]] = field(default_factory=list)
+    rtt_by_server: dict[str, dict[str, float]] = field(default_factory=dict)
+    pairing: dict[str, int] = field(default_factory=dict)
+
+    request_sources: Counter[str] = field(default_factory=Counter)
+
+    @property
+    def masters(self) -> list[str]:
+        """Operational masters — sources that sent to an ENIP port (true
+        TCP-level client direction). Falls back to client_ips for older
+        summaries. Using request_sources avoids counting a PLC as a 'master'
+        when a server->client continuation packet is mis-classified as a
+        request by the CIP-direction heuristic."""
+        src = self.request_sources or self.client_ips
+        return [ip for ip, cnt in src.items() if cnt > 0]
+
+    @property
+    def write_service_count(self) -> int:
+        total = 0
+        for name, cnt in self.cip_services.items():
+            low = name.lower()
+            if "write" in low or low.startswith("msp/write") or "set_attribute" in low:
+                total += cnt
+        return total
 
 
 def merge_enip_summaries(summaries: list[ENIPAnalysis]) -> ENIPAnalysis:
@@ -258,6 +307,17 @@ def merge_enip_summaries(summaries: list[ENIPAnalysis]) -> ENIPAnalysis:
         merged.instance_ids.update(summary.instance_ids)
         merged.attribute_ids.update(summary.attribute_ids)
         merged.status_codes.update(summary.status_codes)
+        merged.request_sources.update(summary.request_sources)
+        merged.enumeration_services.update(summary.enumeration_services)
+        merged.tag_reads.update(summary.tag_reads)
+        merged.tag_writes.update(summary.tag_writes)
+        merged.error_status_counts.update(summary.error_status_counts)
+        merged.first_seen.update(summary.first_seen)
+        merged.cip_success += summary.cip_success
+        merged.cip_errors += summary.cip_errors
+        merged.connections.extend(summary.connections)
+        for tag, counter in summary.tag_endpoints.items():
+            merged.tag_endpoints.setdefault(tag, Counter()).update(counter)
 
         for service, counter in summary.service_endpoints.items():
             merged.service_endpoints.setdefault(service, Counter()).update(counter)
@@ -508,6 +568,53 @@ def _bucketize(values: list[int]) -> list[SizeBucket]:
     return buckets
 
 
+def _stats_from_samples(samples: list[int]) -> dict[str, float]:
+    if not samples:
+        return {"min": 0.0, "max": 0.0, "avg": 0.0, "p50": 0.0, "p95": 0.0}
+    ordered = sorted(samples)
+    n = len(ordered)
+
+    def _pct(p: float) -> float:
+        idx = max(0, min(n - 1, int(round((p / 100.0) * (n - 1)))))
+        return float(ordered[idx])
+
+    return {
+        "min": float(ordered[0]),
+        "max": float(ordered[-1]),
+        "avg": sum(ordered) / n,
+        "p50": _pct(50.0),
+        "p95": _pct(95.0),
+    }
+
+
+def _parse_forward_open(data: bytes) -> Optional[dict[str, object]]:
+    """Best-effort parse of a CIP ForwardOpen request body (Connection Manager
+    service 0x54). Extracts the O->T / T->O RPIs and originator identity so the
+    connection-establishment view shows who set up which I/O connection at what
+    rate. Returns None if the body is too short to be a ForwardOpen."""
+    if not data or len(data) < 36:
+        return None
+    try:
+        ot_conn_id = int.from_bytes(data[2:6], "little")
+        to_conn_id = int.from_bytes(data[6:10], "little")
+        conn_serial = int.from_bytes(data[10:12], "little")
+        vendor_id = int.from_bytes(data[12:14], "little")
+        orig_serial = int.from_bytes(data[14:18], "little")
+        ot_rpi_us = int.from_bytes(data[22:26], "little")
+        to_rpi_us = int.from_bytes(data[28:32], "little")
+    except Exception:
+        return None
+    return {
+        "ot_conn_id": ot_conn_id,
+        "to_conn_id": to_conn_id,
+        "conn_serial": conn_serial,
+        "vendor_id": vendor_id,
+        "orig_serial": orig_serial,
+        "ot_rpi_ms": round(ot_rpi_us / 1000.0, 1),
+        "to_rpi_ms": round(to_rpi_us / 1000.0, 1),
+    }
+
+
 @memoize_analysis
 def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
     if TCP is None and UDP is None:
@@ -557,6 +664,60 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
     # CIP findings.
     enip_layer_anom_seen: set[str] = set()
     msp_bundle_seen: set[str] = set()
+    # Per-pair malformed-frame flood detection (segmentation-safe, see note at
+    # the emission site). Plus request-timestamp queues for coarse RTT pairing.
+    malformed_len_pairs: Counter[str] = Counter()
+    malformed_cpf_pairs: Counter[str] = Counter()
+    enip_pkts_per_pair: Counter[str] = Counter()
+    req_ts_by_session: dict[str, list[float]] = defaultdict(list)
+    rtt_samples: dict[str, list[int]] = defaultdict(list)
+    # Control (Reset/Start/Stop) and program (up/download) invocations are
+    # catastrophic even once — track with dst + service so a single occurrence
+    # raises a finding (volume thresholds elsewhere miss the stealthy single op).
+    control_events: Counter[tuple[str, str, str]] = Counter()
+    program_events: Counter[tuple[str, str, str]] = Counter()
+    # Per-source operational tag reads — the discriminator between an HMI (reads
+    # real tags) and a scanner (identity/attribute reads only, no tag I/O).
+    src_tag_reads: Counter[str] = Counter()
+
+    def _classify_service(
+        code: int, name: str, s_ip: str, d_ip: str, tag: Optional[str]
+    ) -> bool:
+        """Update risk-tier + source + tag-map counters for one CIP service
+        invocation (top-level or Multiple-Service-Packet sub). Returns whether
+        the service is a write. Tag reads (0x4C/0x52) are NORMAL polling, not
+        'suspicious'; discovery reads feed the enumeration bucket; only config
+        writes / connection setup / program upload are 'suspicious'."""
+        is_write = code in WRITE_SERVICE_CODES or code in HIGH_RISK_SERVICE_CODES
+        if code in HIGH_RISK_SERVICE_CODES:
+            analysis.high_risk_services[name] += 1
+            analysis.source_risky_commands[s_ip] += 1
+            src_high_risk_commands[s_ip] += 1
+        if code in SUSPICIOUS_SERVICE_CODES:
+            analysis.suspicious_services[name] += 1
+        if code in DISCOVERY_SERVICE_CODES:
+            analysis.enumeration_services[name] += 1
+            analysis.source_enum_commands[s_ip] += 1
+            src_enum_commands[s_ip] += 1
+        if code in CONTROL_SERVICE_CODES:
+            src_control_commands[s_ip] += 1
+            control_events[(s_ip, d_ip, name)] += 1
+        if code in PROGRAM_SERVICE_CODES:
+            src_program_commands[s_ip] += 1
+            program_events[(s_ip, d_ip, name)] += 1
+        if is_write:
+            src_write_commands[s_ip] += 1
+        if code in READ_TAG_SERVICE_CODES:
+            src_tag_reads[s_ip] += 1
+        if tag:
+            if is_write:
+                analysis.tag_writes[tag] += 1
+            else:
+                analysis.tag_reads[tag] += 1
+            analysis.tag_endpoints.setdefault(tag, Counter())[
+                f"{s_ip} -> {d_ip}"
+            ] += 1
+        return is_write
 
     try:
         with status as pbar:
@@ -615,7 +776,15 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
 
                 if not matches_port and not matches_signature:
                     continue
-                if matches_signature and not matches_port:
+                # "Non-standard port" means NEITHER endpoint uses an ENIP port.
+                # A server response from :44818 to a low client ephemeral port
+                # (e.g. 3479, 24292 — below the old 32768 threshold) is standard
+                # ENIP, not a non-standard-port flow: gate on both-ports-foreign
+                # so those legitimate responses stop raising a bogus finding.
+                both_ports_nonstandard = (
+                    sport not in _ENIP_PORTS and dport not in _ENIP_PORTS
+                )
+                if matches_signature and both_ports_nonstandard:
                     nonstandard_sessions[f"{src_ip}:{sport} -> {dst_ip}:{dport}"] += 1
 
                 analysis.enip_packets += 1
@@ -627,6 +796,9 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                 analysis.dst_ips[dst_ip] += 1
                 analysis.sessions[f"{src_ip}:{sport} -> {dst_ip}:{dport}"] += 1
                 src_dst_counts[src_ip][dst_ip] += 1
+                if ts is not None:
+                    analysis.first_seen.setdefault(src_ip, ts)
+                    analysis.first_seen.setdefault(dst_ip, ts)
 
                 if sport == ENIP_SECURITY_PORT or dport == ENIP_SECURITY_PORT:
                     sec_key = f"enip_security_port:{src_ip}->{dst_ip}"
@@ -674,6 +846,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                 response_like = (
                     sport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
                 ) and (dport not in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT})
+                # True operational master = sent TO an ENIP port. Unambiguous at
+                # the TCP layer, unlike the CIP-direction heuristic used for
+                # request/response accounting below.
+                if request_like:
+                    analysis.request_sources[src_ip] += 1
 
                 enip = _parse_enip_details_base(payload)
                 encap_command = enip.get("command")
@@ -758,42 +935,20 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                             )
                         )
 
-                _ml_key = f"Malformed ENIP Length|{src_ip}|{dst_ip}"
-                if (
-                    length_mismatch
-                    and _ml_key not in enip_layer_anom_seen
-                    and len(analysis.anomalies) < max_anomalies
-                ):
-                    enip_layer_anom_seen.add(_ml_key)
-                    analysis.anomalies.append(
-                        IndustrialAnomaly(
-                            severity="MEDIUM",
-                            title="Malformed ENIP Length",
-                            description="ENIP declared payload length does not match observed payload size.",
-                            src=src_ip,
-                            dst=dst_ip,
-                            ts=ts or 0.0,
-                        )
-                    )
-
-                _cpf_key = f"Malformed ENIP CPF|{src_ip}|{dst_ip}"
-                if (
-                    is_cip_carrier
-                    and cpf_malformed
-                    and _cpf_key not in enip_layer_anom_seen
-                    and len(analysis.anomalies) < max_anomalies
-                ):
-                    enip_layer_anom_seen.add(_cpf_key)
-                    analysis.anomalies.append(
-                        IndustrialAnomaly(
-                            severity="MEDIUM",
-                            title="Malformed ENIP CPF",
-                            description="Common Packet Format item table appears truncated or malformed.",
-                            src=src_ip,
-                            dst=dst_ip,
-                            ts=ts or 0.0,
-                        )
-                    )
+                # NOTE: the parser flags length_mismatch as (declared > observed),
+                # which is the TCP-segmentation / snaplen-truncation direction —
+                # a benign artifact of an ENIP PDU spanning multiple TCP segments,
+                # NOT malformation (verified against tshark full-reassembly: 0
+                # malformed on a capture this heuristic flagged). Rather than a
+                # per-packet MEDIUM on every fragmented tag read, count per pair
+                # and emit once post-loop only above a genuine-corruption flood
+                # threshold.
+                pair_key = f"{src_ip} -> {dst_ip}"
+                enip_pkts_per_pair[pair_key] += 1
+                if length_mismatch:
+                    malformed_len_pairs[pair_key] += 1
+                if is_cip_carrier and cpf_malformed:
+                    malformed_cpf_pairs[pair_key] += 1
 
                 if (
                     is_cip_carrier
@@ -932,41 +1087,64 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                     analysis.client_ips[src_ip] += 1
                     analysis.server_ips[dst_ip] += 1
                     src_requests[src_ip] += 1
+                    # Enqueue only genuine CIP requests (skip service 0x00 /
+                    # fragment-continuation artifacts that would otherwise pile up
+                    # and stale-match later responses) keyed by full TCP connection.
+                    if ts is not None and service_code not in (None, 0x00):
+                        q = req_ts_by_session[f"{src_ip}:{sport}->{dst_ip}:{dport}"]
+                        if len(q) < 4096:
+                            q.append(ts)
                 else:
                     analysis.responses += 1
                     analysis.client_ips[dst_ip] += 1
                     analysis.server_ips[src_ip] += 1
                     src_responses[src_ip] += 1
+                    # Strict pairing: only record a latency when exactly one
+                    # request is outstanding on this connection (an unambiguous
+                    # req->resp match) and the value is physically plausible for a
+                    # LAN OT round-trip. Pipelined/imbalanced connections yield no
+                    # sample rather than a misleading one.
+                    if ts is not None:
+                        q = req_ts_by_session.get(f"{dst_ip}:{dport}->{src_ip}:{sport}")
+                        if q:
+                            depth = len(q)
+                            req_ts = q.pop(0)
+                            rtt_ms = int(max(0.0, (ts - req_ts)) * 1000)
+                            if (
+                                depth == 1
+                                and rtt_ms <= 5000
+                                and len(rtt_samples[src_ip]) < 50000
+                            ):
+                                rtt_samples[src_ip].append(rtt_ms)
+                            elif depth > 1:
+                                q.clear()  # resync: drop stale backlog
 
                 if service_name:
                     analysis.cip_services[service_name] += 1
                     actor_ip = src_ip if is_request else dst_ip
                     src_commands[actor_ip][service_name] += 1
-                    endpoints = analysis.service_endpoints.setdefault(
-                        service_name, Counter()
-                    )
-                    endpoints[f"{src_ip} -> {dst_ip}"] += 1
-                    if is_request and service_code is not None:
-                        is_write_service = (
-                            service_code in WRITE_SERVICE_CODES
-                            or service_code in HIGH_RISK_SERVICE_CODES
+                    # Attribute to the request (client -> server) direction only,
+                    # so a service isn't listed as both "A -> B" and "B -> A" for
+                    # the same request/response exchange.
+                    if is_request:
+                        endpoints = analysis.service_endpoints.setdefault(
+                            service_name, Counter()
                         )
-                        if service_code in HIGH_RISK_SERVICE_CODES:
-                            analysis.high_risk_services[service_name] += 1
-                            analysis.source_risky_commands[src_ip] += 1
-                        if is_write_service:
-                            src_write_commands[src_ip] += 1
-                        elif service_code in ENUMERATION_SERVICE_CODES:
-                            analysis.suspicious_services[service_name] += 1
-                            analysis.source_enum_commands[src_ip] += 1
-                        if service_code in CONTROL_SERVICE_CODES:
-                            src_control_commands[src_ip] += 1
-                        if service_code in PROGRAM_SERVICE_CODES:
-                            src_program_commands[src_ip] += 1
-                        if service_code in ENUMERATION_SERVICE_CODES:
-                            src_enum_commands[src_ip] += 1
-                        if service_code in HIGH_RISK_SERVICE_CODES:
-                            src_high_risk_commands[src_ip] += 1
+                        endpoints[f"{src_ip} -> {dst_ip}"] += 1
+                    if is_request and service_code is not None:
+                        is_write_service = _classify_service(
+                            service_code, service_name, src_ip, dst_ip, tag_name
+                        )
+
+                        if (
+                            service_code in FORWARD_OPEN_SERVICE_CODES
+                            and len(analysis.connections) < 200
+                        ):
+                            conn = _parse_forward_open(cip_payload or b"")
+                            if conn:
+                                conn["src"] = src_ip
+                                conn["dst"] = dst_ip
+                                analysis.connections.append(conn)
 
                         if service_code == 0x0A:
                             sub_codes = _parse_multiple_service_packet(cip_payload)
@@ -993,32 +1171,33 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                                             ts=ts or 0.0,
                                         )
                                     )
-                                for sub_code, sub_name in zip(sub_codes, sub_names):
+                                # Expand sub-requests to recover each one's
+                                # symbolic tag (the Tag Access Map lives here —
+                                # in this capture every Read_Tag is an MSP sub).
+                                sub_details = parse_multiple_service_subrequests(
+                                    cip_payload, limit=max(16, len(sub_codes))
+                                )
+                                for si, sub_code in enumerate(sub_codes):
+                                    sub_name = sub_names[si]
                                     msp_service_name = f"MSP/{sub_name}"
                                     analysis.cip_services[msp_service_name] += 1
                                     msp_eps = analysis.service_endpoints.setdefault(
                                         msp_service_name, Counter()
                                     )
                                     msp_eps[f"{src_ip} -> {dst_ip}"] += 1
-                                    if sub_code in HIGH_RISK_SERVICE_CODES:
-                                        analysis.high_risk_services[
-                                            msp_service_name
-                                        ] += 1
-                                        analysis.source_risky_commands[src_ip] += 1
-                                    if sub_code in ENUMERATION_SERVICE_CODES:
-                                        analysis.suspicious_services[
-                                            msp_service_name
-                                        ] += 1
-                                        analysis.source_enum_commands[src_ip] += 1
-                                    if sub_code in CONTROL_SERVICE_CODES:
-                                        src_control_commands[src_ip] += 1
-                                    if sub_code in PROGRAM_SERVICE_CODES:
-                                        src_program_commands[src_ip] += 1
-                                    if (
-                                        sub_code in WRITE_SERVICE_CODES
-                                        or sub_code in HIGH_RISK_SERVICE_CODES
-                                    ):
-                                        src_write_commands[src_ip] += 1
+                                    sub_tag = (
+                                        sub_details[si][1]
+                                        if si < len(sub_details)
+                                        and sub_details[si][0] == sub_code
+                                        else None
+                                    )
+                                    _classify_service(
+                                        sub_code,
+                                        msp_service_name,
+                                        src_ip,
+                                        dst_ip,
+                                        sub_tag,
+                                    )
 
                                 high_risk_subs = sorted(
                                     {
@@ -1242,6 +1421,11 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                         or f"0x{general_status:02x}"
                     )
                     analysis.status_codes[f"CIP:{cip_status_text}"] += 1
+                    if general_status == 0x00:
+                        analysis.cip_success += 1
+                    else:
+                        analysis.cip_errors += 1
+                        analysis.error_status_counts[cip_status_text] += 1
                     if general_status != 0x00:
                         # Emit the LOW anomaly once per distinct status — one
                         # anomaly per error *packet* flooded the list (e.g. 173
@@ -1460,20 +1644,78 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                 )
             )
 
+    # A campaign is a source whose activity is DOMINATED by discovery reads
+    # across many targets — a scanner shape. An operational HMI also issues
+    # GetAttribute identity reads, but they are a tiny fraction of its (mostly
+    # tag-read) traffic. Gate on enumeration ratio, not "top client": the scanner
+    # is often the noisiest host, so "not the top client" fails to catch it.
     for src, enum_count in src_enum_commands.items():
         unique_dsts = len(src_dst_counts.get(src, {}))
-        if enum_count >= 30 and unique_dsts >= 8:
-            if len(analysis.anomalies) < max_anomalies:
-                analysis.anomalies.append(
-                    IndustrialAnomaly(
-                        severity="MEDIUM",
-                        title="CIP Enumeration Campaign",
-                        description=f"Enumeration-heavy CIP usage across {unique_dsts} endpoints ({enum_count} requests).",
-                        src=src,
-                        dst="*",
-                        ts=0.0,
-                    )
+        tag_reads = src_tag_reads.get(src, 0)
+        # Scanner shape = enumeration across many targets with (near-)zero
+        # operational tag I/O. An HMI/SCADA master also issues identity/attribute
+        # reads (Logix bundles Get_Attribute_List with tag reads), but it is
+        # dominated by real Read_Tag traffic — so gate on the ABSENCE of tag I/O,
+        # not on enumeration volume, which fires on a busy operator.
+        if (
+            enum_count >= 30
+            and unique_dsts >= 8
+            and tag_reads < 10
+            and len(analysis.anomalies) < max_anomalies
+        ):
+            analysis.anomalies.append(
+                IndustrialAnomaly(
+                    severity="MEDIUM",
+                    title="CIP Enumeration Campaign",
+                    description=(
+                        f"Discovery-only CIP from {src} — {enum_count} identity/"
+                        f"attribute reads across {unique_dsts} endpoints with no "
+                        "operational tag I/O. Scanner shape, active OT discovery "
+                        "(T0846)."
+                    ),
+                    src=src,
+                    dst="*",
+                    ts=0.0,
                 )
+            )
+
+    # Control (Reset/Start/Stop) and program transfer are operationally
+    # catastrophic — flag on a single occurrence, deduped per (src,dst,service).
+    for (s_ip, d_ip, name), count in control_events.items():
+        if len(analysis.anomalies) >= max_anomalies:
+            break
+        suffix = f" (x{count})" if count > 1 else ""
+        analysis.anomalies.append(
+            IndustrialAnomaly(
+                severity="HIGH",
+                title="CIP Control Command",
+                description=(
+                    f"{name} issued to {d_ip}{suffix} — device Reset/Start/Stop "
+                    "changes the run state of the controller (T0816/T0858). Confirm "
+                    "an authorized engineering source within a change window."
+                ),
+                src=s_ip,
+                dst=d_ip,
+                ts=0.0,
+            )
+        )
+    for (s_ip, d_ip, name), count in program_events.items():
+        if len(analysis.anomalies) >= max_anomalies:
+            break
+        suffix = f" (x{count})" if count > 1 else ""
+        analysis.anomalies.append(
+            IndustrialAnomaly(
+                severity="HIGH",
+                title="CIP Program Transfer",
+                description=(
+                    f"{name} to/from {d_ip}{suffix} — control-logic upload/download "
+                    "(T0843/T0845). The Stuxnet-class ladder-logic injection vector."
+                ),
+                src=s_ip,
+                dst=d_ip,
+                ts=0.0,
+            )
+        )
 
     for server, error_count in analysis.server_error_responses.items():
         resp_count = src_responses.get(server, 0)
@@ -1648,5 +1890,39 @@ def analyze_enip(path: Path, show_status: bool = True) -> ENIPAnalysis:
                     ts=0.0,
                 )
             )
+
+    # Malformed-frame flood: emit only when a pair's malformed count is high AND
+    # a large fraction of its ENIP traffic (genuine corruption/fuzzing), not the
+    # handful of segment-boundary packets a benign fragmented-read flow produces.
+    for pair, mcount in list(malformed_len_pairs.items()) + list(malformed_cpf_pairs.items()):
+        total = enip_pkts_per_pair.get(pair, 0)
+        ratio = (mcount / total) if total else 0.0
+        if mcount >= 50 and ratio >= 0.5 and len(analysis.anomalies) < max_anomalies:
+            s_ip, _, d_ip = pair.partition(" -> ")
+            analysis.anomalies.append(
+                IndustrialAnomaly(
+                    severity="MEDIUM",
+                    title="Malformed ENIP Frames",
+                    description=(
+                        f"{mcount} malformed ENIP frames ({ratio:.0%} of the flow) "
+                        "— sustained protocol corruption/fuzzing, not TCP segmentation."
+                    ),
+                    src=s_ip,
+                    dst=d_ip or "*",
+                    ts=0.0,
+                )
+            )
+            break
+
+    # Derive per-server RTT + pairing summary.
+    for s_ip, samples in rtt_samples.items():
+        if samples:
+            analysis.rtt_by_server[s_ip] = _stats_from_samples(samples)
+    outstanding = sum(len(q) for q in req_ts_by_session.values())
+    matched = sum(len(v) for v in rtt_samples.values())
+    analysis.pairing = {
+        "matched": matched,
+        "outstanding_requests": outstanding,
+    }
 
     return analysis

@@ -105,6 +105,95 @@ _NBNS_GROUP_NAMES = {
     "\x01\x02__MSBROWSE__\x02",
 }
 
+# --- Browser (MS-BRWS) protocol: Mailslot \MAILSLOT\BROWSE command opcodes. ---
+BROWSER_CMD_MAP = {
+    0x01: "Host Announcement",
+    0x02: "Announcement Request",
+    0x08: "Request Election",
+    0x09: "Get Backup List Request",
+    0x0A: "Get Backup List Response",
+    0x0B: "Become Backup Browser",
+    0x0C: "Domain/Workgroup Announcement",
+    0x0D: "Master Announcement",
+    0x0E: "Reset Browser State",
+    0x0F: "Local Master Announcement",
+}
+# SV_TYPE_* server-type bitfield (MS-BRWS / lmserver.h). Little-endian 4 bytes.
+# (bit value, short label, is a "role" worth surfacing in triage).
+SV_TYPE_FLAGS = [
+    (0x00000001, "Workstation"),
+    (0x00000002, "Server"),
+    (0x00000004, "SQL Server"),
+    (0x00000008, "Domain Controller (PDC)"),
+    (0x00000010, "Backup Domain Controller"),
+    (0x00000020, "Time Source"),
+    (0x00000040, "Apple/AFP Server"),
+    (0x00000080, "Novell Server"),
+    (0x00000100, "Domain Member Server"),
+    (0x00000200, "Print Queue Server"),
+    (0x00000400, "Dial-in Server"),
+    (0x00000800, "Xenix/Unix Server"),
+    (0x00001000, "NT Workstation"),
+    (0x00002000, "Windows for Workgroups"),
+    (0x00004000, "MFPN Server"),
+    (0x00008000, "NT Server"),
+    (0x00010000, "Potential Browser"),
+    (0x00020000, "Backup Browser"),
+    (0x00040000, "Master Browser"),
+    (0x00080000, "Domain Master Browser"),
+    (0x00100000, "OSF/1 Server"),
+    (0x00200000, "VMS Server"),
+    (0x00400000, "Windows 9x"),
+    (0x00800000, "DFS Root"),
+    (0x01000000, "NT Cluster"),
+    (0x02000000, "Terminal Server"),
+    (0x04000000, "NT Cluster VS"),
+    (0x10000000, "DCE/DSS Directory"),
+    (0x20000000, "Alternate Transport"),
+    (0x40000000, "Local List Only"),
+    (0x80000000, "Domain Enum"),
+]
+# Roles that identify high-value / directory infrastructure (triage priority).
+_HIGH_VALUE_SV_TYPE = {
+    0x00000008: "Domain Controller (PDC)",
+    0x00000010: "Backup Domain Controller",
+    0x00000004: "SQL Server",
+    0x00040000: "Master Browser",
+    0x00080000: "Domain Master Browser",
+}
+_MASTER_BROWSER_BITS = 0x00040000 | 0x00080000
+_DC_BITS = 0x00000008 | 0x00000010
+
+# Windows OS version (major.minor from browser announcement) -> product name.
+OS_VERSION_MAP = {
+    (3, 51): "Windows NT 3.51",
+    (4, 0): "Windows NT 4.0 / 9x",
+    (5, 0): "Windows 2000",
+    (5, 1): "Windows XP",
+    (5, 2): "Windows Server 2003 / XP x64",
+    (6, 0): "Windows Vista / Server 2008",
+    (6, 1): "Windows 7 / Server 2008 R2",
+    (6, 2): "Windows 8 / Server 2012",
+    (6, 3): "Windows 8.1 / Server 2012 R2",
+    (10, 0): "Windows 10/11 / Server 2016+",
+}
+
+
+def decode_sv_type(server_type: int) -> list[str]:
+    """Decode the SV_TYPE server-type bitfield into human-readable roles."""
+    if not server_type:
+        return []
+    return [label for bit, label in SV_TYPE_FLAGS if server_type & bit]
+
+
+def os_version_label(major: int, minor: int) -> str:
+    name = OS_VERSION_MAP.get((int(major), int(minor)))
+    if name:
+        return f"{name} ({major}.{minor})"
+    if major or minor:
+        return f"{major}.{minor}"
+    return "-"
+
 
 def _parse_ntlm_type3(
     payload: bytes,
@@ -180,6 +269,37 @@ class NetbiosHost:
     is_master_browser: bool = False
     is_domain_controller: bool = False
     group_name: Optional[str] = None
+
+
+@dataclass
+class BrowserHost:
+    """A host as advertised via the Browser (MS-BRWS) Mailslot protocol."""
+
+    ip: str
+    name: str = ""
+    os_major: int = 0
+    os_minor: int = 0
+    server_type: int = 0  # SV_TYPE_* bitfield
+    roles: List[str] = field(default_factory=list)
+    comment: str = ""
+    domain: str = ""  # workgroup/domain the announcement targeted
+    periodicity_s: float = 0.0
+    announcement_types: Counter[str] = field(default_factory=Counter)
+    announcements: int = 0
+    first_seen: Optional[float] = None
+    last_seen: Optional[float] = None
+
+    @property
+    def is_master_browser(self) -> bool:
+        return bool(self.server_type & _MASTER_BROWSER_BITS)
+
+    @property
+    def is_domain_controller(self) -> bool:
+        return bool(self.server_type & _DC_BITS)
+
+    @property
+    def os_label(self) -> str:
+        return os_version_label(self.os_major, self.os_minor)
 
 
 @dataclass
@@ -261,11 +381,81 @@ class NetbiosAnalysis:
     anomalies: List[NetbiosAnomaly] = field(default_factory=list)
     name_conflicts: int = 0
     browser_elections: int = 0
+    # Browser (MS-BRWS) protocol intelligence.
+    browser_hosts: Dict[str, BrowserHost] = field(default_factory=dict)  # by IP
+    browser_command_counts: Counter[str] = field(default_factory=Counter)
+    browser_domains: Counter[str] = field(default_factory=Counter)
+    master_browsers: Set[str] = field(default_factory=set)  # IPs claiming master
+    announced_dcs: Set[str] = field(default_factory=set)  # IPs claiming DC role
+    election_events: List[Dict[str, object]] = field(default_factory=list)
+    logon_requests: List[Dict[str, object]] = field(default_factory=list)
     unique_names: Set[str] = field(default_factory=set)
     deterministic_checks: Dict[str, List[str]] = field(default_factory=dict)
     threat_hypotheses: List[Dict[str, object]] = field(default_factory=list)
     benign_context: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+
+
+def collect_netbios_host_intel(analysis: "NetbiosAnalysis") -> Dict[str, Dict[str, object]]:
+    """Merge Browser (MS-BRWS) announcements and NBNS names into a per-IP host
+    fact sheet for cross-analyzer consumers (--hostdetails, --domain, hostname
+    resolution). Browser announcements are the richer source (hostname + OS +
+    server roles + domain + comment); NBNS fills gaps and role suffixes.
+
+    Returns IP -> {hostname, os, roles, domain, comment, is_dc,
+    is_master_browser, source}."""
+    intel: Dict[str, Dict[str, object]] = {}
+
+    def _entry(ip: str) -> Dict[str, object]:
+        return intel.setdefault(
+            ip,
+            {
+                "hostname": "",
+                "os": "",
+                "roles": [],
+                "domain": "",
+                "comment": "",
+                "is_dc": False,
+                "is_master_browser": False,
+                "source": "",
+            },
+        )
+
+    for ip, bh in getattr(analysis, "browser_hosts", {}).items():
+        e = _entry(ip)
+        if bh.name:
+            e["hostname"] = bh.name
+        if bh.os_major or bh.os_minor:
+            e["os"] = bh.os_label
+        if bh.roles:
+            e["roles"] = list(bh.roles)
+        if bh.domain:
+            e["domain"] = bh.domain
+        if bh.comment:
+            e["comment"] = bh.comment
+        e["is_dc"] = e["is_dc"] or bh.is_domain_controller
+        e["is_master_browser"] = e["is_master_browser"] or bh.is_master_browser
+        e["source"] = "Browser announcement"
+
+    for ip, host in getattr(analysis, "hosts", {}).items():
+        e = _entry(ip)
+        if not e["hostname"]:
+            for nm in getattr(host, "names", []) or []:
+                if int(getattr(nm, "suffix", -1)) in (0x00, 0x20) and str(
+                    getattr(nm, "scope", "")
+                ).upper() != "GROUP":
+                    e["hostname"] = str(getattr(nm, "name", "")).strip()
+                    break
+        if getattr(host, "is_domain_controller", False):
+            e["is_dc"] = True
+        if getattr(host, "is_master_browser", False):
+            e["is_master_browser"] = True
+        if not e["source"]:
+            e["source"] = "NBNS"
+        if not e["domain"] and getattr(host, "group_name", None):
+            e["domain"] = str(host.group_name)
+
+    return {ip: e for ip, e in intel.items() if e["hostname"] or e["roles"] or e["is_dc"]}
 
 
 def decode_netbios_name(encoded_name: bytes) -> str:
@@ -402,6 +592,208 @@ def _extract_plaintext(data: bytes, max_items: int = 8) -> List[str]:
         if len(tokens) >= max_items:
             break
     return tokens
+
+
+_MAILSLOT_BROWSE = b"\\MAILSLOT\\BROWSE\x00"
+_MAILSLOT_NETLOGON = b"\\MAILSLOT\\NET\\NETLOGON\x00"
+_MAILSLOT_NTLOGON = b"\\MAILSLOT\\NET\\NTLOGON\x00"
+
+
+def _oem_str(raw: bytes) -> str:
+    """Decode a null-padded OEM/ASCII field to a clean string."""
+    return raw.split(b"\x00", 1)[0].decode("latin-1", errors="ignore").strip()
+
+
+def _parse_browser_datagram(payload: bytes) -> Optional[Dict[str, object]]:
+    """Parse a Browser (MS-BRWS) Mailslot \\MAILSLOT\\BROWSE datagram carried in
+    a UDP/138 NBT datagram. Returns a dict describing the browser frame (command
+    plus, for announcements/elections, the decoded host/roles/OS/comment), or
+    None if this is not a parseable browser frame.
+
+    The browser data follows the null-terminated mailslot name in the SMB Trans
+    request; a couple of alignment-padding bytes may precede the opcode."""
+    idx = payload.find(_MAILSLOT_BROWSE)
+    if idx < 0:
+        return None
+    data = payload[idx + len(_MAILSLOT_BROWSE):]
+    # Tolerate a small amount of Trans alignment padding before the opcode.
+    skip = 0
+    while skip < 4 and skip < len(data) and data[skip] not in BROWSER_CMD_MAP:
+        skip += 1
+    data = data[skip:]
+    if not data:
+        return None
+    cmd = data[0]
+    cmd_name = BROWSER_CMD_MAP.get(cmd)
+    if cmd_name is None:
+        return None
+    body = data[1:]
+    result: Dict[str, object] = {"command": cmd, "command_name": cmd_name}
+
+    if cmd in (0x01, 0x0F) and len(body) >= 27:  # Host / Local Master Announcement
+        try:
+            periodicity_ms = int.from_bytes(body[1:5], "little")
+            server_name = _oem_str(body[5:21])
+            os_major = body[21]
+            os_minor = body[22]
+            server_type = int.from_bytes(body[23:27], "little")
+            comment = _oem_str(body[31:]) if len(body) > 31 else ""
+            result.update(
+                {
+                    "server_name": server_name,
+                    "os_major": os_major,
+                    "os_minor": os_minor,
+                    "server_type": server_type,
+                    "roles": decode_sv_type(server_type),
+                    "comment": comment,
+                    "periodicity_s": periodicity_ms / 1000.0,
+                }
+            )
+        except Exception:
+            pass
+    elif cmd == 0x0C and len(body) >= 27:  # Domain/Workgroup Announcement
+        # Different body: the 16-byte name is the MachineGroup (domain), no OS
+        # version pair, and the trailing string is the announcing Local Master
+        # Browser's computer name.
+        try:
+            machine_group = _oem_str(body[5:21])
+            server_type = int.from_bytes(body[23:27], "little")
+            lmb_name = _oem_str(body[31:]) if len(body) > 31 else ""
+            result.update(
+                {
+                    "domain": machine_group,
+                    "server_type": server_type,
+                    "roles": decode_sv_type(server_type),
+                    "lmb_name": lmb_name,
+                }
+            )
+        except Exception:
+            pass
+    elif cmd == 0x08 and len(body) >= 9:  # Request Election
+        try:
+            version = body[0]
+            criteria = int.from_bytes(body[1:5], "little")
+            uptime_s = int.from_bytes(body[5:9], "little")  # MS-BRWS: seconds
+            server_name = _oem_str(body[13:]) if len(body) > 13 else ""
+            result.update(
+                {
+                    "election_version": version,
+                    "election_criteria": criteria,
+                    "election_os_summary": criteria & 0xFF000000,
+                    "election_desire": criteria & 0xFF,
+                    "uptime_s": float(uptime_s),
+                    "server_name": server_name,
+                }
+            )
+        except Exception:
+            pass
+    elif cmd in (0x0D, 0x0B) and body:  # Master Announcement / Become Backup
+        result["server_name"] = _oem_str(body)
+    elif cmd == 0x02 and body:  # Announcement Request
+        result["server_name"] = _oem_str(body[1:]) if len(body) > 1 else ""
+    elif cmd == 0x0E and body:  # Reset Browser State
+        result["reset_flags"] = body[0]
+    return result
+
+
+def _browser_dest_domain(pkt) -> str:
+    """The destination NetBIOS name of a UDP/138 NBT datagram is the target
+    workgroup/domain the browser announcement was addressed to (e.g. a
+    HostAnnouncement to WORKGROUP<1D>). scapy exposes it as the NBTDatagram
+    layer's DestinationName; the payload Raw load begins at the SMB header and
+    no longer contains the datagram header, so read it from the parsed layer."""
+    try:
+        layer = None
+        if pkt.haslayer("NBTDatagram"):
+            layer = pkt["NBTDatagram"]
+        elif pkt.haslayer("NBT Datagram Packet"):
+            layer = pkt["NBT Datagram Packet"]
+        if layer is None:
+            return ""
+        dn = getattr(layer, "DestinationName", b"")
+        if isinstance(dn, bytes):
+            dn = dn.decode("latin-1", errors="ignore")
+        return str(dn).strip()[:15]
+    except Exception:
+        return ""
+
+
+# NETLOGON / NTLOGON mailslot opcodes (uint16 LE, first field of the body).
+NETLOGON_OPCODES = {
+    0x00: "LOGON_REQUEST",
+    0x01: "LOGON_RESPONSE",
+    0x07: "LOGON_PRIMARY_QUERY",
+    0x08: "LOGON_START_PRIMARY",
+    0x0C: "LOGON_PRIMARY_RESPONSE",
+    0x12: "SAM_LOGON_REQUEST",
+    0x13: "SAM_LOGON_RESPONSE",
+    0x15: "SAM_USER_UNKNOWN",
+    0x17: "SAM_LOGON_RESPONSE_EX",
+    0x19: "SAM_USER_UNKNOWN_EX",
+}
+# Opcodes carrying a queried account (user-enumeration relevant).
+_NETLOGON_QUERY_OPCODES = {0x12, 0x15, 0x00, 0x07}
+
+
+def _read_utf16z(body: bytes, off: int) -> Tuple[str, int]:
+    """Read a UTF-16LE NUL-terminated string starting at off; return (text,
+    next_offset past the 2-byte terminator)."""
+    end = off
+    n = len(body)
+    while end + 1 < n and not (body[end] == 0 and body[end + 1] == 0):
+        end += 2
+    text = body[off:end].decode("utf-16-le", errors="ignore").strip()
+    return text, end + 2
+
+
+def _parse_logon_mailslot(payload: bytes) -> Optional[Dict[str, object]]:
+    """Parse a NETLOGON / NTLOGON logon datagram (UDP/138). The SAMLOGON request
+    (opcode 0x12) embeds the querying host's UnicodeComputerName and the target
+    UnicodeUserName (UTF-16LE) — passive logon activity, abused for DC discovery
+    and user enumeration (Responder/coercion pre-cursors)."""
+    if _MAILSLOT_NETLOGON in payload:
+        slot = "NETLOGON"
+        idx = payload.find(_MAILSLOT_NETLOGON) + len(_MAILSLOT_NETLOGON)
+    elif _MAILSLOT_NTLOGON in payload:
+        slot = "NTLOGON"
+        idx = payload.find(_MAILSLOT_NTLOGON) + len(_MAILSLOT_NTLOGON)
+    else:
+        return None
+    body = payload[idx:]
+    if len(body) < 2:
+        return {"mailslot": slot, "opcode": -1, "op_name": "-", "computer": "", "user": "", "names": []}
+    opcode = int.from_bytes(body[:2], "little")
+    op_name = NETLOGON_OPCODES.get(opcode, f"OP_0x{opcode:04X}")
+    result: Dict[str, object] = {
+        "mailslot": slot,
+        "opcode": opcode,
+        "op_name": op_name,
+        "computer": "",
+        "user": "",
+        "names": [],
+    }
+    names: List[str] = []
+    if opcode == 0x12:  # SAM_LOGON_REQUEST: RequestCount(2) + UnicodeComputer + UnicodeUser
+        try:
+            computer, p = _read_utf16z(body, 4)
+            user, _p = _read_utf16z(body, p)
+            result["computer"] = computer
+            result["user"] = user
+            for nm in (user, computer):
+                if nm and nm not in names:
+                    names.append(nm)
+        except Exception:
+            pass
+    if not names:
+        # Legacy/response variants: pull ASCII + UTF-16LE tokens best-effort.
+        ascii_tokens = re.findall(rb"[\x20-\x7e]{2,63}", body[2:])
+        utf16_tokens = re.findall(rb"(?:[\x20-\x7e]\x00){2,63}", body[2:])
+        for tok in ascii_tokens + [t.replace(b"\x00", b"") for t in utf16_tokens]:
+            text = tok.decode("latin-1", errors="ignore").strip()
+            if text and text not in names and not text.startswith("\\MAILSLOT"):
+                names.append(text)
+    result["names"] = names[:6]
+    return result
 
 
 @memoize_analysis
@@ -773,13 +1165,101 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                     except Exception as exc:
                         analysis.errors.append(f"NBNS node status parse: {exc}")
 
-                # Browser datagram heuristics (UDP/138)
-                if proto_label == "UDP" and (sport == 138 or dport == 138) and payload:
-                    if b"__MSBROWSE__" in payload or b"BROWSE" in payload.upper():
-                        analysis.browser_elections += 1
-                        analysis.request_counts["Browser Election"] += 1
-                    if payload[:1] in {b"\x08", b"\x0c"}:
-                        analysis.browser_elections += 1
+                # Browser (MS-BRWS) datagram dissection (UDP/138). Parse the
+                # Mailslot \MAILSLOT\BROWSE command and, for announcements,
+                # decode the announced host name, OS, server-type ROLES, and
+                # comment — the passive-inventory / role-identification goldmine.
+                if proto_label == "UDP" and (sport == 138 or dport == 138):
+                    # Read the full UDP payload independently of how scapy
+                    # dissected the datagram (under the forced-packet-view cache
+                    # the NBT/SMB layers may be parsed, leaving pkt[Raw] empty),
+                    # so the Mailslot search always sees the browser bytes.
+                    dgm_payload = payload
+                    try:
+                        if UDP is not None and pkt.haslayer(UDP):
+                            full = bytes(pkt[UDP].payload)
+                            if len(full) > len(dgm_payload):
+                                dgm_payload = full
+                    except Exception:
+                        pass
+                    browser = _parse_browser_datagram(dgm_payload) if dgm_payload else None
+                    if browser is not None:
+                        cmd = int(browser.get("command", 0))
+                        cmd_name = str(browser.get("command_name", ""))
+                        analysis.browser_command_counts[cmd_name] += 1
+                        analysis.request_counts[f"Browser: {cmd_name}"] += 1
+                        # Announcement dest name is the target workgroup/domain.
+                        dgm_domain = _browser_dest_domain(pkt)
+                        if dgm_domain:
+                            analysis.browser_domains[dgm_domain] += 1
+
+                        if cmd == 0x0C:  # Domain/Workgroup Announcement
+                            dom = str(browser.get("domain", "") or "")
+                            if dom:
+                                analysis.browser_domains[dom] += 1
+                            # The sender is the domain's Local Master Browser.
+                            analysis.master_browsers.add(src_ip)
+
+                        if cmd in (0x01, 0x0F) and browser.get("server_name"):
+                            bhost = analysis.browser_hosts.get(src_ip)
+                            if bhost is None:
+                                bhost = BrowserHost(ip=src_ip)
+                                analysis.browser_hosts[src_ip] = bhost
+                            bhost.name = str(browser.get("server_name") or bhost.name)
+                            bhost.os_major = int(browser.get("os_major", bhost.os_major) or 0)
+                            bhost.os_minor = int(browser.get("os_minor", bhost.os_minor) or 0)
+                            bhost.server_type = int(
+                                browser.get("server_type", bhost.server_type) or 0
+                            )
+                            bhost.roles = list(browser.get("roles", bhost.roles) or [])
+                            if browser.get("comment"):
+                                bhost.comment = str(browser.get("comment"))
+                            if dgm_domain:
+                                bhost.domain = dgm_domain
+                            bhost.periodicity_s = float(
+                                browser.get("periodicity_s", bhost.periodicity_s) or 0.0
+                            )
+                            bhost.announcement_types[cmd_name] += 1
+                            bhost.announcements += 1
+                            if bhost.first_seen is None or ts < bhost.first_seen:
+                                bhost.first_seen = ts
+                            if bhost.last_seen is None or ts > bhost.last_seen:
+                                bhost.last_seen = ts
+                            if bhost.server_type & _MASTER_BROWSER_BITS:
+                                analysis.master_browsers.add(src_ip)
+                            if bhost.server_type & _DC_BITS:
+                                analysis.announced_dcs.add(src_ip)
+
+                        if cmd == 0x08:  # Request Election
+                            analysis.browser_elections += 1
+                            analysis.election_events.append(
+                                {
+                                    "src_ip": src_ip,
+                                    "criteria": int(browser.get("election_criteria", 0)),
+                                    "os_summary": int(browser.get("election_os_summary", 0)),
+                                    "desire": int(browser.get("election_desire", 0)),
+                                    "uptime_s": float(browser.get("uptime_s", 0.0)),
+                                    "server_name": str(browser.get("server_name", "")),
+                                    "ts": ts,
+                                }
+                            )
+
+                    logon = _parse_logon_mailslot(dgm_payload) if dgm_payload else None
+                    if logon is not None:
+                        analysis.request_counts[
+                            f"Logon: {logon['mailslot']}/{logon.get('op_name', '-')}"
+                        ] += 1
+                        analysis.logon_requests.append(
+                            {"src_ip": src_ip, "dst_ip": dst_ip, **logon, "ts": ts}
+                        )
+                        # Surface the queried account + querying computer as
+                        # observed identities for cross-analyzer consumers.
+                        u = str(logon.get("user", "") or "")
+                        if u:
+                            analysis.observed_users[u] += 1
+                        c = str(logon.get("computer", "") or "")
+                        if c:
+                            analysis.unique_names.add(c)
 
                 # Session/SMB tracking (TCP/139)
                 if proto_label == "TCP" and (sport == 139 or dport == 139):
@@ -973,6 +1453,126 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                 0.0,
             )
 
+    # --- Browser (MS-BRWS) protocol threat detections ---
+    # Election storm: many RequestElection frames (each triggers responses from
+    # every browser, so bursts self-amplify) — instability or an active
+    # master-browser takeover attempt (MITRE T1557).
+    election_count = len(analysis.election_events)
+    if election_count >= 8:
+        election_srcs = Counter(str(e.get("src_ip", "-")) for e in analysis.election_events)
+        top = ", ".join(f"{ip}({c})" for ip, c in election_srcs.most_common(5))
+        analysis.threat_summary["Browser Election Storm"] += 1
+        _append_anomaly(
+            "MEDIUM",
+            "Browser Election Storm",
+            f"{election_count} browser elections observed (possible rogue-master-browser "
+            f"takeover or browser instability): {top}",
+            election_srcs.most_common(1)[0][0] if election_srcs else "-",
+            "-",
+            0.0,
+        )
+
+    # Crafted election criteria: a host forcing an election with server-class OS
+    # + PDC/preferred-master desire bits but implausibly low uptime is muscling
+    # in to win the browser election and serve a poisoned browse list.
+    _rogue_election_srcs: Set[str] = set()
+    for e in analysis.election_events:
+        os_sum = int(e.get("os_summary", 0) or 0)
+        desire = int(e.get("desire", 0) or 0)
+        uptime = float(e.get("uptime_s", 0.0) or 0.0)
+        crit = int(e.get("criteria", 0) or 0)
+        src_e = str(e.get("src_ip", "-"))
+        if (
+            (os_sum & 0x20000000)
+            and (desire & (0x80 | 0x08))
+            and uptime < 60.0
+            and src_e not in _rogue_election_srcs
+        ):
+            _rogue_election_srcs.add(src_e)
+            analysis.threat_summary["Rogue Master Browser Bid"] += 1
+            _append_anomaly(
+                "HIGH",
+                "Rogue Master Browser",
+                f"{e.get('src_ip', '-')} forced a browser election with maximal criteria "
+                f"(0x{crit:08x}) but only {uptime:.0f}s uptime — probable master-browser "
+                "takeover to MITM host discovery (T1557).",
+                str(e.get("src_ip", "-")),
+                "-",
+                float(e.get("ts", 0.0) or 0.0),
+            )
+
+    # Primary Domain Controller role conflict: exactly one PDC exists per domain,
+    # so two hosts announcing the PDC bit for the same domain = rogue-DC
+    # announcement / role spoofing.
+    pdc_by_domain: Dict[str, Set[str]] = defaultdict(set)
+    for ip_value, bhost in analysis.browser_hosts.items():
+        if bhost.server_type & 0x00000008:  # SV_TYPE_DOMAIN_CTRL (PDC)
+            pdc_by_domain[bhost.domain or "-"].add(ip_value)
+    for dom, ips in pdc_by_domain.items():
+        if len(ips) > 1:
+            analysis.threat_summary["PDC Role Conflict"] += 1
+            _append_anomaly(
+                "HIGH",
+                "PDC/DC Role Conflict",
+                f"Multiple hosts announced Primary Domain Controller for domain "
+                f"'{dom}': {', '.join(sorted(ips))} (rogue DC announcement / spoofing).",
+                sorted(ips)[0],
+                "-",
+                0.0,
+            )
+
+    # Role spoofing indicator: a genuine DC/Master-Browser also advertises
+    # server-class flags. A host claiming DC/Master-Browser with ONLY
+    # workstation bits set is an inconsistent, likely crafted, announcement.
+    for ip_value, bhost in analysis.browser_hosts.items():
+        st = bhost.server_type
+        if (st & (_DC_BITS | _MASTER_BROWSER_BITS)) and not (
+            st & (0x00000002 | 0x00008000)
+        ):
+            analysis.threat_summary["Announced Role Inconsistency"] += 1
+            _append_anomaly(
+                "MEDIUM",
+                "Role Spoofing Indicator",
+                f"{ip_value} ({bhost.name}) announced DC/Master-Browser role without "
+                "server-class flags — possible crafted browser announcement.",
+                ip_value,
+                "-",
+                0.0,
+            )
+
+    # Reset Browser State frames can disqualify legitimate browsers (clearing the
+    # way for a rogue master) — rare in normal traffic.
+    reset_count = int(analysis.browser_command_counts.get("Reset Browser State", 0) or 0)
+    if reset_count:
+        analysis.threat_summary["Browser Reset Request"] += 1
+        _append_anomaly(
+            "MEDIUM",
+            "Browser Reset State",
+            f"{reset_count} Reset Browser State request(s) observed — can force "
+            "legitimate browsers offline (browser-service disruption).",
+            "-",
+            "-",
+            0.0,
+        )
+
+    # NETLOGON / NTLOGON logon-ping enumeration: legacy DC discovery is normal in
+    # small volume, but a burst enumerating many accounts is recon.
+    if len(analysis.logon_requests) >= 25:
+        logon_names: Set[str] = set()
+        for lr in analysis.logon_requests:
+            for nm in lr.get("names", []) or []:
+                logon_names.add(str(nm))
+        analysis.threat_summary["Logon Mailslot Enumeration"] += 1
+        _append_anomaly(
+            "MEDIUM",
+            "NETLOGON Enumeration",
+            f"{len(analysis.logon_requests)} NETLOGON/NTLOGON logon pings observed "
+            f"(DC discovery / possible user enumeration; {len(logon_names)} distinct names).",
+            "-",
+            "-",
+            0.0,
+        )
+
     analysis.conversations = sorted(
         conversations.values(), key=lambda item: item.packets, reverse=True
     )
@@ -991,6 +1591,9 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
         "smb_write_exfil_over_netbios": [],
         "netbios_beaconing_pattern": [],
         "role_claim_anomaly": [],
+        "browser_election_or_takeover": [],
+        "browser_role_spoofing_or_conflict": [],
+        "logon_mailslot_enumeration": [],
         "public_netbios_exposure": [],
     }
     threat_hypotheses: List[Dict[str, object]] = []
@@ -1055,6 +1658,28 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
             f"Master-browser role suffixes observed on hosts={', '.join(sorted(browser_hosts)[:8])}"
         )
 
+    # Browser (MS-BRWS) protocol deterministic checks.
+    for label in ("Browser Election Storm", "Rogue Master Browser Bid"):
+        hits = int(analysis.threat_summary.get(label, 0) or 0)
+        if hits:
+            deterministic_checks["browser_election_or_takeover"].append(
+                f"{label} indicators count={hits} (elections={len(analysis.election_events)})"
+            )
+    for label in (
+        "PDC Role Conflict",
+        "Announced Role Inconsistency",
+        "Browser Reset Request",
+    ):
+        hits = int(analysis.threat_summary.get(label, 0) or 0)
+        if hits:
+            deterministic_checks["browser_role_spoofing_or_conflict"].append(
+                f"{label} indicators count={hits}"
+            )
+    if int(analysis.threat_summary.get("Logon Mailslot Enumeration", 0) or 0):
+        deterministic_checks["logon_mailslot_enumeration"].append(
+            f"NETLOGON/NTLOGON logon pings count={len(analysis.logon_requests)}"
+        )
+
     for ip_value, count in analysis.src_counts.items():
         if _is_public_ip(ip_value):
             deterministic_checks["public_netbios_exposure"].append(
@@ -1098,6 +1723,21 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
                 "evidence": len(deterministic_checks["public_netbios_exposure"]),
             }
         )
+    if (
+        deterministic_checks["browser_election_or_takeover"]
+        or deterministic_checks["browser_role_spoofing_or_conflict"]
+    ):
+        threat_hypotheses.append(
+            {
+                "hypothesis": "Browser-service hijack / master-browser takeover to MITM "
+                "host discovery (T1557)",
+                "confidence": "high"
+                if deterministic_checks["browser_role_spoofing_or_conflict"]
+                else "medium",
+                "evidence": len(deterministic_checks["browser_election_or_takeover"])
+                + len(deterministic_checks["browser_role_spoofing_or_conflict"]),
+            }
+        )
 
     if not deterministic_checks["nbns_spoofing_or_conflict"]:
         benign_context.append("No strong NBNS spoofing/name-conflict cluster observed")
@@ -1105,6 +1745,27 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
         benign_context.append("No substantial SMB auth abuse over NetBIOS observed")
     if not deterministic_checks["public_netbios_exposure"]:
         benign_context.append("No public Internet NetBIOS endpoint exposure observed")
+    if analysis.browser_hosts and not (
+        deterministic_checks["browser_election_or_takeover"]
+        or deterministic_checks["browser_role_spoofing_or_conflict"]
+    ):
+        benign_context.append(
+            f"Browser announcements from {len(analysis.browser_hosts)} host(s) are "
+            "consistent (baseline browsing / passive asset inventory, no takeover)"
+        )
+    # Asset context (OT-aware): surface discovered directory infrastructure —
+    # expected on an enterprise segment, but high-value to inventory on any
+    # OT/DCS network where a DC is a crown-jewel asset.
+    if analysis.announced_dcs:
+        dc_desc = []
+        for ip_value in sorted(analysis.announced_dcs):
+            bh = analysis.browser_hosts.get(ip_value)
+            nm = bh.name if bh else ""
+            dc_desc.append(f"{ip_value}{f' ({nm})' if nm else ''}")
+        benign_context.append(
+            "Directory infrastructure identified via browser announcements "
+            f"(domain controllers: {', '.join(dc_desc[:6])}) — asset context"
+        )
 
     analysis.deterministic_checks = {k: v[:80] for k, v in deterministic_checks.items()}
     analysis.threat_hypotheses = threat_hypotheses[:24]

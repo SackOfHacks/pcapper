@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from .arp import analyze_arp
+from .netbios import analyze_netbios, collect_netbios_host_intel
 from .bacnet import analyze_bacnet
 from .beacon import analyze_beacons
 from .remote_access import analyze_remote_access
@@ -57,7 +58,7 @@ from .mqtt import analyze_mqtt
 from .niagara import analyze_niagara
 from .ntlm import analyze_ntlm
 from .obfuscation import analyze_obfuscation
-from .odesys import analyze_odesys
+from .codesys import analyze_codesys
 from .opc import analyze_opc
 from .opc_classic import analyze_opc_classic
 from .ot_risk import compute_ot_risk_posture, dedupe_findings
@@ -92,6 +93,8 @@ from .iec101_103 import analyze_iec101_103
 from .ssh import analyze_ssh
 from .sv import analyze_sv
 from .syslog import analyze_syslog
+from .hypothesis import annotate as _annotate_hypothesis
+from .skeptical import apply_skeptical_filter
 from .tcp import analyze_tcp
 from .tls import analyze_tls
 from .udp import analyze_udp
@@ -1222,12 +1225,19 @@ def _append_detection_items(
     for item in items:
         if not isinstance(item, dict):
             continue
-        detections.append(
-            {
-                "source": source,
-                **item,
-            }
-        )
+        # Apply the skeptical filter (default-on; --strict CLI flag bypasses
+        # by setting the module-level default). Attaches ``skeptical_*``
+        # annotation keys when a known-FP shape matches; renderer picks them
+        # up and shows a ``[skeptical: <rule>]`` marker inline. See
+        # ``pcapper.skeptical`` for the rule registry.
+        #
+        # Then tag with the hypothesis lens (no-op unless the CLI's
+        # --hypothesis <REGEX> was set). Adds a ``hypothesis_relevance``
+        # key valued ``relevant`` / ``adjacent`` / ``unrelated`` so the
+        # reviewer can scan for the findings that touch the hunt hypothesis.
+        merged = apply_skeptical_filter({"source": source, **item})
+        merged = _annotate_hypothesis(merged)
+        detections.append(merged)
 
 
 def _append_anomaly_items(
@@ -1260,6 +1270,7 @@ def _append_anomaly_items(
         title = str(
             getattr(anomaly, "title", "")
             or getattr(anomaly, "summary", "")
+            or getattr(anomaly, "type", "")
             or "Anomaly"
         )
         details = str(
@@ -1272,8 +1283,8 @@ def _append_anomaly_items(
             "summary": title,
             "details": details,
         }
-        src = getattr(anomaly, "src", None)
-        dst = getattr(anomaly, "dst", None)
+        src = getattr(anomaly, "src", None) or getattr(anomaly, "src_ip", None)
+        dst = getattr(anomaly, "dst", None) or getattr(anomaly, "dst_ip", None)
         if src:
             item["top_sources"] = [(str(src), 1)]
         if dst:
@@ -1363,7 +1374,7 @@ def _protocol_packet_count(summary: object) -> int:
         "crimson_packets",
         "pcworx_packets",
         "melsec_packets",
-        "odesys_packets",
+        "codesys_packets",
         "niagara_packets",
         "mms_packets",
         "srtp_packets",
@@ -2363,9 +2374,15 @@ def _curate_threat_detections(
         noisy_summary = summary in _NOISY_DETECTION_SUMMARIES or any(
             token in lowered_summary for token in _LOW_CONFIDENCE_SUMMARY_TOKENS
         )
-        if severity == "info":
+        # Skeptical-filter downgrades are surfaced regardless of the
+        # curation min-signal threshold — the whole point of the annotation
+        # is to keep the finding visible AND explain why it's not the
+        # severity the raw analyzer emitted. Silently dropping downgrades
+        # would undo the reviewer's value.
+        _is_skeptical_downgrade = bool(item.get("skeptical_downgraded", False))
+        if severity == "info" and not _is_skeptical_downgrade:
             continue
-        if severity == "warning":
+        if severity == "warning" and not _is_skeptical_downgrade:
             min_signal = 3 if high_value else 4
             if recon_signal:
                 min_signal = min(min_signal, 3)
@@ -2520,6 +2537,7 @@ def analyze_threats(
     ntlm_summary = analyze_ntlm(path, show_status=show_status)
     syslog_summary = analyze_syslog(path, show_status=show_status)
     arp_summary = analyze_arp(path, show_status=show_status)
+    netbios_summary = analyze_netbios(path, show_status=show_status)
     dhcp_summary = analyze_dhcp(path, show_status=show_status)
     exfil_summary = analyze_exfil(path, show_status=show_status)
     quic_summary = analyze_quic(path, show_status=show_status)
@@ -2572,7 +2590,7 @@ def analyze_threats(
         "PCWorx": analyze_pcworx(path, show_status=show_status),
         "MELSEC": analyze_melsec(path, show_status=show_status),
         "CIP": analyze_cip(path, show_status=show_status),
-        "ODESYS": analyze_odesys(path, show_status=show_status),
+        "CODESYS": analyze_codesys(path, show_status=show_status),
         "Niagara": analyze_niagara(path, show_status=show_status),
         "MMS": analyze_mms(path, show_status=show_status),
         "SRTP": analyze_srtp(path, show_status=show_status),
@@ -2749,6 +2767,13 @@ def analyze_threats(
                 }
             )
     _append_anomaly_items(detections, "ARP", arp_summary.anomalies)
+
+    # NetBIOS / Browser (MS-BRWS) threat detections: NBNS poisoning/spoofing,
+    # rogue master browser, browser election storm, PDC/role conflict, NETLOGON
+    # user enumeration, SMB-over-NetBIOS brute-force/exfil. These previously never
+    # reached the consolidated --threats view (netbios wasn't aggregated).
+    _append_anomaly_items(detections, "NetBIOS", netbios_summary.anomalies)
+    errors.extend(getattr(netbios_summary, "errors", []) or [])
 
     if dhcp_summary.threat_summary:
         for threat, count in dhcp_summary.threat_summary.items():
@@ -4321,6 +4346,53 @@ def analyze_threats(
     }
     detections = _recontextualize_ot_cyclic(detections, ot_peer_ip_set)
     detections = _curate_threat_detections(detections)
+
+    # Crown-jewel asset weighting: a real threat (warning/high) that involves a
+    # browser-announced Domain Controller / critical-infra host is more severe —
+    # annotate it and bump its severity one level so triage surfaces it first.
+    try:
+        _nb_facts = collect_netbios_host_intel(netbios_summary)
+    except Exception:
+        _nb_facts = {}
+    _infra_assets = {
+        ip: facts
+        for ip, facts in _nb_facts.items()
+        if facts.get("is_dc")
+        or facts.get("is_master_browser")
+        or any(
+            r in ("SQL Server", "Domain Master Browser")
+            for r in (facts.get("roles", []) or [])
+        )
+    }
+    if _infra_assets:
+        _sev_bump = {"warning": "high", "high": "critical"}
+        for _det in detections:
+            _ips: set[str] = set()
+            for _key in ("top_sources", "top_destinations"):
+                for _pair in _det.get(_key, []) or []:
+                    try:
+                        _ips.add(str(_pair[0]))
+                    except Exception:
+                        continue
+            _hit = next((ip for ip in _ips if ip in _infra_assets), None)
+            if not _hit:
+                continue
+            _facts = _infra_assets[_hit]
+            _label = (
+                "Domain Controller"
+                if _facts.get("is_dc")
+                else (", ".join((_facts.get("roles", []) or [])[:2]) or "critical infrastructure")
+            )
+            _hn = str(_facts.get("hostname", "") or "")
+            _det["details"] = (
+                f"{str(_det.get('details', '') or '')} "
+                f"[ASSET: {_hit}{f' ({_hn})' if _hn else ''} announces {_label} role — "
+                "crown-jewel / high-value]"
+            ).strip()
+            _sev = str(_det.get("severity", "info"))
+            if _sev in _sev_bump:
+                _det["severity"] = _sev_bump[_sev]
+                _det["asset_elevated"] = True
 
     risk_score, risk_findings = _ot_risk_posture_from_detections(
         detections,

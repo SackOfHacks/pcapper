@@ -11,7 +11,13 @@ from .dns import analyze_dns
 from .http import analyze_http
 from .pcap_cache import get_reader
 from .services import COMMON_PORTS
-from .utils import extract_packet_endpoints, packet_length, safe_float, memoize_analysis
+from .utils import (
+    extract_packet_endpoints,
+    is_unicast_host_ip,
+    packet_length,
+    safe_float,
+    memoize_analysis,
+)
 
 try:
     from scapy.layers.inet import ICMP, IP, TCP, UDP  # type: ignore
@@ -141,6 +147,14 @@ class BeaconSummary:
     errors: list[str] = field(default_factory=list)
 
 
+def _looks_like_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def _flow_key(pkt) -> Optional[tuple[str, str, str, Optional[int], Optional[int]]]:
     src_ip, dst_ip = extract_packet_endpoints(pkt)
     if not src_ip or not dst_ip:
@@ -150,6 +164,17 @@ def _flow_key(pkt) -> Optional[tuple[str, str, str, Optional[int], Optional[int]
             dst_ip = str(getattr(eth, "dst", ""))
 
     if not src_ip or not dst_ip:
+        return None
+
+    # A C2 beacon is a periodic conversation with a specific host. Broadcast and
+    # multicast destinations are one-to-many announcement channels (NetBIOS
+    # Mailslot browse to .255, LLMNR/mDNS/SSDP multicast, OT GOOSE/SV) whose
+    # periodicity is by-design service chatter, not beaconing — excluding them
+    # stops benign broadcast from reading as CRITICAL "beacon-like C2 flows".
+    # Gate only genuine IP destinations here; MAC-only L2 fallback (which never
+    # reaches this because extract_packet_endpoints returned IPs) keeps its
+    # broadcast/multicast handling in the ethertype branch below.
+    if _looks_like_ip(dst_ip) and not is_unicast_host_ip(dst_ip):
         return None
 
     if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
@@ -178,6 +203,23 @@ def _flow_key(pkt) -> Optional[tuple[str, str, str, Optional[int], Optional[int]
             ethertype = int(getattr(pkt[Ether], "type", 0))  # type: ignore[index]
         except Exception:
             ethertype = 0
+        # ARP (0x0806) is L2 address resolution, not a beaconing/C2 channel — its
+        # cadence is cache maintenance (a gateway/DC re-resolving the segment),
+        # so periodic ARP must not be scored as "beacon-like flows". ARP-based
+        # anomalies are covered by --arp.
+        if ethertype == 0x0806:
+            return None
+        # Drop broadcast/multicast-MAC L2 frames (ff:ff:ff:ff:ff:ff, or an odd
+        # first-octet group address) — group traffic is not a beacon peer.
+        dmac = dst_ip.lower()
+        if dmac == "ff:ff:ff:ff:ff:ff":
+            return None
+        first_octet = dmac.split(":")[0] if ":" in dmac else ""
+        try:
+            if first_octet and (int(first_octet, 16) & 0x01):
+                return None
+        except ValueError:
+            pass
         label = L2_ETHERTYPE_NAMES.get(
             ethertype, f"L2:0x{ethertype:04x}" if ethertype else "L2"
         )

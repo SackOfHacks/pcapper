@@ -599,6 +599,20 @@ class Dnp3Analysis:
     # an output) with evidence — the highest-value forensic artifact.
     control_commands: List[dict[str, object]] = field(default_factory=list)
 
+    # Directed conversation view: functions attributed to their ACTUAL sender
+    # (src_ip -> dst_ip), so master-issued commands and outstation responses are
+    # not conflated into one bucket.
+    directed_conversations: dict = field(default_factory=dict)
+    # Functions split by role for the command summary: what masters issue vs what
+    # outstations answer.
+    master_funcs: Counter[str] = field(default_factory=Counter)
+    outstation_funcs: Counter[str] = field(default_factory=Counter)
+    select_count: int = 0
+    operate_count: int = 0
+    # Capture-window sanity: True when the first/last timestamps span an
+    # implausibly long window for the packet volume (merged/non-contiguous pcap).
+    noncontiguous_capture: bool = False
+
     # Activity
     messages: List[Dnp3Message] = field(default_factory=list)
     object_counts: Counter[str] = field(default_factory=Counter)
@@ -611,25 +625,15 @@ class Dnp3Analysis:
     def unique_dnp3_addresses(self) -> int:
         return len(set(list(self.src_addrs.keys()) + list(self.dst_addrs.keys())))
 
+    @property
+    def master_ip_list(self) -> list[str]:
+        return [ip for ip, c in self.master_ips.items() if c > 0]
+
 
 @memoize_analysis
 def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
     if TCP is None:
-        return Dnp3Analysis(
-            path,
-            0.0,
-            0,
-            0,
-            Counter(),
-            Counter(),
-            Counter(),
-            Counter(),
-            [],
-            Counter(),
-            Counter(),
-            [],
-            ["Scapy unavailable (TCP missing)"],
-        )
+        return Dnp3Analysis(path=path, errors=["Scapy unavailable (TCP missing)"])
 
     try:
         reader, status, _stream, _size_bytes, _file_type = get_reader(
@@ -674,6 +678,8 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
     src_dst_counts: Dict[str, Counter[str]] = defaultdict(Counter)
     src_dst_addrs: Dict[str, Set[int]] = defaultdict(set)
     src_control_counts: Counter[str] = Counter()
+    select_count = 0
+    operate_count = 0
     src_unsolicited_counts: Counter[str] = Counter()
     src_restart_counts: Counter[str] = Counter()
     src_app_control_counts: Counter[str] = Counter()
@@ -683,6 +689,9 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
     outstation_ips: Counter[str] = Counter()
     ip_dnp3_addrs: Dict[str, Set[int]] = defaultdict(set)
     conversations: Dict[tuple, Counter] = defaultdict(Counter)
+    directed_conversations: Dict[tuple, Counter] = defaultdict(Counter)
+    master_funcs: Counter[str] = Counter()
+    outstation_funcs: Counter[str] = Counter()
     iin_flags: Counter[str] = Counter()
     control_commands: List[dict[str, object]] = []
     control_cmd_seen: Set[tuple] = set()
@@ -912,10 +921,19 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                     is_response = func_code in RESPONSE_FUNCTIONS
                     ip_dnp3_addrs[src_ip].add(dl_src)
                     ip_dnp3_addrs[dst_ip].add(dl_dst)
+                    # Attribute the function to its ACTUAL sender direction so the
+                    # conversation view isn't conflated (a master's Confirm and an
+                    # outstation's Unsolicited Response are different directions).
+                    directed_conversations[(src_ip, dst_ip)][func_name] += 1
+                    if func_code == 3:
+                        select_count += 1
+                    elif func_code in {4, 5, 6}:
+                        operate_count += 1
                     if func_code in SAV5_FUNCTIONS:
                         sav5_present = True
                     if is_response:
                         src_responses[src_ip] += 1
+                        outstation_funcs[func_name] += 1
                         # The responder is the OUTSTATION (RTU/IED); its peer is
                         # the master.
                         outstation_ips[src_ip] += 1
@@ -935,11 +953,15 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
                         src_requests[src_ip] += 1
                         src_dst_counts[src_ip][dst_ip] += 1
                         src_dst_addrs[src_ip].add(dl_dst)
+                        master_funcs[func_name] += 1
                         # The requester is the MASTER (issues commands/polls).
                         master_ips[src_ip] += 1
                         conversations[(src_ip, dst_ip)][func_name] += 1
 
-                    if func_code in CONTROL_FUNCTIONS:
+                    # Select (3) arms a control point (group-12 CROB) in the
+                    # select-before-operate sequence — control-plane intent even
+                    # without the Operate. Track it alongside Write/Operate.
+                    if func_code in CONTROL_FUNCTIONS or func_code == 3:
                         src_control_counts[src_ip] += 1
                         # Record each control command with evidence (deduped per
                         # src->dst+func+outstation-addr). This is the load-bearing
@@ -1224,6 +1246,31 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
     duration = 0.0
     if start_time and last_time:
         duration = last_time - start_time
+    # Flag an implausible capture window (e.g. a merged/challenge pcap whose
+    # frames span years) so the duration isn't read as a real monitoring period.
+    noncontiguous_capture = bool(
+        duration > 7 * 86400 and dnp3_packets and dnp3_packets < 100000
+    )
+
+    # Select-before-Operate is a two-step control sequence. Selects with no
+    # matching Operate = an aborted/incomplete SBO or an operator/attacker
+    # arming outputs to probe what is controllable (recon of control points).
+    if select_count > 0 and operate_count == 0 and len(anomalies) < max_anomalies:
+        anomalies.append(
+            Dnp3Anomaly(
+                "MEDIUM",
+                "DNP3 Select Without Operate",
+                f"{select_count} Select command(s) arming outstation outputs with no "
+                "matching Operate — incomplete select-before-operate. Consistent with "
+                "probing which control points are actuatable, or an aborted control "
+                "attempt. Confirm operator intent.",
+                "*",
+                "*",
+                0.0,
+                attack="T0855 Unauthorized Command Message",
+                evidence=f"select={select_count} operate={operate_count}",
+            )
+        )
 
     if nonstandard_port_counts:
         for session, count in nonstandard_port_counts.most_common(6):
@@ -1405,6 +1452,12 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
         outstation_ips=outstation_ips,
         ip_dnp3_addrs={k: set(v) for k, v in ip_dnp3_addrs.items()},
         conversations={k: dict(v) for k, v in conversations.items()},
+        directed_conversations={k: dict(v) for k, v in directed_conversations.items()},
+        master_funcs=master_funcs,
+        outstation_funcs=outstation_funcs,
+        select_count=select_count,
+        operate_count=operate_count,
+        noncontiguous_capture=noncontiguous_capture,
         iin_flags=iin_flags,
         sav5_present=sav5_present,
         control_commands=control_commands,

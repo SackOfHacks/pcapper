@@ -167,6 +167,9 @@ class IpSummary:
     analyst_verdict: str = ""
     analyst_confidence: str = "low"
     analyst_reasons: list[str] = field(default_factory=list)
+    # Browser (MS-BRWS) announced identity per IP.
+    ip_roles: dict[str, list[str]] = field(default_factory=dict)
+    ip_os: dict[str, str] = field(default_factory=dict)
     deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
     exposure_profiles: list[dict[str, object]] = field(default_factory=list)
     priority_asset_profiles: list[dict[str, object]] = field(default_factory=list)
@@ -475,6 +478,8 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     ip_category_counts: Counter[str] = Counter()
     ip_mac_counts: dict[str, Counter[str]] = {}
     ip_hostnames: dict[str, Counter[str]] = {}
+    ip_roles: dict[str, list[str]] = {}
+    ip_os: dict[str, str] = {}
     ja3_counts: Counter[str] = Counter()
     ja4_counts: Counter[str] = Counter()
     ja4s_counts: Counter[str] = Counter()
@@ -523,6 +528,10 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
         for ip_value, counter in summary.ip_hostnames.items():
             existing = ip_hostnames.setdefault(ip_value, Counter())
             existing.update(counter)
+        for ip_value, roles in (getattr(summary, "ip_roles", {}) or {}).items():
+            ip_roles.setdefault(ip_value, list(roles))
+        for ip_value, os_text in (getattr(summary, "ip_os", {}) or {}).items():
+            ip_os.setdefault(ip_value, os_text)
         ja3_counts.update(summary.ja3_counts)
         ja4_counts.update(summary.ja4_counts)
         ja4s_counts.update(summary.ja4s_counts)
@@ -750,6 +759,8 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
             enrichment.get("analyst_confidence", "low") or "low"
         ),
         analyst_reasons=list(enrichment.get("analyst_reasons", []) or []),
+        ip_roles=ip_roles,
+        ip_os=ip_os,
         deterministic_checks=dict(
             enrichment.get("deterministic_checks", {}) or {}
         ),
@@ -1980,6 +1991,27 @@ def analyze_ips(
                         }
                     )
 
+    # Browser (MS-BRWS) announced identity — enrich per-IP hostname, roles, OS
+    # so the IP Host Details view names hosts and flags directory infrastructure.
+    ip_roles: dict[str, list[str]] = {}
+    ip_os: dict[str, str] = {}
+    try:
+        from .netbios import analyze_netbios, collect_netbios_host_intel
+
+        _nb_intel = collect_netbios_host_intel(analyze_netbios(path, show_status=False))
+    except Exception:
+        _nb_intel = {}
+    for _bip, _facts in _nb_intel.items():
+        _hn = str(_facts.get("hostname", "") or "").strip()
+        if _hn:
+            ip_hostnames[_bip][_hn] += 1
+        _roles = [str(r) for r in _facts.get("roles", []) or []]
+        if _roles:
+            ip_roles[_bip] = _roles
+        _os = str(_facts.get("os", "") or "")
+        if _os:
+            ip_os[_bip] = _os
+
     enrichment = _build_ips_enrichment(
         endpoints=endpoint_rows,
         conversations=conversation_rows,
@@ -2032,6 +2064,8 @@ def analyze_ips(
             enrichment.get("analyst_confidence", "low") or "low"
         ),
         analyst_reasons=list(enrichment.get("analyst_reasons", []) or []),
+        ip_roles=ip_roles,
+        ip_os=ip_os,
         deterministic_checks=dict(
             enrichment.get("deterministic_checks", {}) or {}
         ),

@@ -535,8 +535,42 @@ def analyze_arp(
                 )
             )
 
+    # Segment-hub awareness: a default gateway, domain controller, or DNS/DHCP
+    # server ARP-resolves every host it serves, so it always looks like a wide
+    # "ARP sweep." The tell is role — a hub is itself ARP-resolved by (almost)
+    # the whole segment, whereas a -sn/-PR recon scanner is not resolved by
+    # anyone. Invert request_targets to count how many distinct hosts resolve
+    # each IP, and don't call a hub's routine cache-maintenance ARP a sweep.
+    resolvers_by_ip: dict[str, set[str]] = defaultdict(set)
+    for _requester, _tgts in request_targets.items():
+        for _tgt in _tgts:
+            resolvers_by_ip[_tgt].add(_requester)
+    distinct_arp_requesters = len(request_targets)
+
+    def _is_segment_hub(ip_value: str) -> bool:
+        resolved_by = len(resolvers_by_ip.get(ip_value, ()))
+        return (
+            distinct_arp_requesters >= 4
+            and resolved_by >= 6
+            and resolved_by >= 0.4 * distinct_arp_requesters
+        )
+
     for src_ip, targets in request_targets.items():
         if len(targets) >= sweep_threshold:
+            if _is_segment_hub(src_ip):
+                # Gateway/DC/DNS hub resolving the segment — routine ARP cache
+                # maintenance, not reconnaissance. A fast (rate-outlier) ARP
+                # storm from any host, hub or not, is still caught by the pps
+                # and burst checks below.
+                summary.benign_indicators[
+                    "Segment hub ARP resolution (gateway/DC/DNS)"
+                ] += 1
+                deterministic_checks["likely_benign_failover"].append(
+                    f"{src_ip} resolves {len(targets)} hosts but is itself ARP-resolved "
+                    f"by {len(resolvers_by_ip.get(src_ip, ()))}/{distinct_arp_requesters} "
+                    "segment hosts (gateway/DC/DNS hub, not recon)"
+                )
+                continue
             summary.threats["ARP Sweep"] += 1
             summary.risk_factors["Broad ARP target sweep"] += 1
             deterministic_checks["arp_recon_sweep"].append(
@@ -570,17 +604,31 @@ def analyze_arp(
             )
         )
 
-    if summary.total_packets and summary.arp_packets >= 150 and arp_ratio >= 0.35:
+    # A high ARP *ratio* is not a flood — on a quiet or OT/DCS segment ARP
+    # legitimately dominates a low-volume capture (few IP flows). A flood/storm
+    # is a *rate* phenomenon, so require the ARP rate to actually be elevated,
+    # not just its share of a slow capture.
+    _avg_arp_pps = float(summary.rate_peaks.get("avg_pps", 0.0) or 0.0)
+    _peak_arp_pps = float(summary.rate_peaks.get("peak_pps", 0.0) or 0.0)
+    if (
+        summary.total_packets
+        and summary.arp_packets >= 150
+        and arp_ratio >= 0.35
+        and (_avg_arp_pps >= 5.0 or _peak_arp_pps >= 50.0)
+    ):
         summary.threats["Layer2 Flooding"] += 1
         summary.risk_factors["High ARP traffic ratio"] += 1
         deterministic_checks["arp_storm_flood"].append(
-            f"arp traffic ratio={arp_ratio:.1%}"
+            f"arp traffic ratio={arp_ratio:.1%} avg={_avg_arp_pps:.1f}pps peak={_peak_arp_pps:.0f}pps"
         )
         _add_anomaly(
             ArpAnomaly(
                 severity="MEDIUM",
                 title="High ARP Traffic Share",
-                description=f"ARP traffic ratio is {arp_ratio:.1%} of capture.",
+                description=(
+                    f"ARP traffic ratio is {arp_ratio:.1%} of capture "
+                    f"at {_avg_arp_pps:.1f}pps avg ({_peak_arp_pps:.0f}pps peak)."
+                ),
                 src="-",
                 dst="-",
                 ts=start_ts or 0.0,

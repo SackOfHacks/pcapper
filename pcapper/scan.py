@@ -13,6 +13,7 @@ from .utils import (
     extract_packet_endpoints,
     is_private_ip,
     is_public_ip,
+    is_unicast_host_ip as _is_unicast_target,
     memoize_analysis,
     safe_float,
     tcp_flags_int as _tcp_flags_int,
@@ -603,6 +604,12 @@ def analyze_scan(
     # OT/ICS service ports probed.
     src_ot_ports: dict[str, set[int]] = defaultdict(set)
     src_ot_targets: dict[str, set[str]] = defaultdict(set)
+    # ARP-role tracking: which distinct hosts ARP-resolve each IP. A default
+    # gateway/router is ARP-resolved by (almost) every host on the segment,
+    # while a host-discovery scanner is not — this separates a router doing
+    # routine ARP cache maintenance from a genuine -sn/-PR sweep.
+    arp_resolved_by: dict[str, set[str]] = defaultdict(set)
+    arp_senders: set[str] = set()
     syn_seen: set[tuple[str, str, int, int]] = set()
     syn_ack_seen: set[tuple[str, str, int, int]] = set()
     handshake_complete: set[tuple[str, str, int, int]] = set()
@@ -724,7 +731,7 @@ def analyze_scan(
                 # Classify the client-side probe by flag combination so stealth
                 # scans (FIN/NULL/XMAS/Maimon/ACK) and connect scans are detected
                 # alongside SYN scans rather than silently ignored.
-                if dport is not None:
+                if dport is not None and _is_unicast_target(dst_ip):
                     flavor = _tcp_scan_flavor(flags)
                     payload_len = len(payload)
                     probe_flow = (src_ip, dst_ip, int(sport or 0), int(dport))
@@ -765,7 +772,7 @@ def analyze_scan(
                             src_syn[src_ip] += 1
             elif UDP is not None and pkt.haslayer(UDP):
                 # UDP scan: a host firing UDP datagrams at many ports/targets.
-                if dport is not None:
+                if dport is not None and _is_unicast_target(dst_ip):
                     _record_probe(
                         src_ip,
                         dst_ip,
@@ -787,7 +794,7 @@ def analyze_scan(
                     icmp_type = int(getattr(pkt[ICMP], "type", -1))
                 except Exception:
                     icmp_type = -1
-                if icmp_type == 8:
+                if icmp_type == 8 and _is_unicast_target(dst_ip):
                     src_probe_targets[src_ip].add(dst_ip)
                     src_probe_packets[src_ip] += 1
                     src_flavor_probes[(src_ip, "icmp")].add((dst_ip, 0))
@@ -808,6 +815,8 @@ def analyze_scan(
                 if op == 1:
                     src_probe_targets[src_ip].add(dst_ip)
                     src_probe_packets[src_ip] += 1
+                    arp_senders.add(src_ip)
+                    arp_resolved_by[dst_ip].add(src_ip)
                     src_flavor_probes[(src_ip, "arp")].add((dst_ip, 0))
                     src_flavor_packets[(src_ip, "arp")] += 1
                     if ts is not None:
@@ -908,6 +917,32 @@ def analyze_scan(
             probe_packets,
             max_ports_single_target,
         ):
+            continue
+
+        # Segment-hub suppression. A network hub — default gateway/router, a
+        # domain controller, or a DNS/DHCP server — ARP-resolves every host it
+        # serves, so on a normal segment it looks like a wide "ARP host sweep."
+        # The tell is role, not volume: a hub is itself ARP-resolved by (almost)
+        # the whole segment (everyone routes through the gateway / authenticates
+        # to the DC), whereas a -sn/-PR host-discovery scanner is not resolved by
+        # anyone. If this source is ARP-resolved by a large share of the segment
+        # AND its only scan techniques are host-discovery sweeps (ARP/ICMP, no
+        # TCP/UDP port probing), treat it as routine infrastructure ARP cache
+        # maintenance and do not flag it. A compromised hub that actually
+        # port-scans still trips the port-scan flavors below and is reported.
+        distinct_arp_senders = len(arp_senders)
+        resolved_by = len(arp_resolved_by.get(scanner, ()))
+        is_segment_hub = (
+            distinct_arp_senders >= 4
+            and resolved_by >= 6
+            and resolved_by >= 0.4 * distinct_arp_senders
+        )
+        port_scan_flavors = [
+            flavor
+            for flavor in ("syn", "fin", "null", "xmas", "maimon", "ack", "udp")
+            if len(src_flavor_probes.get((scanner, flavor), set())) >= 5
+        ]
+        if is_segment_hub and not port_scan_flavors:
             continue
 
         # Flavor-agnostic classification: a port scan (vertical) is many ports

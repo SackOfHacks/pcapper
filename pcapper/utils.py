@@ -296,6 +296,30 @@ def is_private_ip(value: str) -> bool:
         return False
 
 
+@lru_cache(maxsize=100000)
+def is_unicast_host_ip(value: str) -> bool:
+    """True only for a real unicast host address.
+
+    Broadcast and multicast destinations (subnet .255 directed broadcast,
+    255.255.255.255 limited broadcast, 224.0.0.0/4 multicast) are one-to-many
+    announcement/discovery channels — NetBIOS Mailslot browse, LLMNR, mDNS,
+    SSDP, NTP broadcast, OT multicast (GOOSE/SV) — NOT host targets or C2
+    peers. Detections that count "targets"/"peers"/"beacon destinations" must
+    exclude them or benign broadcast chatter reads as scanning/beaconing.
+    """
+    try:
+        obj = ipaddress.ip_address(value)
+    except (ValueError, TypeError):
+        return False
+    if obj.is_multicast or obj.is_unspecified or obj.is_reserved:
+        return False
+    if isinstance(obj, ipaddress.IPv4Address):
+        # Limited broadcast + the common /24 directed broadcast (host octet .255).
+        if int(obj) & 0xFF == 0xFF:
+            return False
+    return True
+
+
 def shannon_entropy(value: str) -> float:
     """Base-2 Shannon entropy of a string (bits per symbol)."""
     if not value:

@@ -50,7 +50,7 @@ from .modicon import analyze_modicon
 from .mqtt import MQTT_PORTS, analyze_mqtt
 from .mqtt import _parse_commands as _parse_mqtt_commands
 from .niagara import analyze_niagara
-from .odesys import analyze_odesys
+from .codesys import analyze_codesys
 from .opc import analyze_opc
 from .pcap_cache import get_cached_packets, has_cached_packets, load_filtered_packets
 from .pccc import analyze_pccc
@@ -81,6 +81,10 @@ class OtCommandSummary:
     fast_notes: list[str]
     detections: list[dict[str, object]]
     errors: list[str]
+    # ALL observed OT commands (reads + writes) per protocol, not just the
+    # control/write subset — so the view is useful on read-only/monitoring
+    # captures instead of showing empty. Keyed "Protocol:Command".
+    all_command_counts: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass(frozen=True)
@@ -514,6 +518,7 @@ def _analyze_ot_commands_fast(
         )
 
     command_counts: Counter[str] = Counter()
+    all_command_counts: Counter[str] = Counter()
     sources: Counter[str] = Counter()
     destinations: Counter[str] = Counter()
     command_sessions: Counter[str] = Counter()
@@ -653,6 +658,7 @@ def _analyze_ot_commands_fast(
             proto_extra = protocol_markers.get(proto.upper(), ())
 
         for cmd in commands:
+            all_command_counts[f"{proto}:{cmd}"] += 1
             is_control = (
                 command_gate(cmd)
                 if command_gate
@@ -703,6 +709,7 @@ def _analyze_ot_commands_fast(
         fast_notes=fast_notes,
         detections=detections,
         errors=errors,
+        all_command_counts=all_command_counts,
     )
 
 
@@ -887,22 +894,22 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(opc, "errors", []) or [])
 
-    odesys = analyze_odesys(path, show_status=show_status)
-    odesys_extra = _protocol_extra("ODESYS")
+    codesys = analyze_codesys(path, show_status=show_status)
+    codesys_extra = _protocol_extra("CODESYS")
     _count_from_industrial(
-        odesys,
+        codesys,
         "ODESYS",
         command_counts,
         sources,
         destinations,
         command_sessions,
         command_session_times,
-        odesys_extra,
+        codesys_extra,
         base_markers,
         control_timestamps,
         control_targets,
     )
-    errors.extend(getattr(odesys, "errors", []) or [])
+    errors.extend(getattr(codesys, "errors", []) or [])
 
     pccc = analyze_pccc(path, show_status=show_status)
     pccc_extra = _protocol_extra("PCCC")
@@ -1166,6 +1173,39 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(prconos, "errors", []) or [])
 
+    # Aggregate ALL observed commands (reads + writes) per protocol from the
+    # analyzers already run above, so the view is useful on read-only captures.
+    all_command_counts: Counter[str] = Counter()
+    _all_sources: list[tuple[str, Counter]] = [
+        ("Modbus", getattr(modbus, "func_counts", Counter())),
+        ("DNP3", getattr(dnp3, "func_counts", Counter())),
+        ("CIP", getattr(cip, "cip_services", Counter())),
+        ("ENIP", getattr(cip, "enip_commands", Counter())),
+        ("IEC-104", getattr(iec, "commands", Counter())),
+        ("S7", getattr(s7, "commands", Counter())),
+        ("OPC-UA", getattr(opc, "commands", Counter())),
+        ("CODESYS", getattr(codesys, "commands", Counter())),
+        ("PCCC", getattr(pccc, "commands", Counter())),
+        ("Niagara", getattr(niagara, "commands", Counter())),
+        ("MQTT", getattr(mqtt, "commands", Counter())),
+        ("BACnet", getattr(bacnet, "commands", Counter())),
+        ("CoAP", getattr(coap, "commands", Counter())),
+        ("DF1", getattr(df1, "commands", Counter())),
+        ("EtherCAT", getattr(ethercat, "commands", Counter())),
+        ("FINS", getattr(fins, "commands", Counter())),
+        ("MELSEC", getattr(melsec, "commands", Counter())),
+        ("MMS", getattr(mms, "commands", Counter())),
+        ("Modicon", getattr(modicon, "commands", Counter())),
+        ("PROFINET", getattr(profinet, "commands", Counter())),
+        ("SRTP", getattr(srtp, "commands", Counter())),
+        ("Yokogawa", getattr(yokogawa, "commands", Counter())),
+        ("PCWorx", getattr(pcworx, "commands", Counter())),
+        ("ProConOS", getattr(prconos, "commands", Counter())),
+    ]
+    for _label, _ctr in _all_sources:
+        for _cmd, _cnt in (_ctr or Counter()).items():
+            all_command_counts[f"{_label}:{_cmd}"] += _cnt
+
     detections: list[dict[str, object]] = []
     if command_counts:
         detections.append(
@@ -1195,4 +1235,5 @@ def analyze_ot_commands(
         fast_notes=[],
         detections=detections,
         errors=errors,
+        all_command_counts=all_command_counts,
     )

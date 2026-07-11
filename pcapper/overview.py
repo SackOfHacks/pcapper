@@ -24,7 +24,7 @@ from .mms import analyze_mms
 from .modbus import analyze_modbus
 from .mqtt import analyze_mqtt
 from .niagara import analyze_niagara
-from .odesys import analyze_odesys
+from .codesys import analyze_codesys
 from .opc import analyze_opc
 from .ot_commands import OtControlConfig, analyze_ot_commands
 from .profinet import analyze_profinet
@@ -95,7 +95,7 @@ _OT_PROTOCOL_MATCHERS: list[tuple[str, str, tuple[str, ...]]] = [
     ("coap", "CoAP", ("coap",)),
     ("hart", "HART-IP", ("hart",)),
     ("niagara", "Niagara Fox", ("niagara", "fox")),
-    ("odesys", "ODESYS/CODESYS", ("odesys", "codesys")),
+    ("codesys", "CODESYS (CoDeSys)", ("odesys", "codesys")),
     (
         "synchrophasor",
         "IEEE C37.118 Synchrophasor",
@@ -147,7 +147,7 @@ _MODULE_LABELS = {
     "coap": "CoAP",
     "hart": "HART-IP",
     "niagara": "Niagara",
-    "odesys": "ODESYS",
+    "codesys": "CODESYS",
     "synchrophasor": "Synchrophasor",
     "bsap": "BSAP-IP",
     "genisys": "Genisys",
@@ -176,7 +176,7 @@ _OT_MODULES = {
     "coap",
     "hart",
     "niagara",
-    "odesys",
+    "codesys",
     "synchrophasor",
     "bsap",
     "genisys",
@@ -201,7 +201,7 @@ _OT_PORT_HINTS: dict[str, tuple[int, ...]] = {
     "coap": (5683, 5684),
     "hart": (5094,),
     "niagara": (1911, 4911),
-    "odesys": (1217, 2455),
+    "codesys": (1217, 2455),
     "synchrophasor": (4712, 4713),
     "bsap": (1234, 1235),
 }
@@ -1062,8 +1062,63 @@ def _notable_flows(protocols, limit: int = 20) -> list[dict[str, object]]:
                 "ports": ports,
             }
         )
-    rows.sort(
+    # "Notable" must mean more than "highest byte volume". On a quiet or OT/DCS
+    # segment the biggest conversations are routine internal name/address
+    # resolution (ARP cache refresh to the gateway/DC, NetBIOS/LLMNR/mDNS/SSDP
+    # discovery) — baseline, not notable. Drop that low-rate internal L2/
+    # discovery churn, and rank genuine cross-zone/external flows first. A
+    # high-rate internal flood/scan is NOT dropped (rate gate below) so real
+    # anomalies still surface.
+    _baseline_protos = (
+        "ARP",
+        "NBNS",
+        "LLMNR",
+        "MDNS",
+        "SSDP",
+        "NETBIOS",
+        "NBT",
+        "BROWSER",
+        "STP",
+        "CDP",
+        "LLDP",
+        "IGMP",
+    )
+
+    def _dst_is_group(dst: str) -> bool:
+        """Broadcast or multicast destination (one-to-many announcement)."""
+        try:
+            obj = ipaddress.ip_address(dst)
+        except ValueError:
+            return False
+        if obj.is_multicast:
+            return True
+        if isinstance(obj, ipaddress.IPv4Address) and (int(obj) & 0xFF) == 0xFF:
+            return True  # 255.255.255.255 + /24 directed broadcast
+        return False
+
+    def _is_routine_baseline(item: dict) -> bool:
+        # High-rate internal churn = possible flood/scan → keep as notable.
+        if float(item.get("packets_per_sec", 0.0) or 0.0) >= 2.0:
+            return False
+        src = str(item.get("src", ""))
+        dst = str(item.get("dst", ""))
+        if _ip_scope(src) != "internal":
+            return False
+        # Internal one-to-many announcement / discovery (LLMNR/mDNS/SSDP/WS-
+        # Discovery/IGMP and vendor multicast) is baseline, not notable.
+        if _dst_is_group(dst):
+            return True
+        # Internal->internal L2 / name-address resolution churn (ARP cache
+        # refresh, NetBIOS, browser) is baseline.
+        if _ip_scope(dst) == "internal":
+            proto_u = str(item.get("protocol", "")).upper()
+            return any(marker in proto_u for marker in _baseline_protos)
+        return False
+
+    notable = [row for row in rows if not _is_routine_baseline(row)]
+    notable.sort(
         key=lambda item: (
+            0 if "external" in str(item.get("scope_pair", "")) else 1,
             -int(item.get("bytes", 0) or 0),
             -int(item.get("packets", 0) or 0),
             -float(item.get("duration_seconds", 0.0) or 0.0),
@@ -1072,7 +1127,7 @@ def _notable_flows(protocols, limit: int = 20) -> list[dict[str, object]]:
             str(item.get("protocol", "")),
         )
     )
-    return rows[:limit]
+    return notable[:limit]
 
 
 def _capture_window(protocols, services) -> tuple[float | None, float | None]:
@@ -1171,6 +1226,22 @@ def _build_hunt_leads(
     seen: set[tuple[str, str]] = set()
     ot_tokens = {str(item).strip().lower() for item in ot_markers if str(item).strip()}
 
+    # Defer "scan-like" hunt leads to the dedicated scan analyzer, which is
+    # hub/broadcast/rate-aware. Without this, the crude per-IP heuristic
+    # (many peers + small packets + several ports) re-flags every gateway,
+    # domain controller, and busy server the scan analyzer already cleared.
+    scan_module_ran = any(
+        getattr(result, "module", "") == "scan" for result in module_results
+    )
+    confirmed_scanner_ips: set[str] = set()
+    for result in module_results:
+        if getattr(result, "module", "") != "scan":
+            continue
+        for scanner_ip in list(getattr(result, "metrics", {}).get("scanner_ips", []) or []):
+            text = str(scanner_ip).strip()
+            if text:
+                confirmed_scanner_ips.add(text)
+
     def add_lead(
         *,
         score: int,
@@ -1244,7 +1315,13 @@ def _build_hunt_leads(
                 last_seen=last_seen,
             )
 
-        if peer_count >= 12 and len(top_ports) >= 4 and avg_bytes_per_packet <= 220.0:
+        scan_like_confirmed = (ip_text in confirmed_scanner_ips) or not scan_module_ran
+        if (
+            peer_count >= 12
+            and len(top_ports) >= 4
+            and avg_bytes_per_packet <= 220.0
+            and scan_like_confirmed
+        ):
             add_lead(
                 score=88,
                 entity=ip_text,
@@ -1537,6 +1614,14 @@ def _build_module_result(module: str, reason: str, summary: object) -> OverviewM
         scan_sources = list(getattr(summary, "scan_sources", []) or [])
         scanner_count = int(getattr(summary, "scanner_count", len(scan_sources)) or 0)
         metrics["scanners"] = scanner_count
+        # Confirmed scanner IPs from the (hub/broadcast-aware) scan analyzer, so
+        # hunt-lead "scan-like" heuristics defer to it instead of re-flagging a
+        # gateway/DC/DNS hub that analyze_scan already cleared.
+        metrics["scanner_ips"] = [
+            str(getattr(src, "scanner_ip", "") or "").strip()
+            for src in scan_sources
+            if str(getattr(src, "scanner_ip", "") or "").strip()
+        ]
         if scanner_count:
             top = scan_sources[0]
             scanner_ip = str(getattr(top, "scanner_ip", "-"))
@@ -1772,6 +1857,27 @@ def analyze_overview(
     top_services = _top_services(services_summary, limit=12)
     ip_activity = _ip_activity(protocol_summary, services_summary, limit=24)
     observed_ips = _observed_ips(protocol_summary, services_summary, limit=20)
+    # Enrich the device/IP inventory with Browser (MS-BRWS) announced identity:
+    # hostname, OS, and server roles (DC/SQL/print/master browser).
+    try:
+        from .netbios import analyze_netbios, collect_netbios_host_intel
+
+        _nb_intel = collect_netbios_host_intel(analyze_netbios(path, show_status=False))
+    except Exception:
+        _nb_intel = {}
+    if _nb_intel:
+        for _row in list(ip_activity) + list(observed_ips):
+            _facts = _nb_intel.get(str(_row.get("ip", "")))
+            if not _facts:
+                continue
+            if _facts.get("hostname"):
+                _row["hostname"] = str(_facts["hostname"])
+            if _facts.get("os"):
+                _row["os"] = str(_facts["os"])
+            if _facts.get("roles"):
+                _row["browser_roles"] = [str(r) for r in _facts["roles"]]
+            if _facts.get("is_dc"):
+                _row["is_dc"] = True
     protocol_activity = _protocol_activity(protocol_summary, limit=24)
     service_activity = _service_activity(services_summary, limit=24)
     notable_flows = _notable_flows(protocol_summary, limit=30)
@@ -1917,7 +2023,7 @@ def analyze_overview(
         "coap": lambda: analyze_coap(path, show_status=show_status),
         "hart": lambda: analyze_hart(path, show_status=show_status),
         "niagara": lambda: analyze_niagara(path, show_status=show_status),
-        "odesys": lambda: analyze_odesys(path, show_status=show_status),
+        "codesys": lambda: analyze_codesys(path, show_status=show_status),
     }
 
     for step in detected_ot_steps[:_AUTO_OT_DEEP_DIVE_LIMIT]:

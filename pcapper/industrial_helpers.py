@@ -453,11 +453,16 @@ def analyze_port_protocol(
                 if commands:
                     analysis.commands.update(commands)
                     if enable_enrichment:
-                        for cmd in commands:
-                            endpoints = analysis.service_endpoints.setdefault(
-                                str(cmd), Counter()
-                            )
-                            endpoints[f"{src_ip} -> {dst_ip}"] += 1
+                        # Attribute command endpoints to the request (client ->
+                        # server) direction only, so a service isn't listed as both
+                        # "A -> B" and "B -> A" for one request/response exchange.
+                        # (is_request/is_response set just above in this block.)
+                        if is_request or not is_response:
+                            for cmd in commands:
+                                endpoints = analysis.service_endpoints.setdefault(
+                                    str(cmd), Counter()
+                                )
+                                endpoints[f"{src_ip} -> {dst_ip}"] += 1
                     if ts is not None and len(analysis.command_events) < 5000:
                         for cmd in commands:
                             analysis.command_events.append(

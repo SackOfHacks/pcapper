@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .dns import analyze_dns
 from .files import analyze_files
-from .netbios import analyze_netbios
+from .netbios import analyze_netbios, collect_netbios_host_intel
 from .ntlm import analyze_ntlm
 from .pcap_cache import PcapMeta, get_reader
 from .progress import run_with_busy_status
@@ -92,6 +92,10 @@ class DomainAnalysis:
     campaign_indicators: List[Dict[str, object]] = field(default_factory=list)
     baseline_anomalies: List[Dict[str, object]] = field(default_factory=list)
     benign_context: List[str] = field(default_factory=list)
+    # Passive domain intelligence from Browser (MS-BRWS) announcements — works
+    # even with no Kerberos/LDAP traffic (e.g. OT/DCS segments).
+    netbios_domains: Counter = field(default_factory=Counter)
+    browser_roles: Dict[str, List[str]] = field(default_factory=dict)
 
 
 _DOMAIN_SKIP_SUFFIXES = (".in-addr.arpa", ".ip6.arpa")
@@ -313,6 +317,28 @@ def analyze_domain(
         if primary:
             host_labels_by_ip[str(ip)] = primary
 
+    # Passive domain/DC discovery from Browser (MS-BRWS) announcements — the
+    # announced workgroup/domain name, the DC/BDC/master-browser roster, and
+    # per-host server roles. Present even when there is no Kerberos/LDAP.
+    netbios_domains: Counter = Counter()
+    browser_roles: Dict[str, List[str]] = {}
+    try:
+        _nb_intel = collect_netbios_host_intel(netbios_summary)
+    except Exception:
+        _nb_intel = {}
+    for _bip, _facts in _nb_intel.items():
+        if _facts.get("is_dc"):
+            dc_hosts[str(_bip)] += 1
+        _hn = str(_facts.get("hostname", "") or "").strip()
+        if _hn:
+            host_labels_by_ip.setdefault(str(_bip), _hn)
+        _roles = [str(r) for r in _facts.get("roles", []) or []]
+        if _roles:
+            browser_roles[str(_bip)] = _roles
+    for _dom, _cnt in getattr(netbios_summary, "browser_domains", Counter()).items():
+        if _dom:
+            netbios_domains[str(_dom)] += int(_cnt)
+
     users = Counter(
         {
             name: int(count)
@@ -331,6 +357,10 @@ def analyze_domain(
     for name in netbios_summary.unique_names:
         if _is_plausible_computer_name(name):
             computer_names[_clean_identity_token(name)] += 1
+    for _bip, _facts in _nb_intel.items():
+        _hn = str(_facts.get("hostname", "") or "").strip()
+        if _hn and _is_plausible_computer_name(_hn):
+            computer_names[_clean_identity_token(_hn)] += 1
 
     response_codes = Counter()
     response_codes.update(netbios_summary.response_codes)
@@ -1220,4 +1250,6 @@ def analyze_domain(
         campaign_indicators=campaign_indicators,
         baseline_anomalies=baseline_anomalies,
         benign_context=benign_context,
+        netbios_domains=netbios_domains,
+        browser_roles=browser_roles,
     )

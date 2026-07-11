@@ -319,6 +319,46 @@ ENUMERATION_SERVICE_CODES = {
     0x55,  # Get_Instance_Attribute_List
 }
 
+# Risk tiers (see enip.py — shared taxonomy). Tag reads are NORMAL polling, not
+# "suspicious"; discovery reads are informational; only config-writes/connection/
+# lifecycle are "suspicious"; writes/control/program are HIGH_RISK.
+READ_TAG_SERVICE_CODES = frozenset({0x4C, 0x52})
+DISCOVERY_SERVICE_CODES = frozenset({0x01, 0x03, 0x0E, 0x11, 0x55})
+SUSPICIOUS_SERVICE_CODES = frozenset({0x02, 0x04, 0x10, 0x54, 0x73})
+FORWARD_OPEN_SERVICE_CODES = frozenset({0x54, 0x5B})
+# PCCC (legacy Allen-Bradley PLC-5/SLC/MicroLogix) tunnelled in CIP via the
+# Execute_PCCC service (0x4B). PCCC carries its own command set for legacy
+# controllers — worth decoding since DFRWS PCCC-forensics shows it exposes
+# logic/config read+write on legacy PLCs.
+PCCC_EXECUTE_SERVICE_CODE = 0x4B
+# (CMD, FNC) -> name. Verified against the Wireshark PCCC dissector.
+PCCC_COMMANDS = {
+    (0x0F, 0x00): "Word Range Write",
+    (0x0F, 0x01): "Word Range Read",
+    (0x0F, 0x02): "Bit Write",
+    (0x0F, 0x26): "Read-Modify-Write",
+    (0x0F, 0x67): "Typed Read",
+    (0x0F, 0x68): "Typed Write",
+    (0x0F, 0xA1): "Protected Typed Logical Read (2 addr)",
+    (0x0F, 0xA2): "Protected Typed Logical Read (3 addr)",
+    (0x0F, 0xA9): "Protected Typed Logical Write w/ mask (2 addr)",
+    (0x0F, 0xAA): "Protected Typed Logical Write (2 addr)",
+    (0x0F, 0xAB): "Protected Typed Logical Write (3 addr)",
+    (0x0F, 0x11): "Get Edit Resource (program access)",
+    (0x0F, 0x12): "Return Edit Resource",
+    (0x0F, 0x8F): "Apply Port Configuration",
+    (0x0F, 0x80): "Download Complete (logic)",
+    (0x0F, 0x81): "Download Request (logic)",
+    (0x06, 0x00): "Set/Reset CPU Mode",
+    (0x06, 0x03): "Diagnostic Status",
+}
+# PCCC commands that change controller state / logic (write / mode / program).
+PCCC_WRITE_CMDS = frozenset({
+    (0x0F, 0x00), (0x0F, 0x02), (0x0F, 0x26), (0x0F, 0x68), (0x0F, 0xA9),
+    (0x0F, 0xAA), (0x0F, 0xAB), (0x0F, 0x11), (0x0F, 0x8F), (0x0F, 0x80),
+    (0x0F, 0x81), (0x06, 0x00),
+})
+
 CIP_RECON_STATUS_CODES = {
     0x04,  # Path segment error
     0x05,  # Path destination unknown
@@ -405,6 +445,35 @@ class CIPAnalysis:
     artifacts: list[IndustrialArtifact] = field(default_factory=list)
     anomalies: list[IndustrialAnomaly] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Forensic baseline / inventory (mirrors the --enip upgrade)
+    request_sources: Counter[str] = field(default_factory=Counter)
+    enumeration_services: Counter[str] = field(default_factory=Counter)
+    tag_reads: Counter[str] = field(default_factory=Counter)
+    tag_writes: Counter[str] = field(default_factory=Counter)
+    tag_endpoints: dict[str, Counter[str]] = field(default_factory=dict)
+    first_seen: dict[str, float] = field(default_factory=dict)
+    cip_success: int = 0
+    cip_errors: int = 0
+    error_status_counts: Counter[str] = field(default_factory=Counter)
+    pccc_commands: Counter[str] = field(default_factory=Counter)
+    pccc_endpoints: dict[str, Counter[str]] = field(default_factory=dict)
+
+    @property
+    def masters(self) -> list[str]:
+        """Operational masters — sources that sent to a CIP/ENIP port (true
+        TCP-level client direction), avoiding the CIP-direction mis-classification
+        that counts a PLC as a master."""
+        src = self.request_sources or self.client_ips
+        return [ip for ip, cnt in src.items() if cnt > 0]
+
+    @property
+    def write_service_count(self) -> int:
+        total = 0
+        for name, cnt in self.cip_services.items():
+            low = name.lower()
+            if "write" in low or "set_attribute" in low:
+                total += cnt
+        return total
 
 
 def merge_cip_summaries(summaries: list[CIPAnalysis]) -> CIPAnalysis:
@@ -448,6 +517,20 @@ def merge_cip_summaries(summaries: list[CIPAnalysis]) -> CIPAnalysis:
 
         for service, counter in summary.service_endpoints.items():
             merged.service_endpoints.setdefault(service, Counter()).update(counter)
+
+        merged.request_sources.update(summary.request_sources)
+        merged.enumeration_services.update(summary.enumeration_services)
+        merged.tag_reads.update(summary.tag_reads)
+        merged.tag_writes.update(summary.tag_writes)
+        merged.error_status_counts.update(summary.error_status_counts)
+        merged.pccc_commands.update(summary.pccc_commands)
+        merged.first_seen.update(summary.first_seen)
+        merged.cip_success += summary.cip_success
+        merged.cip_errors += summary.cip_errors
+        for tag, counter in summary.tag_endpoints.items():
+            merged.tag_endpoints.setdefault(tag, Counter()).update(counter)
+        for svc, counter in summary.pccc_endpoints.items():
+            merged.pccc_endpoints.setdefault(svc, Counter()).update(counter)
 
         merged.artifacts.extend(summary.artifacts)
         merged.anomalies.extend(summary.anomalies)
@@ -752,6 +835,49 @@ def _parse_multiple_service_packet(payload: bytes, limit: int = 16) -> list[int]
     return service_codes
 
 
+def parse_multiple_service_subrequests(
+    payload: bytes, limit: int = 32
+) -> list[tuple[Optional[int], Optional[str], Optional[int], Optional[int], Optional[int]]]:
+    """Expand a Multiple_Service_Packet into its sub-requests, returning
+    ``(service_code, tag_name, class_id, instance_id, attribute_id)`` per sub.
+
+    ``_parse_multiple_service_packet`` returns only the service codes; the Tag
+    Access Map needs each sub-request's symbolic tag, which lives in the
+    sub-request's CIP path. Each offset points at a complete CIP message, so we
+    slice offset->next_offset and re-run the standard CIP parser on it.
+    """
+    if len(payload) < 4:
+        return []
+    count = int.from_bytes(payload[0:2], "little")
+    if count <= 0 or count > 64:
+        return []
+    table_len = 2 + (count * 2)
+    if len(payload) < table_len:
+        return []
+    offsets = [
+        int.from_bytes(payload[2 + (i * 2) : 4 + (i * 2)], "little")
+        for i in range(count)
+    ]
+    out: list[tuple[Optional[int], Optional[str], Optional[int], Optional[int], Optional[int]]] = []
+    for i, off in enumerate(offsets[: max(1, limit)]):
+        if off >= len(payload):
+            continue
+        end = offsets[i + 1] if (i + 1) < len(offsets) else len(payload)
+        if end <= off or end > len(payload):
+            end = len(payload)
+        sub = payload[off:end]
+        try:
+            svc, _sname, _isreq, _gstat, _stext, cls, inst, attr, pstr, _cpay = (
+                _parse_cip_message(sub)
+            )
+        except Exception:
+            continue
+        code = (svc & 0x7F) if svc is not None else None
+        tag = _extract_symbol(pstr)
+        out.append((code, tag, cls, inst, attr))
+    return out
+
+
 def _match_sensitive_tag(tag_name: Optional[str]) -> Optional[str]:
     if not tag_name:
         return None
@@ -944,6 +1070,77 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
     security_sessions_seen: set[str] = set()
     sensitive_write_seen: set[str] = set()
     msp_bundle_seen: set[str] = set()
+    # Forensic-baseline state (ported from the --enip upgrade).
+    src_enum_commands: Counter[str] = Counter()
+    src_high_risk_commands: Counter[str] = Counter()
+    src_tag_reads: Counter[str] = Counter()
+    control_events: Counter[tuple[str, str, str]] = Counter()
+    program_events: Counter[tuple[str, str, str]] = Counter()
+    malformed_len_pairs: Counter[str] = Counter()
+    malformed_cpf_pairs: Counter[str] = Counter()
+    cip_pkts_per_pair: Counter[str] = Counter()
+
+    def _classify_service(
+        code: int, name: str, s_ip: str, d_ip: str, tag: str | None
+    ) -> bool:
+        """Risk-tier + tag-map classification for one CIP service invocation.
+        Tag reads = NORMAL; discovery reads = enumeration bucket; config-write/
+        connection/lifecycle = suspicious; write/control/program = high-risk."""
+        is_write = code in WRITE_SERVICE_CODES or code in HIGH_RISK_SERVICE_CODES
+        if code in HIGH_RISK_SERVICE_CODES:
+            analysis.high_risk_services[name] += 1
+            analysis.source_risky_commands[s_ip] += 1
+            src_high_risk_commands[s_ip] += 1
+        if code in SUSPICIOUS_SERVICE_CODES:
+            analysis.suspicious_services[name] += 1
+        if code in DISCOVERY_SERVICE_CODES:
+            analysis.enumeration_services[name] += 1
+            analysis.source_enum_commands[s_ip] += 1
+            src_enum_commands[s_ip] += 1
+        if code in CONTROL_SERVICE_CODES:
+            src_control_commands[s_ip] += 1
+            control_events[(s_ip, d_ip, name)] += 1
+        if code in PROGRAM_SERVICE_CODES:
+            src_program_commands[s_ip] += 1
+            program_events[(s_ip, d_ip, name)] += 1
+        if is_write:
+            src_write_commands[s_ip] += 1
+        if code in READ_TAG_SERVICE_CODES:
+            src_tag_reads[s_ip] += 1
+        if tag:
+            if is_write:
+                analysis.tag_writes[tag] += 1
+            else:
+                analysis.tag_reads[tag] += 1
+            analysis.tag_endpoints.setdefault(tag, Counter())[f"{s_ip} -> {d_ip}"] += 1
+        return is_write
+
+    def _record_pccc(data: bytes, s_ip: str, d_ip: str) -> None:
+        """Decode the PCCC command tunnelled in an Execute_PCCC (0x4B) request.
+        PCCC request header: requestor-id-len(1) + requestor id + CMD(1) + STS(1)
+        + TNS(2) + FNC(1). We locate CMD/FNC and map to a command name; state-
+        changing PCCC (write/mode/program) raises a control finding."""
+        if not data or len(data) < 2:
+            return
+        try:
+            # Requestor ID = Length(1, value = total incl itself, typically 7) +
+            # CIP Vendor(2) + CIP Serial(4). The PCCC command block (CMD, STS,
+            # TNS(2), FNC) starts right after it.
+            id_len = data[0]
+            idx = id_len if 5 <= id_len <= 15 else 7
+            if idx + 1 >= len(data):
+                return
+            cmd = data[idx]
+            # CMD 0x0F (command) and 0x06 (unprotected) carry FNC after STS+TNS.
+            fnc_idx = idx + 4
+            fnc = data[fnc_idx] if fnc_idx < len(data) else 0
+            name = PCCC_COMMANDS.get((cmd, fnc), f"PCCC CMD 0x{cmd:02x} FNC 0x{fnc:02x}")
+            analysis.pccc_commands[name] += 1
+            analysis.pccc_endpoints.setdefault(name, Counter())[f"{s_ip} -> {d_ip}"] += 1
+            if (cmd, fnc) in PCCC_WRITE_CMDS:
+                control_events[(s_ip, d_ip, f"PCCC {name}")] += 1
+        except Exception:
+            return
 
     try:
         with status as pbar:
@@ -997,7 +1194,13 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
 
                 if not matches_port and not matches_signature:
                     continue
-                if matches_signature and not matches_port:
+                # Non-standard port = NEITHER endpoint uses a CIP port. A server
+                # response from :44818 to a low client ephemeral port is standard
+                # CIP, not a non-standard-port flow.
+                both_ports_nonstandard = (
+                    sport not in _CIP_PORTS and dport not in _CIP_PORTS
+                )
+                if matches_signature and both_ports_nonstandard:
                     nonstandard_sessions[f"{src_ip}:{sport} -> {dst_ip}:{dport}"] += 1
 
                 analysis.cip_packets += 1
@@ -1009,6 +1212,9 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                 analysis.dst_ips[dst_ip] += 1
                 analysis.sessions[f"{src_ip}:{sport} -> {dst_ip}:{dport}"] += 1
                 src_dst_counts[src_ip][dst_ip] += 1
+                if ts is not None:
+                    analysis.first_seen.setdefault(src_ip, ts)
+                    analysis.first_seen.setdefault(dst_ip, ts)
 
                 if sport == CIP_SECURITY_PORT or dport == CIP_SECURITY_PORT:
                     sec_key = f"cip_security_port:{src_ip}->{dst_ip}"
@@ -1056,6 +1262,8 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                 response_like = (
                     sport in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}
                 ) and (dport not in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT})
+                if request_like:
+                    analysis.request_sources[src_ip] += 1
 
                 enip = _parse_enip_details(payload)
                 encap_command = enip.get("command")
@@ -1125,42 +1333,15 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                             )
                         )
 
-                _ml_key = f"Malformed ENIP Length|{src_ip}|{dst_ip}"
-                if (
-                    length_mismatch
-                    and _ml_key not in enip_layer_anom_seen
-                    and len(analysis.anomalies) < max_anomalies
-                ):
-                    enip_layer_anom_seen.add(_ml_key)
-                    analysis.anomalies.append(
-                        IndustrialAnomaly(
-                            severity="MEDIUM",
-                            title="Malformed ENIP Length",
-                            description="ENIP declared payload length does not match observed payload size.",
-                            src=src_ip,
-                            dst=dst_ip,
-                            ts=ts or 0.0,
-                        )
-                    )
-
-                _cpf_key = f"Malformed ENIP CPF|{src_ip}|{dst_ip}"
-                if (
-                    is_cip_carrier
-                    and cpf_malformed
-                    and _cpf_key not in enip_layer_anom_seen
-                    and len(analysis.anomalies) < max_anomalies
-                ):
-                    enip_layer_anom_seen.add(_cpf_key)
-                    analysis.anomalies.append(
-                        IndustrialAnomaly(
-                            severity="MEDIUM",
-                            title="Malformed ENIP CPF",
-                            description="Common Packet Format item table appears truncated or malformed.",
-                            src=src_ip,
-                            dst=dst_ip,
-                            ts=ts or 0.0,
-                        )
-                    )
+                # length_mismatch = (declared > observed) is the TCP-segmentation
+                # direction, not malformation (tshark full-reassembly sees 0). Count
+                # per pair and only flag a sustained corruption flood post-loop.
+                pair_key = f"{src_ip} -> {dst_ip}"
+                cip_pkts_per_pair[pair_key] += 1
+                if length_mismatch:
+                    malformed_len_pairs[pair_key] += 1
+                if is_cip_carrier and cpf_malformed:
+                    malformed_cpf_pairs[pair_key] += 1
 
                 if (
                     is_cip_carrier
@@ -1251,28 +1432,22 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                     analysis.cip_services[service_name] += 1
                     actor_ip = src_ip if is_request else dst_ip
                     src_commands[actor_ip][service_name] += 1
-                    endpoints = analysis.service_endpoints.setdefault(
-                        service_name, Counter()
-                    )
-                    endpoints[f"{src_ip} -> {dst_ip}"] += 1
+                    # Attribute to the request (client -> server) direction only,
+                    # so a service isn't listed as both "A -> B" and "B -> A".
+                    if is_request:
+                        endpoints = analysis.service_endpoints.setdefault(
+                            service_name, Counter()
+                        )
+                        endpoints[f"{src_ip} -> {dst_ip}"] += 1
 
                     if is_request and service_code is not None:
-                        is_write_service = (
-                            service_code in WRITE_SERVICE_CODES
-                            or service_code in HIGH_RISK_SERVICE_CODES
+                        is_write_service = _classify_service(
+                            service_code, service_name, src_ip, dst_ip, tag_name
                         )
-                        if service_code in HIGH_RISK_SERVICE_CODES:
-                            analysis.high_risk_services[service_name] += 1
-                            analysis.source_risky_commands[src_ip] += 1
-                        if is_write_service:
-                            src_write_commands[src_ip] += 1
-                        elif service_code in ENUMERATION_SERVICE_CODES:
-                            analysis.suspicious_services[service_name] += 1
-                            analysis.source_enum_commands[src_ip] += 1
-                        if service_code in CONTROL_SERVICE_CODES:
-                            src_control_commands[src_ip] += 1
-                        if service_code in PROGRAM_SERVICE_CODES:
-                            src_program_commands[src_ip] += 1
+
+                        # Decode PCCC (legacy AB) carried in Execute_PCCC (0x4B).
+                        if service_code == PCCC_EXECUTE_SERVICE_CODE:
+                            _record_pccc(cip_payload, src_ip, dst_ip)
 
                         if service_code == 0x0A:
                             sub_codes = _parse_multiple_service_packet(cip_payload)
@@ -1299,32 +1474,29 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                                             ts=ts or 0.0,
                                         )
                                     )
-                                for sub_code, sub_name in zip(sub_codes, sub_names):
+                                # Expand sub-requests to recover each one's tag
+                                # (the Tag Access Map lives here — Logix tag reads
+                                # are MSP sub-requests).
+                                sub_details = parse_multiple_service_subrequests(
+                                    cip_payload, limit=max(16, len(sub_codes))
+                                )
+                                for si, sub_code in enumerate(sub_codes):
+                                    sub_name = sub_names[si]
                                     msp_service_name = f"MSP/{sub_name}"
                                     analysis.cip_services[msp_service_name] += 1
                                     msp_eps = analysis.service_endpoints.setdefault(
                                         msp_service_name, Counter()
                                     )
                                     msp_eps[f"{src_ip} -> {dst_ip}"] += 1
-                                    if sub_code in HIGH_RISK_SERVICE_CODES:
-                                        analysis.high_risk_services[
-                                            msp_service_name
-                                        ] += 1
-                                        analysis.source_risky_commands[src_ip] += 1
-                                    if sub_code in ENUMERATION_SERVICE_CODES:
-                                        analysis.suspicious_services[
-                                            msp_service_name
-                                        ] += 1
-                                        analysis.source_enum_commands[src_ip] += 1
-                                    if sub_code in CONTROL_SERVICE_CODES:
-                                        src_control_commands[src_ip] += 1
-                                    if sub_code in PROGRAM_SERVICE_CODES:
-                                        src_program_commands[src_ip] += 1
-                                    if (
-                                        sub_code in WRITE_SERVICE_CODES
-                                        or sub_code in HIGH_RISK_SERVICE_CODES
-                                    ):
-                                        src_write_commands[src_ip] += 1
+                                    sub_tag = (
+                                        sub_details[si][1]
+                                        if si < len(sub_details)
+                                        and sub_details[si][0] == sub_code
+                                        else None
+                                    )
+                                    _classify_service(
+                                        sub_code, msp_service_name, src_ip, dst_ip, sub_tag
+                                    )
 
                                 high_risk_subs = sorted(
                                     {
@@ -1567,6 +1739,11 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                 if general_status is not None:
                     status_text = general_status_text or f"0x{general_status:02x}"
                     analysis.status_codes[f"CIP:{status_text}"] += 1
+                    if general_status == 0x00:
+                        analysis.cip_success += 1
+                    else:
+                        analysis.cip_errors += 1
+                        analysis.error_status_counts[status_text] += 1
 
                     if general_status != 0x00:
                         if service_name:
@@ -1846,20 +2023,90 @@ def analyze_cip(path: Path, show_status: bool = True) -> CIPAnalysis:
                     )
                 )
 
-    for src, enum_count in analysis.source_enum_commands.items():
+    # Scanner shape = discovery across many targets with (near-)zero operational
+    # tag I/O. An HMI also issues identity/attribute reads but is dominated by
+    # real tag reads — gate on the ABSENCE of tag I/O, not enumeration volume.
+    for src, enum_count in src_enum_commands.items():
         unique_dsts = len(src_dst_counts.get(src, {}))
-        if enum_count >= 30 and unique_dsts >= 8:
-            if len(analysis.anomalies) < max_anomalies:
-                analysis.anomalies.append(
-                    IndustrialAnomaly(
-                        severity="MEDIUM",
-                        title="CIP Reconnaissance Campaign",
-                        description=f"Enumeration-heavy behavior observed across {unique_dsts} endpoints ({enum_count} requests).",
-                        src=src,
-                        dst="*",
-                        ts=0.0,
-                    )
+        tag_reads = src_tag_reads.get(src, 0)
+        if (
+            enum_count >= 30
+            and unique_dsts >= 8
+            and tag_reads < 10
+            and len(analysis.anomalies) < max_anomalies
+        ):
+            analysis.anomalies.append(
+                IndustrialAnomaly(
+                    severity="MEDIUM",
+                    title="CIP Enumeration Campaign",
+                    description=(
+                        f"Discovery-only CIP from {src} — {enum_count} identity/"
+                        f"attribute reads across {unique_dsts} endpoints with no "
+                        "operational tag I/O. Scanner shape, active OT discovery (T0846)."
+                    ),
+                    src=src,
+                    dst="*",
+                    ts=0.0,
                 )
+            )
+
+    # Control (Reset/Start/Stop) and program transfer are catastrophic even once.
+    for (s_ip, d_ip, name), count in control_events.items():
+        if len(analysis.anomalies) >= max_anomalies:
+            break
+        suffix = f" (x{count})" if count > 1 else ""
+        analysis.anomalies.append(
+            IndustrialAnomaly(
+                severity="HIGH",
+                title="CIP Control Command",
+                description=(
+                    f"{name} issued to {d_ip}{suffix} — changes controller run "
+                    "state / logic (T0816/T0858/T0831). Confirm an authorized "
+                    "engineering source within a change window."
+                ),
+                src=s_ip,
+                dst=d_ip,
+                ts=0.0,
+            )
+        )
+    for (s_ip, d_ip, name), count in program_events.items():
+        if len(analysis.anomalies) >= max_anomalies:
+            break
+        suffix = f" (x{count})" if count > 1 else ""
+        analysis.anomalies.append(
+            IndustrialAnomaly(
+                severity="HIGH",
+                title="CIP Program Transfer",
+                description=(
+                    f"{name} to/from {d_ip}{suffix} — control-logic upload/download "
+                    "(T0843/T0845), the Stuxnet-class injection vector."
+                ),
+                src=s_ip,
+                dst=d_ip,
+                ts=0.0,
+            )
+        )
+
+    # Malformed-frame flood (segmentation-safe): only above a sustained ratio.
+    for pair, mcount in list(malformed_len_pairs.items()) + list(malformed_cpf_pairs.items()):
+        total = cip_pkts_per_pair.get(pair, 0)
+        ratio = (mcount / total) if total else 0.0
+        if mcount >= 50 and ratio >= 0.5 and len(analysis.anomalies) < max_anomalies:
+            s_ip, _, d_ip = pair.partition(" -> ")
+            analysis.anomalies.append(
+                IndustrialAnomaly(
+                    severity="MEDIUM",
+                    title="Malformed ENIP Frames",
+                    description=(
+                        f"{mcount} malformed frames ({ratio:.0%} of the flow) — "
+                        "sustained corruption/fuzzing, not TCP segmentation."
+                    ),
+                    src=s_ip,
+                    dst=d_ip or "*",
+                    ts=0.0,
+                )
+            )
+            break
 
     for src, register_count in src_register_commands.items():
         unregister_count = src_unregister_commands.get(src, 0)

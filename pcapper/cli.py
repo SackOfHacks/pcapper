@@ -100,7 +100,7 @@ from .niagara import analyze_niagara
 from .ntlm import analyze_ntlm
 from .ntp import analyze_ntp
 from .obfuscation import analyze_obfuscation, merge_obfuscation_summaries
-from .odesys import analyze_odesys
+from .codesys import analyze_codesys
 from .opc import analyze_opc
 from .opc_classic import analyze_opc_classic
 from .overview import analyze_overview, merge_overview_summaries
@@ -197,7 +197,7 @@ from .reporting import (
     render_ntlm_summary,
     render_ntp_summary,
     render_obfuscation_summary,
-    render_odesys_summary,
+    render_codesys_summary,
     render_opc_classic_summary,
     render_opc_summary,
     render_overview_summary,
@@ -407,7 +407,7 @@ def _builtin_flag_map() -> dict[str, str]:
         "--pcworx": "pcworx",
         "--melsec": "melsec",
         "--cip": "cip",
-        "--odesys": "odesys",
+        "--codesys": "codesys",
         "--niagara": "niagara",
         "--mms": "mms",
         "--srtp": "srtp",
@@ -800,7 +800,7 @@ def _run_self_check(
             "enip_mappings.json",
             "siemens_mappings.json",
             "niagara_opcodes.json",
-            "odesys_opcodes.json",
+            "codesys_opcodes.json",
         ]
         for filename in required_files:
             exists = (importlib_resources.files("pcapper") / filename).is_file()
@@ -1413,6 +1413,32 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Max decrypted streams per protocol (default: 50).",
     )
     general.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Disable the skeptical filter — raw un-filtered verdicts, "
+            "including FP-prone flags (SYN-flood-to-CDN as blocked-egress, "
+            "vendor-polling as periodic-C2, HTTP fan-out to single host, "
+            "blocked TLS tunnel as SNI suppression). Default off = filter "
+            "applied and each match annotated with a `[skeptical: rule]` "
+            "tag + downgraded severity. See `pcapper.skeptical`."
+        ),
+    )
+    general.add_argument(
+        "--hypothesis",
+        metavar="REGEX",
+        help=(
+            "Case-insensitive regex — every detection is tagged "
+            "`hypothesis_relevance` = relevant / adjacent / unrelated based "
+            "on whether the pattern matches its summary + details + "
+            "MITRE technique ids. Handy on a big capture: `--hypothesis "
+            "'referrer|host header|SNI|T1071|T1090'` labels every finding "
+            "that touches HTTP-Referrer or C2 comms. Adjacent = same "
+            "ATT&CK tactic family but not a direct match. Renderers show "
+            "a `[relevant]` tag next to matching findings."
+        ),
+    )
+    general.add_argument(
         "--json",
         metavar="PATH",
         help="Write JSON export of results to PATH.",
@@ -1796,7 +1822,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--modicon", "Include Modicon/Unity analysis (Modbus family)."),
         ("--mqtt", "Include MQTT analysis (publish/subscribe IoT/ICS)."),
         ("--niagara", "Include Niagara Fox analysis (building automation)."),
-        ("--odesys", "Include ODESYS analysis (programming traffic)."),
+        ("--codesys", "Include CODESYS (CoDeSys) programming-traffic analysis."),
         ("--opc", "Include OPC UA analysis (secure channel, messages)."),
         ("--pccc", "Include PCCC analysis (AB/DF1 over IP)."),
         ("--pcworx", "Include PCWorx analysis (PLC operations)."),
@@ -2103,7 +2129,7 @@ def _analyze_paths(
     show_pcworx: bool,
     show_melsec: bool,
     show_cip: bool,
-    show_odesys: bool,
+    show_codesys: bool,
     show_niagara: bool,
     show_mms: bool,
     show_srtp: bool,
@@ -3442,13 +3468,13 @@ def _analyze_paths(
                 else:
                     print(render_cip_summary(summary))
                 export_summaries["cip"] = summary
-            elif step == "odesys" and show_odesys:
-                summary = analyze_odesys(path, show_status=step_status)
+            elif step == "codesys" and show_codesys:
+                summary = analyze_codesys(path, show_status=step_status)
                 if summarize_rollups:
-                    rollups.setdefault("odesys", []).append(summary)
+                    rollups.setdefault("codesys", []).append(summary)
                 else:
-                    print(render_odesys_summary(summary))
-                export_summaries["odesys"] = summary
+                    print(render_codesys_summary(summary))
+                export_summaries["codesys"] = summary
             elif step == "niagara" and show_niagara:
                 summary = analyze_niagara(path, show_status=step_status)
                 if summarize_rollups:
@@ -4135,7 +4161,7 @@ def _analyze_paths(
             "pcworx": "PCWORX ANALYSIS",
             "melsec": "MELSEC-Q ANALYSIS",
             "cip": "CIP ANALYSIS",
-            "odesys": "ODESYS ANALYSIS",
+            "codesys": "CODESYS ANALYSIS",
             "niagara": "NIAGARA FOX ANALYSIS",
             "mms": "IEC 61850 MMS ANALYSIS",
             "srtp": "GE SRTP ANALYSIS",
@@ -4515,6 +4541,21 @@ def main() -> int:
     if args.no_color:
         set_color_override(False)
     set_verbose_output(args.verbose)
+    # Piggy-back the --verbose flag: emit per-module start/finish/timing
+    # lines to stderr so long-running invocations show visible progress
+    # even on non-TTY (background/CI) captures where the spinner is a no-op.
+    from .progress import set_verbose_progress as _set_verbose_progress
+    _set_verbose_progress(bool(args.verbose))
+    # Wire the skeptical filter's module-level default so every subsequent
+    # apply_skeptical_filter(...) call (from _append_detection_items in
+    # threats.py) reads the right value without threading `strict=` through
+    # every analyzer signature.
+    from .skeptical import set_default_strict as _set_skeptical_strict
+    _set_skeptical_strict(bool(getattr(args, "strict", False)))
+    # Same pattern for the hypothesis lens — set once at startup, read
+    # every time _append_detection_items merges a detection.
+    from .hypothesis import set_active_lens as _set_active_lens
+    _set_active_lens(getattr(args, "hypothesis", None))
     if (
         getattr(args, "vt", False)
         and getattr(args, "dns", False)
@@ -4939,7 +4980,7 @@ def main() -> int:
             show_pcworx=args.pcworx,
             show_melsec=args.melsec,
             show_cip=args.cip,
-            show_odesys=args.odesys,
+            show_codesys=args.codesys,
             show_niagara=args.niagara,
             show_mms=args.mms,
             show_srtp=args.srtp,

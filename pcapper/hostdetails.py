@@ -5,17 +5,20 @@ from .utils import is_public_ip as _is_public_ip
 import ipaddress
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
 from .arp import analyze_arp
 from .creds import analyze_creds
+from .tls import analyze_tls
+from .smb import analyze_smb
+from .email import analyze_email
 from .dhcp import analyze_dhcp
 from .files import analyze_files
 from .hostname import analyze_hostname
 from .ips import analyze_ips
-from .netbios import analyze_netbios
+from .netbios import analyze_netbios, collect_netbios_host_intel
 from .kerberos import analyze_kerberos
 from .progress import run_with_busy_status
 from .services import analyze_services
@@ -96,7 +99,6 @@ class HostDetailsSummary:
     file_transfers: list[dict[str, object]]
     dns_queries: list[dict[str, object]]
     web_requests: list[dict[str, object]]
-    timeline_events: list[dict[str, object]]
     peer_counts: Counter[str]
     protocol_counts: Counter[str]
     port_counts: Counter[int]
@@ -115,6 +117,16 @@ class HostDetailsSummary:
     host_verdict_score: int
     host_verdict_reasons: list[str]
     errors: list[str]
+    # Browser (MS-BRWS) announced identity for the target host.
+    netbios_roles: list[str] = field(default_factory=list)
+    netbios_domain: str = ""
+    netbios_comment: str = ""
+    # Deep host-centric detail sections (TH/IR/forensics).
+    auth_events: list[dict[str, object]] = field(default_factory=list)
+    tls_fingerprints: list[dict[str, object]] = field(default_factory=list)
+    smb_access: list[dict[str, object]] = field(default_factory=list)
+    email_activity: list[dict[str, object]] = field(default_factory=list)
+    peer_intel: list[dict[str, object]] = field(default_factory=list)
 
 
 def _canonical_ip(value: str | None) -> str | None:
@@ -131,7 +143,6 @@ def _canonical_ip(value: str | None) -> str | None:
 
 def _host_window(
     conversations: list[dict[str, object]],
-    timeline_events: list[dict[str, object]],
     dns_queries: list[dict[str, object]],
     file_transfers: list[dict[str, object]],
 ) -> tuple[Optional[float], Optional[float]]:
@@ -141,10 +152,6 @@ def _host_window(
             value = row.get(key)
             if isinstance(value, (int, float)):
                 points.append(float(value))
-    for row in timeline_events:
-        value = row.get("ts")
-        if isinstance(value, (int, float)):
-            points.append(float(value))
     for row in dns_queries:
         value = row.get("ts")
         if isinstance(value, (int, float)):
@@ -277,7 +284,6 @@ def _infer_operating_system(
         "yokogawa",
         "honeywell",
         "codesys",
-        "odesys",
     }
     appliance_markers = {
         "router",
@@ -472,7 +478,6 @@ def merge_hostdetails_summaries(
             file_transfers=[],
             dns_queries=[],
             web_requests=[],
-            timeline_events=[],
             peer_counts=Counter(),
             protocol_counts=Counter(),
             port_counts=Counter(),
@@ -523,8 +528,6 @@ def merge_hostdetails_summaries(
     dns_seen: set[tuple[object, ...]] = set()
     web_requests: list[dict[str, object]] = []
     web_seen: set[tuple[object, ...]] = set()
-    timeline_events: list[dict[str, object]] = []
-    timeline_seen: set[tuple[object, ...]] = set()
     peer_counts: Counter[str] = Counter()
     protocol_counts: Counter[str] = Counter()
     port_counts: Counter[int] = Counter()
@@ -674,17 +677,6 @@ def merge_hostdetails_summaries(
             web_seen.add(key)
             web_requests.append(dict(req))
 
-        for event in summary.timeline_events:
-            key = (
-                event.get("ts"),
-                event.get("category"),
-                event.get("summary"),
-                event.get("details"),
-            )
-            if key in timeline_seen:
-                continue
-            timeline_seen.add(key)
-            timeline_events.append(dict(event))
         peer_counts.update(summary.peer_counts)
         protocol_counts.update(summary.protocol_counts)
         port_counts.update(summary.port_counts)
@@ -806,7 +798,6 @@ def merge_hostdetails_summaries(
     )
     dns_queries.sort(key=lambda item: (item.get("ts") is None, item.get("ts")))
     web_requests.sort(key=lambda item: (item.get("ts") is None, item.get("ts")))
-    timeline_events.sort(key=lambda item: (item.get("ts") is None, item.get("ts")))
     file_transfers.sort(
         key=lambda item: (
             item.get("first_seen") is None,
@@ -850,7 +841,6 @@ def merge_hostdetails_summaries(
         file_transfers=file_transfers,
         dns_queries=dns_queries,
         web_requests=web_requests,
-        timeline_events=timeline_events,
         peer_counts=peer_counts,
         protocol_counts=protocol_counts,
         port_counts=port_counts,
@@ -915,7 +905,6 @@ def analyze_hostdetails(
             file_transfers=[],
             dns_queries=[],
             web_requests=[],
-            timeline_events=[],
             peer_counts=Counter(),
             protocol_counts=Counter(),
             port_counts=Counter(),
@@ -948,7 +937,6 @@ def analyze_hostdetails(
     file_seen: set[tuple[str, ...]] = set()
     dns_queries: list[dict[str, object]] = []
     web_requests: list[dict[str, object]] = []
-    timeline_events: list[dict[str, object]] = []
 
     def add_file_transfer(
         *,
@@ -1076,6 +1064,9 @@ def analyze_hostdetails(
     )
     arp_summary = _busy("ARP", analyze_arp, path, show_status=False)
     dhcp_summary = _busy("DHCP", analyze_dhcp, path, show_status=False)
+    tls_summary = _busy("TLS", analyze_tls, path, show_status=False)
+    smb_summary = _busy("SMB", analyze_smb, path, show_status=False)
+    email_summary = _busy("Email", analyze_email, path, show_status=False)
 
     errors.extend(getattr(ips_summary, "errors", []))
     errors.extend(getattr(hostname_summary, "errors", []))
@@ -1129,6 +1120,14 @@ def analyze_hostdetails(
             for port in conv.ports
             if int(port) in service_port_map.get(peer, set())
         )
+        # Service port(s) the FOCUSED HOST serves in this conversation — i.e. the
+        # peer connected INTO the host here (host is the server/responder). Feeds
+        # the "Remote Access Into This Host" view.
+        local_service_ports = sorted(
+            int(port)
+            for port in conv.ports
+            if int(port) in service_port_map.get(target_ip, set())
+        )
         conversations.append(
             {
                 "direction": direction,
@@ -1144,6 +1143,7 @@ def analyze_hostdetails(
                 if conv.ports
                 else "-",
                 "remote_service_ports": peer_service_ports,
+                "local_service_ports": local_service_ports,
             }
         )
 
@@ -1227,6 +1227,47 @@ def analyze_hostdetails(
                 }
             )
 
+    # Browser (MS-BRWS) announced identity for the target: hostname, OS, server
+    # roles (DC/SQL/print/master-browser), domain/workgroup, and comment — a
+    # passive, self-reported fact sheet that needs no active probing.
+    netbios_roles: list[str] = []
+    netbios_domain = ""
+    netbios_comment = ""
+    netbios_os = ""
+    try:
+        nb_intel = collect_netbios_host_intel(netbios_summary)
+    except Exception:
+        nb_intel = {}
+    for intel_ip, facts in nb_intel.items():
+        if (_canonical_ip(intel_ip) or str(intel_ip)) != target_canonical:
+            continue
+        bname = str(facts.get("hostname", "") or "").strip()
+        if bname:
+            hostnames.add(bname)
+            hostname_findings.append(
+                {
+                    "hostname": bname,
+                    "mapped_ip": target_ip,
+                    "method": "netbios-browser",
+                    "protocol": "Browser",
+                    "confidence": "high",
+                    "details": (
+                        "Browser (MS-BRWS) announcement"
+                        + (f" in domain {facts.get('domain')}" if facts.get("domain") else "")
+                    ),
+                    "src_ip": target_ip,
+                    "dst_ip": "-",
+                    "first_seen": None,
+                    "last_seen": None,
+                    "count": 1,
+                }
+            )
+        netbios_roles = [str(r) for r in facts.get("roles", []) or []]
+        netbios_domain = str(facts.get("domain", "") or "")
+        netbios_comment = str(facts.get("comment", "") or "")
+        netbios_os = str(facts.get("os", "") or "")
+        break
+
     for query in timeline_summary.dns_queries:
         dns_queries.append(
             {
@@ -1273,18 +1314,6 @@ def analyze_hostdetails(
                 "response_name": str(getattr(req, "response_name", "") or ""),
                 "risk_level": str(getattr(req, "risk_level", "") or ""),
                 "risk_score": int(getattr(req, "risk_score", 0) or 0),
-            }
-        )
-
-    for event in timeline_summary.events:
-        timeline_events.append(
-            {
-                "ts": event.ts,
-                "category": event.category,
-                "summary": event.summary,
-                "details": event.details,
-                "packet_index": getattr(event, "packet_index", None),
-                "source": getattr(event, "source", "timeline"),
             }
         )
 
@@ -1450,9 +1479,6 @@ def analyze_hostdetails(
         file_transfers = [
             item for item in file_transfers if _row_matches_search(item, search_token)
         ]
-        timeline_events = [
-            item for item in timeline_events if _row_matches_search(item, search_token)
-        ]
         conversations = [
             item for item in conversations if _row_matches_search(item, search_token)
         ]
@@ -1480,6 +1506,11 @@ def analyze_hostdetails(
     operating_system, os_evidence = _infer_operating_system(
         hostnames, services, dhcp_summary, user_agents=list(host_user_agents)
     )
+    # A Browser-announced OS is a direct, self-reported signal; adopt it when
+    # the naming/service heuristics couldn't determine one.
+    if netbios_os and (not operating_system or operating_system in ("Unknown", "-", "")):
+        operating_system = netbios_os
+        os_evidence = list(os_evidence) + [f"Browser (MS-BRWS) announced OS: {netbios_os}"]
     hostname_findings.sort(
         key=lambda item: int(item.get("count", 0) or 0), reverse=True
     )
@@ -1494,7 +1525,7 @@ def analyze_hostdetails(
     )
 
     host_first_seen, host_last_seen = _host_window(
-        conversations, timeline_events, dns_queries, file_transfers
+        conversations, dns_queries, file_transfers
     )
     if host_first_seen is None:
         host_first_seen = getattr(ips_summary, "first_seen", None)
@@ -1744,6 +1775,155 @@ def analyze_hostdetails(
         reverse=True,
     )
 
+    # ---- Deep host-centric detail sections (best-effort, host-scoped) -------
+    auth_events: list[dict[str, object]] = []
+    try:
+        for hit in getattr(creds_summary, "hits", []) or []:
+            s_ip = str(getattr(hit, "src_ip", "") or "")
+            d_ip = str(getattr(hit, "dst_ip", "") or "")
+            if target_ip not in (s_ip, d_ip):
+                continue
+            secret = getattr(hit, "secret", None)
+            auth_events.append(
+                {
+                    "ts": getattr(hit, "ts", None),
+                    "protocol": str(getattr(hit, "protocol", "") or "-"),
+                    "kind": str(getattr(hit, "kind", "") or "-"),
+                    "direction": "outbound" if s_ip == target_ip else "inbound",
+                    "peer": d_ip if s_ip == target_ip else s_ip,
+                    "username": str(getattr(hit, "username", "") or "-"),
+                    "secret_exposed": bool(secret),
+                    "evidence": str(getattr(hit, "evidence", "") or ""),
+                }
+            )
+    except Exception:
+        pass
+
+    peer_intel: list[dict[str, object]] = []
+    try:
+        enrichment = getattr(ips_summary, "ip_enrichment", {}) or {}
+        intel_by_ip: dict[str, list[str]] = {}
+        for finding in getattr(ips_summary, "intel_findings", []) or []:
+            fip = str(finding.get("ip", "") or "")
+            if fip:
+                intel_by_ip.setdefault(fip, []).append(
+                    str(finding.get("summary", finding.get("detail", "")) or "")
+                )
+        for peer, pkts in peer_counts.most_common(40):
+            enr = enrichment.get(peer, {})
+            intel = intel_by_ip.get(peer, [])
+            if not enr and not intel and not _is_public_ip(peer):
+                continue
+            geo_bits = [
+                str(enr.get(k))
+                for k in ("country", "geo", "asn", "org")
+                if enr.get(k)
+            ]
+            flags = [f for f in ("hosting", "proxy", "mobile") if enr.get(f)]
+            peer_intel.append(
+                {
+                    "peer": peer,
+                    "scope": "external" if _is_public_ip(peer) else "internal",
+                    "geo": " / ".join(dict.fromkeys(geo_bits)) or "-",
+                    "flags": ",".join(flags) or "-",
+                    "intel": "; ".join(intel[:2]) or "-",
+                    "packets": int(pkts),
+                }
+            )
+    except Exception:
+        pass
+
+    tls_fingerprints: list[dict[str, object]] = []
+    try:
+        sni_to_clients = getattr(tls_summary, "sni_to_clients", {}) or {}
+        for sni, clients in sni_to_clients.items():
+            if target_ip in (clients or {}):
+                tls_fingerprints.append(
+                    {
+                        "sni": str(sni),
+                        "count": int(clients.get(target_ip, 0)),
+                        "ja3": "-",
+                    }
+                )
+        tls_fingerprints.sort(key=lambda r: -int(r.get("count", 0)))
+    except Exception:
+        pass
+
+    smb_access: list[dict[str, object]] = []
+    try:
+        shares_by_server: dict[str, list] = {}
+        for share in getattr(smb_summary, "shares", []) or []:
+            srv = str(getattr(share, "server_ip", "") or "")
+            shares_by_server.setdefault(srv, []).append(
+                (str(getattr(share, "name", "") or ""), bool(getattr(share, "is_admin", False)))
+            )
+        _smb_seen: set = set()
+        for sess in getattr(smb_summary, "sessions", []) or []:
+            c_ip = str(getattr(sess, "client_ip", "") or "")
+            s_ip = str(getattr(sess, "server_ip", "") or "")
+            if target_ip not in (c_ip, s_ip):
+                continue
+            role = "client" if c_ip == target_ip else "server"
+            server_shares = shares_by_server.get(s_ip, [])
+            share_names = ", ".join(n for n, _a in server_shares[:5]) or "-"
+            _sk = (role, c_ip, s_ip, share_names, str(getattr(sess, "username", "") or ""))
+            if _sk in _smb_seen:
+                continue
+            _smb_seen.add(_sk)
+            smb_access.append(
+                {
+                    "role": role,
+                    "peer": s_ip if role == "client" else c_ip,
+                    "shares": share_names,
+                    "admin": any(a for _n, a in server_shares),
+                    "user": str(getattr(sess, "username", "") or "-"),
+                    "version": str(getattr(sess, "smb_version", "-") or "-"),
+                    "signing": "yes" if getattr(sess, "signing_required", False) else "no",
+                }
+            )
+        # If there were no session objects, fall back to shares the host serves.
+        if not smb_access:
+            for name, is_admin in shares_by_server.get(target_ip, []):
+                smb_access.append(
+                    {
+                        "role": "server",
+                        "peer": "-",
+                        "shares": name,
+                        "admin": is_admin,
+                        "user": "-",
+                        "version": "-",
+                        "signing": "-",
+                    }
+                )
+    except Exception:
+        pass
+
+    email_activity: list[dict[str, object]] = []
+    try:
+        e_clients = getattr(email_summary, "client_counts", {}) or {}
+        e_servers = getattr(email_summary, "server_counts", {}) or {}
+        if target_ip in e_clients or target_ip in e_servers:
+            role = "client (sender)" if target_ip in e_clients else "server"
+            for field_name, counter in (
+                ("From", getattr(email_summary, "from_counts", {}) or {}),
+                ("To", getattr(email_summary, "to_counts", {}) or {}),
+                ("Subject", getattr(email_summary, "subject_counts", {}) or {}),
+                ("Account", getattr(email_summary, "username_counts", {}) or {}),
+            ):
+                for value, cnt in list(
+                    counter.most_common(4) if hasattr(counter, "most_common") else list(counter.items())[:4]
+                ):
+                    if str(value).strip():
+                        email_activity.append(
+                            {"role": role, "field": field_name, "value": str(value), "count": int(cnt)}
+                        )
+            if getattr(email_summary, "password_counts", None):
+                email_activity.append(
+                    {"role": role, "field": "Password", "value": "EXPOSED", "count": 1}
+                )
+    except Exception:
+        pass
+
     return HostDetailsSummary(
         path=path,
         target_ip=target_ip,
@@ -1769,7 +1949,6 @@ def analyze_hostdetails(
         file_transfers=file_transfers,
         dns_queries=dns_queries,
         web_requests=web_requests,
-        timeline_events=timeline_events,
         peer_counts=peer_counts,
         protocol_counts=protocol_counts,
         port_counts=port_counts,
@@ -1788,4 +1967,12 @@ def analyze_hostdetails(
         host_verdict_score=host_verdict_score,
         host_verdict_reasons=host_verdict_reasons,
         errors=dedup_errors,
+        netbios_roles=netbios_roles,
+        netbios_domain=netbios_domain,
+        netbios_comment=netbios_comment,
+        auth_events=auth_events,
+        tls_fingerprints=tls_fingerprints,
+        smb_access=smb_access,
+        email_activity=email_activity,
+        peer_intel=peer_intel,
     )

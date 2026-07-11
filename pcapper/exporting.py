@@ -20,14 +20,72 @@ def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def _detections_of(summary: Any) -> list[dict[str, Any]]:
+    """Return the ``detections`` list of a summary object, or []."""
+    detections = getattr(summary, "detections", None)
+    if isinstance(detections, list):
+        return [d for d in detections if isinstance(d, dict)]
+    return []
+
+
+def _build_verdict_summary_payload(summary: Any) -> dict[str, Any] | None:
+    """Return a JSON-safe verdict-summary block for a compromise-style
+    summary, or ``None`` when the summary has no detections. Small and
+    isolated so consumers of the JSON can grep for `verdict_summary` and
+    read the accept/reject candidates without re-parsing markdown."""
+    dets = _detections_of(summary)
+    if not dets:
+        return None
+    try:
+        from .verdict_summary import summarize as _summarize_verdict
+    except Exception:  # noqa: BLE001
+        return None
+    vs = _summarize_verdict(dets)
+    candidates = [
+        {
+            "category": c.category,
+            "summary": c.summary,
+            "source": c.source,
+            "severity": c.severity,
+            "count": c.count,
+            "skeptical_rule": c.skeptical_rule,
+            "hypothesis_relevance": c.hypothesis_relevance,
+            "examples": list(c.examples),
+        }
+        for c in vs.candidates
+    ]
+    return {"total_detections": vs.total_detections, "candidates": candidates}
+
+
 def export_json(bundle: ExportBundle, output_path: Path) -> None:
     _ensure_parent(output_path)
-    payload = {
+    summaries_payload: dict[str, Any] = {}
+    for name, summary in bundle.summaries.items():
+        summaries_payload[name] = to_serializable(summary)
+    # Enrich with a top-level verdict-summary block. Same synthesized
+    # accept/reject candidates the compromise renderer surfaces, only
+    # in a structure downstream tooling can consume without markdown
+    # parsing. Emitted per-summary because a run may include multiple
+    # PCAPs each with its own detections.
+    verdict_summaries: dict[str, Any] = {}
+    for name, summary in bundle.summaries.items():
+        vs = _build_verdict_summary_payload(summary)
+        if vs is not None:
+            verdict_summaries[name] = vs
+    payload: dict[str, Any] = {
         "path": str(bundle.path),
-        "summaries": {
-            name: to_serializable(summary) for name, summary in bundle.summaries.items()
-        },
+        "summaries": summaries_payload,
     }
+    if verdict_summaries:
+        payload["verdict_summary"] = verdict_summaries
+    # Include the skeptical-filter rule registry in the JSON so downstream
+    # consumers understand what the `skeptical_rule` string on each
+    # detection refers to. Read-only registry snapshot; small.
+    try:
+        from .skeptical import skeptical_rules_summary as _skeptical_rules
+        payload["skeptical_rules"] = list(_skeptical_rules())
+    except Exception:  # noqa: BLE001
+        pass
     safe_write_text(
         output_path,
         json.dumps(payload, indent=2),

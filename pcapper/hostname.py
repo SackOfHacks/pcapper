@@ -3306,6 +3306,42 @@ def analyze_hostname(
         except Exception:
             pass
 
+    # Browser (MS-BRWS) announcements self-identify a host's computer name (and
+    # its OS/roles) — a high-confidence IP->hostname source that the packet loop
+    # above (NBNS/DNS/mDNS/etc.) does not cover. Merge them in.
+    try:
+        from .netbios import analyze_netbios, collect_netbios_host_intel
+
+        _nb_intel = collect_netbios_host_intel(
+            analyze_netbios(path, show_status=False)
+        )
+    except Exception:
+        _nb_intel = {}
+    for _bip, _facts in _nb_intel.items():
+        _hn = str(_facts.get("hostname", "") or "").strip()
+        if not _hn:
+            continue
+        _detail = "Browser (MS-BRWS) announcement"
+        if _facts.get("domain"):
+            _detail += f" in domain {_facts.get('domain')}"
+        if _facts.get("roles"):
+            _detail += f" [{', '.join(list(_facts.get('roles'))[:4])}]"
+        if _record_finding(
+            findings_map,
+            hostname=_hn,
+            mapped_ip=str(_bip),
+            protocol="BROWSER",
+            method="Browser announcement",
+            confidence="high",
+            details=_detail,
+            src_ip=str(_bip),
+            dst_ip="-",
+            ts=None,
+            packet_index=None,
+        ):
+            summary.protocol_counts["BROWSER"] += 1
+            summary.method_counts["Browser announcement"] += 1
+
     final_findings = list(findings_map.values())
     if target_filter_enabled and target_ip:
         # A hostname belongs to the target only when the per-method, session-aware

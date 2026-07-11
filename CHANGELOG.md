@@ -4,7 +4,111 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 2.1.0 — 2026-07-11
+
+### Changed
+- **`--scan` and `--overview` always render at full depth** — both now show the complete picture regardless of `-v` (no per-section truncation, no verbose-only gating, and no "Output is summarized/truncated. Use -v…" footer). These two triage/overview views are meant to be read whole.
+- **`--overview` "Notable Flows" is now notability-aware, not just top-by-volume.** It previously listed the highest-byte conversations, so on an ARP-dominated OT/DCS segment the "notable" flows were routine ARP cache-refresh to the gateway/DC. It now drops low-rate internal baseline (ARP / NetBIOS / LLMNR / mDNS / SSDP / browser one-to-many announcements to broadcast/multicast) and ranks genuine cross-zone / external flows first; a high-rate internal flood/scan is still kept.
+- **`--odesys` renamed to `--codesys`** (the protocol is CoDeSys). The module (`odesys.py` → `codesys.py`), analyzer (`analyze_codesys`), renderer (`render_codesys_summary`), opcode model (`codesys_opcodes.json`), CLI flag, overview/threats registry entries, and all `ODESYS`-labelled output are now `CODESYS`. Also fixed a latent double-escaped (`\\s`) opcode regex in that module.
+
+### Fixed
+- **Systematic elimination of OT/DCS-baseline false positives across the threat surface.** A benign Foxboro-DCS capture (heavy broadcast ARP + `\MAILSLOT\BROWSE` browser announcements, two domain controllers, zero TCP) previously tripped nearly every verdict engine. Fixed at the root, with a shared `utils.is_unicast_host_ip()` broadcast/multicast gate reused everywhere:
+  - **`--scan`** no longer calls a default gateway / domain controller a "Nmap `-sn` host-discovery sweep." Added segment-hub role awareness (a host ARP-resolved by most of the segment is infrastructure, not a scanner), broadcast/multicast target exclusion, and honest sub-1-pps rate display.
+  - **`--beacon`** (and therefore `--threats` / `--overview`) no longer scores periodic Mailslot-browser broadcast or LLMNR/mDNS multicast as CRITICAL "beacon-like C2 flows," and no longer treats ARP cache-refresh as a beacon channel.
+  - **`--arp`** no longer labels a gateway/DC's routine ARP resolution an "ARP sweep," and the "high ARP traffic share" storm check is now rate-gated (a quiet capture that is *proportionally* ARP-heavy is not a flood).
+  - **`--protocols`** "Broadcast Storm" is rate-gated (share alone no longer implies a storm).
+  - **`--overview`** no longer flags the two DCs as "scan-like / ACTIVE THREAT"; its scan leads defer to the (now hub-aware) scan analyzer, and it correctly identifies the DCs as DNS service hosts.
+  - **`--compromised` / `--threats` / `--mitre`** verdicts follow suit; a benign capture reads as BASELINE.
+- **`--ot-commands` now shows output on read-only/monitoring captures and no longer needs `-v`.** It previously only tracked *control/write* commands, so on a read-only capture (e.g. CIP tag polling) every field rendered as `-` and looked broken. It now shows:
+  - **All Observed OT Commands (by protocol)** — the full cross-protocol command inventory (reads + writes), risk-classified `CONTROL` / `REVIEW` / `Normal`.
+  - **Control/Write Commands (state-changing)** — the prior control-focused view, with a clear "None observed — traffic is read-only / monitoring" message when empty instead of blank dashes.
+  - Detections and all sections are shown by default (the `-v` gate on this view was removed).
+
+### Added
+- **`--netbios` gains full NetBIOS Browser (MS-BRWS) protocol dissection** — the browser Mailslot (`\MAILSLOT\BROWSE`) is now decoded instead of counted. Every Host / Local-Master / Domain announcement yields the announced **computer name, OS version, server ROLES (Domain Controller / SQL / print / master browser / …), comment, and workgroup/domain** — a passive asset-inventory + OS-fingerprint goldmine that needs no active probing. Adds a scored Analyst Verdict, an "Announced Hosts & Roles" table, browser-election detail, a tightened NETLOGON/NTLOGON parser (querying host + queried account for user-enumeration hunting), and browser threat detections: **rogue master browser / forced-election takeover, browser election storm, PDC role conflict, crafted-role announcements, NETLOGON enumeration** (all mapped to MITRE **T1557 / T1046 / T1087**), which now flow into the consolidated `--threats` and `--mitre` views.
+- **Browser-announced host intelligence now flows into eight analyzers.** A shared `collect_netbios_host_intel()` accessor surfaces hostname / OS / server roles / domain / DC identity in **`--hostdetails`, `--domain`, `--hostnames`, `--ips`, `--overview`, `--compromised`, `--threats`, and `--mitre`** — e.g. `--ips` now classes a host as `int/PDC`, `--domain` discovers the domain and DC roster with no Kerberos/LDAP traffic, and a compromised DC is elevated as a crown-jewel.
+- **`--hostdetails` deep host-forensics expansion.** For the target `-ip` it now consolidates everything the capture reveals: identity (hostname, MAC + vendor, OS, browser roles + domain), observed usernames, a host verdict with actor-vs-target attribution, services hosted, **web requests, remote services established (with outbound remote-access / suspected-C2 flagging), a new "Remote Access INTO this host" section (inbound RDP/SSH/VNC/Telnet/WinRM/SMB/RPC/DB with the connecting peer), authentication activity, TLS/JA3 fingerprints, SMB/file-share access (admin-share + unsigned-SMB flagged), email activity, peer geo/ASN/IOC intelligence,** DNS queries, and downloaded files with hashes.
+- **Direction-aware Top-Clients/Servers + risk-classified command summaries rolled out across the remaining core OT/ICS analyzers.** The two shared industrial renderers now drive this for ~20 protocols at once (BACnet, IEC-104, Omron FINS, IEC-61850 MMS, GE SRTP, HART-IP, ICCP, OPC UA, EtherCAT, MELSEC, Siemens S7, PROFINET, BSAP, Genisys, Niagara Fox, DF1, PCCC, and more):
+  - **Top Clients / Servers** now uses the direction-aware requester/responder role counters (falling back to raw src/dst only when a protocol ran without enrichment), instead of conflating every packet's src/dst.
+  - **Observed OT Commands** — every command/operation is classified `CONTROL` (write / operate / restart / stop / program / set-attribute / reinitialize / comms-control) / `REVIEW` (identity / enumeration / who-is / config / session / unsolicited) / `Normal` (read / poll / status), with a count of distinct control-plane command types.
+  - **Service Endpoints** are attributed to the request (client → server) direction only, so a service is no longer listed as both `A -> B` and `B -> A` for one exchange.
+  - The bespoke Layer-2 renderers (IEC-61850 GOOSE / Sampled Values, PTP) were already publisher-appropriate; relabelled for clarity (Top Publishers / Subscriber Groups; PTP masters/clocks + destinations). IEC-101/103 and C37.118 synchrophasor already carried client/server + ASDU/frame-type command views.
+- **`--dnp3` made direction-aware and given a command summary + top master/outstation view.** DNP3 is master↔outstation and the conversation view was conflating both directions — a master's `Confirm`/`Disable Unsolicited` and an outstation's `Unsolicited Response`/`Response` were pooled into one bucket and labelled as if the master sent them all. Now:
+  - **DNP3 Command Summary** — observed function codes split by role (Master Requests vs Outstation Responses) and classified `CONTROL` (Write / Select / Operate / Restart / Stop) / `REVIEW` (Enable-Disable Unsolicited, file ops) / `Normal` (Read / Confirm), so control-plane commands are visible apart from poll traffic.
+  - **Top Masters (clients) / Outstations (servers)** — side-by-side ranking by request/response volume.
+  - **Direction-aware conversations** — a new `sender -> receiver` table attributes each function to its actual sender with the sender's inferred role, cross-checked against the Wireshark DNP3 dissector.
+  - **Select-before-Operate awareness** — `Select` (fn 3, which arms a group-12 CROB output) is now counted as control-plane activity, and a `Select` with no matching `Operate` raises a "Select Without Operate" finding (incomplete SBO / control-point probing, T0855).
+  - **Non-contiguous capture is flagged** — a merged/challenge pcap whose frames span years now shows a readable "Capture Span … non-contiguous / merged capture" note instead of a raw multi-million-second duration.
+- **`--cip` rebuilt as a forensics / threat-hunting / IR triage tool** (it was a near-duplicate of the pre-fix `--enip` and carried the same five false positives). Now adds the same always-on Analyst Verdict, Tag Access Map, CIP Health (success/error), true-master detection, and always-on control/program-transfer findings as `--enip`, plus a CIP-specific **PCCC decoder**: the legacy Allen-Bradley PLC-5/SLC/MicroLogix commands tunnelled in `Execute_PCCC` (service 0x4B) are decoded to named commands (e.g. *Protected Typed Logical Read/Write*, *Set/Reset CPU Mode*, *Download logic*), classified read vs write, and a state-changing PCCC command raises a control finding (DFRWS PCCC-forensics shows PCCC exposes logic/config read+write on legacy controllers).
+- **Session direction is now attributed correctly across `--modbus`, `--enip`, and `--cip`.** The per-service endpoint tables previously listed both `A -> B` and `B -> A` for the same request/response exchange; they now show the client → server (request) direction only, with request counts, and drop the `Service 0x00` CIP parse-artifact rows. Section retitled "Service Endpoints (client -> server)".
+- **Consistent "Observed OT Commands" + top client/server sections across `--modbus`, `--enip`, `--cip`** — Modbus function codes / CIP services are surfaced as "Observed …" command tables with per-command risk, alongside the client/server endpoint breakdown, in all three.
+- **`--enip` rebuilt as a forensics / threat-hunting / IR triage tool.** Grounded in the EtherNet/IP-CIP DFIR literature (ODVA CIP object model, ControlLogix CVE-2023-3595/3596, Team82 ENIP/CIP research, CISA advisories) and validated against a real tank-farm capture (Rockwell ControlLogix polling) plus a synthetic attack capture:
+  - **Always-on Analyst Verdict** — every capture gets an explicit disposition (`CRITICAL`/`HIGH`/`REVIEW`/`BENIGN BASELINE`) + a one-line baseline (masters → devices, tag reads / writes / high-risk services / CIP errors / ForwardOpen count). A clean read-only poll is stated as benign instead of producing no verdict.
+  - **Tag Access Map (process fingerprint)** — symbolic tags aggregated as read vs write with counts and top endpoint, including tags recovered from Multiple-Service-Packet sub-requests (where Logix tag reads actually live). The tag set *is* the process fingerprint.
+  - **Asset roles + true-master detection** — masters are now derived from the TCP-level client direction (sent to an ENIP port), so a PLC whose server→client continuation packet is mis-classified by the CIP-direction heuristic no longer shows up as a bogus "master." Multi-master hunt-hypothesis note.
+  - **CIP Health** — success vs error responses with rate and top CIP error codes (privilege violation / path errors = failed writes/probing).
+  - **Per-server response time (RTT)** — strict per-connection request→response pairing (records only unambiguous depth-1 matches under a LAN-plausible ceiling) so latency is trustworthy rather than corrupted by pipelining.
+  - **ForwardOpen connection analysis** — originator→target with O→T / T→O RPIs and originator identity.
+  - **Always-on control/program-transfer findings** — a single `Reset`/`Start`/`Stop` (T0816/T0858) or program up/download (T0843/T0845) now raises a HIGH finding; previously only volume thresholds (≥10) fired, missing the stealthy single op.
+- Fixed five false-positive classes in `--enip` that flagged benign Rockwell polling (see Fixed).
+- **`--modbus` rebuilt as a forensics / threat-hunting / IR triage tool.** Previously a strong statistics dump that went silent on benign captures and left the analyst to derive "is this normal?" by hand. Now, grounded in the Modbus DFIR literature (SANS FOR572/FOR508 network-forensics model, Trustwave "Modbus 101", the FrostyGoop analyses, and Modbus IDS research), it adds:
+  - **Always-on Analyst Verdict** — every capture gets an explicit disposition (`CRITICAL` / `HIGH` / `REVIEW` / `BENIGN BASELINE`) plus a one-line baseline (`N masters -> M servers; unit ids; reads/writes/exceptions over Ns`). A clean read-only poll is now stated as a benign baseline instead of producing no verdict at all.
+  - **Register / Coil Map (process fingerprint)** — per server+unit, the read vs write address ranges and hottest addresses. The polled/written register set *is* the process fingerprint; a write to a never-read register stands out immediately.
+  - **Polling cadence + per-server response time (RTT)** — request-direction poll interval per master→server, and paired request→response RTT percentiles per server (surfaces a laggy/stressed PLC or an abnormal poll rate).
+  - **Transaction pairing** — matched req/resp, orphan requests (possible DoS / PLC-down, T0814), unsolicited responses (possible response injection, T0856), and static-transaction-id connections (replay/injection tell). Thresholded + capture-edge-aware to avoid flagging pre-established sessions.
+  - **FrostyGoop-style read-then-write correlation** — a write to a register the same actor was just reading (FC3 read + FC6/16 write) is flagged `HIGH` (recon→manipulate, T0836).
+  - **Protocol-violation DPI** — malformed MBAP (non-zero protocol id on port 502) and strictly-reserved/undefined function codes (fuzzing / non-compliant client), distinct from legitimate vendor function-code ranges.
+  - **New/rogue-master + off-baseline recon** — flags >1 request-issuing master (new-master hunt hypothesis) and elevates Read-Device-ID / Report-Server-ID enumeration from a non-primary source to `MEDIUM` (T0888).
+  - **Fuller ATT&CK-for-ICS mapping** (T0831 / T0836 / T0814 / T0856 / T0846 / T0888) and all new baseline structures (`register_map`, `session_cadence`, `rtt_by_server`, `pairing`, `first_seen`) exported to `--json`.
+- **Skeptical filter (`pcapper.skeptical`) — default-on downgrading of well-known false-positive shapes** in `--compromised` / `--threats` output. Motivated by a real-world capture that raised 3× HIGH-severity findings that were textbook FP classes: SYN "flood" to Cloudflare/Akamai with 0% SYN-ACK (blocked egress + client retries, not a flood), "periodic HTTP check-in" against `/RockwellSoftware/AssetCentre/AosService.svc` and `/Activplant/VpPlatformService/VpWebService.asmx` (vendor management-platform polling, not C2), and "TLS SNI suppression" against an internal HTTP-CONNECT proxy on port 80 (blocked outbound tunnel, not evasion). Five rules ship in the initial registry:
+  - `blocked-egress-syn-flood` — TCP SYN flood where SYN-ACK ratio is at/near zero, or destinations are all CDN prefixes (Cloudflare / Akamai / Fastly / AWS CloudFront / Google / Azure Front Door). Downgrades `high → warning`.
+  - `blocked-egress-connection-probe` — "unanswered SYNs" connection-probing heuristic firing across multiple public IPs (not RFC1918). Real probing concentrates on a single target; many public destinations = blocked-egress + client retries. Downgrades `high → warning`.
+  - `likely-vendor-polling` — periodic HTTP check-in against a well-known OT/industrial-management vendor endpoint (Rockwell AssetCentre `AosService.svc`, FactoryTalk `pfwAuthz.aspx`, Activplant `VpPlatformService`, AspenTech aspenONE, OSIsoft/AVEVA PI Web API, GE Proficy Historian, Emerson DeltaV, Yokogawa Vnet mgmt, Rockwell Studio 5000 / ThinManager, GE Mark VIe / ControlST). Downgrades `high → info`.
+  - `single-host-polling-not-fanout` — HTTP fan-out reconnaissance heuristic where `hosts=1` (many URLs to ONE server = polling, not fan-out).
+  - `blocked-outbound-tunnel` — TLS handshake failures / SNI suppression against a destination that also carries HTTP CONNECT or a port-80 proxy shape.
+  
+  Each downgrade preserves the original severity in `skeptical_original_severity`, attaches a machine-readable `skeptical_rule` id and human-readable `skeptical_reason`, and never silently drops the finding — the renderer surfaces a `[skeptical: <rule>, was <sev>]` marker inline and an indented `Skeptical filter: <reason>` line so the reviewer sees the concrete rationale. Extend by appending a `SkepticalRule` to `pcapper/skeptical.py::_RULES`.
+
+- **`--strict` — disable the skeptical filter.** Raw un-filtered verdicts.
+
+- **Hypothesis lens (`pcapper.hypothesis`) — `--hypothesis <REGEX>`** tags every detection as `relevant` / `adjacent` / `unrelated`:
+  - `relevant` — case-insensitive regex match against summary + details + source + evidence + IOCs + ATT&CK technique ids.
+  - `adjacent` — no direct match, but the detection carries a technique in a tactic family named by any T-id literal in the hypothesis pattern (built-in tactic-family map covers all enterprise + ICS techniques the detection modules emit).
+  - `unrelated` — neither.
+  
+  Renderer shows `[relevant]` / `[adjacent]` / `[unrelated]` tags next to each finding so the reviewer scans a large compromise output for the ~30% of findings that touch the hunt hypothesis. Example: `--hypothesis 'referrer|host header|SNI|T1071|T1090|credential'` on an HTTP-Referrer hunt correctly tags cleartext-credential leakage as `[adjacent]` (T1552 credential-access family), TLS SNI findings as `[relevant]` (direct match), and unrelated bystander noise as `[unrelated]`.
+
+- **Verdict Candidates block (`pcapper.verdict_summary`)** rendered near the top of `--compromised` output, before the per-finding table. Synthesized accept/reject verdicts:
+  - `TP_MALICIOUS_CANDIDATE` — HIGH-severity finding, NOT skeptical-downgraded, source in a known-tradecraft class (`Malware`, `Obfuscation`, `Exfil`, `Beacon`, `Files`). Inspect + confirm before treating as final.
+  - `TP_HARDENING` — real security finding orthogonal to any hunt hypothesis but should be in the closure narrative (cleartext credentials, SSLv2 / TLS 1.0 / 1.1, weak ciphers, expired/self-signed certs, SMBv1, PII on the wire).
+  - `LIKELY_CONTROL_WORKING` — findings a skeptical rule identified as a *security-control-doing-its-job* signal (blocked egress, blocked outbound tunnel). Not a threat; documents that the control works.
+  - `LIKELY_FP` — findings a rule identified as a *well-known false-positive class* (vendor polling, single-host polling).
+  - `INCONCLUSIVE` — everything else.
+  
+  Groups identical findings across many hosts into single rows with `xN` counts. Sorts TP_MALICIOUS_CANDIDATE first.
+
+- **JSON output enriched.** `--json PATH` now includes:
+  - Top-level `verdict_summary` per PCAP (structured accept/reject candidates so downstream tooling doesn't parse markdown).
+  - Top-level `skeptical_rules` — snapshot of the rule registry so consumers know what each `skeptical_rule` id refers to.
+  - Every detection dict carries `skeptical_downgraded`, `skeptical_rule`, `skeptical_reason`, `skeptical_original_severity`, and `hypothesis_relevance`, propagated through the compromise pipeline (previously the compromise module rebuilt the detection dict and silently dropped these annotations).
+
+- **`--verbose` emits per-module start/finish/timing to stderr.** Previously the interactive spinner was the only progress signal — a no-op on non-TTY / background runs, and a 15-minute analysis of 3× 17 MB PCAPs looked indistinguishable from a hung process. Now:
+  ```
+  [pcapper] Threats <capture.pcap>: starting...
+  [pcapper] Threats <capture.pcap>: done in 12.4s
+  ```
+  Emits `FAILED after Xs (<Exception>: <msg>)` on module errors. Best-effort — never breaks the run.
+
+### Fixed
+- **`--enip` raised five false-positive classes on benign Rockwell polling** (all verified against tshark full-reassembly on a real ControlLogix capture):
+  - *Non-standard-port* flagged legitimate `:44818` server responses whose client ephemeral port was below the old `32768` threshold (e.g. 3479, 24292). Now gated on both endpoints being non-ENIP ports.
+  - *Malformed ENIP Length/CPF* fired on every ENIP PDU that spanned TCP segments (the parser's `length_mismatch = declared > observed` is exactly the segmentation direction). Replaced with a per-pair flood detector that only fires on sustained corruption, not segment boundaries.
+  - *Suspicious Invocations ~84%* — `Read_Tag`/`Read_Tag_Fragmented` were lumped into the enumeration/"suspicious" bucket via the shared `ENUMERATION_SERVICE_CODES`. Tag reads are normal polling; the risk overview now tiers High-Risk / Suspicious (config/connection/lifecycle) / Enumeration-Discovery / Normal separately.
+  - *CIP Enumeration Campaign* fired on the operational HMI reading device identity across its own PLCs. Now gated on the scanner shape (enumeration across many targets with no operational tag I/O), so a busy operator no longer trips it.
+  - *Multiple masters* counted PLCs as masters when a server→client continuation packet was mis-classified as a request. Masters are now derived from the true TCP-level client direction.
+- **Compromise-module `_curate_threat_detections` was silently dropping downgraded findings.** Findings the skeptical filter moved from `high → warning` were then discarded by the curation min-signal-score threshold. Curation now preserves any `skeptical_downgraded=True` finding regardless of signal score — the whole point of the annotation is to keep the finding visible AND explain why it isn't the severity the raw analyzer emitted.
+
+- **Compromise-module detection cherry-picker was dropping skeptical + hypothesis annotations.** `analyze_compromised` rebuilt each detection dict from a hand-picked field list, so anything `threats.py::_append_detection_items` had attached upstream (`skeptical_*`, `hypothesis_relevance`) was silently lost by the time the detection reached the compromise renderer / JSON export. All five annotation keys now propagate.
 
 ## 2.0.2 — 2026-06-23
 

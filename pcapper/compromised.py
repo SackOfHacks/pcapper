@@ -59,6 +59,8 @@ class CompromisedHost:
     iocs: list[str]
     severity: str
     score: int
+    roles: list[str] = field(default_factory=list)
+    is_infra: bool = False
 
 
 @dataclass(frozen=True)
@@ -439,6 +441,25 @@ def analyze_compromised(
                     "timestamp": ts,
                     "evidence": evidence,
                     "iocs": sorted(iocs)[:10],
+                    # Preserve skeptical-filter + hypothesis-lens
+                    # annotations that threats.py attached upstream —
+                    # the compromise renderer + verdict-summary block
+                    # rely on these to classify the finding.
+                    "skeptical_downgraded": bool(
+                        item.get("skeptical_downgraded", False)
+                    ),
+                    "skeptical_rule": str(
+                        item.get("skeptical_rule", "") or ""
+                    ),
+                    "skeptical_reason": str(
+                        item.get("skeptical_reason", "") or ""
+                    ),
+                    "skeptical_original_severity": str(
+                        item.get("skeptical_original_severity", "") or ""
+                    ),
+                    "hypothesis_relevance": str(
+                        item.get("hypothesis_relevance", "") or ""
+                    ),
                 }
             )
             detection_by_host[ip_value].append(detections[-1])
@@ -760,6 +781,14 @@ def analyze_compromised(
 
     compromised_hosts: list[CompromisedHost] = []
     host_record_by_ip = {record.ip: record for record in hosts_summary.hosts}
+    # Browser (MS-BRWS) announced identity — a compromised Domain Controller /
+    # SQL / critical-infra host is a crown-jewel: annotate and elevate it.
+    try:
+        from .netbios import analyze_netbios, collect_netbios_host_intel
+
+        _nb_intel = collect_netbios_host_intel(analyze_netbios(path, show_status=False))
+    except Exception:
+        _nb_intel = {}
     host_priority: list[dict[str, object]] = []
     for ip_value, state in host_state.items():
         score = int(state.get("score", 0) or 0)
@@ -780,6 +809,33 @@ def analyze_compromised(
         hostname_list = hostnames_by_ip.get(ip_value, [])
         hostname_display = _pick_hostname(ip_value, hostname_list)
 
+        # Browser-announced asset context (roles + crown-jewel elevation).
+        nb_facts = _nb_intel.get(ip_value, {})
+        nb_roles = [str(r) for r in nb_facts.get("roles", []) or []]
+        nb_is_infra = bool(
+            nb_facts.get("is_dc")
+            or any(
+                r in ("Master Browser", "SQL Server", "Domain Master Browser")
+                for r in nb_roles
+            )
+        )
+        asset_evidence: list[str] = []
+        if nb_facts:
+            if not hostname_display and nb_facts.get("hostname"):
+                hostname_display = str(nb_facts["hostname"])
+            if nb_is_infra:
+                infra_label = (
+                    "Domain Controller"
+                    if nb_facts.get("is_dc")
+                    else ", ".join(nb_roles[:3])
+                )
+                asset_evidence.append(
+                    f"ASSET CONTEXT: browser-announced {infra_label}"
+                    f"{f' in domain {nb_facts.get('domain')}' if nb_facts.get('domain') else ''}"
+                    " — crown-jewel, prioritize"
+                )
+                score += 2
+
         severity = "info"
         if severity_counts.get("critical"):
             severity = "critical"
@@ -792,7 +848,7 @@ def analyze_compromised(
         explanation = (
             "; ".join(summaries[:2]) if summaries else "Evidence of compromise"
         )
-        evidence = state.get("details", []) + state.get("evidence", [])
+        evidence = asset_evidence + state.get("details", []) + state.get("evidence", [])
         evidence = [str(item) for item in evidence if str(item).strip()]
         evidence = evidence[:6]
 
@@ -812,6 +868,8 @@ def analyze_compromised(
                 iocs=ioc_list,
                 severity=severity,
                 score=score,
+                roles=nb_roles,
+                is_infra=nb_is_infra,
             )
         )
 

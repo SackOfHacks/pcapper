@@ -221,6 +221,11 @@ def _ot_full_render(fn):
     return _wrap
 
 
+# --scan and --overview always render at full depth (no truncation, no "use -v"
+# footer, verbose sections always shown) regardless of the -v flag.
+_always_full_render = _ot_full_render
+
+
 def _apply_verbose_limit(limit: int | None) -> int | None:
     if _VERBOSE_OUTPUT or _OT_FULL_OUTPUT:
         if limit is None:
@@ -1921,6 +1926,32 @@ def render_domain_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Domain Controllers (NetBIOS/DNS)"))
         lines.append(_counter_table(summary.dc_hosts, "IP", limit=limit))
+
+    # Passive domain intelligence from Browser (MS-BRWS) announcements.
+    nb_domains = getattr(summary, "netbios_domains", None)
+    browser_roles = getattr(summary, "browser_roles", None) or {}
+    if nb_domains or browser_roles:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Browser-Announced Domain Intelligence (MS-BRWS)"))
+        if nb_domains:
+            lines.append(
+                _format_kv(
+                    "Announced Workgroup/Domain",
+                    ", ".join(
+                        f"{d} ({c} announcements)" for d, c in nb_domains.most_common(limit)
+                    ),
+                )
+            )
+        if browser_roles:
+            rows = [["Host IP", "Announced Server Roles"]]
+            for ip, roles in list(browser_roles.items())[:limit]:
+                role_txt = ", ".join(roles)
+                is_infra = any(
+                    r in role_txt
+                    for r in ("Domain Controller", "Master Browser", "SQL Server")
+                )
+                rows.append([ip, danger(role_txt) if is_infra else role_txt])
+            lines.append(_format_table(rows))
 
     if summary.service_counts:
         lines.append(SUBSECTION_BAR)
@@ -4500,6 +4531,26 @@ def render_dns_summary(
     return _finalize_output(lines)
 
 
+def _short_browser_role(roles: list) -> str:
+    """Collapse a Browser SV_TYPE role list into a compact triage tag, priority
+    directory-infra first (DC/SQL/print/master browser)."""
+    if not roles:
+        return ""
+    joined = ", ".join(str(r) for r in roles)
+    for needle, tag in (
+        ("Domain Controller (PDC)", "PDC"),
+        ("Backup Domain Controller", "BDC"),
+        ("Master Browser", "master-browser"),
+        ("SQL Server", "SQL"),
+        ("Print Queue Server", "print-srv"),
+        ("Terminal Server", "term-srv"),
+        ("Server", "server"),
+    ):
+        if needle in joined:
+            return tag
+    return ""
+
+
 def render_ips_summary(
     summary: IpSummary, limit: int = 12, verbose: bool = False
 ) -> str:
@@ -4789,13 +4840,25 @@ def render_ips_summary(
             # Scope + role
             external = _is_public_ip(ip_value)
             scope = "ext" if external else "int"
-            if ip_value in scanner_ips:
+            # Browser (MS-BRWS) announced roles are the authoritative "what is
+            # this host" cue when present (DC / SQL / print / master browser).
+            nb_roles = (getattr(summary, "ip_roles", {}) or {}).get(ip_value, [])
+            role_short = _short_browser_role(nb_roles)
+            if role_short:
+                role = role_short
+            elif ip_value in scanner_ips:
                 role = "scanner"
             elif confirmed_ports:
                 role = "server"
             else:
                 role = "client"
             class_text = f"{scope}/{role}"
+            # Fold the browser-announced OS into the hostname cell (compact).
+            nb_os = (getattr(summary, "ip_os", {}) or {}).get(ip_value, "")
+            if nb_os and hostname_text != "-":
+                hostname_text = f"{hostname_text} [{nb_os.split(' (')[0]}]"
+            elif nb_os:
+                hostname_text = f"[{nb_os.split(' (')[0]}]"
             # Geo / ASN / Org (MaxMind or online), with hosting/proxy flags.
             enr = ip_enrichment.get(ip_value, {})
             geo_bits: list[str] = []
@@ -16926,7 +16989,7 @@ def render_creds_summary(summary: CredentialSummary) -> str:
         "iccp",
         "pcworx",
         "melsec",
-        "odesys",
+        "codesys",
         "niagara",
         "proconos",
         "pccc",
@@ -18449,12 +18512,41 @@ def _dedupe_compromise_issues(
                 "ips": [],
                 "evidence": [],
                 "iocs": [],
+                # Skeptical-filter annotations — carried through so the
+                # renderer can surface a `[skeptical: rule]` tag + reason.
+                "skeptical_downgraded": bool(item.get("skeptical_downgraded", False)),
+                "skeptical_rule": str(item.get("skeptical_rule", "") or ""),
+                "skeptical_reason": str(item.get("skeptical_reason", "") or ""),
+                "skeptical_original_severity": str(
+                    item.get("skeptical_original_severity", "") or ""
+                ),
+                # Hypothesis-lens annotation — carried through so the
+                # renderer can prefix a `[relevant]` / `[adjacent]` tag.
+                "hypothesis_relevance": str(
+                    item.get("hypothesis_relevance", "") or ""
+                ),
             }
         bucket = grouped[key]
         if sev_rank.get(str(item.get("severity", "info")).lower(), 0) > sev_rank.get(
             str(bucket["severity"]), 0
         ):
             bucket["severity"] = str(item.get("severity", "info")).lower()
+        # Preserve any incoming skeptical annotation — same (summary, details)
+        # bucket should always yield the same rule, so first-writer-wins is fine.
+        if item.get("skeptical_downgraded") and not bucket.get("skeptical_rule"):
+            bucket["skeptical_downgraded"] = True
+            bucket["skeptical_rule"] = str(item.get("skeptical_rule", "") or "")
+            bucket["skeptical_reason"] = str(item.get("skeptical_reason", "") or "")
+            bucket["skeptical_original_severity"] = str(
+                item.get("skeptical_original_severity", "") or ""
+            )
+        # Hypothesis-lens: upgrade the bucket's tag when a stronger one is
+        # observed. Precedence: relevant > adjacent > unrelated > "".
+        _rel_rank = {"relevant": 3, "adjacent": 2, "unrelated": 1, "": 0}
+        cur_rel = str(bucket.get("hypothesis_relevance", "") or "")
+        new_rel = str(item.get("hypothesis_relevance", "") or "")
+        if _rel_rank.get(new_rel, 0) > _rel_rank.get(cur_rel, 0):
+            bucket["hypothesis_relevance"] = new_rel
         ip_value = str(item.get("ip", "")).strip()
         if ip_value and ip_value not in bucket["ips"]:
             bucket["ips"].append(ip_value)
@@ -18487,6 +18579,22 @@ def render_compromised_summary(
 
     lines.append(_format_kv("Total Hosts", str(summary.total_hosts)))
     lines.append(_format_kv("Compromised Hosts", str(len(summary.compromised_hosts))))
+
+    # ---- Synthesis-level verdict candidates (reviewer accept/reject) ----
+    # Sits near the top of the compromise block so the reviewer reads the
+    # synthesized classification (LIKELY_FP / LIKELY_CONTROL_WORKING /
+    # TP_HARDENING / TP_MALICIOUS_CANDIDATE / INCONCLUSIVE) BEFORE
+    # scrolling through the raw per-finding table. See pcapper.verdict_summary
+    # for the classification rules.
+    try:
+        from .verdict_summary import render as _render_verdict, summarize as _summarize_verdict
+        _verdict = _summarize_verdict(summary.detections or [])
+        if _verdict.total_detections > 0:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("Verdict Candidates"))
+            lines.append(_render_verdict(_verdict))
+    except Exception:  # noqa: BLE001 — verdict summary must never break output
+        pass
 
     def _compromised_verdict() -> tuple[str, str, list[str], int]:
         score = 0
@@ -18712,10 +18820,44 @@ def render_compromised_summary(
                     marker = danger("[HIGH]")
                 else:
                     marker = warn("[MEDIUM]")
-                lines.append(f"{marker} {summary_text}" + (f"  ({source})" if source else ""))
+                # Skeptical-filter tag — sits between the severity marker and
+                # the summary so the reviewer sees at-a-glance that the
+                # verdict was already downgraded by a known-FP rule.
+                skeptical_tag = ""
+                if item.get("skeptical_downgraded"):
+                    rule = str(item.get("skeptical_rule", "") or "")
+                    orig = str(item.get("skeptical_original_severity", "") or "")
+                    skeptical_tag = muted(
+                        f" [skeptical: {rule}"
+                        + (f", was {orig}" if orig else "")
+                        + "]"
+                    )
+                # Hypothesis-lens tag — reviewer scans for [relevant] first
+                # and can skip [unrelated] on a big capture. Only surfaced
+                # when the lens was active (non-empty hypothesis_relevance).
+                relevance = str(item.get("hypothesis_relevance", "") or "")
+                hypothesis_tag = ""
+                if relevance == "relevant":
+                    hypothesis_tag = danger(" [relevant]")
+                elif relevance == "adjacent":
+                    hypothesis_tag = warn(" [adjacent]")
+                elif relevance == "unrelated":
+                    hypothesis_tag = muted(" [unrelated]")
+                lines.append(
+                    f"{marker}{hypothesis_tag}{skeptical_tag} {summary_text}"
+                    + (f"  ({source})" if source else "")
+                )
                 lines.append(
                     muted(f"  Why: {_compromise_issue_reason(summary_text, source)}")
                 )
+                # Print the skeptical reason as its own indented line so the
+                # analyst sees the concrete rationale for the downgrade
+                # without having to read the module docstring.
+                if item.get("skeptical_downgraded") and item.get("skeptical_reason"):
+                    reason_text = _truncate_text(
+                        str(item.get("skeptical_reason", "")), 240
+                    )
+                    lines.append(muted(f"  Skeptical filter: {reason_text}"))
                 # Hosts involved — internal hosts first (the likely victims).
                 ips = list(item.get("ips", []) or [])
                 ips.sort(key=lambda v: (_is_public_ip(v), v))
@@ -19617,6 +19759,41 @@ def render_hostname_summary(
             set_verbose_output(restore_verbose_flag)
 
 
+_HD_REMOTE_ACCESS_PORTS = {
+    22: "SSH",
+    23: "Telnet",
+    135: "RPC/DCOM",
+    139: "SMB/NetBIOS",
+    445: "SMB",
+    1433: "MSSQL",
+    3306: "MySQL",
+    3389: "RDP",
+    5432: "PostgreSQL",
+    5900: "VNC",
+    5901: "VNC",
+    5985: "WinRM",
+    5986: "WinRM-TLS",
+    5938: "TeamViewer",
+    6379: "Redis",
+}
+
+
+def _hd_remote_access_flag(port: object, byte_count: int, peer_external: bool):
+    """Classify an outbound service the host reached: interactive/admin remote
+    access (RDP/SSH/VNC/...), or a suspected C2/reverse-shell (a sustained
+    session to a non-standard high port). Returns (flag_text, paint_fn)."""
+    try:
+        p = int(port)
+    except Exception:
+        return "-", (lambda t: t)
+    if p in _HD_REMOTE_ACCESS_PORTS:
+        return f"REMOTE-ACCESS ({_HD_REMOTE_ACCESS_PORTS[p]})", orange
+    # Non-standard high port with sustained traffic = suspected C2 / reverse shell.
+    if p >= 1024 and p not in COMMON_PORTS and byte_count >= 50_000:
+        return ("SUSP-C2" if peer_external else "SUSP-SHELL"), danger
+    return "-", (lambda t: t)
+
+
 def render_hostdetails_summary(
     summary: HostDetailsSummary, limit: int = 20, verbose: bool = False
 ) -> str:
@@ -19647,6 +19824,23 @@ def render_hostdetails_summary(
         mac_parts.append(f"{mac} ({vendor})" if vendor and vendor != "-" else mac)
     lines.append(_format_kv("MAC Address", ", ".join(mac_parts) if mac_parts else "-"))
     lines.append(_format_kv("Inferred OS / Device", str(summary.operating_system)))
+    # Browser (MS-BRWS) announced identity: server roles, domain, comment.
+    nb_roles = list(getattr(summary, "netbios_roles", []) or [])
+    nb_domain = str(getattr(summary, "netbios_domain", "") or "")
+    nb_comment = str(getattr(summary, "netbios_comment", "") or "")
+    if nb_roles:
+        role_txt = ", ".join(nb_roles)
+        is_infra = any(
+            r in role_txt
+            for r in ("Domain Controller", "Master Browser", "SQL Server")
+        )
+        lines.append(
+            _format_kv("Announced Roles (Browser)", danger(role_txt) if is_infra else role_txt)
+        )
+    if nb_domain:
+        lines.append(_format_kv("Domain / Workgroup", nb_domain))
+    if nb_comment:
+        lines.append(_format_kv("Announced Comment", nb_comment))
     host_uas = list(getattr(summary, "user_agents", []) or [])
     if host_uas:
         if len(host_uas) == 1:
@@ -20166,6 +20360,7 @@ def render_hostdetails_summary(
                 "Remote Host",
                 "Port",
                 "Service",
+                "Access",
                 "Proto",
                 "Packets",
                 "Bytes",
@@ -20179,11 +20374,16 @@ def render_hostdetails_summary(
             reverse=True,
         )
         for (peer, port, proto), data in sorted_rows:
+            access_flag, access_paint = _hd_remote_access_flag(
+                port, int(data.get("bytes", 0) or 0), _is_public_ip(peer)
+            )
+            peer_cell = access_paint(peer) if access_flag != "-" else peer
             rows.append(
                 [
-                    peer,
+                    peer_cell,
                     port,
                     str(data.get("service", "-")),
+                    access_paint(access_flag) if access_flag != "-" else "-",
                     proto,
                     str(data.get("packets", "-")),
                     format_bytes_as_mb(int(data.get("bytes", 0) or 0)),
@@ -20192,10 +20392,86 @@ def render_hostdetails_summary(
                 ]
             )
         lines.append(_format_table(rows))
+        if any(
+            _hd_remote_access_flag(
+                p, int(d.get("bytes", 0) or 0), _is_public_ip(pe)
+            )[0]
+            not in ("-",)
+            for (pe, p, _pr), d in sorted_rows
+        ):
+            lines.append(
+                muted(
+                    "Access column: REMOTE-ACCESS = interactive/admin protocol; "
+                    "SUSP-C2 = sustained session to a non-standard high port."
+                )
+            )
     else:
         lines.append(
             muted("No remote services established by this host were identified.")
         )
+
+    # ---- Remote Access INTO This Host (inbound sessions) -------------------
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Remote Access Into This Host"))
+    inbound_agg: dict[tuple[str, str, str], dict[str, object]] = {}
+    for conv in summary.conversations or []:
+        peer = str(conv.get("peer", "") or "")
+        if not peer or peer == target_ip:
+            continue
+        local_ports = conv.get("local_service_ports") or []
+        proto = str(conv.get("protocol", "-") or "-")
+        for port in local_ports:
+            port = int(port)
+            if port not in _HD_REMOTE_ACCESS_PORTS:
+                continue
+            key = (peer, str(port), proto)
+            row = inbound_agg.setdefault(
+                key,
+                {
+                    "packets": 0,
+                    "bytes": 0,
+                    "first_seen": conv.get("first_seen"),
+                    "last_seen": conv.get("last_seen"),
+                    "service": _HD_REMOTE_ACCESS_PORTS[port],
+                },
+            )
+            row["packets"] = int(row.get("packets", 0) or 0) + int(conv.get("packets", 0) or 0)
+            row["bytes"] = int(row.get("bytes", 0) or 0) + int(conv.get("bytes", 0) or 0)
+            fs = conv.get("first_seen")
+            if isinstance(fs, (int, float)) and (row.get("first_seen") is None or fs < row["first_seen"]):
+                row["first_seen"] = fs
+            ls = conv.get("last_seen")
+            if isinstance(ls, (int, float)) and (row.get("last_seen") is None or ls > row["last_seen"]):
+                row["last_seen"] = ls
+    if inbound_agg:
+        rows = [["Connecting Peer", "Scope", "Port", "Service", "Proto", "Packets", "Bytes", "First", "Last"]]
+        for (peer, port, proto), data in sorted(
+            inbound_agg.items(), key=lambda it: int(it[1].get("bytes", 0) or 0), reverse=True
+        ):
+            external = _is_public_ip(peer)
+            paint = danger if external else orange
+            rows.append(
+                [
+                    paint(peer),
+                    danger("EXTERNAL") if external else "internal",
+                    port,
+                    paint(str(data.get("service", "-"))),
+                    proto,
+                    str(data.get("packets", "-")),
+                    format_bytes_as_mb(int(data.get("bytes", 0) or 0)),
+                    format_ts(data.get("first_seen")),
+                    format_ts(data.get("last_seen")),
+                ]
+            )
+        lines.append(_format_table(rows))
+        lines.append(
+            warn(
+                "Inbound interactive/admin access to this host — confirm it is authorized "
+                "(jump box / admin session) vs. lateral movement or unauthorized access."
+            )
+        )
+    else:
+        lines.append(muted("No inbound remote-access sessions to this host were identified."))
 
     lines.append(SUBSECTION_BAR)
     lines.append(header("DNS Queries Made By Host"))
@@ -20358,51 +20634,110 @@ def render_hostdetails_summary(
     else:
         lines.append(muted("No downloaded files attributed to this host."))
 
-    # ---- Host Activity Timeline (the chronological forensic record) --------
-    # The single most useful IR/forensics artifact for a host: what happened,
-    # in order. Built from the per-host timeline events already collected.
-    timeline_events = [
-        ev
-        for ev in (getattr(summary, "timeline_events", []) or [])
-        if isinstance(ev, dict)
-    ]
-    timeline_events.sort(
-        key=lambda ev: (
-            ev.get("ts") if isinstance(ev.get("ts"), (int, float)) else float("inf")
-        )
-    )
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Host Activity Timeline"))
-    if timeline_events:
-        event_cap = None if verbose else _limit_value(40)
-        shown = timeline_events if event_cap is None else timeline_events[:event_cap]
-        rows = [["Time", "Category", "Event", "Detail"]]
-        for ev in shown:
+    # ---- Authentication Activity (who authenticated where, cleartext creds) --
+    auth_events = list(getattr(summary, "auth_events", []) or [])
+    if auth_events:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Authentication Activity"))
+        rows = [["Time", "Proto", "Dir", "Peer", "Account", "Secret", "Kind"]]
+        for ev in auth_events[: _limit_value(20)]:
+            secret_cell = danger("EXPOSED") if ev.get("secret_exposed") else "-"
             rows.append(
                 [
                     format_ts(ev.get("ts")),
-                    _truncate_text(str(ev.get("category", "-") or "-"), 16),
-                    _truncate_text(
-                        _redact_in_text(str(ev.get("summary", "-") or "-")), 40
-                    ),
-                    _truncate_text(
-                        _highlight_public_ips(
-                            _redact_in_text(str(ev.get("details", "-") or "-"))
-                        ),
-                        66,
-                    ),
+                    str(ev.get("protocol", "-")),
+                    str(ev.get("direction", "-")),
+                    str(ev.get("peer", "-")),
+                    _redact_in_text(str(ev.get("username", "-"))),
+                    secret_cell,
+                    _truncate_text(str(ev.get("kind", "-")), 22),
                 ]
             )
         lines.append(_format_table(rows))
-        if event_cap is not None and len(timeline_events) > event_cap:
-            lines.append(
-                muted(
-                    f"... {len(timeline_events) - event_cap} more event(s); use -v or "
-                    f"--timeline -ip {target_ip} for the full chronology."
-                )
+        if any(ev.get("secret_exposed") for ev in auth_events):
+            lines.append(danger("Cleartext credential material exposed for this host — rotate affected accounts."))
+
+    # ---- TLS Fingerprints (SNI/JA3 this host presented as a client) ----------
+    tls_fp = list(getattr(summary, "tls_fingerprints", []) or [])
+    if tls_fp:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("TLS / Encryption Fingerprints (as client)"))
+        rows = [["SNI (server name)", "Sessions", "JA3"]]
+        for fp in tls_fp[: _limit_value(15)]:
+            rows.append(
+                [
+                    _truncate_text(_highlight_public_ips(str(fp.get("sni", "-"))), 52),
+                    str(fp.get("count", "-")),
+                    str(fp.get("ja3", "-")),
+                ]
             )
-    else:
-        lines.append(muted("No timeline events were attributed to this host."))
+        lines.append(_format_table(rows))
+
+    # ---- SMB / File-Share Access --------------------------------------------
+    smb_access = list(getattr(summary, "smb_access", []) or [])
+    if smb_access:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("SMB / File-Share Access"))
+        rows = [["Role", "Peer", "Shares", "Account", "SMB Ver", "Signing"]]
+        for sa in smb_access[: _limit_value(15)]:
+            shares_txt = str(sa.get("shares", "-"))
+            is_admin = bool(sa.get("admin")) or any(
+                m in shares_txt for m in ("ADMIN$", "C$", "D$")
+            )
+            signing = str(sa.get("signing", "-"))
+            rows.append(
+                [
+                    str(sa.get("role", "-")),
+                    str(sa.get("peer", "-")),
+                    danger(shares_txt) if is_admin else shares_txt,
+                    _redact_in_text(str(sa.get("user", "-"))),
+                    str(sa.get("version", "-")),
+                    danger(signing) if signing == "no" else signing,
+                ]
+            )
+        lines.append(_format_table(rows))
+        if any(bool(sa.get("admin")) for sa in smb_access):
+            lines.append(warn("Administrative-share access observed — review for lateral movement (PsExec-style)."))
+
+    # ---- Email Activity ------------------------------------------------------
+    email_activity = list(getattr(summary, "email_activity", []) or [])
+    if email_activity:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Email Activity"))
+        role_txt = str(email_activity[0].get("role", "-")) if email_activity else "-"
+        lines.append(_format_kv("Host Email Role", role_txt))
+        rows = [["Field", "Value", "Count"]]
+        for em in email_activity[: _limit_value(18)]:
+            field_name = str(em.get("field", "-"))
+            value = str(em.get("value", "-"))
+            value_cell = danger(value) if field_name == "Password" else _redact_in_text(value)
+            rows.append(
+                [field_name, _truncate_text(value_cell, 56), str(em.get("count", "-"))]
+            )
+        lines.append(_format_table(rows))
+
+    # ---- Peer Intelligence (geo / ASN / IOC on the host's peers) -------------
+    peer_intel = list(getattr(summary, "peer_intel", []) or [])
+    if peer_intel:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Peer Intelligence (Geo / ASN / IOC)"))
+        rows = [["Peer", "Scope", "Geo / ASN / Org", "Flags", "Intel", "Pkts"]]
+        for pi in peer_intel[: _limit_value(20)]:
+            external = str(pi.get("scope")) == "external"
+            intel_txt = str(pi.get("intel", "-"))
+            has_intel = intel_txt not in ("-", "")
+            peer_cell = danger(str(pi.get("peer", "-"))) if (external and has_intel) else str(pi.get("peer", "-"))
+            rows.append(
+                [
+                    peer_cell,
+                    str(pi.get("scope", "-")),
+                    _truncate_text(str(pi.get("geo", "-")), 34),
+                    str(pi.get("flags", "-")),
+                    danger(_truncate_text(intel_txt, 40)) if has_intel else "-",
+                    str(pi.get("packets", "-")),
+                ]
+            )
+        lines.append(_format_table(rows))
 
     lines.append(SECTION_BAR)
     return _finalize_output(lines, show_truncation_note=False)
@@ -21623,9 +21958,108 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
     lines.append(SECTION_BAR)
     lines.append(header(f"NETBIOS ANALYSIS :: {summary.path.name}"))
     lines.append(SECTION_BAR)
-    _render_protocol_verdict(
-        lines, label="NetBIOS", anomalies=getattr(summary, "anomalies", None)
+
+    ts = getattr(summary, "threat_summary", Counter()) or Counter()
+    checks = getattr(summary, "deterministic_checks", {}) or {}
+
+    def _ts(*names: str) -> int:
+        return sum(int(ts.get(n, 0) or 0) for n in names)
+
+    poisoning = _ts("NBNS Response Spoofing", "PDC Role Conflict")
+    # "Takeover" requires CRAFTED evidence (a rogue bid with server-class criteria
+    # + implausible uptime, an inconsistent role announcement, or a reset). Plain
+    # election volume is NOT takeover: two peers legitimately contest the master
+    # browser and produce many normal RequestElection frames.
+    takeover = _ts(
+        "Rogue Master Browser Bid",
+        "Announced Role Inconsistency",
+        "Browser Reset Request",
     )
+    election_churn = _ts("Browser Election Storm")
+    cred_exposure = _ts("SMB Brute-Force Indicators", "Potential Exfiltration")
+    recon = _ts("NBNS Name Scanning", "Host Probing", "Logon Mailslot Enumeration")
+    public_exposure = 1 if checks.get("public_netbios_exposure") else 0
+    periodic = _ts("Beaconing Pattern", "Broadcast/Name Storm")
+    name_conflicts = int(getattr(summary, "name_conflicts", 0) or 0)
+
+    score = (
+        poisoning * 4
+        + _ts("Rogue Master Browser Bid") * 3
+        + takeover * 1
+        + cred_exposure * 3
+        + recon * 1
+        + public_exposure * 2
+        + periodic
+        + election_churn
+    )
+    verdict_reasons: list[str] = []
+    if poisoning:
+        verdict_reasons.append(
+            f"NBNS/PDC identity spoofing or conflict ({poisoning}) — on-path/poisoning risk (T1557)"
+        )
+    if _ts("Rogue Master Browser Bid"):
+        verdict_reasons.append(
+            "Rogue master-browser bid (crafted election criteria) — MITM of host discovery"
+        )
+    if _ts("Announced Role Inconsistency"):
+        verdict_reasons.append("Inconsistent (crafted) browser role announcement observed")
+    if cred_exposure:
+        verdict_reasons.append(
+            f"Credential/session abuse over NetBIOS ({cred_exposure}) — brute-force or bulk write"
+        )
+    if recon:
+        verdict_reasons.append(f"NetBIOS name/host reconnaissance ({recon})")
+    if public_exposure:
+        verdict_reasons.append("Legacy NetBIOS exposed on a public network path")
+    if periodic:
+        verdict_reasons.append(f"Periodic/broadcast-storm NetBIOS activity ({periodic})")
+    if election_churn:
+        verdict_reasons.append(
+            "Browser election churn/instability — contested master browser (review; "
+            "benign contention or forced-election nuisance)"
+        )
+
+    if poisoning or _ts("Rogue Master Browser Bid"):
+        verdict = "SPOOFING / POISONING - NetBIOS identity abuse (LLMNR/NBT-NS or browser takeover, T1557)."
+        vfn, conf = danger, "High"
+    elif takeover:
+        verdict = "BROWSER TAKEOVER - crafted master-browser / role announcements (T1557)."
+        vfn, conf = danger, "Medium"
+    elif cred_exposure:
+        verdict = "CREDENTIAL / SESSION EXPOSURE - authentication abuse over NetBIOS/SMB."
+        vfn, conf = danger, "High"
+    elif recon or public_exposure:
+        verdict = "RECONNAISSANCE / EXPOSURE - NetBIOS name enumeration or legacy exposure."
+        vfn, conf = warn, "Medium"
+    elif periodic or name_conflicts or election_churn:
+        verdict = "SUSPICIOUS - browser election churn / storm / name-conflict to review."
+        vfn, conf = warn, "Low"
+    else:
+        verdict = "BASELINE - normal NetBIOS name service / browser announcements; no attack signal."
+        vfn, conf = ok, "Low"
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    lines.append(vfn(verdict))
+    lines.append(_format_kv("Confidence", f"{conf} (score={score})"))
+    if verdict_reasons:
+        lines.append(muted("Why:"))
+        for reason in verdict_reasons[: _limit_value(8)]:
+            lines.append(muted(f"- {reason}"))
+    # Asset context (OT-aware): surface identified directory infrastructure.
+    announced_dcs = getattr(summary, "announced_dcs", set()) or set()
+    master_browsers = getattr(summary, "master_browsers", set()) or set()
+    if announced_dcs or master_browsers:
+        bhosts = getattr(summary, "browser_hosts", {}) or {}
+        infra = []
+        for ip in sorted(announced_dcs):
+            nm = bhosts.get(ip).name if bhosts.get(ip) else ""
+            infra.append(f"DC {ip}{f' ({nm})' if nm else ''}")
+        for ip in sorted(master_browsers - announced_dcs):
+            infra.append(f"Master Browser {ip}")
+        lines.append(
+            highlight(f"Directory/infra assets (from browser announcements): {', '.join(infra[:8])}")
+        )
 
     if summary.errors:
         lines.append(SUBSECTION_BAR)
@@ -21646,6 +22080,90 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
     lines.append(_format_kv("Unique NetBIOS Names", str(len(summary.unique_names))))
     lines.append(_format_kv("Name Conflicts", str(summary.name_conflicts)))
     lines.append(_format_kv("Browser Elections", str(summary.browser_elections)))
+
+    # Browser (MS-BRWS) passive inventory: announced hosts, OS, roles, comments.
+    browser_hosts = getattr(summary, "browser_hosts", {}) or {}
+    if browser_hosts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Announced Hosts & Roles (Browser / MS-BRWS)"))
+        rows = [["Host", "IP", "OS", "Domain", "Roles", "Comment"]]
+        for ip, bh in sorted(
+            browser_hosts.items(),
+            key=lambda kv: (not kv[1].is_domain_controller, kv[0]),
+        )[: _limit_value(20)]:
+            role_txt = ", ".join(bh.roles) if bh.roles else "-"
+            row = [
+                bh.name or "-",
+                ip,
+                bh.os_label,
+                bh.domain or "-",
+                role_txt,
+                (bh.comment[:32] if bh.comment else "-"),
+            ]
+            if bh.is_domain_controller or bh.is_master_browser:
+                row[4] = danger(role_txt)
+            rows.append(row)
+        lines.append(_format_table(rows))
+        muted_note = []
+        if getattr(summary, "browser_domains", None):
+            doms = ", ".join(
+                f"{d}({c})" for d, c in summary.browser_domains.most_common(_limit_value(6))
+            )
+            muted_note.append(f"Workgroups/Domains announced: {doms}")
+        if muted_note:
+            for note in muted_note:
+                lines.append(muted(note))
+
+    # Browser protocol command breakdown + elections.
+    bcmds = getattr(summary, "browser_command_counts", None)
+    election_events = getattr(summary, "election_events", []) or []
+    if bcmds or election_events:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Browser Protocol Activity"))
+        if bcmds:
+            lines.append(_counter_table(bcmds, "Browser Command", limit=_limit_value(12)))
+        if election_events:
+            rows = [["Election Src", "Criteria", "Uptime(s)", "Candidate"]]
+            for ev in election_events[: _limit_value(10)]:
+                rows.append(
+                    [
+                        str(ev.get("src_ip", "-")),
+                        f"0x{int(ev.get('criteria', 0) or 0):08x}",
+                        f"{float(ev.get('uptime_s', 0.0) or 0.0):.0f}",
+                        str(ev.get("server_name", "") or "-"),
+                    ]
+                )
+            lines.append(_format_table(rows))
+
+    # NETLOGON / NTLOGON logon activity (DC discovery + queried accounts).
+    logon_requests = getattr(summary, "logon_requests", []) or []
+    if logon_requests:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("NETLOGON / Logon Mailslot Activity"))
+        rows = [["Src", "Mailslot", "Operation", "Querying Host", "Queried Account"]]
+        seen_l: set = set()
+        for lr in logon_requests:
+            key = (
+                str(lr.get("src_ip", "-")),
+                str(lr.get("op_name", "-")),
+                str(lr.get("computer", "")),
+                str(lr.get("user", "")),
+            )
+            if key in seen_l:
+                continue
+            seen_l.add(key)
+            rows.append(
+                [
+                    str(lr.get("src_ip", "-")),
+                    str(lr.get("mailslot", "-")),
+                    str(lr.get("op_name", "-")),
+                    str(lr.get("computer", "") or "-"),
+                    (danger(str(lr.get("user", ""))) if lr.get("user") else "-"),
+                ]
+            )
+            if len(rows) > _limit_value(15):
+                break
+        lines.append(_format_table(rows))
 
     if summary.protocol_packets:
         lines.append(SUBSECTION_BAR)
@@ -21937,6 +22455,22 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
         for value in summary.artifacts[: _limit_value(40)]:
             lines.append(f"  - {_truncate_text(value, 120)}")
 
+    hypotheses = getattr(summary, "threat_hypotheses", None) or []
+    benign_context = getattr(summary, "benign_context", None) or []
+    if hypotheses:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Threat Hypotheses"))
+        for hyp in hypotheses[: _limit_value(8)]:
+            if isinstance(hyp, dict):
+                conf = str(hyp.get("confidence", "")).upper()
+                text = str(hyp.get("hypothesis", ""))
+                lines.append(warn(f"[{conf}] {text}"))
+    if benign_context:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Benign / Asset Context"))
+        for note in benign_context[: _limit_value(8)]:
+            lines.append(muted(f"- {note}"))
+
     lines.append(SECTION_BAR)
     _render_deterministic_checks(
         lines, summary, "Deterministic NetBIOS Security Checks", [
@@ -21945,6 +22479,9 @@ def render_netbios_summary(summary: "NetbiosAnalysis") -> str:
             ("nbns_broadcast_storm", "NBNS Broadcast Storm"),
             ("netbios_beaconing_pattern", "NetBIOS Beaconing Pattern"),
             ("role_claim_anomaly", "Role-Claim Anomaly"),
+            ("browser_election_or_takeover", "Browser Election / Master-Browser Takeover"),
+            ("browser_role_spoofing_or_conflict", "Browser Role Spoofing / PDC Conflict"),
+            ("logon_mailslot_enumeration", "NETLOGON/NTLOGON Enumeration"),
             ("smb_auth_abuse_over_netbios", "SMB Auth Abuse over NetBIOS"),
             ("smb_write_exfil_over_netbios", "SMB Write/Exfil over NetBIOS"),
             ("public_netbios_exposure", "Public NetBIOS Exposure"),
@@ -22928,6 +23465,190 @@ def render_dhcp_summary(
 
 
 @_ot_full_render
+def _render_modbus_verdict(lines: list[str], summary: "ModbusAnalysis") -> None:
+    """Always-on triage disposition for Modbus — unlike the shared
+    ``_render_ot_verdict`` (silent on benign captures), this states a verdict on
+    every capture, including a benign polling baseline, so a triager never has
+    to re-derive "is this normal?" from the raw statistics. Anomalies, when
+    present, still drive a Focus-Here-First + ATT&CK-for-ICS block.
+    """
+    anoms = list(getattr(summary, "anomalies", []) or [])
+    norm = [(_normalize_finding(a), a) for a in anoms]
+    worst = max((_PROTO_SEV_RANK.get(n[0][0], 0) for n in norm), default=0)
+
+    masters = list(getattr(summary, "masters", []) or [])
+    servers = list(getattr(summary, "dst_ips", {}) or {})
+    units = list(getattr(summary, "unit_ids", {}) or {})
+    reads = sum(
+        cnt for name, cnt in getattr(summary, "func_counts", {}).items()
+        if "read" in name.lower()
+    )
+    writes = int(getattr(summary, "write_count", 0))
+    excs = int(getattr(summary, "exception_count", 0))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if worst >= 4:
+        lines.append(danger(
+            "CRITICAL - Modbus: broadcast/destructive control activity observed; "
+            "treat as a potential active manipulation of the process."
+        ))
+    elif worst >= 3:
+        lines.append(danger(
+            "HIGH - Modbus: state-changing command or control-plane abuse observed; "
+            "confirm it originates from an authorized master within a change window."
+        ))
+    elif worst >= 2:
+        lines.append(warn(
+            "REVIEW - Modbus: notable activity that deviates from a clean read-only "
+            "polling baseline; triage the findings below."
+        ))
+    else:
+        lines.append(ok(
+            "BENIGN BASELINE - Modbus: read-only polling with no writes, exceptions, "
+            "or protocol anomalies. Consistent with routine SCADA/HMI acquisition."
+        ))
+
+    unit_str = ", ".join(str(u) for u in sorted(units)[:8]) if units else "none"
+    if units and len(units) > 8:
+        unit_str += f", +{len(units) - 8}"
+    lines.append(muted(
+        f"  Baseline: {len(masters)} master(s) -> {len(servers)} server(s); "
+        f"unit id(s) {unit_str}; {reads} reads / {writes} writes / {excs} exceptions "
+        f"over {getattr(summary, 'duration', 0.0):.0f}s."
+    ))
+    if masters:
+        lines.append(muted(f"  Master(s): {', '.join(masters[:6])}"))
+    if len(masters) > 1:
+        lines.append(warn(
+            "  Note: >1 Modbus master present — validate any that is not a known "
+            "SCADA/HMI/EWS (new-master hunt hypothesis)."
+        ))
+
+    if worst >= 2:
+        ranked = sorted(
+            norm, key=lambda n: _PROTO_SEV_RANK.get(n[0][0], 0), reverse=True
+        )
+        lines.append(muted("Focus Here First:"))
+        attack_ids: list[str] = []
+        for (sev, title, detail), orig in ranked[: _limit_value(6)]:
+            if _PROTO_SEV_RANK.get(sev, 0) < 2:
+                continue
+            mark = (
+                danger(f"[{sev.upper()}]")
+                if _PROTO_SEV_RANK.get(sev, 0) >= 3
+                else warn(f"[{sev.upper()}]")
+            )
+            src = str(getattr(orig, "src", "") or "")
+            dst = str(getattr(orig, "dst", "") or "")
+            ev = f"{src} -> {dst}" if (src or dst) else _truncate_text(detail, 80)
+            lines.append(f"  {mark} {title}" + (f" — {_truncate_text(ev, 90)}" if ev else ""))
+        for (_sev, title, _detail), _orig in ranked:
+            tech = _ot_attack_for_title(title)
+            if tech and tech not in attack_ids:
+                attack_ids.append(tech)
+        if attack_ids:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("ATT&CK for ICS Mapping"))
+            for tid in attack_ids[: _limit_value(12)]:
+                lines.append(muted(f"- {tid}"))
+
+
+def _render_modbus_baseline_sections(
+    lines: list[str], summary: "ModbusAnalysis"
+) -> None:
+    """Forensic baseline sections: register/coil map (process fingerprint),
+    polling cadence, per-server response time, and transaction pairing."""
+    # --- Register / Coil Map (process fingerprint) ---
+    register_map = getattr(summary, "register_map", {}) or {}
+    if register_map:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Register / Coil Map (process fingerprint)"))
+        rows = [["Server / Unit", "Reads", "Read Range", "Writes", "Write Range", "Hot (addr:count)"]]
+        ordered = sorted(
+            register_map.values(),
+            key=lambda r: -(int(r.get("read_count", 0)) + int(r.get("write_count", 0))),
+        )
+        for rec in ordered[: _limit_value(12)]:
+            rmin, rmax = rec.get("read_min"), rec.get("read_max")
+            wmin, wmax = rec.get("write_min"), rec.get("write_max")
+            read_rng = f"{rmin}-{rmax}" if rmin is not None else "-"
+            write_rng = f"{wmin}-{wmax}" if wmin is not None else "-"
+            hot_src = rec.get("write_hot") or rec.get("read_hot") or []
+            hot = ", ".join(f"{a}:{c}" for a, c in hot_src[:3]) or "-"
+            wcount = int(rec.get("write_count", 0))
+            wcell = danger(str(wcount)) if wcount else "0"
+            rows.append([
+                f"{rec.get('dst','?')} U{rec.get('unit','?')}",
+                str(rec.get("read_count", 0)),
+                read_rng,
+                wcell,
+                write_rng,
+                hot,
+            ])
+        lines.append(_format_table(rows))
+
+    # --- Polling Cadence (request direction only) ---
+    cadence = getattr(summary, "session_cadence", []) or []
+    req_cadence = [c for c in cadence if str(c.get("session", "")).split(" -> ", 1)[-1].endswith(":502")]
+    if req_cadence:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Polling Cadence (per master -> server)"))
+        rows = [["Session", "Reqs", "Avg (s)", "Median (s)", "Regular?"]]
+        for c in req_cadence[: _limit_value(10)]:
+            rows.append([
+                _truncate_text(str(c.get("session", "")), 46),
+                str(c.get("count", 0)),
+                f"{float(c.get('avg', 0.0)):.3f}",
+                f"{float(c.get('median', 0.0)):.3f}",
+                "yes" if c.get("regular") else "no",
+            ])
+        lines.append(_format_table(rows))
+
+    # --- Response Time by Server ---
+    rtt = getattr(summary, "rtt_by_server", {}) or {}
+    if rtt:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Response Time by Server (paired req->resp)"))
+        rows = [["Server", "min ms", "p50 ms", "p95 ms", "max ms"]]
+        for ip, st in sorted(rtt.items(), key=lambda kv: -kv[1].get("p95", 0)):
+            rows.append([
+                ip,
+                f"{st.get('min', 0):.0f}",
+                f"{st.get('p50', 0):.0f}",
+                f"{st.get('p95', 0):.0f}",
+                f"{st.get('max', 0):.0f}",
+            ])
+        lines.append(_format_table(rows))
+
+    # --- Transaction Pairing ---
+    pairing = getattr(summary, "pairing", {}) or {}
+    if pairing:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Transaction Pairing"))
+        matched = int(pairing.get("matched", 0))
+        orphans = int(pairing.get("orphan_requests", 0))
+        phantom = int(pairing.get("phantom_responses", 0))
+        static = int(pairing.get("static_transid_conns", 0))
+        lines.append(_format_kv("Matched req/resp", str(matched)))
+        lines.append(_format_kv(
+            "Orphan requests (no response)",
+            danger(str(orphans)) if orphans else "0",
+        ))
+        lines.append(_format_kv(
+            "Unsolicited responses",
+            danger(str(phantom)) if phantom else "0",
+        ))
+        lines.append(_format_kv(
+            "Static transaction-id connections",
+            danger(str(static)) if static else "0",
+        ))
+        lines.append(muted(
+            "  Orphans/unsolicited near capture edges are expected (pre-existing "
+            "sessions, cut-off); sustained imbalance = DoS or injection."
+        ))
+
+
 def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> str:
     """
     Render Modbus analysis results.
@@ -22941,7 +23662,7 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
     lines.append(SECTION_BAR)
     lines.append(header(f"MODBUS ANALYSIS :: {summary.path.name}"))
     lines.append(SECTION_BAR)
-    _render_ot_verdict(lines, "Modbus", getattr(summary, "anomalies", []))
+    _render_modbus_verdict(lines, summary)
 
     if summary.errors:
         lines.append(SUBSECTION_BAR)
@@ -23070,6 +23791,8 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
             s_bytes = format_bytes_as_mb(summary.server_bytes.get(ip, 0))
             s_str = f"{ip} ({cnt}/{s_bytes})"
         lines.append(f"{c_str:<{col_width}} | {s_str}")
+
+    _render_modbus_baseline_sections(lines, summary)
 
     if summary.service_endpoints:
         lines.append(SUBSECTION_BAR)
@@ -23561,7 +24284,16 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
     lines.append(SECTION_BAR)
 
     # 1. Overview
-    lines.append(_format_kv("Scan Duration", f"{summary.duration:.2f}s"))
+    dur = float(getattr(summary, "duration", 0.0))
+    if getattr(summary, "noncontiguous_capture", False):
+        days = dur / 86400.0
+        lines.append(_format_kv(
+            "Capture Span",
+            warn(f"{days:,.0f} days (~{days/365:.1f}y) — non-contiguous / merged "
+                 "capture; timestamps are not a real monitoring window"),
+        ))
+    else:
+        lines.append(_format_kv("Scan Duration", f"{dur:.2f}s"))
     lines.append(_format_kv("DNP3 Packets", str(summary.dnp3_packets)))
     lines.append(_format_kv("Active TCP/UDP IPs", str(len(summary.ip_endpoints))))
     lines.append(_format_kv("DNP3 Addresses", str(summary.unique_dnp3_addresses)))
@@ -23645,20 +24377,47 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
             )
         lines.append(_format_table(rows))
 
-    # ---- Conversations (master -> outstation) ---------------------------
-    conversations = getattr(summary, "conversations", {}) or {}
-    if conversations:
+    # ---- Top masters (clients) / outstations (servers) ------------------
+    masters = getattr(summary, "master_ips", Counter())
+    outstations = getattr(summary, "outstation_ips", Counter())
+    src_req = getattr(summary, "src_requests", Counter())
+    src_resp = getattr(summary, "src_responses", Counter())
+    if masters or outstations:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("DNP3 Conversations (initiator -> peer)"))
-        rows = [["Initiator", "Peer", "Top Functions"]]
+        lines.append(header("Top Masters (clients) / Outstations (servers)"))
+        col = 45
+        lines.append(highlight(f"{'Master (requests)':<{col}} | {'Outstation (responses)'}"))
+        lines.append(muted("-" * 90))
+        m_rank = sorted(set(masters), key=lambda i: -int(src_req.get(i, 0)))
+        o_rank = sorted(set(outstations), key=lambda i: -int(src_resp.get(i, 0)))
+        for i in range(max(len(m_rank), len(o_rank))):
+            m = f"{m_rank[i]} ({int(src_req.get(m_rank[i], 0))} req)" if i < len(m_rank) else ""
+            o = f"{o_rank[i]} ({int(src_resp.get(o_rank[i], 0))} resp)" if i < len(o_rank) else ""
+            lines.append(f"{m:<{col}} | {o}")
+
+    # ---- Conversations (direction-aware: actual sender -> receiver) ------
+    directed = getattr(summary, "directed_conversations", {}) or {}
+    conversations = directed or (getattr(summary, "conversations", {}) or {})
+    if conversations:
+        master_set = set(masters)
+        outstation_set = set(outstations)
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("DNP3 Conversations (sender -> receiver)"))
+        rows = [["Sender", "Role", "Receiver", "Functions Sent"]]
         for (a_ip, b_ip), fcounts in sorted(
             conversations.items(), key=lambda kv: -sum(kv[1].values())
-        )[: _limit_value(10)]:
+        )[: _limit_value(12)]:
+            role = (
+                "Master" if a_ip in master_set and a_ip not in outstation_set
+                else "Outstation" if a_ip in outstation_set and a_ip not in master_set
+                else "Master+Out" if a_ip in master_set and a_ip in outstation_set
+                else "-"
+            )
             fc = ", ".join(
                 f"{n}({c})"
-                for n, c in sorted(fcounts.items(), key=lambda x: -x[1])[:4]
+                for n, c in sorted(fcounts.items(), key=lambda x: -x[1])[:5]
             )
-            rows.append([a_ip, b_ip, fc])
+            rows.append([a_ip, role, b_ip, fc])
         lines.append(_format_table(rows))
 
     # ---- Protocol statistics --------------------------------------------
@@ -23677,22 +24436,63 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
         _format_kv("Control Commands", str(getattr(summary, "control_count", 0)))
     )
 
-    # 2. Function Codes
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Function Code Usage"))
-    if not summary.func_counts:
+    # 2. DNP3 Command Summary — observed function codes split by role (master
+    # requests vs outstation responses) and classified by risk, so a triager
+    # sees the control-plane commands separately from monitoring/poll traffic.
+    master_funcs = getattr(summary, "master_funcs", Counter()) or Counter()
+    outstation_funcs = getattr(summary, "outstation_funcs", Counter()) or Counter()
+    if not master_funcs and not outstation_funcs and not summary.func_counts:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("DNP3 Command Summary"))
         lines.append(muted("No DNP3 functions detected."))
     else:
-        for func, count in summary.func_counts.most_common():
-            # Highlight control-plane / state-changing functions.
-            is_risk = any(
-                x in func
-                for x in ["Write", "Operate", "Select", "Restart", "File", "Freeze",
-                          "Stop", "Start", "Config", "Initialize", "Unsolicited"]
-            )
-            c = danger if is_risk else lambda x: x
+        # Control/state-changing (HIGH), config/session (REVIEW), monitoring (normal).
+        _high = {"Write", "Operate", "Direct Operate", "Direct Operate No Ack",
+                 "Select", "Cold Restart", "Warm Restart", "Stop Application",
+                 "Initialize Application", "Start Application", "Save Configuration",
+                 "Delete File", "Write File", "Activate Configuration"}
+        _review = {"Enable Unsolicited", "Disable Unsolicited", "Assign Class",
+                   "Initialize Data", "Record Current Time", "Immediate Freeze",
+                   "Freeze and Clear", "Authenticate", "Open File", "Get File Info"}
 
-            lines.append(c(f"{func:<40} : {count}"))
+        def _risk_of(name: str) -> str:
+            if name in _high or any(k in name for k in ("Restart", "Operate", "Write", "Stop")):
+                return "CONTROL"
+            if name in _review or "Unsolicited" in name or "File" in name:
+                return "REVIEW"
+            return "Normal"
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("DNP3 Command Summary — Master Requests"))
+        if master_funcs:
+            rows = [["Function", "Count", "Class"]]
+            for func, count in master_funcs.most_common(_limit_value(20)):
+                risk = _risk_of(func)
+                disp = danger(func) if risk == "CONTROL" else warn(func) if risk == "REVIEW" else func
+                rows.append([disp, str(count), risk])
+            lines.append(_format_table(rows))
+        else:
+            lines.append(muted("No master-issued requests observed."))
+
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("DNP3 Command Summary — Outstation Responses"))
+        if outstation_funcs:
+            rows = [["Function", "Count", "Class"]]
+            for func, count in outstation_funcs.most_common(_limit_value(10)):
+                cls = "REVIEW" if "Unsolicited" in func else "Normal"
+                disp = warn(func) if cls == "REVIEW" else func
+                rows.append([disp, str(count), cls])
+            lines.append(_format_table(rows))
+        else:
+            lines.append(muted("No outstation responses observed."))
+
+        sel = int(getattr(summary, "select_count", 0))
+        op = int(getattr(summary, "operate_count", 0))
+        if sel or op:
+            note = f"Select={sel}, Operate={op}"
+            if sel and not op:
+                note += "  [Select without Operate — incomplete SBO / control-point probing]"
+            lines.append(muted(f"  Select-before-Operate: {note}"))
 
     # 2a. Control commands (with evidence) -- the load-bearing artifact.
     if control_cmds:
@@ -23910,6 +24710,20 @@ def render_dnp3_rollup(summaries: Iterable["Dnp3Analysis"]) -> str:
 # shared industrial renderer (and any OT analyzer) maps findings to ICS
 # techniques without each analyzer carrying the IDs. Order matters (first match).
 _OT_ATTACK_KEYWORDS = [
+    # Modbus-specific titles — placed first so they win over the generic
+    # "write"/"unsolicited" fallbacks below (first match wins).
+    ("broadcast write", "T0831 Manipulation of Control"),
+    ("read-then-write", "T0836 Modify Parameter"),
+    ("unanswered", "T0814 Denial of Service"),
+    ("unsolicited response", "T0856 Spoof Reporting Message"),
+    ("static transaction", "T0856 Spoof Reporting Message"),
+    ("coil force", "T0831 Manipulation of Control"),
+    ("enumeration campaign", "T0846 Remote System Discovery"),
+    ("discovery sweep", "T0846 Remote System Discovery"),
+    ("sensitive tag", "T0836 Modify Parameter"),
+    ("write target", "T0836 Modify Parameter"),
+    ("high-risk cip", "T0855 Unauthorized Command Message"),
+    ("write burst", "T0836 Modify Parameter"),
     ("program download", "T0843 Program Download"),
     ("program upload", "T0845 Program Upload"),
     # Generic "program transfer" title (S7) — a transfer TO the PLC is the
@@ -23965,6 +24779,46 @@ def _ot_attack_for_title(title: str) -> str:
         if needle in low:
             return tech
     return ""
+
+
+# Keyword sets to classify an OT command/operation name by consequence, shared
+# by the generic industrial renderer's command summary across ~15 protocols.
+# Kept specific to avoid false hits (e.g. bare "control" matching "Controller").
+_OT_CMD_CONTROL_KW = (
+    "write", "operate", "force", "set attr", "setattr", "set_attr", "download",
+    "program download", "program upload", "reset", "restart", "reboot",
+    "reinitial", "cold restart", "warm restart", "stop", "plc start", "start cpu",
+    "start application", "control relay", "control output", "communication control",
+    "communicationcontrol", "comm control", "actuat", "delete", "create object",
+    "erase", "firmware",
+    "select", "activate config", "set point", "setpoint", "mode change",
+    "run mode", "format", "wipe", "clear ", "assign class",
+)
+_OT_CMD_REVIEW_KW = (
+    "read device", "read identity", "identity", "enumerat", "discover", "list ",
+    "get attr", "get_attr", "getattr", "browse", "who-is", "whois", "read file",
+    "upload", "config", "auth", "login", "session", "unsolicited", "subscribe",
+)
+# Explicit read/monitor intent short-circuits to Normal (unless it also carries a
+# write verb) so "Controller Status Read" / "Read Holding Registers" aren't CONTROL.
+_OT_CMD_READ_KW = ("read", "poll", "status", "monitor", "get value", "scan value")
+_OT_CMD_WRITE_VERB = ("write", "download", "program ", "operate", "force", "set ")
+
+
+def _ot_command_risk(name: str) -> str:
+    """Classify an OT command name as CONTROL (state-changing), REVIEW
+    (recon/config/session), or Normal (read/poll/monitor)."""
+    low = str(name or "").lower()
+    is_read = any(k in low for k in _OT_CMD_READ_KW)
+    has_write_verb = any(k in low for k in _OT_CMD_WRITE_VERB)
+    if is_read and not has_write_verb:
+        # A read that also names a recon target (device/identity/file) is REVIEW.
+        return "REVIEW" if any(k in low for k in _OT_CMD_REVIEW_KW) else "Normal"
+    if any(k in low for k in _OT_CMD_CONTROL_KW):
+        return "CONTROL"
+    if any(k in low for k in _OT_CMD_REVIEW_KW):
+        return "REVIEW"
+    return "Normal"
 
 
 def _render_ot_verdict(lines: list[str], label: str, anomalies: object) -> None:
@@ -24038,6 +24892,11 @@ def _render_industrial_summary(
     duration = getattr(summary, "duration", 0.0)
     src_ips = getattr(summary, "src_ips", Counter())
     dst_ips = getattr(summary, "dst_ips", Counter())
+    # Direction-aware role counters (clients = requesters, servers = responders),
+    # populated by the shared analyze loop. Fall back to raw src/dst when a
+    # protocol analyzer ran without enrichment.
+    client_ips = getattr(summary, "client_ips", Counter()) or Counter()
+    server_ips = getattr(summary, "server_ips", Counter()) or Counter()
     sessions = getattr(summary, "sessions", Counter())
     commands = getattr(summary, "commands", Counter())
     artifacts = getattr(summary, "artifacts", [])
@@ -24058,22 +24917,29 @@ def _render_industrial_summary(
         for err in errors:
             lines.append(danger(f"- {err}"))
 
+    # Prefer the direction-aware role split; fall back to raw src/dst counters.
+    directional_roles = bool(client_ips or server_ips)
+    top_clients = client_ips if directional_roles else src_ips
+    top_servers = server_ips if directional_roles else dst_ips
+
     lines.append(_format_kv("Scan Duration", f"{duration:.2f}s"))
     lines.append(_format_kv("Total Packets", str(total_packets)))
     lines.append(_format_kv(packet_label, str(protocol_packets)))
-    lines.append(_format_kv("Unique Clients", str(len(src_ips))))
-    lines.append(_format_kv("Unique Servers", str(len(dst_ips))))
+    lines.append(_format_kv("Unique Clients", str(len(top_clients))))
+    lines.append(_format_kv("Unique Servers", str(len(top_servers))))
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Top Endpoints"))
-    if not src_ips and not dst_ips:
+    lines.append(header("Top Clients / Servers"))
+    if not top_clients and not top_servers:
         lines.append(muted("No endpoints detected."))
     else:
         col_width = 45
-        lines.append(highlight(f"{'Clients':<{col_width}} | {'Servers'}"))
+        c_hdr = "Clients (requesters)" if directional_roles else "Clients"
+        s_hdr = "Servers (responders)" if directional_roles else "Servers"
+        lines.append(highlight(f"{c_hdr:<{col_width}} | {s_hdr}"))
         lines.append(muted("-" * 90))
-        clients = src_ips.most_common(_limit_value(10))
-        servers = dst_ips.most_common(_limit_value(10))
+        clients = top_clients.most_common(_limit_value(10))
+        servers = top_servers.most_common(_limit_value(10))
         max_rows = max(len(clients), len(servers))
         for i in range(max_rows):
             c_str = ""
@@ -24088,8 +24954,25 @@ def _render_industrial_summary(
 
     if commands:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Commands/Operations"))
-        lines.append(_counter_table(commands, "Command", limit=_limit_value(12)))
+        lines.append(header("Observed OT Commands"))
+        rows = [["Command", "Count", "Class"]]
+        n_control = 0
+        for cmd, count in commands.most_common(_limit_value(16)):
+            risk = _ot_command_risk(str(cmd))
+            disp = (
+                danger(str(cmd)) if risk == "CONTROL"
+                else warn(str(cmd)) if risk == "REVIEW"
+                else str(cmd)
+            )
+            if risk == "CONTROL":
+                n_control += 1
+            rows.append([disp, str(count), risk])
+        lines.append(_format_table(rows))
+        if n_control:
+            lines.append(muted(
+                f"  {n_control} distinct control/state-changing command type(s) "
+                "observed — confirm authorized source + change window."
+            ))
 
     if sessions:
         lines.append(SUBSECTION_BAR)
@@ -24190,6 +25073,169 @@ def render_bacnet_summary(summary: "IndustrialAnalysis") -> str:
     return _render_industrial_summary("BACnet", summary, packet_label="BACnet Packets")
 
 
+def _render_enip_verdict(lines: list[str], summary: "ENIPAnalysis") -> None:
+    """Always-on triage disposition for EtherNet/IP — states a verdict on every
+    capture (incl. a benign read-only polling baseline) instead of going silent,
+    mirroring the --modbus upgrade."""
+    anoms = list(getattr(summary, "anomalies", []) or [])
+    norm = [(_normalize_finding(a), a) for a in anoms]
+    worst = max((_PROTO_SEV_RANK.get(n[0][0], 0) for n in norm), default=0)
+
+    masters = list(getattr(summary, "masters", []) or [])
+    servers = list(getattr(summary, "server_ips", {}) or {})
+    reads = sum(getattr(summary, "tag_reads", Counter()).values())
+    writes = int(getattr(summary, "write_service_count", 0))
+    high_risk = sum(getattr(summary, "high_risk_services", Counter()).values())
+    errs = int(getattr(summary, "cip_errors", 0))
+    conns = len(getattr(summary, "connections", []) or [])
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if worst >= 4:
+        lines.append(danger(
+            "CRITICAL - EtherNet/IP: destructive control activity (Reset/Stop/"
+            "program) observed; treat as potential active manipulation."
+        ))
+    elif worst >= 3:
+        lines.append(danger(
+            "HIGH - EtherNet/IP: state-changing CIP (tag/attribute write, control, "
+            "program transfer) observed; confirm an authorized engineering source "
+            "within a change window."
+        ))
+    elif worst >= 2:
+        lines.append(warn(
+            "REVIEW - EtherNet/IP: activity that deviates from a clean read-only "
+            "polling baseline; triage the findings below."
+        ))
+    else:
+        lines.append(ok(
+            "BENIGN BASELINE - EtherNet/IP: read-only CIP polling with no writes, "
+            "control, program transfers, or CIP errors. Consistent with routine "
+            "HMI/SCADA tag acquisition."
+        ))
+    lines.append(muted(
+        f"  Baseline: {len(masters)} master(s) -> {len(servers)} device(s); "
+        f"{reads} tag reads / {writes} writes / {high_risk} high-risk services / "
+        f"{errs} CIP errors / {conns} ForwardOpen over "
+        f"{getattr(summary, 'duration', 0.0):.0f}s."
+    ))
+    if masters:
+        lines.append(muted(f"  Master(s): {', '.join(masters[:6])}"))
+    if len(masters) > 1:
+        lines.append(warn(
+            "  Note: >1 CIP master present — validate any that is not a known "
+            "HMI/SCADA/EWS (new-master hunt hypothesis)."
+        ))
+
+    if worst >= 2:
+        ranked = sorted(norm, key=lambda n: _PROTO_SEV_RANK.get(n[0][0], 0), reverse=True)
+        lines.append(muted("Focus Here First:"))
+        attack_ids: list[str] = []
+        for (sev, title, detail), orig in ranked[: _limit_value(6)]:
+            if _PROTO_SEV_RANK.get(sev, 0) < 2:
+                continue
+            mark = (
+                danger(f"[{sev.upper()}]")
+                if _PROTO_SEV_RANK.get(sev, 0) >= 3
+                else warn(f"[{sev.upper()}]")
+            )
+            src = str(getattr(orig, "src", "") or "")
+            dst = str(getattr(orig, "dst", "") or "")
+            ev = f"{src} -> {dst}" if (src or dst) else _truncate_text(detail, 80)
+            lines.append(f"  {mark} {title}" + (f" — {_truncate_text(ev, 90)}" if ev else ""))
+        for (_sev, title, _detail), orig in ranked:
+            tech = getattr(orig, "attack", "") or _ot_attack_for_title(title)
+            if tech and tech not in attack_ids:
+                attack_ids.append(tech)
+        if attack_ids:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("ATT&CK for ICS Mapping"))
+            for tid in attack_ids[: _limit_value(12)]:
+                lines.append(muted(f"- {tid}"))
+
+
+def _render_enip_baseline_sections(lines: list[str], summary: "ENIPAnalysis") -> None:
+    """Forensic baseline: Tag Access Map (process fingerprint), CIP health
+    (success/error), per-server RTT, and ForwardOpen connections."""
+    # --- Tag Access Map ---
+    tag_reads = getattr(summary, "tag_reads", Counter()) or Counter()
+    tag_writes = getattr(summary, "tag_writes", Counter()) or Counter()
+    tag_endpoints = getattr(summary, "tag_endpoints", {}) or {}
+    all_tags = set(tag_reads) | set(tag_writes)
+    if all_tags:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Tag Access Map (process fingerprint)"))
+        rows = [["Tag", "Reads", "Writes", "Top endpoint"]]
+        ranked_tags = sorted(
+            all_tags, key=lambda t: -(tag_reads.get(t, 0) + tag_writes.get(t, 0))
+        )
+        for tag in ranked_tags[: _limit_value(20)]:
+            w = tag_writes.get(tag, 0)
+            eps = tag_endpoints.get(tag, Counter())
+            top_ep = eps.most_common(1)[0][0] if eps else "-"
+            rows.append([
+                _truncate_text(tag, 40),
+                str(tag_reads.get(tag, 0)),
+                danger(str(w)) if w else "0",
+                _truncate_text(top_ep, 34),
+            ])
+        lines.append(_format_table(rows))
+        if len(all_tags) > 20:
+            lines.append(muted(f"  ... and {len(all_tags) - 20} more tags"))
+
+    # --- CIP Health (success vs error) ---
+    success = int(getattr(summary, "cip_success", 0))
+    errors = int(getattr(summary, "cip_errors", 0))
+    if success or errors:
+        total = success + errors
+        err_rate = (errors / total) if total else 0.0
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("CIP Health"))
+        lines.append(_format_kv("Successful responses", str(success)))
+        lines.append(_format_kv(
+            "Error responses",
+            danger(f"{errors} ({err_rate:.1%})") if errors else "0 (0.0%)",
+        ))
+        err_counts = getattr(summary, "error_status_counts", Counter()) or Counter()
+        if err_counts:
+            lines.append(_format_kv(
+                "Top CIP errors",
+                ", ".join(f"{name} x{cnt}" for name, cnt in err_counts.most_common(4)),
+            ))
+
+    # --- Response Time by Server ---
+    rtt = getattr(summary, "rtt_by_server", {}) or {}
+    if rtt:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Response Time by Server (paired req->resp)"))
+        rows = [["Server", "min ms", "p50 ms", "p95 ms", "max ms"]]
+        for ip, st in sorted(rtt.items(), key=lambda kv: -kv[1].get("p95", 0))[: _limit_value(12)]:
+            rows.append([
+                ip,
+                f"{st.get('min', 0):.0f}",
+                f"{st.get('p50', 0):.0f}",
+                f"{st.get('p95', 0):.0f}",
+                f"{st.get('max', 0):.0f}",
+            ])
+        lines.append(_format_table(rows))
+
+    # --- ForwardOpen Connections ---
+    connections = getattr(summary, "connections", []) or []
+    if connections:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("CIP Connections (ForwardOpen)"))
+        rows = [["Originator -> Target", "O->T RPI ms", "T->O RPI ms", "Vendor", "Serial"]]
+        for c in connections[: _limit_value(12)]:
+            rows.append([
+                f"{c.get('src','?')} -> {c.get('dst','?')}",
+                str(c.get("ot_rpi_ms", "-")),
+                str(c.get("to_rpi_ms", "-")),
+                str(c.get("vendor_id", "-")),
+                str(c.get("orig_serial", "-")),
+            ])
+        lines.append(_format_table(rows))
+
+
 @_ot_full_render
 def render_enip_summary(summary: "ENIPAnalysis") -> str:
     if not summary:
@@ -24199,7 +25245,7 @@ def render_enip_summary(summary: "ENIPAnalysis") -> str:
     lines.append(SECTION_BAR)
     lines.append(header(f"ETHERNET/IP ANALYSIS :: {summary.path.name}"))
     lines.append(SECTION_BAR)
-    _render_ot_verdict(lines, "EtherNet/IP", getattr(summary, "anomalies", []))
+    _render_enip_verdict(lines, summary)
 
     if summary.errors:
         lines.append(SUBSECTION_BAR)
@@ -24280,7 +25326,7 @@ def render_enip_summary(summary: "ENIPAnalysis") -> str:
 
     if summary.cip_services:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Encapsulated CIP Services"))
+        lines.append(header("Observed CIP Services (OT Commands)"))
         rows = [["Service", "Count", "Risk"]]
         dangerous = {
             "Reset",
@@ -24304,6 +25350,8 @@ def render_enip_summary(summary: "ENIPAnalysis") -> str:
             "ProgramUpload",
         }
         for service, count in summary.cip_services.most_common(_limit_value(16)):
+            if service == "Service 0x00":
+                continue  # CIP parse-artifact, not an OT command
             risk = "Normal"
             display = service
             if service in dangerous:
@@ -24321,26 +25369,47 @@ def render_enip_summary(summary: "ENIPAnalysis") -> str:
         suspicious_total = sum(
             getattr(summary, "suspicious_services", Counter()).values()
         )
+        enumeration_total = sum(
+            getattr(summary, "enumeration_services", Counter()).values()
+        )
         total_services = sum(summary.cip_services.values())
-        normal_total = max(0, total_services - high_risk_total - suspicious_total)
+        normal_total = max(
+            0, total_services - high_risk_total - suspicious_total - enumeration_total
+        )
         lines.append(SUBSECTION_BAR)
         lines.append(header("Command Risking Overview"))
         lines.append(_format_kv("Total Service Invocations", str(total_services)))
-        lines.append(_format_kv("High-Risk Invocations", str(high_risk_total)))
-        lines.append(_format_kv("Suspicious Invocations", str(suspicious_total)))
-        lines.append(_format_kv("Normal Invocations", str(normal_total)))
+        lines.append(_format_kv(
+            "High-Risk (write/control/program)",
+            danger(str(high_risk_total)) if high_risk_total else "0",
+        ))
+        lines.append(_format_kv(
+            "Suspicious (config/connection/lifecycle)",
+            warn(str(suspicious_total)) if suspicious_total else "0",
+        ))
+        lines.append(_format_kv(
+            "Enumeration/Discovery reads", str(enumeration_total)
+        ))
+        lines.append(_format_kv("Normal (tag reads/other)", str(normal_total)))
+
+    _render_enip_baseline_sections(lines, summary)
 
     if summary.service_endpoints:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Service Endpoints"))
+        lines.append(header("Service Endpoints (client -> server)"))
         rows = [["Service", "Top Endpoints"]]
-        for service, count in summary.cip_services.most_common(_limit_value(8)):
+        for service, count in summary.cip_services.most_common(_limit_value(12)):
+            if service == "Service 0x00":
+                continue  # CIP parse-artifact for fragment/continuation packets
             endpoints = summary.service_endpoints.get(service, Counter())
+            if not endpoints:
+                continue
             top_eps = ", ".join(
                 f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3))
             )
             rows.append([service, top_eps or "-"])
-        lines.append(_format_table(rows))
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
 
     if summary.status_codes:
         lines.append(SUBSECTION_BAR)
@@ -24606,11 +25675,14 @@ def _render_ot_protocol_summary(
             lines.append(_format_kv("Distribution", sparkline(counts)))
 
     lines.append(SUBSECTION_BAR)
-    lines.append(header("Endpoint Statistics"))
+    lines.append(header("Top Clients / Servers"))
+    _dir_roles = bool(client_ips or server_ips)
     lines.append(_format_kv("Unique Clients", str(len(client_ips) or len(src_ips))))
     lines.append(_format_kv("Unique Servers", str(len(server_ips) or len(dst_ips))))
     col_width = 45
-    lines.append(highlight(f"{'Clients':<{col_width}} | {'Servers'}"))
+    _c_hdr = "Clients (requesters)" if _dir_roles else "Clients"
+    _s_hdr = "Servers (responders)" if _dir_roles else "Servers"
+    lines.append(highlight(f"{_c_hdr:<{col_width}} | {_s_hdr}"))
     lines.append(muted("-" * 90))
     clients = (client_ips or src_ips).most_common(_limit_value(10))
     servers = (server_ips or dst_ips).most_common(_limit_value(10))
@@ -24654,7 +25726,7 @@ def _render_ot_protocol_summary(
 
     if service_endpoints:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Service Endpoints"))
+        lines.append(header("Service Endpoints (client -> server)"))
         rows = [["Service", "Top Endpoints"]]
         for service, _count in commands.most_common(_limit_value(10)):
             endpoints = service_endpoints.get(str(service), Counter())
@@ -24884,6 +25956,133 @@ def render_melsec_summary(summary: "IndustrialAnalysis") -> str:
 
 
 @_ot_full_render
+def _render_cip_verdict(lines: list[str], summary: "CIPAnalysis") -> None:
+    """Always-on triage disposition for CIP (mirrors --enip)."""
+    anoms = list(getattr(summary, "anomalies", []) or [])
+    norm = [(_normalize_finding(a), a) for a in anoms]
+    worst = max((_PROTO_SEV_RANK.get(n[0][0], 0) for n in norm), default=0)
+    masters = list(getattr(summary, "masters", []) or [])
+    servers = list(getattr(summary, "server_ips", {}) or {})
+    reads = sum(getattr(summary, "tag_reads", Counter()).values())
+    writes = int(getattr(summary, "write_service_count", 0))
+    high_risk = sum(getattr(summary, "high_risk_services", Counter()).values())
+    errs = int(getattr(summary, "cip_errors", 0))
+    pccc = sum(getattr(summary, "pccc_commands", Counter()).values())
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Analyst Verdict"))
+    if worst >= 4:
+        lines.append(danger(
+            "CRITICAL - CIP: destructive object/control activity observed; treat "
+            "as potential active manipulation."
+        ))
+    elif worst >= 3:
+        lines.append(danger(
+            "HIGH - CIP: state-changing service (tag/attribute write, control, "
+            "program transfer) observed; confirm an authorized engineering source."
+        ))
+    elif worst >= 2:
+        lines.append(warn(
+            "REVIEW - CIP: activity that deviates from a clean read-only baseline; "
+            "triage the findings below."
+        ))
+    else:
+        lines.append(ok(
+            "BENIGN BASELINE - CIP: read-only object/tag polling with no writes, "
+            "control, program transfers, or CIP errors. Routine HMI/SCADA acquisition."
+        ))
+    lines.append(muted(
+        f"  Baseline: {len(masters)} master(s) -> {len(servers)} device(s); "
+        f"{reads} tag reads / {writes} writes / {high_risk} high-risk / {errs} CIP "
+        f"errors / {pccc} PCCC over {getattr(summary, 'duration', 0.0):.0f}s."
+    ))
+    if masters:
+        lines.append(muted(f"  Master(s): {', '.join(masters[:6])}"))
+    if len(masters) > 1:
+        lines.append(warn(
+            "  Note: >1 CIP master present — validate any that is not a known "
+            "HMI/SCADA/EWS (new-master hunt hypothesis)."
+        ))
+    if worst >= 2:
+        ranked = sorted(norm, key=lambda n: _PROTO_SEV_RANK.get(n[0][0], 0), reverse=True)
+        lines.append(muted("Focus Here First:"))
+        attack_ids: list[str] = []
+        for (sev, title, detail), orig in ranked[: _limit_value(6)]:
+            if _PROTO_SEV_RANK.get(sev, 0) < 2:
+                continue
+            mark = danger(f"[{sev.upper()}]") if _PROTO_SEV_RANK.get(sev, 0) >= 3 else warn(f"[{sev.upper()}]")
+            src = str(getattr(orig, "src", "") or "")
+            dst = str(getattr(orig, "dst", "") or "")
+            ev = f"{src} -> {dst}" if (src or dst) else _truncate_text(detail, 80)
+            lines.append(f"  {mark} {title}" + (f" — {_truncate_text(ev, 90)}" if ev else ""))
+        for (_sev, title, _detail), orig in ranked:
+            tech = getattr(orig, "attack", "") or _ot_attack_for_title(title)
+            if tech and tech not in attack_ids:
+                attack_ids.append(tech)
+        if attack_ids:
+            lines.append(SUBSECTION_BAR)
+            lines.append(header("ATT&CK for ICS Mapping"))
+            for tid in attack_ids[: _limit_value(12)]:
+                lines.append(muted(f"- {tid}"))
+
+
+def _render_cip_baseline_sections(lines: list[str], summary: "CIPAnalysis") -> None:
+    """Tag Access Map, CIP Health, and PCCC (legacy Allen-Bradley) command view."""
+    tag_reads = getattr(summary, "tag_reads", Counter()) or Counter()
+    tag_writes = getattr(summary, "tag_writes", Counter()) or Counter()
+    tag_endpoints = getattr(summary, "tag_endpoints", {}) or {}
+    all_tags = set(tag_reads) | set(tag_writes)
+    if all_tags:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("Tag Access Map (process fingerprint)"))
+        rows = [["Tag", "Reads", "Writes", "Top endpoint"]]
+        for tag in sorted(all_tags, key=lambda t: -(tag_reads.get(t, 0) + tag_writes.get(t, 0)))[: _limit_value(20)]:
+            w = tag_writes.get(tag, 0)
+            eps = tag_endpoints.get(tag, Counter())
+            rows.append([
+                _truncate_text(tag, 40), str(tag_reads.get(tag, 0)),
+                danger(str(w)) if w else "0",
+                _truncate_text(eps.most_common(1)[0][0] if eps else "-", 34),
+            ])
+        lines.append(_format_table(rows))
+
+    success = int(getattr(summary, "cip_success", 0))
+    errors = int(getattr(summary, "cip_errors", 0))
+    if success or errors:
+        total = success + errors
+        err_rate = (errors / total) if total else 0.0
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("CIP Health"))
+        lines.append(_format_kv("Successful responses", str(success)))
+        lines.append(_format_kv(
+            "Error responses",
+            danger(f"{errors} ({err_rate:.1%})") if errors else "0 (0.0%)",
+        ))
+        err_counts = getattr(summary, "error_status_counts", Counter()) or Counter()
+        if err_counts:
+            lines.append(_format_kv(
+                "Top CIP errors",
+                ", ".join(f"{n} x{c}" for n, c in err_counts.most_common(4)),
+            ))
+
+    pccc = getattr(summary, "pccc_commands", Counter()) or Counter()
+    if pccc:
+        pccc_eps = getattr(summary, "pccc_endpoints", {}) or {}
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("PCCC Commands (legacy Allen-Bradley, via Execute_PCCC)"))
+        rows = [["Command", "Count", "Risk", "Top endpoint"]]
+        for name, cnt in pccc.most_common(_limit_value(14)):
+            low = name.lower()
+            is_write = any(k in low for k in ("write", "download", "mode", "edit resource", "apply"))
+            eps = pccc_eps.get(name, Counter())
+            rows.append([
+                _truncate_text(name, 44), str(cnt),
+                danger("Write") if is_write else "Read",
+                _truncate_text(eps.most_common(1)[0][0] if eps else "-", 30),
+            ])
+        lines.append(_format_table(rows))
+
+
 def render_cip_summary(summary: "CIPAnalysis") -> str:
     if not summary:
         return ""
@@ -24892,7 +26091,7 @@ def render_cip_summary(summary: "CIPAnalysis") -> str:
     lines.append(SECTION_BAR)
     lines.append(header(f"CIP ANALYSIS :: {summary.path.name}"))
     lines.append(SECTION_BAR)
-    _render_ot_verdict(lines, "CIP", getattr(summary, "anomalies", []))
+    _render_cip_verdict(lines, summary)
 
     if summary.errors:
         lines.append(SUBSECTION_BAR)
@@ -24958,7 +26157,7 @@ def render_cip_summary(summary: "CIPAnalysis") -> str:
 
     if summary.cip_services:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("CIP Service Usage"))
+        lines.append(header("Observed CIP Services (OT Commands)"))
         rows = [["Service", "Count", "Risk"]]
         dangerous = {
             "Reset",
@@ -24982,6 +26181,8 @@ def render_cip_summary(summary: "CIPAnalysis") -> str:
             "ProgramUpload",
         }
         for service, count in summary.cip_services.most_common(_limit_value(16)):
+            if service == "Service 0x00":
+                continue  # CIP parse-artifact, not an OT command
             risk = "Normal"
             display = service
             if service in dangerous:
@@ -24995,15 +26196,27 @@ def render_cip_summary(summary: "CIPAnalysis") -> str:
 
         high_risk_total = sum(summary.high_risk_services.values())
         suspicious_total = sum(summary.suspicious_services.values())
+        enumeration_total = sum(getattr(summary, "enumeration_services", Counter()).values())
         total_services = sum(summary.cip_services.values())
-        normal_total = max(0, total_services - high_risk_total - suspicious_total)
+        normal_total = max(
+            0, total_services - high_risk_total - suspicious_total - enumeration_total
+        )
 
         lines.append(SUBSECTION_BAR)
         lines.append(header("Command Risking Overview"))
         lines.append(_format_kv("Total Service Invocations", str(total_services)))
-        lines.append(_format_kv("High-Risk Invocations", str(high_risk_total)))
-        lines.append(_format_kv("Suspicious Invocations", str(suspicious_total)))
-        lines.append(_format_kv("Normal Invocations", str(normal_total)))
+        lines.append(_format_kv(
+            "High-Risk (write/control/program)",
+            danger(str(high_risk_total)) if high_risk_total else "0",
+        ))
+        lines.append(_format_kv(
+            "Suspicious (config/connection/lifecycle)",
+            warn(str(suspicious_total)) if suspicious_total else "0",
+        ))
+        lines.append(_format_kv("Enumeration/Discovery reads", str(enumeration_total)))
+        lines.append(_format_kv("Normal (tag reads/other)", str(normal_total)))
+
+        _render_cip_baseline_sections(lines, summary)
 
         if summary.source_risky_commands:
             rows = [["Source", "High-Risk Commands"]]
@@ -25025,15 +26238,20 @@ def render_cip_summary(summary: "CIPAnalysis") -> str:
 
     if summary.service_endpoints:
         lines.append(SUBSECTION_BAR)
-        lines.append(header("Service Endpoints"))
+        lines.append(header("Service Endpoints (client -> server)"))
         rows = [["Service", "Top Endpoints"]]
-        for service, count in summary.cip_services.most_common(_limit_value(8)):
+        for service, count in summary.cip_services.most_common(_limit_value(12)):
+            if service == "Service 0x00":
+                continue  # CIP parse-artifact for fragment/continuation packets
             endpoints = summary.service_endpoints.get(service, Counter())
+            if not endpoints:
+                continue
             top_eps = ", ".join(
                 f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3))
             )
             rows.append([service, top_eps or "-"])
-        lines.append(_format_table(rows))
+        if len(rows) > 1:
+            lines.append(_format_table(rows))
 
     if summary.class_ids or summary.instance_ids or summary.attribute_ids:
         lines.append(SUBSECTION_BAR)
@@ -25133,8 +26351,8 @@ def render_cip_summary(summary: "CIPAnalysis") -> str:
     return _finalize_output(lines)
 
 
-def render_odesys_summary(summary: "IndustrialAnalysis") -> str:
-    return _render_industrial_summary("ODESYS", summary, packet_label="ODESYS Packets")
+def render_codesys_summary(summary: "IndustrialAnalysis") -> str:
+    return _render_industrial_summary("CODESYS", summary, packet_label="CODESYS Packets")
 
 
 def render_niagara_summary(summary: "IndustrialAnalysis") -> str:
@@ -25558,8 +26776,10 @@ def render_goose_summary(summary: GooseSummary, verbose: bool = False) -> str:
     lines = [header("GOOSE ANALYSIS")]
     _render_ot_verdict(lines, "GOOSE (IEC 61850)", getattr(summary, "detections", []))
     lines.append(_format_kv("GOOSE Packets", str(summary.goose_packets)))
-    lines.append(_format_kv("Top Sources", _format_counter(summary.src_macs, 5)))
-    lines.append(_format_kv("Top Destinations", _format_counter(summary.dst_macs, 5)))
+    # GOOSE is Layer-2 publisher -> multicast group (publish/subscribe), so the
+    # source MAC IS the publisher direction; there is no request/response.
+    lines.append(_format_kv("Top Publishers (src MAC)", _format_counter(summary.src_macs, 5)))
+    lines.append(_format_kv("Top Subscriber Groups (dst MAC)", _format_counter(summary.dst_macs, 5)))
     lines.append(_format_kv("APPIDs", _format_counter(summary.app_ids, 5)))
     if getattr(summary, "datasets", None):
         lines.append(_format_kv("Datasets", _format_counter(summary.datasets, 5)))
@@ -25611,8 +26831,10 @@ def render_sv_summary(summary: SvSummary, verbose: bool = False) -> str:
     lines = [header("SV ANALYSIS")]
     _render_ot_verdict(lines, "Sampled Values (IEC 61850)", getattr(summary, "detections", []))
     lines.append(_format_kv("SV Packets", str(summary.sv_packets)))
-    lines.append(_format_kv("Top Sources", _format_counter(summary.src_macs, 5)))
-    lines.append(_format_kv("Top Destinations", _format_counter(summary.dst_macs, 5)))
+    # Sampled Values is Layer-2 publisher -> multicast (merging unit -> subscribers);
+    # source MAC is the publisher, no request/response.
+    lines.append(_format_kv("Top Publishers (src MAC)", _format_counter(summary.src_macs, 5)))
+    lines.append(_format_kv("Top Subscriber Groups (dst MAC)", _format_counter(summary.dst_macs, 5)))
     lines.append(_format_kv("APPIDs", _format_counter(summary.app_ids, 5)))
     if getattr(summary, "sv_ids", None):
         lines.append(_format_kv("svID", _format_counter(summary.sv_ids, 5)))
@@ -25714,14 +26936,20 @@ def render_ptp_summary(summary: PtpSummary, verbose: bool = False) -> str:
         anomalies=getattr(summary, "anomalies", None),
     )
     lines.append(_format_kv("PTP Packets", str(summary.ptp_packets)))
+    # PTP message types are the "commands" (Sync / Follow_Up / Delay_Req /
+    # Announce / Signaling / Management) — a Management SET is state-changing.
     lines.append(_format_kv("Message Types", _format_counter(summary.msg_types, 6)))
     if getattr(summary, "domain_numbers", None):
         lines.append(_format_kv("Domains", _format_counter(summary.domain_numbers, 6)))
     lines.append(
         _format_kv(
-            "Top Sources", _format_counter(summary.src_macs or summary.src_ips, 5)
+            "Top Sources (masters/clocks)",
+            _format_counter(summary.src_macs or summary.src_ips, 5),
         )
     )
+    _ptp_dst = getattr(summary, "dst_macs", None) or getattr(summary, "dst_ips", None)
+    if _ptp_dst:
+        lines.append(_format_kv("Top Destinations", _format_counter(_ptp_dst, 5)))
     if summary.errors:
         lines.append(_format_kv("Errors", "; ".join(summary.errors)))
     detections = _filtered_detections(summary, verbose)
@@ -26888,7 +28116,9 @@ def _scan_mitre_techniques(summary: ScanSummary) -> list[str]:
     return tids
 
 
+@_always_full_render
 def render_scan_summary(summary: ScanSummary, verbose: bool = False) -> str:
+    verbose = True  # --scan always shows the complete picture
     lines = [header("SCAN ANALYSIS")]
     lines.append(_format_kv("Packets", str(summary.total_packets)))
     lines.append(_format_kv("Relevant Packets", str(summary.relevant_packets)))
@@ -26958,7 +28188,11 @@ def render_scan_summary(summary: ScanSummary, verbose: bool = False) -> str:
                 str(src.unique_targets),
                 str(src.unique_ports),
                 f"{src.open_responses}/{src.closed_responses}/{src.filtered_responses}",
-                f"{src.packets_per_second:.0f}",
+                (
+                    f"{src.packets_per_second:.1f}"
+                    if 0 < src.packets_per_second < 100
+                    else f"{src.packets_per_second:.0f}"
+                ),
             ]
         )
     lines.append(_format_table(rows))
@@ -27869,11 +29103,54 @@ def render_ot_commands_summary(
         lines.append(_format_kv("Mode", "FAST (port heuristic)"))
         for note in getattr(summary, "fast_notes", []) or []:
             lines.append(muted(f"- {note}"))
-    lines.append(_format_kv("Commands", _format_counter(summary.command_counts, 8)))
-    lines.append(_format_kv("Top Sources", _format_counter(summary.sources, 5)))
-    lines.append(
-        _format_kv("Top Destinations", _format_counter(summary.destinations, 5))
-    )
+
+    all_cmds = getattr(summary, "all_command_counts", Counter()) or Counter()
+    control_cmds = getattr(summary, "command_counts", Counter()) or Counter()
+
+    # All observed OT commands (reads + writes) across every decoded protocol —
+    # risk-classified so control/write commands stand out. Shown by default; this
+    # is the section that makes --ot-commands useful on read-only captures.
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("All Observed OT Commands (by protocol)"))
+    if all_cmds:
+        rows = [["Protocol", "Command", "Count", "Class"]]
+        n_control = 0
+        for key, count in all_cmds.most_common(_limit_value(25)):
+            proto, _, cmd = str(key).partition(":")
+            risk = _ot_command_risk(cmd)
+            disp = (
+                danger(cmd) if risk == "CONTROL"
+                else warn(cmd) if risk == "REVIEW"
+                else cmd
+            )
+            if risk == "CONTROL":
+                n_control += 1
+            rows.append([proto, disp, str(count), risk])
+        lines.append(_format_table(rows))
+        distinct = len(all_cmds)
+        if distinct > 25:
+            lines.append(muted(f"  ... and {distinct - 25} more distinct command types"))
+        if n_control:
+            lines.append(muted(
+                f"  {n_control} distinct control/state-changing command type(s) in view "
+                "— see Control/Write Commands below."
+            ))
+    else:
+        lines.append(muted("No decodable OT protocol commands observed in this capture."))
+
+    lines.append(SUBSECTION_BAR)
+    lines.append(header("Control/Write Commands (state-changing)"))
+    if control_cmds:
+        lines.append(_format_kv("Commands", _format_counter(control_cmds, 8)))
+        lines.append(_format_kv("Top Sources", _format_counter(summary.sources, 5)))
+        lines.append(
+            _format_kv("Top Destinations", _format_counter(summary.destinations, 5))
+        )
+    else:
+        lines.append(ok(
+            "None observed — traffic is read-only / monitoring "
+            "(no writes, control, restart, or program transfers)."
+        ))
     if getattr(summary, "control_rate_per_min", None) is not None:
         rate = float(summary.control_rate_per_min or 0.0)
         lines.append(_format_kv("Control Rate", f"{rate:.2f}/min"))
@@ -27905,7 +29182,8 @@ def render_ot_commands_summary(
                     lines.append(_format_table(rows))
     if summary.errors:
         lines.append(_format_kv("Errors", "; ".join(summary.errors)))
-    detections = _filtered_detections(summary, verbose)
+    # Show all detections by default — --ot-commands does not require -v.
+    detections = _filtered_detections(summary, True)
     if detections:
         lines.append(header("Detections"))
         for item in detections[: _limit_value(6)]:
@@ -28074,7 +29352,7 @@ _OVERVIEW_OT_SIGNAL_TOKENS = (
     "ptp",
     "hart",
     "niagara",
-    "odesys",
+    "codesys",
 )
 
 _OVERVIEW_IOT_SIGNAL_TOKENS = ("mqtt", "coap")
@@ -28126,11 +29404,19 @@ def _overview_detected_devices(
             if token in signal_blob
         ]
 
+        # Browser (MS-BRWS) announced identity makes a host a device by itself
+        # (it self-identifies its name/OS/roles).
+        nb_host = str(item.get("hostname", "") or "")
+        nb_roles = list(item.get("browser_roles", []) or [])
+        nb_os = str(item.get("os", "") or "")
+        nb_is_dc = bool(item.get("is_dc"))
+
         is_device_candidate = (
             role in {"service-host", "mixed"}
             or bool(services_hosted)
             or bool(ot_signals)
             or bool(iot_signals)
+            or bool(nb_roles)
         )
         if not is_device_candidate:
             continue
@@ -28140,20 +29426,32 @@ def _overview_detected_devices(
             profile = "OT/ICS Device"
         elif iot_signals:
             profile = "IoT Endpoint/Gateway"
+        elif nb_is_dc:
+            profile = "Domain Controller"
+        elif any("SQL Server" in r for r in nb_roles):
+            profile = "SQL Server"
+        elif any("Print Queue Server" in r for r in nb_roles):
+            profile = "Print Server"
+        elif any("Master Browser" in r for r in nb_roles):
+            profile = "Master Browser"
         elif role == "service-host":
             profile = "Service Host"
 
-        role_text = f"{scope}/{role}" if scope else role
+        role_short = _short_browser_role(nb_roles)
+        role_text = f"{scope}/{role_short or role}" if scope else (role_short or role)
+        device_cell = f"{ip_text} ({nb_host})" if nb_host else ip_text
         when_text = _overview_window_text(item.get("first_seen"), item.get("last_seen"))
         signal_items = protocols[:3] + services_hosted[:2] + services_used[:1]
         signal_text = _overview_list_preview(list(dict.fromkeys(signal_items)), limit=3)
+        if nb_os:
+            signal_text = f"{nb_os.split(' (')[0]}; {signal_text}" if signal_text != "-" else nb_os.split(" (")[0]
         hosted_text = _overview_list_preview(services_hosted, limit=2)
         if hosted_text == "-":
             hosted_text = _overview_list_preview(services_used, limit=2)
 
         rows.append(
             {
-                "ip": ip_text,
+                "ip": device_cell,
                 "role": role_text,
                 "profile": profile,
                 "signals": signal_text,
@@ -28362,7 +29660,9 @@ def _overview_hunt_lead_section(summary: OverviewSummary, verbose: bool) -> list
     return lines
 
 
+@_always_full_render
 def render_overview_summary(summary: OverviewSummary, verbose: bool = False) -> str:
+    verbose = True  # --overview always shows the complete picture
     lines = [header(f"THREAT HUNT LEAD :: {summary.path.name}")]
     lines.append(_format_kv("Capture", str(summary.path)))
     lines.append(_format_kv("Packets", str(summary.total_packets)))
@@ -28487,7 +29787,15 @@ def render_overview_summary(summary: OverviewSummary, verbose: bool = False) -> 
                 continue
             scope = str(item.get("scope", "") or "").strip()
             role = str(item.get("role", "mixed") or "mixed").strip()
+            # Prefer the Browser-announced role (DC/SQL/master browser) when known.
+            nb_role = _short_browser_role(item.get("browser_roles", []) or [])
+            if nb_role:
+                role = nb_role
             role_text = f"{scope}/{role}" if scope else role
+            ip_cell = str(item.get("ip", "-"))
+            nb_host = str(item.get("hostname", "") or "")
+            if nb_host:
+                ip_cell = f"{ip_cell} ({nb_host})"
             when_text = _overview_window_text(item.get("first_seen"), item.get("last_seen"))
             peer_text = _overview_list_preview(item.get("top_peers"), limit=2)
             peer_count = int(item.get("peer_count", 0) or 0)
@@ -28502,7 +29810,7 @@ def render_overview_summary(summary: OverviewSummary, verbose: bool = False) -> 
             )
             rows.append(
                 [
-                    _truncate_text(str(item.get("ip", "-")), 24),
+                    _truncate_text(ip_cell, 30),
                     _truncate_text(role_text, 18),
                     _truncate_text(_overview_activity_text(item), 54),
                     _truncate_text(when_text, 54),

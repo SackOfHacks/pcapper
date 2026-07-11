@@ -180,6 +180,36 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
+## What's New in v2.1.0 🔥
+
+**v2.1.0 is the identity, asset-intelligence & OT-accuracy release.** pcapper now reads the wire the way an analyst does — *who is this host, what does it announce itself as, and is this actually notable* — and it stops crying wolf on quiet industrial segments.
+
+- 🪪 **Full NetBIOS Browser (MS-BRWS) dissection** — the browser Mailslot is decoded, not counted. Every announcement hands you a host's **name, OS, server ROLES (Domain Controller / SQL / print / master browser), comment, and domain** — passive asset inventory + OS fingerprinting with zero probing. Plus a scored verdict and browser attack detections: **rogue master browser / forced-election takeover, PDC role conflict, NETLOGON user-enumeration** — mapped to **MITRE T1557 / T1046 / T1087** and rolled up in `--threats` and `--mitre`.
+- 🧠 **Browser intelligence wired into 8 analyzers** — hostname / OS / roles / domain / DC identity now light up `--hostdetails`, `--domain`, `--hostnames`, `--ips`, `--overview`, `--compromised`, `--threats`, and `--mitre`. `--domain` maps your Active Directory (domain + DC roster) **with no Kerberos or LDAP traffic at all**, and a compromised DC is escalated as a crown-jewel.
+- 🔬 **`--hostdetails` is now a full host-forensics dossier** — one `-ip` gives you identity + roles, usernames, services, web requests, **remote services out (with C2/remote-access flagging), remote access *in* (inbound RDP/SSH/VNC/WinRM/SMB with the connecting peer), authentication activity, TLS/JA3 fingerprints, SMB share access, email, peer geo/ASN/IOC intel**, DNS, and downloaded files with hashes.
+- 🎯 **Systematic OT/DCS false-positive kill** — a benign Foxboro-DCS baseline (broadcast ARP + browser Mailslot, two DCs, no TCP) used to trip nearly every verdict engine. `--scan`, `--arp`, `--beacon`, `--protocols`, `--overview`, `--threats`, and `--mitre` are now segment-hub-, broadcast/multicast-, and rate-aware — a gateway/DC ARPing its subnet is *baseline*, not an "Nmap sweep" or "CRITICAL C2 beacon."
+
+> Full detail in [CHANGELOG.md](CHANGELOG.md).
+
+### Preview: a host tells you exactly what it is
+
+```text
+$ python -m pcapper capture.pcap --netbios
+
+Announced Hosts & Roles (Browser / MS-BRWS)
+Host    IP            OS                                Domain  Roles                                       Comment
+0001DC  10.217.34.1   Windows 7 / Server 2008 R2 (6.1)  FOX     Server, Domain Controller (PDC), DFS Root   Domain Controller
+0002DC  10.217.34.2   Windows 7 / Server 2008 R2 (6.1)  FOX     Server, SQL Server, Backup DC, DFS Root     -
+
+$ python -m pcapper capture.pcap --hostdetails -ip 10.217.34.1
+
+Host Identity
+Hostname                 : 0001DC
+Inferred OS / Device     : Windows 7 / Server 2008 R2 (6.1)
+Announced Roles (Browser): Server, Domain Controller (PDC), Time Source, DFS Root, Terminal Server
+Domain / Workgroup       : FOX
+```
+
 ## What's New in v2.0.0 🚀
 
 **v2.0.0 is the threat-hunt / incident-response release** — pcapper graduated from "PCAP analysis" to a full **threat-hunting, forensics, and IR/triage platform** for IT *and* OT/ICS. Every analyzer was reviewed function-by-function so it now reads like an analyst's notebook: a verdict, the evidence, and the ATT&CK technique — never a raw packet dump.
@@ -214,14 +244,16 @@ CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0
   source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
 ```
 
-## Current Release: v2.0.2
+## Current Release: v2.1.0
 
 Headline additions in this release:
-- **IT→OT pivot detection** and high-risk **"Remote IN"** timeline events (SSH/RDP/WinRM/VNC/Telnet/SMB-PsExec) across `--timeline`, `--threats`, `--overview`, and `--compromised`.
-- **CIP/EtherNet-IP commands on the `--timeline`**, plus **DoH-over-SNI** detection in `--encrypted-dns` and **IEC-101/103 control-command** detection.
-- Every analyzer now ships an **Analyst Verdict + evidence + ATT&CK/ATT&CK-ICS** mapping; OT analyzers show full output by default.
-- Revived dead detectors (PsExec admin-share/pipe, WMI persistence, Modicon UMAS CPU start/stop) and a broad false-positive reduction pass — all validated on ground-truth captures.
-- Performance: sub-analyzer memoization (no 3-4× re-parsing in the aggregate views) and ~2,000 lines of behaviour-preserving de-duplication.
+- **Full NetBIOS Browser (MS-BRWS) protocol dissection** in `--netbios` — announced host names, OS, server roles (DC/SQL/print/master browser), comments and domain, a scored verdict, and browser attack detections (rogue master browser, election storm, PDC conflict, NETLOGON enumeration) mapped to MITRE T1557 / T1046 / T1087.
+- **Browser-derived host intelligence propagated to 8 analyzers** (`--hostdetails`, `--domain`, `--hostnames`, `--ips`, `--overview`, `--compromised`, `--threats`, `--mitre`) — passive AD/DC discovery with no Kerberos/LDAP required.
+- **`--hostdetails` expanded into a full host dossier** — inbound + outbound remote access (with C2/remote-access flagging), authentication activity, TLS/JA3, SMB share access, email, and peer geo/ASN/IOC intelligence, alongside the existing identity/services/web/DNS/files.
+- **Systematic OT/DCS false-positive elimination** — a shared unicast/broadcast gate plus segment-hub-role and rate awareness across `--scan`, `--arp`, `--beacon`, `--protocols`, `--overview`, `--threats`, and `--mitre` so a gateway/DC's routine ARP and Mailslot broadcast reads as baseline, not recon or C2.
+- `--scan` and `--overview` now always render at full depth (no `-v` needed, no truncation footer); `--overview` "Notable Flows" is notability-aware instead of top-by-volume.
+
+*Previous milestone (v2.0.x):* IT→OT pivot detection and "Remote IN" timeline events, CIP/EtherNet-IP timeline entries, DoH-over-SNI detection, per-analyzer Analyst Verdict + ATT&CK mapping, revived dead detectors, and sub-analyzer memoization performance work.
 
 ## OT/ICS Command Center
 

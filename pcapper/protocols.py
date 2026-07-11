@@ -962,12 +962,18 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
             )
         )
 
-    if pkt_idx and broadcast_frames / pkt_idx > 0.3:
+    # A high broadcast *share* is not a storm — on a quiet or OT/DCS segment,
+    # broadcast (ARP resolution, NetBIOS/Mailslot, LLMNR) legitimately dominates
+    # a low-volume capture. A storm is a *rate* phenomenon, so require the
+    # broadcast rate to actually be elevated, not just its share of a slow span.
+    _bcast_pps = (broadcast_frames / duration) if duration > 0 else float(broadcast_frames)
+    if pkt_idx and broadcast_frames / pkt_idx > 0.3 and _bcast_pps >= 20.0:
         anomalies.append(
             Anomaly(
                 "MEDIUM",
                 "Broadcast Storm",
-                f"Broadcast frames are {broadcast_frames}/{pkt_idx} packets.",
+                f"Broadcast frames are {broadcast_frames}/{pkt_idx} packets "
+                f"at {_bcast_pps:.0f}/s.",
                 0,
             )
         )
