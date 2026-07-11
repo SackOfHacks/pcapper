@@ -44,5 +44,14 @@ htmlcov/
 *.cap
 files/
 
+# pcapper run outputs / carved & decrypted artifacts / case & evidence exports
+carved/
+decrypted/
+case-*/
+*.sqlite
+*.sqlite3
+*.db
+pcapper.toml
+
 # Jupyter
 .ipynb_checkpoints/
