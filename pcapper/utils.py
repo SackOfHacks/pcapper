@@ -103,6 +103,38 @@ def safe_read_text(
         return ""
 
 
+def restrict_permissions(path: Path) -> None:
+    """Restrict a written artifact to owner-only access (0600, 0700 for a dir).
+
+    pcapper deliberately does not redact recovered secrets (see
+    reporting._redact_secret), so its outputs routinely contain cleartext
+    credentials, session tokens and malware samples. Under a default umask
+    those land world-readable, exposing them to every other local account on a
+    shared analysis host.
+
+    Best effort by design: POSIX mode bits are largely a no-op on Windows, and
+    failing to tighten permissions must never abort an analysis run.
+    """
+    try:
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    except Exception:
+        pass
+
+
+def restrict_dir_permissions(path: Path) -> None:
+    """``mkdir(parents=True, exist_ok=True)`` plus an owner-only chmod.
+
+    Only a directory this call actually creates is tightened; one the analyst
+    already had keeps the mode they gave it, so pointing an output flag at an
+    existing shared directory does not silently re-permission it. mkdir errors
+    propagate exactly as a bare ``mkdir`` would — only the chmod is best effort.
+    """
+    created = not path.exists()
+    path.mkdir(parents=True, exist_ok=True)
+    if created:
+        restrict_permissions(path)
+
+
 def safe_write_text(
     path: Path,
     text: str,
@@ -113,6 +145,7 @@ def safe_write_text(
 ) -> None:
     try:
         path.write_text(text, encoding=encoding)
+        restrict_permissions(path)
     except Exception as exc:
         record_error(errors_list, context, exc)
         if errors_list is None:

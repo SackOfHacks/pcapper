@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .utils import safe_write_text, to_serializable
+from .utils import (
+    restrict_dir_permissions,
+    restrict_permissions,
+    safe_write_text,
+    to_serializable,
+)
 
 
 @dataclass
@@ -17,7 +22,7 @@ class ExportBundle:
 
 
 def _ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    restrict_dir_permissions(path.parent)
 
 
 def _detections_of(summary: Any) -> list[dict[str, Any]]:
@@ -185,6 +190,7 @@ def export_csv(bundle: ExportBundle, output_path: Path) -> None:
     else:
         fieldnames = sorted({key for row in rows for key in row.keys()})
         with output_path.open("w", newline="", encoding="utf-8") as handle:
+            restrict_permissions(output_path)
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for row in rows:
@@ -197,6 +203,7 @@ def export_csv(bundle: ExportBundle, output_path: Path) -> None:
         _ensure_parent(host_path)
         host_fields = sorted({key for row in host_rows for key in row.keys()})
         with host_path.open("w", newline="", encoding="utf-8") as handle:
+            restrict_permissions(host_path)
             writer = csv.DictWriter(handle, fieldnames=host_fields)
             writer.writeheader()
             for row in host_rows:
@@ -210,6 +217,7 @@ def export_sqlite(bundle: ExportBundle, output_path: Path) -> None:
             raise ValueError(f"SQLite export path is a directory: {output_path}")
         output_path.unlink()
     conn = sqlite3.connect(str(output_path))
+    restrict_permissions(output_path)
     cur = conn.cursor()
     cur.execute("CREATE TABLE detections (module TEXT, data TEXT)")
     cur.execute("CREATE TABLE artifacts (module TEXT, data TEXT)")

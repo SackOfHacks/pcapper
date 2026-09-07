@@ -4,6 +4,11 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Security
+- **Recovered secrets and carved artifacts are now written owner-only (`0600`, `0700` for directories).** pcapper deliberately does not redact what it recovers (`reporting._redact_secret` is a documented no-op), so reports, exports, the run log, carved artifacts, extracted files and decrypted streams routinely contain cleartext credentials, LDAP binds, SNMP community strings, session tokens and malware samples. None of those write paths restricted permissions, so under a default umask they landed at `0644` (case and output directories at `0755`) — on a shared analysis host every other local account could read recovered passwords out of another analyst's case directory, and world-readable evidence is harder to defend on chain-of-custody grounds. Tightened at every write path: reports and JSON export (`utils.safe_write_text`), CSV and `_hosts` CSV, the SQLite export (tightened immediately after `sqlite3.connect()`, so the database is never briefly readable while being populated), the `--log-file` run log, case directories, export output directories, carved artifacts, extracted file artifacts, and decrypted TLS/SSH streams. New `utils.restrict_permissions()` / `utils.restrict_dir_permissions()` helpers are best-effort by design: POSIX mode bits are largely a no-op on Windows, and a failure to tighten permissions never aborts an analysis run.
+
 ## 2.1.0 — 2026-07-11
 
 ### Changed

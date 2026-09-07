@@ -41,7 +41,15 @@ from .aim import analyze_aim
 from .cip import CIP_SERVICE_NAMES
 from .nfs import analyze_nfs
 from .pcap_cache import get_reader
-from .utils import detect_file_type_bytes, extract_packet_endpoints, memoize_analysis, packet_length, safe_float
+from .utils import (
+    detect_file_type_bytes,
+    extract_packet_endpoints,
+    memoize_analysis,
+    packet_length,
+    restrict_dir_permissions,
+    restrict_permissions,
+    safe_float,
+)
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
@@ -4324,7 +4332,7 @@ def _export_with_dpkt(
 
         if extract_name:
             out_root = output_dir or Path.cwd() / "files"
-            out_root.mkdir(parents=True, exist_ok=True)
+            restrict_dir_permissions(out_root)
             search = extract_name.lower()
             for art in artifacts:
                 if art.payload and search in art.filename.lower():
@@ -4333,6 +4341,7 @@ def _export_with_dpkt(
                         continue
                     try:
                         out_p.write_bytes(art.payload)
+                        restrict_permissions(out_p)
                         extracted_paths.append(out_p)
                     except Exception:
                         continue

@@ -294,7 +294,13 @@ from .timeline import (
 )
 from .tls import analyze_tls
 from .udp import analyze_udp
-from .utils import hexdump, parse_time_arg, safe_write_text
+from .utils import (
+    hexdump,
+    parse_time_arg,
+    restrict_dir_permissions,
+    restrict_permissions,
+    safe_write_text,
+)
 from .vlan import analyze_vlans
 from .vnc import analyze_vnc, merge_vnc_summaries
 from .vpn import analyze_vpn, merge_vpn_summaries
@@ -751,8 +757,11 @@ def _log_event(log_config: LogConfig | None, event: str, **fields: Any) -> None:
     )
     try:
         if log_config.path:
-            log_config.path.parent.mkdir(parents=True, exist_ok=True)
+            restrict_dir_permissions(log_config.path.parent)
+            existed = log_config.path.exists()
             with log_config.path.open("a", encoding="utf-8") as handle:
+                if not existed:
+                    restrict_permissions(log_config.path)
                 handle.write(f"{line}\n")
         elif log_config.stream:
             log_config.stream.write(f"{line}\n")
@@ -2243,7 +2252,7 @@ def _analyze_paths(
     suricata_scans = 0
 
     if case_dir:
-        case_dir.mkdir(parents=True, exist_ok=True)
+        restrict_dir_permissions(case_dir)
 
     def _render_packet(path: Path, index: int, packets: list[object] | None) -> None:
         if index <= 0:
@@ -2312,11 +2321,11 @@ def _analyze_paths(
         if base.suffix:
             if multi_export:
                 out_dir = base.parent / base.stem
-                out_dir.mkdir(parents=True, exist_ok=True)
+                restrict_dir_permissions(out_dir)
                 return out_dir / f"{pcap_path.stem}{base.suffix}"
             return base
         out_dir = base
-        out_dir.mkdir(parents=True, exist_ok=True)
+        restrict_dir_permissions(out_dir)
         return out_dir / f"{pcap_path.stem}.{suffix}"
 
     def _resolve_misc_path(path: Path) -> Path:
@@ -5068,7 +5077,7 @@ def main() -> int:
         if not case_dir:
             return
         try:
-            case_dir.mkdir(parents=True, exist_ok=True)
+            restrict_dir_permissions(case_dir)
         except Exception:
             pass
         case_id = getattr(args, "case_id", None) or getattr(args, "case_name", None)
