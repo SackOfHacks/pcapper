@@ -896,12 +896,19 @@ def analyze_compromised(
                 f"{ip_value} stages={','.join(sorted(host_stages.get(ip_value, set())))}"
             )
 
+    # The IP is a tiebreaker, not decoration: severity and score alone are not a
+    # total order, and two hosts that tie on both — routine, since scores are
+    # small integers — then fell back to insertion order, which is not stable
+    # across runs. The same capture could produce two different victim orderings
+    # in two invocations, which is indefensible in a report that is used as
+    # evidence. Sorted with negated numerics rather than reverse=True so the
+    # tiebreaker still reads ascending.
     compromised_hosts.sort(
         key=lambda host: (
-            SEVERITY_WEIGHT.get(host.severity, 0),
-            host.score,
-        ),
-        reverse=True,
+            -SEVERITY_WEIGHT.get(host.severity, 0),
+            -host.score,
+            host.ip,
+        )
     )
 
     incidents: list[dict[str, object]] = []

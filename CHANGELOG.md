@@ -4,6 +4,20 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+- **`--compromised` produced a different victim ordering from run to run (`compromised.py`).** The host list was sorted on `(severity, score)` alone. Neither is a total order — both are small integers that tie constantly — so tied hosts fell through to insertion order, which traces back to set iteration and therefore to Python's per-process hash randomisation. The same capture, the same command, two invocations, two different reports. For a tool whose output is used as evidence that is indefensible: two analysts comparing notes see different documents, and a report cannot be reproduced later. The sort now carries the IP as a tiebreaker. Found while verifying the `reporting.py` split below — the differential run over 350 CLI invocations turned up exactly one non-reproducible command. A follow-up sweep of 305 analyzer/fixture combinations under two different `PYTHONHASHSEED` values found no other instance, and `tests/test_determinism.py` now runs that check as a regression test.
+
+### Changed
+- **`reporting.py` is now a package: 29,989 lines in one module became 120 modules, one per analyzer.** It was a fifth of the codebase in a single file, and that was not an aesthetic complaint — both confirmed duplication bugs in the 2026-09 review lived in it, including a pair of nested helpers defined 58 lines apart inside one function, which no reader could have been expected to notice. `reporting/dns.py` now renders what `dns.py` analyses, and so on; shared primitives (constants, formatting helpers, the mutable output-mode state) are in `reporting/_common.py`. The largest module is now 60 KB and the median is 7 KB.
+
+  **No behaviour changed.** The code was moved verbatim — every function's source text hashes identically to before, decorators and comments included — and the split was verified four ways: the partition was machine-checked to have no cross-module references (there were only two renderer-to-renderer edges in the whole file, both within one analyzer family, so no import cycles are possible); every one of the 807 import statements in the new package was resolved, including the lazy ones inside function bodies that no import-time check reaches; the golden-output tests written before the split pass unchanged; and the CLI was run over every fixture with 70 flag combinations against the pre-split code, giving 350 byte-identical outputs.
+
+  One preparatory change was needed. The four mutable output-mode flags (`_VERBOSE_OUTPUT`, `_QUIET_MODE`, `_OUI_ANNOTATE`, `_OT_FULL_OUTPUT`) are now read through accessor functions. A sibling module doing `from ._common import _VERBOSE_OUTPUT` would bind the *value* at import time, so `set_verbose_output()` would silently stop working for that module's renderers — the exact class of bug a mechanical split invites. `tests/test_reporting_package.py` guards against both that and a module growing back past 2,000 lines.
+
+  Names the old module re-exported incidentally, by importing analyzer summary types at module level, are re-exported explicitly so `from pcapper.reporting import DnsSummary` keeps working.
+
 ## 2.2.0 — 2026-09-12
 
 ### Fixed
