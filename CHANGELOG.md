@@ -4,7 +4,7 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 2.3.0 — 2026-09-12
 
 ### Fixed
 - **The built wheel contained no `reporting` package at all, so a `pip install` of pcapper could not start.** `[tool.setuptools] packages` listed only `"pcapper"`. That was correct while `reporting` was a single module, but the split into `pcapper/reporting/` made it a subpackage, and setuptools ships exactly what that list names — nothing else. A clean build from `main` produced a wheel with 147 modules and zero renderers, and `import pcapper.cli` raised `ModuleNotFoundError: No module named 'pcapper.reporting'`. Running from a source checkout was unaffected, which is why it went unnoticed. CI's `Build distribution` job stayed green throughout because `twine check` validates *metadata*, not contents: it never opens the archive. The package list now includes `pcapper.reporting`, `tests/test_packaging.py` fails if any subpackage is undeclared, and CI now installs the built wheel into a clean virtualenv, imports every module in it, and runs the CLI — the check that would have caught this.

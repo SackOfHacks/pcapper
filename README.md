@@ -182,6 +182,19 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
+## What's New in v2.3.0 ☎️
+
+**v2.3.0 is the phone-over-IP release**, plus the packaging fix that made the
+previous one installable.
+
+- ☎️ **`--voip` (alias `--sip`) — the whole call path, not one protocol.** Signalling: SIP/SDP on any port over UDP/TCP/TLS, Cisco SCCP/Skinny, MGCP, MEGACO/H.248, IAX2 and H.323 (H.225 + RAS). Media: RTP, RTCP, SRTP and T.38 fax. Plus STUN/TURN/ICE, phone provisioning over TFTP/HTTP, and ENUM. A Cisco shop signals with Skinny, an Asterisk trunk uses IAX2, a video bridge still speaks H.323 — reading only SIP returns "no VoIP traffic" on a capture that is nothing but VoIP traffic.
+- 🔑 **Credentials, keys and keypad digits recovered.** SIP Digest emitted as ready `hashcat -m 11400` lines, IAX2 MD5 challenge/response pairs, plaintext IAX2 passwords, TURN long-term credentials. Cleartext SRTP master keys from `a=crypto ... inline:` — if the signalling was not itself encrypted, every "encrypted" call in the capture is decryptable. DTMF digits from all four carriers they use (RFC 4733 RTP, SIP INFO, Skinny `KeypadButton`, MGCP observed events): routinely IVR PINs, calling-card numbers and card data.
+- 🎧 **Call audio to WAV** with `--voip-out DIR` — G.711 decoded, written owner-only. `audioop` was removed from the stdlib in 3.13, so the codecs are hand-written and reference-checked.
+- 📦 **The wheel is installable again.** `pcapper/reporting/` became a subpackage in the reporting split, but `[tool.setuptools] packages` still listed only `pcapper`, so the built wheel shipped **zero renderers** and a pip-installed pcapper died on `import pcapper.cli`. `twine check` never opens the archive, so CI stayed green. CI now installs the wheel into a clean venv, imports every module and runs the CLI.
+- 🔢 **One version, not two.** `pcapper/__init__.py` and `pyproject.toml` each carried a literal and drifted — pip said 2.2.0 while the banner printed v2.1.0. `pyproject.toml` now derives the version from the package.
+- 🧱 **`reporting.py` split**: 29,989 lines in one module became 120, one per analyzer, verified byte-identical by source hashing and a 350-run CLI differential.
+- 🔁 **`--compromised` is reproducible.** Its host sort was not a total order, so ties fell through to hash randomisation and the same capture produced two different reports.
+
 ## What's New in v2.2.0 🛡️
 
 **v2.2.0 is the correctness-and-assurance release.** No new analyzers — instead,
@@ -261,9 +274,14 @@ CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0
   source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
 ```
 
-## Current Release: v2.2.0
+## Current Release: v2.3.0
 
 Headline changes in this release:
+- **`--voip` / `--sip`** — phone-over-IP forensics across SIP/SDP, SCCP, MGCP, MEGACO, IAX2, H.323, RTP/RTCP/SRTP, T.38 fax, STUN/TURN, provisioning and ENUM; recovered credentials, SRTP keys and DTMF digits; G.711 call audio to WAV via `--voip-out`.
+- **The distribution actually installs** — the wheel was shipping no `reporting` package at all; CI now installs and runs the built artifact rather than only checking its metadata.
+- **`reporting.py` split into 120 per-analyzer modules**, with no behaviour change.
+
+Carried forward from v2.2.0:
 - **Three silent failure modes in reassembly and decryption fixed** — sequence wraparound, gaps published with an authoritative hash, and an unbounded tshark call. See [CHANGELOG.md](CHANGELOG.md).
 - **A test suite and CI** — 190 tests with golden rendered output, run on Python 3.9 and 3.13.
 - **Wire-derived filenames are neutralised before touching the filesystem**, and a disclosure route exists in [SECURITY.md](SECURITY.md).
