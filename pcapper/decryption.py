@@ -6,6 +6,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .utils import restrict_dir_permissions, restrict_permissions
+
 
 @dataclass(frozen=True)
 class DecryptConfig:
@@ -144,7 +146,7 @@ def decrypt_tls(
     if not streams:
         notes.append("No TLS streams detected for decryption.")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    restrict_dir_permissions(output_dir)
     count = 0
     for stream_id in streams:
         if limit and count >= limit:
@@ -159,6 +161,7 @@ def decrypt_tls(
             errors.append(stderr.strip())
         if stdout:
             filename.write_text(stdout, encoding="utf-8", errors="ignore")
+            restrict_permissions(filename)
             outputs.append(filename)
             count += 1
 
@@ -200,7 +203,7 @@ def decrypt_ssh(
     if not streams:
         notes.append("No SSH streams detected for decryption.")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    restrict_dir_permissions(output_dir)
     count = 0
     for stream_id in streams:
         if limit and count >= limit:
@@ -213,6 +216,7 @@ def decrypt_ssh(
             errors.append(stderr.strip())
         if stdout:
             filename.write_text(stdout, encoding="utf-8", errors="ignore")
+            restrict_permissions(filename)
             outputs.append(filename)
             count += 1
 

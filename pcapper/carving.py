@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .pcap_cache import get_reader
-from .utils import detect_file_type_bytes, extract_packet_endpoints
+from .utils import (
+    detect_file_type_bytes,
+    extract_packet_endpoints,
+    restrict_dir_permissions,
+    restrict_permissions,
+)
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -270,7 +275,7 @@ def analyze_carving(
     detections: list[dict[str, object]] = []
 
     if output_dir:
-        output_dir.mkdir(parents=True, exist_ok=True)
+        restrict_dir_permissions(output_dir)
 
     for stream_key in stream_stats.keys():
         src, sport, dst, dport = stream_key
@@ -297,6 +302,7 @@ def analyze_carving(
                     out_path = output_dir / filename
                     try:
                         out_path.write_bytes(blob)
+                        restrict_permissions(out_path)
                         extracted.append(out_path)
                     except Exception as exc:
                         errors.append(f"Carve write error: {exc}")
