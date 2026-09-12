@@ -246,6 +246,7 @@ from .reporting import (
     render_vlan_rollup,
     render_vlan_summary,
     render_vnc_summary,
+    render_voip_summary,
     render_vpn_summary,
     render_webrequests_summary,
     render_winrm_summary,
@@ -303,6 +304,7 @@ from .utils import (
 )
 from .vlan import analyze_vlans
 from .vnc import analyze_vnc, merge_vnc_summaries
+from .voip import analyze_voip, merge_voip_summaries
 from .vpn import analyze_vpn, merge_vpn_summaries
 from .webrequests import analyze_webrequests, merge_webrequests_summaries
 from .winrm import analyze_winrm, merge_winrm_summaries
@@ -343,6 +345,8 @@ def _builtin_flag_map() -> dict[str, str]:
         "--rdp": "rdp",
         "--telnet": "telnet",
         "--vnc": "vnc",
+        "--voip": "voip",
+        "--sip": "voip",
         "--teamviewer": "teamviewer",
         "--winrm": "winrm",
         "--wmic": "wmic",
@@ -493,6 +497,7 @@ _FILTER_COMPATIBLE_STEPS = {
     "rdp",
     "telnet",
     "vnc",
+    "voip",
     "teamviewer",
     "winrm",
     "wmic",
@@ -565,6 +570,7 @@ _IP_TARGET_FILTER_STEPS = {
     "tls",
     "vlan",
     "vnc",
+    "voip",
     "winrm",
     "wmic",
 }
@@ -1504,6 +1510,15 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Enable generic TCP stream reassembly + file signature carving.",
     )
     general.add_argument(
+        "--voip-out",
+        metavar="DIR",
+        help=(
+            "Output directory for VoIP artifacts. Decodes G.711 (PCMU/PCMA) RTP "
+            "streams to WAV; other codecs are reported but not decoded. Written "
+            "owner-only -- recovered call audio is evidence."
+        ),
+    )
+    general.add_argument(
         "--carve-out",
         metavar="DIR",
         help="Output directory for carved files (default: ./carved or case dir).",
@@ -1708,6 +1723,11 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ("--udp", "Include UDP analysis in the output."),
         ("--vlan", "Include VLAN analysis in the output."),
         ("--vnc", "Include VNC analysis (sessions, banners, anomalies, threats)."),
+        ("--sip", "Alias for --voip."),
+        (
+            "--voip",
+            "Include phone-over-IP analysis (alias: --sip): SIP/SDP, SCCP, MGCP, MEGACO, IAX2, H.323, RTP/RTCP/SRTP, T.38 fax, STUN/TURN, DTMF digits, credentials, phone provisioning.",
+        ),
         ("--winrm", "Include WinRM analysis (HTTP/HTTPS, anomalies, threats)."),
         ("--wmic", "Include WMIC/WMI analysis (commands, hosts, anomalies, threats)."),
         ("--powershell", "Include PowerShell analysis (commands, artifacts, threats)."),
@@ -2070,6 +2090,7 @@ def _analyze_paths(
     show_rdp: bool,
     show_telnet: bool,
     show_vnc: bool,
+    show_voip: bool,
     show_teamviewer: bool,
     show_winrm: bool,
     show_wmic: bool,
@@ -2191,6 +2212,7 @@ def _analyze_paths(
     streams_full: bool = False,
     show_carve: bool = False,
     carve_out: Path | None = None,
+    voip_out: Path | None = None,
     carve_limit: int = 100,
     carve_max_bytes: int = 2 * 1024 * 1024,
     carve_stream_bytes: int = 8 * 1024 * 1024,
@@ -2727,6 +2749,24 @@ def _analyze_paths(
                 else:
                     print(render_vnc_summary(vnc_summary, verbose=verbose))
                 export_summaries["vnc"] = vnc_summary
+            elif step == "voip" and show_voip:
+                voip_summary = analyze_voip(
+                    path,
+                    show_status=step_status,
+                    packets=packets,
+                    meta=meta,
+                    target_ip=timeline_ip,
+                    output_dir=(
+                        _resolve_misc_path(voip_out)
+                        if voip_out
+                        else ((case_dir / "voip") if case_dir else None)
+                    ),
+                )
+                if summarize_rollups:
+                    rollups.setdefault("voip", []).append(voip_summary)
+                else:
+                    print(render_voip_summary(voip_summary, verbose=verbose))
+                export_summaries["voip"] = voip_summary
             elif step == "teamviewer" and show_teamviewer:
                 tv_summary = analyze_teamviewer(
                     path, show_status=step_status, packets=packets, meta=meta
@@ -4007,6 +4047,10 @@ def _analyze_paths(
                 merge_vnc_summaries,
                 lambda s: render_vnc_summary(s, verbose=verbose),
             ),
+            "voip": (
+                merge_voip_summaries,
+                lambda s: render_voip_summary(s, verbose=verbose),
+            ),
             "teamviewer": (
                 merge_teamviewer_summaries,
                 lambda s: render_teamviewer_summary(s, verbose=verbose),
@@ -4106,6 +4150,7 @@ def _analyze_paths(
             "rdp": "RDP ANALYSIS",
             "telnet": "TELNET ANALYSIS",
             "vnc": "VNC ANALYSIS",
+            "voip": "VOIP ANALYSIS",
             "teamviewer": "TEAMVIEWER ANALYSIS",
             "winrm": "WINRM ANALYSIS",
             "wmic": "WMIC/WMI ANALYSIS",
@@ -5039,6 +5084,10 @@ def main() -> int:
             stream_port=getattr(args, "stream_port", None),
             streams_established=getattr(args, "streams_established", False),
             streams_full=getattr(args, "streams_full", False),
+            show_voip=getattr(args, "voip", False) or getattr(args, "sip", False),
+            voip_out=Path(args.voip_out).expanduser()
+            if getattr(args, "voip_out", None)
+            else None,
             show_carve=getattr(args, "carve", False),
             carve_out=Path(args.carve_out).expanduser()
             if getattr(args, "carve_out", None)

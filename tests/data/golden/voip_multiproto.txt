@@ -1,0 +1,94 @@
+========================================================================
+VOIP ANALYSIS :: voip_multiproto.pcap
+========================================================================
+------------------------------------------------------------------------
+Analyst Verdict
+HIGH - VoIP: high-severity activity observed.
+Focus Here First:
+  [HIGH] VoIP credentials recovered (offline-crackable) — 1 credential(s) across IAX2 x1 for 1 account(s): trunk1. SIP Digest lines are hashcat -m …
+  [WARNING] Calls to international / premium-rate destinations — 1 call(s), e.g. 1001 -> 442079460000 (international-format destination). Confirm against …
+  [WARNING] DTMF keypad digits recovered — 12 digit(s) across 2 stream(s) via MGCP, SCCP, e.g. '5551212'. These are unencrypted here…
+Total Packets           : 13
+Signalling Packets      : 10
+RTP Packets             : 0
+Duration                : 240.0 ms
+Calls / Dialogs         : 1
+Registrations           : 1
+------------------------------------------------------------------------
+Protocols Observed
+Protocol       Packets
+SCCP/Skinny    7      
+IAX2           3      
+MGCP           2      
+H.323 (H.225)  1      
+------------------------------------------------------------------------
+Calls / Dialogs
+Time                         Proto  From  To            Disposition  Dur   Auth
+2021-01-01T00:01:40.180000Z  IAX2   1001  442079460000  IAX2 new     0.0s  no  
+------------------------------------------------------------------------
+Registrations
+Proto  Account          Attempts  OK  Chal  Fail  Source IPs   
+SCCP   SEP020000000003  1         0   0     0     192.168.10.60
+------------------------------------------------------------------------
+Recovered Credentials
+1 credential(s) recovered in cleartext signalling — treat this output as evidence.
+Time                         Proto  Context  User    Realm  Src -> Dst                  
+2021-01-01T00:01:40.220000Z  IAX2   AUTHREP  trunk1  -      192.168.10.5 -> 192.168.10.8
+Crack-ready material (IAX2):
+  IAX2 MD5 challenge-response user=trunk1 challenge=483920175 md5=5f4dcc3b5aa765d61d8327deb882cf99 -- md5(challenge + secret)
+------------------------------------------------------------------------
+DTMF Keypad Digits
+Digits pressed during calls. Frequently IVR PINs, calling-card numbers, account numbers or card data.
+Carrier  Source         Destination   Stream          Digits 
+MGCP     192.168.10.7   192.168.10.5  aaln/1@gw1.ex…  5551212
+SCCP     192.168.10.60  192.168.10.5  keypad          91123  
+------------------------------------------------------------------------
+Devices / Endpoints
+Identity                               Seen
+H.323 alias: 1001p                     1   
+MGCP endpoint: aaln/1@gw1.example.com  1   
+Skinny device: SEP020000000003         1   
+------------------------------------------------------------------------
+Dialled / Called Parties
+Called        Calls
+442079460000  2    
+1001          1    
+Caller  Calls
+trunk1  2    
+1001    1    
+------------------------------------------------------------------------
+Detections
+[HIGH] VoIP credentials recovered (offline-crackable)
+  1 credential(s) across IAX2 x1 for 1 account(s): trunk1. SIP Digest lines are hashcat -m 11400 candidates; IAX2 pairs are md5(challenge+secret) (ATT&CK T1040 Network Sniffing, T1110.002 Password Cracking).
+[WARN] Calls to international / premium-rate destinations
+  1 call(s), e.g. 1001 -> 442079460000 (international-format destination). Confirm against the expected dialling profile; this is the payload of PBX toll fraud (ATT&CK T1657 Financial Theft).
+[WARN] DTMF keypad digits recovered
+  12 digit(s) across 2 stream(s) via MGCP, SCCP, e.g. '5551212'. These are unencrypted here; IVR PINs, calling-card numbers, account numbers and card data travel this way (ATT&CK T1040 Network Sniffing).
+------------------------------------------------------------------------
+Deterministic VoIP Security Checks
+Credential exposure
+Yes, there is evidence for credential exposure, here is the evidence:
+- VoIP credentials recovered (offline-crackable): 1 credential(s) across IAX2 x1 for 1 account(s): trunk1. SIP Digest lines are hashcat -m 11400 candidates; IAX2 pairs are md5(challenge+secret) (ATT&CK T1040 Network Sniffing, T1110.002 Password Cracking).
+Toll-fraud indicators
+Yes, there is evidence for toll-fraud indicators, here is the evidence:
+- Calls to international / premium-rate destinations: 1 call(s), e.g. 1001 -> 442079460000 (international-format destination). Confirm against the expected dialling profile; this is the payload of PBX toll fraud (ATT&CK T1657 Financial Theft).
+Sensitive digits / content
+Yes, there is evidence for sensitive digits / content, here is the evidence:
+- DTMF keypad digits recovered: 12 digit(s) across 2 stream(s) via MGCP, SCCP, e.g. '5551212'. These are unencrypted here; IVR PINs, calling-card numbers, account numbers and card data travel this way (ATT&CK T1040 Network Sniffing).
+Cleared (no evidence): Scanning / extension enumeration, Authentication attack, Provisioning exposure, Media key exposure, Registration hijacking, Unsignalled / hijacked media, Internet exposure, Transport hygiene / DoS
+------------------------------------------------------------------------
+Threat Hypotheses
+- VoIP account takeover
+    Why: 1 recoverable credential(s) and 0 authentication failure(s).
+    Next: Crack the recovered material offline (hashcat -m 11400 for SIP Digest) to confirm weak secrets, then check the PBX CDR for calls placed by those accounts.
+- PBX toll fraud
+    Why: 0 unauthenticated call setup(s) and 1 international/premium destination(s).
+    Next: Compare against billing records and the site's normal dialling profile, especially outside business hours.
+------------------------------------------------------------------------
+False-Positive Context
+- No self-identifying VoIP scanner User-Agent observed
+- No failed VoIP authentications observed
+- No cleartext SRTP keying material in SDP
+- No phone configuration files fetched in the clear
+========================================================================
+Output is summarized/truncated. Use -v to view all output.

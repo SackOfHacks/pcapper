@@ -456,6 +456,10 @@ from .udp import (
     render_udp_rollup,
     render_udp_summary,
 )
+from .voip import (
+    CHECK_LABELS,
+    render_voip_summary,
+)
 from .vlan import (
     render_vlan_rollup,
     render_vlan_summary,

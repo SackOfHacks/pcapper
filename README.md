@@ -116,6 +116,7 @@ flowchart LR
 | Investigate data theft and transferred artifacts | `--exfil --files --ftp --http --aim --email` |
 | Investigate identity abuse | `--kerberos --ldap --ntlm --domain --creds` |
 | Track lateral movement | `--hostnames --services --protocols --tcp --timeline -ip <host>` |
+| Investigate phone calls (VoIP) | `--voip` (add `--voip-out DIR` to recover call audio) |
 | Run OT/ICS-specific triage | `--modbus --dnp3 --iec104 --s7 --ot-commands --safety` |
 | Build IR exports and evidence packs | `--json --csv --sqlite --case-dir` |
 
@@ -177,6 +178,7 @@ Capture -> Decoders -> Sessions -> Detections -> Reports
 
 Promotional highlights:
 - Remote-access session visibility (RDP/SSH/WinRM/VNC/TeamViewer/Telnet) with endpoints, timing, and data volume.
+- Phone-over-IP forensics (`--voip`): SIP/SDP, Skinny, MGCP, MEGACO, IAX2 and H.323 signalling; RTP/RTCP/SRTP and T.38 fax media; DTMF keypad digits; recovered credentials; and G.711 call audio to WAV.
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
@@ -291,6 +293,7 @@ What you get:
 - OT/ICS-centric threat and anomaly rollups with evidence lines for fast triage.
 - Device fingerprinting across IT/OT/IoT traffic (vendor/model/OS/firmware/software) for asset-aware triage.
 - Remote-access session visibility (RDP/SSH/WinRM/VNC/TeamViewer/Telnet) with endpoints, timing, and data volume.
+- Phone-over-IP forensics (`--voip`): SIP/SDP, Skinny, MGCP, MEGACO, IAX2 and H.323 signalling; RTP/RTCP/SRTP and T.38 fax media; DTMF keypad digits; recovered credentials; and G.711 call audio to WAV.
 - Deeper OT protocol decoding for DNP3, IEC 61850 GOOSE/SV, Modbus, BACnet, OPC UA, CoAP, MQTT, and CIP/ENIP.
 - Routing protocol forensics (OSPF/BGP/IS-IS/PIM) with route-change, auth, and control-plane health visibility.
 
@@ -391,6 +394,7 @@ lives in **[docs/reference.md](docs/reference.md)**:
 - [Logging](docs/reference.md#logging)
 - [Plugins](docs/reference.md#plugins)
 - [CLI Flag Groups](docs/reference.md#cli-flag-groups)
+- [Phone Over IP (VoIP)](docs/reference.md#phone-over-ip-voip)
 - [Notes](docs/reference.md#notes)
 
 See also [CHANGELOG.md](CHANGELOG.md) (current releases),
