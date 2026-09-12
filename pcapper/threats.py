@@ -5,7 +5,6 @@ from .utils import is_private_ip as _is_private_ip
 from .utils import is_public_ip as _is_public_ip
 import hashlib
 import json
-import math
 import os
 import re
 import shutil
@@ -14,7 +13,6 @@ import tempfile
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -273,9 +271,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
     storyline: list[str] = []
     suricata_event_counts: Counter[str] = Counter()
     suricata_checks: dict[str, list[str]] = defaultdict(list)
-    suricata_source_counts: Counter[str] = Counter()
-    suricata_destination_counts: Counter[str] = Counter()
-    suricata_signature_counts: Counter[str] = Counter()
     suricata_pcaps_scanned = 0
     deterministic_checks: dict[str, list[str]] = defaultdict(list)
     threat_hypotheses: list[dict[str, object]] = []

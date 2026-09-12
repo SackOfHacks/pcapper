@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 import os
 import struct
 import uuid
@@ -11,7 +10,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     from scapy.layers.inet import IP, TCP
-    from scapy.layers.inet6 import IPv6
     from scapy.packet import Packet, Raw
 except ImportError:
     IP = TCP = Raw = None

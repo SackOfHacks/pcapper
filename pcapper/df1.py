@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 import re
 from pathlib import Path
 

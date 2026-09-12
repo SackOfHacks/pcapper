@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .utils import shannon_entropy as _shannon_entropy, packet_length
-from .utils import memoize_analysis
 
 import base64
 import ipaddress

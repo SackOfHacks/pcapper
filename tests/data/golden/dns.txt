@@ -1,0 +1,75 @@
+========================================================================
+DNS ANALYSIS :: dns.pcap
+========================================================================
+DNS Packets             : 6
+DNS Bytes               : 0.00 MB
+Queries                 : 3
+Responses               : 3
+UDP                     : 6
+TCP                     : 0
+Unique Clients          : 1
+Unique Servers          : 1
+Unique QNames           : 3
+First Seen              : 2021-01-01T00:00:00Z
+Last Seen               : 2021-01-01T00:00:00.050000Z
+------------------------------------------------------------------------
+Analyst Verdict
+NO STRONG SIGNAL - no convincing high-risk DNS threat pattern from current heuristics.
+Confidence              : Low (score=0)
+Why confidence:
+- No high-confidence DNS threat heuristic crossed threshold
+Who:
+- Top querying clients
+- 192.168.10.50: 6
+Where:
+- Top DNS servers
+- 192.168.10.10: 6
+------------------------------------------------------------------------
+Traffic Statistics
+Duration                : 50.0 ms
+Query/Response Ratio    : 1.00
+Unique Clients          : 1
+Unique Servers          : 1
+Unique QNames           : 3
+------------------------------------------------------------------------
+DNS Service Statistics
+Query Type  Count
+A (1)       6    
+Response Code  Count
+NOERROR (0)    6    
+Opcode     Count
+QUERY (0)  6    
+------------------------------------------------------------------------
+DNS Client Statistics
+Client         Queries
+192.168.10.50  6      
+------------------------------------------------------------------------
+DNS Server Statistics
+Server         Responses
+192.168.10.10  6        
+------------------------------------------------------------------------
+Most Queried Domains/URLs
+QName                  Count
+intranet.corp.example  2    
+telemetry.example.org  2    
+updates.example.net    2    
+------------------------------------------------------------------------
+Least Queried Domains/URLs
+QName                  Count
+intranet.corp.example  2    
+telemetry.example.org  2    
+updates.example.net    2    
+------------------------------------------------------------------------
+Most Queried Base Domains
+Base Domain   Count
+corp.example  2    
+example.net   2    
+example.org   2    
+------------------------------------------------------------------------
+Least Queried Base Domains
+Base Domain   Count
+corp.example  2    
+example.net   2    
+example.org   2    
+========================================================================
+Output is summarized/truncated. Use -v to view all output.

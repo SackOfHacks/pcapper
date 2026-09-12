@@ -18,7 +18,6 @@ from .progress import run_with_busy_status
 from .tls_fingerprints import (
     ALPN_EXT_TYPE,
     SNI_EXT_TYPE,
-    _coerce_int_list,
     _extract_alpn,
     _extract_sni,
     _is_grease,

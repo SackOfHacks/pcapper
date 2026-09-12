@@ -9,7 +9,6 @@ from .utils import decode_payload, safe_float, extract_packet_endpoints, get_pac
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
-    from scapy.layers.inet6 import IPv6  # type: ignore
     from scapy.packet import Packet, Raw  # type: ignore
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore

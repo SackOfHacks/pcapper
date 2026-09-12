@@ -162,7 +162,6 @@ def _build_services_enrichment(
     # Map the analyzer's curated ServiceRisk findings to triage check buckets.
     for risk in risks or []:
         title = str(getattr(risk, "title", ""))
-        sev = str(getattr(risk, "severity", "")).upper()
         ev = f"{getattr(risk, 'affected_asset', '?')}: {title} — {getattr(risk, 'description', '')}"
         if title == "Public Admin Service":
             checks["public_edge_admin_exposure"].append(ev)

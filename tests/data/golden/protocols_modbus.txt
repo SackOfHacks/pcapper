@@ -1,0 +1,36 @@
+========================================================================
+PROTOCOL & CONVERSATION ANALYSIS :: modbus.pcap
+========================================================================
+Total Packets           : 6
+Duration                : 50.0 ms
+------------------------------------------------------------------------
+Top Protocols
+Protocol    Packets  % traffic
+Ethernet    6        100.0%   
+IP          6        100.0%   
+Modbus/TCP  6        100.0%   
+TCP         6        100.0%   
+------------------------------------------------------------------------
+Port-Based Protocols (Service Heuristics)
+Protocol    Packets  % traffic
+Modbus/TCP  6        100.0%   
+------------------------------------------------------------------------
+Deterministic Protocol Security Checks
+[ ] Protocol identity mismatch: none
+[ ] Anomalous protocol sequence: none
+[ ] Cross-protocol corroboration: none
+[!] Evidence provenance: 1
+  - protocols (4)
+------------------------------------------------------------------------
+Protocol Hierarchy
+Ethernet                                           6 pkts, 0.00 MB
+  |- IP                                            6 pkts, 0.00 MB
+    |- TCP                                         6 pkts, 0.00 MB
+      |- Modbus/TCP                                6 pkts, 0.00 MB
+------------------------------------------------------------------------
+No clear anomalies detected.
+------------------------------------------------------------------------
+Top Conversations (by volume)
+Src            Dst            Proto       Packets  Bytes    Duration  Ports    
+192.168.10.50  192.168.10.10  Modbus/TCP  6        0.00 MB  50.0 ms   502,44320
+========================================================================

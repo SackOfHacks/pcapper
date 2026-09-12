@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover - scapy optional at runtime
 from .equipment import equipment_artifacts
 from .industrial_helpers import IndustrialAnomaly, IndustrialArtifact, _extract_transport
 from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, safe_float
+from .utils import safe_float
 
 CIP_TCP_PORT = 44818
 CIP_UDP_PORT = 2222

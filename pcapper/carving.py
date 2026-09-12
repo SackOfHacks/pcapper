@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .pcap_cache import get_reader
+from .reassembly import Reassembly, reassemble
 from .utils import (
     detect_file_type_bytes,
     extract_packet_endpoints,
@@ -58,6 +59,15 @@ class CarveHit:
     file_type: str
     sha256: str
     note: str | None = None
+    # Bytes missing from the span this artifact was carved out of. Non-zero means
+    # the blob — and therefore the SHA-256 above — is a partial reconstruction,
+    # not the file that crossed the wire. See _reassemble / reassembly.Gap.
+    gap_count: int = 0
+    gap_bytes: int = 0
+
+    @property
+    def incomplete(self) -> bool:
+        return self.gap_count > 0
 
 
 @dataclass(frozen=True)
@@ -119,30 +129,18 @@ def _stream_id(src: str, sport: int, dst: str, dport: int) -> str:
     return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
 
 
-def _reassemble(segments: list[tuple[int, bytes]], max_bytes: int) -> bytes:
-    if not segments:
-        return b""
-    segments.sort(key=lambda item: item[0])
-    out = bytearray()
-    current_end = None
-    for seq, data in segments:
-        if not data:
-            continue
-        if current_end is None:
-            out.extend(data)
-            current_end = seq + len(data)
-        else:
-            if seq >= current_end:
-                out.extend(data)
-                current_end = seq + len(data)
-            else:
-                overlap = current_end - seq
-                if overlap < len(data):
-                    out.extend(data[overlap:])
-                    current_end += len(data) - overlap
-        if len(out) >= max_bytes:
-            return bytes(out[:max_bytes])
-    return bytes(out)
+def _reassemble(segments: list[tuple[int, bytes]], max_bytes: int) -> Reassembly:
+    """Rebuild one direction of a stream for signature scanning.
+
+    Carving zero-fills gaps (``fill_gaps=True``) rather than closing them by
+    concatenation. Two reasons, both specific to carving: offsets into the
+    result then mean the same thing as offsets into the stream, so a reported
+    ``CarveHit.offset`` corresponds to a real position in the conversation; and
+    a file signature that straddles a dropped packet yields a blob with a
+    visible hole in it rather than one silently spliced together and published
+    with an authoritative SHA-256.
+    """
+    return reassemble(segments, max_bytes, fill_gaps=True)
 
 
 def _sanitize_name(value: str) -> str:
@@ -280,10 +278,11 @@ def analyze_carving(
     for stream_key in stream_stats.keys():
         src, sport, dst, dport = stream_key
         sid = _stream_id(src, sport, dst, dport)
-        for direction, data in (
+        for direction, stream in (
             ("client", _reassemble(segments_ab.get(stream_key, []), stream_max_bytes)),
             ("server", _reassemble(segments_ba.get(stream_key, []), stream_max_bytes)),
         ):
+            data = stream.data
             if not data:
                 continue
             sig_hits = _find_signatures(data)
@@ -295,6 +294,10 @@ def analyze_carving(
                     continue
                 file_type = detect_file_type_bytes(blob) or label
                 sha256 = hashlib.sha256(blob).hexdigest()
+                # A blob spanning a gap is a partial reconstruction. Record how
+                # much is missing so the hash is never presented as if it were
+                # the hash of the file that actually crossed the wire.
+                gap_count, gap_bytes = stream.gaps_within(offset, len(blob))
                 name = f"{sid}_{direction}_{offset}_{file_type}".lower()
                 filename = f"carve_{_sanitize_name(name)}.bin"
                 out_path = None
@@ -306,6 +309,14 @@ def analyze_carving(
                         extracted.append(out_path)
                     except Exception as exc:
                         errors.append(f"Carve write error: {exc}")
+                note = str(out_path) if out_path else None
+                if gap_count:
+                    warning = (
+                        f"INCOMPLETE: {gap_bytes} byte(s) missing across "
+                        f"{gap_count} gap(s); SHA-256 is of the partial "
+                        f"reconstruction, not of the original file"
+                    )
+                    note = f"{note} [{warning}]" if note else warning
                 hits.append(
                     CarveHit(
                         stream_id=sid,
@@ -318,7 +329,9 @@ def analyze_carving(
                         length=len(blob),
                         file_type=file_type,
                         sha256=sha256,
-                        note=str(out_path) if out_path else None,
+                        note=note,
+                        gap_count=gap_count,
+                        gap_bytes=gap_bytes,
                     )
                 )
             if len(hits) >= carve_limit:
@@ -333,6 +346,11 @@ def analyze_carving(
         suspicious_hits = [hit for hit in hits if hit.file_type in suspicious_types]
         evidence = [
             f"{hit.file_type} {hit.length}B {hit.src}:{hit.src_port}->{hit.dst}:{hit.dst_port} sha256={hit.sha256[:12]}"
+            + (
+                f" INCOMPLETE({hit.gap_bytes}B missing in {hit.gap_count} gap(s))"
+                if hit.incomplete
+                else ""
+            )
             for hit in hits[:8]
         ]
         detail_suffix = ""
@@ -340,6 +358,13 @@ def analyze_carving(
         if suspicious_hits:
             detail_suffix = f" {len(suspicious_hits)} suspicious type(s) detected."
             severity = "warning"
+        incomplete_hits = [hit for hit in hits if hit.incomplete]
+        if incomplete_hits:
+            detail_suffix += (
+                f" {len(incomplete_hits)} hit(s) carved across gaps in the"
+                " reassembled stream — those hashes are of partial"
+                " reconstructions and will not match the original files."
+            )
         detections.append(
             {
                 "severity": severity,

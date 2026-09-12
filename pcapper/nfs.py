@@ -9,7 +9,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
-    from scapy.layers.inet6 import IPv6
     from scapy.packet import Packet, Raw
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore

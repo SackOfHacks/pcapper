@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import get_reader
+from .reassembly import reassemble
 from .utils import packet_length, safe_float, extract_packet_endpoints
 
 try:
@@ -174,33 +175,21 @@ def _tcp_flags_text(flags: int) -> str:
 def _reassemble(
     segments: list[tuple[int, bytes]], max_bytes: int
 ) -> tuple[bytes, list[dict[str, int]]]:
-    if not segments:
-        return b"", []
-    segments.sort(key=lambda item: item[0])
-    out = bytearray()
-    current_end = None
-    gaps: list[dict[str, int]] = []
-    for seq, data in segments:
-        if not data:
-            continue
-        if current_end is None:
-            out.extend(data)
-            current_end = seq + len(data)
-        else:
-            if seq >= current_end:
-                gap = seq - current_end
-                if gap > 0:
-                    gaps.append({"at_seq": current_end, "gap_bytes": gap})
-                out.extend(data)
-                current_end = seq + len(data)
-            else:
-                overlap = current_end - seq
-                if overlap < len(data):
-                    out.extend(data[overlap:])
-                    current_end += len(data) - overlap
-        if len(out) >= max_bytes:
-            return bytes(out[:max_bytes]), gaps
-    return bytes(out), gaps
+    """Rebuild one direction of a stream for preview and search.
+
+    Delegates to the shared implementation so stream following and carving
+    cannot drift apart again — in particular so both order segments in stream
+    space rather than by raw 32-bit sequence number, which mis-assembles any
+    stream whose ISN sits high enough to wrap mid-transfer.
+
+    Gaps are recorded but *not* zero-filled here: these bytes become payload
+    previews and the ``--follow``/search corpus, where padding a snaplen-
+    truncated capture with NUL runs would crowd real content out of the preview
+    budget. Carving makes the opposite choice, for the reasons in
+    ``carving._reassemble``.
+    """
+    result = reassemble(segments, max_bytes, fill_gaps=False)
+    return result.data, [gap.as_dict() for gap in result.gaps]
 
 
 def analyze_streams(

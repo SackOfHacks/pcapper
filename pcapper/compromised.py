@@ -829,9 +829,14 @@ def analyze_compromised(
                     if nb_facts.get("is_dc")
                     else ", ".join(nb_roles[:3])
                 )
+                # Built as a plain string rather than a nested f-string: reusing
+                # the outer quote character inside an f-string expression is
+                # PEP 701, which is 3.12+, and this package supports 3.9.
+                nb_domain = nb_facts.get("domain")
+                domain_clause = f" in domain {nb_domain}" if nb_domain else ""
                 asset_evidence.append(
                     f"ASSET CONTEXT: browser-announced {infra_label}"
-                    f"{f' in domain {nb_facts.get('domain')}' if nb_facts.get('domain') else ''}"
+                    f"{domain_clause}"
                     " — crown-jewel, prioritize"
                 )
                 score += 2

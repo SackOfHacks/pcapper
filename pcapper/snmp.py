@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from .utils import read_ber_length as _read_ber_length, packet_length
 from .utils import beacon_score
-from .utils import is_public_ip as _is_public_ip
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field

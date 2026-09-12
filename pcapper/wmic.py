@@ -3,7 +3,6 @@ from __future__ import annotations
 from .utils import is_valid_ip as _valid_ip, packet_length, extract_ascii_strings as _extract_ascii_strings
 from .utils import is_public_ip as _is_public_ip
 from .utils import beacon_score as _beaconing_score
-import ipaddress
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass

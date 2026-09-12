@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 
-import ipaddress
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -10,7 +9,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 try:
     from scapy.layers.inet import TCP, UDP
-    from scapy.layers.inet6 import IPv6
     from scapy.layers.l2 import Ether
     from scapy.layers.netbios import (
         NBNSNodeStatusResponse,

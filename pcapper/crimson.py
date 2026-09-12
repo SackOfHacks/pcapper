@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import ipaddress
 from pathlib import Path
 
 from .industrial_helpers import (
     append_public_exposure_anomaly,
     IndustrialAnalysis,
-    IndustrialAnomaly,
     analyze_port_protocol,
 )
 
