@@ -1158,8 +1158,58 @@ def _normalize_filename(name: str) -> str:
         return "unknown_file"
 
 
+# Windows treats these as device names in ANY directory, so writing to
+# "out/CON" opens the console rather than creating a file.
+_WINDOWS_DEVICE_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)]
+)
+
+
+def _local_filename(filename: str) -> Optional[str]:
+    """Reduce a filename taken off the wire to a bare, local name.
+
+    The name is attacker-controlled, so it is never used as a path: only its
+    final component survives, and it is evaluated under *both* POSIX and
+    Windows separator rules so a Windows-style name is neutralised on Linux and
+    a POSIX-style one on Windows.
+
+    Doing this before any filesystem access matters more than it looks.
+    ``_unique_output_path`` calls ``Path.exists()``; on Windows a UNC name such
+    as ``\\\\attacker\\share\\x`` turns that into a live SMB connection to a
+    host named in the capture — a multi-second stall per artifact, and an
+    outbound authentication attempt from the analyst's workstation to a server
+    the adversary chose. Reducing the name to its last component first means
+    nothing off the wire ever reaches the filesystem as a path.
+
+    Returns ``None`` when nothing usable is left.
+    """
+    if not filename:
+        return None
+    name = filename.replace("\\", "/").split("/")[-1]
+    # A drive-relative name ("C:evil.bin") keeps the drive in its final
+    # component, so it survives the split above.
+    if len(name) >= 2 and name[1] == ":":
+        name = name[2:]
+    name = name.replace("\x00", "").strip()
+    if name in {"", ".", ".."}:
+        return None
+    # Windows silently drops trailing dots and spaces, so "evil.exe. " and
+    # "evil.exe" are the same file there but not here.
+    name = name.rstrip(". ")
+    if not name:
+        return None
+    if name.split(".")[0].lower() in _WINDOWS_DEVICE_NAMES:
+        name = f"_{name}"
+    return name
+
+
 def _safe_output_path(base_dir: Path, filename: str) -> Optional[Path]:
-    candidate = _unique_output_path(base_dir, filename)
+    local = _local_filename(filename)
+    if local is None:
+        return None
+    candidate = _unique_output_path(base_dir, local)
     try:
         base_resolved = base_dir.resolve()
         candidate_resolved = candidate.resolve()
