@@ -85,6 +85,34 @@ jobs:
           pip install build twine
           python -m build
           twine check dist/*
+      # twine check validates metadata, not contents. It passed for the whole
+      # window in which the wheel shipped no reporting package at all and
+      # `import pcapper.cli` raised ModuleNotFoundError. Install the artifact
+      # into a clean environment and actually run it.
+      - name: Install the built wheel and run it
+        run: |
+          python -m venv /tmp/wheeltest
+          /tmp/wheeltest/bin/python -m pip install --quiet --upgrade pip
+          /tmp/wheeltest/bin/python -m pip install --quiet dist/*.whl
+          /tmp/wheeltest/bin/python - <<'PY'
+          import importlib, pkgutil, sys
+          import pcapper, pcapper.cli
+          print("installed version:", pcapper.__version__)
+          # Every module in the source tree must be present in the wheel.
+          missing = []
+          for finder, name, _ in pkgutil.walk_packages(
+              pcapper.__path__, prefix="pcapper."
+          ):
+              try:
+                  importlib.import_module(name)
+              except Exception as exc:
+                  missing.append(f"{name}: {type(exc).__name__}: {exc}")
+          for item in missing:
+              print(item, file=sys.stderr)
+          sys.exit(1 if missing else 0)
+          PY
+          /tmp/wheeltest/bin/pcapper --self-check || true
+          /tmp/wheeltest/bin/pcapper 2>&1 | grep -F "PCAPPER v$(/tmp/wheeltest/bin/python -c 'import pcapper; print(pcapper.__version__)')"
       - uses: actions/upload-artifact@v4
         with:
           name: dist

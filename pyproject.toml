@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pcapper"
-version = "2.2.0"
+# Read from pcapper/__init__.py so there is exactly one source of truth.
+# See [tool.setuptools.dynamic] below.
+dynamic = ["version"]
 description = "Modular PCAP threat-hunting, forensics & incident-response/triage CLI for IT and OT/ICS networks"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -78,8 +80,13 @@ line-length = 100
 select = ["F"]
 
 [tool.setuptools]
-packages = ["pcapper"]
+# pcapper.reporting is a subpackage since the reporting split; listing only
+# "pcapper" builds a wheel with every renderer missing.
+packages = ["pcapper", "pcapper.reporting"]
 include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "pcapper.__version__" }
 
 [tool.setuptools.package-data]
 pcapper = ["*.json"]

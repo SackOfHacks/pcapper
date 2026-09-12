@@ -11,7 +11,16 @@ from collections import Counter
 from typing import Any
 
 __all__ = ["__version__"]
-__version__ = "2.1.0"
+
+# The single source of truth for the version. pyproject.toml reads it from here
+# via `[tool.setuptools.dynamic] version = {attr = "pcapper.__version__"}`,
+# rather than carrying its own copy.
+#
+# It used to carry one, and the two drifted: `pip install` reported 2.2.0 while
+# the banner still said 2.1.0, because the banner reads this attribute and the
+# wheel metadata read pyproject. tests/test_version.py fails if a second copy
+# is ever reintroduced.
+__version__ = "2.2.0"
 
 
 # --- Early quiet-mode hook ---------------------------------------------------
