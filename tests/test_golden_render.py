@@ -24,12 +24,14 @@ from pcapper.dns import analyze_dns
 from pcapper.http import analyze_http
 from pcapper.modbus import analyze_modbus
 from pcapper.protocols import analyze_protocols
+from pcapper.voip import analyze_voip
 from pcapper.reporting import (
     render_carve_summary,
     render_dns_summary,
     render_http_summary,
     render_modbus_summary,
     render_protocols_summary,
+    render_voip_summary,
 )
 
 # (golden name, capture, analyze, render)
@@ -41,6 +43,9 @@ CASES = [
     ("protocols_modbus", "modbus.pcap", analyze_protocols, render_protocols_summary),
     ("carve_wrap", "carve_wrap.pcap", analyze_carving, render_carve_summary),
     ("carve_gap", "carve_gap.pcap", analyze_carving, render_carve_summary),
+    ("voip", "voip.pcap", analyze_voip, render_voip_summary),
+    ("voip_multiproto", "voip_multiproto.pcap", analyze_voip, render_voip_summary),
+    ("voip_attack", "voip_attack.pcap", analyze_voip, render_voip_summary),
 ]
 
 

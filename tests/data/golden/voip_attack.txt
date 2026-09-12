@@ -1,0 +1,128 @@
+========================================================================
+VOIP ANALYSIS :: voip_attack.pcap
+========================================================================
+------------------------------------------------------------------------
+Analyst Verdict
+HIGH - VoIP: high-severity activity observed.
+Focus Here First:
+  [HIGH] VoIP scanning/attack tool User-Agent observed — SIPVicious (svmap/svwar/svcrack) — User-Agent 'friendly-scanner' in 38 message(s). SIP en…
+  [HIGH] SIP extension enumeration — 198.18.7.44 addressed 25 distinct SIP URIs — an extension or user sweep (ATT&CK T1046, T1…
+  [HIGH] VoIP authentication brute force / password spray — 14 failed authentications involving 198.18.7.44 (ATT&CK T1110 Brute Force).
+  [HIGH] VoIP credentials recovered (offline-crackable) — 14 credential(s) across SIP x14 for 1 account(s): 1001. SIP Digest lines are hashcat -m 1…
+  [WARNING] High SIP rejection rate — 38 403/404 responses against 0 200 OK — the shape of an extension sweep rather than norma…
+Total Packets           : 76
+Signalling Packets      : 76
+RTP Packets             : 0
+Duration                : 750.0 ms
+Calls / Dialogs         : 38
+Registrations           : 1
+------------------------------------------------------------------------
+Protocols Observed
+Protocol  Packets
+SIP       76     
+SIP Transport           : TLS-port (2), UDP (74)
+Signalling Ports        : 5060 (75), 5061 (1)
+------------------------------------------------------------------------
+Calls / Dialogs
+Time                         Proto  From  To    Disposition  Dur   Auth
+2021-01-01T00:03:20Z         SIP    100   1000  options      0.0s  no  
+2021-01-01T00:03:20.020000Z  SIP    100   1001  options      0.0s  no  
+2021-01-01T00:03:20.040000Z  SIP    100   1002  options      0.0s  no  
+2021-01-01T00:03:20.060000Z  SIP    100   1003  options      0.0s  no  
+2021-01-01T00:03:20.080000Z  SIP    100   1004  options      0.0s  no  
+2021-01-01T00:03:20.100000Z  SIP    100   1005  options      0.0s  no  
+2021-01-01T00:03:20.120000Z  SIP    100   1006  options      0.0s  no  
+2021-01-01T00:03:20.140000Z  SIP    100   1007  options      0.0s  no  
+2021-01-01T00:03:20.160000Z  SIP    100   1008  options      0.0s  no  
+2021-01-01T00:03:20.180000Z  SIP    100   1009  options      0.0s  no  
+2021-01-01T00:03:20.200000Z  SIP    100   1010  options      0.0s  no  
+2021-01-01T00:03:20.220000Z  SIP    100   1011  options      0.0s  no  
+(+26 more dialogs)
+------------------------------------------------------------------------
+Registrations
+Proto  Account                   Attempts  OK  Chal  Fail  Source IPs 
+SIP    sip:1001@pbx.example.com  14        0   0     14    198.18.7.44
+------------------------------------------------------------------------
+Recovered Credentials
+14 credential(s) recovered in cleartext signalling — treat this output as evidence.
+Time                         Proto  Context          User  Realm     Src -> Dst                 
+2021-01-01T00:03:20.480000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+2021-01-01T00:03:20.500000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+2021-01-01T00:03:20.520000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+2021-01-01T00:03:20.540000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+2021-01-01T00:03:20.560000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+2021-01-01T00:03:20.580000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+2021-01-01T00:03:20.600000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+2021-01-01T00:03:20.620000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+2021-01-01T00:03:20.640000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+2021-01-01T00:03:20.660000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+2021-01-01T00:03:20.680000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+2021-01-01T00:03:20.700000Z  SIP    REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+(+2 more credentials)
+Crack-ready material (SIP) — SIP lines are hashcat -m 11400:
+  $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000000
+  $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000001
+  $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000002
+  (+11 more; -v for all, or --json)
+------------------------------------------------------------------------
+Software Fingerprints
+User-Agent        Msgs
+friendly-scanner  38  
+Server                Msgs
+Asterisk PBX 18.10.0  38  
+------------------------------------------------------------------------
+Dialled / Called Parties
+Called  Calls
+1001    15   
+1023    1    
+1022    1    
+1021    1    
+1020    1    
+1019    1    
+1018    1    
+1017    1    
+1016    1    
+1015    1    
+1014    1    
+1013    1    
+Caller  Calls
+100     24   
+1001    14   
+------------------------------------------------------------------------
+Detections
+[HIGH] VoIP scanning/attack tool User-Agent observed
+  SIPVicious (svmap/svwar/svcrack) — User-Agent 'friendly-scanner' in 38 message(s). SIP enumeration and toll-fraud tooling (ATT&CK T1046 Network Service Discovery, T1595 Active Scanning).
+[HIGH] SIP extension enumeration
+  198.18.7.44 addressed 25 distinct SIP URIs — an extension or user sweep (ATT&CK T1046, T1589.002).
+[WARN] High SIP rejection rate
+  38 403/404 responses against 0 200 OK — the shape of an extension sweep rather than normal calling (ATT&CK T1046).
+[HIGH] VoIP authentication brute force / password spray
+  14 failed authentications involving 198.18.7.44 (ATT&CK T1110 Brute Force).
+[HIGH] VoIP credentials recovered (offline-crackable)
+  14 credential(s) across SIP x14 for 1 account(s): 1001. SIP Digest lines are hashcat -m 11400 candidates; IAX2 pairs are md5(challenge+secret) (ATT&CK T1040 Network Sniffing, T1110.002 Password Cracking).
+------------------------------------------------------------------------
+Deterministic VoIP Security Checks
+Scanning / extension enumeration
+Yes, there is evidence for scanning / extension enumeration, here is the evidence:
+- VoIP scanning/attack tool User-Agent observed: SIPVicious (svmap/svwar/svcrack) — User-Agent 'friendly-scanner' in 38 message(s). SIP enumeration and toll-fraud tooling (ATT&CK T1046 Network Service Discovery, T1595 Active Scanning).
+- SIP extension enumeration: 198.18.7.44 addressed 25 distinct SIP URIs — an extension or user sweep (ATT&CK T1046, T1589.002).
+- High SIP rejection rate: 38 403/404 responses against 0 200 OK — the shape of an extension sweep rather than normal calling (ATT&CK T1046).
+Authentication attack
+Yes, there is evidence for authentication attack, here is the evidence:
+- VoIP authentication brute force / password spray: 14 failed authentications involving 198.18.7.44 (ATT&CK T1110 Brute Force).
+Credential exposure
+Yes, there is evidence for credential exposure, here is the evidence:
+- VoIP credentials recovered (offline-crackable): 14 credential(s) across SIP x14 for 1 account(s): 1001. SIP Digest lines are hashcat -m 11400 candidates; IAX2 pairs are md5(challenge+secret) (ATT&CK T1040 Network Sniffing, T1110.002 Password Cracking).
+Cleared (no evidence): Provisioning exposure, Media key exposure, Toll-fraud indicators, Registration hijacking, Unsignalled / hijacked media, Sensitive digits / content, Internet exposure, Transport hygiene / DoS
+------------------------------------------------------------------------
+Threat Hypotheses
+- VoIP account takeover
+    Why: 14 recoverable credential(s) and 14 authentication failure(s).
+    Next: Crack the recovered material offline (hashcat -m 11400 for SIP Digest) to confirm weak secrets, then check the PBX CDR for calls placed by those accounts.
+------------------------------------------------------------------------
+False-Positive Context
+- No cleartext SRTP keying material in SDP
+- No international/premium-rate destinations dialled
+- No phone configuration files fetched in the clear
+========================================================================
+Output is summarized/truncated. Use -v to view all output.

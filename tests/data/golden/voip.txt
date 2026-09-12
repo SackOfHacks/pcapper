@@ -1,0 +1,137 @@
+========================================================================
+VOIP ANALYSIS :: voip.pcap
+========================================================================
+------------------------------------------------------------------------
+Analyst Verdict
+HIGH - VoIP: high-severity activity observed.
+Focus Here First:
+  [HIGH] VoIP credentials recovered (offline-crackable) — 1 credential(s) across SIP x1 for 1 account(s): 1001. SIP Digest lines are hashcat -m 114…
+  [HIGH] Phone configuration downloaded over a cleartext channel — 1 fetch(es), e.g. 192.168.10.60 -> 192.168.10.5 'SEP020000000003.cnf.xml' (Cisco phone co…
+  [HIGH] SRTP master key transmitted in cleartext SDP — 1 media description(s) carry a=crypto inline: keying material (SDES, RFC 4568) over unenc…
+  [WARNING] Call set up without authentication — 1 INVITE dialog(s) reached 200 OK with no 401/407 challenge. An open relay accepts calls …
+  [WARNING] Calls to international / premium-rate destinations — 1 call(s), e.g. 1001 -> 441134960000 (international-format destination). Confirm against …
+  [WARNING] SIP signalling is unencrypted — All SIP was observed in cleartext (no 5061/TLS). Credentials, dialled numbers and any SDE…
+Total Packets           : 85
+Signalling Packets      : 11
+RTP Packets             : 72
+RTP Bytes               : 0.01 MB
+RTCP Packets            : 1
+Duration                : 1.68 s
+Calls / Dialogs         : 2
+Registrations           : 1
+------------------------------------------------------------------------
+Protocols Observed
+Protocol           Packets
+SIP                11     
+RTCP               1      
+TFTP provisioning  1      
+SIP Transport           : UDP (11)
+Signalling Ports        : 5060 (11)
+------------------------------------------------------------------------
+Calls / Dialogs
+Time                         Proto  From  To            Disposition  Dur   Auth
+2021-01-01T00:00:00Z         SIP    1001  1001          registered   0.1s  yes 
+2021-01-01T00:00:00.080000Z  SIP    1001  441134960000  answered     1.5s  no  
+------------------------------------------------------------------------
+Registrations
+Proto  Account                   Attempts  OK  Chal  Fail  Source IPs   
+SIP    sip:1001@pbx.example.com  2         1   1     0     192.168.10.60
+------------------------------------------------------------------------
+Recovered Credentials
+1 credential(s) recovered in cleartext signalling — treat this output as evidence.
+Time                         Proto  Context          User  Realm     Src -> Dst                   
+2021-01-01T00:00:00.040000Z  SIP    REGISTER Digest  1001  asterisk  192.168.10.60 -> 192.168.10.5
+Crack-ready material (SIP) — SIP lines are hashcat -m 11400:
+  $sip$*192.168.10.5*192.168.10.60*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a*3a7f9c2e*00000001*auth*MD5*7cf1d6f2a9b34e5c8d0a1b2c3d4e5f60
+------------------------------------------------------------------------
+DTMF Keypad Digits
+Digits pressed during calls. Frequently IVR PINs, calling-card numbers, account numbers or card data.
+Carrier         Source               Destination         Stream      Digits
+RTP (RFC 4733)  192.168.10.60:40000  192.168.10.5:40002  0x11aa22bb  4827  
+------------------------------------------------------------------------
+RTP Streams
+Source               Destination          SSRC        Codec      Pkts  Loss  Jitter  Flags
+192.168.10.60:40000  192.168.10.5:40002   0x11aa22bb  PCMU/8000  42    0.0%  26.8ms  DTMF 
+192.168.10.5:40002   192.168.10.60:40000  0x33cc44dd  PCMU/8000  30    0.0%  16.9ms  -    
+------------------------------------------------------------------------
+Negotiated Media (SDP)
+Type   Profile  Endpoint             Direction  Codecs                          Keying       
+audio  RTP/AVP  192.168.10.60:40000  sendrecv   PCMU/8000, telephone-event/80…  CLEARTEXT KEY
+audio  RTP/AVP  192.168.10.5:40002   sendrecv   PCMU/8000, telephone-event/80…  none         
+SRTP master keys were sent in the clear (a=crypto inline). Anyone who captured this traffic can decrypt the media:
+  192.168.10.60:40000 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVT9oGZTsLu8HAxLGWMr7dmMLlq
+------------------------------------------------------------------------
+Software Fingerprints
+User-Agent                     Msgs
+Grandstream GXP2170 1.0.11.28  3   
+Server                Msgs
+Asterisk PBX 18.10.0  5   
+RTCP CNAMEs             : 1001@192.168.10.60 (1)
+------------------------------------------------------------------------
+Dialled / Called Parties
+Called        Calls
+441134960000  3    
+1001          2    
+Caller  Calls
+1001    5    
+------------------------------------------------------------------------
+Phone Provisioning Fetches
+Transport  Client         Server        File                     Classification    
+TFTP       192.168.10.60  192.168.10.5  SEP020000000003.cnf.xml  Cisco phone config
+Phone configuration files carry the SIP account password in cleartext; TFTP requires no authentication to fetch them.
+------------------------------------------------------------------------
+Detections
+[HIGH] VoIP credentials recovered (offline-crackable)
+  1 credential(s) across SIP x1 for 1 account(s): 1001. SIP Digest lines are hashcat -m 11400 candidates; IAX2 pairs are md5(challenge+secret) (ATT&CK T1040 Network Sniffing, T1110.002 Password Cracking).
+[HIGH] Phone configuration downloaded over a cleartext channel
+  1 fetch(es), e.g. 192.168.10.60 -> 192.168.10.5 'SEP020000000003.cnf.xml' (Cisco phone config). Phone config files carry the SIP account password in the clear, and TFTP has no authentication at all — anyone on the segment can fetch any handset's config (ATT&CK T1552.001 Credentials In Files, T1040 Network Sniffing).
+[HIGH] SRTP master key transmitted in cleartext SDP
+  1 media description(s) carry a=crypto inline: keying material (SDES, RFC 4568) over unencrypted signalling. Whoever captured this traffic can decrypt the associated media (ATT&CK T1040 Network Sniffing, T1557 Adversary-in-the-Middle).
+[WARN] Call set up without authentication
+  1 INVITE dialog(s) reached 200 OK with no 401/407 challenge. An open relay accepts calls from anyone who can reach it, which is the standard toll-fraud entry point.
+[WARN] Calls to international / premium-rate destinations
+  1 call(s), e.g. 1001 -> 441134960000 (international-format destination). Confirm against the expected dialling profile; this is the payload of PBX toll fraud (ATT&CK T1657 Financial Theft).
+[WARN] SIP signalling is unencrypted
+  All SIP was observed in cleartext (no 5061/TLS). Credentials, dialled numbers and any SDES media keys are readable by anyone on the path (ATT&CK T1040 Network Sniffing).
+[WARN] DTMF keypad digits recovered
+  4 digit(s) across 1 stream(s) via RTP (RFC 4733), e.g. '4827'. These are unencrypted here; IVR PINs, calling-card numbers, account numbers and card data travel this way (ATT&CK T1040 Network Sniffing).
+------------------------------------------------------------------------
+Deterministic VoIP Security Checks
+Credential exposure
+Yes, there is evidence for credential exposure, here is the evidence:
+- VoIP credentials recovered (offline-crackable): 1 credential(s) across SIP x1 for 1 account(s): 1001. SIP Digest lines are hashcat -m 11400 candidates; IAX2 pairs are md5(challenge+secret) (ATT&CK T1040 Network Sniffing, T1110.002 Password Cracking).
+Provisioning exposure
+Yes, there is evidence for provisioning exposure, here is the evidence:
+- Phone configuration downloaded over a cleartext channel: 1 fetch(es), e.g. 192.168.10.60 -> 192.168.10.5 'SEP020000000003.cnf.xml' (Cisco phone config). Phone config files carry the SIP account password in the clear, and TFTP has no authentication at all — anyone on the segment can fetch any handset's config (ATT&CK T1552.001 Credentials In Files, T1040 Network Sniffing).
+Media key exposure
+Yes, there is evidence for media key exposure, here is the evidence:
+- SRTP master key transmitted in cleartext SDP: 1 media description(s) carry a=crypto inline: keying material (SDES, RFC 4568) over unencrypted signalling. Whoever captured this traffic can decrypt the associated media (ATT&CK T1040 Network Sniffing, T1557 Adversary-in-the-Middle).
+Toll-fraud indicators
+Yes, there is evidence for toll-fraud indicators, here is the evidence:
+- Call set up without authentication: 1 INVITE dialog(s) reached 200 OK with no 401/407 challenge. An open relay accepts calls from anyone who can reach it, which is the standard toll-fraud entry point.
+- Calls to international / premium-rate destinations: 1 call(s), e.g. 1001 -> 441134960000 (international-format destination). Confirm against the expected dialling profile; this is the payload of PBX toll fraud (ATT&CK T1657 Financial Theft).
+Sensitive digits / content
+Yes, there is evidence for sensitive digits / content, here is the evidence:
+- DTMF keypad digits recovered: 4 digit(s) across 1 stream(s) via RTP (RFC 4733), e.g. '4827'. These are unencrypted here; IVR PINs, calling-card numbers, account numbers and card data travel this way (ATT&CK T1040 Network Sniffing).
+Transport hygiene / DoS
+Yes, there is evidence for transport hygiene / dos, here is the evidence:
+- SIP signalling is unencrypted: All SIP was observed in cleartext (no 5061/TLS). Credentials, dialled numbers and any SDES media keys are readable by anyone on the path (ATT&CK T1040 Network Sniffing).
+Cleared (no evidence): Scanning / extension enumeration, Authentication attack, Registration hijacking, Unsignalled / hijacked media, Internet exposure
+------------------------------------------------------------------------
+Threat Hypotheses
+- VoIP account takeover
+    Why: 1 recoverable credential(s) and 0 authentication failure(s).
+    Next: Crack the recovered material offline (hashcat -m 11400 for SIP Digest) to confirm weak secrets, then check the PBX CDR for calls placed by those accounts.
+- PBX toll fraud
+    Why: 1 unauthenticated call setup(s) and 1 international/premium destination(s).
+    Next: Compare against billing records and the site's normal dialling profile, especially outside business hours.
+- Credential harvest via phone provisioning
+    Why: 1 config fetch(es) in the clear.
+    Next: Retrieve the same files from the provisioning server and check whether they contain SIP secrets; TFTP requires no credentials.
+------------------------------------------------------------------------
+False-Positive Context
+- No self-identifying VoIP scanner User-Agent observed
+- No failed VoIP authentications observed
+- Every RTP stream matches an SDP offer seen in the capture
+========================================================================
+Output is summarized/truncated. Use -v to view all output.

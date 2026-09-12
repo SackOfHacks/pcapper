@@ -408,6 +408,76 @@ Count: 78 flags
 
 Count: 40 flags
 
+## Phone Over IP (VoIP)
+
+`--voip` (alias `--sip`) analyses the whole call path, not one protocol.
+
+```bash
+python -m pcapper capture.pcap --voip
+python -m pcapper capture.pcap --voip --voip-out voip/     # also recover audio
+python -m pcapper capture.pcap --voip -ip 10.1.2.3         # one endpoint
+```
+
+| Layer | Covered |
+| --- | --- |
+| Signalling | SIP (any port, UDP/TCP/TLS), Cisco SCCP/Skinny, MGCP, MEGACO/H.248, IAX2, H.323 (H.225 call signalling and RAS) |
+| Session description | SDP — addresses, ports, codecs, direction, SRTP keying |
+| Media | RTP, RTCP, SRTP, T.38 fax over UDPTL |
+| NAT traversal | STUN / TURN / ICE |
+| Provisioning | TFTP and HTTP phone configuration fetches |
+| Numbering | ENUM (`e164.arpa` NAPTR lookups) |
+
+SIP is recognised by its start line rather than its port, so a PBX moved to 5080
+— or a service hiding on an arbitrary port — is still analysed, and the
+non-standard port is reported.
+
+### What it recovers
+
+- **Calls** — participants, dialled number, disposition (answered, busy,
+  cancelled, rejected, register failed …) and duration, from whichever protocol
+  carried them.
+- **Registrations** — accounts, contact bindings, source addresses, and the
+  success/challenge/failure counts behind them.
+- **Credentials** — SIP Digest responses as ready `hashcat -m 11400` lines, IAX2
+  MD5 challenge/response pairs and plaintext IAX2 passwords, and TURN long-term
+  credentials. Not redacted: recovering them is the point.
+- **Keypad digits** — RFC 4733 telephone-events in RTP, SIP INFO
+  `application/dtmf-relay`, Skinny `KeypadButton` and MGCP observed events.
+  These are routinely IVR PINs, calling-card numbers and card data.
+- **Media keys** — `a=crypto ... inline:` in SDP. If the signalling was not
+  itself encrypted, every "encrypted" call in the capture is decryptable by
+  whoever captured it.
+- **Media quality** — per stream: SSRC, codec, packet loss, reordering,
+  duplicates and interarrival jitter.
+- **Phone configuration fetches** — the richest credential source in a VoIP
+  capture, since config files carry the SIP password in the clear and TFTP has
+  no authentication at all.
+- **Audio** — with `--voip-out`, G.711 (PCMU/PCMA) streams are decoded to WAV.
+  Other codecs are reported but not decoded; SRTP-negotiated streams are skipped
+  rather than decoded into convincing noise.
+
+### What it detects
+
+Scanner and attack tooling by User-Agent (SIPVicious, sipcli, sipsak, SIPp,
+smap and friends), extension enumeration by behaviour, registration brute force
+and password spraying, unauthenticated call setup, international and
+premium-rate dialling, registration hijacking, RTP with no matching SDP offer,
+multiple SSRCs on one media path, cleartext SRTP keys, cleartext signalling,
+internet exposure, and INVITE floods. Findings carry ATT&CK technique IDs, so
+they flow into `--threats` and `--mitre`.
+
+### Output limits
+
+`PCAPPER_VOIP_MAX_CALLS` (5000), `PCAPPER_VOIP_MAX_CREDENTIALS` (2000),
+`PCAPPER_VOIP_MAX_RTP_STREAMS` (5000), `PCAPPER_VOIP_MAX_DTMF_DIGITS` (256),
+`PCAPPER_VOIP_MAX_AUDIO_BYTES` (16 MB per stream),
+`PCAPPER_VOIP_MIN_RTP_PACKETS` (4 — how many packets must agree on one SSRC
+before a stream is reported, which is what keeps arbitrary UDP from being
+mistaken for media).
+
+> `pcapper.srtp` is **GE SRTP**, an industrial PLC protocol on ports
+> 18245/18246. It is unrelated to Secure RTP, which is handled here.
+
 ## Notes
 
 - For timeline mode, supply `-ip` with `--timeline`.

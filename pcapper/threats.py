@@ -82,6 +82,7 @@ from .email import analyze_email
 from .safety import analyze_safety
 from .telnet import analyze_telnet
 from .vnc import analyze_vnc
+from .voip import analyze_voip
 from .routing import analyze_routing
 from .srtp import analyze_srtp
 from .synchrophasor import analyze_synchrophasor
@@ -2551,6 +2552,7 @@ def analyze_threats(
     safety_summary = analyze_safety(path, show_status=show_status)
     telnet_summary = analyze_telnet(path, show_status=show_status)
     vnc_summary = analyze_vnc(path, show_status=show_status)
+    voip_summary = analyze_voip(path, show_status=show_status)
     routing_summary = analyze_routing(path, show_status=show_status)
     rpc_summary = analyze_rpc(path, show_status=show_status)
     snmp_summary = analyze_snmp(path, show_status=show_status)
@@ -2687,6 +2689,7 @@ def analyze_threats(
     _append_detection_items(detections, "Telnet", telnet_summary.detections)
     _append_anomaly_items(detections, "Telnet", telnet_summary.anomalies)
     _append_detection_items(detections, "VNC", vnc_summary.detections)
+    _append_detection_items(detections, "VoIP", voip_summary.detections)
     _append_anomaly_items(detections, "VNC", vnc_summary.anomalies)
     _append_detection_items(detections, "Routing", routing_summary.detections)
     _append_detection_items(detections, "RPC", rpc_summary.detections)
@@ -2832,6 +2835,7 @@ def analyze_threats(
     errors.extend(safety_summary.errors)
     errors.extend(telnet_summary.errors)
     errors.extend(vnc_summary.errors)
+    errors.extend(voip_summary.errors)
     errors.extend(routing_summary.errors)
     errors.extend(rpc_summary.errors)
     errors.extend(snmp_summary.errors)
