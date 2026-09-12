@@ -1,0 +1,17 @@
+# Capture fixtures are binary. Without this, a checkout with core.autocrlf=true
+# rewrites 0x0A bytes inside the packet data and the fixture stops parsing.
+*.pcap binary
+*.pcapng binary
+*.cap binary
+
+# Golden report fixtures are compared byte for byte against rendered output, so
+# they must not pick up CRLF on a Windows checkout. (The test harness also
+# normalises line endings, but pinning them here keeps the diffs readable.)
+tests/data/golden/*.txt text eol=lf
+
+# Source stays LF everywhere.
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

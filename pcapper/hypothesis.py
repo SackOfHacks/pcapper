@@ -32,7 +32,7 @@ first and de-emphasise ``unrelated`` ones.
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable
 
 Detection = dict[str, Any]
 

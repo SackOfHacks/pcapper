@@ -3,7 +3,6 @@ from __future__ import annotations
 from .utils import shannon_entropy as _shannon_entropy
 from .utils import is_private_ip as _is_private_ip
 from .utils import is_public_ip as _is_public_ip
-from .utils import memoize_analysis
 
 import re
 from collections import Counter, defaultdict

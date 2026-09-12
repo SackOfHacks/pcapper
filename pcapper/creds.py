@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import ipaddress
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -41,7 +40,6 @@ except Exception:  # pragma: no cover
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
-    from scapy.layers.inet6 import IPv6  # type: ignore
     from scapy.packet import Packet, Raw  # type: ignore
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore

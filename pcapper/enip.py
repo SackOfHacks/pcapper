@@ -25,7 +25,6 @@ from .cip import (
     CONTROL_SERVICE_CODES,
     CPF_ITEM_TYPES,
     ENIP_ENUMERATION_COMMANDS,
-    ENUMERATION_SERVICE_CODES,
     HIGH_RISK_SERVICE_CODES,
     PROGRAM_SERVICE_CODES,
     WRITE_BASELINE_MIN,
@@ -45,7 +44,7 @@ from .device_detection import device_fingerprint_from_fields
 from .equipment import equipment_artifacts
 from .industrial_helpers import IndustrialAnomaly, IndustrialArtifact, _extract_transport
 from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, safe_float, safe_read_text
+from .utils import safe_float, safe_read_text
 
 ENIP_TCP_PORT = 44818
 ENIP_UDP_PORT = 2222

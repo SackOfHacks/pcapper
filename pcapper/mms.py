@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .utils import read_ber_length as _read_ber_length
-import ipaddress
 from pathlib import Path
 
 from .industrial_helpers import (

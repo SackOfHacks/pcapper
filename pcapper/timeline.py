@@ -4,13 +4,11 @@ from .utils import read_ber_length as _read_ber_length
 import ipaddress
 import os
 import re
-import statistics
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .bacnet import BACNET_PORT
 from .cip import ENIP_COMMANDS, analyze_cip
 from .creds import analyze_creds
 from .enip import analyze_enip
@@ -26,11 +24,10 @@ from .opc import OPC_TYPES, OPC_UA_PORT
 from .ot_risk import compute_ot_risk_posture, dedupe_findings
 from .pcap_cache import get_reader
 from .powershell import PS_COMMAND_RE
-from .profinet import PROFINET_PORTS
 from .progress import build_statusbar, run_with_busy_status
 from .s7 import S7_PORT, analyze_s7
 from .telnet import TELNET_PORTS
-from .utils import counter_inc, decode_payload, safe_float, extract_packet_endpoints
+from .utils import decode_payload, safe_float, extract_packet_endpoints
 from .winrm import WINRM_PORTS, WSMAN_RE
 from .wmic import WMIC_COMMAND_RE
 

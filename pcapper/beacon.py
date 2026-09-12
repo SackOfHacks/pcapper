@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field

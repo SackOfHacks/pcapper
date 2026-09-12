@@ -17,14 +17,12 @@ from typing import Iterable, Optional
 
 from .pcap_cache import get_reader
 from .tls_fingerprints import (
-    _coerce_int_list,
     _extract_alpn,
     _extract_sni,
     _iter_tls_extensions,
     _ja3_from_client_hello,
     _ja4_from_client_hello,
     _ja4s_from_server_hello,
-    _tls_extension_type,
 )
 from .utils import counter_inc, memoize_analysis, packet_length, safe_float, safe_read_text, set_add_cap, setdict_add
 

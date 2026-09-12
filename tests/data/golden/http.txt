@@ -1,0 +1,112 @@
+========================================================================
+HTTP ANALYSIS :: http.pcap
+========================================================================
+HTTP Requests           : 1
+HTTP Responses          : 1
+Unique Clients          : 1
+Unique Servers          : 1
+Start                   : 2021-01-01T00:00:00.030000Z
+End                     : 2021-01-01T00:00:00.040000Z
+Duration                : 10.0 ms
+------------------------------------------------------------------------
+Analyst Verdict
+NO STRONG SIGNAL - no convincing malicious HTTP pattern from current heuristics.
+Confidence              : Low (score=0)
+Why confidence:
+- No high-confidence HTTP threat heuristic crossed threshold
+Where:
+- Top HTTP hosts
+- intranet.corp.example: 1
+Who:
+- Top source clients
+- 192.168.10.50: 2
+Where:
+- Top target servers
+- 93.184.216.34: 2
+------------------------------------------------------------------------
+Deterministic HTTP Security Checks
+Authentication Abuse
+No, there is no strong evidence for authentication abuse in this capture.
+Suspicious Upload Activity
+No, there is no strong evidence for suspicious upload activity in this capture.
+Web Shell/Dropper Behavior
+No, there is no strong evidence for web shell/dropper behavior in this capture.
+HTTP Beaconing/C2-like Check-ins
+No, there is no strong evidence for http beaconing/c2-like check-ins in this capture.
+URI/Token Obfuscation
+No, there is no strong evidence for uri/token obfuscation in this capture.
+Host Header / Fronting Anomalies
+No, there is no strong evidence for host header / fronting anomalies in this capture.
+Method Misuse/Tunneling
+No, there is no strong evidence for method misuse/tunneling in this capture.
+User-Agent Impersonation
+No, there is no strong evidence for user-agent impersonation in this capture.
+Session Token Replay
+No, there is no strong evidence for session token replay in this capture.
+Burst/Fan-out Reconnaissance
+No, there is no strong evidence for burst/fan-out reconnaissance in this capture.
+Content-Type/Payload Mismatch
+No, there is no strong evidence for content-type/payload mismatch in this capture.
+Threat Intelligence Reputation
+No, there is no strong evidence for threat intelligence reputation in this capture.
+------------------------------------------------------------------------
+Request Methods
+Method  Count
+GET     1    
+------------------------------------------------------------------------
+HTTP Versions
+Version   Count
+HTTP/1.1  2    
+------------------------------------------------------------------------
+Response Codes
+Status  Description  Count
+200     OK           1    
+------------------------------------------------------------------------
+Top Hosts
+Host                   IPs               Requests  Note
+intranet.corp.example  93.184.216.34(1)  1         -   
+------------------------------------------------------------------------
+Top Clients
+Client         Hostname  Requests
+192.168.10.50  -         2       
+------------------------------------------------------------------------
+Top Servers
+Server         Hostname               Responses
+93.184.216.34  intranet.corp.example  2        
+------------------------------------------------------------------------
+Top 25 URLs
+URL                                  Count
+http://intranet.corp.example/status  1    
+------------------------------------------------------------------------
+Bottom 25 URLs
+URL                                  Count
+http://intranet.corp.example/status  1    
+------------------------------------------------------------------------
+User Agents
+User-Agent         Count
+pcapper-tests/1.0  1    
+------------------------------------------------------------------------
+HTTP Referrer Analysis
+Summary
+Metric                 Value
+Referrers Present      0    
+Referrers Missing      1    
+Unique Referrers       0    
+Unique Referrer Hosts  0    
+Cross-Host Referrers   0    
+HTTPS→HTTP Referrers   0    
+Referrers w/ Tokens    0    
+Referrers w/ IP Hosts  0    
+------------------------------------------------------------------------
+Server Headers
+Server          Count
+test-httpd/1.0  1    
+------------------------------------------------------------------------
+Content Types
+Content-Type  Count
+text/plain    1    
+------------------------------------------------------------------------
+HTTP Sessions
+Client         Server         Start                        End                          Duration  Requests  Size     Responses  Methods  Statuses
+192.168.10.50  93.184.216.34  2021-01-01T00:00:00.030000Z  2021-01-01T00:00:00.040000Z  10.0 ms   1         0.00 MB  1          GET(1)   200(1)  
+========================================================================

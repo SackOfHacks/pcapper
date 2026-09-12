@@ -1,0 +1,36 @@
+========================================================================
+PROTOCOL & CONVERSATION ANALYSIS :: dns.pcap
+========================================================================
+Total Packets           : 6
+Duration                : 50.0 ms
+------------------------------------------------------------------------
+Top Protocols
+Protocol  Packets  % traffic
+DNS       6        100.0%   
+Ethernet  6        100.0%   
+IP        6        100.0%   
+UDP       6        100.0%   
+------------------------------------------------------------------------
+Port-Based Protocols (Service Heuristics)
+Protocol  Packets  % traffic
+DNS       6        100.0%   
+------------------------------------------------------------------------
+Deterministic Protocol Security Checks
+[ ] Protocol identity mismatch: none
+[ ] Anomalous protocol sequence: none
+[ ] Cross-protocol corroboration: none
+[!] Evidence provenance: 1
+  - protocols (4)
+------------------------------------------------------------------------
+Protocol Hierarchy
+Ethernet                                           6 pkts, 0.00 MB
+  |- IP                                            6 pkts, 0.00 MB
+    |- UDP                                         6 pkts, 0.00 MB
+      |- DNS                                       6 pkts, 0.00 MB
+------------------------------------------------------------------------
+No clear anomalies detected.
+------------------------------------------------------------------------
+Top Conversations (by volume)
+Src            Dst            Proto  Packets  Bytes    Duration  Ports               
+192.168.10.50  192.168.10.10  DNS    6        0.00 MB  50.0 ms   53,50000,50001,50002
+========================================================================

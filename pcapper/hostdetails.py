@@ -766,14 +766,14 @@ def merge_hostdetails_summaries(
             if existing_evidence:
                 merged["evidence"] = existing_evidence[:12]
 
-            def _merge_top(field: str) -> None:
+            def _merge_top(key: str) -> None:
                 top_counter: Counter[str] = Counter()
-                for ip, count in merged.get(field, []) or []:
+                for ip, count in merged.get(key, []) or []:
                     top_counter[str(ip)] += int(count)
-                for ip, count in item.get(field, []) or []:
+                for ip, count in item.get(key, []) or []:
                     top_counter[str(ip)] += int(count)
                 if top_counter:
-                    merged[field] = top_counter.most_common(6)
+                    merged[key] = top_counter.most_common(6)
 
             _merge_top("top_sources")
             _merge_top("top_destinations")
@@ -1560,7 +1560,6 @@ def analyze_hostdetails(
         role = _detection_role_for_host(det, target_ip)
         if role is None:
             continue
-        severity = str(det.get("severity", "info") or "info").lower()
         enriched = dict(det)
         enriched["host_role"] = role
         detections.append(enriched)

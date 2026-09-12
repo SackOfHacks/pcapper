@@ -1,0 +1,7 @@
+STREAM CARVING
+Streams                 : 1
+Hits                    : 1
+1 of 1 hit(s) span gaps in the reassembled stream: those artifacts are incomplete and their SHA-256 will not match the original file.
+Stream        Dir     Type  Len  Missing  Src                  Dst               
+fbdf7ff96498  client  PDF   193  16B/1    192.168.10.10:44300  192.168.10.50:8080
+Output is summarized/truncated. Use -v to view all output.

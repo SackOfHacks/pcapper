@@ -51,10 +51,28 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
+    "ruff>=0.6.0",
 ]
 
 [project.scripts]
 pcapper = "pcapper.cli:main"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+# Match the floor advertised in requires-python, so a 3.10+ construct is caught
+# here rather than by a user on the oldest supported interpreter.
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+# `F` is the pyflakes rule set. Every confirmed defect in the 2026-09 review was
+# in it, including a duplicate nested helper that silently changed SMB output.
+# Widen this deliberately; do not narrow it.
+select = ["F"]
 
 [tool.setuptools]
 packages = ["pcapper"]

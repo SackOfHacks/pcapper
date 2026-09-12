@@ -6,7 +6,7 @@ import re
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Protocol
 
 from .aim import AimSummary
 from .arp import ArpSummary
@@ -122,6 +122,8 @@ if TYPE_CHECKING:
     from .modbus import ModbusAnalysis
     from .netbios import NetbiosAnalysis
     from .ntlm import NtlmAnalysis
+    from .scan import ScanSourceResult
+    from .services import ServiceAsset
     from .timeline import TimelineEvent
 
 
@@ -2927,14 +2929,14 @@ def render_icmp_summary(
             "icmp_tunneling_signal": "ICMP tunneling/covert signal",
             "icmp_zone_boundary_exposure": "ICMP internet-boundary crossing",
         }
-        for key, label in check_labels.items():
+        for key, label_text in check_labels.items():
             values = [str(v) for v in list(checks.get(key, []) or [])]
             if values:
-                lines.append(warn(f"[!] {label}: {len(values)}"))
+                lines.append(warn(f"[!] {label_text}: {len(values)}"))
                 for item in values[: _limit_value(8)]:
                     lines.append(muted(f"  - {item}"))
             else:
-                lines.append(ok(f"[ ] {label}: none"))
+                lines.append(ok(f"[ ] {label_text}: none"))
 
 
     asymmetry_profiles = list(getattr(summary, "asymmetry_profiles", []) or [])
@@ -4604,14 +4606,14 @@ def render_ips_summary(
             "intent_heuristics": "Intent heuristics",
             "evidence_provenance": "Evidence provenance",
         }
-        for key, label in check_labels.items():
+        for key, label_text in check_labels.items():
             values = [str(v) for v in list(checks.get(key, []) or [])]
             if values:
-                lines.append(warn(f"[!] {label}: {len(values)}"))
+                lines.append(warn(f"[!] {label_text}: {len(values)}"))
                 for item in values[: _limit_value(8)]:
                     lines.append(muted(f"  - {item}"))
             else:
-                lines.append(ok(f"[ ] {label}: none"))
+                lines.append(ok(f"[ ] {label_text}: none"))
 
 
     priority_asset_profiles = list(
@@ -10016,14 +10018,14 @@ def render_tcp_summary(
             "egress_exfil_outlier": "Egress exfil outlier",
             "transport_window_or_retrans_abuse": "Transport retrans/window abuse",
         }
-        for key, label in check_labels.items():
+        for key, label_text in check_labels.items():
             values = [str(v) for v in list(checks.get(key, []) or [])]
             if values:
-                lines.append(warn(f"[!] {label}: {len(values)}"))
+                lines.append(warn(f"[!] {label_text}: {len(values)}"))
                 for item in values[: _limit_value(8)]:
                     lines.append(muted(f"  - {item}"))
             else:
-                lines.append(ok(f"[ ] {label}: none"))
+                lines.append(ok(f"[ ] {label_text}: none"))
 
 
     session_profiles = list(getattr(summary, "session_integrity_profiles", []) or [])
@@ -10720,14 +10722,14 @@ def render_udp_summary(
             "udp_tunneling_signal": "UDP tunneling/covert signal",
             "udp_transport_fragmentation_reliability": "UDP transport/reliability abuse",
         }
-        for key, label in check_labels.items():
+        for key, label_text in check_labels.items():
             values = [str(v) for v in list(checks.get(key, []) or [])]
             if values:
-                lines.append(warn(f"[!] {label}: {len(values)}"))
+                lines.append(warn(f"[!] {label_text}: {len(values)}"))
                 for item in values[: _limit_value(8)]:
                     lines.append(muted(f"  - {item}"))
             else:
-                lines.append(ok(f"[ ] {label}: none"))
+                lines.append(ok(f"[ ] {label_text}: none"))
 
 
     asymmetry_profiles = list(getattr(summary, "asymmetry_profiles", []) or [])
@@ -14794,14 +14796,14 @@ def render_protocols_summary(summary: ProtocolSummary, verbose: bool = False) ->
             "cross_protocol_corroboration": "Cross-protocol corroboration",
             "evidence_provenance": "Evidence provenance",
         }
-        for key, label in check_labels.items():
+        for key, label_text in check_labels.items():
             values = [str(v) for v in list(checks.get(key, []) or [])]
             if values:
-                lines.append(warn(f"[!] {label}: {len(values)}"))
+                lines.append(warn(f"[!] {label_text}: {len(values)}"))
                 for item in values:
                     lines.append(muted(f"  - {item}"))
             else:
-                lines.append(ok(f"[ ] {label}: none"))
+                lines.append(ok(f"[ ] {label_text}: none"))
 
 
     corroborated_findings = list(getattr(summary, "corroborated_findings", []) or [])
@@ -15336,14 +15338,14 @@ def render_services_summary(summary: ServiceSummary, verbose: bool = False) -> s
             "legacy_or_weak_service_hygiene": "Legacy/weak hygiene",
             "evidence_provenance": "Evidence provenance",
         }
-        for key, label in check_labels.items():
+        for key, label_text in check_labels.items():
             values = [str(v) for v in list(checks.get(key, []) or [])]
             if values:
-                lines.append(warn(f"[!] {label}: {len(values)}"))
+                lines.append(warn(f"[!] {label_text}: {len(values)}"))
                 for item in values:
                     lines.append(muted(f"  - {item}"))
             else:
-                lines.append(ok(f"[ ] {label}: none"))
+                lines.append(ok(f"[ ] {label_text}: none"))
 
 
     mismatch_profiles = list(getattr(summary, "service_mismatch_profiles", []) or [])
@@ -15554,52 +15556,6 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
             if not items:
                 return "-", False
             return ", ".join(_redact_in_text(item) for item in items), False
-        items: list[str]
-        if isinstance(values, (set, list, tuple)):
-            items = sorted(str(v) for v in values)
-        else:
-            try:
-                items = sorted(str(v) for v in list(values))
-            except Exception:
-                items = [str(values)]
-        if not items:
-            return "-", False
-        total = len(items)
-        filtered = [item for item in items if _looks_like_smb_token(item)]
-        used = filtered if filtered else items
-        preview = used[:limit]
-        text = ", ".join(_redact_in_text(item) for item in preview)
-        if len(used) > limit:
-            text = f"{text} (+{len(used) - limit} more)"
-        if total > limit:
-            if filtered and len(filtered) != total:
-                text = f"{total} ({len(filtered)} filtered): {text}"
-            else:
-                text = f"{total}: {text}"
-        return _truncate_text(text, max_len), bool(filtered and len(filtered) != total)
-
-    def _looks_like_smb_token(value: str) -> bool:
-        if not value:
-            return False
-        token = value.strip()
-        if token in {"-", "(unknown)"}:
-            return False
-        if len(token) < 2 or len(token) > 64:
-            return False
-        if not any(ch.isalpha() for ch in token):
-            return False
-        allowed = set(
-            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.@$"
-        )
-        if any(ch not in allowed for ch in token):
-            return False
-        return True
-
-    def _smb_preview_tokens(
-        values: object, limit: int = 3, max_len: int = 60
-    ) -> tuple[str, bool]:
-        if not values:
-            return "-", False
         items: list[str]
         if isinstance(values, (set, list, tuple)):
             items = sorted(str(v) for v in values)
@@ -16605,7 +16561,6 @@ def render_strings_summary(summary: StringsSummary) -> str:
     s_lolbin = _sdc("command_execution_or_lolbin")
     s_exfil = _sdc("download_stager_or_exfil")
     s_otwrite = _sdc("ot_ics_control_write_ops")
-    s_otmark = _sdc("ot_ics_protocol_markers")
     s_ctf = _sdc("ctf_flag_or_challenge_markers")
     reasons: list[str] = []
     if s_creds:
@@ -28931,15 +28886,30 @@ def render_carve_summary(summary) -> str:
         lines.append(_format_kv("Extracted", str(len(summary.extracted))))
     if summary.errors:
         lines.append(_format_kv("Errors", "; ".join(summary.errors)))
+    incomplete = [hit for hit in summary.hits if getattr(hit, "gap_count", 0)]
+    if incomplete:
+        # A carve taken across a hole in the reassembled stream is a partial
+        # reconstruction. Say so next to the table rather than letting a
+        # confident SHA-256 travel into a report unqualified.
+        lines.append(
+            danger(
+                f"{len(incomplete)} of {len(summary.hits)} hit(s) span gaps in the"
+                " reassembled stream: those artifacts are incomplete and their"
+                " SHA-256 will not match the original file."
+            )
+        )
     if summary.hits:
-        rows = [["Stream", "Dir", "Type", "Len", "Src", "Dst"]]
+        rows = [["Stream", "Dir", "Type", "Len", "Missing", "Src", "Dst"]]
         for hit in summary.hits[: _limit_value(10)]:
+            gap_bytes = getattr(hit, "gap_bytes", 0)
+            gap_count = getattr(hit, "gap_count", 0)
             rows.append(
                 [
                     hit.stream_id,
                     hit.direction,
                     hit.file_type,
                     str(hit.length),
+                    f"{gap_bytes}B/{gap_count}" if gap_count else "-",
                     f"{hit.src}:{hit.src_port}",
                     f"{hit.dst}:{hit.dst_port}",
                 ]

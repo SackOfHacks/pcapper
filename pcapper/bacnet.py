@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .utils import is_public_ip as _is_public_ip
-import ipaddress
 from collections import Counter, defaultdict
 from pathlib import Path
 

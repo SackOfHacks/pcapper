@@ -1,0 +1,97 @@
+========================================================================
+MODBUS ANALYSIS :: modbus.pcap
+========================================================================
+------------------------------------------------------------------------
+Analyst Verdict
+HIGH - Modbus: state-changing command or control-plane abuse observed; confirm it originates from an authorized master within a change window.
+  Baseline: 1 master(s) -> 1 server(s); unit id(s) 1; 4 reads / 2 writes / 0 exceptions over 0s.
+  Master(s): 192.168.10.50
+Focus Here First:
+  [HIGH] Modbus Coil Force (output manipulation) — 192.168.10.50 -> 192.168.10.10
+------------------------------------------------------------------------
+ATT&CK for ICS Mapping
+- T0831 Manipulation of Control
+------------------------------------------------------------------------
+Overall Traffic Statistics
+Scan Duration           : 0.05s
+Total Packets           : 6
+Total Bytes             : 0.00 MB
+Packets/sec             : 120.00
+Bits/sec                : 63.36 Kbps
+------------------------------------------------------------------------
+Modbus Protocol Statistics
+Modbus Packets          : 6 (100.0%)
+Modbus Bytes            : 0.00 MB (100.0%)
+Modbus Payload Bytes    : 0.00 MB
+Avg Modbus Packet Size  : 66.0 bytes
+Avg Modbus Payload Size : 5.0 bytes
+Unique Clients          : 1
+Unique Servers          : 1
+Error Rate              : 0.00%
+------------------------------------------------------------------------
+Observed Commands
+Read Holding Registers                   : 2
+Read Input Registers                     : 2
+Write Single Coil                        : 2
+------------------------------------------------------------------------
+Active Unit IDs
+  ID 1 (6)
+------------------------------------------------------------------------
+Endpoint Statistics
+Endpoint       Packets  Bytes  
+192.168.10.10  6        0.00 MB
+192.168.10.50  6        0.00 MB
+------------------------------------------------------------------------
+Client/Server Statistics
+Clients (Controllers)                         | Servers (PLCs/Sensors)
+------------------------------------------------------------------------------------------
+192.168.10.50 (3/0.00 MB)                     | 192.168.10.10 (3/0.00 MB)
+------------------------------------------------------------------------
+Register / Coil Map (process fingerprint)
+Server / Unit     Reads  Read Range  Writes  Write Range  Hot (addr:count)
+192.168.10.10 U1  2      0-16        1       3-3          3:1             
+------------------------------------------------------------------------
+Response Time by Server (paired req->resp)
+Server         min ms  p50 ms  p95 ms  max ms
+192.168.10.10  9       9       9       9     
+------------------------------------------------------------------------
+Transaction Pairing
+Matched req/resp        : 3
+Orphan requests (no response): 0
+Unsolicited responses   : 0
+Static transaction-id connections: 0
+  Orphans/unsolicited near capture edges are expected (pre-existing sessions, cut-off); sustained imbalance = DoS or injection.
+------------------------------------------------------------------------
+Modbus Services (Endpoints)
+Service                 Top Endpoints                     
+Read Holding Registers  192.168.10.50 -> 192.168.10.10 (1)
+Read Input Registers    192.168.10.50 -> 192.168.10.10 (1)
+Write Single Coil       192.168.10.50 -> 192.168.10.10 (1)
+------------------------------------------------------------------------
+Packet & Payload Size Distribution
+Packet Size Buckets     : <=64, 65-128, 129-256, 257-512, 513-1024, 1025-1500, 1501-9000, >9000
+Packet Size Spark       : ▁█▁▁▁▁▁▁
+Packet Size Stats       : min 65 / p50 66 / p95 67 / max 67
+Payload Size Buckets    : <=64, 65-128, 129-256, 257-512, 513-1024, 1025-1500, 1501-9000, >9000
+Payload Size Spark      : █▁▁▁▁▁▁▁
+Payload Size Stats      : min 4 / p50 5 / p95 6 / max 6
+------------------------------------------------------------------------
+Flow Duration Distribution
+All Buckets             : <=1s, 1-10s, 10-60s, 1-5m, 5-30m, >30m
+All Counts              : 2, 0, 0, 0, 0, 0
+Requests Buckets        : <=1s, 1-10s, 10-60s, 1-5m, 5-30m, >30m
+Requests Counts         : 1, 0, 0, 0, 0, 0
+Responses Buckets       : <=1s, 1-10s, 10-60s, 1-5m, 5-30m, >30m
+Responses Counts        : 1, 0, 0, 0, 0, 0
+------------------------------------------------------------------------
+Anomalies & Threats
+Total Anomalies         : 1
+Severity  Count
+HIGH      1    
+------------------------------------------------------------------------
+Top Anomaly Types
+Type                                     Count
+Modbus Coil Force (output manipulation)  1    
+Use -v for detailed anomaly listings.
+========================================================================
+Output is summarized/truncated. Use -v to view all output.

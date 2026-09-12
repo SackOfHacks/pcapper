@@ -265,7 +265,6 @@ def merge_ftp_summaries(
     mac_addresses: dict[str, set[str]] = defaultdict(set)
 
     credential_hits: list[FtpCredential] = []
-    cleartext_cred_seen: set[tuple[str, str]] = set()
     transfers: list[FtpTransfer] = []
     detections: list[dict[str, object]] = []
     errors: list[str] = []

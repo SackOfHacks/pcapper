@@ -597,7 +597,12 @@ def _analyze_ot_commands_fast(
                 commands = [cmd]
                 dnp3_markers = protocol_markers.get("DNP3", ())
 
-                def command_gate(name: str, flag: bool = is_control) -> bool:
+                # Deliberate conditional re-bind of the `command_gate = None`
+                # declared above the branch: only a DNP3 match has a control
+                # flag to close over.
+                def command_gate(  # noqa: F811
+                    name: str, flag: bool = is_control
+                ) -> bool:
                     return flag or _is_write_command(name, dnp3_markers, base_markers)
         elif port == IEC104_PORT:
             proto = "IEC-104"
@@ -640,7 +645,12 @@ def _analyze_ot_commands_fast(
                 commands = [cmd]
                 dnp3_markers = protocol_markers.get("DNP3", ())
 
-                def command_gate(name: str, flag: bool = is_control) -> bool:
+                # Deliberate conditional re-bind of the `command_gate = None`
+                # declared above the branch: only a DNP3 match has a control
+                # flag to close over.
+                def command_gate(  # noqa: F811
+                    name: str, flag: bool = is_control
+                ) -> bool:
                     return flag or _is_write_command(name, dnp3_markers, base_markers)
             else:
                 commands = _fast_cip_commands(payload)
