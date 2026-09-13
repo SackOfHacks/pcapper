@@ -1,0 +1,22 @@
+# Dependabot alerts were disabled on this repository until 2026-09-13, so
+# nothing was watching the runtime dependencies -- which for pcapper are the
+# parsers it points at hostile input. A scapy or cryptography advisory is
+# directly in the threat model SECURITY.md describes.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  # CI pins actions by commit SHA; without this the pins never move.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
