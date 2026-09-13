@@ -1,0 +1,29 @@
+# Dependabot alerts were disabled on this repository until 2026-09-13, so
+# nothing was watching the runtime dependencies -- which for pcapper are the
+# parsers it points at hostile input. A scapy or cryptography advisory is
+# directly in the threat model SECURITY.md describes.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    # Only move a floor when the current constraint genuinely excludes the new
+    # version. The default ("increase") raises `>=` floors on every release,
+    # which for this project means proposing a bump with no security driver,
+    # touching requirements.txt alone, and dropping support for older
+    # environments that the code runs on perfectly well. Security updates still
+    # raise a floor when they have to.
+    versioning-strategy: increase-if-necessary
+
+  # CI pins actions by commit SHA; without this the pins never move.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
