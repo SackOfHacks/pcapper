@@ -111,3 +111,53 @@ class TestEverySubpackageIsDistributed:
     def test_reporting_is_declared(self) -> None:
         declared = set(_pyproject()["tool"]["setuptools"]["packages"])
         assert "pcapper.reporting" in declared
+
+
+class TestRequirementsMatchPyproject:
+    """``requirements.txt`` and ``pyproject.toml`` must list the same runtime
+    dependencies, with the same specifiers.
+
+    The header of ``requirements.txt`` has always said "Keep in sync with
+    pyproject.toml [project.dependencies]", and nothing enforced it. A
+    Dependabot PR then proposed raising ``tomli>=2.0.1`` to ``>=2.4.1`` in
+    ``requirements.txt`` alone, which would have left the two disagreeing on
+    the first line it touched -- and silently, because installs resolve from
+    ``pyproject.toml``, so the requirements floor has no effect on what a user
+    actually gets. A manual-sync comment is not a control; this is.
+    """
+
+    @staticmethod
+    def _normalise(spec: str) -> str:
+        """Compare requirement strings without whitespace or quote noise.
+
+        ``tomli>=2.0.1; python_version < "3.11"`` and the pyproject spelling of
+        the same line differ only in spacing, so neither survives into the
+        comparison.
+        """
+        return re.sub(r"\s+", "", spec).replace("'", '"')
+
+    def _requirements(self) -> set[str]:
+        out = set()
+        text = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+        for line in text.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                out.add(self._normalise(line))
+        return out
+
+    def test_the_two_manifests_agree(self) -> None:
+        declared = {self._normalise(d) for d in _pyproject()["project"]["dependencies"]}
+        listed = self._requirements()
+        only_in_requirements = listed - declared
+        only_in_pyproject = declared - listed
+        assert not (only_in_requirements or only_in_pyproject), (
+            "requirements.txt and pyproject.toml have drifted.\n"
+            f"  only in requirements.txt: {sorted(only_in_requirements)}\n"
+            f"  only in pyproject.toml:   {sorted(only_in_pyproject)}\n"
+            "Both files must be updated together -- note that installs resolve "
+            "from pyproject.toml, so a requirements-only change has no effect."
+        )
+
+    def test_requirements_is_not_empty(self) -> None:
+        """Guard the guard: an empty parse would make the test above vacuous."""
+        assert len(self._requirements()) >= 5
