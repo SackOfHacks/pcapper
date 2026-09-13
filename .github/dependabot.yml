@@ -11,6 +11,13 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps"
+    # Only move a floor when the current constraint genuinely excludes the new
+    # version. The default ("increase") raises `>=` floors on every release,
+    # which for this project means proposing a bump with no security driver,
+    # touching requirements.txt alone, and dropping support for older
+    # environments that the code runs on perfectly well. Security updates still
+    # raise a floor when they have to.
+    versioning-strategy: increase-if-necessary
 
   # CI pins actions by commit SHA; without this the pins never move.
   - package-ecosystem: github-actions
