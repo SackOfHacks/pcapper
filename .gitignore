@@ -28,9 +28,17 @@ htmlcov/
 
 # Editor / OS
 .DS_Store
+Thumbs.db
+desktop.ini
 .claude/
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
 
 # Logs
 *.log
@@ -42,6 +50,10 @@ htmlcov/
 *.pcap
 *.pcapng
 *.cap
+*.pcap.gz
+*.pcapng.gz
+*.pcap.zst
+*.pcapng.zst
 files/
 
 # ...except the synthetic test fixtures, which are committed so the suite runs
@@ -58,6 +70,27 @@ case-*/
 *.sqlite3
 *.db
 pcapper.toml
+# --voip-out decodes G.711 RTP to WAV; recovered call audio is evidence.
+*.wav
+# --csv export. No CSV is committed, so a blanket rule is safe here; JSON is
+# deliberately NOT blanket-ignored because the package ships *_mappings.json
+# and *_opcodes.json data files (see [tool.setuptools.package-data]).
+*.csv
+
+# Key material and secrets. --tls-keylog / --ssh-keylog take NSS key logs, and
+# decryption workflows tend to leave keys next to the capture being worked on.
+# Add a fixture with `git add -f` if the suite ever needs a committed cert.
+.env
+.env.*
+*.keylog
+*keylog*.txt
+sslkeys*.txt
+*.pem
+*.key
+
+# GeoIP databases (PCAPPER_GEOIP_CITY_DB / PCAPPER_GEOIP_ASN_DB) — large,
+# licensed, and redistributed by MaxMind, never by this repo.
+*.mmdb
 
 # Jupyter
 .ipynb_checkpoints/
