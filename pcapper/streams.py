@@ -6,9 +6,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .reassembly import reassemble
-from .utils import packet_length, safe_float, extract_packet_endpoints
+from .utils import (
+    env_int,
+    extract_packet_endpoints,
+    packet_length,
+    safe_float,
+    tcp_flags_int,
+    tcp_flags_text,
+)
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -22,6 +29,9 @@ except Exception:  # pragma: no cover
 
 
 STREAM_MAX_BYTES = 4 * 1024 * 1024
+# Per-direction cap above, and a cap on the total retained across *all*
+# streams: a capture with 100 k connections could otherwise hold gigabytes.
+STREAM_TOTAL_MAX_BYTES = env_int("PCAPPER_STREAM_TOTAL_MAX_BYTES", 512 * 1024 * 1024, minimum=1)
 
 
 @dataclass
@@ -157,21 +167,6 @@ def _conn_state(
     return "no-handshake"
 
 
-def _tcp_flags_text(flags: int) -> str:
-    bits = [
-        ("F", 0x01),
-        ("S", 0x02),
-        ("R", 0x04),
-        ("P", 0x08),
-        ("A", 0x10),
-        ("U", 0x20),
-        ("E", 0x40),
-        ("C", 0x80),
-    ]
-    out = "".join(label for label, bit in bits if flags & bit)
-    return out or "-"
-
-
 def _reassemble(
     segments: list[tuple[int, bytes]], max_bytes: int
 ) -> tuple[bytes, list[dict[str, int]]]:
@@ -196,7 +191,7 @@ def analyze_streams(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
     stream_id: Optional[str] = None,
     stream_search: Optional[str] = None,
     streams_full: bool = False,
@@ -225,10 +220,6 @@ def analyze_streams(
             filter_port=filter_port,
             established_only=established_only,
         )
-
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     errors: list[str] = []
     stats = defaultdict(
@@ -271,151 +262,140 @@ def analyze_streams(
         if search_term_text
         else None
     )
+    retained_bytes = 0
+    budget_exhausted = False
 
-    try:
-        for pkt in reader:
-            packet_number += 1
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        packet_number += 1
+        tcp = pkt.getlayer(TCP)  # type: ignore[arg-type]
+        if tcp is None:
+            continue
 
-            if not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                continue
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
+        if not src_ip or not dst_ip:
+            continue
 
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-            if not src_ip or not dst_ip:
-                continue
+        sport = int(getattr(tcp, "sport", 0) or 0)
+        dport = int(getattr(tcp, "dport", 0) or 0)
+        if sport == 0 or dport == 0:
+            continue
+        if filter_ip and src_ip != filter_ip and dst_ip != filter_ip:
+            continue
+        if (
+            filter_port is not None
+            and sport != filter_port
+            and dport != filter_port
+        ):
+            continue
 
-            tcp = pkt[TCP]  # type: ignore[index]
-            sport = int(getattr(tcp, "sport", 0) or 0)
-            dport = int(getattr(tcp, "dport", 0) or 0)
-            if sport == 0 or dport == 0:
-                continue
-            if filter_ip and src_ip != filter_ip and dst_ip != filter_ip:
-                continue
+        stream_key = _canonical_key(src_ip, dst_ip, sport, dport)
+        sid = stream_ids.get(stream_key)
+        if sid is None:
+            sid = _stream_id(
+                stream_key[0], stream_key[1], stream_key[2], stream_key[3]
+            )
+            stream_ids[stream_key] = sid
+        info = stats[stream_key]
+        info["packets"] += 1
+        pkt_len = packet_length(pkt)
+        info["bytes"] += pkt_len
+        if info["first_pkt"] is None:
+            info["first_pkt"] = packet_number
+        ts = safe_float(getattr(pkt, "time", None))
+        if ts is not None:
+            info["first"] = ts if info["first"] is None else min(info["first"], ts)
+            info["last"] = ts if info["last"] is None else max(info["last"], ts)
+        flags = tcp_flags_int(getattr(tcp, "flags", 0))
+        # Prefer the first SYN without ACK as stream start packet.
+        is_ab = (src_ip, sport, dst_ip, dport) == stream_key
+        direction = "ab" if is_ab else "ba"
+        if flags & 0x04:  # RST
+            info["rst_seen"] = True
+        if (flags & 0x02) and not (flags & 0x10) and info["syn_pkt"] is None:
+            info["syn_pkt"] = packet_number
+            info["syn_dir"] = direction
+        syn_dir = info.get("syn_dir")
+        if syn_dir in {"ab", "ba"}:
+            expected_synack_dir = "ba" if syn_dir == "ab" else "ab"
             if (
-                filter_port is not None
-                and sport != filter_port
-                and dport != filter_port
+                (flags & 0x02)
+                and (flags & 0x10)
+                and direction == expected_synack_dir
             ):
-                continue
+                info["synack_seen"] = True
+            if (
+                info.get("synack_seen")
+                and (flags & 0x10)
+                and not (flags & 0x02)
+                and direction == syn_dir
+            ):
+                info["established"] = True
 
-            stream_key = _canonical_key(src_ip, dst_ip, sport, dport)
-            sid = stream_ids.get(stream_key)
-            if sid is None:
-                sid = _stream_id(
-                    stream_key[0], stream_key[1], stream_key[2], stream_key[3]
-                )
-                stream_ids[stream_key] = sid
-            info = stats[stream_key]
-            info["packets"] += 1
-            pkt_len = packet_length(pkt)
-            info["bytes"] += pkt_len
-            if info["first_pkt"] is None:
-                info["first_pkt"] = packet_number
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                info["first"] = ts if info["first"] is None else min(info["first"], ts)
-                info["last"] = ts if info["last"] is None else max(info["last"], ts)
+        payload = b""
+        # A TCP segment carrying application data always exposes a Raw layer.
+        # When there is none, the segment is a pure ACK/control packet -- do
+        # NOT fall back to bytes(tcp.payload), which would pull in the
+        # Ethernet frame Padding (null bytes) Scapy attaches to short frames
+        # and corrupt the reassembled stream content.
+        raw = tcp.getlayer(Raw) if Raw is not None else None
+        if raw is not None:
             try:
-                flags = int(getattr(tcp, "flags", 0) or 0)
+                payload = bytes(raw.load)
             except Exception:
-                flags = 0
-            # Prefer the first SYN without ACK as stream start packet.
-            is_ab = (src_ip, sport, dst_ip, dport) == stream_key
-            direction = "ab" if is_ab else "ba"
-            if flags & 0x04:  # RST
-                info["rst_seen"] = True
-            if (flags & 0x02) and not (flags & 0x10) and info["syn_pkt"] is None:
-                info["syn_pkt"] = packet_number
-                info["syn_dir"] = direction
-            syn_dir = info.get("syn_dir")
-            if syn_dir in {"ab", "ba"}:
-                expected_synack_dir = "ba" if syn_dir == "ab" else "ab"
-                if (
-                    (flags & 0x02)
-                    and (flags & 0x10)
-                    and direction == expected_synack_dir
-                ):
-                    info["synack_seen"] = True
-                if (
-                    info.get("synack_seen")
-                    and (flags & 0x10)
-                    and not (flags & 0x02)
-                    and direction == syn_dir
-                ):
-                    info["established"] = True
-
-            payload = b""
-            if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                try:
-                    payload = bytes(pkt[Raw].load)  # type: ignore[index]
-                except Exception:
-                    payload = b""
-            # A TCP segment carrying application data always exposes a Raw layer.
-            # When there is none, the segment is a pure ACK/control packet -- do
-            # NOT fall back to bytes(tcp.payload), which would pull in the
-            # Ethernet frame Padding (null bytes) Scapy attaches to short frames
-            # and corrupt the reassembled stream content.
-            if payload:
-                seq = int(getattr(tcp, "seq", 0) or 0)
-                if (src_ip, sport, dst_ip, dport) == stream_key:
-                    current = segments_ab_bytes[stream_key]
-                    if current < STREAM_MAX_BYTES:
-                        remaining = STREAM_MAX_BYTES - current
-                        if remaining <= 0:
-                            continue
-                        if len(payload) > remaining:
-                            payload = payload[:remaining]
-                        segments_ab[stream_key].append((seq, payload))
-                        segments_ab_bytes[stream_key] += len(payload)
-                else:
-                    current = segments_ba_bytes[stream_key]
-                    if current < STREAM_MAX_BYTES:
-                        remaining = STREAM_MAX_BYTES - current
-                        if remaining <= 0:
-                            continue
-                        if len(payload) > remaining:
-                            payload = payload[:remaining]
-                        segments_ba[stream_key].append((seq, payload))
-                        segments_ba_bytes[stream_key] += len(payload)
-            if target_followed_id and sid == target_followed_id:
-                try:
-                    seq_value = int(getattr(tcp, "seq", 0) or 0)
-                except Exception:
-                    seq_value = 0
-                try:
-                    ack_value = int(getattr(tcp, "ack", 0) or 0)
-                except Exception:
-                    ack_value = 0
-                try:
-                    window_value = int(getattr(tcp, "window", 0) or 0)
-                except Exception:
-                    window_value = 0
-                followed_packets.append(
-                    StreamPacketDetail(
-                        packet_number=packet_number,
-                        ts=ts,
-                        direction="A->B" if direction == "ab" else "B->A",
-                        src=src_ip,
-                        dst=dst_ip,
-                        src_port=sport,
-                        dst_port=dport,
-                        flags=_tcp_flags_text(flags),
-                        seq=seq_value,
-                        ack=ack_value,
-                        window=window_value,
-                        packet_bytes=pkt_len,
-                        payload_bytes=len(payload),
-                    )
+                payload = b""
+        if payload and not budget_exhausted:
+            seq = int(getattr(tcp, "seq", 0) or 0)
+            if is_ab:
+                seg_list, seg_bytes = segments_ab, segments_ab_bytes
+            else:
+                seg_list, seg_bytes = segments_ba, segments_ba_bytes
+            current = seg_bytes[stream_key]
+            remaining = min(
+                STREAM_MAX_BYTES - current,
+                STREAM_TOTAL_MAX_BYTES - retained_bytes,
+            )
+            if remaining > 0:
+                chunk = payload[:remaining] if len(payload) > remaining else payload
+                seg_list[stream_key].append((seq, chunk))
+                seg_bytes[stream_key] += len(chunk)
+                retained_bytes += len(chunk)
+            if retained_bytes >= STREAM_TOTAL_MAX_BYTES:
+                budget_exhausted = True
+                errors.append(
+                    f"Stream reassembly budget of {STREAM_TOTAL_MAX_BYTES} bytes "
+                    f"reached at packet {packet_number}; later payload was "
+                    "counted but not retained (PCAPPER_STREAM_TOTAL_MAX_BYTES)."
                 )
-
-    finally:
-        status.finish()
-        reader.close()
+        if target_followed_id and sid == target_followed_id:
+            try:
+                seq_value = int(getattr(tcp, "seq", 0) or 0)
+            except Exception:
+                seq_value = 0
+            try:
+                ack_value = int(getattr(tcp, "ack", 0) or 0)
+            except Exception:
+                ack_value = 0
+            try:
+                window_value = int(getattr(tcp, "window", 0) or 0)
+            except Exception:
+                window_value = 0
+            followed_packets.append(
+                StreamPacketDetail(
+                    packet_number=packet_number,
+                    ts=ts,
+                    direction="A->B" if direction == "ab" else "B->A",
+                    src=src_ip,
+                    dst=dst_ip,
+                    src_port=sport,
+                    dst_port=dport,
+                    flags=tcp_flags_text(flags),
+                    seq=seq_value,
+                    ack=ack_value,
+                    window=window_value,
+                    packet_bytes=pkt_len,
+                    payload_bytes=len(payload),
+                )
+            )
 
     observed_streams = len(stats)
     records: list[StreamRecord] = []

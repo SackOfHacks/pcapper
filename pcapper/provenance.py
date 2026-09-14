@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+from .pcap_cache import capture_hashes
 
 
 @dataclass(frozen=True)
@@ -35,14 +36,6 @@ class CaseMetadata:
         }
 
 
-def _hash_file(path: Path, algo: str = "sha256") -> str:
-    hasher = hashlib.new(algo)
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
 def build_case_metadata(
     *,
     case_id: str,
@@ -59,18 +52,24 @@ def build_case_metadata(
     for item in inputs:
         try:
             stat = item.stat()
-            inputs_meta.append(
-                {
-                    "path": str(item),
-                    "size_bytes": int(stat.st_size),
-                    "modified_time": datetime.fromtimestamp(
-                        stat.st_mtime, tz=timezone.utc
-                    ).isoformat(),
-                    "sha256": _hash_file(item),
-                }
-            )
-        except Exception:
+        except OSError:
+            inputs_meta.append({"path": str(item), "error": "stat_failed"})
+            continue
+        sha256, sha1 = capture_hashes(item)
+        if sha256 is None:
             inputs_meta.append({"path": str(item), "error": "hash_failed"})
+            continue
+        inputs_meta.append(
+            {
+                "path": str(item),
+                "size_bytes": int(stat.st_size),
+                "modified_time": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ).isoformat(),
+                "sha256": sha256,
+                "sha1": sha1,
+            }
+        )
 
     duration = (end_time - start_time).total_seconds()
     return CaseMetadata(

@@ -1,4 +1,4 @@
-# Runtime dependencies for pcapper v2.3.0 (alphabetical; Scapy required for deep protocol analysis).
+# Runtime dependencies for pcapper v2.4.0 (alphabetical; Scapy required for deep protocol analysis).
 # Keep in sync with pyproject.toml [project.dependencies].
 cryptography>=42.0.0          # TLS/certificate parsing (JA3/JA4, cert IOCs)
 dpkt>=1.9.8                   # fast HTTP/file-carving fallback path
@@ -6,3 +6,7 @@ geoip2>=4.7.0                 # optional IP geolocation enrichment
 pydicom>=2.4.4                # DICOM (medical-device) artifact parsing
 scapy>=2.5.0                  # core packet dissection (required)
 tomli>=2.0.1; python_version < "3.11"   # TOML config loader on Python < 3.11
+#
+# Development (tests, lint): `pip install -e .[dev]` pulls pytest, pytest-cov and ruff.
+# Optional at runtime: tshark on PATH for --decrypt, suricata for --suricata,
+# Npcap/libpcap for --bpf. None are Python packages, so none are listed here.

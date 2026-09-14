@@ -147,11 +147,21 @@ You can provide enriched IOC metadata via JSON.
 ## Configuration
 
 Pcapper can load default flag values from a TOML config file. Lookup order:
-- `./pcapper.toml`
+- `--config PATH` on the command line
+- `PCAPPER_CONFIG` in the environment
 - `~/.pcapper.toml`
 - `~/.config/pcapper/config.toml`
 
-You can also supply `--config PATH` or set `PCAPPER_CONFIG` to override the location.
+A `pcapper.toml` in the **current directory is not loaded automatically**.
+pcapper is often run from inside an evidence directory, and a config planted
+there could enable outbound VirusTotal/ip-api lookups or redirect output paths
+without any sign on the command line. Pass it explicitly with `--config` if
+that is what you want.
+
+Whenever a config is applied, pcapper prints `Config: <path>` to stderr, lists
+any keys that match no option, and prints a notice for any key that enables
+network egress (`vt`, `ip_geo`). A config that exists but cannot be parsed is
+an error (exit 2), not a silent fallback to defaults.
 
 Example:
 
@@ -164,7 +174,8 @@ log_file = "pcapper.log"
 log_json = true
 ```
 
-Config keys match argparse dest names (use underscores, not dashes).
+Config keys match argparse dest names (use underscores, not dashes). Options
+given on the command line always take precedence over the config.
 
 ## Logging
 
@@ -493,5 +504,11 @@ mistaken for media).
 - Output ordering is deterministic by default; set `PCAPPER_DETERMINISTIC=0` to restore Python's default Counter tie ordering.
 - Use `--self-check` for a quick dependency and environment check, and `--list-plugins` to inspect loaded plugins.
 - Chained steps (e.g. `--ssh --tls --dns`) parse the capture once and share the packet list across all analyzers. Captures are held in memory when they fit the cache budget (default 256 MB total / 64 MB per file; chained runs raise the per-file limit to the total budget). For larger captures, raise the budget with `--cache-mb` (e.g. `--cache-mb 1024`) so multi-step runs avoid re-parsing the file per step — parsed packets occupy roughly 5–10x the file size in RAM. Env equivalents: `PCAPPER_CACHE_MAX_BYTES`, `PCAPPER_CACHE_FILE_MAX_BYTES`, `PCAPPER_CACHE_ENABLED=0`.
-- Analyzers invoked multiple times in one run (top-level step plus internal fan-out from `--threats`, `--overview`, `--hostdetails`, `--ips`, `--files`) are computed once and replayed from an in-memory result cache. Disable with `PCAPPER_ANALYSIS_MEMO=0`.
+- Analyzers invoked multiple times in one run (top-level step plus internal fan-out from `--threats`, `--overview`, `--hostdetails`, `--ips`, `--files`) are computed once and replayed from an in-memory result cache. Disable with `PCAPPER_ANALYSIS_MEMO=0`. The cached object is shared, not copied, on a replay (results are immutable by contract); set `PCAPPER_ANALYSIS_MEMO_COPY=1` to restore deep copies.
+- **Roles.** In every per-protocol view the *client* is the end that talks to the service port and the *server* is the end that holds it, regardless of which way a given packet travels. A service port on the source side only identifies the service when the destination is an ephemeral port (>= 1024), so a flow from ephemeral 389 to 443 is not LDAP.
+- **Windows.** `First Seen` / `Last Seen` / `Duration` in a per-protocol view span that protocol's packets, not the whole capture; the capture-wide window is in the base summary and `--health`. Per-second rates in a protocol view are computed over the protocol window.
+- **Segment lengths** come from the IP/TCP headers, so the padding of a 60-byte minimum Ethernet frame is never read as payload (a padded pure ACK is 0 bytes of data, not 6).
+- `--decode` bounds every decompressor (gzip, zlib, bzip2, xz) at 32 MiB of output.
+- `--decrypt` bounds every tshark call at 120 s; override with `PCAPPER_TSHARK_TIMEOUT`.
+- A target whose extension says capture but whose magic does not (a gzip-compressed or renamed file) is rejected with exit code 2 rather than read as an empty capture.
 

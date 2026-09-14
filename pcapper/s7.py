@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
 from .equipment import equipment_artifacts
 from .industrial_helpers import (
+    cleared_analysis,
     append_public_exposure_anomaly,
     IndustrialAnalysis,
     IndustrialAnomaly,
     analyze_port_protocol,
     default_artifacts,
 )
+from .utils import format_ts, memoize_analysis
 
 S7_PORT = 102
 
@@ -904,27 +905,6 @@ def _canonical_command_name(command: str) -> str:
     return command
 
 
-def _clear_low_confidence(analysis: IndustrialAnalysis) -> IndustrialAnalysis:
-    analysis.protocol_packets = 0
-    analysis.protocol_bytes = 0
-    analysis.requests = 0
-    analysis.responses = 0
-    analysis.src_ips.clear()
-    analysis.dst_ips.clear()
-    analysis.client_ips.clear()
-    analysis.server_ips.clear()
-    analysis.sessions.clear()
-    analysis.ports.clear()
-    analysis.commands.clear()
-    analysis.service_endpoints.clear()
-    analysis.packet_size_buckets = []
-    analysis.payload_size_buckets = []
-    analysis.command_events = []
-    analysis.artifacts = []
-    analysis.anomalies = []
-    return analysis
-
-
 def _rollup_anomalies(anomalies: list[IndustrialAnomaly]) -> list[IndustrialAnomaly]:
     if not anomalies:
         return []
@@ -968,7 +948,7 @@ def _rollup_anomalies(anomalies: list[IndustrialAnomaly]) -> list[IndustrialAnom
         if count > 1:
             desc = (
                 f"{description} "
-                f"Observed {count} times from {_fmt_ts(first)} to {_fmt_ts(last)} "
+                f"Observed {count} times from {_s7_ts(first)} to {_s7_ts(last)} "
                 f"across {len(targets)} target(s)."
             )
         rolled.append(
@@ -994,11 +974,12 @@ def _rollup_anomalies(anomalies: list[IndustrialAnomaly]) -> list[IndustrialAnom
     return rolled + passthrough
 
 
-def _fmt_ts(ts: float) -> str:
+def _s7_ts(ts: float) -> str:
+    """``utils.format_ts`` with the S7 view's "n/a" for an unset timestamp."""
     if ts <= 0:
         return "n/a"
     try:
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        return format_ts(ts)
     except Exception:
         return "n/a"
 
@@ -1008,6 +989,7 @@ def _parse_commands(payload: bytes) -> list[str]:
     return _S7State().parse_commands(payload)
 
 
+@memoize_analysis
 def analyze_s7(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     state = _S7State()
     analysis = analyze_port_protocol(
@@ -1030,7 +1012,7 @@ def analyze_s7(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         for a in analysis.anomalies
     )
     if not _has_high_anomaly and state.is_low_confidence(analysis):
-        return _clear_low_confidence(analysis)
+        return cleared_analysis(analysis)
 
     analysis.anomalies = _rollup_anomalies(analysis.anomalies)
 

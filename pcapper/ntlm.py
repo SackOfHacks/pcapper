@@ -14,7 +14,7 @@ try:
 except ImportError:
     TCP = UDP = Raw = None
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 from .utils import is_public_ip as _is_public_ip
 
@@ -149,6 +149,13 @@ def _append_ntlm_artifact(
 
 
 # --- Constants ---
+
+# Carrier services, keyed by the server-side port. The challenge (Type 2)
+# travels server->client, so the service is whichever end holds a known port.
+_NTLM_SERVICE_PORTS = {
+    445: "SMB", 139: "SMB", 80: "HTTP", 8080: "HTTP", 8000: "HTTP",
+    389: "LDAP", 636: "LDAP", 5985: "WinRM", 5986: "WinRM",
+}
 
 NTLM_SIG = b"NTLMSSP\x00"
 
@@ -478,7 +485,12 @@ def _build_netntlm_hash(
 
 
 @memoize_analysis
-def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
+def analyze_ntlm(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> NtlmAnalysis:
     if TCP is None:
         return NtlmAnalysis(
             path,
@@ -494,26 +506,6 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
             ["Scapy unavailable"],
         )
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as exc:
-        return NtlmAnalysis(
-            path,
-            0.0,
-            0,
-            0,
-            Counter(),
-            Counter(),
-            Counter(),
-            Counter(),
-            [],
-            [],
-            [f"Error: {exc}"],
-        )
-
-    size_bytes = size_bytes
 
     total_packets = 0
     ntlm_packets = 0
@@ -554,20 +546,9 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
     last_time = None
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", 0))
-            if start_time is None:
-                start_time = ts
-            last_time = ts
 
             # Look for the NTLMSSP signature in the L4 payload. Using the TCP/UDP
             # payload (not just pkt[Raw]) is essential: when NTLM rides a carrier
@@ -597,6 +578,12 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                 ntlm_data = payload[idx:]
 
             ntlm_packets += 1
+            # The report window spans NTLM traffic, not every packet in scope.
+            if ts is not None:
+                if start_time is None or ts < start_time:
+                    start_time = ts
+                if last_time is None or ts > last_time:
+                    last_time = ts
 
             if len(ntlm_data) < 12:
                 continue
@@ -623,14 +610,10 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
                 src_counts[src] += 1
                 dst_counts[dst] += 1
 
-                if dport in (445, 139):
-                    services["SMB"] += 1
-                elif dport in (80, 8080, 8000):
-                    services["HTTP"] += 1
-                elif dport in (389, 636):
-                    services["LDAP"] += 1
-                elif dport in (5985, 5986):
-                    services["WinRM"] += 1
+                service_port = dport if dport in _NTLM_SERVICE_PORTS else sport
+                service = _NTLM_SERVICE_PORTS.get(int(service_port))
+                if service:
+                    services[service] += 1
 
                 smb2_msg, smb2_sess = _parse_smb2_ids(payload)
                 smb1_uid, smb1_mid = _parse_smb1_ids(payload)
@@ -851,9 +834,6 @@ def analyze_ntlm(path: Path, show_status: bool = True) -> NtlmAnalysis:
 
     except Exception as e:
         errors.append(str(e))
-    finally:
-        status.finish()
-        reader.close()
 
     duration = 0.0
     if start_time and last_time:

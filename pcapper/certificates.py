@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 import logging
 import warnings
 from collections import Counter
@@ -9,8 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, memoize_analysis
 
 try:
     from scapy import error as scapy_error  # type: ignore
@@ -130,14 +129,42 @@ class CertificateSummary:
     errors: list[str] = field(default_factory=list)
 
 
-def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSummary:
-    errors: list[str] = []
+_SCAPY_TLS_QUIETED = False
+
+
+def _quiet_scapy_tls() -> None:
+    """Silence scapy's per-record TLS warnings once per process.
+
+    ``warnings.filterwarnings`` appends to the global filter list, so calling
+    it on every analysis (each ``--tls`` also runs this) grew the list.
+    """
+    global _SCAPY_TLS_QUIETED
+    if _SCAPY_TLS_QUIETED:
+        return
+    _SCAPY_TLS_QUIETED = True
     warnings.filterwarnings("ignore", message=r".*Unknown cipher suite.*")
-    warnings.filterwarnings(
-        "ignore", message=r".*serial number which wasn't positive.*"
-    )
+    warnings.filterwarnings("ignore", message=r".*serial number which wasn't positive.*")
     logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
     logging.getLogger("scapy.layers.tls").setLevel(logging.ERROR)
+
+
+def _is_tls_record_start(payload: bytes) -> bool:
+    return (
+        len(payload) >= 5
+        and payload[0] in (20, 21, 22, 23)
+        and payload[1] == 0x03
+    )
+
+
+@memoize_analysis
+def analyze_certificates(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> CertificateSummary:
+    errors: list[str] = []
+    _quiet_scapy_tls()
     prev_verb = None
     prev_warning = None
     if conf is not None:
@@ -189,10 +216,6 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
             timeline=[],
             errors=errors,
         )
-
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
 
     total_packets = 0
     tls_packets = 0
@@ -304,6 +327,8 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
         return certs, idx
 
     def _handle_cert_bytes(raw_cert: bytes, src_ip: str, dst_ip: str) -> None:
+        # The Certificate message travels server -> client: src_ip is the
+        # service presenting the certificate, dst_ip the client that saw it.
         der_cert = _extract_der_cert(raw_cert)
         if der_cert is None:
             return
@@ -344,9 +369,11 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
         pubkey_type = pubkey.__class__.__name__
         pubkey_size = getattr(pubkey, "key_size", 0) or 0
         san_list = []
+        san_ips: list[str] = []
         try:
             san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
             san_list = san.value.get_values_for_type(x509.DNSName)
+            san_ips = [str(ip) for ip in san.value.get_values_for_type(x509.IPAddress)]
         except Exception:
             san_list = []
         san_text = ", ".join(san_list) if san_list else "-"
@@ -544,20 +571,21 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
                 }
             )
 
-        if san_list:
-            if dst_ip not in san_list:
-                try:
-                    ipaddress.ip_address(dst_ip)
-                    name_mismatches.append(
-                        {
-                            "subject": subject,
-                            "reason": "dst_ip_not_in_san",
-                            "dst": dst_ip,
-                            "src": src_ip,
-                        }
-                    )
-                except Exception:
-                    pass
+        if san_list or san_ips:
+            # Only an IP-address SAN can be checked against the wire: the
+            # DNS names are matched by the client against the SNI, which the
+            # Certificate message does not carry. The old check compared the
+            # *client* IP with the DNS SANs and so flagged every certificate.
+            if san_ips and src_ip not in san_ips:
+                name_mismatches.append(
+                    {
+                        "subject": subject,
+                        "reason": "server_ip_not_in_san",
+                        "san_ips": ", ".join(san_ips[:4]),
+                        "dst": dst_ip,
+                        "src": src_ip,
+                    }
+                )
         elif not is_ca_cert:
             name_mismatches.append(
                 {
@@ -655,24 +683,33 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
         )
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
-            if TLS is not None and pkt.haslayer(TLS):
+            tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
+            tls_layer = pkt.getlayer(TLS) if TLS is not None else None
+            payload: bytes | None = None
+            if tcp_layer is not None:
+                raw_layer = tcp_layer.getlayer(Raw) if Raw is not None else None
+                if raw_layer is not None:
+                    payload = bytes(raw_layer)
+                else:
+                    try:
+                        payload = bytes(tcp_layer.payload)
+                    except Exception:
+                        payload = None
+            # Count a packet as TLS whether scapy dissected it (port 443) or
+            # the record header says so on any port — the raw reassembly path
+            # below is what actually yields certificates off non-443 ports.
+            tls_on_wire = payload is not None and _is_tls_record_start(payload)
+            if tls_layer is not None or tls_on_wire:
                 tls_packets += 1
 
             cert_payloads: list[object] = []
-            if TLSCertificate is not None and pkt.haslayer(TLSCertificate):
-                cert_payloads.append(pkt[TLSCertificate])  # type: ignore[index]
-            if TLS is not None and pkt.haslayer(TLS):
-                tls_layer = pkt[TLS]  # type: ignore[index]
+            if TLSCertificate is not None:
+                cert_layer = pkt.getlayer(TLSCertificate)
+                if cert_layer is not None:
+                    cert_payloads.append(cert_layer)
+            if tls_layer is not None:
                 for attr in (
                     "msg",
                     "msglist",
@@ -690,15 +727,15 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
                         cert_payloads.extend(value)
                     else:
                         cert_payloads.append(value)
-            if not cert_payloads:
+            if not cert_payloads and not tls_on_wire:
                 continue
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             src_ip = src_ip or "0.0.0.0"
             dst_ip = dst_ip or "0.0.0.0"
 
-            for payload in cert_payloads:
-                for cert_bytes in _collect_cert_items(payload):
+            for cert_payload in cert_payloads:
+                for cert_bytes in _collect_cert_items(cert_payload):
                     try:
                         if isinstance(cert_bytes, (bytes, bytearray)):
                             raw_cert = bytes(cert_bytes)
@@ -741,40 +778,23 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
                         errors.append(exc_text)
                         continue
 
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                tcp_layer = pkt[TCP]  # type: ignore[index]
-                payload = None
-                if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                    payload = bytes(pkt[Raw])  # type: ignore[index]
-                else:
-                    try:
-                        payload = bytes(tcp_layer.payload)
-                    except Exception:
-                        payload = None
-                if (
-                    payload
-                    and len(payload) >= 5
-                    and payload[0] in (20, 21, 22, 23)
-                    and payload[1] == 0x03
-                ):
-                    flow_key = (
-                        src_ip,
-                        dst_ip,
-                        int(getattr(tcp_layer, "sport", 0)),
-                        int(getattr(tcp_layer, "dport", 0)),
-                    )
-                    buf = tls_buffers.setdefault(flow_key, bytearray())
-                    buf.extend(payload)
-                    certs, consumed = _parse_tls_from_buffer(buf)
-                    if consumed > 0:
-                        del buf[:consumed]
-                    if len(buf) > 1_000_000:
-                        del buf[:-1_000_000]
-                    for cert_bytes in certs:
-                        _handle_cert_bytes(cert_bytes, src_ip, dst_ip)
+            if tls_on_wire and tcp_layer is not None and payload:
+                flow_key = (
+                    src_ip,
+                    dst_ip,
+                    int(getattr(tcp_layer, "sport", 0)),
+                    int(getattr(tcp_layer, "dport", 0)),
+                )
+                buf = tls_buffers.setdefault(flow_key, bytearray())
+                buf.extend(payload)
+                certs, consumed = _parse_tls_from_buffer(buf)
+                if consumed > 0:
+                    del buf[:consumed]
+                if len(buf) > 1_000_000:
+                    del buf[:-1_000_000]
+                for cert_bytes in certs:
+                    _handle_cert_bytes(cert_bytes, src_ip, dst_ip)
     finally:
-        status.finish()
-        reader.close()
         if conf is not None and prev_verb is not None:
             try:
                 conf.verb = prev_verb
@@ -808,9 +828,11 @@ def analyze_certificates(path: Path, show_status: bool = True) -> CertificateSum
                 }
             )
 
+    # Profiles are per *presenting* endpoint: src_ip of the Certificate
+    # message is the service, dst_ip the client that received it.
     endpoint_profiles_map: dict[str, dict[str, object]] = {}
     for cert in artifacts:
-        endpoint = str(cert.dst_ip)
+        endpoint = str(cert.src_ip)
         profile = endpoint_profiles_map.setdefault(
             endpoint,
             {

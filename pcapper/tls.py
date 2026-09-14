@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-from .utils import shannon_entropy as _shannon_entropy, packet_length
 import hashlib
-import ipaddress
 import os
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from .certificates import CertificateInfo, analyze_certificates, is_weak_pubkey
-from .dns import _vt_lookup_domains
+from .dns import _vt_lookup_domains, vt_lookup_candidate
 from .http import analyze_http
-from .pcap_cache import get_reader
+from .pcap_cache import iter_packets
 from .progress import run_with_busy_status
 from .tls_fingerprints import (
     ALPN_EXT_TYPE,
@@ -31,7 +29,15 @@ from .tls_fingerprints import (
     _tls_extension_type,
     lookup_ja3_intel,
 )
-from .utils import decode_payload, extract_packet_endpoints, memoize_analysis, safe_float
+from .utils import (
+    decode_payload,
+    extract_packet_endpoints,
+    is_valid_ip,
+    memoize_analysis,
+    packet_length,
+    safe_float,
+    shannon_entropy,
+)
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -112,6 +118,31 @@ BRAND_KEYWORDS = (
     "github",
     "office365",
 )
+_TLS_VERSION_LABELS = {
+    0x0002: "SSLv2",
+    0x0200: "SSLv2",
+    0x0300: "SSLv3",
+    0x0301: "TLS1.0",
+    0x0302: "TLS1.1",
+    0x0303: "TLS1.2",
+    0x0304: "TLS1.3",
+    0xFEFF: "DTLS1.0",
+    0xFEFD: "DTLS1.2",
+    0xFEFC: "DTLS1.3",
+}
+_JA4_VERSION_CODES = {
+    0x0304: "13",
+    0x0303: "12",
+    0x0302: "11",
+    0x0301: "10",
+    0x0300: "s3",
+    0x0200: "s2",
+    0x0002: "s2",
+    0xFEFF: "d1",
+    0xFEFD: "d2",
+    0xFEFC: "d3",
+}
+LEGACY_TLS_VERSIONS = frozenset({"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"})
 
 
 @dataclass(frozen=True)
@@ -424,19 +455,7 @@ def _tls_version_label(value: object) -> str:
         ver = int(value)
     except Exception:
         return str(value)
-    mapping = {
-        0x0002: "SSLv2",
-        0x0200: "SSLv2",
-        0x0300: "SSLv3",
-        0x0301: "TLS1.0",
-        0x0302: "TLS1.1",
-        0x0303: "TLS1.2",
-        0x0304: "TLS1.3",
-        0xFEFF: "DTLS1.0",
-        0xFEFD: "DTLS1.2",
-        0xFEFC: "DTLS1.3",
-    }
-    return mapping.get(ver, f"0x{ver:04x}")
+    return _TLS_VERSION_LABELS.get(ver, f"0x{ver:04x}")
 
 
 def _looks_like_tls_record(payload: bytes) -> bool:
@@ -667,21 +686,9 @@ def _ja4s_from_raw_server_hello(
 
 
 def _tls_fingerprints_version_code(version: Optional[int]) -> str:
-    mapping = {
-        0x0304: "13",
-        0x0303: "12",
-        0x0302: "11",
-        0x0301: "10",
-        0x0300: "s3",
-        0x0200: "s2",
-        0x0002: "s2",
-        0xFEFF: "d1",
-        0xFEFD: "d2",
-        0xFEFC: "d3",
-    }
     if version is None:
         return "00"
-    return mapping.get(version, "00")
+    return _JA4_VERSION_CODES.get(version, "00")
 
 
 def _parse_raw_client_hello(payload: bytes) -> Optional[_RawClientHello]:
@@ -849,14 +856,6 @@ def _ssl2_handshake_type(payload: bytes) -> Optional[int]:
     return int(payload[2])
 
 
-def _is_ip_literal(value: str) -> bool:
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except Exception:
-        return False
-
-
 def _parse_iso_ts(value: str) -> Optional[datetime]:
     if not value:
         return None
@@ -961,10 +960,6 @@ def analyze_tls(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
-
     total_packets = 0
     tls_packets = 0
     tls_like_packets = 0
@@ -1068,7 +1063,7 @@ def analyze_tls(
         convo["client_hellos"] = int(convo.get("client_hellos", 0) or 0) + 1
         versions[version_label] += 1
         _get_convo_counter(convo, "versions")[version_label] += 1
-        if version_label in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
+        if version_label in LEGACY_TLS_VERSIONS:
             legacy_version_servers[version_label][server] += 1
         if sni_val:
             sni_counts[sni_val] += 1
@@ -1079,7 +1074,7 @@ def analyze_tls(
             sni_to_servers[sni_val][server_endpoint] += 1
             if convo.get("sni") is None:
                 convo["sni"] = sni_val
-            if _is_ip_literal(sni_val):
+            if is_valid_ip(sni_val):
                 sni_ip_literals.add(sni_val)
         else:
             client_missing_sni[client] += 1
@@ -1132,7 +1127,7 @@ def analyze_tls(
         convo["server_hellos"] = int(convo.get("server_hellos", 0) or 0) + 1
         versions[version_label] += 1
         _get_convo_counter(convo, "versions")[version_label] += 1
-        if version_label in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
+        if version_label in LEGACY_TLS_VERSIONS:
             legacy_version_servers[version_label][server] += 1
         if cipher is not None:
             cipher_name = _cipher_label(cipher)
@@ -1148,32 +1143,19 @@ def analyze_tls(
             server_endpoint_ja4s_counts[server_endpoint][ja4s] += 1
             _get_convo_counter(convo, "ja4s")[ja4s] += 1
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
-            total_packets += 1
+    skipped_packets = 0
+    first_skip_error: str | None = None
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        if TCP is None:
+            continue
+        tcp_layer = pkt.getlayer(TCP)  # type: ignore[arg-type]
+        if tcp_layer is None:
+            continue
+        try:
             pkt_len = packet_length(pkt)
             ts = safe_float(getattr(pkt, "time", None))
-
             src_ip, dst_ip = extract_packet_endpoints(pkt)
-
-            if src_ip and dst_ip and ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
-
-            if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                continue
-
-            tcp_layer = pkt[TCP]  # type: ignore[index]
             sport = int(getattr(tcp_layer, "sport", 0))
             dport = int(getattr(tcp_layer, "dport", 0))
             payload = bytes(getattr(tcp_layer, "payload", b""))
@@ -1206,13 +1188,11 @@ def analyze_tls(
                 ):
                     continue
 
-            is_tls_layer = TLS is not None and pkt.haslayer(TLS)  # type: ignore[truthy-bool]
-            has_scapy_client_hello = (
-                TLSClientHello is not None and pkt.haslayer(TLSClientHello)
-            )
-            has_scapy_server_hello = (
-                TLSServerHello is not None and pkt.haslayer(TLSServerHello)
-            )
+            is_tls_layer = TLS is not None and pkt.getlayer(TLS) is not None
+            client_hello = pkt.getlayer(TLSClientHello) if TLSClientHello is not None else None
+            server_hello = pkt.getlayer(TLSServerHello) if TLSServerHello is not None else None
+            has_scapy_client_hello = client_hello is not None
+            has_scapy_server_hello = server_hello is not None
             is_tls_like_record = _looks_like_tls_record(payload)
             is_ssl2_like_record = _looks_like_ssl2_record(payload)
             is_tls_like = is_tls_like_record or is_ssl2_like_record
@@ -1242,6 +1222,12 @@ def analyze_tls(
             tls_like_packets += 1
             if is_tls_layer or is_tls_handshake:
                 tls_packets += 1
+            # The report window spans TLS traffic, not every packet in scope.
+            if ts is not None:
+                if first_seen is None or ts < first_seen:
+                    first_seen = ts
+                if last_seen is None or ts > last_seen:
+                    last_seen = ts
 
             handshake_type = None
             if is_tls_like and not (dport in TLS_PORTS or sport in TLS_PORTS):
@@ -1304,11 +1290,10 @@ def analyze_tls(
                     convo_versions = convo.get("versions")
                     if isinstance(convo_versions, Counter):
                         convo_versions[record_version] += 1
-                    if record_version in {"SSLv2", "SSLv3", "TLS1.0", "TLS1.1"}:
+                    if record_version in LEGACY_TLS_VERSIONS:
                         legacy_version_servers[record_version][server] += 1
 
-            if TLSClientHello is not None and pkt.haslayer(TLSClientHello):  # type: ignore[truthy-bool]
-                client_hello = pkt[TLSClientHello]  # type: ignore[index]
+            if client_hello is not None:
                 client_ver = _tls_version_label(
                     _resolve_negotiated_version(
                         client_hello, getattr(client_hello, "version", "?")
@@ -1364,8 +1349,7 @@ def analyze_tls(
                     ja4=raw_client_hello.ja4,
                 )
 
-            if TLSServerHello is not None and pkt.haslayer(TLSServerHello):  # type: ignore[truthy-bool]
-                server_hello = pkt[TLSServerHello]  # type: ignore[index]
+            if server_hello is not None:
                 server_ver = _tls_version_label(
                     _resolve_negotiated_version(
                         server_hello, getattr(server_hello, "version", "?")
@@ -1400,12 +1384,16 @@ def analyze_tls(
                     alpn_vals=list(raw_server_hello.alpn),
                     ja4s=raw_server_hello.ja4s,
                 )
+        except Exception as exc:  # noqa: BLE001 — one malformed record must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
 
-    except Exception as exc:
-        errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} TCP packet(s) skipped after a TLS parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -1468,13 +1456,38 @@ def analyze_tls(
         port_filter=port_filter_value,
         search_query=search_token or None,
     )
-    cert_summary = _busy("Certificates", analyze_certificates, path, show_status=False)
+    cert_summary = _busy(
+        "Certificates",
+        analyze_certificates,
+        path,
+        show_status=False,
+        packets=packets,
+        meta=meta,
+    )
     allowed_tls_ips = {
         ip
         for conv in conversation_rows
         for ip in (conv.client_ip, conv.server_ip)
         if str(ip).strip()
     }
+
+    # The Certificate message carries no SNI; attribute one from the client
+    # hellos of the same (client, server) pair when they agree on a single
+    # name. Ambiguous pairs (a CDN edge serving many names) stay unattributed
+    # rather than guessed. The memoized cert summary is shared, so certs are
+    # replaced, never mutated.
+    pair_sni: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for conv in conversation_rows:
+        if conv.sni:
+            pair_sni[(conv.client_ip, conv.server_ip)].add(conv.sni)
+
+    def _with_sni(cert: CertificateInfo) -> CertificateInfo:
+        if cert.sni:
+            return cert
+        names = pair_sni.get((cert.dst_ip, cert.src_ip))
+        if names and len(names) == 1:
+            return replace(cert, sni=next(iter(names)))
+        return cert
 
     def _cert_matches_filters(cert: CertificateInfo) -> bool:
         if target_ip_value and target_ip_value not in {cert.src_ip, cert.dst_ip}:
@@ -1519,31 +1532,18 @@ def analyze_tls(
         return True
 
     filtered_cert_artifacts = [
-        cert for cert in cert_summary.artifacts if _cert_matches_filters(cert)
+        cert
+        for cert in (_with_sni(cert) for cert in cert_summary.artifacts)
+        if _cert_matches_filters(cert)
     ]
     cert_subjects: Counter[str] = Counter(cert.subject for cert in filtered_cert_artifacts)
     cert_issuers: Counter[str] = Counter(cert.issuer for cert in filtered_cert_artifacts)
     cert_sans: Counter[str] = Counter(cert.san for cert in filtered_cert_artifacts)
     cert_count = len(filtered_cert_artifacts)
-    weak_certs = sum(
-        1
-        for cert in filtered_cert_artifacts
-        if is_weak_pubkey(
-            str(getattr(cert, "pubkey_type", "")),
-            int(getattr(cert, "pubkey_size", 0) or 0),
-        )
-    )
-    expired_certs = 0
-    self_signed_certs = 0
-    for cert in filtered_cert_artifacts:
-        if str(cert.subject or "").strip() and str(cert.subject) == str(cert.issuer):
-            self_signed_certs += 1
-        end_dt = _parse_iso_ts(cert.not_after)
-        if end_dt is not None and end_dt < datetime.now(timezone.utc):
-            expired_certs += 1
 
     def _cert_endpoint_marker(cert: CertificateInfo) -> str:
-        host = str(cert.sni or "").strip() or str(cert.dst_ip or "").strip() or "-"
+        # src_ip is the service that presented the certificate.
+        host = str(cert.sni or "").strip() or str(cert.src_ip or "").strip() or "-"
         flow = f"{cert.src_ip}->{cert.dst_ip}"
         return f"{host} [{flow}]"
 
@@ -1553,16 +1553,16 @@ def analyze_tls(
     now_dt = datetime.now(timezone.utc)
     for cert in filtered_cert_artifacts:
         marker = _cert_endpoint_marker(cert)
-        if is_weak_pubkey(
-            str(getattr(cert, "pubkey_type", "")),
-            int(getattr(cert, "pubkey_size", 0) or 0),
-        ):
+        if is_weak_pubkey(str(cert.pubkey_type or ""), int(cert.pubkey_size or 0)):
             weak_cert_endpoints[marker] += 1
         if str(cert.subject or "").strip() and str(cert.subject) == str(cert.issuer):
             self_signed_endpoints[marker] += 1
         end_dt = _parse_iso_ts(cert.not_after)
         if end_dt is not None and end_dt < now_dt:
             expired_cert_endpoints[marker] += 1
+    weak_certs = sum(weak_cert_endpoints.values())
+    expired_certs = sum(expired_cert_endpoints.values())
+    self_signed_certs = sum(self_signed_endpoints.values())
 
     if tls_like_packets and tls_packets == 0:
         analysis_notes.append(
@@ -1718,7 +1718,7 @@ def analyze_tls(
     high_entropy_sni = [
         sni
         for sni, count in sni_counts.items()
-        if count >= 3 and len(sni) >= 18 and _shannon_entropy(sni) >= 3.85
+        if count >= 3 and len(sni) >= 18 and shannon_entropy(sni) >= 3.85
     ]
     if high_entropy_sni:
         detections.append(
@@ -2025,7 +2025,7 @@ def analyze_tls(
         ):
             suspicious = True
         if suspicious:
-            marker = cert.sni or cert.dst_ip or cert.subject
+            marker = cert.sni or cert.src_ip or cert.subject
             impersonation_hits.append(str(marker))
     if impersonation_hits:
         unique_hits = sorted(set(impersonation_hits))
@@ -2092,8 +2092,8 @@ def analyze_tls(
         sha256 = str(getattr(cert, "sha256", "") or "").strip()
         if not sha256 or sha256 == "-":
             continue
-        service = str(getattr(cert, "sni", "") or getattr(cert, "dst_ip", "") or "-")
-        serial = str(getattr(cert, "serial", "") or "-")
+        service = str(cert.sni or cert.src_ip or "-")
+        serial = str(cert.serial or "-")
         artifacts.append(f"Cert SHA256: {sha256} serial={serial} service={service}")
 
     vt_results: dict[str, dict[str, object]] = {}
@@ -2103,12 +2103,13 @@ def analyze_tls(
         if not api_key:
             vt_errors.append("VT_API_KEY is not set; skipping VirusTotal lookups.")
         else:
+            # Public names only, filtered *before* taking the top 80 so
+            # internal SNIs do not use up the lookup slots.
             candidate_domains = [
                 str(name).strip().lower().strip(".")
-                for name, _count in sni_counts.most_common(80)
-                if str(name).strip()
-            ]
-            candidate_domains = [name for name in candidate_domains if "." in name]
+                for name, _count in sni_counts.most_common()
+                if vt_lookup_candidate(str(name))
+            ][:80]
             if candidate_domains:
                 vt_results, vt_errors = _vt_lookup_domains(candidate_domains, api_key)
                 vt_hits = [

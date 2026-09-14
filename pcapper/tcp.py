@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from .utils import is_private_ip as _is_private_ip
-from .utils import is_public_ip as _is_public_ip
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -10,10 +8,19 @@ from typing import Optional
 
 from .files import analyze_files
 from .http import analyze_http
-from .pcap_cache import get_reader
+from .pcap_cache import iter_packets
 from .progress import run_with_busy_status
 from .services import analyze_services
-from .utils import extract_packet_endpoints, format_duration, format_ts, memoize_analysis, packet_length, safe_float
+from .utils import (
+    extract_packet_endpoints,
+    format_duration,
+    format_ts,
+    is_private_ip,
+    is_public_ip,
+    memoize_analysis,
+    packet_length,
+    safe_float,
+)
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -143,29 +150,21 @@ def _stats_from_samples(samples: list[int]) -> dict[str, float]:
     }
 
 
+def _is_likely_tcp_responder_packet(sport: int, dport: int) -> bool:
+    """Port-only fallback for flows whose handshake was not captured: a
+    well-known/registered source port talking to an ephemeral one."""
+    if sport <= 1024 and dport > 1024:
+        return True
+    if dport <= 1024 and sport > 1024:
+        return False
+    return sport <= 49151 < dport
+
+
 def _build_tcp_enrichment(
-    *,
-    tcp_packets: int,
-    conversations: list[TcpConversation],
     detections: list[dict[str, object]],
-    retrans_counts: Counter[str],
-    zero_window_counts: Counter[str],
-    small_window_counts: Counter[str],
-    src_to_ports: dict[str, set[int]],
-    src_to_dsts: dict[str, set[str]],
-    src_port_dsts: dict[tuple[str, int], set[str]],
     outbound_flow_bytes: Counter[tuple[str, str]],
 ) -> dict[str, object]:
-    _ = (
-        tcp_packets,
-        conversations,
-        retrans_counts,
-        zero_window_counts,
-        small_window_counts,
-        src_to_ports,
-        src_to_dsts,
-        src_port_dsts,
-    )
+    """Verdict, confidence and check buckets derived from the thresholded detections."""
     checks: dict[str, list[str]] = defaultdict(list)
 
     # Map the analyzer's already-thresholded detections to triage categories
@@ -204,7 +203,7 @@ def _build_tcp_enrichment(
     # Egress exfil outlier: a large sustained outbound transfer to a public host.
     # Conservative threshold so ordinary downloads/uploads don't fire.
     for (src, dst), nbytes in (outbound_flow_bytes or {}).items():
-        if nbytes >= 100 * 1024 * 1024 and _is_public_ip(str(dst)):
+        if nbytes >= 100 * 1024 * 1024 and is_public_ip(str(dst)):
             checks["egress_exfil_outlier"].append(
                 f"{src} -> {dst}: {nbytes / (1024 * 1024):.0f} MB outbound to public host"
             )
@@ -311,10 +310,6 @@ def analyze_tcp(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
-
     total_packets = 0
     total_bytes = 0
     tcp_packets = 0
@@ -349,12 +344,10 @@ def analyze_tcp(
     payload_size_samples: list[int] = []
     syn_counts: Counter[str] = Counter()
     rst_counts: Counter[str] = Counter()
-    src_to_ports: dict[str, set[int]] = defaultdict(set)
-    src_to_dsts: dict[str, set[str]] = defaultdict(set)
-    dst_to_ports: dict[str, set[int]] = defaultdict(set)
-    dst_to_srcs: dict[str, set[str]] = defaultdict(set)
-    src_dst_ports: dict[tuple[str, str], set[int]] = defaultdict(set)
-    src_port_dsts: dict[tuple[str, int], set[str]] = defaultdict(set)
+    # (ip, port) pairs that have answered with SYN-ACK or been sent a SYN:
+    # the services. Every later segment of those flows is attributed to the
+    # flow's client/server roles rather than to whichever side sent it.
+    known_services: set[tuple[str, int]] = set()
     syn_triplet_counts: Counter[tuple[str, str, int]] = Counter()
     syn_ack_triplet_counts: Counter[tuple[str, str, int]] = Counter()
     syn_ack_service_counts: Counter[tuple[str, int]] = Counter()
@@ -380,36 +373,28 @@ def analyze_tcp(
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
-            total_packets += 1
-            pkt_len = packet_length(pkt)
-            total_bytes += pkt_len
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        pkt_len = packet_length(pkt)
+        total_bytes += pkt_len
+        tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
+        if tcp_layer is None:
+            continue
+        try:
             ts = safe_float(getattr(pkt, "time", None))
-
             src_ip, dst_ip = extract_packet_endpoints(pkt)
 
-            if src_ip and dst_ip and ts is not None:
+            tcp_packets += 1
+            tcp_bytes += pkt_len
+            # The report window spans TCP traffic, not every packet in scope.
+            if ts is not None:
                 if first_seen is None or ts < first_seen:
                     first_seen = ts
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
-
-            if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                continue
-
-            tcp_packets += 1
-            tcp_bytes += pkt_len
-            tcp_layer = pkt[TCP]  # type: ignore[index]
             sport = int(getattr(tcp_layer, "sport", 0))
             dport = int(getattr(tcp_layer, "dport", 0))
             flags = getattr(tcp_layer, "flags", 0)
@@ -448,8 +433,31 @@ def analyze_tcp(
                 except Exception:
                     payload_len = 0
 
-            client_key = src_ip or "-"
-            server_key = dst_ip or "-"
+            is_syn = bool(flags_val & 0x02) and not (flags_val & 0x10)
+            is_syn_ack = flags_val & 0x12 == 0x12
+            # Per-sender counters (who sent the SYN/RST, who retransmitted or
+            # advertised a zero window) stay keyed by the packet's source.
+            sender_key = src_ip or "-"
+            src_key = src_ip or "-"
+            dst_key = dst_ip or "-"
+
+            # Flow roles: learned from the handshake, port heuristic otherwise.
+            # Attributing every packet's source as the "client" made each busy
+            # server a top client and each client's ephemeral port a top port.
+            if is_syn:
+                known_services.add((dst_key, dport))
+            elif is_syn_ack:
+                known_services.add((src_key, sport))
+            if (dst_key, dport) in known_services:
+                responder = False
+            elif (src_key, sport) in known_services:
+                responder = True
+            else:
+                responder = _is_likely_tcp_responder_packet(sport, dport)
+            if responder:
+                client_key, server_key, server_port = dst_key, src_key, sport
+            else:
+                client_key, server_key, server_port = src_key, dst_key, dport
             client_counts[client_key] += 1
             server_counts[server_key] += 1
             client_bytes[client_key] += pkt_len
@@ -458,49 +466,50 @@ def analyze_tcp(
             endpoint_packets[server_key] += 1
             endpoint_bytes[client_key] += pkt_len
             endpoint_bytes[server_key] += pkt_len
-            port_counts[dport] += 1
-            if dst_ip:
-                port_destinations[dport][dst_ip] += 1
+            port_counts[server_port] += 1
+            if server_key != "-":
+                port_destinations[server_port][server_key] += 1
 
-            src_to_ports[client_key].add(dport)
-            src_to_dsts[client_key].add(server_key)
-            dst_to_ports[server_key].add(dport)
-            dst_to_srcs[server_key].add(client_key)
-            src_dst_ports[(client_key, server_key)].add(dport)
-            src_port_dsts[(client_key, dport)].add(server_key)
-
-            convo_key = (src_ip or "-", dst_ip or "-", sport, dport)
+            convo_key = (src_key, dst_key, sport, dport)
             convo = conversations[convo_key]
             convo["packets"] = int(convo["packets"]) + 1
             convo["bytes"] = int(convo["bytes"]) + pkt_len
 
-            seq_set = flow_seq_seen[convo_key]
-            if seq in seq_set:
-                retrans_counts[client_key] += 1
-                if ts is not None:
-                    retrans_bins[int(ts // 60)] += 1
-            else:
-                seq_set.add(seq)
-                if len(seq_set) > 5000:
-                    seq_set.clear()
+            # A retransmission is a *data* segment (or SYN/FIN) whose sequence
+            # number was already seen on the flow. Pure ACKs do not consume
+            # sequence space, so the data segment that follows one legitimately
+            # shares its seq — counting those made every flow look lossy.
+            if payload_len > 0 or flags_val & 0x03:
+                seq_set = flow_seq_seen[convo_key]
+                if seq in seq_set:
+                    retrans_counts[sender_key] += 1
+                    if ts is not None:
+                        retrans_bins[int(ts // 60)] += 1
+                else:
+                    seq_set.add(seq)
+                    if len(seq_set) > 5000:
+                        seq_set.clear()
 
             if window == 0:
-                zero_window_counts[client_key] += 1
+                zero_window_counts[sender_key] += 1
             elif window < 1024:
-                small_window_counts[client_key] += 1
-            if flags_val & 0x02:
+                small_window_counts[sender_key] += 1
+            # A SYN-ACK also carries the SYN bit; it must not count as a SYN
+            # from the server, or every busy service reads as a port scanner
+            # of its clients' ephemeral ports.
+            if is_syn:
                 convo["syn"] = int(convo["syn"]) + 1
-                syn_counts[client_key] += 1
+                syn_counts[sender_key] += 1
                 if src_ip and dst_ip:
                     syn_triplet_counts[(src_ip, dst_ip, dport)] += 1
-            if flags_val & 0x12 == 0x12:
+            if is_syn_ack:
                 convo["syn_ack"] = int(convo["syn_ack"]) + 1
                 if src_ip and dst_ip:
                     syn_ack_triplet_counts[(dst_ip, src_ip, sport)] += 1
                     syn_ack_service_counts[(src_ip, sport)] += 1
             if flags_val & 0x04:
                 convo["rst"] = int(convo["rst"]) + 1
-                rst_counts[client_key] += 1
+                rst_counts[sender_key] += 1
             if flags_val & 0x01:
                 convo["fin"] = int(convo["fin"]) + 1
             if flags_val & 0x10:
@@ -532,7 +541,7 @@ def analyze_tcp(
             if payload_len == 0:
                 zero_payload_packets += 1
 
-            if src_ip and dst_ip and _is_private_ip(src_ip) and _is_public_ip(dst_ip):
+            if src_ip and dst_ip and is_private_ip(src_ip) and is_public_ip(dst_ip):
                 outbound_flow_bytes[(src_ip, dst_ip)] += pkt_len
 
             tracker = beacon_trackers[convo_key]
@@ -555,12 +564,16 @@ def analyze_tcp(
                     convo["first_seen"] = ts
                 if convo["last_seen"] is None or ts > convo["last_seen"]:
                     convo["last_seen"] = ts
+        except Exception as exc:  # noqa: BLE001 — one malformed segment must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
 
-    except Exception as exc:
-        errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} TCP segment(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -595,7 +608,9 @@ def analyze_tcp(
         "HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta
     )
     file_summary = _busy("Files", analyze_files, path, show_status=False)
-    services_summary = _busy("Services", analyze_services, path, show_status=False)
+    services_summary = _busy(
+        "Services", analyze_services, path, show_status=False, packets=packets, meta=meta
+    )
 
     detections: list[dict[str, object]] = []
     if tcp_packets and (sum(rst_counts.values()) / max(tcp_packets, 1)) > 0.2:
@@ -1040,18 +1055,7 @@ def analyze_tcp(
             }
         )
 
-    context = _build_tcp_enrichment(
-        tcp_packets=tcp_packets,
-        conversations=sorted(conversation_rows, key=lambda c: c.packets, reverse=True),
-        detections=detections,
-        retrans_counts=retrans_counts,
-        zero_window_counts=zero_window_counts,
-        small_window_counts=small_window_counts,
-        src_to_ports=syn_src_to_ports,
-        src_to_dsts=syn_src_to_dsts,
-        src_port_dsts=syn_src_port_dsts,
-        outbound_flow_bytes=outbound_flow_bytes,
-    )
+    context = _build_tcp_enrichment(detections, outbound_flow_bytes)
 
     return TcpSummary(
         path=path,

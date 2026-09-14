@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from .utils import read_ber_length as _read_ber_length, packet_length
 import ipaddress
 import math
 from collections import Counter, defaultdict
@@ -9,9 +8,17 @@ from pathlib import Path
 from typing import Optional
 
 from .certificates import analyze_certificates
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .progress import run_with_busy_status
-from .utils import extract_packet_endpoints, safe_float
+from .utils import (
+    extract_packet_endpoints,
+    memoize_analysis,
+    packet_length,
+    read_ber_length as _read_ber_length,
+    safe_float,
+    tcp_flags_int,
+    tcp_segment_length,
+)
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -586,12 +593,14 @@ def _parse_snmp_pdu(payload: bytes) -> Optional[str]:
     }.get(pdu)
 
 
-def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
+@memoize_analysis
+def analyze_health(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> HealthSummary:
     errors: list[str] = []
-
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
 
     total_packets = 0
     total_bytes = 0
@@ -670,276 +679,267 @@ def analyze_health(path: Path, show_status: bool = True) -> HealthSummary:
         3269,
     }
 
-    try:
-        for pkt in reader:
-            packet_index += 1
-            if stream is not None and size_bytes:
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        packet_index += 1
+        total_packets += 1
+        pkt_len = packet_length(pkt)
+        total_bytes += pkt_len
+        ts = safe_float(getattr(pkt, "time", None))
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
+
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
+        ip_layer = None
+        if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
+            ip_layer = pkt[IP]  # type: ignore[index]
+            ttl_val = int(getattr(ip_layer, "ttl", 0) or 0)
+            if ttl_val <= 1:
+                ttl_expired += 1
+            if ttl_val and ttl_val <= 5:
+                ttl_low += 1
+            tos = int(getattr(ip_layer, "tos", 0) or 0)
+            dscp_counts[(tos >> 2) & 0x3F] += 1
+            ecn_counts[tos & 0x03] += 1
+        elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
+            ip_layer = pkt[IPv6]  # type: ignore[index]
+            hlim = int(getattr(ip_layer, "hlim", 0) or 0)
+            if hlim <= 1:
+                ttl_expired += 1
+            if hlim and hlim <= 5:
+                ttl_low += 1
+            tc = int(getattr(ip_layer, "tc", 0) or 0)
+            dscp_counts[(tc >> 2) & 0x3F] += 1
+            ecn_counts[tc & 0x03] += 1
+
+        if src_ip:
+            endpoint_packets[src_ip] += 1
+            endpoint_bytes[src_ip] += pkt_len
+        if dst_ip:
+            endpoint_packets[dst_ip] += 1
+            endpoint_bytes[dst_ip] += pkt_len
+
+        if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+            try:
+                eth_layer = pkt[Ether]  # type: ignore[index]
+                etype = int(getattr(eth_layer, "type", 0) or 0)
+                if etype == 0x8892:
+                    src_mac = str(getattr(eth_layer, "src", "?"))
+                    dst_mac = str(getattr(eth_layer, "dst", "?"))
+                    pn_key = f"{src_mac} -> {dst_mac}"
+                    if ts is not None:
+                        last_ts_val = profinet_last_ts.get(pn_key)
+                        if last_ts_val is not None:
+                            interval = ts - last_ts_val
+                            if interval >= 0:
+                                profinet_intervals[pn_key].append(interval)
+                        profinet_last_ts[pn_key] = ts
+            except Exception:
+                pass
+
+        if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+            tcp_packets += 1
+            tcp_layer = pkt[TCP]  # type: ignore[index]
+            if src_ip and dst_ip:
                 try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+                    seq = int(getattr(tcp_layer, "seq", 0) or 0)
+                    sport = int(getattr(tcp_layer, "sport", 0) or 0)
+                    dport = int(getattr(tcp_layer, "dport", 0) or 0)
+                    flags = tcp_flags_int(getattr(tcp_layer, "flags", 0))
+                    window = int(getattr(tcp_layer, "window", 0) or 0)
+                    # Segment length from the IP total length, not from
+                    # bytes(tcp.payload): a 60-byte minimum Ethernet frame
+                    # carries pad bytes that scapy hangs under TCP, so every
+                    # padded pure ACK looked like a 6-byte data segment and a
+                    # run of them on one flow was counted as retransmissions.
+                    payload_len = tcp_segment_length(tcp_layer, ip_layer)
+                    if payload_len is None:
+                        try:
+                            payload_len = len(bytes(tcp_layer.payload))
+                        except Exception:
+                            payload_len = 0
 
-            total_packets += 1
-            pkt_len = packet_length(pkt)
-            total_bytes += pkt_len
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
-
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
-                ttl_val = int(getattr(ip_layer, "ttl", 0) or 0)
-                if ttl_val <= 1:
-                    ttl_expired += 1
-                if ttl_val and ttl_val <= 5:
-                    ttl_low += 1
-                tos = int(getattr(ip_layer, "tos", 0) or 0)
-                dscp_counts[(tos >> 2) & 0x3F] += 1
-                ecn_counts[tos & 0x03] += 1
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                hlim = int(getattr(ip_layer, "hlim", 0) or 0)
-                if hlim <= 1:
-                    ttl_expired += 1
-                if hlim and hlim <= 5:
-                    ttl_low += 1
-                tc = int(getattr(ip_layer, "tc", 0) or 0)
-                dscp_counts[(tc >> 2) & 0x3F] += 1
-                ecn_counts[tc & 0x03] += 1
-
-            if src_ip:
-                endpoint_packets[src_ip] += 1
-                endpoint_bytes[src_ip] += pkt_len
-            if dst_ip:
-                endpoint_packets[dst_ip] += 1
-                endpoint_bytes[dst_ip] += pkt_len
-
-            if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-                try:
-                    eth_layer = pkt[Ether]  # type: ignore[index]
-                    etype = int(getattr(eth_layer, "type", 0) or 0)
-                    if etype == 0x8892:
-                        src_mac = str(getattr(eth_layer, "src", "?"))
-                        dst_mac = str(getattr(eth_layer, "dst", "?"))
-                        pn_key = f"{src_mac} -> {dst_mac}"
-                        if ts is not None:
-                            last_ts_val = profinet_last_ts.get(pn_key)
-                            if last_ts_val is not None:
-                                interval = ts - last_ts_val
-                                if interval >= 0:
-                                    profinet_intervals[pn_key].append(interval)
-                            profinet_last_ts[pn_key] = ts
-                except Exception:
-                    pass
-
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                tcp_packets += 1
-                tcp_layer = pkt[TCP]  # type: ignore[index]
-                if src_ip and dst_ip:
-                    try:
-                        seq = int(getattr(tcp_layer, "seq", 0) or 0)
-                        sport = int(getattr(tcp_layer, "sport", 0) or 0)
-                        dport = int(getattr(tcp_layer, "dport", 0) or 0)
-                        flags = int(getattr(tcp_layer, "flags", 0) or 0)
-                        window = int(getattr(tcp_layer, "window", 0) or 0)
-                        payload_len = 0
-                        if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                            payload_len = len(bytes(pkt[Raw]))  # type: ignore[index]
+                    key = (src_ip, dst_ip, sport, dport)
+                    # Only data-bearing segments can be retransmissions. A
+                    # repeated (seq, 0) is a normal cumulative/duplicate ACK
+                    # or window update -- counting those inflated the
+                    # retransmission rate on chatty-but-healthy flows.
+                    if payload_len > 0:
+                        sig = (seq, payload_len)
+                        if sig in seen_seq[key]:
+                            retransmissions += 1
+                            if ts is not None:
+                                minute_metrics[int(ts // 60)]["retrans"] += 1
+                                minute_samples[int(ts // 60)].append(
+                                    f"Retrans {src_ip}->{dst_ip}:{dport}"
+                                )
                         else:
-                            try:
-                                payload_len = len(bytes(tcp_layer.payload))
-                            except Exception:
-                                payload_len = 0
+                            seen_seq[key].add(sig)
+                    if len(seen_seq[key]) > 20000:
+                        seen_seq[key].clear()
 
-                        key = (src_ip, dst_ip, sport, dport)
-                        # Only data-bearing segments can be retransmissions. A
-                        # repeated (seq, 0) is a normal cumulative/duplicate ACK
-                        # or window update -- counting those inflated the
-                        # retransmission rate on chatty-but-healthy flows.
-                        if payload_len > 0:
-                            sig = (seq, payload_len)
-                            if sig in seen_seq[key]:
-                                retransmissions += 1
-                                if ts is not None:
-                                    minute_metrics[int(ts // 60)]["retrans"] += 1
-                                    minute_samples[int(ts // 60)].append(
-                                        f"Retrans {src_ip}->{dst_ip}:{dport}"
-                                    )
-                            else:
-                                seen_seq[key].add(sig)
-                        if len(seen_seq[key]) > 20000:
-                            seen_seq[key].clear()
-
-                        flow = tcp_flows[key]
-                        if ts is not None:
-                            if flow["first"] is None or ts < float(flow["first"] or ts):
-                                flow["first"] = ts
-                            if flow["last"] is None or ts > float(flow["last"] or ts):
-                                flow["last"] = ts
-
-                        if flags & 0x02:
-                            tcp_syn += 1
-                            tcp_syn_sources[src_ip] += 1
-                            host_syn_targets[src_ip].add(dst_ip)
-                            if ts is not None:
-                                minute_metrics[int(ts // 60)]["syn"] += 1
-                                minute_samples[int(ts // 60)].append(
-                                    f"SYN {src_ip}->{dst_ip}:{dport}"
-                                )
-                        if flags & 0x12 == 0x12:
-                            tcp_syn_ack += 1
-                        if flags & 0x04:
-                            tcp_rst += 1
-                            tcp_rst_sources[src_ip] += 1
-                            if ts is not None:
-                                minute_metrics[int(ts // 60)]["rst"] += 1
-                                minute_samples[int(ts // 60)].append(
-                                    f"RST {src_ip}->{dst_ip}:{dport}"
-                                )
-                        if window == 0:
-                            tcp_zero_window += 1
-                            tcp_zero_window_sources[src_ip] += 1
-                            if ts is not None:
-                                minute_metrics[int(ts // 60)]["zero_window"] += 1
-                                minute_samples[int(ts // 60)].append(
-                                    f"ZeroWindow {src_ip}->{dst_ip}:{dport}"
-                                )
-                        elif window < 1024:
-                            tcp_small_window += 1
-
-                        if dport in management_ports:
-                            host_mgmt_targets[src_ip].add(dst_ip)
-                            try:
-                                src_is_private = ipaddress.ip_address(src_ip).is_private
-                                dst_is_private = ipaddress.ip_address(dst_ip).is_private
-                            except Exception:
-                                src_is_private = True
-                                dst_is_private = True
-                            if src_is_private != dst_is_private:
-                                drift = f"Mgmt/OT service cross-zone flow: {src_ip}->{dst_ip}:{dport}"
-                                if drift not in mgmt_zone_events:
-                                    mgmt_zone_events.add(drift)
-                                    zone_anomalies.append(drift)
-                                    event_anchors.append(
-                                        {
-                                            "packet": packet_index,
-                                            "signal": "zone_policy_drift",
-                                            "details": drift,
-                                        }
-                                    )
-
-                        if sport == 102 or dport == 102:
-                            s7_payload = b""
-                            if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                                s7_payload = bytes(pkt[Raw])  # type: ignore[index]
-                            else:
-                                try:
-                                    s7_payload = bytes(tcp_layer.payload)
-                                except Exception:
-                                    s7_payload = b""
-                            rosctr = _extract_s7_rosctr(s7_payload) or "ROSCTR ?"
-                            s7_key = f"{src_ip}:{sport} -> {dst_ip}:{dport} ({rosctr})"
-                            if ts is not None:
-                                last_s7 = s7_last_ts.get(s7_key)
-                                if last_s7 is not None:
-                                    interval = ts - last_s7
-                                    if interval >= 0:
-                                        s7_intervals[s7_key].append(interval)
-                                s7_last_ts[s7_key] = ts
-                    except Exception:
-                        pass
-
-            if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                udp_packets += 1
-                udp_layer = pkt[UDP]  # type: ignore[index]
-                sport = int(getattr(udp_layer, "sport", 0) or 0)
-                dport = int(getattr(udp_layer, "dport", 0) or 0)
-                if src_ip and dst_ip:
-                    flow = udp_flows[(src_ip, dst_ip, sport, dport)]
+                    flow = tcp_flows[key]
                     if ts is not None:
                         if flow["first"] is None or ts < float(flow["first"] or ts):
                             flow["first"] = ts
                         if flow["last"] is None or ts > float(flow["last"] or ts):
                             flow["last"] = ts
 
-                if dport in AMPLIFICATION_PORTS or sport in AMPLIFICATION_PORTS:
-                    payload_len = 0
-                    if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                        payload_len = len(bytes(pkt[Raw]))  # type: ignore[index]
-                    else:
+                    if flags & 0x02:
+                        tcp_syn += 1
+                        tcp_syn_sources[src_ip] += 1
+                        host_syn_targets[src_ip].add(dst_ip)
+                        if ts is not None:
+                            minute_metrics[int(ts // 60)]["syn"] += 1
+                            minute_samples[int(ts // 60)].append(
+                                f"SYN {src_ip}->{dst_ip}:{dport}"
+                            )
+                    if flags & 0x12 == 0x12:
+                        tcp_syn_ack += 1
+                    if flags & 0x04:
+                        tcp_rst += 1
+                        tcp_rst_sources[src_ip] += 1
+                        if ts is not None:
+                            minute_metrics[int(ts // 60)]["rst"] += 1
+                            minute_samples[int(ts // 60)].append(
+                                f"RST {src_ip}->{dst_ip}:{dport}"
+                            )
+                    if window == 0:
+                        tcp_zero_window += 1
+                        tcp_zero_window_sources[src_ip] += 1
+                        if ts is not None:
+                            minute_metrics[int(ts // 60)]["zero_window"] += 1
+                            minute_samples[int(ts // 60)].append(
+                                f"ZeroWindow {src_ip}->{dst_ip}:{dport}"
+                            )
+                    elif window < 1024:
+                        tcp_small_window += 1
+
+                    if dport in management_ports:
+                        host_mgmt_targets[src_ip].add(dst_ip)
                         try:
-                            payload_len = len(bytes(udp_layer.payload))
+                            src_is_private = ipaddress.ip_address(src_ip).is_private
+                            dst_is_private = ipaddress.ip_address(dst_ip).is_private
                         except Exception:
-                            payload_len = 0
-                    if dport in AMPLIFICATION_PORTS:
-                        client = src_ip or "-"
-                        server = dst_ip or "-"
-                        amp_flows[(client, server, dport)]["client"] += payload_len
-                    else:
-                        client = dst_ip or "-"
-                        server = src_ip or "-"
-                        amp_flows[(client, server, sport)]["server"] += payload_len
-
-                if (sport == 2222 or dport == 2222) and src_ip and dst_ip:
-                    enip_key = f"{src_ip}:{sport} -> {dst_ip}:{dport}"
-                    if ts is not None:
-                        last_enip = enip_io_last_ts.get(enip_key)
-                        if last_enip is not None:
-                            interval = ts - last_enip
-                            if interval >= 0:
-                                enip_io_intervals[enip_key].append(interval)
-                        enip_io_last_ts[enip_key] = ts
-
-                if sport in (161, 162) or dport in (161, 162):
-                    snmp_packets += 1
-                    if src_ip:
-                        snmp_sources[src_ip] += 1
-                    if ts is not None:
-                        minute_metrics[int(ts // 60)]["snmp"] += 1
-
-                    payload = None
-                    if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                        payload = bytes(pkt[Raw])  # type: ignore[index]
-                    else:
-                        try:
-                            payload = bytes(udp_layer.payload)
-                        except Exception:
-                            payload = None
-                    if payload:
-                        version, community = _parse_snmp(payload)
-                        pdu = _parse_snmp_pdu(payload)
-                        if version:
-                            snmp_versions[version] += 1
-                        if community:
-                            snmp_communities[community] += 1
-                            if community.lower() in {"public", "private"} and src_ip:
-                                host_snmp_default[src_ip] += 1
+                            src_is_private = True
+                            dst_is_private = True
+                        if src_is_private != dst_is_private:
+                            drift = f"Mgmt/OT service cross-zone flow: {src_ip}->{dst_ip}:{dport}"
+                            if drift not in mgmt_zone_events:
+                                mgmt_zone_events.add(drift)
+                                zone_anomalies.append(drift)
                                 event_anchors.append(
                                     {
                                         "packet": packet_index,
-                                        "signal": "snmp_exposure_risk",
-                                        "details": f"Default SNMP community '{community}' from {src_ip}",
+                                        "signal": "zone_policy_drift",
+                                        "details": drift,
                                     }
                                 )
-                        if pdu == "SetRequest" and src_ip:
-                            snmp_set_sources[src_ip] += 1
+
+                    if sport == 102 or dport == 102:
+                        s7_payload = b""
+                        if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
+                            s7_payload = bytes(pkt[Raw])  # type: ignore[index]
+                        else:
+                            try:
+                                s7_payload = bytes(tcp_layer.payload)
+                            except Exception:
+                                s7_payload = b""
+                        rosctr = _extract_s7_rosctr(s7_payload) or "ROSCTR ?"
+                        s7_key = f"{src_ip}:{sport} -> {dst_ip}:{dport} ({rosctr})"
+                        if ts is not None:
+                            last_s7 = s7_last_ts.get(s7_key)
+                            if last_s7 is not None:
+                                interval = ts - last_s7
+                                if interval >= 0:
+                                    s7_intervals[s7_key].append(interval)
+                            s7_last_ts[s7_key] = ts
+                except Exception:
+                    pass
+
+        if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+            udp_packets += 1
+            udp_layer = pkt[UDP]  # type: ignore[index]
+            sport = int(getattr(udp_layer, "sport", 0) or 0)
+            dport = int(getattr(udp_layer, "dport", 0) or 0)
+            if src_ip and dst_ip:
+                flow = udp_flows[(src_ip, dst_ip, sport, dport)]
+                if ts is not None:
+                    if flow["first"] is None or ts < float(flow["first"] or ts):
+                        flow["first"] = ts
+                    if flow["last"] is None or ts > float(flow["last"] or ts):
+                        flow["last"] = ts
+
+            if dport in AMPLIFICATION_PORTS or sport in AMPLIFICATION_PORTS:
+                payload_len = 0
+                if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
+                    payload_len = len(bytes(pkt[Raw]))  # type: ignore[index]
+                else:
+                    try:
+                        payload_len = len(bytes(udp_layer.payload))
+                    except Exception:
+                        payload_len = 0
+                if dport in AMPLIFICATION_PORTS:
+                    client = src_ip or "-"
+                    server = dst_ip or "-"
+                    amp_flows[(client, server, dport)]["client"] += payload_len
+                else:
+                    client = dst_ip or "-"
+                    server = src_ip or "-"
+                    amp_flows[(client, server, sport)]["server"] += payload_len
+
+            if (sport == 2222 or dport == 2222) and src_ip and dst_ip:
+                enip_key = f"{src_ip}:{sport} -> {dst_ip}:{dport}"
+                if ts is not None:
+                    last_enip = enip_io_last_ts.get(enip_key)
+                    if last_enip is not None:
+                        interval = ts - last_enip
+                        if interval >= 0:
+                            enip_io_intervals[enip_key].append(interval)
+                    enip_io_last_ts[enip_key] = ts
+
+            if sport in (161, 162) or dport in (161, 162):
+                snmp_packets += 1
+                if src_ip:
+                    snmp_sources[src_ip] += 1
+                if ts is not None:
+                    minute_metrics[int(ts // 60)]["snmp"] += 1
+
+                payload = None
+                if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
+                    payload = bytes(pkt[Raw])  # type: ignore[index]
+                else:
+                    try:
+                        payload = bytes(udp_layer.payload)
+                    except Exception:
+                        payload = None
+                if payload:
+                    version, community = _parse_snmp(payload)
+                    pdu = _parse_snmp_pdu(payload)
+                    if version:
+                        snmp_versions[version] += 1
+                    if community:
+                        snmp_communities[community] += 1
+                        if community.lower() in {"public", "private"} and src_ip:
+                            host_snmp_default[src_ip] += 1
                             event_anchors.append(
                                 {
                                     "packet": packet_index,
-                                    "signal": "snmp_set_request",
-                                    "details": f"SNMP SetRequest from {src_ip} to {dst_ip or '-'}",
+                                    "signal": "snmp_exposure_risk",
+                                    "details": f"Default SNMP community '{community}' from {src_ip}",
                                 }
                             )
-    finally:
-        status.finish()
-        reader.close()
-
+                    if pdu == "SetRequest" and src_ip:
+                        snmp_set_sources[src_ip] += 1
+                        event_anchors.append(
+                            {
+                                "packet": packet_index,
+                                "signal": "snmp_set_request",
+                                "details": f"SNMP SetRequest from {src_ip} to {dst_ip or '-'}",
+                            }
+                        )
     retransmission_rate = (retransmissions / tcp_packets) if tcp_packets else 0.0
     duration_seconds = None
     if first_seen is not None and last_seen is not None:

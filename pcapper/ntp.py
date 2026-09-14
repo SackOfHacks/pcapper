@@ -5,19 +5,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
-    from scapy.layers.inet import IP, UDP  # type: ignore
-    from scapy.layers.inet6 import IPv6  # type: ignore
+    from scapy.layers.inet import UDP  # type: ignore
 except Exception:  # pragma: no cover
-    IP = None  # type: ignore
     UDP = None  # type: ignore
-    IPv6 = None  # type: ignore
 
 
 NTP_PORT = 123
+_MODE_NAMES = {
+    0: "reserved",
+    1: "symmetric_active",
+    2: "symmetric_passive",
+    3: "client",
+    4: "server",
+    5: "broadcast",
+    6: "control",
+    7: "private",
+}
 
 
 @dataclass(frozen=True)
@@ -38,19 +45,16 @@ class NtpSummary:
 
 
 def _mode_name(value: int) -> str:
-    return {
-        0: "reserved",
-        1: "symmetric_active",
-        2: "symmetric_passive",
-        3: "client",
-        4: "server",
-        5: "broadcast",
-        6: "control",
-        7: "private",
-    }.get(value, f"mode_{value}")
+    return _MODE_NAMES.get(value, f"mode_{value}")
 
 
-def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
+@memoize_analysis
+def analyze_ntp(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> NtpSummary:
     if UDP is None:
         return NtpSummary(
             path,
@@ -68,10 +72,6 @@ def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
             None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
-
     total_packets = 0
     ntp_packets = 0
     client_counts: Counter[str] = Counter()
@@ -83,27 +83,15 @@ def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
     errors: list[str] = []
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
-
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
-
-            if not pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                continue
-            udp = pkt[UDP]  # type: ignore[index]
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        udp = pkt.getlayer(UDP)  # type: ignore[arg-type]
+        if udp is None:
+            continue
+        try:
             sport = int(getattr(udp, "sport", 0) or 0)
             dport = int(getattr(udp, "dport", 0) or 0)
             if sport != NTP_PORT and dport != NTP_PORT:
@@ -114,18 +102,23 @@ def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
                 continue
 
             ntp_packets += 1
+            # The report window spans NTP traffic, not every packet in scope.
+            ts = safe_float(getattr(pkt, "time", None))
+            if ts is not None:
+                if first_seen is None or ts < first_seen:
+                    first_seen = ts
+                if last_seen is None or ts > last_seen:
+                    last_seen = ts
+
             payload = bytes(getattr(udp, "payload", b""))
             if len(payload) < 2:
                 continue
             first_byte = payload[0]
             version = (first_byte >> 3) & 0x7
             mode = first_byte & 0x7
-            mode_name = _mode_name(mode)
-            mode_counts[mode_name] += 1
+            mode_counts[_mode_name(mode)] += 1
             version_counts[version] += 1
-            if len(payload) > 1:
-                stratum = payload[1]
-                stratum_counts[int(stratum)] += 1
+            stratum_counts[int(payload[1])] += 1
 
             if mode == 3:
                 client_counts[src_ip] += 1
@@ -133,10 +126,18 @@ def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
             elif mode == 4:
                 server_counts[src_ip] += 1
                 client_counts[dst_ip] += 1
+            elif mode == 5:  # broadcast server: sender is the time source
+                server_counts[src_ip] += 1
+        except Exception as exc:  # noqa: BLE001 — one malformed datagram must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
 
-    finally:
-        status.finish()
-        reader.close()
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} NTP packet(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     if ntp_packets and mode_counts.get("control", 0) > 0:
         detections.append(
@@ -161,15 +162,14 @@ def analyze_ntp(path: Path, show_status: bool = True) -> NtpSummary:
                 ),
             }
         )
-    if ntp_packets and stratum_counts:
-        if any(stratum >= 16 for stratum in stratum_counts.keys()):
-            detections.append(
-                {
-                    "severity": "warning",
-                    "summary": "NTP stratum 16/unsynchronized observed",
-                    "details": "Stratum 16 indicates unsynchronized sources; investigate NTP health.",
-                }
-            )
+    if ntp_packets and any(stratum >= 16 for stratum in stratum_counts):
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "NTP stratum 16/unsynchronized observed",
+                "details": "Stratum 16 indicates unsynchronized sources; investigate NTP health.",
+            }
+        )
 
     duration = (
         (last_seen - first_seen)

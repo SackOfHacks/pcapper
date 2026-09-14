@@ -21,7 +21,7 @@ except ImportError:
     TCP = UDP = Raw = None
     NBNSQueryRequest = NBNSQueryResponse = NBNSNodeStatusResponse = None
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length
 from .utils import is_public_ip as _is_public_ip
 
@@ -795,7 +795,12 @@ def _parse_logon_mailslot(payload: bytes) -> Optional[Dict[str, object]]:
 
 
 @memoize_analysis
-def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysis:
+def analyze_netbios(
+    pcap_path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> NetbiosAnalysis:
     analysis = NetbiosAnalysis(path=pcap_path)
 
     if not pcap_path.exists():
@@ -884,495 +889,476 @@ def analyze_netbios(pcap_path: Path, show_status: bool = True) -> NetbiosAnalysi
         if norm_scope == "GROUP" and analysis.hosts[host_ip].group_name is None:
             analysis.hosts[host_ip].group_name = norm_name
 
-    try:
-        reader, status_bar, stream, size_bytes, _file_type = get_reader(
-            pcap_path, show_status=show_status
-        )
-    except Exception as exc:
-        analysis.errors.append(f"Error opening pcap: {exc}")
-        return analysis
 
     try:
-        with status_bar as pbar:
-            for pkt in reader:
-                if not pkt:
-                    continue
+        for pkt in iter_packets(pcap_path, packets=packets, meta=meta, show_status=show_status):
+            if not pkt:
+                continue
 
-                if stream is not None and size_bytes:
-                    try:
-                        pos = stream.tell()
-                        pbar.update(int(min(100, (pos / size_bytes) * 100)))
-                    except Exception:
-                        pass
+            ts = safe_float(getattr(pkt, "time", None))
+            if ts is None:
+                ts = 0.0
 
-                ts = safe_float(getattr(pkt, "time", None))
-                if ts is None:
-                    ts = 0.0
-                if start_time is None or ts < start_time:
-                    start_time = ts
-                if last_time is None or ts > last_time:
-                    last_time = ts
+            pkt_len = packet_length(pkt)
 
-                pkt_len = packet_length(pkt)
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
+            if not src_ip or not dst_ip:
+                src_ip = "0.0.0.0"
+                dst_ip = "0.0.0.0"
 
-                src_ip, dst_ip = extract_packet_endpoints(pkt)
-                if not src_ip or not dst_ip:
-                    src_ip = "0.0.0.0"
-                    dst_ip = "0.0.0.0"
+            sport = 0
+            dport = 0
+            proto_label = "OTHER"
+            is_nb = False
+            if UDP is not None and pkt.haslayer(UDP):
+                sport = int(pkt[UDP].sport)
+                dport = int(pkt[UDP].dport)
+                proto_label = "UDP"
+                if sport in (137, 138) or dport in (137, 138):
+                    is_nb = True
+            elif TCP is not None and pkt.haslayer(TCP):
+                sport = int(pkt[TCP].sport)
+                dport = int(pkt[TCP].dport)
+                proto_label = "TCP"
+                if sport == 139 or dport == 139:
+                    is_nb = True
 
-                sport = 0
-                dport = 0
-                proto_label = "OTHER"
-                is_nb = False
-                if UDP is not None and pkt.haslayer(UDP):
-                    sport = int(pkt[UDP].sport)
-                    dport = int(pkt[UDP].dport)
-                    proto_label = "UDP"
-                    if sport in (137, 138) or dport in (137, 138):
-                        is_nb = True
-                elif TCP is not None and pkt.haslayer(TCP):
-                    sport = int(pkt[TCP].sport)
-                    dport = int(pkt[TCP].dport)
-                    proto_label = "TCP"
-                    if sport == 139 or dport == 139:
-                        is_nb = True
+            if not is_nb:
+                continue
 
-                if not is_nb:
-                    continue
+            analysis.total_packets += 1
+            analysis.total_bytes += pkt_len
+            # The report window spans NetBIOS traffic, not every packet.
+            if start_time is None or ts < start_time:
+                start_time = ts
+            if last_time is None or ts > last_time:
+                last_time = ts
+            analysis.protocol_packets[proto_label] += 1
+            analysis.src_counts[src_ip] += 1
+            analysis.dst_counts[dst_ip] += 1
+            analysis.endpoint_bytes_sent[src_ip] += pkt_len
+            analysis.endpoint_bytes_recv[dst_ip] += pkt_len
+            src_distinct_destinations[src_ip].add(dst_ip)
 
-                analysis.total_packets += 1
-                analysis.total_bytes += pkt_len
-                analysis.protocol_packets[proto_label] += 1
-                analysis.src_counts[src_ip] += 1
-                analysis.dst_counts[dst_ip] += 1
-                analysis.endpoint_bytes_sent[src_ip] += pkt_len
-                analysis.endpoint_bytes_recv[dst_ip] += pkt_len
-                src_distinct_destinations[src_ip].add(dst_ip)
+            if src_ip not in analysis.hosts:
+                analysis.hosts[src_ip] = NetbiosHost(ip=src_ip)
+            if (
+                Ether is not None
+                and pkt.haslayer(Ether)
+                and analysis.hosts[src_ip].mac is None
+            ):
+                try:
+                    analysis.hosts[src_ip].mac = str(pkt[Ether].src)
+                except Exception:
+                    pass
 
-                if src_ip not in analysis.hosts:
-                    analysis.hosts[src_ip] = NetbiosHost(ip=src_ip)
-                if (
-                    Ether is not None
-                    and pkt.haslayer(Ether)
-                    and analysis.hosts[src_ip].mac is None
-                ):
-                    try:
-                        analysis.hosts[src_ip].mac = str(pkt[Ether].src)
-                    except Exception:
-                        pass
+            convo_key = (src_ip, dst_ip, proto_label, sport, dport)
+            convo = conversations.get(convo_key)
+            if convo is None:
+                convo = NetbiosConversation(
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    protocol=proto_label,
+                    src_port=sport,
+                    dst_port=dport,
+                )
+                conversations[convo_key] = convo
+            convo.packets += 1
+            _update_time(convo, ts)
 
-                convo_key = (src_ip, dst_ip, proto_label, sport, dport)
-                convo = conversations.get(convo_key)
-                if convo is None:
-                    convo = NetbiosConversation(
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        protocol=proto_label,
-                        src_port=sport,
-                        dst_port=dport,
-                    )
-                    conversations[convo_key] = convo
-                convo.packets += 1
-                _update_time(convo, ts)
+            if sport == 137 or dport == 137:
+                analysis.service_counts["NBNS (Name Service)"] += 1
+                service_endpoints["NBNS (Name Service)"][f"{src_ip}->{dst_ip}"] += 1
+            if sport == 138 or dport == 138:
+                analysis.service_counts["Datagram Service"] += 1
+                service_endpoints["Datagram Service"][f"{src_ip}->{dst_ip}"] += 1
+            if proto_label == "TCP" and (sport == 139 or dport == 139):
+                analysis.service_counts["Session Service"] += 1
+                service_endpoints["Session Service"][f"{src_ip}->{dst_ip}"] += 1
 
-                if sport == 137 or dport == 137:
-                    analysis.service_counts["NBNS (Name Service)"] += 1
-                    service_endpoints["NBNS (Name Service)"][f"{src_ip}->{dst_ip}"] += 1
-                if sport == 138 or dport == 138:
-                    analysis.service_counts["Datagram Service"] += 1
-                    service_endpoints["Datagram Service"][f"{src_ip}->{dst_ip}"] += 1
-                if proto_label == "TCP" and (sport == 139 or dport == 139):
-                    analysis.service_counts["Session Service"] += 1
-                    service_endpoints["Session Service"][f"{src_ip}->{dst_ip}"] += 1
+            payload = b""
+            if Raw is not None and pkt.haslayer(Raw):
+                try:
+                    payload = bytes(pkt[Raw].load)
+                except Exception:
+                    payload = b""
 
-                payload = b""
-                if Raw is not None and pkt.haslayer(Raw):
-                    try:
-                        payload = bytes(pkt[Raw].load)
-                    except Exception:
-                        payload = b""
+            if payload:
+                for token in _extract_plaintext(payload):
+                    analysis.plaintext_observed[token] += 1
+                    artifacts.add(token)
+                for name in _scan_filenames(payload):
+                    file_set.add(name)
 
-                if payload:
-                    for token in _extract_plaintext(payload):
-                        analysis.plaintext_observed[token] += 1
-                        artifacts.add(token)
-                    for name in _scan_filenames(payload):
-                        file_set.add(name)
-
-                # NBNS: request handling
-                if pkt.haslayer("NBNSQueryRequest"):
-                    analysis.request_counts["NBNS Query"] += 1
-                    convo.requests += 1
-                    try:
-                        qlayer = pkt["NBNSQueryRequest"]
-                        qname = getattr(qlayer, "QUESTION_NAME", None)
-                        if qname is None:
-                            qname = getattr(qlayer, "qname", None)
-                        if isinstance(qname, bytes):
-                            qname_str = qname.decode("latin-1", errors="ignore").strip()
-                        else:
-                            qname_str = str(qname).strip() if qname is not None else ""
-                        if qname_str:
-                            parsed_name, parsed_suffix = _parse_name_text(qname_str)
-                            display_name = qname_str
-                            if parsed_name:
-                                display_name = (
-                                    f"{parsed_name}<{parsed_suffix:02X}>"
-                                    if parsed_suffix is not None
-                                    else parsed_name
-                                )
-                            src_nbns_names[src_ip].add(display_name)
-                            src_nbns_targets[src_ip].add(dst_ip)
-                            analysis.observed_users[display_name] += 1
-                            analysis.unique_names.add(display_name)
-                            artifacts.add(display_name)
-                            # NOTE: do NOT flag "multiple hosts queried the same
-                            # name" as a conflict. Many hosts legitimately query
-                            # the same name (WORKGROUP for browser elections,
-                            # WPAD, a shared server). A real NBNS name conflict /
-                            # spoof is when multiple hosts RESPOND as the OWNER of
-                            # a unique name — handled in the response branch below.
-                            name_registry[display_name].add(src_ip)
-                    except Exception as exc:
-                        analysis.errors.append(f"NBNS query parse: {exc}")
-
-                # NBNS: response handling
-                if pkt.haslayer("NBNSQueryResponse"):
-                    analysis.response_counts["NBNS Response"] += 1
-                    convo.responses += 1
-                    try:
-                        nbns = pkt["NBNSQueryResponse"]
-                        rcode = getattr(nbns, "RCODE", None)
-                        if rcode is None:
-                            rcode = getattr(nbns, "rcode", None)
-                        if rcode is None and hasattr(nbns, "FLAGS"):
-                            try:
-                                rcode = int(nbns.FLAGS) & 0x000F
-                            except Exception:
-                                rcode = None
-                        if rcode is not None:
-                            code_name = NBNS_RCODE_MAP.get(int(rcode), f"RCODE_{rcode}")
-                            analysis.response_codes[code_name] += 1
-                            convo.response_codes[code_name] += 1
-                            if code_name in HIGH_RISK_NBNS_CODES:
-                                _append_anomaly(
-                                    "MEDIUM",
-                                    "NBNS Failure",
-                                    f"NBNS response code {code_name} observed.",
-                                    src_ip,
-                                    dst_ip,
-                                    ts,
-                                )
-
-                        rr_name = getattr(nbns, "RR_NAME", None)
-                        parsed_name, parsed_suffix = _parse_name_text(rr_name)
-                        if parsed_name and parsed_suffix is None:
-                            parsed_suffix = _infer_suffix_from_name(parsed_name)
-                        rr_name_text = (
-                            f"{parsed_name}<{parsed_suffix:02X}>"
-                            if (parsed_name and parsed_suffix is not None)
-                            else parsed_name
-                        )
-                        # Read the NBNS group bit from the response address entry:
-                        # G=Group registrations (workgroup/domain) are answered by
-                        # many hosts by design and must not be flagged.
-                        entry_is_group = False
-                        try:
-                            for _entry in getattr(nbns, "ADDR_ENTRY", []) or []:
-                                g_val = getattr(_entry, "G", None)
-                                if (isinstance(g_val, int) and g_val == 1) or (
-                                    isinstance(g_val, str) and "group" in g_val.lower()
-                                ):
-                                    entry_is_group = True
-                                    break
-                        except Exception:
-                            entry_is_group = False
-                        if rr_name_text:
-                            response_name_registry[rr_name_text].add(src_ip)
-                            # Names legitimately answered by MANY hosts and never a
-                            # poisoning signal: <1C> domain controllers, <1D> master
-                            # browser, <1E> browser elections, the group bit, and the
-                            # well-known workgroup/browser group names.
-                            base_name = (parsed_name or "").upper()
-                            is_group_name = (
-                                parsed_suffix in (0x1C, 0x1D, 0x1E)
-                                or entry_is_group
-                                or base_name in _NBNS_GROUP_NAMES
-                            )
-                            if (
-                                len(response_name_registry[rr_name_text]) > 1
-                                and not is_group_name
-                            ):
-                                analysis.threat_summary["NBNS Response Spoofing"] += 1
-                                analysis.name_conflicts += 1
-                                _append_anomaly(
-                                    "HIGH",
-                                    "NBNS Spoofing / Name Conflict",
-                                    f"Unique NetBIOS name {rr_name_text} answered by multiple hosts (possible NBNS poisoning): {', '.join(sorted(response_name_registry[rr_name_text]))}",
-                                    src_ip,
-                                    dst_ip,
-                                    ts,
-                                )
+            # NBNS: request handling
+            if pkt.haslayer("NBNSQueryRequest"):
+                analysis.request_counts["NBNS Query"] += 1
+                convo.requests += 1
+                try:
+                    qlayer = pkt["NBNSQueryRequest"]
+                    qname = getattr(qlayer, "QUESTION_NAME", None)
+                    if qname is None:
+                        qname = getattr(qlayer, "qname", None)
+                    if isinstance(qname, bytes):
+                        qname_str = qname.decode("latin-1", errors="ignore").strip()
+                    else:
+                        qname_str = str(qname).strip() if qname is not None else ""
+                    if qname_str:
+                        parsed_name, parsed_suffix = _parse_name_text(qname_str)
+                        display_name = qname_str
                         if parsed_name:
-                            addr_entries = getattr(nbns, "ADDR_ENTRY", []) or []
-                            entry_scope = _scope_from_suffix(
-                                parsed_suffix if parsed_suffix is not None else 0x00
+                            display_name = (
+                                f"{parsed_name}<{parsed_suffix:02X}>"
+                                if parsed_suffix is not None
+                                else parsed_name
                             )
-                            if isinstance(addr_entries, list) and addr_entries:
-                                try:
-                                    g_raw = getattr(addr_entries[0], "G", None)
-                                    if isinstance(g_raw, int):
-                                        if int(g_raw) == 1:
-                                            entry_scope = "GROUP"
-                                        elif int(g_raw) == 0:
-                                            entry_scope = "UNIQUE"
-                                    else:
-                                        g_value = str(g_raw or "").lower()
-                                        if "group" in g_value:
-                                            entry_scope = "GROUP"
-                                        elif "unique" in g_value:
-                                            entry_scope = "UNIQUE"
-                                except Exception:
-                                    pass
-                            if parsed_name.upper() == "__MSBROWSE__":
-                                entry_scope = "GROUP"
-                            _add_host_name(
+                        src_nbns_names[src_ip].add(display_name)
+                        src_nbns_targets[src_ip].add(dst_ip)
+                        analysis.observed_users[display_name] += 1
+                        analysis.unique_names.add(display_name)
+                        artifacts.add(display_name)
+                        # NOTE: do NOT flag "multiple hosts queried the same
+                        # name" as a conflict. Many hosts legitimately query
+                        # the same name (WORKGROUP for browser elections,
+                        # WPAD, a shared server). A real NBNS name conflict /
+                        # spoof is when multiple hosts RESPOND as the OWNER of
+                        # a unique name — handled in the response branch below.
+                        name_registry[display_name].add(src_ip)
+                except Exception as exc:
+                    analysis.errors.append(f"NBNS query parse: {exc}")
+
+            # NBNS: response handling
+            if pkt.haslayer("NBNSQueryResponse"):
+                analysis.response_counts["NBNS Response"] += 1
+                convo.responses += 1
+                try:
+                    nbns = pkt["NBNSQueryResponse"]
+                    rcode = getattr(nbns, "RCODE", None)
+                    if rcode is None:
+                        rcode = getattr(nbns, "rcode", None)
+                    if rcode is None and hasattr(nbns, "FLAGS"):
+                        try:
+                            rcode = int(nbns.FLAGS) & 0x000F
+                        except Exception:
+                            rcode = None
+                    if rcode is not None:
+                        code_name = NBNS_RCODE_MAP.get(int(rcode), f"RCODE_{rcode}")
+                        analysis.response_codes[code_name] += 1
+                        convo.response_codes[code_name] += 1
+                        if code_name in HIGH_RISK_NBNS_CODES:
+                            _append_anomaly(
+                                "MEDIUM",
+                                "NBNS Failure",
+                                f"NBNS response code {code_name} observed.",
                                 src_ip,
-                                parsed_name,
-                                int(
-                                    parsed_suffix if parsed_suffix is not None else 0x00
-                                ),
-                                entry_scope,
-                                "Registered",
-                                "NBNS Response",
-                            )
-                    except Exception as exc:
-                        analysis.errors.append(f"NBNS response parse: {exc}")
-
-                if NBNSNodeStatusResponse is not None and pkt.haslayer(
-                    NBNSNodeStatusResponse
-                ):
-                    try:
-                        node_status = pkt[NBNSNodeStatusResponse]
-                        entries = _extract_node_status_entries(node_status)
-                        for name, suffix, scope, status in entries:
-                            _add_host_name(
-                                src_ip, name, suffix, scope, status, "NBSTAT"
-                            )
-                            analysis.unique_names.add(f"{name}<{suffix:02X}>")
-                    except Exception as exc:
-                        analysis.errors.append(f"NBNS node status parse: {exc}")
-
-                # Browser (MS-BRWS) datagram dissection (UDP/138). Parse the
-                # Mailslot \MAILSLOT\BROWSE command and, for announcements,
-                # decode the announced host name, OS, server-type ROLES, and
-                # comment — the passive-inventory / role-identification goldmine.
-                if proto_label == "UDP" and (sport == 138 or dport == 138):
-                    # Read the full UDP payload independently of how scapy
-                    # dissected the datagram (under the forced-packet-view cache
-                    # the NBT/SMB layers may be parsed, leaving pkt[Raw] empty),
-                    # so the Mailslot search always sees the browser bytes.
-                    dgm_payload = payload
-                    try:
-                        if UDP is not None and pkt.haslayer(UDP):
-                            full = bytes(pkt[UDP].payload)
-                            if len(full) > len(dgm_payload):
-                                dgm_payload = full
-                    except Exception:
-                        pass
-                    browser = _parse_browser_datagram(dgm_payload) if dgm_payload else None
-                    if browser is not None:
-                        cmd = int(browser.get("command", 0))
-                        cmd_name = str(browser.get("command_name", ""))
-                        analysis.browser_command_counts[cmd_name] += 1
-                        analysis.request_counts[f"Browser: {cmd_name}"] += 1
-                        # Announcement dest name is the target workgroup/domain.
-                        dgm_domain = _browser_dest_domain(pkt)
-                        if dgm_domain:
-                            analysis.browser_domains[dgm_domain] += 1
-
-                        if cmd == 0x0C:  # Domain/Workgroup Announcement
-                            dom = str(browser.get("domain", "") or "")
-                            if dom:
-                                analysis.browser_domains[dom] += 1
-                            # The sender is the domain's Local Master Browser.
-                            analysis.master_browsers.add(src_ip)
-
-                        if cmd in (0x01, 0x0F) and browser.get("server_name"):
-                            bhost = analysis.browser_hosts.get(src_ip)
-                            if bhost is None:
-                                bhost = BrowserHost(ip=src_ip)
-                                analysis.browser_hosts[src_ip] = bhost
-                            bhost.name = str(browser.get("server_name") or bhost.name)
-                            bhost.os_major = int(browser.get("os_major", bhost.os_major) or 0)
-                            bhost.os_minor = int(browser.get("os_minor", bhost.os_minor) or 0)
-                            bhost.server_type = int(
-                                browser.get("server_type", bhost.server_type) or 0
-                            )
-                            bhost.roles = list(browser.get("roles", bhost.roles) or [])
-                            if browser.get("comment"):
-                                bhost.comment = str(browser.get("comment"))
-                            if dgm_domain:
-                                bhost.domain = dgm_domain
-                            bhost.periodicity_s = float(
-                                browser.get("periodicity_s", bhost.periodicity_s) or 0.0
-                            )
-                            bhost.announcement_types[cmd_name] += 1
-                            bhost.announcements += 1
-                            if bhost.first_seen is None or ts < bhost.first_seen:
-                                bhost.first_seen = ts
-                            if bhost.last_seen is None or ts > bhost.last_seen:
-                                bhost.last_seen = ts
-                            if bhost.server_type & _MASTER_BROWSER_BITS:
-                                analysis.master_browsers.add(src_ip)
-                            if bhost.server_type & _DC_BITS:
-                                analysis.announced_dcs.add(src_ip)
-
-                        if cmd == 0x08:  # Request Election
-                            analysis.browser_elections += 1
-                            analysis.election_events.append(
-                                {
-                                    "src_ip": src_ip,
-                                    "criteria": int(browser.get("election_criteria", 0)),
-                                    "os_summary": int(browser.get("election_os_summary", 0)),
-                                    "desire": int(browser.get("election_desire", 0)),
-                                    "uptime_s": float(browser.get("uptime_s", 0.0)),
-                                    "server_name": str(browser.get("server_name", "")),
-                                    "ts": ts,
-                                }
+                                dst_ip,
+                                ts,
                             )
 
-                    logon = _parse_logon_mailslot(dgm_payload) if dgm_payload else None
-                    if logon is not None:
-                        analysis.request_counts[
-                            f"Logon: {logon['mailslot']}/{logon.get('op_name', '-')}"
-                        ] += 1
-                        analysis.logon_requests.append(
-                            {"src_ip": src_ip, "dst_ip": dst_ip, **logon, "ts": ts}
-                        )
-                        # Surface the queried account + querying computer as
-                        # observed identities for cross-analyzer consumers.
-                        u = str(logon.get("user", "") or "")
-                        if u:
-                            analysis.observed_users[u] += 1
-                        c = str(logon.get("computer", "") or "")
-                        if c:
-                            analysis.unique_names.add(c)
-
-                # Session/SMB tracking (TCP/139)
-                if proto_label == "TCP" and (sport == 139 or dport == 139):
-                    sess_key = (src_ip, dst_ip, sport, dport)
-                    sess = sessions.get(sess_key)
-                    if sess is None:
-                        sess = NetbiosSession(
-                            src_ip=src_ip, dst_ip=dst_ip, src_port=sport, dst_port=dport
-                        )
-                        sessions[sess_key] = sess
-                    sess.packets += 1
-                    _update_time(sess, ts)
-
-                    is_client_to_server = dport == 139
-                    if is_client_to_server:
-                        analysis.smb_clients[src_ip] += 1
-                        analysis.smb_servers[dst_ip] += 1
-
-                    if payload and len(payload) >= 4:
-                        msg_type = payload[0]
-                        nbss_type_map = {
-                            0x00: "Session Message",
-                            0x81: "Session Request",
-                            0x82: "Positive Session Response",
-                            0x83: "Negative Session Response",
-                            0x84: "Retarget Session Response",
-                            0x85: "Session Keepalive",
-                        }
-                        msg_name = nbss_type_map.get(msg_type, f"Type 0x{msg_type:02X}")
-                        analysis.nbss_message_types[msg_name] += 1
-
-                        flow_key = f"{src_ip}:{sport}->{dst_ip}:{dport}"
-                        if msg_type == 0x85:
-                            previous = keepalive_last_ts.get(flow_key)
-                            if previous is not None and ts > previous:
-                                keepalive_intervals[flow_key].append(ts - previous)
-                            keepalive_last_ts[flow_key] = ts
-
-                        if msg_type == 0x83:
-                            smb_negative_sessions[src_ip] += 1
-
-                        if msg_type == 0x00 and len(payload) > 4:
-                            nbss_payload = payload[4:]
-                            if nbss_payload.startswith(b"\xffSMB"):
-                                analysis.smb_versions["SMB1"] += 1
-                            if nbss_payload.startswith(b"\xfeSMB"):
-                                analysis.smb_versions["SMB2/3"] += 1
-
-                            cmd_name = _parse_smb_command(nbss_payload)
-                            if cmd_name:
-                                analysis.smb_commands[cmd_name] += 1
-                                if any(
-                                    token in cmd_name for token in SUSPICIOUS_SMB_TOKENS
-                                ):
-                                    analysis.suspicious_smb_commands[cmd_name] += 1
-                                if "Session Setup" in cmd_name and is_client_to_server:
-                                    smb_session_setup_attempts[src_ip] += 1
-                                if "Write" in cmd_name and is_client_to_server:
-                                    smb_write_commands[src_ip] += 1
-                                    smb_write_bytes[src_ip] += len(nbss_payload)
-
-                            user, domain, workstation = _parse_ntlm_type3(nbss_payload)
-                            if user:
-                                analysis.smb_users[user] += 1
-                                analysis.smb_sources[src_ip] += 1
-                                analysis.smb_destinations[dst_ip] += 1
-                                key = (src_ip, dst_ip, user, domain or "", sport, dport)
-                                if key not in user_evidence_seen:
-                                    user_evidence_seen.add(key)
-                                    analysis.user_evidence.append(
-                                        {
-                                            "src_ip": src_ip,
-                                            "dst_ip": dst_ip,
-                                            "src_port": sport,
-                                            "dst_port": dport,
-                                            "username": user,
-                                            "domain": domain,
-                                            "workstation": workstation,
-                                            "method": "NetBIOS SMB Session Setup",
-                                            "details": cmd_name or "SMB over NetBIOS",
-                                        }
-                                    )
-                            if domain:
-                                analysis.smb_domains[domain] += 1
-                            if workstation:
-                                analysis.observed_users[workstation] += 1
-
-                            for name in _scan_filenames(nbss_payload):
-                                file_set.add(name)
-
-                # Broadcast storm heuristic
-                ts_sec = int(ts)
-                packet_rate_tracker[ts_sec][src_ip] += 1
-                if (
-                    packet_rate_tracker[ts_sec][src_ip] > 200
-                    and src_ip not in storm_flagged
-                ):
-                    storm_flagged.add(src_ip)
-                    analysis.threat_summary["Broadcast/Name Storm"] += 1
-                    _append_anomaly(
-                        "MEDIUM",
-                        "BroadcastStorm",
-                        f"High NetBIOS packet rate from {src_ip} in one second.",
-                        src_ip,
-                        dst_ip,
-                        ts,
+                    rr_name = getattr(nbns, "RR_NAME", None)
+                    parsed_name, parsed_suffix = _parse_name_text(rr_name)
+                    if parsed_name and parsed_suffix is None:
+                        parsed_suffix = _infer_suffix_from_name(parsed_name)
+                    rr_name_text = (
+                        f"{parsed_name}<{parsed_suffix:02X}>"
+                        if (parsed_name and parsed_suffix is not None)
+                        else parsed_name
                     )
+                    # Read the NBNS group bit from the response address entry:
+                    # G=Group registrations (workgroup/domain) are answered by
+                    # many hosts by design and must not be flagged.
+                    entry_is_group = False
+                    try:
+                        for _entry in getattr(nbns, "ADDR_ENTRY", []) or []:
+                            g_val = getattr(_entry, "G", None)
+                            if (isinstance(g_val, int) and g_val == 1) or (
+                                isinstance(g_val, str) and "group" in g_val.lower()
+                            ):
+                                entry_is_group = True
+                                break
+                    except Exception:
+                        entry_is_group = False
+                    if rr_name_text:
+                        response_name_registry[rr_name_text].add(src_ip)
+                        # Names legitimately answered by MANY hosts and never a
+                        # poisoning signal: <1C> domain controllers, <1D> master
+                        # browser, <1E> browser elections, the group bit, and the
+                        # well-known workgroup/browser group names.
+                        base_name = (parsed_name or "").upper()
+                        is_group_name = (
+                            parsed_suffix in (0x1C, 0x1D, 0x1E)
+                            or entry_is_group
+                            or base_name in _NBNS_GROUP_NAMES
+                        )
+                        if (
+                            len(response_name_registry[rr_name_text]) > 1
+                            and not is_group_name
+                        ):
+                            analysis.threat_summary["NBNS Response Spoofing"] += 1
+                            analysis.name_conflicts += 1
+                            _append_anomaly(
+                                "HIGH",
+                                "NBNS Spoofing / Name Conflict",
+                                f"Unique NetBIOS name {rr_name_text} answered by multiple hosts (possible NBNS poisoning): {', '.join(sorted(response_name_registry[rr_name_text]))}",
+                                src_ip,
+                                dst_ip,
+                                ts,
+                            )
+                    if parsed_name:
+                        addr_entries = getattr(nbns, "ADDR_ENTRY", []) or []
+                        entry_scope = _scope_from_suffix(
+                            parsed_suffix if parsed_suffix is not None else 0x00
+                        )
+                        if isinstance(addr_entries, list) and addr_entries:
+                            try:
+                                g_raw = getattr(addr_entries[0], "G", None)
+                                if isinstance(g_raw, int):
+                                    if int(g_raw) == 1:
+                                        entry_scope = "GROUP"
+                                    elif int(g_raw) == 0:
+                                        entry_scope = "UNIQUE"
+                                else:
+                                    g_value = str(g_raw or "").lower()
+                                    if "group" in g_value:
+                                        entry_scope = "GROUP"
+                                    elif "unique" in g_value:
+                                        entry_scope = "UNIQUE"
+                            except Exception:
+                                pass
+                        if parsed_name.upper() == "__MSBROWSE__":
+                            entry_scope = "GROUP"
+                        _add_host_name(
+                            src_ip,
+                            parsed_name,
+                            int(
+                                parsed_suffix if parsed_suffix is not None else 0x00
+                            ),
+                            entry_scope,
+                            "Registered",
+                            "NBNS Response",
+                        )
+                except Exception as exc:
+                    analysis.errors.append(f"NBNS response parse: {exc}")
+
+            if NBNSNodeStatusResponse is not None and pkt.haslayer(
+                NBNSNodeStatusResponse
+            ):
+                try:
+                    node_status = pkt[NBNSNodeStatusResponse]
+                    entries = _extract_node_status_entries(node_status)
+                    for name, suffix, scope, status in entries:
+                        _add_host_name(
+                            src_ip, name, suffix, scope, status, "NBSTAT"
+                        )
+                        analysis.unique_names.add(f"{name}<{suffix:02X}>")
+                except Exception as exc:
+                    analysis.errors.append(f"NBNS node status parse: {exc}")
+
+            # Browser (MS-BRWS) datagram dissection (UDP/138). Parse the
+            # Mailslot \MAILSLOT\BROWSE command and, for announcements,
+            # decode the announced host name, OS, server-type ROLES, and
+            # comment — the passive-inventory / role-identification goldmine.
+            if proto_label == "UDP" and (sport == 138 or dport == 138):
+                # Read the full UDP payload independently of how scapy
+                # dissected the datagram (under the forced-packet-view cache
+                # the NBT/SMB layers may be parsed, leaving pkt[Raw] empty),
+                # so the Mailslot search always sees the browser bytes.
+                dgm_payload = payload
+                try:
+                    if UDP is not None and pkt.haslayer(UDP):
+                        full = bytes(pkt[UDP].payload)
+                        if len(full) > len(dgm_payload):
+                            dgm_payload = full
+                except Exception:
+                    pass
+                browser = _parse_browser_datagram(dgm_payload) if dgm_payload else None
+                if browser is not None:
+                    cmd = int(browser.get("command", 0))
+                    cmd_name = str(browser.get("command_name", ""))
+                    analysis.browser_command_counts[cmd_name] += 1
+                    analysis.request_counts[f"Browser: {cmd_name}"] += 1
+                    # Announcement dest name is the target workgroup/domain.
+                    dgm_domain = _browser_dest_domain(pkt)
+                    if dgm_domain:
+                        analysis.browser_domains[dgm_domain] += 1
+
+                    if cmd == 0x0C:  # Domain/Workgroup Announcement
+                        dom = str(browser.get("domain", "") or "")
+                        if dom:
+                            analysis.browser_domains[dom] += 1
+                        # The sender is the domain's Local Master Browser.
+                        analysis.master_browsers.add(src_ip)
+
+                    if cmd in (0x01, 0x0F) and browser.get("server_name"):
+                        bhost = analysis.browser_hosts.get(src_ip)
+                        if bhost is None:
+                            bhost = BrowserHost(ip=src_ip)
+                            analysis.browser_hosts[src_ip] = bhost
+                        bhost.name = str(browser.get("server_name") or bhost.name)
+                        bhost.os_major = int(browser.get("os_major", bhost.os_major) or 0)
+                        bhost.os_minor = int(browser.get("os_minor", bhost.os_minor) or 0)
+                        bhost.server_type = int(
+                            browser.get("server_type", bhost.server_type) or 0
+                        )
+                        bhost.roles = list(browser.get("roles", bhost.roles) or [])
+                        if browser.get("comment"):
+                            bhost.comment = str(browser.get("comment"))
+                        if dgm_domain:
+                            bhost.domain = dgm_domain
+                        bhost.periodicity_s = float(
+                            browser.get("periodicity_s", bhost.periodicity_s) or 0.0
+                        )
+                        bhost.announcement_types[cmd_name] += 1
+                        bhost.announcements += 1
+                        if bhost.first_seen is None or ts < bhost.first_seen:
+                            bhost.first_seen = ts
+                        if bhost.last_seen is None or ts > bhost.last_seen:
+                            bhost.last_seen = ts
+                        if bhost.server_type & _MASTER_BROWSER_BITS:
+                            analysis.master_browsers.add(src_ip)
+                        if bhost.server_type & _DC_BITS:
+                            analysis.announced_dcs.add(src_ip)
+
+                    if cmd == 0x08:  # Request Election
+                        analysis.browser_elections += 1
+                        analysis.election_events.append(
+                            {
+                                "src_ip": src_ip,
+                                "criteria": int(browser.get("election_criteria", 0)),
+                                "os_summary": int(browser.get("election_os_summary", 0)),
+                                "desire": int(browser.get("election_desire", 0)),
+                                "uptime_s": float(browser.get("uptime_s", 0.0)),
+                                "server_name": str(browser.get("server_name", "")),
+                                "ts": ts,
+                            }
+                        )
+
+                logon = _parse_logon_mailslot(dgm_payload) if dgm_payload else None
+                if logon is not None:
+                    analysis.request_counts[
+                        f"Logon: {logon['mailslot']}/{logon.get('op_name', '-')}"
+                    ] += 1
+                    analysis.logon_requests.append(
+                        {"src_ip": src_ip, "dst_ip": dst_ip, **logon, "ts": ts}
+                    )
+                    # Surface the queried account + querying computer as
+                    # observed identities for cross-analyzer consumers.
+                    u = str(logon.get("user", "") or "")
+                    if u:
+                        analysis.observed_users[u] += 1
+                    c = str(logon.get("computer", "") or "")
+                    if c:
+                        analysis.unique_names.add(c)
+
+            # Session/SMB tracking (TCP/139)
+            if proto_label == "TCP" and (sport == 139 or dport == 139):
+                sess_key = (src_ip, dst_ip, sport, dport)
+                sess = sessions.get(sess_key)
+                if sess is None:
+                    sess = NetbiosSession(
+                        src_ip=src_ip, dst_ip=dst_ip, src_port=sport, dst_port=dport
+                    )
+                    sessions[sess_key] = sess
+                sess.packets += 1
+                _update_time(sess, ts)
+
+                is_client_to_server = dport == 139
+                if is_client_to_server:
+                    analysis.smb_clients[src_ip] += 1
+                    analysis.smb_servers[dst_ip] += 1
+
+                if payload and len(payload) >= 4:
+                    msg_type = payload[0]
+                    nbss_type_map = {
+                        0x00: "Session Message",
+                        0x81: "Session Request",
+                        0x82: "Positive Session Response",
+                        0x83: "Negative Session Response",
+                        0x84: "Retarget Session Response",
+                        0x85: "Session Keepalive",
+                    }
+                    msg_name = nbss_type_map.get(msg_type, f"Type 0x{msg_type:02X}")
+                    analysis.nbss_message_types[msg_name] += 1
+
+                    flow_key = f"{src_ip}:{sport}->{dst_ip}:{dport}"
+                    if msg_type == 0x85:
+                        previous = keepalive_last_ts.get(flow_key)
+                        if previous is not None and ts > previous:
+                            keepalive_intervals[flow_key].append(ts - previous)
+                        keepalive_last_ts[flow_key] = ts
+
+                    if msg_type == 0x83:
+                        smb_negative_sessions[src_ip] += 1
+
+                    if msg_type == 0x00 and len(payload) > 4:
+                        nbss_payload = payload[4:]
+                        if nbss_payload.startswith(b"\xffSMB"):
+                            analysis.smb_versions["SMB1"] += 1
+                        if nbss_payload.startswith(b"\xfeSMB"):
+                            analysis.smb_versions["SMB2/3"] += 1
+
+                        cmd_name = _parse_smb_command(nbss_payload)
+                        if cmd_name:
+                            analysis.smb_commands[cmd_name] += 1
+                            if any(
+                                token in cmd_name for token in SUSPICIOUS_SMB_TOKENS
+                            ):
+                                analysis.suspicious_smb_commands[cmd_name] += 1
+                            if "Session Setup" in cmd_name and is_client_to_server:
+                                smb_session_setup_attempts[src_ip] += 1
+                            if "Write" in cmd_name and is_client_to_server:
+                                smb_write_commands[src_ip] += 1
+                                smb_write_bytes[src_ip] += len(nbss_payload)
+
+                        user, domain, workstation = _parse_ntlm_type3(nbss_payload)
+                        if user:
+                            analysis.smb_users[user] += 1
+                            analysis.smb_sources[src_ip] += 1
+                            analysis.smb_destinations[dst_ip] += 1
+                            key = (src_ip, dst_ip, user, domain or "", sport, dport)
+                            if key not in user_evidence_seen:
+                                user_evidence_seen.add(key)
+                                analysis.user_evidence.append(
+                                    {
+                                        "src_ip": src_ip,
+                                        "dst_ip": dst_ip,
+                                        "src_port": sport,
+                                        "dst_port": dport,
+                                        "username": user,
+                                        "domain": domain,
+                                        "workstation": workstation,
+                                        "method": "NetBIOS SMB Session Setup",
+                                        "details": cmd_name or "SMB over NetBIOS",
+                                    }
+                                )
+                        if domain:
+                            analysis.smb_domains[domain] += 1
+                        if workstation:
+                            analysis.observed_users[workstation] += 1
+
+                        for name in _scan_filenames(nbss_payload):
+                            file_set.add(name)
+
+            # Broadcast storm heuristic
+            ts_sec = int(ts)
+            packet_rate_tracker[ts_sec][src_ip] += 1
+            if (
+                packet_rate_tracker[ts_sec][src_ip] > 200
+                and src_ip not in storm_flagged
+            ):
+                storm_flagged.add(src_ip)
+                analysis.threat_summary["Broadcast/Name Storm"] += 1
+                _append_anomaly(
+                    "MEDIUM",
+                    "BroadcastStorm",
+                    f"High NetBIOS packet rate from {src_ip} in one second.",
+                    src_ip,
+                    dst_ip,
+                    ts,
+                )
 
     except Exception as exc:
         analysis.errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        try:
-            reader.close()
-        except Exception:
-            pass
 
     if start_time is not None and last_time is not None:
         analysis.duration = max(0.0, last_time - start_time)

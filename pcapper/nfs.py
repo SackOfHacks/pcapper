@@ -13,8 +13,16 @@ try:
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
 
-from .pcap_cache import get_reader
-from .utils import counter_inc, decode_payload, extract_packet_endpoints, memoize_analysis, safe_float, set_add_cap
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import (
+    counter_inc,
+    decode_payload,
+    extract_ascii_strings,
+    extract_packet_endpoints,
+    memoize_analysis,
+    safe_float,
+    set_add_cap,
+)
 
 RPC_CALL = 0
 RPC_REPLY = 1
@@ -188,21 +196,6 @@ def _get_ip_pair(pkt: Packet) -> Tuple[str, str]:
     return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
 
-def _extract_strings(data: bytes, min_len: int = 4) -> Set[str]:
-    results: Set[str] = set()
-    current = bytearray()
-    for b in data:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= min_len:
-                results.add(decode_payload(current, encoding="latin-1"))
-            current = bytearray()
-    if len(current) >= min_len:
-        results.add(decode_payload(current, encoding="latin-1"))
-    return results
-
-
 def _strip_record_marker(payload: bytes) -> bytes:
     if len(payload) < 4:
         return payload
@@ -239,7 +232,12 @@ def _parse_auth_unix(blob: bytes) -> Tuple[Optional[str], Optional[int], Optiona
 
 
 @memoize_analysis
-def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
+def analyze_nfs(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> NfsSummary:
     if TCP is None:
         return NfsSummary(
             path,
@@ -262,35 +260,6 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
             Counter(),
             ["Scapy not available"],
         )
-
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as exc:
-        return NfsSummary(
-            path,
-            0,
-            0,
-            Counter(),
-            Counter(),
-            Counter(),
-            Counter(),
-            Counter(),
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            Counter(),
-            [],
-            Counter(),
-            Counter(),
-            [f"Error opening pcap: {exc}"],
-        )
-
-    size_bytes = size_bytes
 
     total_packets = 0
     nfs_packets = 0
@@ -336,15 +305,7 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
         return cli
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             if TCP in pkt or UDP in pkt:
                 sport = (
@@ -487,7 +448,7 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
                     )
                     sessions[xid] = sess
 
-                    strings = _extract_strings(rpc_payload[32 + _rpc_align(cred_len) :])
+                    strings = set(extract_ascii_strings(rpc_payload[32 + _rpc_align(cred_len) :]))
                     for text in strings:
                         if "/" in text or "." in text:
                             set_add_cap(artifacts, text)
@@ -556,9 +517,6 @@ def analyze_nfs(path: Path, show_status: bool = True) -> NfsSummary:
 
     except Exception as e:
         errors.append(str(e))
-    finally:
-        status.finish()
-        reader.close()
 
     # Bulk file access from one client — many distinct files read/written in a
     # session is the signature of data harvesting/exfil or ransomware-style mass

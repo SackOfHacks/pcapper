@@ -9,9 +9,15 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qsl, unquote_plus, urlsplit
 
-from .pcap_cache import PcapMeta, get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .services import COMMON_PORTS
-from .utils import decode_payload, extract_packet_endpoints, memoize_analysis, safe_float, get_packet_ports as _get_ports, is_public_ip as _util_is_public_ip
+from .utils import (
+    decode_payload,
+    extract_packet_endpoints,
+    is_public_ip,
+    memoize_analysis,
+    safe_float,
+)
 
 try:
     from .cip import (
@@ -290,6 +296,28 @@ OT_DROP_TOKENS = {
 }
 OT_WRITE_SERVICE_CODES = set(WRITE_SERVICE_CODES) | {0x0F, 0x4C, 0x4E, 0x4F}
 
+# These run per candidate token / per line of every payload; compile once.
+_HEX16_RE = re.compile(r"[0-9a-f]{16,}")
+_HEX_GUID_RE = re.compile(r"[0-9a-f-]{32,}")
+_BASE64_24_RE = re.compile(r"[A-Za-z0-9+/=]{24,}")
+_BASE64_20_RE = re.compile(r"[A-Za-z0-9+/=]{20,}")
+_BASE64_8_RE = re.compile(r"[A-Za-z0-9+/=]{8,}")
+_HEX_ANY16_RE = re.compile(r"[0-9a-fA-F]{16,}")
+_USERNAME_SHAPE_RE = re.compile(r"[A-Za-z0-9._@\\-]{3,96}")
+_FTP_CMD_RE = re.compile(r"(?i)^(USER|PASS|ACCT|AUTH|SYST|FEAT|CWD|PWD|TYPE|PASV|PORT|RETR|STOR)\b")
+_POP_CMD_RE = re.compile(r"(?i)^(USER|PASS|APOP|AUTH)\b")
+_IMAP_CMD_RE = re.compile(r"(?i)^\w+\s+LOGIN\s+")
+_SMTP_CMD_RE = re.compile(r"(?i)^(EHLO|HELO|AUTH|MAIL FROM|RCPT TO|DATA)\b")
+_NUMERIC_REPLY_RE = re.compile(r"^\d{3}[ -]")
+_NUMERIC_CODE_RE = re.compile(r"^\d{3}\b")
+_TELNET_USER_RE = re.compile(r"(?im)\b(?:login|username)\s*[:=]\s*([^\r\n]{1,96})")
+_TELNET_PASS_RE = re.compile(r"(?im)\b(?:password|passwd|passcode)\s*[:=]\s*([^\r\n]{1,160})")
+_VALUE_SPLIT_RE = re.compile(r"[!,:;|/\\]+")
+_CAMEL_SPLIT_RE = re.compile(r"([a-z0-9])([A-Z])")
+_NON_ALNUM_RE = re.compile(r"[^A-Za-z0-9]+")
+# Request URLs remembered to attribute URL-mined credentials to a packet.
+_MAX_URL_OBSERVATIONS = 20000
+
 
 @dataclass(frozen=True)
 class CredentialHit:
@@ -340,27 +368,29 @@ def _service_name(sport: Optional[int], dport: Optional[int], proto: str) -> str
     return proto
 
 
-def _extract_payload(pkt: Packet) -> bytes:
-    if Raw is not None and Raw in pkt:
-        try:
-            return bytes(pkt[Raw])
-        except Exception:
-            return b""
-    if TCP is not None and TCP in pkt:
-        try:
-            return bytes(pkt[TCP].payload)
-        except Exception:
-            return b""
-    if UDP is not None and UDP in pkt:
-        try:
-            return bytes(pkt[UDP].payload)
-        except Exception:
-            return b""
-    return b""
-
-
-def _safe_decode(value: bytes) -> str:
-    return decode_payload(value, encoding="latin-1")
+def _transport_and_payload(pkt: Packet) -> tuple[Optional[int], Optional[int], str, bytes]:
+    """(sport, dport, transport label, payload bytes) resolved with one walk each."""
+    transport = pkt.getlayer(TCP) if TCP is not None else None
+    proto = "TCP"
+    if transport is None and UDP is not None:
+        transport = pkt.getlayer(UDP)
+        proto = "UDP"
+    if transport is None:
+        proto = "OTHER"
+    sport = dport = None
+    if transport is not None:
+        sport = int(getattr(transport, "sport", 0) or 0)
+        dport = int(getattr(transport, "dport", 0) or 0)
+    raw_layer = pkt.getlayer(Raw) if Raw is not None else None
+    payload = b""
+    try:
+        if raw_layer is not None:
+            payload = bytes(raw_layer)
+        elif transport is not None:
+            payload = bytes(transport.payload)
+    except Exception:
+        payload = b""
+    return sport, dport, proto, payload
 
 
 def _build_context(text: str, needle: str, max_len: int = 80) -> str:
@@ -497,13 +527,13 @@ def _is_likely_username(value: str) -> bool:
         return False
     if lower.startswith("0x"):
         return False
-    if re.fullmatch(r"[0-9a-f]{16,}", lower):
+    if _HEX16_RE.fullmatch(lower):
         return False
-    if re.fullmatch(r"[0-9a-f-]{32,}", lower):
+    if _HEX_GUID_RE.fullmatch(lower):
         return False
-    if re.fullmatch(r"[A-Za-z0-9+/=]{24,}", token):
+    if _BASE64_24_RE.fullmatch(token):
         return False
-    if not re.fullmatch(r"[A-Za-z0-9._@\\-]{3,96}", token):
+    if not _USERNAME_SHAPE_RE.fullmatch(token):
         return False
     return any(ch.isalpha() for ch in token)
 
@@ -512,9 +542,9 @@ def _is_likely_secret(value: str) -> bool:
     token = value.strip().strip("\"'").strip()
     if len(token) < 6:
         return False
-    if re.fullmatch(r"[A-Za-z0-9+/=]{20,}", token):
+    if _BASE64_20_RE.fullmatch(token):
         return True
-    if re.fullmatch(r"[0-9a-fA-F]{16,}", token):
+    if _HEX_ANY16_RE.fullmatch(token):
         return True
     has_upper = any(ch.isupper() for ch in token)
     has_lower = any(ch.islower() for ch in token)
@@ -1081,60 +1111,69 @@ def _looks_like_http(
     return False
 
 
+def _head_lines(text: str, lines: Optional[list[str]] = None) -> list[str]:
+    """The first 12 non-blank, stripped lines — shared by the protocol sniffers."""
+    if lines is not None:
+        return lines
+    return [line.strip() for line in text.splitlines() if line.strip()][:12]
+
+
 def _looks_like_ftp(
-    text: str, sport: Optional[int], dport: Optional[int], service: str
+    text: str,
+    sport: Optional[int],
+    dport: Optional[int],
+    service: str,
+    lines: Optional[list[str]] = None,
 ) -> bool:
     if service == "FTP" or _ports_match(sport, dport, FTP_PORTS):
         return True
-    lines = [line.strip() for line in text.splitlines() if line.strip()][:12]
-    cmd_hits = sum(
-        1
-        for line in lines
-        if re.match(
-            r"(?i)^(USER|PASS|ACCT|AUTH|SYST|FEAT|CWD|PWD|TYPE|PASV|PORT|RETR|STOR)\b",
-            line,
-        )
-    )
-    response_hits = sum(1 for line in lines if re.match(r"^\d{3}[ -]", line))
+    head = _head_lines(text, lines)
+    cmd_hits = sum(1 for line in head if _FTP_CMD_RE.match(line))
+    response_hits = sum(1 for line in head if _NUMERIC_REPLY_RE.match(line))
     return cmd_hits >= 2 or (cmd_hits >= 1 and response_hits >= 1)
 
 
 def _looks_like_pop3(
-    text: str, sport: Optional[int], dport: Optional[int], service: str
+    text: str,
+    sport: Optional[int],
+    dport: Optional[int],
+    service: str,
+    lines: Optional[list[str]] = None,
 ) -> bool:
     if service == "POP3" or _ports_match(sport, dport, POP3_PORTS):
         return True
-    lines = [line.strip() for line in text.splitlines() if line.strip()][:12]
-    cmd_hits = sum(
-        1 for line in lines if re.match(r"(?i)^(USER|PASS|APOP|AUTH)\b", line)
-    )
+    head = _head_lines(text, lines)
+    cmd_hits = sum(1 for line in head if _POP_CMD_RE.match(line))
     response_hits = sum(
-        1 for line in lines if line.startswith("+OK") or line.startswith("-ERR")
+        1 for line in head if line.startswith("+OK") or line.startswith("-ERR")
     )
     return cmd_hits >= 2 or (cmd_hits >= 1 and response_hits >= 1)
 
 
 def _looks_like_imap(
-    text: str, sport: Optional[int], dport: Optional[int], service: str
+    text: str,
+    sport: Optional[int],
+    dport: Optional[int],
+    service: str,
+    lines: Optional[list[str]] = None,
 ) -> bool:
     if service == "IMAP" or _ports_match(sport, dport, IMAP_PORTS):
         return True
-    lines = [line.strip() for line in text.splitlines() if line.strip()][:12]
-    return any(re.match(r"(?i)^\w+\s+LOGIN\s+", line) for line in lines)
+    return any(_IMAP_CMD_RE.match(line) for line in _head_lines(text, lines))
 
 
 def _looks_like_smtp(
-    text: str, sport: Optional[int], dport: Optional[int], service: str
+    text: str,
+    sport: Optional[int],
+    dport: Optional[int],
+    service: str,
+    lines: Optional[list[str]] = None,
 ) -> bool:
     if service == "SMTP" or _ports_match(sport, dport, SMTP_PORTS):
         return True
-    lines = [line.strip() for line in text.splitlines() if line.strip()][:12]
-    cmd_hits = sum(
-        1
-        for line in lines
-        if re.match(r"(?i)^(EHLO|HELO|AUTH|MAIL FROM|RCPT TO|DATA)\b", line)
-    )
-    response_hits = sum(1 for line in lines if re.match(r"^\d{3}[ -]", line))
+    head = _head_lines(text, lines)
+    cmd_hits = sum(1 for line in head if _SMTP_CMD_RE.match(line))
+    response_hits = sum(1 for line in head if _NUMERIC_REPLY_RE.match(line))
     return cmd_hits >= 1 and response_hits >= 1
 
 
@@ -1322,13 +1361,13 @@ def _extract_http_query_creds(
 
             # Common username-style keys in query strings.
             if key_n in user_keys:
-                candidate = re.split(r"[!,:;|/\\]+", cleaned, maxsplit=1)[0]
+                candidate = _VALUE_SPLIT_RE.split(cleaned, maxsplit=1)[0]
                 user = _clean_value(candidate, allow_spaces=False, max_len=96)
                 if user and _is_likely_username(user):
                     _add_hit("HTTP Query Username", user, None, f"{key}={cleaned}")
 
             # Privileged account hints embedded in non-standard keys (for example guid=ADMINISTRATOR!HOST!...)
-            for token in re.split(r"[!,:;|/\\]+", cleaned):
+            for token in _VALUE_SPLIT_RE.split(cleaned):
                 candidate = _clean_value(token, allow_spaces=False, max_len=96)
                 if not candidate:
                     continue
@@ -1498,16 +1537,14 @@ def _extract_mail_auth(
                 elif "password" in decoded_challenge:
                     awaiting_login = "password"
                 continue
-            if re.match(r"^\d{3}\b", stripped):
+            if _NUMERIC_CODE_RE.match(stripped):
                 if stripped.startswith(("235", "535", "454", "530")):
                     auth_login_seen = False
                     awaiting_login = ""
                     pending_login_user = ""
                 continue
             token = stripped
-            if awaiting_login in {"username", "password"} and re.fullmatch(
-                r"[A-Za-z0-9+/=]{8,}", token
-            ):
+            if awaiting_login in {"username", "password"} and _BASE64_8_RE.fullmatch(token):
                 decoded = _decode_base64(token)
                 cleaned = _clean_value(decoded or "", allow_spaces=False, max_len=256)
                 if cleaned:
@@ -1589,15 +1626,11 @@ def _extract_telnet_creds(
     text: str,
 ) -> list[tuple[str, Optional[str], Optional[str], str]]:
     hits: list[tuple[str, Optional[str], Optional[str], str]] = []
-    for match in re.finditer(
-        r"(?im)\b(?:login|username)\s*[:=]\s*([^\r\n]{1,96})", text
-    ):
+    for match in _TELNET_USER_RE.finditer(text):
         user = _clean_value(match.group(1), allow_spaces=False, max_len=96)
         if user and _is_likely_username(user):
             hits.append(("TELNET Username", user, None, match.group(0).strip()))
-    for match in re.finditer(
-        r"(?im)\b(?:password|passwd|passcode)\s*[:=]\s*([^\r\n]{1,160})", text
-    ):
+    for match in _TELNET_PASS_RE.finditer(text):
         secret = _clean_value(match.group(1), allow_spaces=False, max_len=160)
         if secret:
             hits.append(("TELNET Password", None, secret, match.group(0).strip()))
@@ -1797,7 +1830,7 @@ def _extract_xml_creds(
 
 def _normalize_printable(value: bytes | str, max_len: int = 240) -> str:
     if isinstance(value, bytes):
-        text = _safe_decode(value)
+        text = decode_payload(value, encoding="latin-1")
     else:
         text = value
     cleaned = "".join(ch if ch.isprintable() else " " for ch in text)
@@ -1808,8 +1841,8 @@ def _normalize_printable(value: bytes | str, max_len: int = 240) -> str:
 def _tokenize_identifier(value: str) -> list[str]:
     if not value:
         return []
-    split_camel = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
-    cleaned = re.sub(r"[^A-Za-z0-9]+", " ", split_camel).lower()
+    split_camel = _CAMEL_SPLIT_RE.sub(r"\1 \2", value)
+    cleaned = _NON_ALNUM_RE.sub(" ", split_camel).lower()
     return [part for part in cleaned.split() if part]
 
 
@@ -2057,19 +2090,12 @@ def analyze_creds(
             path, 0, 0, [], False, Counter(), Counter(), ["Scapy not available"]
         )
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, packets=packets, meta=meta, show_status=show_status
-        )
-    except Exception as exc:
-        return CredentialSummary(
-            path, 0, 0, [], False, Counter(), Counter(), [f"Error opening pcap: {exc}"]
-        )
-
     total_packets = 0
     matches = 0
     hits: list[CredentialHit] = []
     errors: list[str] = []
+    skipped_packets = 0
+    first_skip_error: str | None = None
     kind_counts: Counter[str] = Counter()
     user_counts: Counter[str] = Counter()
     confidence_counts: Counter[str] = Counter()
@@ -2081,36 +2107,30 @@ def analyze_creds(
         str, tuple[int, Optional[float], str, str, Optional[int], Optional[int]]
     ] = {}
 
-    try:
-        for pkt in reader:
-            total_packets += 1
-
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
-            payload = _extract_payload(pkt)  # type: ignore[arg-type]
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        try:
+            src_port, dst_port, proto, payload = _transport_and_payload(pkt)
             if not payload:
                 continue
 
             src_ip, dst_ip = _get_ip_pair(pkt)  # type: ignore[arg-type]
-            src_port, dst_port, proto = _get_ports(pkt)  # type: ignore[arg-type]
             service = _service_name(src_port, dst_port, proto)
             ts = safe_float(getattr(pkt, "time", None))
 
-            seen: set[tuple[str, Optional[str], Optional[str], str]] = set()
+            # Insertion-ordered: a set here made the hit order within a packet
+            # follow the per-process string hash seed, so two runs of the same
+            # capture could list the same credentials in a different order.
+            seen: dict[tuple[str, Optional[str], Optional[str], str], None] = {}
 
-            text = _safe_decode(payload)
+            text = decode_payload(payload, encoding="latin-1")
             lines = text.splitlines()
+            head = [line.strip() for line in lines if line.strip()][:12]
             looks_http = _looks_like_http(text, src_port, dst_port, service)
-            looks_ftp = _looks_like_ftp(text, src_port, dst_port, service)
-            looks_pop3 = _looks_like_pop3(text, src_port, dst_port, service)
-            looks_imap = _looks_like_imap(text, src_port, dst_port, service)
-            looks_smtp = _looks_like_smtp(text, src_port, dst_port, service)
+            looks_ftp = _looks_like_ftp(text, src_port, dst_port, service, head)
+            looks_pop3 = _looks_like_pop3(text, src_port, dst_port, service, head)
+            looks_imap = _looks_like_imap(text, src_port, dst_port, service, head)
+            looks_smtp = _looks_like_smtp(text, src_port, dst_port, service, head)
             looks_telnet = _looks_like_telnet(text, src_port, dst_port, service)
             looks_tftp = _looks_like_tftp(payload, src_port, dst_port, service)
             looks_smb_netbios = _looks_like_smb_netbios(
@@ -2130,7 +2150,11 @@ def analyze_creds(
 
             if looks_http:
                 for observed_url in _extract_http_request_urls(text):
-                    if observed_url and observed_url not in http_url_observations:
+                    if (
+                        observed_url
+                        and observed_url not in http_url_observations
+                        and len(http_url_observations) < _MAX_URL_OBSERVATIONS
+                    ):
                         http_url_observations[observed_url] = (
                             total_packets,
                             ts,
@@ -2149,13 +2173,13 @@ def analyze_creds(
                 # continuation packets carry no request line and are skipped.
                 if HTTP_REQUEST_LINE_RE.search(text):
                     for item in _extract_http_basic(text):
-                        seen.add(item)
+                        seen[item] = None
                     for item in _extract_http_query_creds(text):
-                        seen.add(item)
+                        seen[item] = None
                     for item in _extract_kv_creds(text, kind_prefix="HTTP "):
-                        seen.add(item)
+                        seen[item] = None
                     for item in _extract_xml_creds(text, kind_prefix="HTTP "):
-                        seen.add(item)
+                        seen[item] = None
             elif not (
                 looks_telnet or looks_ftp or looks_pop3 or looks_imap or looks_smtp
             ):
@@ -2165,11 +2189,11 @@ def analyze_creds(
                 # same line is reported twice (e.g. "Credential Field" and
                 # "TELNET Credential Field" for one telnet login prompt).
                 for item in _extract_kv_creds(text):
-                    seen.add(item)
+                    seen[item] = None
                 for item in _extract_prompt_creds(text):
-                    seen.add(item)
+                    seen[item] = None
                 for item in _extract_xml_creds(text):
-                    seen.add(item)
+                    seen[item] = None
 
             for item in _extract_line_creds(
                 text,
@@ -2177,7 +2201,7 @@ def analyze_creds(
                 looks_pop3=looks_pop3,
                 looks_imap=looks_imap,
             ):
-                seen.add(item)
+                seen[item] = None
             if looks_smtp:
                 s_port = int(src_port or 0)
                 d_port = int(dst_port or 0)
@@ -2196,26 +2220,26 @@ def analyze_creds(
                     },
                 )
                 for item in _extract_mail_auth(lines, state):
-                    seen.add(item)
+                    seen[item] = None
             if looks_telnet:
                 for item in _extract_telnet_creds(text):
-                    seen.add(item)
+                    seen[item] = None
             if looks_tftp:
                 for item in _extract_tftp_creds(payload):
-                    seen.add(item)
+                    seen[item] = None
             if looks_smb_netbios:
                 for item in _extract_smb_netbios_ntlm_creds(
                     payload, text, src_port, dst_port, service
                 ):
-                    seen.add(item)
+                    seen[item] = None
             # LDAP simple bind (cleartext AD password) on the LDAP / Global
             # Catalog ports, and the GC ports also carry LDAP.
             if _ports_match(src_port, dst_port, {389, 3268}):
                 for item in _extract_ldap_simple_bind(payload):
-                    seen.add(item)
+                    seen[item] = None
             # SNMP v1/v2c community strings (cleartext device credentials).
             for item in _extract_snmp_community(payload, src_port, dst_port):
-                seen.add(item)
+                seen[item] = None
             # NTLM challenge/response correlation -> crackable NetNTLM hash.
             # Type 2 (server->client) carries the challenge; Type 3 the response.
             ntlm_msgs = _ntlm_messages(payload)
@@ -2234,16 +2258,16 @@ def analyze_creds(
                             built = _build_netntlm_hash(msg, challenge)
                             if built:
                                 kind, mode, hash_str = built
-                                seen.add(
+                                seen[
                                     (
                                         kind,
                                         str(msg.get("user") or "") or None,
                                         hash_str,
                                         f"offline-crackable: hashcat -m {mode}",
                                     )
-                                )
+                                ] = None
             for item in _extract_ot_protocol_creds(payload, src_port, dst_port):
-                seen.add(item)
+                seen[item] = None
 
             for kind, user, secret, evidence in seen:
                 matches += 1
@@ -2266,14 +2290,16 @@ def analyze_creds(
                             evidence=evidence,
                         )
                     )
-    except Exception as exc:
-        errors.append(str(exc))
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — one malformed payload must not end the scan
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
+
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} packet(s) skipped after a decode error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     # Supplemental HTTP URL mining: recover credentials from reconstructed request URLs
     # that may not appear contiguously in single packet payloads.
@@ -2345,6 +2371,9 @@ def analyze_creds(
         telnet_summary = analyze_telnet(
             path, show_status=False, packets=packets, meta=meta
         )
+        existing_hit_keys = {
+            (str(h.kind), h.username, h.secret, str(h.evidence)) for h in hits
+        }
         for conv in getattr(telnet_summary, "conversations", []) or []:
             conv_users = list(getattr(conv, "usernames", []) or [])
             conv_pwds = list(getattr(conv, "password_values", ()) or ())
@@ -2359,9 +2388,8 @@ def analyze_creds(
             secret = conv_pwds[0] if conv_pwds else None
             evidence = "telnet session transcript (reassembled)"
             key = ("Telnet Login", user, secret, evidence)
-            if key not in {
-                (str(h.kind), h.username, h.secret, str(h.evidence)) for h in hits
-            }:
+            if key not in existing_hit_keys:
+                existing_hit_keys.add(key)
                 matches += 1
                 kind_counts["Telnet Login"] += 1
                 if user:
@@ -2403,11 +2431,6 @@ def analyze_creds(
         "likely_benign_test_credentials": [],
     }
 
-    # Routable internet UNICAST peer. Shared helper excludes IPv6 multicast,
-    # which Python otherwise reports as is_global=True (mislabeling mDNS / ND
-    # as "credential sent to the public internet").
-    _is_public_ip = _util_is_public_ip
-
     for hit in hits:
         score = 0
         secret = str(hit.secret or "")
@@ -2421,7 +2444,7 @@ def analyze_creds(
             score += 1
         if secret and len(secret) >= 10:
             score += 1
-        if _is_public_ip(hit.dst_ip):
+        if is_public_ip(hit.dst_ip):
             score += 1
 
         if score >= 4:
@@ -2452,7 +2475,7 @@ def analyze_creds(
                 f"pkt={hit.packet_number} {hit.src_ip}->{hit.dst_ip} {hit.kind} confidence={confidence}"
             )
 
-        if _is_public_ip(hit.dst_ip):
+        if is_public_ip(hit.dst_ip):
             external_exposures.append(
                 {
                     "src": hit.src_ip,

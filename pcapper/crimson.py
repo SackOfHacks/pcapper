@@ -7,10 +7,12 @@ from .industrial_helpers import (
     IndustrialAnalysis,
     analyze_port_protocol,
 )
+from .utils import memoize_analysis
 
 CRIMSON_PORT = 789
 
 
+@memoize_analysis
 def analyze_crimson(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,

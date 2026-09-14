@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import PcapMeta, get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .services import COMMON_PORTS, _OT_SERVICE_PORTS
 from .utils import (
     extract_packet_endpoints,
@@ -18,6 +18,17 @@ from .utils import (
     safe_float,
     tcp_flags_int as _tcp_flags_int,
 )
+
+# Payload regexes run on every packet of the capture; compile them once.
+_AUTH_ATTEMPT_RE = re.compile(r"(?i)\b(?:user|username|login|pass|password|auth|binddn|ntlm)\b")
+_AUTH_FAIL_RE = re.compile(r"(?i)\b(?:fail|failed|invalid|denied|incorrect|unauthorized|535|530)\b")
+_AUTH_SUCCESS_RE = re.compile(r"(?i)\b(?:ok|success|authenticated|logged in|230 )\b")
+_CRED_USER_RE = re.compile(r"(?i)\b(?:user(?:name)?|login|account)\s*[=:]\s*([^\s,;]+)")
+_CRED_SECRET_RE = re.compile(r"(?i)\b(?:pass(?:word)?|pwd|secret|token)\s*[=:]\s*([^\s,;]+)")
+_HELO_RE = re.compile(r"(?im)^\s*(?:EHLO|HELO)\s+([A-Za-z0-9._-]{1,255})\s*$")
+_HOST_HEADER_RE = re.compile(r"(?im)^\s*Host:\s*([A-Za-z0-9._-]{1,255})\s*$")
+_DOMAIN_RE = re.compile(r"(?i)\b([a-z0-9][a-z0-9-]{0,62}(?:\.[a-z0-9][a-z0-9-]{0,62}){1,6})\b")
+_WHITESPACE_RE = re.compile(r"\s+")
 
 try:
     from scapy.layers.inet import ICMP, IP, TCP, UDP
@@ -103,73 +114,49 @@ def _extract_ip_pair(pkt) -> tuple[str, str]:
     return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
 
-def _extract_ports(pkt) -> tuple[Optional[int], Optional[int]]:
-    if TCP is not None and pkt.haslayer(TCP):
-        try:
-            return int(pkt[TCP].sport), int(pkt[TCP].dport)
-        except Exception:
-            return None, None
-    if UDP is not None and pkt.haslayer(UDP):
-        try:
-            return int(pkt[UDP].sport), int(pkt[UDP].dport)
-        except Exception:
-            return None, None
-    return None, None
+def _extract_payload(pkt, tcp_layer, ip_layer) -> bytes:
+    """Application bytes of the packet.
 
-
-def _extract_payload(pkt) -> bytes:
-    if TCP is not None and pkt.haslayer(TCP):
+    For TCP the length is derived from the IP header fields so Ethernet
+    padding (which scapy hangs under TCP on sub-60-byte frames) is not
+    mistaken for data — a data-less scan probe must read as empty.
+    """
+    if tcp_layer is not None:
+        if ip_layer is None:
+            return b""
         try:
-            tcp_layer = pkt[TCP]
-            ip_layer = (
-                pkt[IP]
-                if (IP is not None and pkt.haslayer(IP))
-                else (pkt[IPv6] if (IPv6 is not None and pkt.haslayer(IPv6)) else None)
-            )
-            if ip_layer is not None:
-                tcp_hlen = int(getattr(tcp_layer, "dataofs", 0) or 0) * 4
-                if tcp_hlen <= 0:
-                    tcp_hlen = 20
-                payload_len = 0
-                if hasattr(ip_layer, "ihl") and hasattr(ip_layer, "len"):
-                    ip_hlen = int(getattr(ip_layer, "ihl", 0) or 0) * 4
-                    total = int(getattr(ip_layer, "len", 0) or 0)
-                    if ip_hlen > 0 and total > 0:
-                        payload_len = max(0, total - ip_hlen - tcp_hlen)
-                elif hasattr(ip_layer, "plen"):
-                    plen = int(getattr(ip_layer, "plen", 0) or 0)
-                    if plen > 0:
-                        payload_len = max(0, plen - tcp_hlen)
-                if payload_len <= 0:
-                    return b""
-                payload = bytes(getattr(tcp_layer, "payload", b"") or b"")
-                return payload[:payload_len]
+            tcp_hlen = int(getattr(tcp_layer, "dataofs", 0) or 0) * 4 or 20
+            payload_len = 0
+            if hasattr(ip_layer, "ihl") and hasattr(ip_layer, "len"):
+                ip_hlen = int(getattr(ip_layer, "ihl", 0) or 0) * 4
+                total = int(getattr(ip_layer, "len", 0) or 0)
+                if ip_hlen > 0 and total > 0:
+                    payload_len = max(0, total - ip_hlen - tcp_hlen)
+            elif hasattr(ip_layer, "plen"):
+                plen = int(getattr(ip_layer, "plen", 0) or 0)
+                if plen > 0:
+                    payload_len = max(0, plen - tcp_hlen)
+            if payload_len <= 0:
+                return b""
+            return bytes(getattr(tcp_layer, "payload", b"") or b"")[:payload_len]
         except Exception:
             return b""
-    if Raw is not None and pkt.haslayer(Raw):
-        try:
-            return bytes(pkt[Raw].load)
-        except Exception:
-            return b""
-    return b""
+    raw_layer = pkt.getlayer(Raw) if Raw is not None else None
+    if raw_layer is None:
+        return b""
+    try:
+        return bytes(raw_layer.load)
+    except Exception:
+        return b""
 
 
 def _tcp_is_syn(flags: object) -> bool:
-    try:
-        if isinstance(flags, str):
-            return "S" in flags and "A" not in flags
-        return (int(flags) & 0x02) and not (int(flags) & 0x10)
-    except Exception:
-        return False
+    value = _tcp_flags_int(flags)
+    return bool(value & 0x02) and not (value & 0x10)
 
 
 def _tcp_is_synack(flags: object) -> bool:
-    try:
-        if isinstance(flags, str):
-            return "S" in flags and "A" in flags
-        return (int(flags) & 0x12) == 0x12
-    except Exception:
-        return False
+    return (_tcp_flags_int(flags) & 0x12) == 0x12
 
 
 def _tcp_is_rst(flags: object) -> bool:
@@ -328,7 +315,7 @@ def _extract_banner(payload: bytes, port: int | None) -> Optional[str]:
     if first_l.startswith(("220 ", "220-", "* ok", "+ok", "ftp", "smtp")):
         return first[:120]
     if port in {21, 22, 23, 25, 80, 110, 143, 443, 445, 587, 993, 995, 3389}:
-        printable = re.sub(r"\s+", " ", first)
+        printable = _WHITESPACE_RE.sub(" ", first)
         if printable:
             return printable[:120]
     return None
@@ -337,55 +324,26 @@ def _extract_banner(payload: bytes, port: int | None) -> Optional[str]:
 def _has_auth_attempt(payload: bytes) -> bool:
     if not payload:
         return False
-    try:
-        text = payload.decode("latin-1", errors="ignore")
-    except Exception:
-        return False
-    return bool(
-        re.search(
-            r"(?i)\b(?:user|username|login|pass|password|auth|binddn|ntlm)\b", text
-        )
-    )
+    return bool(_AUTH_ATTEMPT_RE.search(payload.decode("latin-1", errors="ignore")))
 
 
 def _auth_result(payload: bytes) -> tuple[int, int]:
     if not payload:
         return 0, 0
-    try:
-        text = payload.decode("latin-1", errors="ignore")
-    except Exception:
-        return 0, 0
-    fail = (
-        1
-        if re.search(
-            r"(?i)\b(?:fail|failed|invalid|denied|incorrect|unauthorized|535|530)\b",
-            text,
-        )
-        else 0
-    )
-    success = (
-        1
-        if re.search(r"(?i)\b(?:ok|success|authenticated|logged in|230 )\b", text)
-        else 0
-    )
+    text = payload.decode("latin-1", errors="ignore")
+    fail = 1 if _AUTH_FAIL_RE.search(text) else 0
+    success = 1 if _AUTH_SUCCESS_RE.search(text) else 0
     return fail, success
 
 
 def _extract_creds(payload: bytes) -> list[str]:
     if not payload:
         return []
-    try:
-        text = payload.decode("latin-1", errors="ignore")
-    except Exception:
-        return []
+    text = payload.decode("latin-1", errors="ignore")
     samples: list[str] = []
-    for m in re.findall(
-        r"(?i)\b(?:user(?:name)?|login|account)\s*[=:]\s*([^\s,;]+)", text
-    ):
+    for m in _CRED_USER_RE.findall(text):
         samples.append(f"user={m}")
-    for m in re.findall(
-        r"(?i)\b(?:pass(?:word)?|pwd|secret|token)\s*[=:]\s*([^\s,;]+)", text
-    ):
+    for m in _CRED_SECRET_RE.findall(text):
         samples.append(f"secret={m}")
     deduped: list[str] = []
     seen: set[str] = set()
@@ -400,23 +358,16 @@ def _extract_creds(payload: bytes) -> list[str]:
 def _extract_hostname_hints(payload: bytes) -> list[str]:
     if not payload:
         return []
-    try:
-        text = payload.decode("latin-1", errors="ignore")
-    except Exception:
-        return []
+    text = payload.decode("latin-1", errors="ignore")
     if not text.strip():
         return []
 
     hints: list[str] = []
-    for match in re.findall(
-        r"(?im)^\s*(?:EHLO|HELO)\s+([A-Za-z0-9._-]{1,255})\s*$", text
-    ):
+    for match in _HELO_RE.findall(text):
         hints.append(str(match).strip().rstrip("."))
-    for match in re.findall(r"(?im)^\s*Host:\s*([A-Za-z0-9._-]{1,255})\s*$", text):
+    for match in _HOST_HEADER_RE.findall(text):
         hints.append(str(match).strip().rstrip("."))
-    for match in re.findall(
-        r"(?i)\b([a-z0-9][a-z0-9-]{0,62}(?:\.[a-z0-9][a-z0-9-]{0,62}){1,6})\b", text
-    ):
+    for match in _DOMAIN_RE.findall(text):
         token = str(match).strip().rstrip(".").lower()
         if token.endswith((".arpa", ".invalid")):
             continue
@@ -626,153 +577,121 @@ def analyze_scan(
     brute_success: Counter[tuple[str, str]] = Counter()
     creds_by_pair: dict[tuple[str, str], list[str]] = defaultdict(list)
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, packets=packets, meta=meta, show_status=show_status
-        )
-    except Exception as exc:
-        summary.errors.append(f"Error opening pcap: {exc}")
-        return summary
-
-    try:
-        for pkt in reader:
-            summary.total_packets += 1
-            if stream is not None and size_bytes:
-                try:
-                    status.update(int(min(100, (stream.tell() / size_bytes) * 100)))
-                except Exception:
-                    pass
-
-            src_ip, dst_ip = _extract_ip_pair(pkt)
-            if src_ip == "-" or dst_ip == "-":
-                continue
-            if Ether is not None and pkt.haslayer(Ether):
-                try:
-                    src_mac = str(getattr(pkt[Ether], "src", "") or "").lower()
-                    if src_mac:
-                        src_mac_counts[src_ip][src_mac] += 1
-                except Exception:
-                    pass
-            if IP is not None and pkt.haslayer(IP):
-                try:
-                    ttl = int(getattr(pkt[IP], "ttl", 0) or 0)
-                    if ttl > 0:
-                        src_ttl_counts[src_ip][ttl] += 1
-                except Exception:
-                    pass
-            sport, dport = _extract_ports(pkt)
-            payload = _extract_payload(pkt)
-            ts = safe_float(getattr(pkt, "time", None))
+    def _process(pkt) -> None:
+        src_ip, dst_ip = _extract_ip_pair(pkt)
+        ether = pkt.getlayer(Ether) if Ether is not None else None
+        if ether is not None:
+            src_mac = str(getattr(ether, "src", "") or "").lower()
+            if src_mac:
+                src_mac_counts[src_ip][src_mac] += 1
+        ip_layer = pkt.getlayer(IP) if IP is not None else None
+        if ip_layer is not None:
+            ttl = int(getattr(ip_layer, "ttl", 0) or 0)
+            if ttl > 0:
+                src_ttl_counts[src_ip][ttl] += 1
+        elif IPv6 is not None:
+            ip_layer = pkt.getlayer(IPv6)
+        tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
+        udp_layer = None
+        if tcp_layer is None and UDP is not None:
+            udp_layer = pkt.getlayer(UDP)
+        transport = tcp_layer if tcp_layer is not None else udp_layer
+        sport: Optional[int] = None
+        dport: Optional[int] = None
+        if transport is not None:
+            sport, dport = int(transport.sport), int(transport.dport)
+        payload = _extract_payload(pkt, tcp_layer, ip_layer)
+        ts = safe_float(getattr(pkt, "time", None))
+        if payload:
             for hint in _extract_hostname_hints(payload):
                 src_hostname_hints[src_ip][hint] += 1
             for marker in _extract_scanner_markers(payload):
                 src_tool_markers[src_ip][marker] += 1
 
-            if TCP is not None and pkt.haslayer(TCP):
-                flags = getattr(pkt[TCP], "flags", None)
-                tcp_sport = sport if sport is not None else None
-                tcp_dport = dport if dport is not None else None
-                if tcp_sport is not None and tcp_dport is not None:
-                    flow_key = (src_ip, dst_ip, int(tcp_sport), int(tcp_dport))
-                    reverse_key = (dst_ip, src_ip, int(tcp_dport), int(tcp_sport))
-                    pair_key, src_is_left = _canonical_tcp_pair(
-                        src_ip, int(tcp_sport), dst_ip, int(tcp_dport)
-                    )
-                    flow_stats = seen_tcp_flows.get(pair_key)
-                    if flow_stats is None:
-                        flow_stats = {
-                            "packets_ab": 0,
-                            "packets_ba": 0,
-                            "syn_ab": 0,
-                            "syn_ba": 0,
-                            "payload_bytes_ab": 0,
-                            "payload_bytes_ba": 0,
-                            "rst_ab": 0,
-                            "rst_ba": 0,
-                        }
-                        seen_tcp_flows[pair_key] = flow_stats
+        if tcp_layer is not None:
+            flags = getattr(tcp_layer, "flags", None)
+            tcp_sport = sport if sport is not None else None
+            tcp_dport = dport if dport is not None else None
+            if tcp_sport is not None and tcp_dport is not None:
+                flow_key = (src_ip, dst_ip, int(tcp_sport), int(tcp_dport))
+                reverse_key = (dst_ip, src_ip, int(tcp_dport), int(tcp_sport))
+                pair_key, src_is_left = _canonical_tcp_pair(
+                    src_ip, int(tcp_sport), dst_ip, int(tcp_dport)
+                )
+                flow_stats = seen_tcp_flows.get(pair_key)
+                if flow_stats is None:
+                    flow_stats = {
+                        "packets_ab": 0,
+                        "packets_ba": 0,
+                        "syn_ab": 0,
+                        "syn_ba": 0,
+                        "payload_bytes_ab": 0,
+                        "payload_bytes_ba": 0,
+                        "rst_ab": 0,
+                        "rst_ba": 0,
+                    }
+                    seen_tcp_flows[pair_key] = flow_stats
+                if src_is_left:
+                    flow_stats["packets_ab"] += 1
+                else:
+                    flow_stats["packets_ba"] += 1
+                payload_len = len(payload)
+                if src_is_left:
+                    flow_stats["payload_bytes_ab"] += int(payload_len)
+                else:
+                    flow_stats["payload_bytes_ba"] += int(payload_len)
+                flags_int = _tcp_flags_int(flags)
+                if _tcp_is_rst(flags):
                     if src_is_left:
-                        flow_stats["packets_ab"] += 1
+                        flow_stats["rst_ab"] += 1
                     else:
-                        flow_stats["packets_ba"] += 1
-                    payload_len = len(_extract_payload(pkt))
-                    if src_is_left:
-                        flow_stats["payload_bytes_ab"] += int(payload_len)
-                    else:
-                        flow_stats["payload_bytes_ba"] += int(payload_len)
-                    flags_int = _tcp_flags_int(flags)
-                    if _tcp_is_rst(flags):
-                        if src_is_left:
-                            flow_stats["rst_ab"] += 1
-                        else:
-                            flow_stats["rst_ba"] += 1
-                        # RST+ACK is a closed-port response back to the prober;
-                        # a bare RST is usually the scanner tearing a half-open
-                        # connection, so only the former counts as "closed".
-                        if (flags_int & 0x10) and dst_ip != src_ip:
-                            recv_rst[dst_ip] += 1
-                            responsive_pairs.add((dst_ip, src_ip))
-                    if _tcp_is_syn(flags):
-                        syn_seen.add(flow_key)
-                        if src_is_left:
-                            flow_stats["syn_ab"] += 1
-                        else:
-                            flow_stats["syn_ba"] += 1
-                    elif _tcp_is_synack(flags):
-                        # SYN/ACK is an open-port response back to the scanner.
-                        recv_synack[dst_ip] += 1
+                        flow_stats["rst_ba"] += 1
+                    # RST+ACK is a closed-port response back to the prober;
+                    # a bare RST is usually the scanner tearing a half-open
+                    # connection, so only the former counts as "closed".
+                    if (flags_int & 0x10) and dst_ip != src_ip:
+                        recv_rst[dst_ip] += 1
                         responsive_pairs.add((dst_ip, src_ip))
-                        if reverse_key in syn_seen:
-                            syn_ack_seen.add(reverse_key)
-                    elif _tcp_is_final_handshake_ack(flags):
-                        if flow_key in syn_seen and flow_key in syn_ack_seen:
-                            handshake_complete.add(flow_key)
-
-                # Classify the client-side probe by flag combination so stealth
-                # scans (FIN/NULL/XMAS/Maimon/ACK) and connect scans are detected
-                # alongside SYN scans rather than silently ignored.
-                if dport is not None and _is_unicast_target(dst_ip):
-                    flavor = _tcp_scan_flavor(flags)
-                    payload_len = len(payload)
-                    probe_flow = (src_ip, dst_ip, int(sport or 0), int(dport))
-                    probe_reverse = (dst_ip, src_ip, int(dport), int(sport or 0))
-                    if flavor == "syn":
-                        accept = True
-                    elif flavor in _GATED_FLAVORS:
-                        # Genuine probe only if the connection was never
-                        # SYN-initiated in EITHER direction (so server-side
-                        # FIN+ACK teardowns and mid-session ACKs of an
-                        # established flow are not mistaken for stealth scans)
-                        # and the packet carries no payload.
-                        accept = (
-                            probe_flow not in syn_seen
-                            and probe_reverse not in syn_seen
-                            and payload_len == 0
-                        )
+                if _tcp_is_syn(flags):
+                    syn_seen.add(flow_key)
+                    if src_is_left:
+                        flow_stats["syn_ab"] += 1
                     else:
-                        accept = False
-                    if accept:
-                        _record_probe(
-                            src_ip,
-                            dst_ip,
-                            int(dport),
-                            ts,
-                            src_targets,
-                            src_ports,
-                            src_dst_ports,
-                            src_dst_packets,
-                            src_first_seen,
-                            src_last_seen,
-                            src_ot_ports,
-                            src_ot_targets,
-                        )
-                        src_flavor_probes[(src_ip, flavor)].add((dst_ip, int(dport)))
-                        src_flavor_packets[(src_ip, flavor)] += 1
-                        if flavor == "syn":
-                            src_syn[src_ip] += 1
-            elif UDP is not None and pkt.haslayer(UDP):
-                # UDP scan: a host firing UDP datagrams at many ports/targets.
-                if dport is not None and _is_unicast_target(dst_ip):
+                        flow_stats["syn_ba"] += 1
+                elif _tcp_is_synack(flags):
+                    # SYN/ACK is an open-port response back to the scanner.
+                    recv_synack[dst_ip] += 1
+                    responsive_pairs.add((dst_ip, src_ip))
+                    if reverse_key in syn_seen:
+                        syn_ack_seen.add(reverse_key)
+                elif _tcp_is_final_handshake_ack(flags):
+                    if flow_key in syn_seen and flow_key in syn_ack_seen:
+                        handshake_complete.add(flow_key)
+
+            # Classify the client-side probe by flag combination so stealth
+            # scans (FIN/NULL/XMAS/Maimon/ACK) and connect scans are detected
+            # alongside SYN scans rather than silently ignored.
+            if dport is not None and _is_unicast_target(dst_ip):
+                flavor = _tcp_scan_flavor(flags)
+                payload_len = len(payload)
+                probe_flow = (src_ip, dst_ip, int(sport or 0), int(dport))
+                probe_reverse = (dst_ip, src_ip, int(dport), int(sport or 0))
+                if flavor == "syn":
+                    accept = True
+                elif flavor in _GATED_FLAVORS:
+                    # Genuine probe only if the connection was never
+                    # SYN-initiated in EITHER direction (so server-side
+                    # FIN+ACK teardowns and mid-session ACKs of an
+                    # established flow are not mistaken for stealth scans)
+                    # and the packet carries no payload.
+                    accept = (
+                        probe_flow not in syn_seen
+                        and probe_reverse not in syn_seen
+                        and payload_len == 0
+                    )
+                else:
+                    accept = False
+                if accept:
                     _record_probe(
                         src_ip,
                         dst_ip,
@@ -787,110 +706,151 @@ def analyze_scan(
                         src_ot_ports,
                         src_ot_targets,
                     )
-                    src_flavor_probes[(src_ip, "udp")].add((dst_ip, int(dport)))
-                    src_flavor_packets[(src_ip, "udp")] += 1
-            elif ICMP is not None and pkt.haslayer(ICMP):
-                try:
-                    icmp_type = int(getattr(pkt[ICMP], "type", -1))
-                except Exception:
-                    icmp_type = -1
-                if icmp_type == 8 and _is_unicast_target(dst_ip):
-                    src_probe_targets[src_ip].add(dst_ip)
-                    src_probe_packets[src_ip] += 1
-                    src_flavor_probes[(src_ip, "icmp")].add((dst_ip, 0))
-                    src_flavor_packets[(src_ip, "icmp")] += 1
-                    if ts is not None:
-                        src_first_seen[src_ip] = min(ts, src_first_seen.get(src_ip, ts))
-                        src_last_seen[src_ip] = max(ts, src_last_seen.get(src_ip, ts))
-                elif icmp_type == 3:
-                    # Destination/port unreachable -> filtered/closed signal to
-                    # the host that sent the probe (the scanner = dst_ip here).
-                    recv_icmp_unreach[dst_ip] += 1
+                    src_flavor_probes[(src_ip, flavor)].add((dst_ip, int(dport)))
+                    src_flavor_packets[(src_ip, flavor)] += 1
+                    if flavor == "syn":
+                        src_syn[src_ip] += 1
+        elif udp_layer is not None:
+            # UDP scan: a host firing UDP datagrams at many ports/targets.
+            if dport is not None and _is_unicast_target(dst_ip):
+                _record_probe(
+                    src_ip,
+                    dst_ip,
+                    int(dport),
+                    ts,
+                    src_targets,
+                    src_ports,
+                    src_dst_ports,
+                    src_dst_packets,
+                    src_first_seen,
+                    src_last_seen,
+                    src_ot_ports,
+                    src_ot_targets,
+                )
+                src_flavor_probes[(src_ip, "udp")].add((dst_ip, int(dport)))
+                src_flavor_packets[(src_ip, "udp")] += 1
+        elif ICMP is not None and (icmp_layer := pkt.getlayer(ICMP)) is not None:
+            try:
+                icmp_type = int(getattr(icmp_layer, "type", -1))
+            except Exception:
+                icmp_type = -1
+            if icmp_type == 8 and _is_unicast_target(dst_ip):
+                src_probe_targets[src_ip].add(dst_ip)
+                src_probe_packets[src_ip] += 1
+                src_flavor_probes[(src_ip, "icmp")].add((dst_ip, 0))
+                src_flavor_packets[(src_ip, "icmp")] += 1
+                if ts is not None:
+                    src_first_seen[src_ip] = min(ts, src_first_seen.get(src_ip, ts))
+                    src_last_seen[src_ip] = max(ts, src_last_seen.get(src_ip, ts))
+            elif icmp_type == 3:
+                # Destination/port unreachable -> filtered/closed signal to
+                # the host that sent the probe (the scanner = dst_ip here).
+                recv_icmp_unreach[dst_ip] += 1
 
-            if ARP is not None and pkt.haslayer(ARP):
-                try:
-                    op = int(getattr(pkt[ARP], "op", 0) or 0)
-                except Exception:
-                    op = 0
-                if op == 1:
-                    src_probe_targets[src_ip].add(dst_ip)
-                    src_probe_packets[src_ip] += 1
-                    arp_senders.add(src_ip)
-                    arp_resolved_by[dst_ip].add(src_ip)
-                    src_flavor_probes[(src_ip, "arp")].add((dst_ip, 0))
-                    src_flavor_packets[(src_ip, "arp")] += 1
-                    if ts is not None:
-                        src_first_seen[src_ip] = min(ts, src_first_seen.get(src_ip, ts))
-                        src_last_seen[src_ip] = max(ts, src_last_seen.get(src_ip, ts))
+        if ARP is not None and (arp_layer := pkt.getlayer(ARP)) is not None:
+            try:
+                op = int(getattr(arp_layer, "op", 0) or 0)
+            except Exception:
+                op = 0
+            if op == 1:
+                src_probe_targets[src_ip].add(dst_ip)
+                src_probe_packets[src_ip] += 1
+                arp_senders.add(src_ip)
+                arp_resolved_by[dst_ip].add(src_ip)
+                src_flavor_probes[(src_ip, "arp")].add((dst_ip, 0))
+                src_flavor_packets[(src_ip, "arp")] += 1
+                if ts is not None:
+                    src_first_seen[src_ip] = min(ts, src_first_seen.get(src_ip, ts))
+                    src_last_seen[src_ip] = max(ts, src_last_seen.get(src_ip, ts))
 
-            if sport is not None:
-                banner = _extract_banner(payload, sport)
-                if banner:
-                    pair = (dst_ip, src_ip)
-                    lst = banner_by_pair[pair]
-                    if banner not in lst and len(lst) < 8:
-                        lst.append(banner)
+        if sport is not None:
+            banner = _extract_banner(payload, sport)
+            if banner:
+                pair = (dst_ip, src_ip)
+                lst = banner_by_pair[pair]
+                if banner not in lst and len(lst) < 8:
+                    lst.append(banner)
 
-            if dport in AUTH_PORTS and _has_auth_attempt(payload):
-                pair = (src_ip, dst_ip)
-                brute_attempts[pair] += 1
-                for sample in _extract_creds(payload):
-                    if (
-                        sample not in creds_by_pair[pair]
-                        and len(creds_by_pair[pair]) < 8
-                    ):
-                        creds_by_pair[pair].append(sample)
+        if dport in AUTH_PORTS and _has_auth_attempt(payload):
+            pair = (src_ip, dst_ip)
+            brute_attempts[pair] += 1
+            for sample in _extract_creds(payload):
+                if (
+                    sample not in creds_by_pair[pair]
+                    and len(creds_by_pair[pair]) < 8
+                ):
+                    creds_by_pair[pair].append(sample)
 
-            if sport in AUTH_PORTS:
-                fail, success = _auth_result(payload)
-                if fail or success:
-                    pair = (dst_ip, src_ip)
-                    brute_fails[pair] += fail
-                    brute_success[pair] += success
+        if sport in AUTH_PORTS:
+            fail, success = _auth_result(payload)
+            if fail or success:
+                pair = (dst_ip, src_ip)
+                brute_fails[pair] += fail
+                brute_success[pair] += success
 
-        # Handshake-confirmed open ports require responder payload evidence.
-        for client_ip, server_ip, client_port, server_port in handshake_complete:
-            open_ports_by_pair[(client_ip, server_ip)].add(int(server_port))
-
-        # Fallback for capture-gapped sessions:
-        # if handshake isn't present, treat bidirectional seen traffic as possible open service.
-        for pair_key, flow_stats in seen_tcp_flows.items():
-            a_ip, a_port, b_ip, b_port = pair_key
-            flow_key = (a_ip, b_ip, a_port, b_port)
-            reverse_key = (b_ip, a_ip, b_port, a_port)
-            if flow_key in handshake_complete or reverse_key in handshake_complete:
-                continue
-            if (
-                int(flow_stats.get("packets_ab", 0)) <= 0
-                or int(flow_stats.get("packets_ba", 0)) <= 0
-            ):
-                continue
-            inferred = _infer_server_from_seen_traffic(
-                a_ip=a_ip,
-                a_port=a_port,
-                b_ip=b_ip,
-                b_port=b_port,
-                syn_ab=int(flow_stats.get("syn_ab", 0) or 0),
-                syn_ba=int(flow_stats.get("syn_ba", 0) or 0),
-            )
-            if inferred is None:
-                continue
-            server_ip, server_port, client_ip = inferred
-            server_is_left = server_ip == a_ip and server_port == a_port
-            if not _seen_traffic_supports_service_presence(
-                flow_stats, server_is_left=server_is_left
-            ):
-                continue
-            open_ports_by_pair[(client_ip, server_ip)].add(int(server_port))
-
+    skipped_packets = 0
+    first_skip_error: str | None = None
+    try:
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+            summary.total_packets += 1
+            try:
+                _process(pkt)
+            except Exception as exc:  # noqa: BLE001 — one malformed packet must not end the pass
+                skipped_packets += 1
+                if first_skip_error is None:
+                    first_skip_error = f"{type(exc).__name__}: {exc}"
     except Exception as exc:
-        summary.errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
+        summary.errors.append(f"Error reading pcap: {type(exc).__name__}: {exc}")
+    if skipped_packets:
+        summary.errors.append(
+            f"{skipped_packets} packet(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
+
+    # Handshake-confirmed open ports require responder payload evidence.
+    for client_ip, server_ip, client_port, server_port in handshake_complete:
+        open_ports_by_pair[(client_ip, server_ip)].add(int(server_port))
+
+    # Fallback for capture-gapped sessions:
+    # if handshake isn't present, treat bidirectional seen traffic as possible open service.
+    for pair_key, flow_stats in seen_tcp_flows.items():
+        a_ip, a_port, b_ip, b_port = pair_key
+        flow_key = (a_ip, b_ip, a_port, b_port)
+        reverse_key = (b_ip, a_ip, b_port, a_port)
+        if flow_key in handshake_complete or reverse_key in handshake_complete:
+            continue
+        if (
+            int(flow_stats.get("packets_ab", 0)) <= 0
+            or int(flow_stats.get("packets_ba", 0)) <= 0
+        ):
+            continue
+        inferred = _infer_server_from_seen_traffic(
+            a_ip=a_ip,
+            a_port=a_port,
+            b_ip=b_ip,
+            b_port=b_port,
+            syn_ab=int(flow_stats.get("syn_ab", 0) or 0),
+            syn_ba=int(flow_stats.get("syn_ba", 0) or 0),
+        )
+        if inferred is None:
+            continue
+        server_ip, server_port, client_ip = inferred
+        server_is_left = server_ip == a_ip and server_port == a_port
+        if not _seen_traffic_supports_service_presence(
+            flow_stats, server_is_left=server_is_left
+        ):
+            continue
+        open_ports_by_pair[(client_ip, server_ip)].add(int(server_port))
+
+    # Per-source totals computed once instead of a full pass over the pair
+    # tables for every candidate scanner.
+    probe_packets_by_src: Counter[str] = Counter()
+    for (src, _dst), count in src_dst_packets.items():
+        probe_packets_by_src[src] += count
+    responsive_by_src: Counter[str] = Counter(src for (src, _target) in responsive_pairs)
+    handshakes_by_src: Counter[str] = Counter(
+        client for (client, _server, _cport, _sport) in handshake_complete
+    )
 
     results: list[ScanSourceResult] = []
     included_scanners: set[str] = set()
@@ -970,9 +930,7 @@ def analyze_scan(
         ]
 
         # Techniques used (by flag combination / protocol), connect vs half-open.
-        scanner_handshakes = sum(
-            1 for (c, _s, _cp, _sp) in handshake_complete if c == scanner
-        )
+        scanner_handshakes = handshakes_by_src.get(scanner, 0)
         techniques: list[str] = []
         for flavor in ("syn", "fin", "null", "xmas", "maimon", "ack", "udp", "arp", "icmp"):
             spread = len(src_flavor_probes.get((scanner, flavor), set()))
@@ -1009,15 +967,12 @@ def analyze_scan(
             if first_ts is not None and last_ts is not None and last_ts > first_ts
             else 0.0
         )
-        total_probe_packets = (
-            sum(c for (s, _d), c in src_dst_packets.items() if s == scanner)
-            + probe_packets
-        )
+        total_probe_packets = probe_packets_by_src.get(scanner, 0) + probe_packets
         pps = (total_probe_packets / duration) if duration > 0 else 0.0
         open_resp = int(recv_synack.get(scanner, 0))
         closed_resp = int(recv_rst.get(scanner, 0))
         filtered_resp = int(recv_icmp_unreach.get(scanner, 0))
-        responsive = sum(1 for (s, _t) in responsive_pairs if s == scanner)
+        responsive = responsive_by_src.get(scanner, 0)
         ot_ports_hit = sorted(src_ot_ports.get(scanner, set()))
         ot_targets_hit = sorted(src_ot_targets.get(scanner, set()))
 
@@ -1133,11 +1088,22 @@ def analyze_scan(
         reverse=True,
     )
     summary.relevant_packets = sum(
-        sum(c for (s, _d), c in src_dst_packets.items() if s == scanner)
-        + int(src_probe_packets.get(scanner, 0))
+        probe_packets_by_src.get(scanner, 0) + int(src_probe_packets.get(scanner, 0))
         for scanner in included_scanners
     )
     return summary
+
+
+def _copy_target(row: ScanTargetResult) -> ScanTargetResult:
+    return ScanTargetResult(
+        target_ip=row.target_ip,
+        open_ports=list(row.open_ports),
+        banner_samples=list(row.banner_samples),
+        brute_force_attempts=row.brute_force_attempts,
+        brute_force_failures=row.brute_force_failures,
+        brute_force_success_hints=row.brute_force_success_hints,
+        credential_samples=list(row.credential_samples),
+    )
 
 
 def merge_scan_summaries(summaries: list[ScanSummary]) -> ScanSummary:
@@ -1169,7 +1135,9 @@ def merge_scan_summaries(summaries: list[ScanSummary]) -> ScanSummary:
                     hostname_hints=list(src.hostname_hints),
                     scanner_software_guess=src.scanner_software_guess,
                     top_ports=list(src.top_ports),
-                    targets=list(src.targets),
+                    # Copies: the rows are merged in place below and the
+                    # source summaries are memoized, shared objects.
+                    targets=[_copy_target(row) for row in src.targets],
                     techniques=list(src.techniques),
                     probe_packets=src.probe_packets,
                     scanner_scope=src.scanner_scope,
@@ -1256,15 +1224,7 @@ def merge_scan_summaries(summaries: list[ScanSummary]) -> ScanSummary:
             for row in src.targets:
                 existing = by_target.get(row.target_ip)
                 if existing is None:
-                    by_target[row.target_ip] = ScanTargetResult(
-                        target_ip=row.target_ip,
-                        open_ports=list(row.open_ports),
-                        banner_samples=list(row.banner_samples),
-                        brute_force_attempts=row.brute_force_attempts,
-                        brute_force_failures=row.brute_force_failures,
-                        brute_force_success_hints=row.brute_force_success_hints,
-                        credential_samples=list(row.credential_samples),
-                    )
+                    by_target[row.target_ip] = _copy_target(row)
                     continue
                 existing.open_ports = sorted(
                     set(existing.open_ports).union(row.open_ports)

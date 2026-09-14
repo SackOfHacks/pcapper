@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 import math
 import re
 from collections import Counter, defaultdict
@@ -12,9 +11,15 @@ from .dns import analyze_dns
 from .files import analyze_files
 from .netbios import analyze_netbios, collect_netbios_host_intel
 from .ntlm import analyze_ntlm
-from .pcap_cache import PcapMeta, get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .progress import run_with_busy_status
-from .utils import safe_float, extract_packet_endpoints, extract_ascii_strings as _extract_ascii_strings
+from .utils import (
+    extract_ascii_strings as _extract_ascii_strings,
+    extract_packet_endpoints,
+    is_public_ip,
+    memoize_analysis,
+    safe_float,
+)
 from .utils import extract_utf16le_strings as _extract_utf16le_strings
 
 try:
@@ -277,6 +282,7 @@ def _parse_http_request(payload: bytes) -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
 
+@memoize_analysis
 def analyze_domain(
     path: Path,
     show_status: bool = True,
@@ -372,10 +378,6 @@ def analyze_domain(
 
     files = [art.filename for art in files_summary.artifacts]
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
-
     total_packets = 0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -404,216 +406,204 @@ def analyze_domain(
     relay_chain_hints_by_src: Counter[str] = Counter()
     src_first_packet: Dict[str, int] = {}
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
 
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
+        if not src_ip or not dst_ip:
+            continue
 
-            if not src_ip or not dst_ip:
-                continue
+        src_first_packet.setdefault(src_ip, total_packets)
 
-            src_first_packet.setdefault(src_ip, total_packets)
+        if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+            tcp_layer = pkt[TCP]  # type: ignore[index]
+            sport = int(getattr(tcp_layer, "sport", 0) or 0)
+            dport = int(getattr(tcp_layer, "dport", 0) or 0)
+            if dport in DOMAIN_PORTS or sport in DOMAIN_PORTS:
+                if dport in DOMAIN_PORTS:
+                    server_ip = dst_ip
+                    client_ip = src_ip
+                    server_port = dport
+                else:
+                    server_ip = src_ip
+                    client_ip = dst_ip
+                    server_port = sport
 
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                tcp_layer = pkt[TCP]  # type: ignore[index]
-                sport = int(getattr(tcp_layer, "sport", 0) or 0)
-                dport = int(getattr(tcp_layer, "dport", 0) or 0)
-                if dport in DOMAIN_PORTS or sport in DOMAIN_PORTS:
-                    if dport in DOMAIN_PORTS:
-                        server_ip = dst_ip
-                        client_ip = src_ip
-                        server_port = dport
-                    else:
-                        server_ip = src_ip
-                        client_ip = dst_ip
-                        server_port = sport
+                service_name = _port_to_domain_service(server_port)
+                servers[server_ip] += 1
+                clients[client_ip] += 1
+                service_counts[f"TCP/{server_port}"] += 1
+                convos[(client_ip, server_ip, server_port, "TCP")] += 1
+                server_service_hits[server_ip][service_name] += 1
+                src_service_hits[client_ip][service_name] += 1
+                pair_ports[(client_ip, server_ip)].add(server_port)
+                pair_packets[(client_ip, server_ip)] += 1
+                if server_port in KERBEROS_PORTS:
+                    kerberos_targets_by_src[client_ip].add(server_ip)
 
-                    service_name = _port_to_domain_service(server_port)
-                    servers[server_ip] += 1
-                    clients[client_ip] += 1
-                    service_counts[f"TCP/{server_port}"] += 1
-                    convos[(client_ip, server_ip, server_port, "TCP")] += 1
-                    server_service_hits[server_ip][service_name] += 1
-                    src_service_hits[client_ip][service_name] += 1
-                    pair_ports[(client_ip, server_ip)].add(server_port)
-                    pair_packets[(client_ip, server_ip)] += 1
-                    if server_port in KERBEROS_PORTS:
-                        kerberos_targets_by_src[client_ip].add(server_ip)
+            payload = bytes(getattr(tcp_layer, "payload", b""))
+            if payload and ((dport in KERBEROS_PORTS) or (sport in KERBEROS_PORTS)):
+                kerb_src = src_ip if dport in KERBEROS_PORTS else dst_ip
+                kerb_dst = dst_ip if dport in KERBEROS_PORTS else src_ip
+                for msg_type in _extract_kerberos_message_types(payload):
+                    kerberos_msgtype_by_src[kerb_src][msg_type] += 1
+                for etype in _extract_kerberos_etypes(payload):
+                    kerberos_etypes_by_src[kerb_src][etype] += 1
+                payload_lower = payload.lower()
+                if b"krbtgt/" in payload_lower:
+                    kerberos_spn_targets[(kerb_src, "krbtgt")] += 1
+                if (
+                    b"serviceprincipalname" in payload_lower
+                    or b"cifs/" in payload_lower
+                    or b"http/" in payload_lower
+                ):
+                    kerberos_spn_targets[(kerb_src, kerb_dst)] += 1
 
-                payload = bytes(getattr(tcp_layer, "payload", b""))
-                if payload and ((dport in KERBEROS_PORTS) or (sport in KERBEROS_PORTS)):
-                    kerb_src = src_ip if dport in KERBEROS_PORTS else dst_ip
-                    kerb_dst = dst_ip if dport in KERBEROS_PORTS else src_ip
+            if payload and (
+                (dport in RPC_PORTS)
+                or (sport in RPC_PORTS)
+                or dport == 445
+                or sport == 445
+            ):
+                pair_key = (
+                    (src_ip, dst_ip)
+                    if dport in {135, 593, 445}
+                    else (dst_ip, src_ip)
+                )
+                payload_lower = payload.lower()
+                if b"drsuapi" in payload_lower:
+                    dcsync_fingerprint_hits[pair_key]["drsuapi_string"] += 1
+                    dcsync_fingerprint_packets[pair_key].append(total_packets)
+                if b"idl_drsgetncchanges" in payload_lower:
+                    dcsync_fingerprint_hits[pair_key]["drsgetncchanges"] += 1
+                    dcsync_fingerprint_packets[pair_key].append(total_packets)
+                if (
+                    b"\x35\x42\x51\xe3\x06\x4b\xd1\x11\xab\x04\x00\xc0\x4f\xc2\xdc\xd2"
+                    in payload
+                ):
+                    dcsync_fingerprint_hits[pair_key]["drsuapi_uuid"] += 1
+                    dcsync_fingerprint_packets[pair_key].append(total_packets)
+
+            if payload and payload.startswith(
+                (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ")
+            ):
+                url, ua = _parse_http_request(payload)
+                if url:
+                    urls[url] += 1
+                if ua:
+                    user_agents[ua] += 1
+
+            if payload:
+                extracted = _extract_ascii_strings(
+                    payload
+                ) + _extract_utf16le_strings(payload)
+                values: set[str] = set()
+                for value in extracted:
+                    cleaned = _clean_identity_token(value)
+                    if cleaned:
+                        values.add(cleaned)
+                for value in values:
+                    value_lower = value.lower()
+                    if any(token in value_lower for token in _RELAY_COERCION_HINTS):
+                        relay_chain_hints_by_src[src_ip] += 1
+                    if any(
+                        token in value_lower
+                        for token in (
+                            "certsrv",
+                            "pkinit",
+                            "certipy",
+                            "adcs",
+                            "enrollment",
+                            "enrollcert",
+                        )
+                    ):
+                        adcs_hits[src_ip] += 1
+                    if any(
+                        token in value_lower
+                        for token in (
+                            "plc",
+                            "scada",
+                            "hmi",
+                            "modbus",
+                            "dnp3",
+                            "iec104",
+                            "profinet",
+                            "s7",
+                            "opc",
+                        )
+                    ):
+                        ot_identity_overlap_hits[src_ip] += 1
+                    if dport in LDAP_PORTS or sport in LDAP_PORTS:
+                        pair_key = (
+                            (src_ip, dst_ip)
+                            if dport in LDAP_PORTS
+                            else (dst_ip, src_ip)
+                        )
+                        for token, reason in _LDAP_RISKY_TOKENS.items():
+                            if token in value_lower:
+                                ldap_risky_query_hits[
+                                    (pair_key[0], pair_key[1], reason)
+                                ] += 1
+                        if "simple" in value_lower and "bind" in value_lower:
+                            ldap_simple_bind_hits[pair_key] += 1
+                        if "anonymous" in value_lower and "bind" in value_lower:
+                            ldap_anonymous_bind_hits[pair_key] += 1
+                    for pattern in _CRED_USER_PATTERNS:
+                        match = pattern.search(value)
+                        if match:
+                            user_val = _clean_identity_token(match.group(3))
+                            if _is_plausible_domain_user(user_val):
+                                users[user_val] += 1
+                    for pattern in _CRED_PASS_PATTERNS:
+                        match = pattern.search(value)
+                        if match:
+                            field_name = _clean_identity_token(
+                                match.group(1) or "password"
+                            ).lower()
+                            raw_value = _clean_identity_token(match.group(3))
+                            if not raw_value:
+                                continue
+                            credential_value = f"{field_name}={raw_value}"
+                            if _is_plausible_credential_string(credential_value):
+                                credentials[credential_value] += 1
+
+        if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+            udp_layer = pkt[UDP]  # type: ignore[index]
+            sport = int(getattr(udp_layer, "sport", 0) or 0)
+            dport = int(getattr(udp_layer, "dport", 0) or 0)
+            payload = bytes(getattr(udp_layer, "payload", b""))
+            if dport in DOMAIN_PORTS or sport in DOMAIN_PORTS:
+                if dport in DOMAIN_PORTS:
+                    server_ip = dst_ip
+                    client_ip = src_ip
+                    server_port = dport
+                else:
+                    server_ip = src_ip
+                    client_ip = dst_ip
+                    server_port = sport
+
+                service_name = _port_to_domain_service(server_port)
+                servers[server_ip] += 1
+                clients[client_ip] += 1
+                service_counts[f"UDP/{server_port}"] += 1
+                convos[(client_ip, server_ip, server_port, "UDP")] += 1
+                server_service_hits[server_ip][service_name] += 1
+                src_service_hits[client_ip][service_name] += 1
+                pair_ports[(client_ip, server_ip)].add(server_port)
+                pair_packets[(client_ip, server_ip)] += 1
+                if server_port in KERBEROS_PORTS:
+                    kerberos_targets_by_src[client_ip].add(server_ip)
                     for msg_type in _extract_kerberos_message_types(payload):
-                        kerberos_msgtype_by_src[kerb_src][msg_type] += 1
+                        kerberos_msgtype_by_src[client_ip][msg_type] += 1
                     for etype in _extract_kerberos_etypes(payload):
-                        kerberos_etypes_by_src[kerb_src][etype] += 1
-                    payload_lower = payload.lower()
-                    if b"krbtgt/" in payload_lower:
-                        kerberos_spn_targets[(kerb_src, "krbtgt")] += 1
-                    if (
-                        b"serviceprincipalname" in payload_lower
-                        or b"cifs/" in payload_lower
-                        or b"http/" in payload_lower
-                    ):
-                        kerberos_spn_targets[(kerb_src, kerb_dst)] += 1
-
-                if payload and (
-                    (dport in RPC_PORTS)
-                    or (sport in RPC_PORTS)
-                    or dport == 445
-                    or sport == 445
-                ):
-                    pair_key = (
-                        (src_ip, dst_ip)
-                        if dport in {135, 593, 445}
-                        else (dst_ip, src_ip)
-                    )
-                    payload_lower = payload.lower()
-                    if b"drsuapi" in payload_lower:
-                        dcsync_fingerprint_hits[pair_key]["drsuapi_string"] += 1
-                        dcsync_fingerprint_packets[pair_key].append(total_packets)
-                    if b"idl_drsgetncchanges" in payload_lower:
-                        dcsync_fingerprint_hits[pair_key]["drsgetncchanges"] += 1
-                        dcsync_fingerprint_packets[pair_key].append(total_packets)
-                    if (
-                        b"\x35\x42\x51\xe3\x06\x4b\xd1\x11\xab\x04\x00\xc0\x4f\xc2\xdc\xd2"
-                        in payload
-                    ):
-                        dcsync_fingerprint_hits[pair_key]["drsuapi_uuid"] += 1
-                        dcsync_fingerprint_packets[pair_key].append(total_packets)
-
-                if payload and payload.startswith(
-                    (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ")
-                ):
-                    url, ua = _parse_http_request(payload)
-                    if url:
-                        urls[url] += 1
-                    if ua:
-                        user_agents[ua] += 1
-
-                if payload:
-                    extracted = _extract_ascii_strings(
-                        payload
-                    ) + _extract_utf16le_strings(payload)
-                    values: set[str] = set()
-                    for value in extracted:
-                        cleaned = _clean_identity_token(value)
-                        if cleaned:
-                            values.add(cleaned)
-                    for value in values:
-                        value_lower = value.lower()
-                        if any(token in value_lower for token in _RELAY_COERCION_HINTS):
-                            relay_chain_hints_by_src[src_ip] += 1
-                        if any(
-                            token in value_lower
-                            for token in (
-                                "certsrv",
-                                "pkinit",
-                                "certipy",
-                                "adcs",
-                                "enrollment",
-                                "enrollcert",
-                            )
-                        ):
-                            adcs_hits[src_ip] += 1
-                        if any(
-                            token in value_lower
-                            for token in (
-                                "plc",
-                                "scada",
-                                "hmi",
-                                "modbus",
-                                "dnp3",
-                                "iec104",
-                                "profinet",
-                                "s7",
-                                "opc",
-                            )
-                        ):
-                            ot_identity_overlap_hits[src_ip] += 1
-                        if dport in LDAP_PORTS or sport in LDAP_PORTS:
-                            pair_key = (
-                                (src_ip, dst_ip)
-                                if dport in LDAP_PORTS
-                                else (dst_ip, src_ip)
-                            )
-                            for token, reason in _LDAP_RISKY_TOKENS.items():
-                                if token in value_lower:
-                                    ldap_risky_query_hits[
-                                        (pair_key[0], pair_key[1], reason)
-                                    ] += 1
-                            if "simple" in value_lower and "bind" in value_lower:
-                                ldap_simple_bind_hits[pair_key] += 1
-                            if "anonymous" in value_lower and "bind" in value_lower:
-                                ldap_anonymous_bind_hits[pair_key] += 1
-                        for pattern in _CRED_USER_PATTERNS:
-                            match = pattern.search(value)
-                            if match:
-                                user_val = _clean_identity_token(match.group(3))
-                                if _is_plausible_domain_user(user_val):
-                                    users[user_val] += 1
-                        for pattern in _CRED_PASS_PATTERNS:
-                            match = pattern.search(value)
-                            if match:
-                                field_name = _clean_identity_token(
-                                    match.group(1) or "password"
-                                ).lower()
-                                raw_value = _clean_identity_token(match.group(3))
-                                if not raw_value:
-                                    continue
-                                credential_value = f"{field_name}={raw_value}"
-                                if _is_plausible_credential_string(credential_value):
-                                    credentials[credential_value] += 1
-
-            if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                udp_layer = pkt[UDP]  # type: ignore[index]
-                sport = int(getattr(udp_layer, "sport", 0) or 0)
-                dport = int(getattr(udp_layer, "dport", 0) or 0)
-                payload = bytes(getattr(udp_layer, "payload", b""))
-                if dport in DOMAIN_PORTS or sport in DOMAIN_PORTS:
-                    if dport in DOMAIN_PORTS:
-                        server_ip = dst_ip
-                        client_ip = src_ip
-                        server_port = dport
-                    else:
-                        server_ip = src_ip
-                        client_ip = dst_ip
-                        server_port = sport
-
-                    service_name = _port_to_domain_service(server_port)
-                    servers[server_ip] += 1
-                    clients[client_ip] += 1
-                    service_counts[f"UDP/{server_port}"] += 1
-                    convos[(client_ip, server_ip, server_port, "UDP")] += 1
-                    server_service_hits[server_ip][service_name] += 1
-                    src_service_hits[client_ip][service_name] += 1
-                    pair_ports[(client_ip, server_ip)].add(server_port)
-                    pair_packets[(client_ip, server_ip)] += 1
-                    if server_port in KERBEROS_PORTS:
-                        kerberos_targets_by_src[client_ip].add(server_ip)
-                        for msg_type in _extract_kerberos_message_types(payload):
-                            kerberos_msgtype_by_src[client_ip][msg_type] += 1
-                        for etype in _extract_kerberos_etypes(payload):
-                            kerberos_etypes_by_src[client_ip][etype] += 1
-    finally:
-        status.finish()
-        reader.close()
+                        kerberos_etypes_by_src[client_ip][etype] += 1
 
     duration = 0.0
     if first_seen is not None and last_seen is not None:
@@ -950,17 +940,27 @@ def analyze_domain(
                     f"{src_ip} {service_name} volume={value} deviates from peer baseline (avg={avg:.1f}, z={zscore:.2f})"
                 )
 
+    # Only the domain-CONTROL protocols (Kerberos/LDAP/SMB/RPC) reaching a
+    # public address are an exposure. DNS is in DOMAIN_PORTS because DC-hosted
+    # resolvers matter for the service mix, but a query to 8.8.8.8 or 1.1.1.1
+    # is ordinary internet recursion, and flagging every external resolver as
+    # "domain-control protocol surface" made the HIGH detection fire on
+    # nearly every enterprise capture.
     for server_ip, count in servers.items():
         server_text = str(server_ip)
-        if "." not in server_text and ":" not in server_text:
+        if not is_public_ip(server_text):
             continue
-        try:
-            if ipaddress.ip_address(server_text).is_global:
-                deterministic_checks["public_domain_service_exposure"].append(
-                    f"Public domain-service endpoint observed server={server_text} packets={int(count)}"
-                )
-        except Exception:
+        control_services = [
+            name
+            for name in ("Kerberos", "LDAP", "SMB", "RPC")
+            if int(server_service_hits.get(server_ip, Counter()).get(name, 0)) > 0
+        ]
+        if not control_services:
             continue
+        deterministic_checks["public_domain_service_exposure"].append(
+            f"Public domain-service endpoint observed server={server_text} "
+            f"services={','.join(control_services)} packets={int(count)}"
+        )
 
     for src_ip, count in adcs_hits.most_common(10):
         deterministic_checks["adcs_or_certificate_abuse_context"].append(

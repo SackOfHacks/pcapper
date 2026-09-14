@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 from .utils import is_public_ip as _is_public_ip, packet_length
+import bisect
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
     from scapy.layers.l2 import Ether
-    from scapy.packet import Raw
+    from scapy.packet import Padding, Raw
 except ImportError:  # pragma: no cover - scapy optional at runtime
-    TCP = UDP = IP = Raw = Ether = None
+    TCP = UDP = IP = Raw = Ether = Padding = None
 
-from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, memoize_analysis, safe_float
+from .pcap_cache import iter_packets
+from .utils import extract_ethertype, extract_packet_endpoints, safe_float
 
 DEFAULT_KEYWORDS = {
     "user",
@@ -76,6 +77,12 @@ def append_public_exposure_anomaly(
     Shared by the OT protocol analyzers (was a byte-identical ~12-line block
     copy-pasted across ~25 modules). Carries the ATT&CK-for-ICS technique and
     evidence so every OT protocol reports the exposure consistently.
+
+    Mutates ``analysis`` in place. That is safe only because
+    :func:`analyze_port_protocol` / :func:`analyze_ethertype_protocol` return
+    a fresh object on every call (they are deliberately *not* memoized); the
+    outer ``analyze_<protocol>`` function that owns the object is the one
+    memoized, after all post-processing has run.
     """
     public_endpoints = [
         ip
@@ -145,6 +152,24 @@ class SizeBucket:
     pct: float
 
 
+def cleared_analysis(analysis: IndustrialAnalysis) -> IndustrialAnalysis:
+    """A fresh result keeping only the capture-level facts of ``analysis``.
+
+    Used when a protocol analyzer decides its match was low-confidence (a port
+    collision, a few ambiguous packets) and must report "not present" without
+    losing the total packet/byte counts, duration and any errors. Building a
+    new object — rather than clearing every counter on the old one in place —
+    keeps the result independent of anything else still holding the original.
+    """
+    return IndustrialAnalysis(
+        path=analysis.path,
+        duration=analysis.duration,
+        total_packets=analysis.total_packets,
+        total_bytes=analysis.total_bytes,
+        errors=list(analysis.errors),
+    )
+
+
 CommandParser = Callable[[bytes], Iterable[str]]
 ArtifactParser = Callable[[bytes], Iterable[tuple[str, str]]]
 AnomalyDetector = Callable[
@@ -188,36 +213,52 @@ def default_artifacts(payload: bytes) -> list[tuple[str, str]]:
     return _default_artifacts(payload)
 
 
+_SIZE_BUCKETS: tuple[tuple[int, int, str], ...] = (
+    (0, 19, "0-19"),
+    (20, 39, "20-39"),
+    (40, 79, "40-79"),
+    (80, 159, "80-159"),
+    (160, 319, "160-319"),
+    (320, 639, "320-639"),
+    (640, 1279, "640-1279"),
+    (1280, 2559, "1280-2559"),
+    (2560, 5119, "2560-5119"),
+    (5120, 65535, "5120+"),
+)
+_BUCKET_UPPERS = [high for _low, high, _label in _SIZE_BUCKETS]
+
+
 def _bucketize(values: list[int]) -> list[SizeBucket]:
+    """Histogram of sizes into the fixed bucket ranges, in one pass
+    (was one list comprehension per bucket over the whole sample)."""
     if not values:
         return []
-    size_buckets = [
-        (0, 19, "0-19"),
-        (20, 39, "20-39"),
-        (40, 79, "40-79"),
-        (80, 159, "80-159"),
-        (160, 319, "160-319"),
-        (320, 639, "320-639"),
-        (640, 1279, "640-1279"),
-        (1280, 2559, "1280-2559"),
-        (2560, 5119, "2560-5119"),
-        (5120, 65535, "5120+"),
-    ]
-    buckets: list[SizeBucket] = []
+    count = [0] * len(_SIZE_BUCKETS)
+    total_in = [0] * len(_SIZE_BUCKETS)
+    min_in = [0] * len(_SIZE_BUCKETS)
+    max_in = [0] * len(_SIZE_BUCKETS)
+    for val in values:
+        idx = bisect.bisect_left(_BUCKET_UPPERS, val)
+        if idx >= len(_SIZE_BUCKETS):
+            continue  # above 65535: outside every bucket, as before
+        if count[idx] == 0 or val < min_in[idx]:
+            min_in[idx] = val
+        if val > max_in[idx]:
+            max_in[idx] = val
+        count[idx] += 1
+        total_in[idx] += val
     total = len(values)
-    for low, high, label in size_buckets:
-        entries = [val for val in values if low <= val <= high]
-        count = len(entries)
-        avg = sum(entries) / count if count else 0.0
-        min_val = min(entries) if entries else 0
-        max_val = max(entries) if entries else 0
-        pct = (count / total) * 100 if total else 0.0
-        buckets.append(
-            SizeBucket(
-                label=label, count=count, avg=avg, min=min_val, max=max_val, pct=pct
-            )
+    return [
+        SizeBucket(
+            label=label,
+            count=count[i],
+            avg=(total_in[i] / count[i]) if count[i] else 0.0,
+            min=min_in[i],
+            max=max_in[i],
+            pct=(count[i] / total) * 100 if total else 0.0,
         )
-    return buckets
+        for i, (_low, _high, label) in enumerate(_SIZE_BUCKETS)
+    ]
 
 
 def _default_anomalies(
@@ -259,63 +300,363 @@ def _default_anomalies(
     return anomalies
 
 
-def _extract_transport(pkt) -> tuple[bool, str, str, int, int, bytes]:
-    src_ip = "?"
-    dst_ip = "?"
-    sport = 0
-    dport = 0
-    payload = b""
+@dataclass(frozen=True)
+class _Matched:
+    """One packet the protocol claims: endpoints, ports, payload and role."""
 
-    if TCP is not None and pkt.haslayer(TCP):
-        sport = int(pkt[TCP].sport)
-        dport = int(pkt[TCP].dport)
-        payload_obj = pkt[TCP].payload
-        payload = bytes(payload_obj) if payload_obj else b""
-        if not payload and Raw is not None and pkt.haslayer(Raw):
-            try:
-                payload = bytes(pkt[Raw].load)
-            except Exception:
-                pass
-    elif UDP is not None and pkt.haslayer(UDP):
-        sport = int(pkt[UDP].sport)
-        dport = int(pkt[UDP].dport)
-        payload_obj = pkt[UDP].payload
-        payload = bytes(payload_obj) if payload_obj else b""
-        if not payload and Raw is not None and pkt.haslayer(Raw):
-            try:
-                payload = bytes(pkt[Raw].load)
-            except Exception:
-                pass
-    else:
-        return False, src_ip, dst_ip, sport, dport, payload
-
-    src_raw, dst_raw = extract_packet_endpoints(pkt)
-    if src_raw and dst_raw:
-        src_ip = src_raw
-        dst_ip = dst_raw
-    else:
-        src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
-        dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "?"
-
-    return True, src_ip, dst_ip, sport, dport, payload
+    src: str
+    dst: str
+    sport: int
+    dport: int
+    payload: bytes
+    is_request: bool
+    is_response: bool
+    session_key: str
 
 
-def _extract_ethertype(pkt) -> Optional[int]:
-    if Ether is not None and pkt.haslayer(Ether):
-        try:
-            return int(pkt[Ether].type)
-        except Exception:
-            return None
+def _strip_padding(layer: object) -> bytes:
+    """Bytes of a transport payload without scapy's trailing ``Padding``.
+
+    Ethernet pads short frames to 60 bytes; scapy dissects the pad as a
+    ``Padding`` layer *inside* the transport payload, so ``bytes(tcp.payload)``
+    of a 12-byte Modbus request comes back as 12 protocol bytes plus zeros
+    that the protocol parsers then read as data.
+    """
+    if not layer:
+        return b""
     try:
-        raw = bytes(pkt)
-        if len(raw) >= 14:
-            return int.from_bytes(raw[12:14], "big")
+        raw = bytes(layer)
     except Exception:
+        return b""
+    pad = layer.getlayer(Padding) if Padding is not None else None
+    if pad is not None:
+        try:
+            raw = raw[: len(raw) - len(bytes(pad))]
+        except Exception:
+            pass
+    return raw
+
+
+def _extract_transport(pkt: object) -> tuple[bool, str, str, int, int, bytes]:
+    """``(has_transport, src, dst, sport, dport, payload)`` for a TCP/UDP packet.
+
+    Kept for the analyzers with their own packet loop (cip, enip,
+    ot_commands). One layer walk per transport, padding stripped.
+    """
+    getlayer = getattr(pkt, "getlayer", None)
+    transport = None
+    if callable(getlayer):
+        transport = getlayer(TCP) if TCP is not None else None
+        if transport is None:
+            transport = getlayer(UDP) if UDP is not None else None
+    if transport is None:
+        return False, "?", "?", 0, 0, b""
+    sport = int(getattr(transport, "sport", 0) or 0)
+    dport = int(getattr(transport, "dport", 0) or 0)
+    payload = _strip_padding(transport.payload)
+    src, dst = extract_packet_endpoints(pkt)
+    if not src or not dst:
+        first = pkt[0]  # type: ignore[index]
+        src = getattr(first, "src", None) or "?"
+        dst = getattr(first, "dst", None) or "?"
+    return True, src, dst, sport, dport, payload
+
+
+def _match_ports(
+    pkt: object,
+    tcp_ports: set[int],
+    udp_ports: set[int],
+    signature_matcher: SignatureMatcher | None,
+) -> _Matched | None:
+    """Port/signature classification for TCP- and UDP-carried protocols."""
+    getlayer = pkt.getlayer  # type: ignore[attr-defined]
+    transport = getlayer(TCP) if TCP is not None else None
+    if transport is None:
+        transport = getlayer(UDP) if UDP is not None else None
+        if transport is None:
+            return None
+    sport = int(getattr(transport, "sport", 0) or 0)
+    dport = int(getattr(transport, "dport", 0) or 0)
+    payload = _strip_padding(transport.payload)
+
+    # Classify by port only when the OT port is the *server* side: the
+    # destination (client -> server) or the source with an ephemeral
+    # destination (server -> client response). A bare "sport or dport in
+    # ports" test misclassifies any flow whose ephemeral source port happens
+    # to equal an OT port number — e.g. a TCP DNS query to 8.8.8.8:53 whose
+    # ephemeral source port is 44818 would otherwise be reported as
+    # EtherNet/IP/CSP/PCCC traffic to a public IP. Signature matches are
+    # always honored.
+    matches_port = (
+        dport in tcp_ports
+        or dport in udp_ports
+        or ((sport in tcp_ports or sport in udp_ports) and dport >= _PORT_SERVER_EPHEMERAL_MIN)
+    )
+    matches_sig = bool(signature_matcher and payload and signature_matcher(payload))
+    if not matches_port and not matches_sig:
         return None
-    return None
+
+    src, dst = extract_packet_endpoints(pkt)
+    if not src or not dst:
+        first = pkt[0]  # type: ignore[index]
+        src = getattr(first, "src", None) or "?"
+        dst = getattr(first, "dst", None) or "?"
+    return _Matched(
+        src=src,
+        dst=dst,
+        sport=sport,
+        dport=dport,
+        payload=payload,
+        is_request=(dport in tcp_ports) or (dport in udp_ports),
+        is_response=(sport in tcp_ports) or (sport in udp_ports),
+        session_key=f"{src}:{sport} -> {dst}:{dport}",
+    )
 
 
-@memoize_analysis
+def _match_ethertype(pkt: object, ethertype: int) -> _Matched | None:
+    """EtherType classification for L2 protocols (GOOSE, SV, PROFINET RT, …).
+    Endpoints are MAC addresses; every frame counts as a request."""
+    if extract_ethertype(pkt) != ethertype:
+        return None
+    first = pkt[0]  # type: ignore[index]
+    src = getattr(first, "src", None) or "?"
+    dst = getattr(first, "dst", None) or "?"
+    ether = pkt.getlayer(Ether) if Ether is not None else None  # type: ignore[attr-defined]
+    payload = _strip_padding(ether.payload) if ether is not None else b""
+    return _Matched(
+        src=src, dst=dst, sport=0, dport=0, payload=payload,
+        is_request=True, is_response=False, session_key=f"{src} -> {dst}",
+    )
+
+
+_ANOMALY_CAP = 200
+_ARTIFACT_CAP = 200
+_COMMAND_EVENT_CAP = 5000
+
+
+def _industrial_pass(
+    path: Path,
+    protocol_name: str,
+    *,
+    classify: Callable[[object], "_Matched | None"],
+    command_parser: CommandParser | None,
+    artifact_parser: ArtifactParser | None,
+    anomaly_detector: AnomalyDetector | None,
+    enable_enrichment: bool,
+    show_status: bool,
+    scanning_check: bool,
+) -> IndustrialAnalysis:
+    """The single packet pass behind every port- and EtherType-based OT analyzer.
+
+    ``classify`` decides whether a packet belongs to the protocol and returns
+    its endpoints/payload/role; everything after that — counters, command and
+    artifact extraction, per-packet anomaly detection with de-duplication,
+    size buckets, cadence (beaconing) and exfiltration checks — is shared.
+    Was two ~250-line copies that had already drifted apart.
+
+    A packet that raises inside a protocol parser is counted and skipped;
+    the pass no longer aborts at the first malformed packet and reports the
+    number skipped, so a partial result is visible as partial.
+    """
+    analysis = IndustrialAnalysis(path=path)
+    # Collapse identical per-packet detector findings (same title/src/dst/detail)
+    # to one — OT detectors that emit an anomaly per packet otherwise flood the
+    # cap with thousands of identical entries (e.g. one "Control Object
+    # Operation" per DNP3 packet) and bury the distinct findings.
+    seen_anomalies: set[tuple[str, str, str, str]] = set()
+    seen_artifacts: set[str] = set()
+    start_time = None
+    last_time = None
+    payload_sizes: list[int] = []
+    packet_sizes: list[int] = []
+    session_last_ts: dict[str, float] = {}
+    session_intervals: dict[str, list[float]] = defaultdict(list)
+    session_endpoints: dict[str, tuple[str, str]] = {}
+    src_requests: Counter[str] = Counter()
+    src_responses: Counter[str] = Counter()
+    src_dst_bytes: dict[str, Counter[str]] = defaultdict(Counter)
+    detector = anomaly_detector or _default_anomalies
+    skipped = 0
+    first_error: str | None = None
+
+    for pkt in iter_packets(path, show_status=show_status):
+        analysis.total_packets += 1
+        pkt_len = packet_length(pkt)
+        analysis.total_bytes += pkt_len
+        ts = safe_float(getattr(pkt, "time", 0))
+        if start_time is None:
+            start_time = ts
+        last_time = ts
+
+        try:
+            match = classify(pkt)
+            if match is None:
+                continue
+
+            analysis.protocol_packets += 1
+            analysis.protocol_bytes += pkt_len
+            analysis.src_ips[match.src] += 1
+            analysis.dst_ips[match.dst] += 1
+            analysis.sessions[match.session_key] += 1
+            if match.sport:
+                analysis.ports[match.sport] += 1
+            if match.dport:
+                analysis.ports[match.dport] += 1
+            payload = match.payload
+
+            if enable_enrichment:
+                payload_sizes.append(len(payload))
+                packet_sizes.append(pkt_len)
+                key = match.session_key
+                session_endpoints.setdefault(key, (match.src, match.dst))
+                if key in session_last_ts and ts is not None:
+                    interval = ts - session_last_ts[key]
+                    if interval >= 0:
+                        session_intervals[key].append(interval)
+                if ts is not None:
+                    session_last_ts[key] = ts
+                if match.is_request and not match.is_response:
+                    analysis.requests += 1
+                    analysis.client_ips[match.src] += 1
+                    analysis.server_ips[match.dst] += 1
+                    src_requests[match.src] += 1
+                elif match.is_response and not match.is_request:
+                    analysis.responses += 1
+                    analysis.client_ips[match.dst] += 1
+                    analysis.server_ips[match.src] += 1
+                    src_responses[match.src] += 1
+                if payload:
+                    src_dst_bytes[match.src][match.dst] += len(payload)
+
+            commands = list(command_parser(payload)) if command_parser else []
+            if commands:
+                analysis.commands.update(commands)
+                # Attribute command endpoints to the request (client -> server)
+                # direction only, so a service isn't listed as both "A -> B" and
+                # "B -> A" for one request/response exchange.
+                if enable_enrichment and (match.is_request or not match.is_response):
+                    for cmd in commands:
+                        endpoints = analysis.service_endpoints.setdefault(str(cmd), Counter())
+                        endpoints[f"{match.src} -> {match.dst}"] += 1
+                if ts is not None and len(analysis.command_events) < _COMMAND_EVENT_CAP:
+                    for cmd in commands:
+                        analysis.command_events.append(
+                            IndustrialCommandEvent(ts=ts, src=match.src, dst=match.dst, command=str(cmd))
+                        )
+
+            artifacts = _default_artifacts(payload) if artifact_parser is None else list(artifact_parser(payload))
+            for kind, detail in artifacts:
+                key = f"{kind}:{detail}"
+                if key in seen_artifacts:
+                    continue
+                seen_artifacts.add(key)
+                if len(analysis.artifacts) < _ARTIFACT_CAP:
+                    analysis.artifacts.append(
+                        IndustrialArtifact(kind=kind, detail=detail, src=match.src, dst=match.dst, ts=ts)
+                    )
+
+            for anomaly in detector(payload, match.src, match.dst, ts, commands):
+                akey = (
+                    str(getattr(anomaly, "title", "")),
+                    str(getattr(anomaly, "src", "")),
+                    str(getattr(anomaly, "dst", "")),
+                    str(getattr(anomaly, "description", "")),
+                )
+                if akey in seen_anomalies:
+                    continue
+                seen_anomalies.add(akey)
+                if len(analysis.anomalies) < _ANOMALY_CAP:
+                    analysis.anomalies.append(anomaly)
+        except Exception as exc:  # noqa: BLE001 — one bad packet must not end the pass
+            skipped += 1
+            if first_error is None:
+                first_error = f"{type(exc).__name__}: {exc}"
+
+    if skipped:
+        analysis.errors.append(
+            f"{skipped} packet(s) skipped by the {protocol_name} parser "
+            f"(first error: {first_error}); counts are lower bounds."
+        )
+    if start_time is not None and last_time is not None:
+        analysis.duration = last_time - start_time
+
+    if enable_enrichment:
+        analysis.packet_size_buckets = _bucketize(packet_sizes)
+        analysis.payload_size_buckets = _bucketize(payload_sizes)
+
+        if scanning_check:
+            for src, dsts in src_dst_bytes.items():
+                unique_dsts = len(dsts)
+                req_count = src_requests.get(src, 0)
+                resp_count = src_responses.get(src, 0)
+                if unique_dsts >= 20 and req_count > resp_count * 2 and len(analysis.anomalies) < _ANOMALY_CAP:
+                    sample_dsts = ", ".join(
+                        str(d) for d, _b in sorted(dsts.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                    )
+                    analysis.anomalies.append(
+                        IndustrialAnomaly(
+                            severity="MEDIUM",
+                            title=f"{protocol_name} Scanning/Probing",
+                            description=f"Source contacted {unique_dsts} endpoints with low response rate.",
+                            src=src, dst="*", ts=0.0,
+                            attack="T0846 Remote System Discovery",
+                            evidence=[
+                                f"{unique_dsts} unique destinations",
+                                f"requests={req_count} responses={resp_count}",
+                                f"top dst: {sample_dsts}",
+                            ],
+                        )
+                    )
+
+        for session_key, intervals in session_intervals.items():
+            if len(intervals) < 6:
+                continue
+            avg = sum(intervals) / len(intervals)
+            if avg <= 0:
+                continue
+            variance = sum((x - avg) ** 2 for x in intervals) / len(intervals)
+            cv = (variance**0.5) / avg
+            if cv <= 0.2 and 1.0 <= avg <= 300.0:
+                # Endpoints come from the session record, not from re-parsing
+                # the "src:port -> dst:port" key, which cut IPv6 addresses at
+                # their first colon.
+                src_ip, dst_ip = session_endpoints.get(session_key, ("?", "?"))
+                # Low-jitter regular intervals are normal SCADA polling; only an
+                # EXTERNAL destination makes periodic OT traffic a beacon/C2 lead.
+                if not _is_public_ip(dst_ip):
+                    continue
+                if len(analysis.anomalies) < _ANOMALY_CAP:
+                    analysis.anomalies.append(
+                        IndustrialAnomaly(
+                            severity="LOW",
+                            title=f"Possible {protocol_name} Beaconing",
+                            description=f"Regular interval traffic (~{avg:.2f}s) observed.",
+                            src=src_ip, dst=dst_ip, ts=0.0,
+                            attack="T0869 Standard Application Layer Protocol",
+                            evidence=[
+                                f"mean interval ~{avg:.2f}s (CV={cv:.2f}, n={len(intervals)})",
+                                f"external destination {dst_ip}",
+                            ],
+                        )
+                    )
+
+        for src, dsts in src_dst_bytes.items():
+            for dst, byte_count in dsts.items():
+                if byte_count >= 5_000_000 and _is_public_ip(dst) and len(analysis.anomalies) < _ANOMALY_CAP:
+                    analysis.anomalies.append(
+                        IndustrialAnomaly(
+                            severity="MEDIUM",
+                            title=f"Possible {protocol_name} Data Exfiltration",
+                            description=f"{byte_count} bytes sent to public IP.",
+                            src=src, dst=dst, ts=0.0,
+                            attack="T0883 Internet Accessible Device",
+                            evidence=[f"{byte_count:,} bytes to public IP {dst}"],
+                        )
+                    )
+
+    return analysis
+
+
 def analyze_port_protocol(
     path: Path,
     protocol_name: str,
@@ -328,293 +669,25 @@ def analyze_port_protocol(
     enable_enrichment: bool = False,
     show_status: bool = True,
 ) -> IndustrialAnalysis:
+    """Analyse a TCP/UDP-carried OT protocol. Returns a fresh object every
+    call (not memoized) so callers may post-process it in place."""
     if TCP is None and UDP is None:
-        return IndustrialAnalysis(
-            path=path,
-            errors=["Scapy unavailable (TCP/UDP missing)"],
-        )
-
-    tcp_ports = tcp_ports or set()
-    udp_ports = udp_ports or set()
-
-    try:
-        reader, status, _stream, _size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as exc:
-        return IndustrialAnalysis(path=path, errors=[f"Error: {exc}"])
-
-    analysis = IndustrialAnalysis(path=path)
-    # Collapse identical per-packet detector findings (same title/src/dst/detail)
-    # to one — OT detectors that emit an anomaly per packet otherwise flood the
-    # 200-cap with thousands of identical entries (e.g. one "Control Object
-    # Operation" per DNP3 packet) and bury the distinct findings. Detectors that
-    # already aggregate (distinct descriptions per sub-event) are unaffected.
-    _seen_anoms: set[tuple[str, str, str, str]] = set()
-    start_time = None
-    last_time = None
-    seen_artifacts: set[str] = set()
-    payload_sizes: list[int] = []
-    packet_sizes: list[int] = []
-    session_last_ts: dict[str, float] = {}
-    session_intervals: dict[str, list[float]] = defaultdict(list)
-    src_requests: Counter[str] = Counter()
-    src_responses: Counter[str] = Counter()
-    src_dst_bytes: dict[str, Counter[str]] = defaultdict(Counter)
-
-    try:
-        with status as pbar:
-            try:
-                total_count = len(reader)
-            except Exception:
-                total_count = None
-            for idx, pkt in enumerate(reader):
-                if total_count and idx % 10 == 0:
-                    try:
-                        pbar.update(int((idx / max(1, total_count)) * 100))
-                    except Exception:
-                        pass
-
-                analysis.total_packets += 1
-                pkt_len = packet_length(pkt)
-                analysis.total_bytes += pkt_len
-                ts = safe_float(getattr(pkt, "time", 0))
-                if start_time is None:
-                    start_time = ts
-                last_time = ts
-
-                has_transport, src_ip, dst_ip, sport, dport, payload = (
-                    _extract_transport(pkt)
-                )
-                if not has_transport:
-                    continue
-
-                # Classify by port only when the OT port is the *server* side:
-                # the destination (client -> server) or the source with an
-                # ephemeral destination (server -> client response). A bare
-                # "sport or dport in ports" test misclassifies any flow whose
-                # ephemeral source port happens to equal an OT port number —
-                # e.g. a TCP DNS query to 8.8.8.8:53 whose ephemeral source port
-                # is 44818 would otherwise be reported as EtherNet/IP/CSP/PCCC
-                # traffic to a public IP. Signature matches are always honored.
-                matches_port = (
-                    dport in tcp_ports
-                    or dport in udp_ports
-                    or (
-                        (sport in tcp_ports or sport in udp_ports)
-                        and dport >= _PORT_SERVER_EPHEMERAL_MIN
-                    )
-                )
-                matches_sig = (
-                    signature_matcher(payload)
-                    if signature_matcher and payload
-                    else False
-                )
-                if not matches_port and not matches_sig:
-                    continue
-
-                analysis.protocol_packets += 1
-                analysis.protocol_bytes += pkt_len
-                analysis.src_ips[src_ip] += 1
-                analysis.dst_ips[dst_ip] += 1
-                analysis.sessions[f"{src_ip}:{sport} -> {dst_ip}:{dport}"] += 1
-                if sport:
-                    analysis.ports[sport] += 1
-                if dport:
-                    analysis.ports[dport] += 1
-
-                if enable_enrichment:
-                    payload_sizes.append(len(payload))
-                    packet_sizes.append(pkt_len)
-                    session_key = f"{src_ip}:{sport} -> {dst_ip}:{dport}"
-                    if session_key in session_last_ts and ts is not None:
-                        interval = ts - session_last_ts[session_key]
-                        if interval >= 0:
-                            session_intervals[session_key].append(interval)
-                    if ts is not None:
-                        session_last_ts[session_key] = ts
-
-                    is_request = (dport in tcp_ports) or (dport in udp_ports)
-                    is_response = (sport in tcp_ports) or (sport in udp_ports)
-                    if is_request and not is_response:
-                        analysis.requests += 1
-                        analysis.client_ips[src_ip] += 1
-                        analysis.server_ips[dst_ip] += 1
-                        src_requests[src_ip] += 1
-                    elif is_response and not is_request:
-                        analysis.responses += 1
-                        analysis.client_ips[dst_ip] += 1
-                        analysis.server_ips[src_ip] += 1
-                        src_responses[src_ip] += 1
-                    if payload:
-                        src_dst_bytes[src_ip][dst_ip] += len(payload)
-
-                commands = list(command_parser(payload)) if command_parser else []
-                if commands:
-                    analysis.commands.update(commands)
-                    if enable_enrichment:
-                        # Attribute command endpoints to the request (client ->
-                        # server) direction only, so a service isn't listed as both
-                        # "A -> B" and "B -> A" for one request/response exchange.
-                        # (is_request/is_response set just above in this block.)
-                        if is_request or not is_response:
-                            for cmd in commands:
-                                endpoints = analysis.service_endpoints.setdefault(
-                                    str(cmd), Counter()
-                                )
-                                endpoints[f"{src_ip} -> {dst_ip}"] += 1
-                    if ts is not None and len(analysis.command_events) < 5000:
-                        for cmd in commands:
-                            analysis.command_events.append(
-                                IndustrialCommandEvent(
-                                    ts=ts,
-                                    src=src_ip,
-                                    dst=dst_ip,
-                                    command=str(cmd),
-                                )
-                            )
-
-                if artifact_parser is None:
-                    artifacts = _default_artifacts(payload)
-                else:
-                    artifacts = list(artifact_parser(payload))
-                for kind, detail in artifacts:
-                    key = f"{kind}:{detail}"
-                    if key in seen_artifacts:
-                        continue
-                    seen_artifacts.add(key)
-                    if len(analysis.artifacts) < 200:
-                        analysis.artifacts.append(
-                            IndustrialArtifact(
-                                kind=kind,
-                                detail=detail,
-                                src=src_ip,
-                                dst=dst_ip,
-                                ts=ts,
-                            )
-                        )
-
-                detector = anomaly_detector or _default_anomalies
-                for anomaly in detector(payload, src_ip, dst_ip, ts, commands):
-                    _akey = (
-                        str(getattr(anomaly, "title", "")),
-                        str(getattr(anomaly, "src", "")),
-                        str(getattr(anomaly, "dst", "")),
-                        str(getattr(anomaly, "description", "")),
-                    )
-                    if _akey in _seen_anoms:
-                        continue
-                    _seen_anoms.add(_akey)
-                    if len(analysis.anomalies) < 200:
-                        analysis.anomalies.append(anomaly)
-
-    except Exception as exc:
-        analysis.errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        try:
-            reader.close()
-        except Exception:
-            pass
-
-    if start_time is not None and last_time is not None:
-        analysis.duration = last_time - start_time
-
-    if enable_enrichment:
-        analysis.packet_size_buckets = _bucketize(packet_sizes)
-        analysis.payload_size_buckets = _bucketize(payload_sizes)
-
-        max_anomalies = 200
-        for src, dsts in src_dst_bytes.items():
-            unique_dsts = len(dsts)
-            req_count = src_requests.get(src, 0)
-            resp_count = src_responses.get(src, 0)
-            if (
-                unique_dsts >= 20
-                and req_count > resp_count * 2
-                and len(analysis.anomalies) < max_anomalies
-            ):
-                sample_dsts = ", ".join(
-                    str(d)
-                    for d, _b in sorted(
-                        dsts.items(), key=lambda kv: kv[1], reverse=True
-                    )[:6]
-                )
-                analysis.anomalies.append(
-                    IndustrialAnomaly(
-                        severity="MEDIUM",
-                        title=f"{protocol_name} Scanning/Probing",
-                        description=f"Source contacted {unique_dsts} endpoints with low response rate.",
-                        src=src,
-                        dst="*",
-                        ts=0.0,
-                        attack="T0846 Remote System Discovery",
-                        evidence=[
-                            f"{unique_dsts} unique destinations",
-                            f"requests={req_count} responses={resp_count}",
-                            f"top dst: {sample_dsts}",
-                        ],
-                    )
-                )
-
-        for session_key, intervals in session_intervals.items():
-            if len(intervals) < 6:
-                continue
-            avg = sum(intervals) / len(intervals)
-            if avg <= 0:
-                continue
-            variance = sum((x - avg) ** 2 for x in intervals) / len(intervals)
-            cv = (variance**0.5) / avg
-            if cv <= 0.2 and 1.0 <= avg <= 300.0:
-                src_part, dst_part = session_key.split(" -> ", 1)
-                src_ip = src_part.split(":", 1)[0]
-                dst_ip = dst_part.split(":", 1)[0]
-                # Low-jitter regular intervals are normal SCADA polling; only an
-                # EXTERNAL destination makes periodic OT traffic a beacon/C2 lead.
-                if not _is_public_ip(dst_ip):
-                    continue
-                if len(analysis.anomalies) < max_anomalies:
-                    analysis.anomalies.append(
-                        IndustrialAnomaly(
-                            severity="LOW",
-                            title=f"Possible {protocol_name} Beaconing",
-                            description=f"Regular interval traffic (~{avg:.2f}s) observed.",
-                            src=src_ip,
-                            dst=dst_ip,
-                            ts=0.0,
-                            attack="T0869 Standard Application Layer Protocol",
-                            evidence=[
-                                f"mean interval ~{avg:.2f}s (CV={cv:.2f}, n={len(intervals)})",
-                                f"external destination {dst_ip}",
-                            ],
-                        )
-                    )
-
-        for src, dsts in src_dst_bytes.items():
-            for dst, byte_count in dsts.items():
-                if (
-                    byte_count >= 5_000_000
-                    and _is_public_ip(dst)
-                    and len(analysis.anomalies) < max_anomalies
-                ):
-                    analysis.anomalies.append(
-                        IndustrialAnomaly(
-                            severity="MEDIUM",
-                            title=f"Possible {protocol_name} Data Exfiltration",
-                            description=f"{byte_count} bytes sent to public IP.",
-                            src=src,
-                            dst=dst,
-                            ts=0.0,
-                            attack="T0883 Internet Accessible Device",
-                            evidence=[
-                                f"{byte_count:,} bytes to public IP {dst}",
-                            ],
-                        )
-                    )
-
-    return analysis
+        return IndustrialAnalysis(path=path, errors=["Scapy unavailable (TCP/UDP missing)"])
+    tcp_set = set(tcp_ports or ())
+    udp_set = set(udp_ports or ())
+    return _industrial_pass(
+        path,
+        protocol_name,
+        classify=lambda pkt: _match_ports(pkt, tcp_set, udp_set, signature_matcher),
+        command_parser=command_parser,
+        artifact_parser=artifact_parser,
+        anomaly_detector=anomaly_detector,
+        enable_enrichment=enable_enrichment,
+        show_status=show_status,
+        scanning_check=True,
+    )
 
 
-@memoize_analysis
 def analyze_ethertype_protocol(
     path: Path,
     protocol_name: str,
@@ -625,206 +698,18 @@ def analyze_ethertype_protocol(
     enable_enrichment: bool = False,
     show_status: bool = True,
 ) -> IndustrialAnalysis:
+    """Analyse an EtherType-carried (L2) OT protocol. Returns a fresh object
+    every call (not memoized) so callers may post-process it in place."""
     if Ether is None:
-        return IndustrialAnalysis(
-            path=path,
-            errors=["Scapy unavailable (Ether missing)"],
-        )
-
-    try:
-        reader, status, _stream, _size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as exc:
-        return IndustrialAnalysis(path=path, errors=[f"Error: {exc}"])
-
-    analysis = IndustrialAnalysis(path=path)
-    # Collapse identical per-packet detector findings (same title/src/dst/detail)
-    # to one — OT detectors that emit an anomaly per packet otherwise flood the
-    # 200-cap with thousands of identical entries (e.g. one "Control Object
-    # Operation" per DNP3 packet) and bury the distinct findings. Detectors that
-    # already aggregate (distinct descriptions per sub-event) are unaffected.
-    _seen_anoms: set[tuple[str, str, str, str]] = set()
-    start_time = None
-    last_time = None
-    seen_artifacts: set[str] = set()
-    payload_sizes: list[int] = []
-    packet_sizes: list[int] = []
-    session_last_ts: dict[str, float] = {}
-    session_intervals: dict[str, list[float]] = defaultdict(list)
-    src_dst_bytes: dict[str, Counter[str]] = defaultdict(Counter)
-
-    try:
-        with status as pbar:
-            try:
-                total_count = len(reader)
-            except Exception:
-                total_count = None
-            for idx, pkt in enumerate(reader):
-                if total_count and idx % 10 == 0:
-                    try:
-                        pbar.update(int((idx / max(1, total_count)) * 100))
-                    except Exception:
-                        pass
-
-                analysis.total_packets += 1
-                pkt_len = packet_length(pkt)
-                analysis.total_bytes += pkt_len
-                ts = safe_float(getattr(pkt, "time", 0))
-                if start_time is None:
-                    start_time = ts
-                last_time = ts
-
-                etype = _extract_ethertype(pkt)
-                if etype != ethertype:
-                    continue
-
-                analysis.protocol_packets += 1
-                analysis.protocol_bytes += pkt_len
-                src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
-                dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "?"
-                analysis.src_ips[src_ip] += 1
-                analysis.dst_ips[dst_ip] += 1
-                analysis.sessions[f"{src_ip} -> {dst_ip}"] += 1
-
-                if enable_enrichment:
-                    payload = (
-                        bytes(pkt[Ether].payload)
-                        if Ether is not None and pkt.haslayer(Ether)
-                        else b""
-                    )
-                    payload_sizes.append(len(payload))
-                    packet_sizes.append(pkt_len)
-                    analysis.requests += 1
-                    analysis.client_ips[src_ip] += 1
-                    analysis.server_ips[dst_ip] += 1
-                    session_key = f"{src_ip} -> {dst_ip}"
-                    if session_key in session_last_ts and ts is not None:
-                        interval = ts - session_last_ts[session_key]
-                        if interval >= 0:
-                            session_intervals[session_key].append(interval)
-                    if ts is not None:
-                        session_last_ts[session_key] = ts
-                    if payload:
-                        src_dst_bytes[src_ip][dst_ip] += len(payload)
-
-                payload = (
-                    bytes(pkt[Ether].payload)
-                    if Ether is not None and pkt.haslayer(Ether)
-                    else b""
-                )
-
-                commands = list(command_parser(payload)) if command_parser else []
-                if commands:
-                    analysis.commands.update(commands)
-                    if enable_enrichment:
-                        for cmd in commands:
-                            endpoints = analysis.service_endpoints.setdefault(
-                                str(cmd), Counter()
-                            )
-                            endpoints[f"{src_ip} -> {dst_ip}"] += 1
-
-                if artifact_parser is None:
-                    artifacts = _default_artifacts(payload)
-                else:
-                    artifacts = list(artifact_parser(payload))
-                for kind, detail in artifacts:
-                    key = f"{kind}:{detail}"
-                    if key in seen_artifacts:
-                        continue
-                    seen_artifacts.add(key)
-                    if len(analysis.artifacts) < 200:
-                        analysis.artifacts.append(
-                            IndustrialArtifact(
-                                kind=kind,
-                                detail=detail,
-                                src=src_ip,
-                                dst=dst_ip,
-                                ts=ts,
-                            )
-                        )
-
-                detector = anomaly_detector or _default_anomalies
-                for anomaly in detector(payload, src_ip, dst_ip, ts, commands):
-                    _akey = (
-                        str(getattr(anomaly, "title", "")),
-                        str(getattr(anomaly, "src", "")),
-                        str(getattr(anomaly, "dst", "")),
-                        str(getattr(anomaly, "description", "")),
-                    )
-                    if _akey in _seen_anoms:
-                        continue
-                    _seen_anoms.add(_akey)
-                    if len(analysis.anomalies) < 200:
-                        analysis.anomalies.append(anomaly)
-
-    except Exception as exc:
-        analysis.errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        try:
-            reader.close()
-        except Exception:
-            pass
-
-    if start_time is not None and last_time is not None:
-        analysis.duration = last_time - start_time
-
-    if enable_enrichment:
-        analysis.packet_size_buckets = _bucketize(packet_sizes)
-        analysis.payload_size_buckets = _bucketize(payload_sizes)
-
-        max_anomalies = 200
-        for session_key, intervals in session_intervals.items():
-            if len(intervals) < 6:
-                continue
-            avg = sum(intervals) / len(intervals)
-            if avg <= 0:
-                continue
-            variance = sum((x - avg) ** 2 for x in intervals) / len(intervals)
-            cv = (variance**0.5) / avg
-            if cv <= 0.2 and 1.0 <= avg <= 300.0:
-                src_ip, dst_ip = session_key.split(" -> ", 1)
-                # Only external destinations make periodic OT traffic a beacon
-                # lead; internal cyclic polling is normal SCADA baseline.
-                if not _is_public_ip(dst_ip.split(":", 1)[0]):
-                    continue
-                if len(analysis.anomalies) < max_anomalies:
-                    analysis.anomalies.append(
-                        IndustrialAnomaly(
-                            severity="LOW",
-                            title=f"Possible {protocol_name} Beaconing",
-                            description=f"Regular interval traffic (~{avg:.2f}s) observed.",
-                            src=src_ip,
-                            dst=dst_ip,
-                            ts=0.0,
-                            attack="T0869 Standard Application Layer Protocol",
-                            evidence=[
-                                f"mean interval ~{avg:.2f}s (CV={cv:.2f}, n={len(intervals)})",
-                                f"external destination {dst_ip}",
-                            ],
-                        )
-                    )
-
-        for src, dsts in src_dst_bytes.items():
-            for dst, byte_count in dsts.items():
-                if (
-                    byte_count >= 5_000_000
-                    and _is_public_ip(dst)
-                    and len(analysis.anomalies) < max_anomalies
-                ):
-                    analysis.anomalies.append(
-                        IndustrialAnomaly(
-                            severity="MEDIUM",
-                            title=f"Possible {protocol_name} Data Exfiltration",
-                            description=f"{byte_count} bytes sent to public IP.",
-                            src=src,
-                            dst=dst,
-                            ts=0.0,
-                            attack="T0883 Internet Accessible Device",
-                            evidence=[
-                                f"{byte_count:,} bytes to public IP {dst}",
-                            ],
-                        )
-                    )
-
-    return analysis
+        return IndustrialAnalysis(path=path, errors=["Scapy unavailable (Ether missing)"])
+    return _industrial_pass(
+        path,
+        protocol_name,
+        classify=lambda pkt: _match_ethertype(pkt, ethertype),
+        command_parser=command_parser,
+        artifact_parser=artifact_parser,
+        anomaly_detector=anomaly_detector,
+        enable_enrichment=enable_enrichment,
+        show_status=show_status,
+        scanning_check=False,
+    )

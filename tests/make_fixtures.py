@@ -703,6 +703,402 @@ def build_voip_attack() -> list:
     return _stamp(packets, start=BASE_TIME + 200, step=0.01)
 
 
+# --- Mixed IT traffic ---------------------------------------------------------
+# One small capture that touches the analyzers the other fixtures leave empty:
+# VLAN tags, ICMPv4 and ICMPv6, ARP, DHCP, NTP, SNMP, a TCP retransmission and
+# an HTTP download of a (fake, inert) PE. Everything is fixed and synthetic.
+ROUTER_MAC = "02:00:00:00:00:fe"
+ROUTER_IP = "192.168.10.1"
+CLIENT_IP6 = "fd00:10::50"
+SERVER_IP6 = "fd00:10::10"
+
+
+def _fake_pe(section_bytes: int = 600) -> bytes:
+    """A minimal PE: MZ stub, e_lfanew -> "PE\\0\\0", one section whose raw
+    data ends the file. Not executable — the section body is 0xCC filler."""
+    lfanew = 0x80
+    image = bytearray(b"MZ" + b"\x00" * (lfanew - 2))
+    image[0x3C:0x40] = lfanew.to_bytes(4, "little")
+    coff = b"PE\x00\x00" + b"\x4c\x01" + (1).to_bytes(2, "little") + b"\x00" * 12
+    opt_size = 0xE0
+    coff += opt_size.to_bytes(2, "little") + b"\x00" * 2
+    image += coff + b"\x00" * opt_size
+    raw_ptr = len(image) + 40
+    section = bytearray(40)
+    section[0:6] = b".text\x00"
+    section[16:20] = section_bytes.to_bytes(4, "little")
+    section[20:24] = raw_ptr.to_bytes(4, "little")
+    image += section
+    image += bytes((i * 37) & 0xFF for i in range(section_bytes))
+    return bytes(image)
+
+
+def build_mixed() -> list:
+    from scapy.layers.dhcp import BOOTP, DHCP  # type: ignore
+    from scapy.layers.inet import ICMP  # type: ignore
+    from scapy.layers.inet6 import ICMPv6EchoReply, ICMPv6EchoRequest, IPv6  # type: ignore
+    from scapy.layers.l2 import ARP, Dot1Q  # type: ignore
+    from scapy.layers.ntp import NTP  # type: ignore
+    from scapy.layers.snmp import SNMP, SNMPget, SNMPvarbind  # type: ignore
+
+    packets = []
+
+    # ARP: who-has / is-at, then a gratuitous announcement from the router.
+    packets.append(
+        Ether(src=CLIENT_MAC, dst="ff:ff:ff:ff:ff:ff")
+        / ARP(op=1, hwsrc=CLIENT_MAC, psrc=CLIENT_IP, hwdst="00:00:00:00:00:00", pdst=SERVER_IP)
+    )
+    packets.append(
+        Ether(src=SERVER_MAC, dst=CLIENT_MAC)
+        / ARP(op=2, hwsrc=SERVER_MAC, psrc=SERVER_IP, hwdst=CLIENT_MAC, pdst=CLIENT_IP)
+    )
+    packets.append(
+        Ether(src=ROUTER_MAC, dst="ff:ff:ff:ff:ff:ff")
+        / ARP(op=2, hwsrc=ROUTER_MAC, psrc=ROUTER_IP, hwdst="ff:ff:ff:ff:ff:ff", pdst=ROUTER_IP)
+    )
+
+    # VLAN-tagged ICMPv4 echo pairs on VLAN 10.
+    for seq in range(3):
+        packets.append(
+            Ether(src=CLIENT_MAC, dst=SERVER_MAC)
+            / Dot1Q(vlan=10)
+            / IP(src=CLIENT_IP, dst=SERVER_IP)
+            / ICMP(type=8, id=0x1234, seq=seq)
+            / Raw(load=bytes(range(56)))
+        )
+        packets.append(
+            Ether(src=SERVER_MAC, dst=CLIENT_MAC)
+            / Dot1Q(vlan=10)
+            / IP(src=SERVER_IP, dst=CLIENT_IP)
+            / ICMP(type=0, id=0x1234, seq=seq)
+            / Raw(load=bytes(range(56)))
+        )
+    # One oversized echo to an external host: boundary crossing + large payload.
+    packets.append(
+        Ether(src=CLIENT_MAC, dst=ROUTER_MAC)
+        / IP(src=CLIENT_IP, dst=EXTERNAL_IP)
+        / ICMP(type=8, id=0x4242, seq=1)
+        / Raw(load=bytes((i * 131 + 7) & 0xFF for i in range(1400)))
+    )
+
+    # ICMPv6 echo pair.
+    packets.append(
+        Ether(src=CLIENT_MAC, dst=SERVER_MAC)
+        / IPv6(src=CLIENT_IP6, dst=SERVER_IP6)
+        / ICMPv6EchoRequest(id=0x77, seq=1, data=b"ping6")
+    )
+    packets.append(
+        Ether(src=SERVER_MAC, dst=CLIENT_MAC)
+        / IPv6(src=SERVER_IP6, dst=CLIENT_IP6)
+        / ICMPv6EchoReply(id=0x77, seq=1, data=b"ping6")
+    )
+
+    # DHCP discover / offer.
+    chaddr = bytes.fromhex(CLIENT_MAC.replace(":", ""))
+    packets.append(
+        Ether(src=CLIENT_MAC, dst="ff:ff:ff:ff:ff:ff")
+        / IP(src="0.0.0.0", dst="255.255.255.255")
+        / UDP(sport=68, dport=67)
+        / BOOTP(chaddr=chaddr, xid=0x0BADF00D, flags=0x8000)
+        / DHCP(options=[("message-type", "discover"), ("hostname", b"ws-analyst"), "end"])
+    )
+    packets.append(
+        Ether(src=ROUTER_MAC, dst=CLIENT_MAC)
+        / IP(src=ROUTER_IP, dst=CLIENT_IP)
+        / UDP(sport=67, dport=68)
+        / BOOTP(op=2, yiaddr=CLIENT_IP, siaddr=ROUTER_IP, chaddr=chaddr, xid=0x0BADF00D)
+        / DHCP(options=[("message-type", "offer"), ("server_id", ROUTER_IP),
+                        ("lease_time", 86400), ("subnet_mask", "255.255.255.0"),
+                        ("router", ROUTER_IP), ("name_server", SERVER_IP), "end"])
+    )
+
+    # NTP request (mode 3) and reply (mode 4). scapy fills an unset NTP
+    # timestamp field with time.time() at build, so every stamp is pinned.
+    ntp_stamps = {"ref": BASE_TIME, "orig": BASE_TIME, "recv": BASE_TIME, "sent": BASE_TIME}
+    packets.append(
+        Ether(src=CLIENT_MAC, dst=SERVER_MAC)
+        / IP(src=CLIENT_IP, dst=SERVER_IP)
+        / UDP(sport=123, dport=123)
+        / NTP(mode=3, version=4, **ntp_stamps)
+    )
+    packets.append(
+        Ether(src=SERVER_MAC, dst=CLIENT_MAC)
+        / IP(src=SERVER_IP, dst=CLIENT_IP)
+        / UDP(sport=123, dport=123)
+        / NTP(mode=4, version=4, stratum=2, **ntp_stamps)
+    )
+
+    # SNMPv2c get with the default community — the classic finding.
+    packets.append(
+        Ether(src=CLIENT_MAC, dst=SERVER_MAC)
+        / IP(src=CLIENT_IP, dst=SERVER_IP)
+        / UDP(sport=50100, dport=161)
+        / SNMP(version=1, community="public",
+               PDU=SNMPget(id=7, varbindlist=[SNMPvarbind(oid="1.3.6.1.2.1.1.1.0")]))
+    )
+
+    # TCP: handshake, a data segment, the same segment retransmitted, then a
+    # download of the fake PE over HTTP.
+    request = b"GET /update.exe HTTP/1.1\r\nHost: updates.example.net\r\n\r\n"
+    pe = _fake_pe()
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Server: test-httpd/1.0\r\n"
+        b"Content-Type: application/octet-stream\r\n"
+        b"Content-Disposition: attachment; filename=\"update.exe\"\r\n"
+        + f"Content-Length: {len(pe)}\r\n\r\n".encode()
+        + pe
+    )
+    c, s = 5000, 9000
+    flow = [
+        Ether(src=CLIENT_MAC, dst=ROUTER_MAC) / IP(src=CLIENT_IP, dst=EXTERNAL_IP)
+        / TCP(sport=44400, dport=80, seq=c, flags="S"),
+        Ether(src=ROUTER_MAC, dst=CLIENT_MAC) / IP(src=EXTERNAL_IP, dst=CLIENT_IP)
+        / TCP(sport=80, dport=44400, seq=s, ack=c + 1, flags="SA"),
+        Ether(src=CLIENT_MAC, dst=ROUTER_MAC) / IP(src=CLIENT_IP, dst=EXTERNAL_IP)
+        / TCP(sport=44400, dport=80, seq=c + 1, ack=s + 1, flags="A"),
+        Ether(src=CLIENT_MAC, dst=ROUTER_MAC) / IP(src=CLIENT_IP, dst=EXTERNAL_IP)
+        / TCP(sport=44400, dport=80, seq=c + 1, ack=s + 1, flags="PA") / Raw(load=request),
+        # retransmission of the request: same seq, same payload
+        Ether(src=CLIENT_MAC, dst=ROUTER_MAC) / IP(src=CLIENT_IP, dst=EXTERNAL_IP)
+        / TCP(sport=44400, dport=80, seq=c + 1, ack=s + 1, flags="PA") / Raw(load=request),
+    ]
+    seq = s + 1
+    for i in range(0, len(response), 400):
+        chunk = response[i : i + 400]
+        flow.append(
+            Ether(src=ROUTER_MAC, dst=CLIENT_MAC) / IP(src=EXTERNAL_IP, dst=CLIENT_IP)
+            / TCP(sport=80, dport=44400, seq=seq, ack=c + 1 + len(request), flags="PA")
+            / Raw(load=chunk)
+        )
+        seq += len(chunk)
+    packets.extend(flow)
+    return _stamp(packets, start=BASE_TIME + 300, step=0.05)
+
+
+def build_truncated() -> list:
+    """The HTTP exchange written as if captured with a 96-byte snaplen.
+
+    scapy's pcap writer records ``pkt.wirelen`` as the original length, so
+    the file's headers say each frame was longer than the bytes stored —
+    exactly what a snaplen-limited capture looks like to a reader.
+    """
+    packets = []
+    for pkt in build_http():
+        full = bytes(pkt)
+        cut = full[:96]
+        truncated = Ether(cut)
+        truncated.time = pkt.time
+        truncated.wirelen = len(full)
+        packets.append(truncated)
+    return packets
+
+
+def _tls_record(content_type: int, body: bytes, version: int = 0x0303) -> bytes:
+    return bytes([content_type]) + version.to_bytes(2, "big") + len(body).to_bytes(2, "big") + body
+
+
+def _tls_handshake(msg_type: int, body: bytes) -> bytes:
+    return bytes([msg_type]) + len(body).to_bytes(3, "big") + body
+
+
+def _tls_ext(ext_type: int, data: bytes) -> bytes:
+    return ext_type.to_bytes(2, "big") + len(data).to_bytes(2, "big") + data
+
+
+def _tls_u16_vector(values: list[int]) -> bytes:
+    body = b"".join(value.to_bytes(2, "big") for value in values)
+    return len(body).to_bytes(2, "big") + body
+
+
+def _tls_random(seed: int) -> bytes:
+    """32 fixed bytes standing in for the handshake random."""
+    return bytes((seed * 37 + index * 11) & 0xFF for index in range(32))
+
+
+def _client_hello(
+    *,
+    sni: str | None,
+    alpn: list[str],
+    ciphers: list[int],
+    versions: list[int],
+    seed: int,
+) -> bytes:
+    exts = []
+    if sni:
+        name = sni.encode("ascii")
+        entry = b"\x00" + len(name).to_bytes(2, "big") + name
+        exts.append(_tls_ext(0x0000, len(entry).to_bytes(2, "big") + entry))
+    exts.append(_tls_ext(0x000A, _tls_u16_vector([0x001D, 0x0017])))  # groups
+    exts.append(_tls_ext(0x000B, b"\x01\x00"))  # ec_point_formats
+    exts.append(_tls_ext(0x000D, _tls_u16_vector([0x0403, 0x0804])))  # sig_algs
+    if alpn:
+        protos = b"".join(bytes([len(proto)]) + proto.encode("ascii") for proto in alpn)
+        exts.append(_tls_ext(0x0010, len(protos).to_bytes(2, "big") + protos))
+    if versions:
+        listed = b"".join(version.to_bytes(2, "big") for version in versions)
+        exts.append(_tls_ext(0x002B, bytes([len(listed)]) + listed))
+    ext_blob = b"".join(exts)
+    body = (
+        b"\x03\x03"
+        + _tls_random(seed)
+        + b"\x00"  # empty session id
+        + _tls_u16_vector(ciphers)
+        + b"\x01\x00"  # null compression only
+        + len(ext_blob).to_bytes(2, "big")
+        + ext_blob
+    )
+    return _tls_record(22, _tls_handshake(1, body), version=0x0301)
+
+
+def _server_hello(*, version: int, cipher: int, alpn: str | None, seed: int) -> bytes:
+    exts = []
+    if alpn:
+        proto = bytes([len(alpn)]) + alpn.encode("ascii")
+        exts.append(_tls_ext(0x0010, len(proto).to_bytes(2, "big") + proto))
+    ext_blob = b"".join(exts)
+    body = version.to_bytes(2, "big") + _tls_random(seed) + b"\x00" + cipher.to_bytes(2, "big") + b"\x00"
+    if ext_blob:
+        body += len(ext_blob).to_bytes(2, "big") + ext_blob
+    return _tls_record(22, _tls_handshake(2, body), version=version)
+
+
+def _certificate_record(der: bytes) -> bytes:
+    entry = len(der).to_bytes(3, "big") + der
+    return _tls_record(22, _tls_handshake(11, len(entry).to_bytes(3, "big") + entry))
+
+
+def _fixture_certificate() -> bytes:
+    """A self-signed, already-expired Ed25519 leaf for shop.example.net.
+
+    Ed25519 is used because both the key (derived from fixed bytes) and the
+    signature are deterministic, so the DER — and therefore the fixture and
+    the fingerprints in the golden reports — never changes on regeneration.
+    """
+    from datetime import datetime, timezone
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    name = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COMMON_NAME, "shop.example.net"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "pcapper fixtures"),
+        ]
+    )
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(0x1001)
+        .not_valid_before(datetime(2021, 1, 1, tzinfo=timezone.utc))
+        .not_valid_after(datetime(2022, 1, 1, tzinfo=timezone.utc))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("shop.example.net")]), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .sign(key, None)
+    )
+    return cert.public_bytes(Encoding.DER)
+
+
+def build_tls() -> list:
+    """Three TLS conversations covering the handshake shapes the analyzer keys on.
+
+    * ``:443`` — ClientHello with SNI ``shop.example.net``, ALPN h2 + http/1.1
+      and supported_versions; the server picks TLS 1.2 / ECDHE-RSA-AES128-GCM
+      and sends a self-signed, expired Ed25519 certificate in the clear, then
+      application data flows both ways.
+    * ``EXTERNAL_IP:8443`` (twice) — SNI ``cdn-update.xyz``, no ALPN, and a
+      server answering TLS 1.0 with 3DES: legacy version, weak cipher,
+      suspicious TLD and a non-standard port in one flow.
+    * ``:443`` — a ClientHello with no SNI at all.
+    """
+    der = _fixture_certificate()
+    packets: list = []
+
+    def _flow(sport: int, dst: str, dport: int, client: list[bytes], server: list[bytes]) -> None:
+        c_seq, s_seq = 1, 1
+        for index in range(max(len(client), len(server))):
+            if index < len(client):
+                packets.append(
+                    Ether(src=CLIENT_MAC, dst=SERVER_MAC)
+                    / IP(src=CLIENT_IP, dst=dst)
+                    / TCP(sport=sport, dport=dport, seq=c_seq, ack=s_seq, flags="PA")
+                    / Raw(load=client[index])
+                )
+                c_seq += len(client[index])
+            if index < len(server):
+                packets.append(
+                    Ether(src=SERVER_MAC, dst=CLIENT_MAC)
+                    / IP(src=dst, dst=CLIENT_IP)
+                    / TCP(sport=dport, dport=sport, seq=s_seq, ack=c_seq, flags="PA")
+                    / Raw(load=server[index])
+                )
+                s_seq += len(server[index])
+
+    app_data = _tls_record(23, bytes(64))
+    _flow(
+        44330,
+        SERVER_IP,
+        443,
+        [
+            _client_hello(
+                sni="shop.example.net",
+                alpn=["h2", "http/1.1"],
+                ciphers=[0x1301, 0x1302, 0xC02B, 0xC02F],
+                versions=[0x0304, 0x0303],
+                seed=1,
+            ),
+            app_data,
+            app_data,
+        ],
+        [
+            _server_hello(version=0x0303, cipher=0xC02F, alpn="h2", seed=2),
+            _certificate_record(der),
+            app_data,
+        ],
+    )
+    for sport in (44331, 44332):
+        _flow(
+            sport,
+            EXTERNAL_IP,
+            8443,
+            [_client_hello(sni="cdn-update.xyz", alpn=[], ciphers=[0x000A, 0x0004, 0xC02F], versions=[], seed=3)],
+            [_server_hello(version=0x0301, cipher=0x000A, alpn=None, seed=4)],
+        )
+    _flow(
+        44333,
+        SERVER_IP,
+        443,
+        [_client_hello(sni=None, alpn=["http/1.1"], ciphers=[0xC02F], versions=[0x0303], seed=5)],
+        [_server_hello(version=0x0303, cipher=0xC02F, alpn="http/1.1", seed=6)],
+    )
+    return _stamp(packets, start=BASE_TIME + 600, step=0.05)
+
+
+SMB_CLIENT_GUID = bytes(range(0x10, 0x20))
+SMB_SERVER_GUID = bytes(range(0xA0, 0xB0))
+SMB_FILE_ID = bytes(range(0x30, 0x40))
+
+
 FIXTURES = {
     "carve_wrap.pcap": build_carve_wrap,
     "carve_gap.pcap": build_carve_gap,
@@ -712,7 +1108,24 @@ FIXTURES = {
     "voip.pcap": build_voip,
     "voip_multiproto.pcap": build_voip_multiproto,
     "voip_attack.pcap": build_voip_attack,
+    "mixed.pcap": build_mixed,
+    "truncated.pcap": build_truncated,
+    "tls.pcap": build_tls,
 }
+
+# Written with the pcapng writer so the pcapng reader/metadata path is
+# exercised by a fixture too.
+PCAPNG_FIXTURES = {
+    "mixed.pcapng": build_mixed,
+}
+
+
+def _write_pcapng(target: Path, packets: list) -> None:
+    from scapy.utils import PcapNgWriter  # type: ignore
+
+    with PcapNgWriter(str(target)) as writer:
+        for pkt in packets:
+            writer.write(pkt)
 
 
 def main() -> int:
@@ -720,6 +1133,10 @@ def main() -> int:
     for name, builder in sorted(FIXTURES.items()):
         target = DATA_DIR / name
         wrpcap(str(target), builder())
+        print(f"wrote {target} ({target.stat().st_size} bytes)")
+    for name, builder in sorted(PCAPNG_FIXTURES.items()):
+        target = DATA_DIR / name
+        _write_pcapng(target, builder())
         print(f"wrote {target} ({target.stat().st_size} bytes)")
     return 0
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 from .utils import is_valid_ip as _valid_ip
 from .utils import is_private_ip as _is_private_ip
 from .utils import is_public_ip as _is_public_ip
-import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -19,25 +18,23 @@ from .hostname import analyze_hostname
 from .ips import analyze_ips
 from .ldap import analyze_ldap
 from .netbios import analyze_netbios
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .progress import run_with_busy_status
 from .services import ServiceAsset, analyze_services
 from .smb import analyze_smb
-from .utils import extract_packet_endpoints
+from .utils import env_int, extract_packet_endpoints, memoize_analysis, tcp_flags_int
 
 try:  # pragma: no cover - guarded for environments without scapy
     from scapy.layers.inet import IP, TCP  # type: ignore
-except Exception:  # pragma: no cover
-    IP = TCP = None  # type: ignore
-
-try:  # pragma: no cover
     from scapy.layers.inet6 import IPv6  # type: ignore
 except Exception:  # pragma: no cover
-    IPv6 = None  # type: ignore
+    IP = TCP = IPv6 = None  # type: ignore
 
-MAX_FP_SAMPLES = int(os.getenv("PCAPPER_MAX_OS_FP_SAMPLES", "200000"))
-MAX_FP_PER_HOST = int(os.getenv("PCAPPER_MAX_OS_FP_PER_HOST", "250"))
+MAX_FP_SAMPLES = env_int("PCAPPER_MAX_OS_FP_SAMPLES", 200000, minimum=1)
+MAX_FP_PER_HOST = env_int("PCAPPER_MAX_OS_FP_PER_HOST", 250, minimum=1)
 MAX_FP_EVIDENCE = 6
+_WHITESPACE_RE = re.compile(r"\s+")
+_DNS_LABEL_RE = re.compile(r"^[a-z0-9-]{1,63}$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -176,7 +173,7 @@ def _normalize_mac(value: str) -> str | None:
 
 def _normalize_hostname(value: str) -> str:
     hostname = value.strip().strip(".")
-    hostname = re.sub(r"\s+", "", hostname)
+    hostname = _WHITESPACE_RE.sub("", hostname)
     if hostname.endswith("$"):
         hostname = hostname[:-1]
     return hostname.lower()
@@ -228,7 +225,7 @@ def _is_reasonable_domain(value: str) -> bool:
     if len(labels) < 2:
         return False
     for label in labels:
-        if not label or not re.match(r"^[a-z0-9-]{1,63}$", label, re.IGNORECASE):
+        if not label or not _DNS_LABEL_RE.match(label):
             return False
         if label.startswith("-") or label.endswith("-"):
             return False
@@ -585,8 +582,12 @@ def _fingerprint_os_hint(
 
 
 def _collect_os_fingerprints(
-    path: Path, show_status: bool
+    path: Path,
+    show_status: bool,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> tuple[dict[str, Counter[str]], dict[str, list[str]]]:
+    """Passive OS hints from TCP SYN options (TTL/window/MSS/WScale/SACK/TS)."""
     if IP is None and IPv6 is None or TCP is None:
         return {}, {}
 
@@ -595,42 +596,32 @@ def _collect_os_fingerprints(
     per_host = Counter()
     total_samples = 0
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    status.update(int(min(100, (stream.tell() / size_bytes) * 100)))
-                except Exception:
-                    pass
-
-            if total_samples >= MAX_FP_SAMPLES:
-                break
-            if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                continue
-
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        if total_samples >= MAX_FP_SAMPLES:
+            break
+        tcp = pkt.getlayer(TCP)  # type: ignore[arg-type]
+        if tcp is None:
+            continue
+        # Only SYNs carry the fingerprintable option set; test the flags
+        # before resolving endpoints and IP layers.
+        if not (tcp_flags_int(getattr(tcp, "flags", 0)) & 0x02):
+            continue
+        try:
             src_ip, _dst_ip = extract_packet_endpoints(pkt)
             src_ip = src_ip or ""
-            ttl = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ttl = int(getattr(pkt[IP], "ttl", 0) or 0)  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ttl = int(getattr(pkt[IPv6], "hlim", 0) or 0)  # type: ignore[index]
             if not src_ip or not _valid_ip(src_ip):
                 continue
-
             if per_host[src_ip] >= MAX_FP_PER_HOST:
                 continue
 
-            tcp = pkt[TCP]  # type: ignore[index]
-            try:
-                flags = int(getattr(tcp, "flags", 0) or 0)
-            except Exception:
-                flags = 0
-            if not (flags & 0x02):
-                continue
+            ttl = None
+            ip4 = pkt.getlayer(IP) if IP is not None else None
+            if ip4 is not None:
+                ttl = int(getattr(ip4, "ttl", 0) or 0)
+            elif IPv6 is not None:
+                ip6 = pkt.getlayer(IPv6)
+                if ip6 is not None:
+                    ttl = int(getattr(ip6, "hlim", 0) or 0)
 
             window = int(getattr(tcp, "window", 0) or 0)
             options = getattr(tcp, "options", []) or []
@@ -667,12 +658,8 @@ def _collect_os_fingerprints(
                     )
             per_host[src_ip] += 1
             total_samples += 1
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 — a malformed SYN is skipped, not fatal
+            continue
 
     return hints, evidence
 
@@ -721,10 +708,19 @@ def _infer_os(
     return os_guess, evidence[:10]
 
 
-def analyze_hosts(path: Path, show_status: bool = True) -> HostSummary:
+@memoize_analysis
+def analyze_hosts(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> HostSummary:
     errors: list[str] = []
 
-    ips_summary = analyze_ips(path, show_status=show_status)
+    # Analyzers that accept the shared packet view get it; the others serve
+    # from the forced view registered by the CLI.
+    view = {"packets": packets, "meta": meta}
+    ips_summary = analyze_ips(path, show_status=show_status, **view)
 
     def _busy(desc: str, func, *args, **kwargs):
         return run_with_busy_status(
@@ -734,15 +730,15 @@ def analyze_hosts(path: Path, show_status: bool = True) -> HostSummary:
     hostname_summary = _busy(
         "Hostnames", analyze_hostname, path, None, show_status=False
     )
-    services_summary = _busy("Services", analyze_services, path, show_status=False)
-    arp_summary = _busy("ARP", analyze_arp, path, show_status=False)
-    dhcp_summary = _busy("DHCP", analyze_dhcp, path, show_status=False)
-    domain_summary = _busy("Domain", analyze_domain, path, show_status=False)
-    ldap_summary = _busy("LDAP", analyze_ldap, path, show_status=False)
+    services_summary = _busy("Services", analyze_services, path, show_status=False, **view)
+    arp_summary = _busy("ARP", analyze_arp, path, show_status=False, **view)
+    dhcp_summary = _busy("DHCP", analyze_dhcp, path, show_status=False, **view)
+    domain_summary = _busy("Domain", analyze_domain, path, show_status=False, **view)
+    ldap_summary = _busy("LDAP", analyze_ldap, path, show_status=False, **view)
     netbios_summary = _busy("NetBIOS", analyze_netbios, path, show_status=False)
-    smb_summary = _busy("SMB", analyze_smb, path, show_status=False)
+    smb_summary = _busy("SMB", analyze_smb, path, show_status=False, **view)
     fp_hints, fp_evidence = _busy(
-        "TCP fingerprints", _collect_os_fingerprints, path, show_status=False
+        "TCP fingerprints", _collect_os_fingerprints, path, show_status=False, **view
     )
 
     errors.extend(getattr(ips_summary, "errors", []) or [])

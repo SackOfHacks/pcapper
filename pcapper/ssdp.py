@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, UDP  # type: ignore
@@ -113,11 +113,12 @@ def _looks_like_ssdp(payload: bytes, sport: int, dport: int) -> bool:
     )
 
 
+@memoize_analysis
 def analyze_ssdp(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> SsdpSummary:
     errors: list[str] = []
     if UDP is None:
@@ -154,12 +155,6 @@ def analyze_ssdp(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path,
-        packets=packets,
-        meta=meta,
-        show_status=show_status,
-    )
 
     total_packets = 0
     udp_packets = 0
@@ -210,163 +205,153 @@ def analyze_ssdp(
     def _add_anomaly(severity: str, title: str, details: str) -> None:
         anomalies.append({"severity": severity, "title": title, "details": details})
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
+        if not pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+            continue
+        udp_packets += 1
+        udp = pkt[UDP]  # type: ignore[index]
+        sport = int(getattr(udp, "sport", 0) or 0)
+        dport = int(getattr(udp, "dport", 0) or 0)
+        payload = bytes(getattr(udp, "payload", b""))
+        if not _looks_like_ssdp(payload, sport, dport):
+            continue
+
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
+        if not src_ip or not dst_ip:
+            continue
+
+        ssdp_packets += 1
+        # The report window spans SSDP traffic, not every packet in scope.
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
+        total_bytes += len(payload)
+        target_port_counts[dport] += 1
+
+        text = payload.decode("latin-1", errors="ignore")
+        lines = text.splitlines()
+        start_line = lines[0].strip() if lines else ""
+        message_type = _classify_message(start_line)
+        headers = _parse_headers(text)
+
+        host = headers.get("host", "")
+        st = headers.get("st", "")
+        nt = headers.get("nt", "")
+        usn = headers.get("usn", "")
+        server = headers.get("server", "") or headers.get("user-agent", "")
+        location = headers.get("location", "")
+        man = headers.get("man", "")
+
+        if host:
+            host_header_counts[host] += 1
+        if st:
+            st_counts[st] += 1
+        if nt:
+            nt_counts[nt] += 1
+        if usn:
+            usn_counts[usn] += 1
+            usn_sources[usn].add(src_ip)
+        if server:
+            server_banner_counts[server] += 1
+        if location:
+            location_counts[location] += 1
+
+        if message_type == "M-SEARCH":
+            msearch_count += 1
+            client_counts[src_ip] += 1
+            msearch_by_src[src_ip] += 1
+            msearch_targets_by_src[src_ip].add(dst_ip)
             if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+                msearch_times_by_src[src_ip].append(ts)
+        elif message_type == "NOTIFY":
+            notify_count += 1
+            server_counts[src_ip] += 1
+            notify_by_src[src_ip] += 1
+            if ts is not None:
+                notify_times_by_src[src_ip].append(ts)
+        elif message_type == "RESPONSE":
+            response_count += 1
+            server_counts[src_ip] += 1
+            response_to_dst[dst_ip] += 1
+            client_counts[dst_ip] += 1
+        else:
+            other_count += 1
+            malformed_messages += 1
 
-            if not pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                continue
-            udp_packets += 1
-            udp = pkt[UDP]  # type: ignore[index]
-            sport = int(getattr(udp, "sport", 0) or 0)
-            dport = int(getattr(udp, "dport", 0) or 0)
-            payload = bytes(getattr(udp, "payload", b""))
-            if not _looks_like_ssdp(payload, sport, dport):
-                continue
+        if dst_ip in SSDP_MULTICAST:
+            multicast_destinations[dst_ip] += 1
+        else:
+            unicast_destinations[dst_ip] += 1
 
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-            if not src_ip or not dst_ip:
-                continue
+        if message_type == "M-SEARCH" and dst_ip not in SSDP_MULTICAST:
+            unicast_discovery += 1
 
-            ssdp_packets += 1
-            total_bytes += len(payload)
-            target_port_counts[dport] += 1
+        if sport != SSDP_PORT and dport != SSDP_PORT:
+            nonstandard_port_messages += 1
 
-            text = payload.decode("latin-1", errors="ignore")
-            lines = text.splitlines()
-            start_line = lines[0].strip() if lines else ""
-            message_type = _classify_message(start_line)
-            headers = _parse_headers(text)
+        # Require BOTH ends public to count as internet-traversing SSDP. A
+        # single public endpoint is usually a local box with a public WAN
+        # address (router/CPE) — one such packet should not raise HIGH.
+        if _is_public_ip(src_ip) and _is_public_ip(dst_ip):
+            public_messages += 1
+            public_peers[src_ip] += 1
+            public_peers[dst_ip] += 1
 
-            host = headers.get("host", "")
-            st = headers.get("st", "")
-            nt = headers.get("nt", "")
-            usn = headers.get("usn", "")
-            server = headers.get("server", "") or headers.get("user-agent", "")
-            location = headers.get("location", "")
-            man = headers.get("man", "")
-
-            if host:
-                host_header_counts[host] += 1
+        if message_type == "M-SEARCH":
+            if not host:
+                malformed_messages += 1
+            if man and "SSDP:DISCOVER" not in man.upper():
+                malformed_messages += 1
             if st:
-                st_counts[st] += 1
-            if nt:
-                nt_counts[nt] += 1
-            if usn:
-                usn_counts[usn] += 1
-                usn_sources[usn].add(src_ip)
-            if server:
-                server_banner_counts[server] += 1
-            if location:
-                location_counts[location] += 1
-
-            if message_type == "M-SEARCH":
-                msearch_count += 1
-                client_counts[src_ip] += 1
-                msearch_by_src[src_ip] += 1
-                msearch_targets_by_src[src_ip].add(dst_ip)
-                if ts is not None:
-                    msearch_times_by_src[src_ip].append(ts)
-            elif message_type == "NOTIFY":
-                notify_count += 1
-                server_counts[src_ip] += 1
-                notify_by_src[src_ip] += 1
-                if ts is not None:
-                    notify_times_by_src[src_ip].append(ts)
-            elif message_type == "RESPONSE":
-                response_count += 1
-                server_counts[src_ip] += 1
-                response_to_dst[dst_ip] += 1
-                client_counts[dst_ip] += 1
-            else:
-                other_count += 1
-                malformed_messages += 1
-
-            if dst_ip in SSDP_MULTICAST:
-                multicast_destinations[dst_ip] += 1
-            else:
-                unicast_destinations[dst_ip] += 1
-
-            if message_type == "M-SEARCH" and dst_ip not in SSDP_MULTICAST:
-                unicast_discovery += 1
-
-            if sport != SSDP_PORT and dport != SSDP_PORT:
-                nonstandard_port_messages += 1
-
-            # Require BOTH ends public to count as internet-traversing SSDP. A
-            # single public endpoint is usually a local box with a public WAN
-            # address (router/CPE) — one such packet should not raise HIGH.
-            if _is_public_ip(src_ip) and _is_public_ip(dst_ip):
-                public_messages += 1
-                public_peers[src_ip] += 1
-                public_peers[dst_ip] += 1
-
-            if message_type == "M-SEARCH":
-                if not host:
-                    malformed_messages += 1
-                if man and "SSDP:DISCOVER" not in man.upper():
-                    malformed_messages += 1
-                if st:
-                    st_upper = st.upper()
-                    if (
-                        "INTERNETGATEWAYDEVICE" in st_upper
-                        or "WANIPCONNECTION" in st_upper
-                        or "WANPPPCONNECTION" in st_upper
-                    ):
-                        gateway_enumeration += 1
-
-            if message_type in {"NOTIFY", "RESPONSE"} and not usn:
-                malformed_messages += 1
-
-            if location:
-                loc_lower = location.lower()
-                parsed = urlparse(location)
-                if parsed.scheme and parsed.scheme not in {"http", "https"}:
-                    suspicious_locations += 1
-                if parsed.hostname and _is_public_ip(parsed.hostname):
-                    suspicious_locations += 1
-                if any(
-                    token in loc_lower
-                    for token in (
-                        "/cmd",
-                        "/shell",
-                        ".exe",
-                        ".bat",
-                        ".ps1",
-                        "powershell",
-                    )
+                st_upper = st.upper()
+                if (
+                    "INTERNETGATEWAYDEVICE" in st_upper
+                    or "WANIPCONNECTION" in st_upper
+                    or "WANPPPCONNECTION" in st_upper
                 ):
-                    suspicious_locations += 1
+                    gateway_enumeration += 1
 
-            detail = start_line or "(empty start line)"
-            artifacts.append(
-                SsdpArtifact(
-                    ts=ts,
-                    kind="ssdp_message",
-                    src_ip=src_ip,
-                    dst_ip=dst_ip,
-                    src_port=sport,
-                    dst_port=dport,
-                    message_type=message_type,
-                    detail=detail[:220],
+        if message_type in {"NOTIFY", "RESPONSE"} and not usn:
+            malformed_messages += 1
+
+        if location:
+            loc_lower = location.lower()
+            parsed = urlparse(location)
+            if parsed.scheme and parsed.scheme not in {"http", "https"}:
+                suspicious_locations += 1
+            if parsed.hostname and _is_public_ip(parsed.hostname):
+                suspicious_locations += 1
+            if any(
+                token in loc_lower
+                for token in (
+                    "/cmd",
+                    "/shell",
+                    ".exe",
+                    ".bat",
+                    ".ps1",
+                    "powershell",
                 )
+            ):
+                suspicious_locations += 1
+
+        detail = start_line or "(empty start line)"
+        artifacts.append(
+            SsdpArtifact(
+                ts=ts,
+                kind="ssdp_message",
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                src_port=sport,
+                dst_port=dport,
+                message_type=message_type,
+                detail=detail[:220],
             )
-    finally:
-        status.finish()
-        reader.close()
+        )
 
     if ssdp_packets:
         for src, count in msearch_by_src.items():

@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-from .utils import shannon_entropy as _shannon_entropy
-from .utils import is_private_ip as _is_private_ip
-from .utils import is_public_ip as _is_public_ip
-
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -13,15 +9,19 @@ from typing import Optional
 from .dns import analyze_dns
 from .files import analyze_files
 from .http import analyze_http
-from .pcap_cache import get_reader
+from .pcap_cache import iter_packets
 from .progress import run_with_busy_status
 from .utils import (
+    dns_questions,
     extract_packet_endpoints,
     format_bytes_as_mb,
     format_duration,
+    is_private_ip,
+    is_public_ip,
     memoize_analysis,
     packet_length,
     safe_float,
+    shannon_entropy,
 )
 
 try:
@@ -35,6 +35,11 @@ except Exception:  # pragma: no cover
     ICMP = None  # type: ignore
     IPv6 = None  # type: ignore
     DNS = None  # type: ignore
+
+_EXTENSIONLESS_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{16,}")
+_IP_PROTO_ICMP = 1
+# WebSocket upgrade handshakes kept as evidence; only a handful are shown.
+_MAX_WEBSOCKET_HANDSHAKES = 200
 
 
 @dataclass(frozen=True)
@@ -212,10 +217,6 @@ def analyze_exfil(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
-
     total_packets = 0
     total_bytes = 0
     outbound_bytes = 0
@@ -238,8 +239,8 @@ def analyze_exfil(
     dns_query_counts: Counter[str] = Counter()
     dns_unique_queries: dict[str, set[str]] = defaultdict(set)
     dns_long_queries: Counter[str] = Counter()
-    dns_entropy_scores: list[float] = []
-    dns_entropy_by_src: dict[str, list[float]] = defaultdict(list)
+    # Running entropy sums per source (the average is all that is used).
+    dns_entropy_total_by_src: dict[str, float] = defaultdict(float)
     dns_max_label_by_src: Counter[str] = Counter()
 
     icmp_outbound_packets = 0
@@ -255,86 +256,81 @@ def analyze_exfil(
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
-            total_packets += 1
-            pkt_len = packet_length(pkt)
-            total_bytes += pkt_len
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        pkt_len = packet_length(pkt)
+        total_bytes += pkt_len
+        try:
             ts = safe_float(getattr(pkt, "time", None))
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             proto = "IP"
             src_port: Optional[int] = None
             dst_port: Optional[int] = None
+            # Private -> public is the exfil direction every check below keys on;
+            # decide it once (both helpers are cached).
+            outbound = bool(src_ip and dst_ip and is_private_ip(src_ip) and is_public_ip(dst_ip))
 
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+            tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
+            udp_layer = None
+            if tcp_layer is not None:
                 proto = "TCP"
-                src_port = int(getattr(pkt[TCP], "sport", 0) or 0)  # type: ignore[index]
-                dst_port = int(getattr(pkt[TCP], "dport", 0) or 0)  # type: ignore[index]
-                try:
-                    payload = bytes(getattr(pkt[TCP], "payload", b""))  # type: ignore[index]
-                except Exception:
-                    payload = b""
-                if (
-                    payload
-                    and _is_private_ip(src_ip or "")
-                    and _is_public_ip(dst_ip or "")
-                ):
-                    marker = payload[:2048].decode("latin-1", errors="ignore").lower()
-                    if "upgrade: websocket" in marker or "sec-websocket-key" in marker:
-                        websocket_handshakes.append(
-                            {
-                                "src": src_ip,
-                                "dst": dst_ip,
-                                "dst_port": dst_port,
-                                "bytes": pkt_len,
-                                "marker": "upgrade"
-                                if "upgrade: websocket" in marker
-                                else "sec-websocket-key",
-                            }
-                        )
-            elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                proto = "UDP"
-                src_port = int(getattr(pkt[UDP], "sport", 0) or 0)  # type: ignore[index]
-                dst_port = int(getattr(pkt[UDP], "dport", 0) or 0)  # type: ignore[index]
+                src_port = int(getattr(tcp_layer, "sport", 0) or 0)
+                dst_port = int(getattr(tcp_layer, "dport", 0) or 0)
+                if outbound and len(websocket_handshakes) < _MAX_WEBSOCKET_HANDSHAKES:
+                    try:
+                        payload = bytes(getattr(tcp_layer, "payload", b""))
+                    except Exception:
+                        payload = b""
+                    if payload:
+                        marker = payload[:2048].decode("latin-1", errors="ignore").lower()
+                        if "upgrade: websocket" in marker or "sec-websocket-key" in marker:
+                            websocket_handshakes.append(
+                                {
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "dst_port": dst_port,
+                                    "bytes": pkt_len,
+                                    "marker": "upgrade"
+                                    if "upgrade: websocket" in marker
+                                    else "sec-websocket-key",
+                                }
+                            )
+            else:
+                udp_layer = pkt.getlayer(UDP) if UDP is not None else None
+                if udp_layer is not None:
+                    proto = "UDP"
+                    src_port = int(getattr(udp_layer, "sport", 0) or 0)
+                    dst_port = int(getattr(udp_layer, "dport", 0) or 0)
 
-            if _is_private_ip(src_ip) and _is_public_ip(dst_ip):
+            if outbound:
                 if src_port == 123 or dst_port == 123:
                     ntp_outbound_packets += 1
                     ntp_outbound_bytes += pkt_len
                     ntp_dst_counts[dst_ip] += pkt_len
 
-                is_icmp = False
-                icmp_payload_len = 0
-                try:
-                    if (
-                        IP is not None
-                        and pkt.haslayer(IP)
-                        and int(getattr(pkt[IP], "proto", 0) or 0) == 1
-                    ):  # type: ignore[index]
-                        is_icmp = True
-                    if ICMP is not None and pkt.haslayer(ICMP):  # type: ignore[truthy-bool]
-                        is_icmp = True
-                        icmp_payload_len = len(
-                            bytes(getattr(pkt[ICMP], "payload", b""))
-                        )  # type: ignore[index]
-                except Exception:
+                if tcp_layer is None and udp_layer is None:
                     is_icmp = False
-                if is_icmp:
-                    icmp_outbound_packets += 1
-                    icmp_outbound_bytes += pkt_len
-                    icmp_dst_counts[dst_ip] += pkt_len
-                    if icmp_payload_len >= 128:
-                        icmp_large_payload_packets += 1
+                    icmp_payload_len = 0
+                    ip_layer = pkt.getlayer(IP) if IP is not None else None
+                    if ip_layer is not None and int(getattr(ip_layer, "proto", 0) or 0) == _IP_PROTO_ICMP:
+                        is_icmp = True
+                    icmp_layer = pkt.getlayer(ICMP) if ICMP is not None else None
+                    if icmp_layer is not None:
+                        is_icmp = True
+                        try:
+                            icmp_payload_len = len(bytes(getattr(icmp_layer, "payload", b"")))
+                        except Exception:
+                            icmp_payload_len = 0
+                    if is_icmp:
+                        icmp_outbound_packets += 1
+                        icmp_outbound_bytes += pkt_len
+                        icmp_dst_counts[dst_ip] += pkt_len
+                        if icmp_payload_len >= 128:
+                            icmp_large_payload_packets += 1
 
             if src_ip and dst_ip and ts is not None:
                 if first_seen is None or ts < first_seen:
@@ -345,7 +341,7 @@ def analyze_exfil(
             if not src_ip or not dst_ip:
                 continue
 
-            if _is_private_ip(src_ip) and _is_public_ip(dst_ip):
+            if outbound:
                 flow_key = (src_ip, dst_ip, proto, dst_port)
                 outbound_bytes += pkt_len
                 outbound_flow_bytes[flow_key] += pkt_len
@@ -358,7 +354,7 @@ def analyze_exfil(
                 if dst_port is not None and dst_port > 0:
                     outbound_port_bytes[(proto, dst_port)] += pkt_len
 
-            if _is_private_ip(src_ip) and _is_private_ip(dst_ip):
+            if is_private_ip(src_ip) and is_private_ip(dst_ip):
                 flow_key = (src_ip, dst_ip, proto, dst_port)
                 internal_flow_bytes[flow_key] += pkt_len
                 internal_flow_packets[flow_key] += 1
@@ -385,35 +381,32 @@ def analyze_exfil(
                 flow_key = (src_ip, dst_ip, proto, dst_port or src_port)
                 remote_mgmt_bytes[flow_key] += pkt_len
 
-            if DNS is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
-                dns_layer = pkt[DNS]  # type: ignore[index]
-                if getattr(dns_layer, "qr", 0) == 0:
-                    qname = None
-                    if getattr(dns_layer, "qd", None):
-                        qname = getattr(dns_layer.qd, "qname", None)
-                    if isinstance(qname, bytes):
-                        qname = qname.decode("utf-8", errors="ignore")
-                    if qname:
-                        qname = qname.strip(".")
-                        dns_query_counts[src_ip] += 1
-                        dns_unique_queries[src_ip].add(qname)
-                        if len(qname) >= 50:
-                            dns_long_queries[src_ip] += 1
-                        entropy = _shannon_entropy(qname)
-                        dns_entropy_scores.append(entropy)
-                        dns_entropy_by_src[src_ip].append(entropy)
-                        max_label = max(
-                            (len(label) for label in qname.split(".") if label),
-                            default=0,
-                        )
-                        if max_label > dns_max_label_by_src[src_ip]:
-                            dns_max_label_by_src[src_ip] = max_label
+            dns_layer = udp_layer.getlayer(DNS) if udp_layer is not None and DNS is not None else None
+            if dns_layer is not None and getattr(dns_layer, "qr", 0) == 0:
+                questions = dns_questions(dns_layer)
+                qname = questions[0][0] if questions else None
+                if qname:
+                    dns_query_counts[src_ip] += 1
+                    dns_unique_queries[src_ip].add(qname)
+                    if len(qname) >= 50:
+                        dns_long_queries[src_ip] += 1
+                    dns_entropy_total_by_src[src_ip] += shannon_entropy(qname)
+                    max_label = max(
+                        (len(label) for label in qname.split(".") if label),
+                        default=0,
+                    )
+                    if max_label > dns_max_label_by_src[src_ip]:
+                        dns_max_label_by_src[src_ip] = max_label
+        except Exception as exc:  # noqa: BLE001 — one malformed packet must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
 
-    except Exception as exc:
-        errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} packet(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -661,8 +654,7 @@ def analyze_exfil(
     for src_ip, total in dns_query_counts.items():
         unique = len(dns_unique_queries.get(src_ip, set()))
         long_q = dns_long_queries.get(src_ip, 0)
-        entropy_values = dns_entropy_by_src.get(src_ip, [])
-        avg_entropy = sum(entropy_values) / max(len(entropy_values), 1)
+        avg_entropy = dns_entropy_total_by_src.get(src_ip, 0.0) / max(total, 1)
         max_label = int(dns_max_label_by_src.get(src_ip, 0))
         if (
             total >= 20
@@ -687,10 +679,7 @@ def analyze_exfil(
         candidate = str(value or "").strip()
         if not candidate or "." in candidate:
             return False
-        return (
-            len(candidate) >= 24
-            and re.fullmatch(r"[A-Za-z0-9_-]{16,}", candidate) is not None
-        )
+        return len(candidate) >= 24 and _EXTENSIONLESS_TOKEN_RE.fullmatch(candidate) is not None
 
     for art in getattr(file_summary, "artifacts", []) or []:
         name = getattr(art, "filename", None)
@@ -712,8 +701,8 @@ def analyze_exfil(
         if name and "." in str(name):
             ext = "." + str(name).lower().rsplit(".", 1)[-1]
         if src_ip and dst_ip:
-            src_private = _is_private_ip(str(src_ip))
-            dst_public = _is_public_ip(str(dst_ip))
+            src_private = is_private_ip(str(src_ip))
+            dst_public = is_public_ip(str(dst_ip))
             is_ot_proto = proto.upper() in {
                 "ENIP",
                 "S7",
@@ -1003,8 +992,8 @@ def analyze_exfil(
         external_ot = [
             flow
             for flow in ot_candidates
-            if _is_public_ip(str(flow.get("src", "")))
-            or _is_public_ip(str(flow.get("dst", "")))
+            if is_public_ip(str(flow.get("src", "")))
+            or is_public_ip(str(flow.get("dst", "")))
         ]
         severity = "critical" if external_ot else "warning"
         detections.append(
@@ -1261,7 +1250,7 @@ def analyze_exfil(
     for flow in ot_flows[:12]:
         src_text = str(flow.get("src", ""))
         dst_text = str(flow.get("dst", ""))
-        if _is_public_ip(src_text) or _is_public_ip(dst_text):
+        if is_public_ip(src_text) or is_public_ip(dst_text):
             deterministic_checks["ot_control_channel_exfil"].append(
                 f"{src_text}->{dst_text} {flow.get('proto')}/{flow.get('dst_port') or '-'} "
                 f"bytes={format_bytes_as_mb(int(flow.get('bytes', 0) or 0))}"

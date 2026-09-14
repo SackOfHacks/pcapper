@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -82,6 +83,21 @@ def _equipment_index() -> dict[str, tuple[str, str]]:
     return index
 
 
+@lru_cache
+def _equipment_pattern() -> "re.Pattern[str] | None":
+    """One compiled alternation over every product token.
+
+    ``equipment_artifacts`` runs per OT packet; testing hundreds of tokens
+    with ``in`` per call was O(tokens × payload). Longest tokens first so a
+    product name that contains another (``1756-L71`` vs ``1756-L7``) matches
+    whole.
+    """
+    tokens = sorted(_equipment_index(), key=len, reverse=True)
+    if not tokens:
+        return None
+    return re.compile("|".join(re.escape(token) for token in tokens))
+
+
 def equipment_artifacts(payload: bytes, limit: int = 512) -> list[tuple[str, str]]:
     if not payload:
         return []
@@ -94,8 +110,15 @@ def equipment_artifacts(payload: bytes, limit: int = 512) -> list[tuple[str, str
 
     matches: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for token, (vendor, label) in _equipment_index().items():
-        if token in lowered:
+    pattern = _equipment_pattern()
+    index = _equipment_index()
+    if pattern is not None:
+        # Iterate in index order for a stable output, but only over tokens
+        # the single regex pass actually found.
+        found = {m.group(0) for m in pattern.finditer(lowered)}
+        for token, (vendor, label) in index.items():
+            if token not in found:
+                continue
             detail = f"{vendor}: {label}"
             if detail in seen:
                 continue

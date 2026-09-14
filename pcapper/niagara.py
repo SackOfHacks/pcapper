@@ -10,6 +10,7 @@ from .industrial_helpers import (
     analyze_port_protocol,
 )
 from .opcode_models import format_opcode, load_opcode_model
+from .utils import memoize_analysis
 
 NIAGARA_PORTS = {1911, 4911}
 NIAGARA_MODEL_PATH = Path(__file__).with_name("niagara_opcodes.json")
@@ -91,6 +92,7 @@ def _detect_anomalies(
     return anomalies
 
 
+@memoize_analysis
 def analyze_niagara(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,

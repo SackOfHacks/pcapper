@@ -7,8 +7,15 @@ from pathlib import Path
 from typing import Optional
 
 from .device_detection import device_fingerprints_from_text
-from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_ascii_strings as _extract_ascii_strings
+from .utils import (
+    extract_packet_endpoints,
+    memoize_analysis,
+    packet_length,
+    safe_float,
+    tcp_segment_length,
+)
 from .utils import beacon_score as _beaconing_score
 
 try:
@@ -25,6 +32,9 @@ except Exception:  # pragma: no cover
 
 
 TELNET_PORTS = {23, 2323, 9923}
+# A Telnet port on the *source* side is the service only when the destination
+# is an ephemeral port; a flow from ephemeral 23 to 443 is not Telnet.
+_EPHEMERAL_MIN = 1024
 
 # Negative lookbehind on "last " avoids the ubiquitous "Last login: <weekday>"
 # MOTD banner being mistaken for a login prompt (captured "Thu", "Mon", ...).
@@ -283,12 +293,32 @@ def _scan_plaintext(
             artifacts.append(item)
 
 
+def _tcp_payload_bytes(pkt: object, tcp: object) -> bytes:
+    """TCP application data without scapy's trailing Ethernet ``Padding``.
+
+    Short frames are padded to 60 bytes and scapy hangs the pad under TCP, so
+    ``bytes(tcp.payload)`` of a one-keystroke segment is the keystroke plus
+    NULs. The IP total length is immune to padding.
+    """
+    try:
+        raw = bytes(getattr(tcp, "payload", b"") or b"")
+    except Exception:
+        return b""
+    if not raw:
+        return b""
+    ip_layer = pkt.getlayer(IP) if IP is not None else None  # type: ignore[attr-defined]
+    if ip_layer is None and IPv6 is not None:
+        ip_layer = pkt.getlayer(IPv6)  # type: ignore[attr-defined]
+    length = tcp_segment_length(tcp, ip_layer)
+    return raw if length is None else raw[:length]
+
+
 def _direction(
     src_ip: str, dst_ip: str, sport: int, dport: int
 ) -> tuple[str, str, int, int]:
     if dport in TELNET_PORTS:
         return src_ip, dst_ip, sport, dport
-    if sport in TELNET_PORTS:
+    if sport in TELNET_PORTS and dport >= _EPHEMERAL_MIN:
         return dst_ip, src_ip, dport, sport
     if dport < 1024 and sport >= 1024:
         return src_ip, dst_ip, sport, dport
@@ -297,11 +327,12 @@ def _direction(
     return src_ip, dst_ip, sport, dport
 
 
+@memoize_analysis
 def analyze_telnet(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> TelnetSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
@@ -343,9 +374,6 @@ def analyze_telnet(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     total_packets = 0
     telnet_packets = 0
@@ -380,15 +408,7 @@ def analyze_telnet(
     pair_first_seen: dict[tuple[str, str], list[float]] = defaultdict(list)
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -404,22 +424,12 @@ def analyze_telnet(
             sport = int(getattr(tcp, "sport", 0) or 0)
             dport = int(getattr(tcp, "dport", 0) or 0)
 
-            payload = b""
-            if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                try:
-                    payload = bytes(pkt[Raw])  # type: ignore[index]
-                except Exception:
-                    payload = b""
-            else:
-                try:
-                    payload = bytes(tcp.payload)
-                except Exception:
-                    payload = b""
+            payload = _tcp_payload_bytes(pkt, tcp)
 
             payload_prefix = payload[:16] if payload else b""
             is_telnet = (
-                sport in TELNET_PORTS
-                or dport in TELNET_PORTS
+                dport in TELNET_PORTS
+                or (sport in TELNET_PORTS and dport >= _EPHEMERAL_MIN)
                 or payload_prefix.startswith(b"\xff\xfb")
                 or payload_prefix.startswith(b"\xff\xfd")
             )
@@ -533,9 +543,6 @@ def analyze_telnet(
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:

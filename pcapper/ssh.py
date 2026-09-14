@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from .device_detection import device_fingerprints_from_text
-from .pcap_cache import get_reader
+from .pcap_cache import iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, extract_ascii_strings as _extract_ascii_strings
 from .utils import beacon_score as _beaconing_score
 from .utils import is_private_ip, is_public_ip
@@ -1191,10 +1191,6 @@ def analyze_ssh(
             auth_inference=[],
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
-
     total_packets = 0
     ssh_packets = 0
     total_bytes = 0
@@ -1275,54 +1271,37 @@ def analyze_ssh(
     pkt_index = 0
     decrypted_sources: set[str] = set()
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    skipped_packets = 0
+    first_skip_error: Optional[str] = None
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        pkt_index += 1
+        total_packets += 1
+        pkt_len = packet_length(pkt)
+        total_bytes += pkt_len
 
-            pkt_index += 1
-            total_packets += 1
-            pkt_len = packet_length(pkt)
-            total_bytes += pkt_len
-
-            if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                continue
-
+        tcp = pkt.getlayer(TCP) if TCP is not None else None
+        if tcp is None:
+            continue
+        try:
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 
-            tcp = pkt[TCP]  # type: ignore[index]
             sport = int(getattr(tcp, "sport", 0) or 0)
             dport = int(getattr(tcp, "dport", 0) or 0)
 
             eth_src = None
             eth_dst = None
-            if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-                try:
-                    eth_layer = pkt[Ether]  # type: ignore[index]
-                    eth_src = str(getattr(eth_layer, "src", "")) or None
-                    eth_dst = str(getattr(eth_layer, "dst", "")) or None
-                except Exception:
-                    eth_src = None
-                    eth_dst = None
+            eth_layer = pkt.getlayer(Ether) if Ether is not None else None
+            if eth_layer is not None:
+                eth_src = str(getattr(eth_layer, "src", "")) or None
+                eth_dst = str(getattr(eth_layer, "dst", "")) or None
 
-            payload = b""
-            if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                try:
-                    payload = bytes(pkt[Raw])  # type: ignore[index]
-                except Exception:
-                    payload = b""
-            else:
-                try:
-                    payload = bytes(tcp.payload)
-                except Exception:
-                    payload = b""
+            raw_layer = tcp.getlayer(Raw) if Raw is not None else None
+            try:
+                payload = bytes(raw_layer) if raw_layer is not None else bytes(tcp.payload)
+            except Exception:
+                payload = b""
 
             decrypted_payload, decrypt_source = _find_decrypted_payload(
                 pkt, meta, pkt_index, decrypted_payloads
@@ -1572,11 +1551,16 @@ def analyze_ssh(
                             artifacts,
                         )
 
-    except Exception as exc:
-        errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
+        except Exception as exc:  # noqa: BLE001 — one malformed packet must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
+
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} packet(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:

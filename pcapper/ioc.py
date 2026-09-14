@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from .files import analyze_files
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import safe_float, safe_read_text, extract_packet_endpoints
 
 try:
@@ -210,7 +210,13 @@ def _compile_domain_patterns(domains: set[str]) -> list[tuple[str, "re.Pattern[s
     return patterns
 
 
-def analyze_iocs(path: Path, ioc_path: Path, show_status: bool = True) -> IocSummary:
+def analyze_iocs(
+    path: Path,
+    ioc_path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> IocSummary:
     errors: list[str] = []
     ips, domains, hashes, meta = _load_iocs(ioc_path, errors=errors)
     domain_patterns = _compile_domain_patterns(domains)
@@ -228,57 +234,43 @@ def analyze_iocs(path: Path, ioc_path: Path, show_status: bool = True) -> IocSum
         if md5 and md5.lower() in hashes:
             hash_hits[md5.lower()] += 1
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
     total_packets = 0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
 
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
+        if src_ip and src_ip in ips:
+            ip_hits[src_ip] += 1
+        if dst_ip and dst_ip in ips:
+            ip_hits[dst_ip] += 1
 
-            if src_ip and src_ip in ips:
-                ip_hits[src_ip] += 1
-            if dst_ip and dst_ip in ips:
-                ip_hits[dst_ip] += 1
+        if domain_patterns:
+            payload = _extract_payload(pkt)
+            if payload:
+                text = payload.decode("latin-1", errors="ignore").lower()
+                for domain, pattern in domain_patterns:
+                    # Cheap substring pre-filter before the boundary check.
+                    if domain in text and pattern.search(text):
+                        domain_hits[domain] += 1
+            # DNS query/answer names are length-prefix encoded on the wire,
+            # so the raw-payload search above can't see them -- match the
+            # decoded names explicitly (TLS SNI is contiguous and is already
+            # covered by the payload search).
+            for dns_name in _extract_dns_names(pkt):
+                for domain, _pattern in domain_patterns:
+                    if domain == dns_name or dns_name.endswith("." + domain):
+                        domain_hits[domain] += 1
 
-            if domain_patterns:
-                payload = _extract_payload(pkt)
-                if payload:
-                    text = payload.decode("latin-1", errors="ignore").lower()
-                    for domain, pattern in domain_patterns:
-                        # Cheap substring pre-filter before the boundary check.
-                        if domain in text and pattern.search(text):
-                            domain_hits[domain] += 1
-                # DNS query/answer names are length-prefix encoded on the wire,
-                # so the raw-payload search above can't see them -- match the
-                # decoded names explicitly (TLS SNI is contiguous and is already
-                # covered by the payload search).
-                for dns_name in _extract_dns_names(pkt):
-                    for domain, _pattern in domain_patterns:
-                        if domain == dns_name or dns_name.endswith("." + domain):
-                            domain_hits[domain] += 1
-
-    finally:
-        status.finish()
-        reader.close()
 
     if ip_hits:
 

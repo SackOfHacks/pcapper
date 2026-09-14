@@ -6,6 +6,7 @@ import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -455,12 +456,18 @@ def _extract_explicit_ids(text: str) -> tuple[list[str], list[str]]:
     return tactic_ids, technique_ids
 
 
+@lru_cache(maxsize=1024)
+def _token_pattern(token: str) -> "re.Pattern[str]":
+    # Whole-token match: "s7" must not fire inside "s7comm-plus-xyz123".
+    return re.compile(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", re.IGNORECASE)
+
+
 def _contains_token(blob: str, token: str) -> bool:
+    """Called for every rule keyword against every detection; the pattern
+    per token is compiled once for the life of the process."""
     if not token:
         return False
-    escaped = re.escape(token)
-    pattern = rf"(?<![a-z0-9]){escaped}(?![a-z0-9])"
-    return re.search(pattern, blob, re.IGNORECASE) is not None
+    return _token_pattern(token).search(blob) is not None
 
 
 def _rule_from_text(blob: str) -> tuple[_TechniqueRule | None, int]:
@@ -581,7 +588,8 @@ def _extract_iocs(evidence: list[str]) -> list[str]:
             lowered = token.lower()
             if _looks_like_domain(lowered):
                 iocs.add(lowered)
-        for token in re.findall(r"\b[0-9a-fA-F]{32,64}\b", entry):
+        # MD5 / SHA-1 / SHA-256 exactly; a 33–63-char hex run is not a hash.
+        for token in re.findall(r"\b(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{40}|[0-9a-fA-F]{32})\b", entry):
             iocs.add(token.lower())
     return sorted(iocs)
 

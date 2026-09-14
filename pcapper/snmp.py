@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from .utils import read_ber_length as _read_ber_length, packet_length
-from .utils import beacon_score
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -9,8 +7,15 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
-from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, memoize_analysis, safe_float
+from .pcap_cache import iter_packets
+from .utils import (
+    beacon_score,
+    extract_packet_endpoints,
+    memoize_analysis,
+    packet_length,
+    read_ber_length,
+    safe_float,
+)
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -23,6 +28,16 @@ except Exception:  # pragma: no cover
 
 
 SNMP_PORTS = {161, 162}
+_REQUEST_PDUS = frozenset(
+    {"GetRequest", "GetNextRequest", "GetBulkRequest", "SetRequest", "InformRequest"}
+)
+_RESPONSE_PDUS = frozenset({"GetResponse", "SNMPv2-Trap", "Trap", "Report"})
+_LABELLED_SERVICE_OIDS = frozenset({"hrSWRunName", "hrSWInstalledName", "hrDeviceDescr"})
+# Per-flow request timestamps kept for beacon scoring; a poller hitting an
+# agent every few seconds for a day would otherwise buffer every timestamp.
+_MAX_REQUEST_TIMES = 512
+# Labelled varbinds are stored as artifacts; a full MIB walk emits thousands.
+_MAX_ARTIFACTS = 2000
 
 PDU_TYPE_MAP = {
     0xA0: "GetRequest",
@@ -182,7 +197,7 @@ def _read_tlv(
     if offset >= len(payload):
         return None, None, offset
     tag = payload[offset]
-    length, idx = _read_ber_length(payload, offset + 1)
+    length, idx = read_ber_length(payload, offset + 1)
     if length is None or idx + length > len(payload):
         return None, None, offset
     value = payload[idx : idx + length]
@@ -275,7 +290,7 @@ def _parse_snmp_message(payload: bytes) -> Optional[dict[str, object]]:
         return None
     pdu_tag = value[idx]
     pdu_name = PDU_TYPE_MAP.get(pdu_tag, f"0x{pdu_tag:02x}")
-    pdu_len, pdu_idx = _read_ber_length(value, idx + 1)
+    pdu_len, pdu_idx = read_ber_length(value, idx + 1)
     if pdu_len is None or pdu_idx + pdu_len > len(value):
         return None
     pdu_value = value[pdu_idx : pdu_idx + pdu_len]
@@ -320,7 +335,8 @@ def _format_mac(value: str) -> Optional[str]:
     return None
 
 
-def _beacon_score(times: list[float]):
+def _snmp_beacon(times: list[float]):
+    """``utils.beacon_score`` with the SNMP view's tighter jitter tolerance."""
     return beacon_score(
         times, min_interval=1.0, max_interval=3600.0, rel_jitter=0.15, abs_jitter_floor=0.0
     )
@@ -367,10 +383,6 @@ def analyze_snmp(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
-
     total_packets = 0
     snmp_packets = 0
     total_bytes = 0
@@ -404,20 +416,60 @@ def analyze_snmp(
     request_times: dict[tuple[str, str], list[float]] = defaultdict(list)
     response_bytes: Counter[tuple[str, str]] = Counter()
     request_bytes: Counter[tuple[str, str]] = Counter()
+    seen_detections: set[tuple[str, str]] = set()
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    def _detect(severity: str, summary_text: str, details: str) -> None:
+        # A value repeated in every poll response is one finding, not one per packet.
+        key = (summary_text, details)
+        if key in seen_detections:
+            return
+        seen_detections.add(key)
+        detections.append(
+            {"severity": severity, "summary": summary_text, "details": details, "source": "SNMP"}
+        )
 
-            total_packets += 1
-            pkt_len = packet_length(pkt)
-            total_bytes += pkt_len
+    def _artifact(kind: str, detail: str, src: str, dst: str) -> None:
+        if len(artifacts) < _MAX_ARTIFACTS:
+            artifacts.append(SnmpArtifact(kind=kind, detail=detail, src=src, dst=dst))
+
+    def _device_artifacts(value: str, source: str, src: str, dst: str) -> None:
+        for detail in device_fingerprints_from_text(value, source=source):
+            key = f"device:{detail}"
+            if key in seen_device_artifacts:
+                continue
+            seen_device_artifacts.add(key)
+            _artifact("device", detail, src, dst)
+
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        pkt_len = packet_length(pkt)
+        total_bytes += pkt_len
+
+        transport = pkt.getlayer(UDP) if UDP is not None else None
+        proto = "UDP"
+        if transport is None and TCP is not None:
+            transport = pkt.getlayer(TCP)
+            proto = "TCP"
+        if transport is None:
+            continue
+        sport = int(getattr(transport, "sport", 0) or 0)
+        dport = int(getattr(transport, "dport", 0) or 0)
+        if sport not in SNMP_PORTS and dport not in SNMP_PORTS:
+            continue
+        try:
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
+            if not src_ip or not dst_ip:
+                continue
+            try:
+                payload = bytes(transport.payload)
+            except Exception:
+                payload = b""
+
+            snmp_packets += 1
+            protocol_counts[proto] += 1
+            # The report window spans SNMP traffic, not every packet in scope.
             ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:
                 if first_seen is None or ts < first_seen:
@@ -425,47 +477,17 @@ def analyze_snmp(
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
 
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-
-            if not src_ip or not dst_ip:
-                continue
-
-            proto = None
-            sport = None
-            dport = None
-            payload = None
-
-            if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                udp_layer = pkt[UDP]  # type: ignore[index]
-                proto = "UDP"
-                sport = int(getattr(udp_layer, "sport", 0) or 0)
-                dport = int(getattr(udp_layer, "dport", 0) or 0)
-                try:
-                    payload = bytes(udp_layer.payload)
-                except Exception:
-                    payload = None
-            elif TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                tcp_layer = pkt[TCP]  # type: ignore[index]
-                proto = "TCP"
-                sport = int(getattr(tcp_layer, "sport", 0) or 0)
-                dport = int(getattr(tcp_layer, "dport", 0) or 0)
-                try:
-                    payload = bytes(tcp_layer.payload)
-                except Exception:
-                    payload = None
-
-            if not proto or (sport not in SNMP_PORTS and dport not in SNMP_PORTS):
-                continue
-
-            snmp_packets += 1
-            protocol_counts[proto] += 1
-            server_port = dport if dport in SNMP_PORTS else sport
+            # Roles by port: an agent answers from its well-known port to the
+            # manager's ephemeral port; everything else (requests to 161, traps
+            # to 162) flows from the client side to the listener. Counting the
+            # packet's src as "client" made every polled agent a client too.
+            if sport in SNMP_PORTS and dport not in SNMP_PORTS:
+                client_ip, server_ip, server_port = dst_ip, src_ip, sport
+            else:
+                client_ip, server_ip, server_port = src_ip, dst_ip, dport
             server_ports[server_port] += 1
 
-            if payload:
-                msg = _parse_snmp_message(payload)
-            else:
-                msg = None
+            msg = _parse_snmp_message(payload) if payload else None
             if not msg:
                 continue
 
@@ -484,26 +506,27 @@ def analyze_snmp(
             if pdu:
                 pdu_counts[pdu] += 1
 
-            client_counts[src_ip] += 1
-            server_counts[dst_ip] += 1
-            dst_by_src[src_ip].add(dst_ip)
-            community_by_flow[(src_ip, dst_ip)].add(community)
+            flow = (client_ip, server_ip)
+            client_counts[client_ip] += 1
+            server_counts[server_ip] += 1
+            dst_by_src[client_ip].add(server_ip)
+            community_by_flow[flow].add(community)
 
-            if ts is not None and pdu in {
-                "GetRequest",
-                "GetNextRequest",
-                "GetBulkRequest",
-                "SetRequest",
-                "InformRequest",
-            }:
-                request_times[(src_ip, dst_ip)].append(ts)
+            if ts is not None and pdu in _REQUEST_PDUS:
+                times = request_times[flow]
+                if len(times) < _MAX_REQUEST_TIMES:
+                    times.append(ts)
 
-            if pdu in {"GetResponse", "SNMPv2-Trap", "Trap", "Report"}:
-                response_bytes[(src_ip, dst_ip)] += pkt_len
+            # Both directions keyed on the same (client, server) flow so the
+            # exfil ratio compares an agent's responses with the requests that
+            # elicited them (keyed by packet direction they never met, and the
+            # request side always read as 1 byte).
+            if pdu in _RESPONSE_PDUS:
+                response_bytes[flow] += pkt_len
             else:
-                request_bytes[(src_ip, dst_ip)] += pkt_len
+                request_bytes[flow] += pkt_len
 
-            conv_key = (src_ip, dst_ip, proto, int(server_port))
+            conv_key = (client_ip, server_ip, proto, int(server_port))
             conv = conv_map.get(conv_key)
             if conv is None:
                 conv = {
@@ -528,80 +551,48 @@ def analyze_snmp(
                     label = OID_LABELS.get(oid)
                     oid_counts[oid] += 1
                     if label:
-                        artifacts.append(
-                            SnmpArtifact(
-                                kind=label, detail=value, src=src_ip, dst=dst_ip
-                            )
-                        )
-                    if label == "sysName" and value:
+                        _artifact(label, value, src_ip, dst_ip)
+                    if not value:
+                        continue
+                    if label == "sysName":
                         hostnames[value] += 1
-                    if label == "sysDescr" and value:
+                    elif label == "sysDescr":
                         plaintext_strings[_truncate(value, 120)] += 1
                         if "windows" in value.lower():
-                            detections.append(
-                                {
-                                    "severity": "info",
-                                    "summary": "Windows SNMP device observed",
-                                    "details": f"{src_ip}->{dst_ip} {value[:80]}",
-                                    "source": "SNMP",
-                                }
+                            _detect(
+                                "info",
+                                "Windows SNMP device observed",
+                                f"{src_ip}->{dst_ip} {value[:80]}",
                             )
-                        for detail in device_fingerprints_from_text(
-                            value, source="SNMP sysDescr"
-                        ):
-                            key = f"device:{detail}"
-                            if key in seen_device_artifacts:
-                                continue
-                            seen_device_artifacts.add(key)
-                            artifacts.append(
-                                SnmpArtifact(
-                                    kind="device", detail=detail, src=src_ip, dst=dst_ip
-                                )
-                            )
-                    if label == "ipAdEntAddr" and value:
+                        _device_artifacts(value, "SNMP sysDescr", src_ip, dst_ip)
+                    elif label == "ipAdEntAddr":
                         ip_addresses[value] += 1
-                    if label == "ifPhysAddress":
+                    elif label == "ifPhysAddress":
                         mac = _format_mac(value)
                         if mac:
                             mac_addresses[mac] += 1
-                    if (
-                        label in {"hrSWRunName", "hrSWInstalledName", "hrDeviceDescr"}
-                        and value
-                    ):
+                    elif label in _LABELLED_SERVICE_OIDS:
                         services[_truncate(value, 80)] += 1
-                        for detail in device_fingerprints_from_text(
-                            value, source=f"SNMP {label}"
-                        ):
-                            key = f"device:{detail}"
-                            if key in seen_device_artifacts:
-                                continue
-                            seen_device_artifacts.add(key)
-                            artifacts.append(
-                                SnmpArtifact(
-                                    kind="device", detail=detail, src=src_ip, dst=dst_ip
-                                )
+                        _device_artifacts(value, f"SNMP {label}", src_ip, dst_ip)
+                    for pattern, reason in SUSPICIOUS_PATTERNS:
+                        if pattern.search(value):
+                            _detect(
+                                "warning",
+                                f"Suspicious SNMP value: {reason}",
+                                f"{src_ip}->{dst_ip} {value[:120]}",
                             )
-                    if value:
-                        for pattern, reason in SUSPICIOUS_PATTERNS:
-                            if pattern.search(value):
-                                detections.append(
-                                    {
-                                        "severity": "warning",
-                                        "summary": f"Suspicious SNMP value: {reason}",
-                                        "details": f"{src_ip}->{dst_ip} {value[:120]}",
-                                        "source": "SNMP",
-                                    }
-                                )
-    except Exception as exc:
-        errors.append(str(exc))
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — one malformed message must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
 
-    for community in list(community_counts.keys()):
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} SNMP packet(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
+
+    for community in community_counts:
         if community.lower() in {"public", "private"}:
             detections.append(
                 {
@@ -655,7 +646,7 @@ def analyze_snmp(
             )
 
     for flow, times in request_times.items():
-        score = _beacon_score(times)
+        score = _snmp_beacon(times)
         if score:
             detections.append(
                 {

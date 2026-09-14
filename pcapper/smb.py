@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os
+import re
 import struct
 import uuid
 from collections import Counter, defaultdict
@@ -9,25 +9,46 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
-    from scapy.layers.inet import IP, TCP
+    from scapy.layers.inet import TCP
     from scapy.packet import Packet, Raw
 except ImportError:
-    IP = TCP = Raw = None
+    TCP = Raw = None
+    Packet = object
 
-from .pcap_cache import get_reader
-from .utils import counter_inc, decode_payload, extract_packet_endpoints, memoize_analysis, safe_float, set_add_cap, setdict_add
-from .utils import is_public_ip as _is_public_ip
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import (
+    counter_inc,
+    decode_payload,
+    env_int,
+    extract_packet_endpoints,
+    is_public_ip,
+    memoize_analysis,
+    safe_float,
+    set_add_cap,
+    setdict_add,
+)
 
-MAX_SMB_UNIQUE = int(os.getenv("PCAPPER_MAX_SMB_UNIQUE", "50000"))
-MAX_SMB_CONVERSATIONS = int(os.getenv("PCAPPER_MAX_SMB_CONVERSATIONS", "50000"))
-MAX_SMB_SESSIONS = int(os.getenv("PCAPPER_MAX_SMB_SESSIONS", "20000"))
-MAX_SMB_SHARES = int(os.getenv("PCAPPER_MAX_SMB_SHARES", "20000"))
-MAX_SMB_FILES = int(os.getenv("PCAPPER_MAX_SMB_FILES", "50000"))
-MAX_SMB_ARTIFACTS = int(os.getenv("PCAPPER_MAX_SMB_ARTIFACTS", "50000"))
-MAX_SMB_ANOMALIES = int(os.getenv("PCAPPER_MAX_SMB_ANOMALIES", "2000"))
-MAX_SMB_PENDING = int(os.getenv("PCAPPER_MAX_SMB_PENDING", "50000"))
-MAX_SMB_TREE_MAP = int(os.getenv("PCAPPER_MAX_SMB_TREES", "50000"))
-MAX_SMB_FILE_IDS = int(os.getenv("PCAPPER_MAX_SMB_FILE_IDS", "100000"))
+MAX_SMB_UNIQUE = env_int("PCAPPER_MAX_SMB_UNIQUE", 50000, minimum=1)
+MAX_SMB_CONVERSATIONS = env_int("PCAPPER_MAX_SMB_CONVERSATIONS", 50000, minimum=1)
+MAX_SMB_SESSIONS = env_int("PCAPPER_MAX_SMB_SESSIONS", 20000, minimum=1)
+MAX_SMB_SHARES = env_int("PCAPPER_MAX_SMB_SHARES", 20000, minimum=1)
+MAX_SMB_FILES = env_int("PCAPPER_MAX_SMB_FILES", 50000, minimum=1)
+MAX_SMB_ARTIFACTS = env_int("PCAPPER_MAX_SMB_ARTIFACTS", 50000, minimum=1)
+MAX_SMB_ANOMALIES = env_int("PCAPPER_MAX_SMB_ANOMALIES", 2000, minimum=1)
+MAX_SMB_PENDING = env_int("PCAPPER_MAX_SMB_PENDING", 50000, minimum=1)
+MAX_SMB_TREE_MAP = env_int("PCAPPER_MAX_SMB_TREES", 50000, minimum=1)
+MAX_SMB_FILE_IDS = env_int("PCAPPER_MAX_SMB_FILE_IDS", 100000, minimum=1)
+
+# Printable runs (ASCII, and UTF-16LE on an even offset) in an SMB record.
+# The byte-by-byte Python loop this replaces cost ~2 µs per byte, i.e. more
+# than 100 ms for a single 64 KB SMB2 WRITE.
+_ASCII_RUN_RE = re.compile(rb"[ -~]{4,}")
+_UTF16_RUN_RE = re.compile(rb"(?:[ -~]\x00){4,}")
+# File extensions whose SMB CREATE/WRITE is a staging indicator.
+_SUSPICIOUS_SMB_EXTS = (
+    ".exe", ".dll", ".ps1", ".bat", ".vbs", ".js", ".scr", ".sys", ".lnk",
+    ".zip", ".rar", ".7z",
+)
 
 # --- Dataclasses ---
 
@@ -311,7 +332,12 @@ def _is_disk_admin_share(share_path: str) -> bool:
 
 
 @memoize_analysis
-def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
+def analyze_smb(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> SmbSummary:
     if TCP is None:
         return SmbSummary(
             path,
@@ -344,44 +370,6 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
             [],
             [],
             ["Scapy not available"],
-        )
-
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as exc:
-        return SmbSummary(
-            path,
-            0,
-            0,
-            Counter(),
-            Counter(),
-            Counter(),
-            Counter(),
-            Counter(),
-            0,
-            0,
-            0,
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            Counter(),
-            Counter(),
-            [],
-            Counter(),
-            Counter(),
-            [],
-            [],
-            {},
-            [],
-            [],
-            [],
-            [f"Error opening pcap: {exc}"],
         )
 
     total_packets = 0
@@ -422,6 +410,9 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
     pending_creates: Dict[Tuple[str, str, int, int], Dict[str, object]] = {}
     pending_io: Dict[Tuple[str, str, int, int, int], Dict[str, object]] = {}
     pending_auth: Dict[Tuple[str, str, int], Dict[str, object]] = {}
+    # TREE_CONNECT requests carry TreeId 0; the id is assigned in the response,
+    # so the share path is parked by MessageId until the response names the tree.
+    pending_tree_connects: Dict[Tuple[str, str, int, int], str] = {}
     tree_map: Dict[Tuple[str, str, int, int], str] = {}
     file_id_map: Dict[Tuple[str, str, int, str], str] = {}
     smb1_tree_map: Dict[Tuple[str, str, int], str] = {}
@@ -524,33 +515,18 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
             return "SMB2"
         return "SMB2/3"
 
-    def _extract_strings(data: bytes, min_len: int = 4) -> Set[str]:
+    def _smb_strings(data: bytes) -> Set[str]:
+        """ASCII plus 2-byte-aligned UTF-16LE runs; not the generic utils
+        extractor, which has no alignment rule and would read a coincidental
+        odd-offset byte pattern as a wide string."""
         results: Set[str] = set()
-        current = bytearray()
-        for b in data:
-            if 32 <= b <= 126:
-                current.append(b)
-            else:
-                if len(current) >= min_len:
-                    results.add(decode_payload(bytes(current), encoding="latin-1"))
-                current = bytearray()
-        if len(current) >= min_len:
-            results.add(decode_payload(bytes(current), encoding="latin-1"))
-
-        utf16 = bytearray()
-        i = 0
-        while i + 1 < len(data):
-            ch = data[i]
-            if 32 <= ch <= 126 and data[i + 1] == 0x00:
-                utf16.append(ch)
-                i += 2
-            else:
-                if len(utf16) >= min_len:
-                    results.add(decode_payload(bytes(utf16), encoding="latin-1"))
-                utf16 = bytearray()
-                i += 2
-        if len(utf16) >= min_len:
-            results.add(decode_payload(bytes(utf16), encoding="latin-1"))
+        for match in _ASCII_RUN_RE.finditer(data):
+            results.add(match.group(0).decode("latin-1"))
+        for match in _UTF16_RUN_RE.finditer(data):
+            # SMB strings are 2-byte aligned from the record start; an odd
+            # offset is a coincidental byte pattern, not a UTF-16 string.
+            if match.start() % 2 == 0:
+                results.add(match.group(0)[::2].decode("latin-1"))
         return results
 
     def _extract_users_from_strings(strings: Set[str]) -> Tuple[Set[str], Set[str]]:
@@ -812,515 +788,518 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
         # ProcessId (4) | TreeId (4) | SessionId (8)
         # Signature (16)
 
-        try:
-            status = struct.unpack("<I", payload[8:12])[0]
-            cmd = struct.unpack("<H", payload[12:14])[0]
-            flags = struct.unpack("<I", payload[16:20])[0]
-            msg_id = struct.unpack("<Q", payload[24:32])[0]
-            tree_id = struct.unpack("<I", payload[36:40])[0]
-            session_id = struct.unpack("<Q", payload[40:48])[0]
+        status = struct.unpack("<I", payload[8:12])[0]
+        cmd = struct.unpack("<H", payload[12:14])[0]
+        flags = struct.unpack("<I", payload[16:20])[0]
+        msg_id = struct.unpack("<Q", payload[24:32])[0]
+        tree_id = struct.unpack("<I", payload[36:40])[0]
+        session_id = struct.unpack("<Q", payload[40:48])[0]
 
-            is_response = (flags & 0x00000001) != 0
-            client = dst if is_response else src
-            server = src if is_response else dst
-            server_port = src_port if is_response else dst_port
+        is_response = (flags & 0x00000001) != 0
+        client = dst if is_response else src
+        server = src if is_response else dst
+        server_port = src_port if is_response else dst_port
 
-            if isinstance(server_port, int):
-                counter_inc(smb_ports, int(server_port))
+        if isinstance(server_port, int):
+            counter_inc(smb_ports, int(server_port))
 
-            signed = (flags & SMB2_FLAGS_SIGNED) != 0
-            if signed:
-                signed_packets += 1
-            else:
-                unsigned_packets += 1
+        signed = (flags & SMB2_FLAGS_SIGNED) != 0
+        if signed:
+            signed_packets += 1
+        else:
+            unsigned_packets += 1
 
-            cmd_name = SMB2_CMD_MAP.get(cmd, f"Unknown(0x{cmd:02X})")
-            full_cmd = f"SMB2:{cmd_name}"
-            counter_inc(commands, full_cmd)
-            if is_response:
-                counter_inc(responses, full_cmd)
-            else:
-                counter_inc(requests, full_cmd)
+        cmd_name = SMB2_CMD_MAP.get(cmd, f"Unknown(0x{cmd:02X})")
+        full_cmd = f"SMB2:{cmd_name}"
+        counter_inc(commands, full_cmd)
+        if is_response:
+            counter_inc(responses, full_cmd)
+        else:
+            counter_inc(requests, full_cmd)
 
-            # Error Code Tracking (only on responses)
-            status_text = None
-            if is_response:
-                status_text = NT_STATUS_MAP.get(status, f"0x{status:08X}")
-                counter_inc(error_codes, status_text)
+        # Error Code Tracking (only on responses)
+        status_text = None
+        if is_response:
+            status_text = NT_STATUS_MAP.get(status, f"0x{status:08X}")
+            counter_inc(error_codes, status_text)
 
-                if status == STATUS_LOGON_FAILURE:
-                    _append_capped(
-                        anomalies,
-                        SmbAnomaly(
-                            "HIGH",
-                            "SMB Logon Failure",
-                            f"Failed login attempt to {server}",
-                            idx,
-                            src,
-                            dst,
-                        ),
-                        MAX_SMB_ANOMALIES,
-                        "anomalies",
-                        f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
+            if status == STATUS_LOGON_FAILURE:
+                _append_capped(
+                    anomalies,
+                    SmbAnomaly(
+                        "HIGH",
+                        "SMB Logon Failure",
+                        f"Failed login attempt to {server}",
+                        idx,
+                        src,
+                        dst,
+                    ),
+                    MAX_SMB_ANOMALIES,
+                    "anomalies",
+                    f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
+                )
+                counter_inc(client_failures, client)
+            elif status == STATUS_ACCESS_DENIED:
+                _append_capped(
+                    anomalies,
+                    SmbAnomaly(
+                        "MEDIUM",
+                        "SMB Access Denied",
+                        f"Access denied on {server}",
+                        idx,
+                        src,
+                        dst,
+                    ),
+                    MAX_SMB_ANOMALIES,
+                    "anomalies",
+                    f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
+                )
+
+        _track_conversation(
+            client, server, length, ts, not is_response, full_cmd, status_text
+        )
+
+        session_key = (client, server, int(session_id))
+        sess: Optional[SmbSession] = None
+        if session_id != 0:
+            sess = sessions.get(session_key)
+            if sess is None:
+                if len(sessions) >= MAX_SMB_SESSIONS:
+                    _cap_warn(
+                        "sessions", f"SMB sessions capped at {MAX_SMB_SESSIONS}"
                     )
-                    counter_inc(client_failures, client)
-                elif status == STATUS_ACCESS_DENIED:
-                    _append_capped(
-                        anomalies,
-                        SmbAnomaly(
-                            "MEDIUM",
-                            "SMB Access Denied",
-                            f"Access denied on {server}",
-                            idx,
-                            src,
-                            dst,
-                        ),
-                        MAX_SMB_ANOMALIES,
-                        "anomalies",
-                        f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
+                    sess = None
+                else:
+                    sess = SmbSession(
+                        client_ip=client,
+                        server_ip=server,
+                        session_id=int(session_id),
                     )
-
-            _track_conversation(
-                client, server, length, ts, not is_response, full_cmd, status_text
-            )
-
-            session_key = (client, server, int(session_id))
-            sess: Optional[SmbSession] = None
-            if session_id != 0:
-                sess = sessions.get(session_key)
-                if sess is None:
-                    if len(sessions) >= MAX_SMB_SESSIONS:
-                        _cap_warn(
-                            "sessions", f"SMB sessions capped at {MAX_SMB_SESSIONS}"
-                        )
-                        sess = None
+                    sessions[session_key] = sess
+            if sess:
+                session_id_map.setdefault(int(session_id), (client, server))
+                server_info = servers.get(sess.server_ip)
+                if server_info and server_info.signing_required is not None:
+                    sess.signing_required = server_info.signing_required
+                if (
+                    server_info
+                    and server_info.dialects
+                    and sess.smb_version == "Unknown"
+                ):
+                    if any(d.startswith("SMB3") for d in server_info.dialects):
+                        sess.smb_version = "SMB3"
+                    elif any(d.startswith("SMB2") for d in server_info.dialects):
+                        sess.smb_version = "SMB2"
                     else:
-                        sess = SmbSession(
-                            client_ip=client,
-                            server_ip=server,
-                            session_id=int(session_id),
-                        )
-                        sessions[session_key] = sess
-                if sess:
-                    session_id_map.setdefault(int(session_id), (client, server))
-                    server_info = servers.get(sess.server_ip)
-                    if server_info and server_info.signing_required is not None:
-                        sess.signing_required = server_info.signing_required
-                    if (
-                        server_info
-                        and server_info.dialects
-                        and sess.smb_version == "Unknown"
-                    ):
-                        if any(d.startswith("SMB3") for d in server_info.dialects):
-                            sess.smb_version = "SMB3"
-                        elif any(d.startswith("SMB2") for d in server_info.dialects):
-                            sess.smb_version = "SMB2"
-                        else:
-                            sess.smb_version = "SMB2/3"
-                    elif sess.smb_version == "Unknown":
                         sess.smb_version = "SMB2/3"
-                    sess.packets += 1
-                    sess.bytes += length
-                    if ts is not None and (sess.start_ts == 0.0 or ts < sess.start_ts):
-                        sess.start_ts = ts
-                    if ts is not None and ts > sess.last_seen:
-                        sess.last_seen = ts
-                    sess.active = True
+                elif sess.smb_version == "Unknown":
+                    sess.smb_version = "SMB2/3"
+                sess.packets += 1
+                sess.bytes += length
+                if ts is not None and (sess.start_ts == 0.0 or ts < sess.start_ts):
+                    sess.start_ts = ts
+                if ts is not None and ts > sess.last_seen:
+                    sess.last_seen = ts
+                sess.active = True
 
-                    if signed:
-                        sess.signed_packets += 1
-                    else:
-                        sess.unsigned_packets += 1
-
-            # Payload after header
-            data = payload[64:]
-
-            # --- Negotiate (Capabilities, Dialects, Signing) ---
-            if cmd == SMB2_COM_NEGOTIATE:
-                if not is_response:
-                    if len(data) >= 36:
-                        dialect_count = struct.unpack("<H", data[2:4])[0]
-                        client_guid = data[12:28]
-                        cli = _get_client(client)
-                        if client_guid.strip(b"\x00"):
-                            cli.client_guid = _hex_guid(client_guid)
-                        if len(data) >= 36 + (dialect_count * 2):
-                            dialects = [
-                                struct.unpack("<H", data[36 + i : 38 + i])[0]
-                                for i in range(0, dialect_count * 2, 2)
-                            ]
-                            for d in dialects:
-                                name = _dialect_name(d)
-                                set_add_cap(cli.dialects, name, max_size=MAX_SMB_UNIQUE)
-                                counter_inc(versions, _dialect_family(name))
+                if signed:
+                    sess.signed_packets += 1
                 else:
-                    if len(data) >= 64:
-                        security_mode = struct.unpack("<H", data[2:4])[0]
-                        dialect = struct.unpack("<H", data[4:6])[0]
-                        capabilities = struct.unpack("<I", data[12:16])[0]
-                        server_guid = data[16:32]
-                        srv = _get_server(server)
-                        srv.server_guid = (
-                            _hex_guid(server_guid)
-                            if server_guid.strip(b"\x00")
-                            else srv.server_guid
-                        )
-                        dialect_name = _dialect_name(dialect)
-                        set_add_cap(srv.dialects, dialect_name, max_size=MAX_SMB_UNIQUE)
-                        counter_inc(versions, _dialect_family(dialect_name))
-                        signing_required = (security_mode & SMB2_SIGNING_REQUIRED) != 0
-                        srv.signing_required = (
-                            signing_required
-                            if srv.signing_required is None
-                            else srv.signing_required
-                        )
-                        for cap_bit, cap_name in SMB2_CAPABILITIES.items():
-                            if capabilities & cap_bit:
-                                set_add_cap(
-                                    srv.capabilities, cap_name, max_size=MAX_SMB_UNIQUE
-                                )
-                        if not signing_required:
-                            _append_capped(
-                                anomalies,
-                                SmbAnomaly(
-                                    "MEDIUM",
-                                    "SMB Signing Not Required",
-                                    f"Server {srv.ip} allows unsigned SMB sessions",
-                                    idx,
-                                    src,
-                                    dst,
-                                ),
-                                MAX_SMB_ANOMALIES,
-                                "anomalies",
-                                f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
+                    sess.unsigned_packets += 1
+
+        # Payload after header
+        data = payload[64:]
+
+        # --- Negotiate (Capabilities, Dialects, Signing) ---
+        if cmd == SMB2_COM_NEGOTIATE:
+            if not is_response:
+                if len(data) >= 36:
+                    dialect_count = struct.unpack("<H", data[2:4])[0]
+                    client_guid = data[12:28]
+                    cli = _get_client(client)
+                    if client_guid.strip(b"\x00"):
+                        cli.client_guid = _hex_guid(client_guid)
+                    if len(data) >= 36 + (dialect_count * 2):
+                        dialects = [
+                            struct.unpack("<H", data[36 + i : 38 + i])[0]
+                            for i in range(0, dialect_count * 2, 2)
+                        ]
+                        for d in dialects:
+                            name = _dialect_name(d)
+                            set_add_cap(cli.dialects, name, max_size=MAX_SMB_UNIQUE)
+                            counter_inc(versions, _dialect_family(name))
+            else:
+                if len(data) >= 64:
+                    # MS-SMB2 2.2.4: StructureSize(2) SecurityMode(2)
+                    # DialectRevision(2) NegotiateContextCount(2) ServerGuid(16)
+                    # Capabilities(4) ... — the GUID and capabilities used to be
+                    # read from the wrong offsets (mid-GUID), so both were junk.
+                    security_mode = struct.unpack("<H", data[2:4])[0]
+                    dialect = struct.unpack("<H", data[4:6])[0]
+                    server_guid = data[8:24]
+                    capabilities = struct.unpack("<I", data[24:28])[0]
+                    srv = _get_server(server)
+                    srv.server_guid = (
+                        _hex_guid(server_guid)
+                        if server_guid.strip(b"\x00")
+                        else srv.server_guid
+                    )
+                    dialect_name = _dialect_name(dialect)
+                    set_add_cap(srv.dialects, dialect_name, max_size=MAX_SMB_UNIQUE)
+                    counter_inc(versions, _dialect_family(dialect_name))
+                    signing_required = (security_mode & SMB2_SIGNING_REQUIRED) != 0
+                    srv.signing_required = (
+                        signing_required
+                        if srv.signing_required is None
+                        else srv.signing_required
+                    )
+                    for cap_bit, cap_name in SMB2_CAPABILITIES.items():
+                        if capabilities & cap_bit:
+                            set_add_cap(
+                                srv.capabilities, cap_name, max_size=MAX_SMB_UNIQUE
                             )
-
-            # --- Session Setup (Authentication Activity) ---
-            if cmd == SMB2_COM_SESSION_SETUP:
-                if not is_response:
-                    mechs = _detect_auth_mechs(payload)
-                    user, domain, workstation = _parse_ntlm_type3(payload)
-                    if user:
-                        counter_inc(observed_users, user)
-                    if domain:
-                        counter_inc(observed_domains, domain)
-                    auth_details = {
-                        "user": user,
-                        "domain": domain,
-                        "workstation": workstation,
-                        "mechs": sorted(mechs),
-                    }
-                    if user or domain or mechs:
-                        pending_auth[(client, server, int(msg_id))] = auth_details
-                        if sess is None and session_id != 0:
-                            if len(sessions) >= MAX_SMB_SESSIONS:
-                                _cap_warn(
-                                    "sessions",
-                                    f"SMB sessions capped at {MAX_SMB_SESSIONS}",
-                                )
-                                sess = None
-                            else:
-                                sess = SmbSession(
-                                    client_ip=client,
-                                    server_ip=server,
-                                    session_id=int(session_id),
-                                )
-                                sessions[session_key] = sess
-                        if sess:
-                            _apply_auth_details(sess, auth_details)
-                            if user or domain:
-                                _set_auth_type(sess, "NTLM")
-                else:
-                    if session_id != 0:
-                        if sess is None:
-                            if len(sessions) >= MAX_SMB_SESSIONS:
-                                _cap_warn(
-                                    "sessions",
-                                    f"SMB sessions capped at {MAX_SMB_SESSIONS}",
-                                )
-                                sess = None
-                            else:
-                                sess = SmbSession(
-                                    client_ip=client,
-                                    server_ip=server,
-                                    session_id=int(session_id),
-                                )
-                                sessions[session_key] = sess
-                        if sess:
-                            pending = pending_auth.pop(
-                                (client, server, int(msg_id)), None
-                            )
-                            if pending:
-                                _apply_auth_details(sess, pending)
-                                if pending.get("user") or pending.get("domain"):
-                                    _set_auth_type(sess, "NTLM")
-                    if len(data) >= 8 and sess:
-                        session_flags = struct.unpack("<H", data[2:4])[0]
-                        if session_flags & SMB2_SESSION_FLAG_ENCRYPT_DATA:
-                            sess.encryption_required = True
-                        if session_flags & SMB2_SESSION_FLAG_IS_GUEST:
-                            sess.is_guest = True
-                            _set_auth_type(sess, "Guest")
-                        if session_flags & SMB2_SESSION_FLAG_IS_NULL:
-                            _set_auth_type(sess, "Anonymous")
-
-            # --- Tree Connect (Share Access) ---
-            # Request: 0x03
-            if cmd == SMB2_COM_TREE_CONNECT and not is_response:
-                # Structure: StructSize(2), Reserved(2), PathOffset(2), PathLength(2)
-                if len(data) >= 8:
-                    path_off = struct.unpack("<H", data[4:6])[0]
-                    path_len = struct.unpack("<H", data[6:8])[0]
-
-                    # Offset is from start of SMB2 Header
-                    real_off = path_off - 64
-                    if real_off >= 0 and real_off + path_len <= len(data):
-                        share_path = decode_payload(
-                            data[real_off : real_off + path_len], encoding="utf-16le"
-                        )
-
-                        share_key = f"{server}|{share_path}"
-                        if share_key not in shares:
-                            if len(shares) >= MAX_SMB_SHARES:
-                                _cap_warn(
-                                    "shares", f"SMB shares capped at {MAX_SMB_SHARES}"
-                                )
-                                share_key = ""
-                            else:
-                                is_admin = _is_disk_admin_share(share_path)
-                                shares[share_key] = SmbShare(
-                                    share_path, server, is_admin=is_admin
-                                )
-                                set_add_cap(
-                                    _get_server(server).shares,
-                                    share_path,
-                                    max_size=MAX_SMB_UNIQUE,
-                                )
-                        if share_key and share_key in shares:
-                            shares[share_key].connect_count += 1
-
-                        if share_key and shares[share_key].is_admin:
-                            _append_capped(
-                                anomalies,
-                                SmbAnomaly(
-                                    "HIGH",
-                                    "Admin Share Access",
-                                    f"Administrative share {share_path} accessed",
-                                    idx,
-                                    src,
-                                    dst,
-                                ),
-                                MAX_SMB_ANOMALIES,
-                                "anomalies",
-                                f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
-                            )
-                            counter_inc(client_admin_shares, client)
-
-                        setdict_add(
-                            client_to_servers,
-                            client,
-                            server,
-                            max_keys=MAX_SMB_UNIQUE,
-                            max_values=MAX_SMB_UNIQUE,
-                        )
-
-                        if tree_id != 0:
-                            tree_key = (client, server, int(session_id), int(tree_id))
-                            if len(tree_map) < MAX_SMB_TREE_MAP or tree_key in tree_map:
-                                tree_map[tree_key] = share_path
-                            else:
-                                _cap_warn(
-                                    "tree_map",
-                                    f"SMB tree map capped at {MAX_SMB_TREE_MAP}",
-                                )
-
-            # --- Create (File Access) ---
-            if cmd == SMB2_COM_CREATE and not is_response:
-                if len(data) >= 56:
-                    name_offset = struct.unpack("<H", data[48:50])[0]
-                    name_length = struct.unpack("<H", data[50:52])[0]
-                    real_off = name_offset - 64
-                    if (
-                        name_length > 0
-                        and real_off >= 0
-                        and real_off + name_length <= len(data)
-                    ):
-                        filename = decode_payload(
-                            data[real_off : real_off + name_length], encoding="utf-16le"
-                        )
-                        share = tree_map.get(
-                            (client, server, int(session_id), int(tree_id))
-                        )
-                        if not share:
-                            unc_share, unc_name = _split_unc_share(filename)
-                            if unc_share:
-                                share = unc_share
-                                filename = unc_name or filename
+                    if not signing_required:
                         _append_capped(
-                            files,
-                            SmbFileOp(
-                                filename=filename,
-                                action="Create",
-                                path=filename,
-                                ts=ts or 0.0,
+                            anomalies,
+                            SmbAnomaly(
+                                "MEDIUM",
+                                "SMB Signing Not Required",
+                                f"Server {srv.ip} allows unsigned SMB sessions",
+                                idx,
+                                src,
+                                dst,
+                            ),
+                            MAX_SMB_ANOMALIES,
+                            "anomalies",
+                            f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
+                        )
+
+        # --- Session Setup (Authentication Activity) ---
+        if cmd == SMB2_COM_SESSION_SETUP:
+            if not is_response:
+                mechs = _detect_auth_mechs(payload)
+                user, domain, workstation = _parse_ntlm_type3(payload)
+                if user:
+                    counter_inc(observed_users, user)
+                if domain:
+                    counter_inc(observed_domains, domain)
+                auth_details = {
+                    "user": user,
+                    "domain": domain,
+                    "workstation": workstation,
+                    "mechs": sorted(mechs),
+                }
+                if user or domain or mechs:
+                    pending_auth[(client, server, int(msg_id))] = auth_details
+                    if sess is None and session_id != 0:
+                        if len(sessions) >= MAX_SMB_SESSIONS:
+                            _cap_warn(
+                                "sessions",
+                                f"SMB sessions capped at {MAX_SMB_SESSIONS}",
+                            )
+                            sess = None
+                        else:
+                            sess = SmbSession(
                                 client_ip=client,
                                 server_ip=server,
-                                share=share,
-                            ),
-                            MAX_SMB_FILES,
-                            "files",
-                            f"SMB file events capped at {MAX_SMB_FILES}",
+                                session_id=int(session_id),
+                            )
+                            sessions[session_key] = sess
+                    if sess:
+                        _apply_auth_details(sess, auth_details)
+                        if user or domain:
+                            _set_auth_type(sess, "NTLM")
+            else:
+                if session_id != 0:
+                    if sess is None:
+                        if len(sessions) >= MAX_SMB_SESSIONS:
+                            _cap_warn(
+                                "sessions",
+                                f"SMB sessions capped at {MAX_SMB_SESSIONS}",
+                            )
+                            sess = None
+                        else:
+                            sess = SmbSession(
+                                client_ip=client,
+                                server_ip=server,
+                                session_id=int(session_id),
+                            )
+                            sessions[session_key] = sess
+                    if sess:
+                        pending = pending_auth.pop(
+                            (client, server, int(msg_id)), None
                         )
-                        suspicious_ext = {
-                            ".exe",
-                            ".dll",
-                            ".ps1",
-                            ".bat",
-                            ".vbs",
-                            ".js",
-                            ".scr",
-                            ".sys",
-                            ".lnk",
-                            ".zip",
-                            ".rar",
-                            ".7z",
-                        }
-                        lower_name = filename.lower()
-                        for ext in suspicious_ext:
-                            if lower_name.endswith(ext):
-                                _append_capped(
-                                    anomalies,
-                                    SmbAnomaly(
-                                        "MEDIUM",
-                                        "Suspicious File Created",
-                                        f"{filename} created over SMB",
-                                        idx,
-                                        src,
-                                        dst,
-                                    ),
-                                    MAX_SMB_ANOMALIES,
-                                    "anomalies",
-                                    f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
-                                )
-                                break
-                        if (
-                            len(pending_creates) < MAX_SMB_PENDING
-                            or (client, server, int(session_id), int(msg_id))
-                            in pending_creates
-                        ):
-                            pending_creates[
-                                (client, server, int(session_id), int(msg_id))
-                            ] = {
-                                "filename": filename,
-                                "tree_id": int(tree_id),
-                                "share": share,
-                            }
-                        else:
-                            _cap_warn(
-                                "pending_creates",
-                                f"SMB pending creates capped at {MAX_SMB_PENDING}",
-                            )
+                        if pending:
+                            _apply_auth_details(sess, pending)
+                            if pending.get("user") or pending.get("domain"):
+                                _set_auth_type(sess, "NTLM")
+                if len(data) >= 8 and sess:
+                    session_flags = struct.unpack("<H", data[2:4])[0]
+                    if session_flags & SMB2_SESSION_FLAG_ENCRYPT_DATA:
+                        sess.encryption_required = True
+                    if session_flags & SMB2_SESSION_FLAG_IS_GUEST:
+                        sess.is_guest = True
+                        _set_auth_type(sess, "Guest")
+                    if session_flags & SMB2_SESSION_FLAG_IS_NULL:
+                        _set_auth_type(sess, "Anonymous")
 
-            if cmd == SMB2_COM_CREATE and is_response:
-                if len(data) >= 80:
-                    file_id = data[64:80]
-                    pending = pending_creates.pop(
-                        (client, server, int(session_id), int(msg_id)), None
+        # --- Tree Connect (Share Access) ---
+        # Request: 0x03
+        if cmd == SMB2_COM_TREE_CONNECT and not is_response:
+            # Structure: StructSize(2), Reserved(2), PathOffset(2), PathLength(2)
+            if len(data) >= 8:
+                path_off = struct.unpack("<H", data[4:6])[0]
+                path_len = struct.unpack("<H", data[6:8])[0]
+
+                # Offset is from start of SMB2 Header
+                real_off = path_off - 64
+                if real_off >= 0 and real_off + path_len <= len(data):
+                    share_path = decode_payload(
+                        data[real_off : real_off + path_len], encoding="utf-16le"
                     )
-                    if pending:
-                        file_id_hex = file_id.hex()
-                        share = pending.get("share")
-                        filename = str(pending.get("filename", ""))
-                        if not share:
-                            unc_share, unc_name = _split_unc_share(filename)
-                            if unc_share:
-                                share = unc_share
-                                filename = unc_name or filename
-                        if (
-                            len(file_id_map) < MAX_SMB_FILE_IDS
-                            or (client, server, int(session_id), file_id_hex)
-                            in file_id_map
-                        ):
-                            file_id_map[
-                                (client, server, int(session_id), file_id_hex)
-                            ] = filename
+
+                    share_key = f"{server}|{share_path}"
+                    if share_key not in shares:
+                        if len(shares) >= MAX_SMB_SHARES:
+                            _cap_warn(
+                                "shares", f"SMB shares capped at {MAX_SMB_SHARES}"
+                            )
+                            share_key = ""
+                        else:
+                            is_admin = _is_disk_admin_share(share_path)
+                            shares[share_key] = SmbShare(
+                                share_path, server, is_admin=is_admin
+                            )
+                            set_add_cap(
+                                _get_server(server).shares,
+                                share_path,
+                                max_size=MAX_SMB_UNIQUE,
+                            )
+                    if share_key and share_key in shares:
+                        shares[share_key].connect_count += 1
+
+                    if share_key and shares[share_key].is_admin:
+                        _append_capped(
+                            anomalies,
+                            SmbAnomaly(
+                                "HIGH",
+                                "Admin Share Access",
+                                f"Administrative share {share_path} accessed",
+                                idx,
+                                src,
+                                dst,
+                            ),
+                            MAX_SMB_ANOMALIES,
+                            "anomalies",
+                            f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
+                        )
+                        counter_inc(client_admin_shares, client)
+
+                    setdict_add(
+                        client_to_servers,
+                        client,
+                        server,
+                        max_keys=MAX_SMB_UNIQUE,
+                        max_values=MAX_SMB_UNIQUE,
+                    )
+
+                    if tree_id != 0:
+                        tree_key = (client, server, int(session_id), int(tree_id))
+                        if len(tree_map) < MAX_SMB_TREE_MAP or tree_key in tree_map:
+                            tree_map[tree_key] = share_path
                         else:
                             _cap_warn(
-                                "file_ids",
-                                f"SMB file id map capped at {MAX_SMB_FILE_IDS}",
+                                "tree_map",
+                                f"SMB tree map capped at {MAX_SMB_TREE_MAP}",
                             )
-                        if filename and share:
-                            if (
-                                len(artifacts) < MAX_SMB_ARTIFACTS
-                                or f"{share}{filename}" in artifacts
-                            ):
-                                artifacts.add(f"{share}{filename}")
-                            else:
-                                _cap_warn(
-                                    "artifacts",
-                                    f"SMB artifacts capped at {MAX_SMB_ARTIFACTS}",
-                                )
+                    elif len(pending_tree_connects) < MAX_SMB_PENDING:
+                        pending_tree_connects[
+                            (client, server, int(session_id), int(msg_id))
+                        ] = share_path
 
-            if cmd in (SMB2_COM_READ, SMB2_COM_WRITE) and not is_response:
-                if len(data) >= 32:
-                    length_bytes = struct.unpack("<I", data[4:8])[0]
-                    file_id = data[16:32]
-                    file_id_hex = file_id.hex()
-                    filename = file_id_map.get(
-                        (client, server, int(session_id), file_id_hex)
+        if cmd == SMB2_COM_TREE_CONNECT and is_response and tree_id != 0:
+            share_path = pending_tree_connects.pop(
+                (client, server, int(session_id), int(msg_id)), None
+            )
+            if share_path and status == STATUS_SUCCESS:
+                tree_key = (client, server, int(session_id), int(tree_id))
+                if len(tree_map) < MAX_SMB_TREE_MAP or tree_key in tree_map:
+                    tree_map[tree_key] = share_path
+                else:
+                    _cap_warn("tree_map", f"SMB tree map capped at {MAX_SMB_TREE_MAP}")
+
+        # --- Create (File Access) ---
+        if cmd == SMB2_COM_CREATE and not is_response:
+            if len(data) >= 56:
+                # MS-SMB2 2.2.13: NameOffset/NameLength sit at body offsets
+                # 44/46 (CreateContextsOffset/Length follow at 48/52). They were
+                # read from 48/50, so real CREATE requests never yielded a name.
+                name_offset = struct.unpack("<H", data[44:46])[0]
+                name_length = struct.unpack("<H", data[46:48])[0]
+                real_off = name_offset - 64
+                if (
+                    name_length > 0
+                    and real_off >= 0
+                    and real_off + name_length <= len(data)
+                ):
+                    filename = decode_payload(
+                        data[real_off : real_off + name_length], encoding="utf-16le"
                     )
                     share = tree_map.get(
                         (client, server, int(session_id), int(tree_id))
                     )
-                    if filename and not share:
+                    if not share:
                         unc_share, unc_name = _split_unc_share(filename)
                         if unc_share:
                             share = unc_share
                             filename = unc_name or filename
-                    action = "Read" if cmd == SMB2_COM_READ else "Write"
-                    op_index = None
-                    if len(files) < MAX_SMB_FILES:
-                        files.append(
-                            SmbFileOp(
-                                filename=filename or "(unknown)",
-                                action=action,
-                                path=filename or "(unknown)",
-                                size=length_bytes,
-                                ts=ts or 0.0,
-                                client_ip=client,
-                                server_ip=server,
-                                share=share,
-                                file_id=file_id_hex,
-                            )
-                        )
-                        op_index = len(files) - 1
-                    else:
-                        _cap_warn("files", f"SMB file events capped at {MAX_SMB_FILES}")
-
-                    if op_index is not None:
-                        pending_io[
-                            (client, server, int(session_id), int(msg_id), int(cmd))
-                        ] = {
-                            "index": op_index,
-                        }
-
-            if cmd in (SMB2_COM_READ, SMB2_COM_WRITE) and is_response:
-                if len(data) >= 8:
-                    resp_len = 0
-                    if cmd == SMB2_COM_READ:
-                        resp_len = struct.unpack("<I", data[4:8])[0]
-                    else:
-                        resp_len = struct.unpack("<I", data[4:8])[0]
-                    pending = pending_io.pop(
-                        (client, server, int(session_id), int(msg_id), int(cmd)), None
+                    _append_capped(
+                        files,
+                        SmbFileOp(
+                            filename=filename,
+                            action="Create",
+                            path=filename,
+                            ts=ts or 0.0,
+                            client_ip=client,
+                            server_ip=server,
+                            share=share,
+                        ),
+                        MAX_SMB_FILES,
+                        "files",
+                        f"SMB file events capped at {MAX_SMB_FILES}",
                     )
-                    if pending and resp_len:
-                        idx = pending.get("index")
-                        if isinstance(idx, int) and 0 <= idx < len(files):
-                            files[idx].size = resp_len
+                    if filename.lower().endswith(_SUSPICIOUS_SMB_EXTS):
+                        _append_capped(
+                            anomalies,
+                            SmbAnomaly(
+                                "MEDIUM",
+                                "Suspicious File Created",
+                                f"{filename} created over SMB",
+                                idx,
+                                src,
+                                dst,
+                            ),
+                            MAX_SMB_ANOMALIES,
+                            "anomalies",
+                            f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
+                        )
+                    if (
+                        len(pending_creates) < MAX_SMB_PENDING
+                        or (client, server, int(session_id), int(msg_id))
+                        in pending_creates
+                    ):
+                        pending_creates[
+                            (client, server, int(session_id), int(msg_id))
+                        ] = {
+                            "filename": filename,
+                            "tree_id": int(tree_id),
+                            "share": share,
+                        }
+                    else:
+                        _cap_warn(
+                            "pending_creates",
+                            f"SMB pending creates capped at {MAX_SMB_PENDING}",
+                        )
 
-        except Exception:
-            pass
+        if cmd == SMB2_COM_CREATE and is_response:
+            if len(data) >= 72:
+                # MS-SMB2 2.2.14: the 16-byte FileId starts at body offset 56
+                # (2+1+1+4 + five 8-byte times/sizes + 4+4), not 64.
+                file_id = data[56:72]
+                pending = pending_creates.pop(
+                    (client, server, int(session_id), int(msg_id)), None
+                )
+                if pending:
+                    file_id_hex = file_id.hex()
+                    share = pending.get("share")
+                    filename = str(pending.get("filename", ""))
+                    if not share:
+                        unc_share, unc_name = _split_unc_share(filename)
+                        if unc_share:
+                            share = unc_share
+                            filename = unc_name or filename
+                    if (
+                        len(file_id_map) < MAX_SMB_FILE_IDS
+                        or (client, server, int(session_id), file_id_hex)
+                        in file_id_map
+                    ):
+                        file_id_map[
+                            (client, server, int(session_id), file_id_hex)
+                        ] = filename
+                    else:
+                        _cap_warn(
+                            "file_ids",
+                            f"SMB file id map capped at {MAX_SMB_FILE_IDS}",
+                        )
+                    if filename and share:
+                        if (
+                            len(artifacts) < MAX_SMB_ARTIFACTS
+                            or f"{share}{filename}" in artifacts
+                        ):
+                            artifacts.add(f"{share}{filename}")
+                        else:
+                            _cap_warn(
+                                "artifacts",
+                                f"SMB artifacts capped at {MAX_SMB_ARTIFACTS}",
+                            )
+
+        if cmd in (SMB2_COM_READ, SMB2_COM_WRITE) and not is_response:
+            if len(data) >= 32:
+                length_bytes = struct.unpack("<I", data[4:8])[0]
+                file_id = data[16:32]
+                file_id_hex = file_id.hex()
+                filename = file_id_map.get(
+                    (client, server, int(session_id), file_id_hex)
+                )
+                share = tree_map.get(
+                    (client, server, int(session_id), int(tree_id))
+                )
+                if filename and not share:
+                    unc_share, unc_name = _split_unc_share(filename)
+                    if unc_share:
+                        share = unc_share
+                        filename = unc_name or filename
+                action = "Read" if cmd == SMB2_COM_READ else "Write"
+                op_index = None
+                if len(files) < MAX_SMB_FILES:
+                    files.append(
+                        SmbFileOp(
+                            filename=filename or "(unknown)",
+                            action=action,
+                            path=filename or "(unknown)",
+                            size=length_bytes,
+                            ts=ts or 0.0,
+                            client_ip=client,
+                            server_ip=server,
+                            share=share,
+                            file_id=file_id_hex,
+                        )
+                    )
+                    op_index = len(files) - 1
+                else:
+                    _cap_warn("files", f"SMB file events capped at {MAX_SMB_FILES}")
+
+                if op_index is not None:
+                    pending_io[
+                        (client, server, int(session_id), int(msg_id), int(cmd))
+                    ] = {
+                        "index": op_index,
+                    }
+
+        if cmd in (SMB2_COM_READ, SMB2_COM_WRITE) and is_response:
+            if len(data) >= 8:
+                resp_len = 0
+                if cmd == SMB2_COM_READ:
+                    resp_len = struct.unpack("<I", data[4:8])[0]
+                else:
+                    resp_len = struct.unpack("<I", data[4:8])[0]
+                pending = pending_io.pop(
+                    (client, server, int(session_id), int(msg_id), int(cmd)), None
+                )
+                if pending and resp_len:
+                    idx = pending.get("index")
+                    if isinstance(idx, int) and 0 <= idx < len(files):
+                        files[idx].size = resp_len
 
     def _pick_smb1_filename(strings: Set[str]) -> Optional[str]:
         candidates: List[str] = []
@@ -1464,7 +1443,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
                         sess.active = True
 
         if cmd == SMB1_COM_TREE_CONNECT_ANDX and not is_response:
-            strings = _extract_strings(payload)
+            strings = _smb_strings(payload)
             for text in strings:
                 if text.startswith("\\\\") and "\\" in text[2:]:
                     share_path = text
@@ -1514,7 +1493,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
                         smb1_tree_map[(client, server, int(tid))] = share_path
 
         if cmd in (SMB1_COM_NT_CREATE_ANDX, SMB1_COM_OPEN_ANDX) and not is_response:
-            strings = _extract_strings(payload)
+            strings = _smb_strings(payload)
             filename = _pick_smb1_filename(strings)
             share = smb1_tree_map.get((client, server, int(tid)))
             if filename and not share:
@@ -1568,7 +1547,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
             except Exception:
                 length_bytes = 0
             share = smb1_tree_map.get((client, server, int(tid)))
-            strings = _extract_strings(payload)
+            strings = _smb_strings(payload)
             filename = _pick_smb1_filename(strings)
             if filename and not share:
                 unc_share, unc_name = _split_unc_share(filename)
@@ -1703,31 +1682,24 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
                     sess.last_seen = ts
                 sess.active = True
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    skipped_packets = 0
+    first_skip_error: Optional[str] = None
 
-            total_packets += 1
-            if TCP not in pkt:
-                continue
-            payload = b""
-            if Raw in pkt:
-                payload = bytes(pkt[Raw])
-            else:
-                try:
-                    payload = bytes(pkt[TCP].payload)
-                except Exception:
-                    payload = b""
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        tcp_layer = pkt.getlayer(TCP)
+        if tcp_layer is None:
+            continue
+        try:
+            raw_layer = tcp_layer.getlayer(Raw) if Raw is not None else None
+            try:
+                payload = bytes(raw_layer) if raw_layer is not None else bytes(tcp_layer.payload)
+            except Exception:
+                payload = b""
             if not payload:
                 continue
-            src_port = int(pkt[TCP].sport)
-            dst_port = int(pkt[TCP].dport)
+            src_port = int(tcp_layer.sport)
+            dst_port = int(tcp_layer.dport)
             standard_port = src_port in (445, 139) or dst_port in (445, 139)
             if not standard_port and not _looks_like_smb(payload):
                 continue
@@ -1832,7 +1804,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
                     continue
 
                 # Artifacts and user strings (skip encrypted SMB3 transform)
-                strings = _extract_strings(smb_data)
+                strings = _smb_strings(smb_data)
                 for text in strings:
                     if "\\PIPE\\" in text.upper():
                         if len(artifacts) < MAX_SMB_ARTIFACTS or text in artifacts:
@@ -1873,12 +1845,16 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
                     set_add_cap(
                         cli.workstation_candidates, workstation, max_size=MAX_SMB_UNIQUE
                     )
+        except Exception as exc:  # noqa: BLE001 — one malformed record must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
 
-    except Exception as e:
-        errors.append(str(e))
-    finally:
-        status.finish()
-        reader.close()
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} SMB packet(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     lateral_movement: List[Dict[str, object]] = []
     for client, server_set in client_to_servers.items():
@@ -1964,26 +1940,11 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
             f"Lateral profile client={item.get('client', '-')} servers={item.get('servers', 0)} admin_shares={item.get('admin_shares', 0)} score={item.get('score', 0)}"
         )
 
-    suspicious_ext = {
-        ".exe",
-        ".dll",
-        ".ps1",
-        ".bat",
-        ".vbs",
-        ".js",
-        ".scr",
-        ".sys",
-        ".lnk",
-        ".zip",
-        ".rar",
-        ".7z",
-    }
     suspicious_file_hits = 0
     for file_item in files:
         name = str(getattr(file_item, "filename", "") or "")
         action = str(getattr(file_item, "action", "") or "").lower()
-        lowered = name.lower()
-        if any(lowered.endswith(ext) for ext in suspicious_ext):
+        if name.lower().endswith(_SUSPICIOUS_SMB_EXTS):
             suspicious_file_hits += 1
             if action in {"write", "create", "setinfo"}:
                 deterministic_checks["smb_sensitive_file_staging"].append(
@@ -2001,12 +1962,12 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
             )
 
     for ip_value, count in top_servers.items():
-        if _is_public_ip(ip_value):
+        if is_public_ip(ip_value):
             deterministic_checks["smb_public_endpoint_exposure"].append(
                 f"Public SMB server endpoint {ip_value} packets={int(count)}"
             )
     for ip_value, count in top_clients.items():
-        if _is_public_ip(ip_value):
+        if is_public_ip(ip_value):
             deterministic_checks["smb_public_endpoint_exposure"].append(
                 f"Public SMB client endpoint {ip_value} packets={int(count)}"
             )
@@ -2088,9 +2049,6 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
             f"SMB anomalies capped at {MAX_SMB_ANOMALIES}",
         )
 
-    server_values = (
-        list(servers.values()) if isinstance(servers, dict) else list(servers)
-    )
     return SmbSummary(
         path=path,
         total_packets=total_packets,
@@ -2106,7 +2064,7 @@ def analyze_smb(path: Path, show_status: bool = True) -> SmbSummary:
         encrypted_packets=encrypted_packets,
         sessions=list(sessions.values()),
         conversations=list(conversations.values()),
-        servers=server_values,
+        servers=list(servers.values()),
         clients=list(clients.values()),
         shares=list(shares.values()),
         files=files,

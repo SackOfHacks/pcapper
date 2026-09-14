@@ -284,14 +284,16 @@ def compare_baseline(
     base_services = {_service_key(item): item for item in baseline.services}
     curr_services = {_service_key(item): item for item in current.services}
 
+    # Sorted: these came straight from set-difference iteration, so the
+    # rendered delta changed order from run to run.
     new_services = [
-        curr_services[key] for key in curr_services.keys() - base_services.keys()
+        curr_services[key] for key in sorted(curr_services.keys() - base_services.keys())
     ]
     missing_services = [
-        base_services[key] for key in base_services.keys() - curr_services.keys()
+        base_services[key] for key in sorted(base_services.keys() - curr_services.keys())
     ]
     service_changes: list[dict[str, object]] = []
-    for key in curr_services.keys() & base_services.keys():
+    for key in sorted(curr_services.keys() & base_services.keys()):
         base = base_services[key]
         curr = curr_services[key]
         if str(base.get("service", "") or "") != str(
@@ -316,7 +318,7 @@ def compare_baseline(
         [cmd for cmd in base_commands if cmd not in curr_commands]
     )
     ot_command_changes: list[dict[str, object]] = []
-    for cmd in curr_commands.keys() & base_commands.keys():
+    for cmd in sorted(curr_commands.keys() & base_commands.keys()):
         base_val = base_commands.get(cmd, 0)
         curr_val = curr_commands.get(cmd, 0)
         diff = curr_val - base_val
@@ -364,12 +366,30 @@ def compare_baseline(
 
 
 def load_baseline(path: Path) -> BaselineSnapshot:
+    """Load a saved snapshot; every failure surfaces as ValueError with the path.
+
+    A baseline is analyst-authored JSON, so a hand edit that leaves a count as
+    a string or drops a table must produce a message naming the file, not a
+    traceback out of ``int()`` three calls deep.
+    """
     raw = safe_read_text(path, error_list=None, context="baseline read")
     if not raw:
-        raise ValueError(f"Baseline file is empty: {path}")
+        raise ValueError(f"Baseline file is empty or unreadable: {path}")
     import json
 
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Baseline file is not valid JSON: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"Baseline file root is not an object: {path}")
+    try:
+        return _baseline_from_dict(data)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(f"Baseline file has an unexpected shape: {path}: {exc}") from exc
+
+
+def _baseline_from_dict(data: dict) -> BaselineSnapshot:
     return BaselineSnapshot(
         created_at=str(data.get("created_at") or ""),
         pcapper_version=str(data.get("pcapper_version") or ""),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -15,6 +16,15 @@ class Rule:
     title: str
     severity: str
     match: dict[str, Any]
+
+
+@lru_cache(maxsize=512)
+def _compiled(pattern: str) -> "re.Pattern[str] | None":
+    """Rule regexes are applied to every detection; compile each once."""
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return None
 
 
 @dataclass(frozen=True)
@@ -165,10 +175,8 @@ def _match_condition(condition: dict[str, Any], record: dict[str, Any]) -> bool:
     if op == "regex":
         if value is None:
             return False
-        try:
-            return re.search(str(value), str(actual or ""), re.IGNORECASE) is not None
-        except re.error:
-            return False
+        pattern = _compiled(str(value))
+        return pattern is not None and pattern.search(str(actual or "")) is not None
     if op == "in":
         if isinstance(value, (list, tuple, set)):
             return str(actual) in {str(item) for item in value}

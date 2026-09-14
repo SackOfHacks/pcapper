@@ -13,6 +13,7 @@ from .industrial_helpers import (
     analyze_port_protocol,
     default_artifacts,
 )
+from .utils import memoize_analysis
 
 PROFINET_PORTS = {34962, 34963, 34964}
 PROFINET_ETHERTYPE = 0x8892
@@ -544,6 +545,7 @@ def _merge_size_buckets(left: list, right: list) -> list:
     return updated
 
 
+@memoize_analysis
 def analyze_profinet(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     port_analysis = analyze_port_protocol(
         path=path,

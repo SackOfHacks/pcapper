@@ -8,8 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import (
+    extract_ascii_strings,
+    extract_packet_endpoints,
+    memoize_analysis,
+    packet_length,
+    safe_float,
+)
 from .utils import is_public_ip as _is_public_ip
 from .utils import beacon_score
 
@@ -429,28 +435,16 @@ def _extract_utf16le_strings(payload: bytes, limit: int = 200) -> list[str]:
     return out
 
 
-def _extract_strings(payload: bytes, limit: int = 200) -> list[str]:
+def _rpc_strings(payload: bytes, limit: int = 200) -> list[str]:
+    """ASCII and UTF-16LE strings of a PDU, de-duplicated, in wire order."""
     if not payload:
         return []
     out: list[str] = []
     seen: set[str] = set()
-    current = bytearray()
-    for b in payload:
-        if 32 <= b <= 126:
-            current.append(b)
-        else:
-            if len(current) >= 4:
-                value = current.decode("latin-1", errors="ignore")[:limit]
-                if value not in seen:
-                    out.append(value)
-                    seen.add(value)
-            current = bytearray()
-    if len(current) >= 4:
-        value = current.decode("latin-1", errors="ignore")[:limit]
+    for value in extract_ascii_strings(payload, min_len=4, max_len=limit):
         if value not in seen:
             out.append(value)
             seen.add(value)
-
     for value in _extract_utf16le_strings(payload, limit=limit):
         if value not in seen:
             out.append(value)
@@ -528,7 +522,8 @@ def _extract_samr_fullnames(payload: bytes) -> list[str]:
     return names
 
 
-def _beacon_score(times: list[float]):
+def _rpc_beacon(times: list[float]):
+    """``utils.beacon_score`` with the RPC view's tighter jitter tolerance."""
     return beacon_score(
         times, min_interval=1.0, max_interval=3600.0, rel_jitter=0.15, abs_jitter_floor=0.0
     )
@@ -539,7 +534,7 @@ def analyze_rpc(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> RpcSummary:
     errors: list[str] = []
     if TCP is None and UDP is None:
@@ -580,9 +575,6 @@ def analyze_rpc(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     total_packets = 0
     rpc_packets = 0
@@ -623,15 +615,7 @@ def analyze_rpc(
     bind_failures: Counter[str] = Counter()
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -816,7 +800,7 @@ def analyze_rpc(
                     )
                 )
 
-            for item in _extract_strings(payload, limit=200):
+            for item in _rpc_strings(payload, limit=200):
                 plaintext_strings[item] += 1
                 if HOST_RE.fullmatch(item) and len(item) <= 64:
                     hostname_counts[item] += 1
@@ -892,12 +876,6 @@ def analyze_rpc(
                         )
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
 
     for (iface_label, attack_id), pairs in high_risk_iface_use.items():
         sample = ", ".join(sorted(pairs)[:5])
@@ -940,7 +918,7 @@ def analyze_rpc(
             )
 
     for flow, times in request_times.items():
-        score = _beacon_score(times)
+        score = _rpc_beacon(times)
         if score:
             detections.append(
                 {
@@ -1030,7 +1008,7 @@ def analyze_rpc(
             )
 
     for flow, times in request_times.items():
-        score = _beacon_score(times)
+        score = _rpc_beacon(times)
         if score:
             deterministic_checks["rpc_beaconing_pattern"].append(
                 f"{flow[0]}->{flow[1]} periodic RPC avg={score['avg']:.1f}s stddev={score['stddev']:.1f}s"
@@ -1107,7 +1085,9 @@ def analyze_rpc(
                 last_seen=data.get("last_seen"),
             )
         )
-    conversations.sort(key=lambda c: c.packets, reverse=True)
+    conversations.sort(
+        key=lambda c: (-c.packets, c.client_ip, c.server_ip, c.server_port, c.protocol)
+    )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -1321,7 +1301,9 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
         )
         for key, val in conv_map.items()
     ]
-    conversations.sort(key=lambda c: c.packets, reverse=True)
+    conversations.sort(
+        key=lambda c: (-c.packets, c.client_ip, c.server_ip, c.server_port, c.protocol)
+    )
 
     return RpcSummary(
         path=Path(f"ALL_PCAPS_{len(summary_list)}"),

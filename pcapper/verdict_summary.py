@@ -175,23 +175,23 @@ def summarize(detections: Iterable[Detection]) -> VerdictSummary:
         )
         grouped[key].append(det)
 
+    # Show TP_MALICIOUS_CANDIDATE first, then TP_HARDENING, then
+    # LIKELY_CONTROL_WORKING, then LIKELY_FP, then INCONCLUSIVE; within a
+    # category by severity, then by summary/source so equal rows keep a
+    # stable order across runs.
+    category_order = {
+        "TP_MALICIOUS_CANDIDATE": 0,
+        "TP_HARDENING": 1,
+        "LIKELY_CONTROL_WORKING": 2,
+        "LIKELY_FP": 3,
+        "INCONCLUSIVE": 4,
+    }
+    sev_order = {"critical": 0, "high": 1, "warning": 2, "info": 3}
+
     def _sort_key(kv):
-        _, dets = kv
-        # Show TP_MALICIOUS_CANDIDATE first, then TP_HARDENING, then
-        # LIKELY_CONTROL_WORKING, then LIKELY_FP, then INCONCLUSIVE.
-        order = {
-            "TP_MALICIOUS_CANDIDATE":   0,
-            "TP_HARDENING":             1,
-            "LIKELY_CONTROL_WORKING":   2,
-            "LIKELY_FP":                3,
-            "INCONCLUSIVE":             4,
-        }
-        first_det = dets[0]
-        cat = _classify(first_det)
-        # Within the category, sort by severity (higher first).
-        sev_order = {"critical": 0, "high": 1, "warning": 2, "info": 3}
-        sev = str(first_det.get("severity", "")).lower()
-        return (order.get(cat, 99), sev_order.get(sev, 99))
+        (cat, summary_text, source), dets = kv
+        sev = str(dets[0].get("severity", "")).lower()
+        return (category_order.get(cat, 99), sev_order.get(sev, 99), summary_text, source)
 
     ordered = sorted(grouped.items(), key=_sort_key)
 
@@ -217,7 +217,7 @@ def summarize(detections: Iterable[Detection]) -> VerdictSummary:
                 category=cat,
                 summary=summary_text,
                 source=source,
-                count=sum(1 for _ in dets),
+                count=len(dets),
                 severity=str(head.get("severity", "")),
                 skeptical_rule=str(head.get("skeptical_rule", "") or ""),
                 hypothesis_relevance=relevance,

@@ -16,7 +16,7 @@ try:
 except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import memoize_analysis, packet_length, safe_float
 
 # --- Dataclasses ---
@@ -478,7 +478,12 @@ def _get_proto_name(
 
 
 @memoize_analysis
-def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
+def analyze_protocols(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> ProtocolSummary:
     if IP is None:
         return ProtocolSummary(
             path,
@@ -494,25 +499,6 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
             ["Scapy not available"],
         )
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as e:
-        return ProtocolSummary(
-            path,
-            0,
-            0,
-            ProtocolStat("Root"),
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            [f"Error opening pcap: {e}"],
-        )
-    size_bytes = size_bytes
 
     # Stats containers
     hierarchy = ProtocolStat("Root")
@@ -540,15 +526,7 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
     errors = []
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             pkt_idx += 1
             ts = safe_float(getattr(pkt, "time", 0))
             if start_ts is None:
@@ -946,9 +924,6 @@ def analyze_protocols(path: Path, show_status: bool = True) -> ProtocolSummary:
 
     except Exception as e:
         errors.append(str(e))
-    finally:
-        status.finish()
-        reader.close()
 
     duration = (end_ts - start_ts) if (start_ts and end_ts) else 0.0
 

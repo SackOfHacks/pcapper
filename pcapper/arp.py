@@ -8,26 +8,39 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import iter_packets
 from .utils import is_private_ip as _is_private_ipv4, memoize_analysis, safe_float
 
 try:
-    from scapy.layers.l2 import ARP, Ether  # type: ignore
-    from scapy.packet import Raw  # type: ignore
+    from scapy.layers.l2 import ARP  # type: ignore
 except Exception:
-    ARP = Ether = Raw = None  # type: ignore
+    ARP = None  # type: ignore
 
 
 _FILENAME_RE = re.compile(
     r"[\w\-.()\[\] ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|txt|bat|ps1|jpg|jpeg|png|gif|iso|img|tar|gz|7z|rar)",
     re.IGNORECASE,
 )
+_PRINTABLE_RUN_RE = re.compile(r"[ -~]{6,}")
 
 _VIRTUAL_MAC_PREFIXES = (
     "00:00:5e:00:01",  # VRRP
     "00:00:5e:00:02",  # CARP
     "00:00:0c:07:ac",  # HSRP
 )
+_OPCODE_NAMES = {
+    1: "Request",
+    2: "Reply",
+    3: "RARP Request",
+    4: "RARP Reply",
+    8: "InARP Request",
+    9: "InARP Reply",
+}
+_ZERO_MAC = "00:00:00:00:00:00"
+_BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
+# Outstanding requests remembered per (requester, target) for reply-latency
+# measurement; a sweep that never gets answers must not grow without bound.
+_MAX_PENDING_REQUESTS_PER_PAIR = 64
 
 
 @dataclass
@@ -116,15 +129,7 @@ class ArpSummary:
 
 
 def _opcode_name(op: int) -> str:
-    mapping = {
-        1: "Request",
-        2: "Reply",
-        3: "RARP Request",
-        4: "RARP Reply",
-        8: "InARP Request",
-        9: "InARP Reply",
-    }
-    return mapping.get(op, f"Opcode {op}")
+    return _OPCODE_NAMES.get(op, f"Opcode {op}")
 
 
 def _version_label(hwtype: int, ptype: int) -> str:
@@ -135,18 +140,26 @@ def _version_label(hwtype: int, ptype: int) -> str:
     return f"hw={hwtype},ptype=0x{ptype:04x}"
 
 
-def _extract_payload_strings(pkt: object) -> list[str]:
-    payload_bytes = b""
-    if Raw is not None and hasattr(pkt, "haslayer") and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-        try:
-            payload_bytes = bytes(pkt[Raw].load)  # type: ignore[index]
-        except Exception:
-            payload_bytes = b""
-    if not payload_bytes:
+def _extract_trailer_strings(arp_layer: object) -> list[str]:
+    """Printable runs in the bytes that follow the 28-byte ARP body.
+
+    A minimum-size Ethernet frame pads an ARP with 18 bytes; scapy exposes
+    them as ``Padding`` (never ``Raw``). Real padding is zeros, so anything
+    printable here is either driver buffer leakage (Etherleak,
+    CVE-2003-0001) or data deliberately hidden in a frame no IDS parses.
+    """
+    trailer = getattr(arp_layer, "payload", None)
+    if trailer is None:
         return []
-    text = payload_bytes.decode("latin-1", errors="ignore")
+    try:
+        trailer_bytes = bytes(trailer)
+    except Exception:
+        return []
+    if not trailer_bytes or not trailer_bytes.strip(b"\x00"):
+        return []
+    text = trailer_bytes.decode("latin-1", errors="ignore")
     tokens = []
-    for token in re.findall(r"[ -~]{6,}", text):
+    for token in _PRINTABLE_RUN_RE.findall(text):
         cleaned = " ".join(token.split())
         if cleaned:
             tokens.append(cleaned[:96])
@@ -176,6 +189,13 @@ def _mad(values: list[float], center: float) -> float:
     return _median([abs(v - center) for v in values])
 
 
+def _percentile(values: list[float], fraction: float) -> float:
+    """Nearest-rank percentile (``fraction`` in 0..1) of a non-empty list."""
+    ordered = sorted(values)
+    index = math.ceil(len(ordered) * fraction) - 1
+    return ordered[max(0, min(len(ordered) - 1, index))]
+
+
 def _is_virtual_mac(mac: str) -> bool:
     lower = (mac or "").lower()
     return any(lower.startswith(prefix) for prefix in _VIRTUAL_MAC_PREFIXES)
@@ -191,16 +211,6 @@ def analyze_arp(
     if ARP is None:
         return ArpSummary(path=path, errors=["Scapy unavailable (ARP layer missing)"])
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path,
-            show_status=show_status,
-            packets=packets,
-            meta=meta,
-        )
-    except Exception as exc:
-        return ArpSummary(path=path, errors=[f"Error opening pcap: {exc}"])
-
     summary = ArpSummary(path=path)
     start_ts: Optional[float] = None
     end_ts: Optional[float] = None
@@ -210,7 +220,9 @@ def analyze_arp(
     req_pairs: Counter[tuple[str, str]] = Counter()
     reply_pairs: Counter[tuple[str, str]] = Counter()
     request_targets: dict[str, set[str]] = defaultdict(set)
-    request_times: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+    request_times: dict[tuple[str, str], deque[float]] = defaultdict(
+        lambda: deque(maxlen=_MAX_PENDING_REQUESTS_PER_PAIR)
+    )
     reply_latencies_by_responder: dict[str, list[float]] = defaultdict(list)
     unsolicited_by_src_ip: Counter[str] = Counter()
     unsolicited_by_src_mac: Counter[str] = Counter()
@@ -244,158 +256,162 @@ def analyze_arp(
         "likely_benign_failover": [],
     }
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-            summary.total_packets += 1
-            if not hasattr(pkt, "haslayer") or not pkt.haslayer(ARP):  # type: ignore[truthy-bool]
-                continue
+    def _process(pkt: object) -> None:
+        nonlocal start_ts, end_ts
+        arp_layer = pkt.getlayer(ARP)  # type: ignore[attr-defined]
+        if arp_layer is None:
+            return
 
-            summary.arp_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if start_ts is None or ts < start_ts:
-                    start_ts = ts
-                if end_ts is None or ts > end_ts:
-                    end_ts = ts
-                arp_packets_by_second[int(ts)] += 1
+        summary.arp_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
+        if ts is not None:
+            if start_ts is None or ts < start_ts:
+                start_ts = ts
+            if end_ts is None or ts > end_ts:
+                end_ts = ts
+            arp_packets_by_second[int(ts)] += 1
 
-            arp_layer = pkt[ARP]  # type: ignore[index]
-            op = int(getattr(arp_layer, "op", 0) or 0)
-            opcode_name = _opcode_name(op)
-            src_ip = str(getattr(arp_layer, "psrc", "0.0.0.0") or "0.0.0.0")
-            dst_ip = str(getattr(arp_layer, "pdst", "0.0.0.0") or "0.0.0.0")
-            src_mac = str(
-                getattr(arp_layer, "hwsrc", "00:00:00:00:00:00") or "00:00:00:00:00:00"
+        op = int(getattr(arp_layer, "op", 0) or 0)
+        opcode_name = _opcode_name(op)
+        src_ip = str(getattr(arp_layer, "psrc", "0.0.0.0") or "0.0.0.0")
+        dst_ip = str(getattr(arp_layer, "pdst", "0.0.0.0") or "0.0.0.0")
+        src_mac = str(getattr(arp_layer, "hwsrc", _ZERO_MAC) or _ZERO_MAC)
+        dst_mac = str(getattr(arp_layer, "hwdst", _ZERO_MAC) or _ZERO_MAC)
+        hwtype = int(getattr(arp_layer, "hwtype", 0) or 0)
+        ptype = int(getattr(arp_layer, "ptype", 0) or 0)
+        version = _version_label(hwtype, ptype)
+
+
+        summary.src_ips[src_ip] += 1
+        summary.dst_ips[dst_ip] += 1
+        summary.src_macs[src_mac] += 1
+        summary.dst_macs[dst_mac] += 1
+        summary.opcode_counts[opcode_name] += 1
+        if ts is not None:
+            if src_ip not in src_first_seen:
+                src_first_seen[src_ip] = ts
+            if src_mac not in mac_first_seen:
+                mac_first_seen[src_mac] = ts
+
+        key = (src_ip, dst_ip, src_mac, dst_mac, opcode_name)
+        convo = conversations.get(key)
+        if convo is None:
+            convo = ArpConversation(
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                src_mac=src_mac,
+                dst_mac=dst_mac,
+                opcode=opcode_name,
             )
-            dst_mac = str(
-                getattr(arp_layer, "hwdst", "00:00:00:00:00:00") or "00:00:00:00:00:00"
-            )
-            hwtype = int(getattr(arp_layer, "hwtype", 0) or 0)
-            ptype = int(getattr(arp_layer, "ptype", 0) or 0)
-            version = _version_label(hwtype, ptype)
+            conversations[key] = convo
+        convo.packets += 1
+        if ts is not None:
+            if convo.first_seen is None or ts < convo.first_seen:
+                convo.first_seen = ts
+            if convo.last_seen is None or ts > convo.last_seen:
+                convo.last_seen = ts
 
-            summary.src_ips[src_ip] += 1
-            summary.dst_ips[dst_ip] += 1
-            summary.src_macs[src_mac] += 1
-            summary.dst_macs[dst_mac] += 1
-            summary.opcode_counts[opcode_name] += 1
-            if ts is not None:
-                if src_ip not in src_first_seen:
-                    src_first_seen[src_ip] = ts
-                if src_mac not in mac_first_seen:
-                    mac_first_seen[src_mac] = ts
+        ip_to_macs[src_ip].add(src_mac)
+        mac_to_ips[src_mac].add(src_ip)
+        if op == 2:
+            replies_by_ip_mac[src_ip][src_mac] += 1
+            reply_dst_targets_by_mac[src_mac].add(dst_ip)
+            reply_dst_targets_by_ip[src_ip].add(dst_ip)
 
-            key = (src_ip, dst_ip, src_mac, dst_mac, opcode_name)
-            convo = conversations.get(key)
-            if convo is None:
-                convo = ArpConversation(
-                    src_ip=src_ip,
-                    dst_ip=dst_ip,
-                    src_mac=src_mac,
-                    dst_mac=dst_mac,
-                    opcode=opcode_name,
-                )
-                conversations[key] = convo
-            convo.packets += 1
-            if ts is not None:
-                if convo.first_seen is None or ts < convo.first_seen:
-                    convo.first_seen = ts
-                if convo.last_seen is None or ts > convo.last_seen:
-                    convo.last_seen = ts
-
-            ip_to_macs[src_ip].add(src_mac)
-            mac_to_ips[src_mac].add(src_ip)
-            if op == 2:
-                replies_by_ip_mac[src_ip][src_mac] += 1
-                reply_dst_targets_by_mac[src_mac].add(dst_ip)
-                reply_dst_targets_by_ip[src_ip].add(dst_ip)
-
-            if op == 1:
-                summary.arp_requests += 1
-                summary.request_summary["Request"] += 1
-                summary.client_details[src_ip] += 1
-                summary.client_versions[version] += 1
-                req_pairs[(src_ip, dst_ip)] += 1
-                if dst_ip != "0.0.0.0":
-                    request_targets[src_ip].add(dst_ip)
-                    if ts is not None:
-                        request_times[(src_ip, dst_ip)].append(ts)
-                if src_ip == dst_ip:
-                    summary.gratuitous_arp += 1
-                    summary.request_summary["Gratuitous Request"] += 1
-                if src_ip == "0.0.0.0":
-                    summary.arp_probes += 1
-                    summary.request_summary["Probe"] += 1
-                    probes_by_src_mac[src_mac] += 1
-                    if dst_ip != "0.0.0.0":
-                        probe_targets_by_src_mac[src_mac].add(dst_ip)
-            elif op == 2:
-                summary.arp_replies += 1
-                summary.response_codes["Reply"] += 1
-                summary.server_details[src_ip] += 1
-                summary.server_versions[version] += 1
-                reply_pairs[(src_ip, dst_ip)] += 1
-                if src_ip == dst_ip:
-                    summary.gratuitous_arp += 1
-                    summary.response_codes["Gratuitous Reply"] += 1
-                if req_pairs.get((dst_ip, src_ip), 0) == 0:
-                    summary.unsolicited_replies += 1
-                    unsolicited_by_src_ip[src_ip] += 1
-                    unsolicited_by_src_mac[src_mac] += 1
-                    summary.response_codes["Unsolicited Reply"] += 1
-                    if dst_mac.lower() == "ff:ff:ff:ff:ff:ff":
-                        unsolicited_to_broadcast_by_src_mac[src_mac] += 1
-                elif ts is not None:
-                    pending = request_times.get((dst_ip, src_ip))
-                    if pending:
-                        req_ts = pending.popleft()
-                        if ts >= req_ts:
-                            reply_latencies_by_responder[src_ip].append(ts - req_ts)
+        if op == 1:
+            summary.arp_requests += 1
+            summary.request_summary["Request"] += 1
+            summary.client_details[src_ip] += 1
+            summary.client_versions[version] += 1
+            req_pairs[(src_ip, dst_ip)] += 1
+            if dst_ip != "0.0.0.0":
+                request_targets[src_ip].add(dst_ip)
                 if ts is not None:
-                    ip_mac_reply_timeline[src_ip].append((ts, src_mac))
-            else:
-                summary.response_codes[opcode_name] += 1
-
-            if op == 1:
-                session_key = (src_ip, dst_ip)
-            elif op == 2:
-                session_key = (dst_ip, src_ip)
-            else:
-                session_key = (dst_ip, src_ip)
-            session = sessions.get(session_key)
-            if session is None:
-                session = ArpSession(client_ip=session_key[0], server_ip=session_key[1])
-                sessions[session_key] = session
-            if op == 1:
-                session.requests += 1
-            elif op == 2:
-                session.replies += 1
+                    request_times[(src_ip, dst_ip)].append(ts)
+            if src_ip == dst_ip:
+                summary.gratuitous_arp += 1
+                summary.request_summary["Gratuitous Request"] += 1
+            if src_ip == "0.0.0.0":
+                summary.arp_probes += 1
+                summary.request_summary["Probe"] += 1
+                probes_by_src_mac[src_mac] += 1
+                if dst_ip != "0.0.0.0":
+                    probe_targets_by_src_mac[src_mac].add(dst_ip)
+        elif op == 2:
+            summary.arp_replies += 1
+            summary.response_codes["Reply"] += 1
+            summary.server_details[src_ip] += 1
+            summary.server_versions[version] += 1
+            reply_pairs[(src_ip, dst_ip)] += 1
+            if src_ip == dst_ip:
+                summary.gratuitous_arp += 1
+                summary.response_codes["Gratuitous Reply"] += 1
+            if req_pairs.get((dst_ip, src_ip), 0) == 0:
+                summary.unsolicited_replies += 1
+                unsolicited_by_src_ip[src_ip] += 1
+                unsolicited_by_src_mac[src_mac] += 1
+                summary.response_codes["Unsolicited Reply"] += 1
+                if dst_mac.lower() == _BROADCAST_MAC:
+                    unsolicited_to_broadcast_by_src_mac[src_mac] += 1
+            elif ts is not None:
+                pending = request_times.get((dst_ip, src_ip))
+                if pending:
+                    req_ts = pending.popleft()
+                    if ts >= req_ts:
+                        reply_latencies_by_responder[src_ip].append(ts - req_ts)
             if ts is not None:
-                if session.first_seen is None or ts < session.first_seen:
-                    session.first_seen = ts
-                if session.last_seen is None or ts > session.last_seen:
-                    session.last_seen = ts
+                # Only MAC *changes* matter to the gateway-flip check, so
+                # store the run-length sequence instead of every reply.
+                timeline = ip_mac_reply_timeline[src_ip]
+                if not timeline or timeline[-1][1] != src_mac:
+                    timeline.append((ts, src_mac))
+        else:
+            summary.response_codes[opcode_name] += 1
 
-            strings = _extract_payload_strings(pkt)
-            for token in strings:
-                plain[token] += 1
-            files.update(_extract_filenames(strings))
+        if op == 1:
+            session_key = (src_ip, dst_ip)
+        elif op == 2:
+            session_key = (dst_ip, src_ip)
+        else:
+            session_key = (dst_ip, src_ip)
+        session = sessions.get(session_key)
+        if session is None:
+            session = ArpSession(client_ip=session_key[0], server_ip=session_key[1])
+            sessions[session_key] = session
+        if op == 1:
+            session.requests += 1
+        elif op == 2:
+            session.replies += 1
+        if ts is not None:
+            if session.first_seen is None or ts < session.first_seen:
+                session.first_seen = ts
+            if session.last_seen is None or ts > session.last_seen:
+                session.last_seen = ts
 
+        strings = _extract_trailer_strings(arp_layer)
+        for token in strings:
+            plain[token] += 1
+        files.update(_extract_filenames(strings))
+
+    try:
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+            summary.total_packets += 1
+            try:
+                _process(pkt)
+            except Exception as exc:  # noqa: BLE001 — one malformed frame must not end the pass
+                skipped_packets += 1
+                if first_skip_error is None:
+                    first_skip_error = f"{type(exc).__name__}: {exc}"
     except Exception as exc:
-        summary.errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
+        summary.errors.append(f"Error reading pcap: {type(exc).__name__}: {exc}")
+    if skipped_packets:
+        summary.errors.append(
+            f"{skipped_packets} ARP frame(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     if start_ts is not None and end_ts is not None:
         summary.duration = max(0.0, end_ts - start_ts)
@@ -424,17 +440,7 @@ def analyze_arp(
     if latency_values:
         summary.reply_latency_summary = {
             "median_s": _median(latency_values),
-            "p95_s": sorted(latency_values)[
-                int(
-                    max(
-                        0,
-                        min(
-                            len(latency_values) - 1,
-                            math.ceil(len(latency_values) * 0.95) - 1,
-                        ),
-                    )
-                )
-            ],
+            "p95_s": _percentile(latency_values, 0.95),
             "samples": float(len(latency_values)),
         }
     if arp_packets_by_second:

@@ -9,6 +9,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass
@@ -17,15 +18,18 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from .device_detection import append_device_fingerprints, device_fingerprints_from_text
-from .pcap_cache import PcapMeta, get_reader
+from .dns import vt_lookup_candidate
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     counter_inc,
     decode_payload,
     detect_file_type_bytes,
+    env_int,
     extract_packet_endpoints,
     memoize_analysis,
     safe_float,
     set_add_cap,
+    setdict_add,
 )
 
 try:
@@ -49,7 +53,37 @@ HTTP_METHODS = {
     "PATCH",
     "TRACE",
     "CONNECT",
+    # WebDAV (RFC 4918/3253/5323). The method-misuse detection below tests
+    # for PROPFIND, which could never fire while the verb was not parsed.
+    "PROPFIND",
+    "PROPPATCH",
+    "MKCOL",
+    "COPY",
+    "MOVE",
+    "LOCK",
+    "UNLOCK",
+    "REPORT",
+    "SEARCH",
 }
+# Cheap gate applied to the first bytes of a TCP payload before any decoding:
+# an HTTP request start line or a status line. Everything else in the capture
+# (TLS, SMB, RDP, ...) is skipped without being UTF-8 decoded and split.
+_HTTP_START_RE = re.compile(
+    rb"^(?:" + b"|".join(sorted(m.encode() for m in HTTP_METHODS)) + rb") \S"
+    rb"|^HTTP/\S+ \d"
+)
+_URI_SPLIT_RE = re.compile(r"[/?&=]")
+_HAS_ALPHA_RE = re.compile(r"[A-Za-z]")
+_HAS_DIGIT_RE = re.compile(r"\d")
+_IPV4_LITERAL_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
+_TOKEN_RE = re.compile(
+    r"(?i)(session|sessid|jsessionid|phpsessid|token|auth|sid)=([A-Za-z0-9._-]{6,})"
+)
+_FILENAME_DISPOSITION_RE = re.compile(r"filename=\"?([^\";]+)", re.IGNORECASE)
+_EXTENSIONLESS_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{16,}")
+# Bounded per-entity sample lists; see the DNS analyzer for the same pattern.
+_MAX_CHANNEL_TIMES = 512
+_MAX_POST_PAYLOADS = 2000
 SUSPICIOUS_UA = (
     "sqlmap",
     "nikto",
@@ -121,26 +155,15 @@ COMMON_AUTH_SCHEMES = {
     "AWS4-HMAC-SHA256",
 }
 
-MAX_HTTP_UNIQUE = int(os.getenv("PCAPPER_MAX_HTTP_UNIQUE", "50000"))
-MAX_HTTP_CONVERSATIONS = int(os.getenv("PCAPPER_MAX_HTTP_CONVERSATIONS", "50000"))
-MAX_HTTP_PENDING = int(os.getenv("PCAPPER_MAX_HTTP_PENDING", "200"))
-MIN_HTTP_DOWNLOAD_BYTES = int(os.getenv("PCAPPER_MIN_HTTP_DOWNLOAD_BYTES", "512"))
-MAX_HTTP_DETECTION_EVIDENCE = int(
-    os.getenv("PCAPPER_MAX_HTTP_DETECTION_EVIDENCE", "12")
-)
-MAX_VT_CACHE = int(os.getenv("PCAPPER_VT_CACHE_SIZE", "2048"))
-MAX_VT_LOOKUPS = int(os.getenv("PCAPPER_VT_MAX_LOOKUPS", "500"))
-VT_TIMEOUT = float(os.getenv("PCAPPER_VT_TIMEOUT", "8"))
-
-INTERNAL_TLDS = {
-    "local",
-    "lan",
-    "localdomain",
-    "home",
-    "corp",
-    "internal",
-    "intranet",
-}
+MAX_HTTP_UNIQUE = env_int("PCAPPER_MAX_HTTP_UNIQUE", 50000, minimum=1)
+MAX_HTTP_CONVERSATIONS = env_int("PCAPPER_MAX_HTTP_CONVERSATIONS", 50000, minimum=1)
+MAX_HTTP_PENDING = env_int("PCAPPER_MAX_HTTP_PENDING", 200, minimum=1)
+MIN_HTTP_DOWNLOAD_BYTES = env_int("PCAPPER_MIN_HTTP_DOWNLOAD_BYTES", 512, minimum=0)
+MAX_HTTP_DETECTION_EVIDENCE = env_int("PCAPPER_MAX_HTTP_DETECTION_EVIDENCE", 12, minimum=1)
+MAX_VT_CACHE = env_int("PCAPPER_VT_CACHE_SIZE", 2048, minimum=1)
+MAX_VT_LOOKUPS = env_int("PCAPPER_VT_MAX_LOOKUPS", 500)
+VT_TIMEOUT = float(env_int("PCAPPER_VT_TIMEOUT", 8, minimum=1))
+VT_BUDGET_SECONDS = float(env_int("PCAPPER_VT_BUDGET_SECONDS", 120, minimum=1))
 
 _VT_CACHE: "OrderedDict[str, dict[str, object]]" = OrderedDict()
 
@@ -319,7 +342,7 @@ def _parse_referrer(referrer: str) -> tuple[str, str, str]:
 
 def _extract_filename(headers: dict[str, str], uri: str) -> Optional[str]:
     content_disp = headers.get("content-disposition", "")
-    match = re.search(r"filename=\"?([^\";]+)", content_disp, re.IGNORECASE)
+    match = _FILENAME_DISPOSITION_RE.search(content_disp)
     if match:
         return match.group(1)
     if "/" in uri:
@@ -328,7 +351,7 @@ def _extract_filename(headers: dict[str, str], uri: str) -> Optional[str]:
             return name
         # Malware delivery paths are sometimes extensionless random-like tokens.
         # Keep strict bounds to avoid normal endpoint path noise.
-        if len(name) >= 24 and re.fullmatch(r"[A-Za-z0-9_-]{16,}", name):
+        if len(name) >= 24 and _EXTENSIONLESS_TOKEN_RE.fullmatch(name):
             return name
     return None
 
@@ -374,14 +397,7 @@ def _expected_type_from_filename(
 
 
 def _extract_tokens(text: str) -> list[str]:
-    tokens: list[str] = []
-    patterns = [
-        r"(?i)(session|sessid|jsessionid|phpsessid|token|auth|sid)=([A-Za-z0-9._-]{6,})",
-    ]
-    for pattern in patterns:
-        for match in re.finditer(pattern, text):
-            tokens.append(match.group(0))
-    return tokens
+    return [match.group(0) for match in _TOKEN_RE.finditer(text)]
 
 
 def _token_fingerprint(token: str) -> str:
@@ -420,21 +436,6 @@ def _parse_content_length(headers: dict[str, str]) -> Optional[int]:
     return length
 
 
-def _is_internal_host(host: str) -> bool:
-    if not host:
-        return True
-    host = host.strip(".")
-    if not host or "." not in host:
-        return True
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except Exception:
-        pass
-    tld = host.rsplit(".", 1)[-1].lower()
-    return tld in INTERNAL_TLDS
-
-
 def _vt_url_id(url: str) -> str:
     return (
         base64.urlsafe_b64encode(url.encode("utf-8", errors="ignore"))
@@ -446,7 +447,8 @@ def _vt_url_id(url: str) -> str:
 def _vt_lookup_domain(
     domain: str, api_key: str
 ) -> tuple[Optional[dict[str, object]], Optional[str]]:
-    vt_url = f"https://www.virustotal.com/api/v3/domains/{domain}"
+    # Wire-derived name: percent-encode so it cannot rewrite the request path.
+    vt_url = "https://www.virustotal.com/api/v3/domains/" + urllib.parse.quote(domain, safe="")
     headers = {"x-apikey": api_key}
     req = urllib.request.Request(vt_url, headers=headers)
     try:
@@ -518,34 +520,70 @@ def _vt_lookup_url(
     return result, None
 
 
+def _vt_target_allowed(kind: str, target: str) -> bool:
+    """Only public hostnames — and URLs on public hostnames — leave the box."""
+    if kind == "url":
+        host = (_safe_urlparse(target).hostname or "").lower()
+        return bool(host) and vt_lookup_candidate(host)
+    return vt_lookup_candidate(target)
+
+
 def _vt_lookup_targets(
-    targets: list[tuple[str, str]], api_key: str
+    targets: list[tuple[str, str]],
+    api_key: str,
+    *,
+    lookup_domain=None,
+    lookup_url=None,
+    budget_seconds: float | None = None,
 ) -> tuple[list[dict[str, object]], list[str]]:
+    """Look up ``(kind, target)`` pairs until the count cap or the time budget.
+
+    Internal / non-public targets are withheld and counted, never sent.
+    ``lookup_domain``/``lookup_url``/``budget_seconds`` are injectable for tests.
+    """
     results: list[dict[str, object]] = []
     errors: list[str] = []
     if not targets:
         return results, errors
+    lookup_domain = lookup_domain or _vt_lookup_domain
+    lookup_url = lookup_url or _vt_lookup_url
+    budget = VT_BUDGET_SECONDS if budget_seconds is None else budget_seconds
 
     max_lookups = MAX_VT_LOOKUPS
     if max_lookups <= 0:
         max_lookups = len(targets)
 
-    for idx, (kind, target) in enumerate(targets):
-        if idx >= max_lookups:
-            errors.append(
-                f"VT lookups capped at {max_lookups} targets (set PCAPPER_VT_MAX_LOOKUPS to raise)."
-            )
-            break
+    allowed = [(kind, target) for kind, target in targets if _vt_target_allowed(kind, target)]
+    withheld = len(targets) - len(allowed)
+    if withheld:
+        errors.append(
+            f"VT: {withheld} internal/non-public target(s) withheld from lookup "
+            "(local TLDs, IP-literal and single-label hosts are never sent)."
+        )
+    if len(allowed) > max_lookups:
+        errors.append(
+            f"VT lookups capped at {max_lookups} targets (set PCAPPER_VT_MAX_LOOKUPS to raise)."
+        )
+        allowed = allowed[:max_lookups]
+
+    started = time.monotonic()
+    for idx, (kind, target) in enumerate(allowed):
         key = f"{kind}:{target}"
         cached = _VT_CACHE.get(key)
         if cached is not None:
             _VT_CACHE.move_to_end(key)
             results.append(cached)
             continue
+        if time.monotonic() - started > budget:
+            errors.append(
+                f"VT time budget of {budget:.0f}s spent after {idx}/{len(allowed)} "
+                "lookups; remaining targets not looked up (PCAPPER_VT_BUDGET_SECONDS)."
+            )
+            break
         if kind == "url":
-            vt_result, err = _vt_lookup_url(target, api_key)
+            vt_result, err = lookup_url(target, api_key)
         else:
-            vt_result, err = _vt_lookup_domain(target, api_key)
+            vt_result, err = lookup_domain(target, api_key)
         if vt_result:
             results.append(vt_result)
             _VT_CACHE[key] = vt_result
@@ -553,7 +591,7 @@ def _vt_lookup_targets(
                 _VT_CACHE.popitem(last=False)
         if err:
             errors.append(err)
-        if idx > 0:
+        if idx + 1 < len(allowed):
             time.sleep(0.05)
     return results, errors
 
@@ -640,10 +678,6 @@ def analyze_http(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
-
     total_packets = 0
     total_bytes = 0
     total_requests = 0
@@ -706,9 +740,6 @@ def analyze_http(
     request_channel_times: dict[tuple[str, str, str, str, str], list[float]] = (
         defaultdict(list)
     )
-    request_channel_sizes: dict[tuple[str, str, str, str, str], list[int]] = (
-        defaultdict(list)
-    )
     suspicious_exec_uri_hits: Counter[str] = Counter()
     token_to_sources: dict[str, set[str]] = defaultdict(set)
     source_to_hosts: dict[str, set[str]] = defaultdict(set)
@@ -745,27 +776,31 @@ def analyze_http(
     hostname_token = str(hostname_query or "").strip().lower()
     search_token = str(search_query or "").strip().lower()
     port_filter_value = int(port_filter) if isinstance(port_filter, int) else None
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-    try:
-        for pkt_index, pkt in enumerate(reader, start=1):
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    for pkt_index, pkt in enumerate(
+        iter_packets(path, packets=packets, meta=meta, show_status=show_status), start=1
+    ):
+        total_packets += 1
+        pkt_len = packet_length(pkt)
+        total_bytes += pkt_len
 
-            total_packets += 1
-            pkt_len = packet_length(pkt)
-            total_bytes += pkt_len
-
-            if TCP is None or Raw is None:
-                continue
-            if not pkt.haslayer(TCP) or not pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                continue
-
-            tcp_layer = pkt[TCP]  # type: ignore[index]
+        if TCP is None or Raw is None:
+            continue
+        tcp_layer = pkt.getlayer(TCP)  # type: ignore[arg-type]
+        if tcp_layer is None:
+            continue
+        raw_layer = tcp_layer.getlayer(Raw)
+        if raw_layer is None:
+            continue
+        payload = bytes(raw_layer)
+        # Start-line gate before any decoding: the vast majority of TCP
+        # payloads in a capture are not HTTP and used to be UTF-8 decoded
+        # and CRLF-split anyway.
+        if not payload or not _HTTP_START_RE.match(payload[:64]):
+            continue
+        try:
             sport = getattr(tcp_layer, "sport", None)
             dport = getattr(tcp_layer, "dport", None)
             if sport is None or dport is None:
@@ -783,10 +818,6 @@ def analyze_http(
                 and int(sport) != port_filter_value
                 and int(dport) != port_filter_value
             ):
-                continue
-
-            payload = bytes(pkt[Raw])
-            if not payload:
                 continue
 
             text = decode_payload(payload, encoding="utf-8", limit=8192)
@@ -839,15 +870,16 @@ def analyze_http(
 
                     source_requests[src_ip] += 1
                     if host_norm:
-                        source_to_hosts[src_ip].add(host_norm)
-                    source_to_urls[src_ip].add(url)
+                        setdict_add(source_to_hosts, src_ip, host_norm)
+                    setdict_add(source_to_urls, src_ip, url)
                     if uri:
-                        uri_to_targets[uri].add(dst_ip)
+                        setdict_add(uri_to_targets, uri, dst_ip)
 
                     channel_key = (src_ip, dst_ip, host_norm or host, uri, method)
                     if ts is not None:
-                        request_channel_times[channel_key].append(ts)
-                    request_channel_sizes[channel_key].append(pkt_len)
+                        channel_times = request_channel_times[channel_key]
+                        if len(channel_times) < _MAX_CHANNEL_TIMES:
+                            channel_times.append(ts)
 
                     auth_header = headers.get("authorization", "")
                     if auth_header:
@@ -892,24 +924,24 @@ def analyze_http(
                         + _extract_tokens(auth_header)
                     ):
                         token_fp = _token_fingerprint(raw_token)
-                        token_to_sources[token_fp].add(src_ip)
+                        setdict_add(token_to_sources, token_fp, src_ip)
 
                     if host_norm:
                         try:
                             host_ip = ipaddress.ip_address(host_norm)
-                            if host_ip and host_norm != dst_ip:
-                                _append_evidence(
-                                    host_header_anomaly_evidence,
-                                    {
-                                        "packet": pkt_index,
-                                        "src": src_ip,
-                                        "dst": dst_ip,
-                                        "host": host_norm,
-                                        "uri": uri,
-                                    },
-                                )
-                        except Exception:
-                            pass
+                        except ValueError:
+                            host_ip = None  # a hostname, not an IP literal
+                        if host_ip is not None and host_norm != dst_ip:
+                            _append_evidence(
+                                host_header_anomaly_evidence,
+                                {
+                                    "packet": pkt_index,
+                                    "src": src_ip,
+                                    "dst": dst_ip,
+                                    "host": host_norm,
+                                    "uri": uri,
+                                },
+                            )
 
                     if SUSPICIOUS_URI_RE.search(uri_lc):
                         suspicious_exec_uri_hits[uri] += 1
@@ -925,13 +957,11 @@ def analyze_http(
                             },
                         )
 
-                    for chunk in re.split(r"[/?&=]", uri):
+                    for chunk in _URI_SPLIT_RE.split(uri):
                         token = chunk.strip()
                         if len(token) < 24:
                             continue
-                        if not re.search(r"[A-Za-z]", token) or not re.search(
-                            r"\d", token
-                        ):
+                        if not _HAS_ALPHA_RE.search(token) or not _HAS_DIGIT_RE.search(token):
                             continue
                         entropy = _shannon_entropy(token)
                         if entropy >= 3.9:
@@ -988,10 +1018,7 @@ def analyze_http(
                             counter_inc(referrer_scheme_counts, scheme)
                         if ref_host:
                             counter_inc(referrer_host_counts, ref_host)
-                            if (
-                                re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ref_host)
-                                or ":" in ref_host
-                            ):
+                            if _IPV4_LITERAL_RE.fullmatch(ref_host) or ":" in ref_host:
                                 counter_inc(referrer_ip_hosts, ref_host)
                                 _append_evidence(
                                     referrer_ip_evidence,
@@ -1176,7 +1203,7 @@ def analyze_http(
                         body = b""
                         if b"\r\n\r\n" in payload:
                             body = payload.split(b"\r\n\r\n", 1)[1]
-                        if body:
+                        if body and len(post_payloads) < _MAX_POST_PAYLOADS:
                             content_length = headers.get("content-length", "")
                             content_type = headers.get("content-type", "")
                             sample = body[:160]
@@ -1362,7 +1389,7 @@ def analyze_http(
                         for token in tokens:
                             token_fp = _token_fingerprint(token)
                             counter_inc(session_tokens, token_fp)
-                            token_to_sources[token_fp].add(dst_ip)
+                            setdict_add(token_to_sources, token_fp, dst_ip)
 
                     conv_key = (dst_ip, src_ip)
                     conv = None
@@ -1452,13 +1479,19 @@ def analyze_http(
                                     "packet": pkt_index,
                                 }
                             )
-    finally:
-        status.finish()
-        reader.close()
+        except Exception as exc:  # noqa: BLE001 — one malformed message must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} HTTP message(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
     if skipped_conversations:
         errors.append(
             f"HTTP conversation cap reached; {skipped_conversations} updates skipped."
@@ -1810,7 +1843,7 @@ def analyze_http(
         _append_detection(
             "warning",
             "Web shell-like HTTP request patterns",
-            ", ".join(_truncate for _truncate in webshell_uri_hits[:6]),
+            ", ".join(webshell_uri_hits[:6]),
             evidence=webshell_evidence,
             artifacts=webshell_uri_hits[:10],
         )
@@ -2077,21 +2110,17 @@ def analyze_http(
             errors.append("VT_API_KEY is not set; skipping VirusTotal lookups.")
         else:
             target_counts: dict[tuple[str, str], int] = {}
+            # Non-public hosts (local TLDs, IP literals, single labels) are
+            # dropped here silently; _vt_lookup_targets re-checks and reports.
             for host, count in host_counts.items():
                 host_key = host.lower().split(":", 1)[0]
-                if not host_key or _is_internal_host(host_key):
+                if not vt_lookup_candidate(host_key):
                     continue
                 target_counts[("domain", host_key)] = target_counts.get(
                     ("domain", host_key), 0
                 ) + int(count)
             for url, count in url_counts.items():
-                if not url:
-                    continue
-                parsed = _safe_urlparse(url)
-                host = (parsed.hostname or "").lower()
-                if host and _is_internal_host(host):
-                    continue
-                if not parsed.hostname:
+                if not url or not _vt_target_allowed("url", url):
                     continue
                 target_counts[("url", url)] = target_counts.get(("url", url), 0) + int(
                     count

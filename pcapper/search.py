@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import PcapMeta, get_reader
-from .utils import decode_payload, safe_float, extract_packet_endpoints, get_packet_ports as _get_ports
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import get_packet_ports as _get_ports
+from .utils import decode_payload, extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -112,6 +113,7 @@ def _find_match(payload: bytes, query: str, *, case_sensitive: bool) -> Optional
     return None
 
 
+@memoize_analysis
 def analyze_search(
     path: Path,
     query: str,
@@ -127,14 +129,6 @@ def analyze_search(
     if TCP is None and UDP is None and Raw is None:
         return SearchSummary(path, query, 0, 0, [], False, ["Scapy not available"])
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, packets=packets, meta=meta, show_status=show_status
-        )
-    except Exception as exc:
-        return SearchSummary(
-            path, query, 0, 0, [], False, [f"Error opening pcap: {exc}"]
-        )
 
     total_packets = 0
     matches = 0
@@ -142,16 +136,8 @@ def analyze_search(
     errors: list[str] = []
 
     try:
-        for pkt in reader:
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
-
-            if status.enabled and stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
 
             payload = _extract_payload(pkt)  # type: ignore[arg-type]
             if not payload:
@@ -184,12 +170,6 @@ def analyze_search(
             )
     except Exception as exc:
         errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
 
     truncated = matches > len(hits)
     return SearchSummary(path, query, total_packets, matches, hits, truncated, errors)

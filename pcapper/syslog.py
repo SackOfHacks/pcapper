@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover
 SYSLOG_UDP_PORTS = {514, 5514}
 SYSLOG_TCP_PORTS = {514, 601, 6514}
 SYSLOG_PORTS = SYSLOG_UDP_PORTS | SYSLOG_TCP_PORTS
+_PRI_RE = re.compile(rb"^<\d{1,3}>")
 
 SYSLOG_PRI_RE = re.compile(r"^<(\d{1,3})>")
 SYSLOG_5424_RE = re.compile(
@@ -315,7 +316,7 @@ def analyze_syslog(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> SyslogSummary:
     errors: list[str] = []
     if TCP is None and UDP is None:
@@ -355,9 +356,6 @@ def analyze_syslog(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     total_packets = 0
     syslog_packets = 0
@@ -393,15 +391,7 @@ def analyze_syslog(
     message_cache: set[str] = set()
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -445,8 +435,11 @@ def analyze_syslog(
             if not payload:
                 continue
 
-            is_syslog = sport in SYSLOG_PORTS or dport in SYSLOG_PORTS
-            if not is_syslog and b"<" not in payload[:4]:
+            # Off the syslog ports the message must open with a PRI ("<13>");
+            # a bare "<" matched every HTML/XML segment on port 80/443 and
+            # counted it as a syslog message.
+            is_syslog = dport in SYSLOG_PORTS or (sport in SYSLOG_PORTS and dport >= 1024)
+            if not is_syslog and not _PRI_RE.match(payload):
                 continue
 
             text = payload.decode("latin-1", errors="ignore").strip()
@@ -467,7 +460,7 @@ def analyze_syslog(
                 client_ip = src_ip
                 server_ip = dst_ip
                 server_port = dport
-            elif sport in SYSLOG_PORTS:
+            elif sport in SYSLOG_PORTS and dport >= 1024:
                 client_ip = dst_ip
                 server_ip = src_ip
                 server_port = sport
@@ -560,9 +553,6 @@ def analyze_syslog(
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:

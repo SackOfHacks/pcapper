@@ -17,7 +17,7 @@ try:
 except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
 
-from .pcap_cache import PcapMeta, get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, packet_length, safe_float
 
 import ipaddress as _ipaddress
@@ -732,14 +732,6 @@ def analyze_services(
     if IP is None and IPv6 is None:
         return ServiceSummary(path, 0, [], [], {}, errors=["Scapy unavailable"])
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, packets=packets, meta=meta, show_status=show_status
-        )
-    except Exception as exc:
-        return ServiceSummary(path, 0, [], [], {}, errors=[f"Error: {exc}"])
-    size_bytes = size_bytes
-
     # Map: (IP, Port, Proto) -> ServiceAsset
     services: Dict[Tuple[str, int, str], ServiceAsset] = {}
     risks: List[ServiceRisk] = []
@@ -754,15 +746,7 @@ def analyze_services(
     seen_tcp_flows: Dict[Tuple[str, int, str, int], Dict[str, object]] = {}
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             ts = safe_float(getattr(pkt, "time", 0))
             src, dst = extract_packet_endpoints(pkt, include_arp=False)
             if not src or not dst:
@@ -963,9 +947,6 @@ def analyze_services(
 
     except Exception as e:
         errors.append(str(e))
-    finally:
-        status.finish()
-        reader.close()
 
     # Fallback for capture-gapped TCP sessions:
     # if handshake wasn't observed but traffic is bidirectional, infer likely service role.

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, extract_ascii_strings as _extract_ascii_strings
 from .utils import beacon_score as _beaconing_score
 from .utils import is_public_ip as _is_public_ip
@@ -28,6 +28,9 @@ except Exception:  # pragma: no cover
 
 RDP_TCP_PORTS = {3389, 3390, 3388}
 RDP_UDP_PORTS = {3389, 3390, 3391, 3392}
+# An RDP port on the *source* side is the service only when the destination
+# is an ephemeral port; a flow from ephemeral 3389 to 443 is not RDP.
+_EPHEMERAL_MIN = 1024
 MSTSHASH_RE = re.compile(r"Cookie:\s*mstshash=([^\r\n;]+)", re.IGNORECASE)
 _BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 
@@ -648,7 +651,7 @@ def _direction(
     ports = RDP_UDP_PORTS if is_udp else RDP_TCP_PORTS
     if dport in ports:
         return src_ip, dst_ip, sport, dport
-    if sport in ports:
+    if sport in ports and dport >= _EPHEMERAL_MIN:
         return dst_ip, src_ip, dport, sport
     if dport < 1024 and sport >= 1024:
         return src_ip, dst_ip, sport, dport
@@ -662,7 +665,7 @@ def analyze_rdp(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
     decrypted_payloads: dict[int, bytes] | None = None,
 ) -> RdpSummary:
     errors: list[str] = []
@@ -716,9 +719,6 @@ def analyze_rdp(
             analysis_notes=[],
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     total_packets = 0
     rdp_packets = 0
@@ -773,15 +773,7 @@ def analyze_rdp(
     decrypted_sources: set[str] = set()
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             pkt_index += 1
             total_packets += 1
             pkt_len = packet_length(pkt)
@@ -826,9 +818,10 @@ def analyze_rdp(
             )
             if decrypt_source:
                 decrypted_sources.add(decrypt_source)
+            rdp_ports = RDP_UDP_PORTS if is_udp else RDP_TCP_PORTS
             is_rdp = (
-                (is_tcp and (sport in RDP_TCP_PORTS or dport in RDP_TCP_PORTS))
-                or (is_udp and (sport in RDP_UDP_PORTS or dport in RDP_UDP_PORTS))
+                dport in rdp_ports
+                or (sport in rdp_ports and dport >= _EPHEMERAL_MIN)
                 or (
                     payload_prefix
                     and (
@@ -1011,9 +1004,6 @@ def analyze_rdp(
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:

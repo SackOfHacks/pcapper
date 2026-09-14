@@ -5,20 +5,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import memoize_analysis, packet_length, safe_float
 
 try:
     from scapy.layers.inet import IP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
+    from scapy.layers.l2 import Dot1Q  # type: ignore
 except Exception:  # pragma: no cover
     IP = None  # type: ignore
     IPv6 = None  # type: ignore
-
-from .utils import memoize_analysis, safe_float, packet_length
-
-try:
-    from scapy.layers.l2 import Dot1Q  # type: ignore
-except Exception:  # pragma: no cover
     Dot1Q = None  # type: ignore
 
 
@@ -44,17 +40,19 @@ class VlanSummary:
     vlan_stats: list[VlanStat]
     detections: list[dict[str, str]]
     errors: list[str]
-
-
-def _layer_names(packet) -> list[str]:
-    names = []
-    for layer in packet.layers():
-        names.append(layer.__name__)
-    return names
+    # Frames carrying two 802.1Q tags (Q-in-Q). On an access port that is the
+    # classic VLAN-hopping shape: the switch strips the outer tag and forwards
+    # on the inner one. Defaulted for backward-compatible construction.
+    double_tagged_packets: int = 0
 
 
 @memoize_analysis
-def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
+def analyze_vlans(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> VlanSummary:
     errors: list[str] = []
     if Dot1Q is None:
         errors.append("Scapy Dot1Q layer unavailable; install scapy for VLAN analysis.")
@@ -66,10 +64,6 @@ def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
             detections=[],
             errors=errors,
         )
-
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
 
     vlan_stats: dict[int, dict[str, object]] = defaultdict(
         lambda: {
@@ -87,24 +81,23 @@ def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
 
     total_tagged_packets = 0
     total_tagged_bytes = 0
+    double_tagged_packets = 0
+    double_tagged_pairs: Counter[tuple[int, int]] = Counter()
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
-            # Resolve each scapy layer class at most once per packet via
-            # getlayer (haslayer + pkt[X] would walk the layer chain twice).
-            vlan_layer = pkt.getlayer(Dot1Q)  # type: ignore[arg-type]
-            if vlan_layer is None:
-                continue
-
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        # Resolve each scapy layer class at most once per packet via
+        # getlayer (haslayer + pkt[X] would walk the layer chain twice).
+        vlan_layer = pkt.getlayer(Dot1Q)  # type: ignore[arg-type]
+        if vlan_layer is None:
+            continue
+        try:
             vlan_id = int(getattr(vlan_layer, "vlan", 0) or 0)
+            inner = vlan_layer.payload
+            if isinstance(inner, Dot1Q):
+                double_tagged_packets += 1
+                double_tagged_pairs[(vlan_id, int(getattr(inner, "vlan", 0) or 0))] += 1
             if vlan_id == 0:
                 continue
 
@@ -137,7 +130,7 @@ def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
                     info["dst_ips"].add(str(ip6_layer.dst))
 
             protocols = info["protocols"]
-            for name in set(_layer_names(pkt)):
+            for name in {layer.__name__ for layer in pkt.layers()}:
                 protocols[name] += 1
 
             ts = safe_float(getattr(pkt, "time", None))
@@ -146,9 +139,16 @@ def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
                     info["first_seen"] = ts
                 if info["last_seen"] is None or ts > info["last_seen"]:
                     info["last_seen"] = ts
-    finally:
-        status.finish()
-        reader.close()
+        except Exception as exc:  # noqa: BLE001 — one malformed frame must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
+
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} tagged frame(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     stats_list: list[VlanStat] = []
     for vlan_id, info in vlan_stats.items():
@@ -170,6 +170,23 @@ def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
     stats_list.sort(key=lambda item: item.packets, reverse=True)
 
     detections: list[dict[str, str]] = []
+    if double_tagged_packets:
+        pairs = ", ".join(
+            f"{outer}->{inner}({count})"
+            for (outer, inner), count in double_tagged_pairs.most_common(5)
+        )
+        detections.append(
+            {
+                "type": "vlan_double_tagged",
+                "severity": "high",
+                "summary": f"Double-tagged (802.1Q-in-Q) frames observed: {double_tagged_packets}",
+                "details": (
+                    f"Outer->inner VLAN pairs: {pairs}. On an access port this is the "
+                    "VLAN-hopping shape (outer tag stripped, inner tag forwarded); on a "
+                    "provider trunk Q-in-Q is expected."
+                ),
+            }
+        )
     if stats_list:
         vlan_ids = sorted(v.vlan_id for v in stats_list)
         if 1 in vlan_ids:
@@ -212,4 +229,5 @@ def analyze_vlans(path: Path, show_status: bool = True) -> VlanSummary:
         vlan_stats=stats_list,
         detections=detections,
         errors=errors,
+        double_tagged_packets=double_tagged_packets,
     )

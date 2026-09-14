@@ -1,29 +1,31 @@
 from __future__ import annotations
 
 
-import ipaddress
 import os
 import re
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import parse_qsl, urlsplit
 
-from .dns import _vt_lookup_domains
-from .pcap_cache import PcapMeta, get_reader
-from .utils import extract_packet_endpoints, memoize_analysis, safe_float
+from .dns import _vt_lookup_domains, vt_lookup_candidate
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import env_int, extract_packet_endpoints, is_public_ip, memoize_analysis, safe_float
 
 try:
-    from scapy.layers.inet import IP, TCP  # type: ignore
-    from scapy.layers.inet6 import IPv6  # type: ignore
+    from scapy.layers.inet import TCP  # type: ignore
     from scapy.packet import Packet, Raw  # type: ignore
 except Exception:  # pragma: no cover
-    IP = None  # type: ignore
     TCP = None  # type: ignore
-    IPv6 = None  # type: ignore
     Raw = None  # type: ignore
     Packet = object  # type: ignore
+
+# Every parsed request is kept as a WebRequestEntry (the report and the JSON
+# export list them); a proxy log of a busy segment can hold millions.
+MAX_WEB_REQUESTS = env_int("PCAPPER_MAX_WEB_REQUESTS", 50000, minimum=1)
+# Responses waiting to be paired with their request, per conversation.
+_MAX_PENDING_RESPONSES = 256
 
 
 HTTP_REQUEST_LINE_RE = re.compile(
@@ -206,25 +208,6 @@ def _score_request(
     content_type = str(headers.get("content-type", "") or "")
     combined = f"{uri_t}\n{body_t}"
 
-    def _is_public_ip(value: str) -> bool:
-        try:
-            addr = ipaddress.ip_address(str(value).strip())
-        except Exception:
-            return False
-        if getattr(addr, "is_private", False):
-            return False
-        if getattr(addr, "is_loopback", False):
-            return False
-        if getattr(addr, "is_link_local", False):
-            return False
-        if getattr(addr, "is_multicast", False):
-            return False
-        if getattr(addr, "is_reserved", False):
-            return False
-        if getattr(addr, "is_unspecified", False):
-            return False
-        return True
-
     if method_u in {"TRACE", "CONNECT"}:
         score += 2
         reasons.append(f"uncommon_method={method_u}")
@@ -234,7 +217,7 @@ def _score_request(
     # indicators below (SQLi/traversal/cmd-inject/cred-in-body/encoded payload)
     # drive the score. Outbound POST to a public IP is a weak lead (+1) that
     # must be corroborated to reach medium/high.
-    if method_u == "POST" and _is_public_ip(dst_ip):
+    if method_u == "POST" and is_public_ip(str(dst_ip).strip()):
         score += 1
         reasons.append(f"post_to_public_ip={dst_ip}")
     if _SQLI_RE.search(combined):
@@ -299,34 +282,14 @@ def _ip_pair(pkt: Packet) -> tuple[str, str]:
     return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
 
-def _ports(pkt: Packet) -> tuple[Optional[int], Optional[int]]:
-    if TCP is None or TCP not in pkt:
-        return None, None
+def _payload(tcp_layer) -> bytes:
+    raw_layer = tcp_layer.getlayer(Raw) if Raw is not None else None
     try:
-        return int(pkt[TCP].sport), int(pkt[TCP].dport)
+        if raw_layer is not None:
+            return bytes(raw_layer)
+        return bytes(tcp_layer.payload)
     except Exception:
-        return None, None
-
-
-def _payload(pkt: Packet) -> bytes:
-    if Raw is not None and Raw in pkt:
-        try:
-            return bytes(pkt[Raw])
-        except Exception:
-            return b""
-    if TCP is not None and TCP in pkt:
-        try:
-            return bytes(pkt[TCP].payload)
-        except Exception:
-            return b""
-    return b""
-
-
-def _safe_decode(data: bytes) -> str:
-    try:
-        return data.decode("latin-1", errors="ignore")
-    except Exception:
-        return ""
+        return b""
 
 
 def _parse_headers(lines: list[str]) -> tuple[dict[str, str], int]:
@@ -598,37 +561,6 @@ def analyze_webrequests(
             vt_errors=[],
         )
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, packets=packets, meta=meta, show_status=show_status
-        )
-    except Exception as exc:
-        return WebRequestSummary(
-            path=path,
-            target_ip=target_ip_value or "ALL",
-            post_only=post_filter_enabled,
-            high_only=high_filter_enabled,
-            scoped=scoped,
-            total_packets=0,
-            http_packets=0,
-            matched_requests=0,
-            method_counts=Counter(),
-            request_port_counts=Counter(),
-            proxy_port_counts=Counter(),
-            host_counts=Counter(),
-            uri_counts=Counter(),
-            client_counts=Counter(),
-            server_counts=Counter(),
-            risk_level_counts=Counter(),
-            suspicious_requests=0,
-            requests=[],
-            errors=[f"Error opening pcap: {exc}"],
-            search_query=search_text,
-            vt_lookup_enabled=bool(vt_lookup),
-            vt_results={},
-            vt_errors=[],
-        )
-
     total_packets = 0
     http_packets = 0
     method_counts: Counter[str] = Counter()
@@ -642,34 +574,28 @@ def analyze_webrequests(
     requests: list[WebRequestEntry] = []
     stream_buffers: dict[tuple[str, str, int, int], str] = {}
     response_stream_buffers: dict[tuple[str, str, int, int], str] = {}
-    response_queues: dict[tuple[str, str, int, int], list[tuple[int, str, str]]] = {}
+    response_queues: dict[tuple[str, str, int, int], deque[tuple[int, str, str]]] = {}
+    dropped_requests = 0
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-    try:
-        for pkt in reader:
-            total_packets += 1
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
-            if TCP is None or TCP not in pkt:
-                continue
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        tcp_layer = pkt.getlayer(TCP)  # type: ignore[arg-type]
+        if tcp_layer is None:
+            continue
+        try:
             src_ip, dst_ip = _ip_pair(pkt)  # type: ignore[arg-type]
             if scoped and src_ip != target_ip_value and dst_ip != target_ip_value:
                 continue
 
-            src_port, dst_port = _ports(pkt)  # type: ignore[arg-type]
-            payload = _payload(pkt)  # type: ignore[arg-type]
+            payload = _payload(tcp_layer)
             if not payload:
                 continue
-            text = _safe_decode(payload)
-            if not text:
-                continue
-            s_port = int(src_port or 0)
-            d_port = int(dst_port or 0)
+            text = payload.decode("latin-1", errors="ignore")
+            src_port = int(getattr(tcp_layer, "sport", 0) or 0)
+            dst_port = int(getattr(tcp_layer, "dport", 0) or 0)
+            s_port, d_port = src_port, dst_port
             stream_key = (src_ip, dst_ip, s_port, d_port)
 
             existing_resp = response_stream_buffers.get(stream_key, "")
@@ -678,7 +604,7 @@ def analyze_webrequests(
             response_stream_buffers[stream_key] = remaining_resp
             if parsed_responses and s_port > 0 and d_port > 0:
                 conv_key = (dst_ip, src_ip, d_port, s_port)
-                queue = response_queues.setdefault(conv_key, [])
+                queue = response_queues.setdefault(conv_key, deque(maxlen=_MAX_PENDING_RESPONSES))
                 queue.extend(parsed_responses)
 
             existing = stream_buffers.get(stream_key, "")
@@ -709,9 +635,9 @@ def analyze_webrequests(
                 response_location = ""
                 if s_port > 0 and d_port > 0:
                     conv_key = (src_ip, dst_ip, s_port, d_port)
-                    queue = response_queues.get(conv_key, [])
+                    queue = response_queues.get(conv_key)
                     if queue:
-                        code_value, reason_value, location_value = queue.pop(0)
+                        code_value, reason_value, location_value = queue.popleft()
                         response_code = int(code_value)
                         response_name = str(reason_value or "").strip() or "-"
                         response_location = str(location_value or "").strip()
@@ -746,6 +672,9 @@ def analyze_webrequests(
                     uri_counts[uri] += 1
                 client_counts[src_ip] += 1
                 server_counts[dst_ip] += 1
+                if len(requests) >= MAX_WEB_REQUESTS:
+                    dropped_requests += 1
+                    continue
                 requests.append(
                     WebRequestEntry(
                         packet_number=total_packets,
@@ -771,14 +700,21 @@ def analyze_webrequests(
                         risk_reasons=risk_reasons,
                     )
                 )
-    except Exception as exc:
-        errors.append(str(exc))
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — one malformed segment must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
+
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} TCP segment(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
+    if dropped_requests:
+        errors.append(
+            f"{dropped_requests} request(s) beyond the first {MAX_WEB_REQUESTS} were counted "
+            "but not listed (PCAPPER_MAX_WEB_REQUESTS)."
+        )
 
     requests.sort(
         key=lambda item: (
@@ -799,30 +735,25 @@ def analyze_webrequests(
         else:
             def _normalized_domain(host_value: str) -> str:
                 host_text = str(host_value or "").strip().lower()
-                if not host_text:
-                    return ""
                 if host_text.startswith("[") and "]" in host_text:
                     host_text = host_text[1 : host_text.index("]")]
-                elif ":" in host_text and host_text.count(":") == 1:
+                elif host_text.count(":") == 1:
                     candidate, maybe_port = host_text.rsplit(":", 1)
                     if maybe_port.isdigit():
                         host_text = candidate
-                try:
-                    ipaddress.ip_address(host_text)
-                    return ""
-                except Exception:
-                    pass
-                if "." not in host_text:
-                    return ""
-                return host_text.strip(".")
+                host_text = host_text.strip(".")
+                # Public hostnames only (no IP literals, local TLDs or
+                # single labels), decided before the top-80 slice so internal
+                # hosts do not use up the lookup slots.
+                return host_text if vt_lookup_candidate(host_text) else ""
 
-            ranked_hosts = [
-                host
-                for host, _count in host_counts.most_common(80)
-                if _normalized_domain(host)
-            ]
-            vt_domains = [_normalized_domain(host) for host in ranked_hosts]
-            vt_domains = [domain for domain in vt_domains if domain]
+            vt_domains: list[str] = []
+            for host, _count in host_counts.most_common():
+                domain = _normalized_domain(host)
+                if domain and domain not in vt_domains:
+                    vt_domains.append(domain)
+                if len(vt_domains) >= 80:
+                    break
             if vt_domains:
                 vt_results, vt_errors = _vt_lookup_domains(vt_domains, api_key)
                 errors.extend(vt_errors)

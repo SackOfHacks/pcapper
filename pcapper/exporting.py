@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .utils import (
+    open_private,
     restrict_dir_permissions,
-    restrict_permissions,
     safe_write_text,
     to_serializable,
 )
@@ -135,11 +135,47 @@ def _iter_hosts(summary: Any) -> Iterable[Any]:
 
 
 def _csv_safe(value: Any) -> Any:
+    """Neutralise spreadsheet formula injection in a recovered string.
+
+    A cell starting with ``=``, ``+``, ``-``, ``@``, a tab or a carriage return
+    is evaluated as a formula by Excel and LibreOffice (OWASP CSV injection).
+    Values here come off the wire — a hostname or URL an adversary chose — so
+    a leading apostrophe forces them to be read as text.
+    """
     if isinstance(value, str):
-        stripped = value.lstrip()
-        if stripped and stripped[0] in ("=", "+", "-", "@"):
+        stripped = value.lstrip(" ")
+        if stripped and stripped[0] in ("=", "+", "-", "@", "\t", "\r"):
             return "'" + value
     return value
+
+
+def _host_row(bundle_path: Path, name: str, host: Any) -> dict[str, Any]:
+    """One exported row per discovered host, shared by the CSV and SQLite writers."""
+    open_ports = [
+        {
+            "port": int(getattr(port, "port", 0) or 0),
+            "protocol": str(getattr(port, "protocol", "") or ""),
+            "service": str(getattr(port, "service", "") or ""),
+            "software": str(getattr(port, "software", "") or ""),
+        }
+        for port in getattr(host, "open_ports", []) or []
+    ]
+    return {
+        "pcap_path": str(bundle_path),
+        "module": name,
+        "ip": str(getattr(host, "ip", "") or ""),
+        "macs": list(getattr(host, "mac_addresses", []) or []),
+        "hostnames": list(getattr(host, "hostnames", []) or []),
+        "operating_system": str(getattr(host, "operating_system", "") or ""),
+        "os_evidence": list(getattr(host, "os_evidence", []) or []),
+        "packets_sent": int(getattr(host, "packets_sent", 0) or 0),
+        "packets_recv": int(getattr(host, "packets_recv", 0) or 0),
+        "bytes_sent": int(getattr(host, "bytes_sent", 0) or 0),
+        "bytes_recv": int(getattr(host, "bytes_recv", 0) or 0),
+        "first_seen": getattr(host, "first_seen", None),
+        "last_seen": getattr(host, "last_seen", None),
+        "open_ports": open_ports,
+    }
 
 
 def export_csv(bundle: ExportBundle, output_path: Path) -> None:
@@ -156,32 +192,14 @@ def export_csv(bundle: ExportBundle, output_path: Path) -> None:
             row.update(to_serializable(item))
             rows.append({key: _csv_safe(value) for key, value in row.items()})
         for host in _iter_hosts(summary):
-            open_ports = []
-            for port in getattr(host, "open_ports", []) or []:
-                open_ports.append(
-                    {
-                        "port": int(getattr(port, "port", 0) or 0),
-                        "protocol": str(getattr(port, "protocol", "") or ""),
-                        "service": str(getattr(port, "service", "") or ""),
-                        "software": str(getattr(port, "software", "") or ""),
-                    }
-                )
+            base = _host_row(bundle.path, name, host)
             row = {
                 "category": "host",
-                "module": name,
-                "pcap_path": str(bundle.path),
-                "ip": str(getattr(host, "ip", "") or ""),
-                "macs": ", ".join(getattr(host, "mac_addresses", []) or []),
-                "hostnames": ", ".join(getattr(host, "hostnames", []) or []),
-                "operating_system": str(getattr(host, "operating_system", "") or ""),
-                "os_evidence": " | ".join(getattr(host, "os_evidence", []) or []),
-                "packets_sent": int(getattr(host, "packets_sent", 0) or 0),
-                "packets_recv": int(getattr(host, "packets_recv", 0) or 0),
-                "bytes_sent": int(getattr(host, "bytes_sent", 0) or 0),
-                "bytes_recv": int(getattr(host, "bytes_recv", 0) or 0),
-                "first_seen": getattr(host, "first_seen", None),
-                "last_seen": getattr(host, "last_seen", None),
-                "open_ports": json.dumps(open_ports),
+                **base,
+                "macs": ", ".join(base["macs"]),
+                "hostnames": ", ".join(base["hostnames"]),
+                "os_evidence": " | ".join(base["os_evidence"]),
+                "open_ports": json.dumps(base["open_ports"]),
             }
             host_rows.append({key: _csv_safe(value) for key, value in row.items()})
 
@@ -189,8 +207,7 @@ def export_csv(bundle: ExportBundle, output_path: Path) -> None:
         safe_write_text(output_path, "", encoding="utf-8", context="export_csv")
     else:
         fieldnames = sorted({key for row in rows for key in row.keys()})
-        with output_path.open("w", newline="", encoding="utf-8") as handle:
-            restrict_permissions(output_path)
+        with open_private(output_path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for row in rows:
@@ -202,8 +219,7 @@ def export_csv(bundle: ExportBundle, output_path: Path) -> None:
         )
         _ensure_parent(host_path)
         host_fields = sorted({key for row in host_rows for key in row.keys()})
-        with host_path.open("w", newline="", encoding="utf-8") as handle:
-            restrict_permissions(host_path)
+        with open_private(host_path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=host_fields)
             writer.writeheader()
             for row in host_rows:
@@ -216,8 +232,10 @@ def export_sqlite(bundle: ExportBundle, output_path: Path) -> None:
         if output_path.is_dir():
             raise ValueError(f"SQLite export path is a directory: {output_path}")
         output_path.unlink()
+    # Create the file owner-only *before* sqlite opens it, so it is never
+    # world-readable, even briefly, while being populated.
+    open_private(output_path, "wb").close()
     conn = sqlite3.connect(str(output_path))
-    restrict_permissions(output_path)
     cur = conn.cursor()
     cur.execute("CREATE TABLE detections (module TEXT, data TEXT)")
     cur.execute("CREATE TABLE artifacts (module TEXT, data TEXT)")
@@ -241,33 +259,7 @@ def export_sqlite(bundle: ExportBundle, output_path: Path) -> None:
                 (name, json.dumps(payload)),
             )
         for host in _iter_hosts(summary):
-            open_ports = []
-            for port in getattr(host, "open_ports", []) or []:
-                open_ports.append(
-                    {
-                        "port": int(getattr(port, "port", 0) or 0),
-                        "protocol": str(getattr(port, "protocol", "") or ""),
-                        "service": str(getattr(port, "service", "") or ""),
-                        "software": str(getattr(port, "software", "") or ""),
-                    }
-                )
-            row = {
-                "pcap_path": str(bundle.path),
-                "module": name,
-                "ip": str(getattr(host, "ip", "") or ""),
-                "macs": list(getattr(host, "mac_addresses", []) or []),
-                "hostnames": list(getattr(host, "hostnames", []) or []),
-                "operating_system": str(getattr(host, "operating_system", "") or ""),
-                "os_evidence": list(getattr(host, "os_evidence", []) or []),
-                "packets_sent": int(getattr(host, "packets_sent", 0) or 0),
-                "packets_recv": int(getattr(host, "packets_recv", 0) or 0),
-                "bytes_sent": int(getattr(host, "bytes_sent", 0) or 0),
-                "bytes_recv": int(getattr(host, "bytes_recv", 0) or 0),
-                "first_seen": getattr(host, "first_seen", None),
-                "last_seen": getattr(host, "last_seen", None),
-                "open_ports": open_ports,
-            }
-            payload = row
+            payload = _host_row(bundle.path, name, host)
             cur.execute(
                 "INSERT INTO hosts (pcap_path, module, ip, macs, hostnames, operating_system, os_evidence, "
                 "packets_sent, packets_recv, bytes_sent, bytes_recv, first_seen, last_seen, open_ports) "

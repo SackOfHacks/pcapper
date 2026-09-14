@@ -8,6 +8,7 @@ from .industrial_helpers import (
     IndustrialAnomaly,
     analyze_port_protocol,
 )
+from .utils import memoize_analysis
 
 # NOTE: the 3-byte token b"CDA" was removed -- with no port constraint this
 # matcher scans every payload, and "CDA" occurs constantly in unrelated traffic
@@ -48,6 +49,7 @@ def _detect_anomalies(
     ]
 
 
+@memoize_analysis
 def analyze_honeywell(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,

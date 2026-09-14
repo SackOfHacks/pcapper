@@ -20,7 +20,7 @@ __all__ = ["__version__"]
 # the banner still said 2.1.0, because the banner reads this attribute and the
 # wheel metadata read pyproject. tests/test_version.py fails if a second copy
 # is ever reintroduced.
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 
 # --- Early quiet-mode hook ---------------------------------------------------

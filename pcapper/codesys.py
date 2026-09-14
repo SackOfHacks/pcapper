@@ -10,6 +10,7 @@ from .industrial_helpers import (
     analyze_port_protocol,
 )
 from .opcode_models import format_opcode, load_opcode_model
+from .utils import memoize_analysis
 
 # CoDeSys runtime (2455) + gateway (1217). Used by Schneider/Wago/Beckhoff and
 # many CoDeSys-based PLCs; PIPEDREAM's Codesys module targets this stack.
@@ -111,6 +112,7 @@ def _detect_anomalies(
     return anomalies
 
 
+@memoize_analysis
 def analyze_codesys(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,

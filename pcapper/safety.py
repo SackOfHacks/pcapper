@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import ipaddress
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, is_public_ip, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -49,12 +48,6 @@ class SafetySummary:
     errors: list[str] = field(default_factory=list)
 
 
-def _is_public(ip: str) -> bool:
-    try:
-        return ipaddress.ip_address(ip).is_global
-    except Exception:
-        return False
-
 
 def merge_safety_summaries(summaries: list[SafetySummary]) -> SafetySummary:
     if not summaries:
@@ -94,7 +87,24 @@ def merge_safety_summaries(summaries: list[SafetySummary]) -> SafetySummary:
     )
 
 
-def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
+def _safety_service(sport: int, dport: int) -> Optional[str]:
+    """Service name when a safety-system port is on the server side: the
+    destination, or the source paired with an ephemeral destination."""
+    service = SAFETY_PORTS.get(dport)
+    if service:
+        return service
+    if dport >= 1024:
+        return SAFETY_PORTS.get(sport)
+    return None
+
+
+@memoize_analysis
+def analyze_safety(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> SafetySummary:
     if TCP is None and UDP is None:
         return SafetySummary(
             path=path,
@@ -107,9 +117,6 @@ def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
             errors=["Scapy TCP/UDP unavailable"],
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
     total_packets = 0
     hits: list[SafetyHit] = []
     source_counts: Counter[str] = Counter()
@@ -118,14 +125,7 @@ def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
     errors: list[str] = []
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", None))
 
@@ -137,7 +137,7 @@ def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
                 tcp = pkt[TCP]  # type: ignore[index]
                 sport = int(getattr(tcp, "sport", 0) or 0)
                 dport = int(getattr(tcp, "dport", 0) or 0)
-                service = SAFETY_PORTS.get(sport) or SAFETY_PORTS.get(dport)
+                service = _safety_service(sport, dport)
                 if service:
                     hits.append(
                         SafetyHit(
@@ -158,7 +158,7 @@ def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
                 udp = pkt[UDP]  # type: ignore[index]
                 sport = int(getattr(udp, "sport", 0) or 0)
                 dport = int(getattr(udp, "dport", 0) or 0)
-                service = SAFETY_PORTS.get(sport) or SAFETY_PORTS.get(dport)
+                service = _safety_service(sport, dport)
                 if service:
                     hits.append(
                         SafetyHit(
@@ -177,21 +177,18 @@ def analyze_safety(path: Path, show_status: bool = True) -> SafetySummary:
 
     except Exception as exc:
         errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        status.finish()
-        reader.close()
 
     detections: list[dict[str, object]] = []
     if hits:
         public_hits = [
-            hit for hit in hits if _is_public(hit.src) or _is_public(hit.dst)
+            hit for hit in hits if is_public_ip(hit.src) or is_public_ip(hit.dst)
         ]
         severity = "high" if public_hits else "warning"
         # When public endpoints drive the high-severity escalation, show them
         # first in the evidence sample — otherwise hits[:8] can omit the very
         # hosts the "Public endpoints observed" claim is about.
         ordered_hits = public_hits + [
-            hit for hit in hits if not (_is_public(hit.src) or _is_public(hit.dst))
+            hit for hit in hits if not (is_public_ip(hit.src) or is_public_ip(hit.dst))
         ]
         evidence = [
             f"{hit.protocol} {hit.src}:{hit.src_port}->{hit.dst}:{hit.dst_port} {hit.service}"

@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -51,7 +51,22 @@ class OpcClassicSummary:
     duration_seconds: Optional[float]
 
 
-def analyze_opc_classic(path: Path, show_status: bool = True) -> OpcClassicSummary:
+_DCERPC_SERVER_PDUS = {2, 3, 12, 13, 15}  # response, fault, bind_ack, bind_nak, alter_context_resp
+
+
+def _dcerpc_from_server(payload: bytes) -> bool:
+    if len(payload) < 3 or payload[0] != 5:
+        return False
+    return payload[2] in _DCERPC_SERVER_PDUS
+
+
+@memoize_analysis
+def analyze_opc_classic(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> OpcClassicSummary:
     if TCP is None:
         return OpcClassicSummary(
             path,
@@ -67,9 +82,6 @@ def analyze_opc_classic(path: Path, show_status: bool = True) -> OpcClassicSumma
             None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
     total_packets = 0
     opc_packets = 0
     interface_counts: Counter[str] = Counter()
@@ -80,49 +92,47 @@ def analyze_opc_classic(path: Path, show_status: bool = True) -> OpcClassicSumma
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+        if not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+            continue
+        tcp = pkt[TCP]  # type: ignore[index]
+        payload = bytes(getattr(tcp, "payload", b""))
+        if not payload:
+            continue
 
-            if not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                continue
-            tcp = pkt[TCP]  # type: ignore[index]
-            payload = bytes(getattr(tcp, "payload", b""))
-            if not payload:
-                continue
+        matched = False
+        for uuid_text, marker in UUID_MARKERS.items():
+            if marker in payload:
+                interface_counts[OPC_UUIDS[uuid_text]] += 1
+                matched = True
 
-            matched = False
-            for uuid_text, marker in UUID_MARKERS.items():
-                if marker in payload:
-                    interface_counts[OPC_UUIDS[uuid_text]] += 1
-                    matched = True
+        if not matched:
+            continue
 
-            if not matched:
-                continue
-
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-            if src_ip and dst_ip:
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
+        if src_ip and dst_ip:
+            # DCE/RPC PDU type (byte 2): bind/alter-context/request come from
+            # the client, bind_ack/response from the server. The UUID marker
+            # appears in both directions, so counting the sender of every
+            # marked PDU as the client made each OPC server its own client.
+            if _dcerpc_from_server(payload):
+                client_counts[dst_ip] += 1
+                server_counts[src_ip] += 1
+            else:
                 client_counts[src_ip] += 1
                 server_counts[dst_ip] += 1
 
-            opc_packets += 1
+        opc_packets += 1
+        # The report window spans this protocol's traffic, not every packet.
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
 
-    finally:
-        status.finish()
-        reader.close()
 
     if opc_packets:
         detections.append(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .utils import is_public_ip as _is_public_ip
+from .utils import memoize_analysis
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -1080,6 +1081,7 @@ def _append_behavioral_anomalies(analysis: IndustrialAnalysis) -> None:
         )
 
 
+@memoize_analysis
 def analyze_bacnet(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,

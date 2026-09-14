@@ -32,8 +32,17 @@ _VENDOR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\byokogawa\b", re.IGNORECASE), "Yokogawa"),
     (re.compile(r"\bhoneywell\b", re.IGNORECASE), "Honeywell"),
     (re.compile(r"\bemerson\b|\bovation\b|\bdelta[v]?\b", re.IGNORECASE), "Emerson"),
-    (re.compile(r"\babb\b", re.IGNORECASE), "ABB"),
-    (re.compile(r"\bge\b|general electric", re.IGNORECASE), "GE"),
+    (re.compile(r"\babb\b(?=[ -]?(?:ac|800|freelance|relion|totalflow|drives?|robot))", re.IGNORECASE), "ABB"),
+    # "ge" alone is a common 2-letter fragment (hex, base64, URL paths); it only
+    # names the vendor next to one of its product families.
+    (
+        re.compile(
+            r"general electric|\bge[ -]?(?:fanuc|proficy|multilin|srtp|ip\b|vernova|"
+            r"mark ?vi|d20|d25|ur\b|ifix|cimplicity|pacsystems|rx3i|versamax)",
+            re.IGNORECASE,
+        ),
+        "GE",
+    ),
     (re.compile(r"\bbeckhoff\b", re.IGNORECASE), "Beckhoff"),
     (re.compile(r"\bphoenix contact\b", re.IGNORECASE), "Phoenix Contact"),
     (re.compile(r"\bwago\b", re.IGNORECASE), "WAGO"),
@@ -47,7 +56,7 @@ _VENDOR_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bmikrotik\b", re.IGNORECASE), "MikroTik"),
     (re.compile(r"\bdell\b", re.IGNORECASE), "Dell"),
     (re.compile(r"\bmicrosoft\b|\bmsft\b", re.IGNORECASE), "Microsoft"),
-    (re.compile(r"\bhewlett[- ]?packard\b|\bhp\b", re.IGNORECASE), "HP"),
+    (re.compile(r"\bhewlett[- ]?packard\b|\bhp[ -]?(?:proliant|ilo|laserjet|officejet|procurve|aruba|elitebook|probook|inc\b)", re.IGNORECASE), "HP"),
     (re.compile(r"\blenovo\b", re.IGNORECASE), "Lenovo"),
     (re.compile(r"\bapple\b", re.IGNORECASE), "Apple"),
 ]
@@ -62,7 +71,9 @@ _DEVICE_TYPE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bied\b|intelligent electronic device", re.IGNORECASE), "IED"),
     (re.compile(r"\brelay\b|protection relay", re.IGNORECASE), "Protection Relay"),
     (
-        re.compile(r"\bvfd\b|variable frequency drive|drive\b", re.IGNORECASE),
+        # A bare "drive" is Google Drive, a disk drive, a driver; only the
+        # industrial phrasings name a motor drive.
+        re.compile(r"\bvfd\b|variable frequency drive|servo drive|motor drive|frequency inverter", re.IGNORECASE),
         "Drive/VFD",
     ),
     (re.compile(r"\brouter\b", re.IGNORECASE), "Router"),
@@ -90,7 +101,10 @@ _OS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bmacOS\s*([0-9.]+)?", re.IGNORECASE), "macOS"),
     (re.compile(r"\bDarwin\s*([0-9.]+)?", re.IGNORECASE), "macOS"),
     (re.compile(r"\bAndroid\s*([0-9.]+)?", re.IGNORECASE), "Android"),
-    (re.compile(r"\biOS\s*([0-9.]+)?", re.IGNORECASE), "iOS"),
+    # Cisco IOS / IOS-XE / IOS-XR is a router OS; only a bare "iOS" without a
+    # Cisco context is Apple's.
+    (re.compile(r"\bcisco\s+ios(?:[- ]?x[er])?\s*(?:software\s*)?(?:version\s*)?([0-9.()A-Za-z]+)?", re.IGNORECASE), "Cisco IOS"),
+    (re.compile(r"(?<!cisco )\biOS\s*([0-9.]+)?", re.IGNORECASE), "iOS"),
     (re.compile(r"\bVxWorks\b\s*([0-9.]+)?", re.IGNORECASE), "VxWorks"),
     (re.compile(r"\bQNX\b\s*([0-9.]+)?", re.IGNORECASE), "QNX"),
     (re.compile(r"\bFreeRTOS\b\s*([0-9.]+)?", re.IGNORECASE), "FreeRTOS"),
@@ -143,17 +157,20 @@ _MODEL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
 ]
 
+# A version is only captured when it starts with a digit after a separator;
+# ``\bBoa/?([0-9A-Za-z.p]+)?`` used to turn "Boarding" into software "Boa rding".
+_VER = r"(?:[/_ -]v?([0-9][0-9A-Za-z.p-]*))?\b"
 _SOFTWARE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\bOpenSSH[_/-]?([0-9A-Za-z.p]+)", re.IGNORECASE), "OpenSSH"),
-    (re.compile(r"\bDropbear[_/-]?([0-9A-Za-z.p]+)", re.IGNORECASE), "Dropbear"),
-    (re.compile(r"\bApache/?([0-9A-Za-z.p]+)?", re.IGNORECASE), "Apache"),
-    (re.compile(r"\bnginx/?([0-9A-Za-z.p]+)?", re.IGNORECASE), "nginx"),
-    (re.compile(r"Microsoft-IIS/?([0-9A-Za-z.p]+)?", re.IGNORECASE), "Microsoft IIS"),
-    (re.compile(r"\bLighttpd/?([0-9A-Za-z.p]+)?", re.IGNORECASE), "Lighttpd"),
-    (re.compile(r"\bBoa/?([0-9A-Za-z.p]+)?", re.IGNORECASE), "Boa"),
-    (re.compile(r"\bGoAhead/?([0-9A-Za-z.p]+)?", re.IGNORECASE), "GoAhead"),
-    (re.compile(r"\bMongoose/?([0-9A-Za-z.p]+)?", re.IGNORECASE), "Mongoose"),
-    (re.compile(r"\bBusyBox/?([0-9A-Za-z.p]+)?", re.IGNORECASE), "BusyBox"),
+    (re.compile(r"\bOpenSSH" + _VER, re.IGNORECASE), "OpenSSH"),
+    (re.compile(r"\bDropbear" + _VER, re.IGNORECASE), "Dropbear"),
+    (re.compile(r"\bApache" + _VER, re.IGNORECASE), "Apache"),
+    (re.compile(r"\bnginx" + _VER, re.IGNORECASE), "nginx"),
+    (re.compile(r"Microsoft-IIS" + _VER, re.IGNORECASE), "Microsoft IIS"),
+    (re.compile(r"\bLighttpd" + _VER, re.IGNORECASE), "Lighttpd"),
+    (re.compile(r"\bBoa" + _VER, re.IGNORECASE), "Boa"),
+    (re.compile(r"\bGoAhead" + _VER, re.IGNORECASE), "GoAhead"),
+    (re.compile(r"\bMongoose" + _VER, re.IGNORECASE), "Mongoose"),
+    (re.compile(r"\bBusyBox" + _VER, re.IGNORECASE), "BusyBox"),
     (re.compile(r"\bCODESYS\b(?:\s*V?([0-9A-Za-z.p]+))?", re.IGNORECASE), "CODESYS"),
     (re.compile(r"\bNiagara\b", re.IGNORECASE), "Niagara"),
     (re.compile(r"\bIgnition\b(?:\s*([0-9A-Za-z.p]+))?", re.IGNORECASE), "Ignition"),

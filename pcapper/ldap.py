@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .dns import analyze_dns
 from .files import analyze_files
-from .pcap_cache import PcapMeta, get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .progress import run_with_busy_status
 from .utils import counter_inc, decode_payload, extract_packet_endpoints, memoize_analysis, safe_float, set_add_cap
 
@@ -27,6 +27,26 @@ except Exception:  # pragma: no cover
 
 LDAP_PORTS = {389, 636, 3268, 3269}
 LDAP_CLEAR_PORTS = {389, 3268}
+# A source port equal to an LDAP port identifies the directory server only
+# when the other end is an ephemeral port; otherwise a flow whose ephemeral
+# source happens to be 389 is reported as a directory server.
+_EPHEMERAL_MIN = 1024
+
+
+def _ldap_roles(
+    src_ip: str, dst_ip: str, sport: int, dport: int
+) -> tuple[str, str, int] | None:
+    """(client_ip, server_ip, server_port), or None when not LDAP.
+
+    Roles come from the LDAP port, not from packet direction: the server's
+    reply is still the server's traffic. Counting ``dst_ip`` as the server on
+    every packet made each directory server also its own busiest "client".
+    """
+    if dport in LDAP_PORTS:
+        return src_ip, dst_ip, dport
+    if sport in LDAP_PORTS and dport >= _EPHEMERAL_MIN:
+        return dst_ip, src_ip, sport
+    return None
 
 LDAP_DNS_HINTS = ("_ldap._tcp", "_gc._tcp", "_msdcs")
 
@@ -316,9 +336,6 @@ def analyze_ldap(
 
     files = [art.filename for art in files_summary.artifacts]
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     total_packets = 0
     first_seen: Optional[float] = None
@@ -353,274 +370,272 @@ def analyze_ldap(
     cleartext_ldap_seen = False
     udp_ldap_seen = False
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    def _mark_window(ts: Optional[float]) -> None:
+        # The report window spans LDAP traffic, not every packet in scope.
+        nonlocal first_seen, last_seen
+        if ts is None:
+            return
+        if first_seen is None or ts < first_seen:
+            first_seen = ts
+        if last_seen is None or ts > last_seen:
+            last_seen = ts
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
 
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
+        if not src_ip or not dst_ip:
+            continue
 
-            if not src_ip or not dst_ip:
-                continue
-
-            proto = None
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                tcp_layer = pkt[TCP]  # type: ignore[index]
-                sport = int(getattr(tcp_layer, "sport", 0) or 0)
-                dport = int(getattr(tcp_layer, "dport", 0) or 0)
-                proto = "TCP"
-                if dport in LDAP_PORTS or sport in LDAP_PORTS:
-                    counter_inc(servers, dst_ip)
-                    counter_inc(clients, src_ip)
-                    counter_inc(request_counts, "LDAP Traffic")
-                    counter_inc(service_counts, f"TCP/{dport or sport}")
-                    counter_inc(convos, (src_ip, dst_ip, dport or sport, "TCP"))
-                    if dport in LDAP_CLEAR_PORTS or sport in LDAP_CLEAR_PORTS:
-                        cleartext_ldap_seen = True
-                        cleartext_packets += 1
-                    if dport in {636, 3269} or sport in {636, 3269}:
-                        ldaps_packets += 1
-                    if _is_public_ip(src_ip):
-                        counter_inc(public_endpoints, src_ip)
-                    if _is_public_ip(dst_ip):
-                        counter_inc(public_endpoints, dst_ip)
-
-                payload = bytes(getattr(tcp_layer, "payload", b""))
-                if payload and payload.startswith(
-                    (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ")
-                ):
-                    url, ua, method = _parse_http_request(payload)
-                    if url:
-                        counter_inc(urls, url)
-                    if ua:
-                        counter_inc(user_agents, ua)
-                    if method:
-                        counter_inc(http_methods, method)
-                    counter_inc(http_clients, src_ip)
-
-                if payload and (sport in LDAP_PORTS or dport in LDAP_PORTS):
-                    for token in _extract_ldap_strings(payload):
-                        if token:
-                            counter_inc(ldap_queries, token)
-                            filter_type = _ldap_filter_type(token)
-                            if filter_type:
-                                counter_inc(ldap_filter_types, filter_type)
-                            lower_token = token.lower()
-                            if "unicodepwd" in lower_token:
-                                counter_inc(suspicious_attributes, "unicodePwd")
-                            if "ms-mcs-admpwd" in lower_token:
-                                counter_inc(suspicious_attributes, "ms-Mcs-AdmPwd")
-                            if "userpassword" in lower_token:
-                                counter_inc(suspicious_attributes, "userPassword")
-                            if token.lower().startswith("cn="):
-                                counter_inc(ldap_users, token)
-                                set_add_cap(artifacts, token)
-                                key = (
-                                    src_ip,
-                                    dst_ip,
-                                    dport or sport,
-                                    proto or "TCP",
-                                    "cn",
-                                    token,
-                                )
-                                if key not in user_evidence_seen:
-                                    user_evidence_seen.add(key)
-                                    user_evidence.append(
-                                        {
-                                            "src_ip": src_ip,
-                                            "dst_ip": dst_ip,
-                                            "dst_port": dport or sport,
-                                            "protocol": proto or "TCP",
-                                            "attr": "cn",
-                                            "value": token.partition("=")[2].strip()
-                                            if "=" in token
-                                            else token,
-                                        }
-                                    )
-
-                    # Recover result codes from the binary BER (the ASCII
-                    # heuristics below never match real LDAP responses).
-                    for code in _ldap_result_codes_from_payload(payload):
-                        name = LDAP_RESULT_CODES.get(code, str(code))
-                        counter_inc(response_codes, f"{code} ({name})")
-                        # 0=success, 5/6=compareFalse/True, 14=saslBindInProgress
-                        # are normal results, not errors.
-                        if code not in (0, 5, 6, 14):
-                            counter_inc(ldap_error_codes, f"{code} ({name})")
-
-                    for value in _extract_ascii_strings(
-                        payload
-                    ) + _extract_utf16le_strings(payload):
-                        if not value:
-                            continue
-                        lower = value.lower()
-
-                        if (
-                            any(hint in lower for hint in FILTER_HINTS)
-                            or "(objectclass" in lower
-                        ):
-                            counter_inc(ldap_queries, value)
-                            set_add_cap(artifacts, value)
-                            filter_type = _ldap_filter_type(value)
-                            if filter_type:
-                                counter_inc(ldap_filter_types, filter_type)
-                            if "unicodepwd" in lower:
-                                counter_inc(suspicious_attributes, "unicodePwd")
-                            if "ms-mcs-admpwd" in lower:
-                                counter_inc(suspicious_attributes, "ms-Mcs-AdmPwd")
-                            if "userpassword" in lower:
-                                counter_inc(suspicious_attributes, "userPassword")
-
-                        for match in DN_TOKEN_RE.findall(value):
-                            counter_inc(ldap_queries, match)
-                            set_add_cap(artifacts, match)
-                            key, _, val = match.partition("=")
-                            key_lower = key.strip().lower()
-                            val = val.strip()
-                            if key_lower in LDAP_USER_ATTRS or key_lower in {
-                                "cn",
-                                "sn",
-                            }:
-                                ev_key = (
-                                    src_ip,
-                                    dst_ip,
-                                    dport or sport,
-                                    proto or "TCP",
-                                    key_lower,
-                                    val,
-                                )
-                                if ev_key not in user_evidence_seen:
-                                    user_evidence_seen.add(ev_key)
-                                    user_evidence.append(
-                                        {
-                                            "src_ip": src_ip,
-                                            "dst_ip": dst_ip,
-                                            "dst_port": dport or sport,
-                                            "protocol": proto or "TCP",
-                                            "attr": key_lower,
-                                            "value": val,
-                                        }
-                                    )
-                            if key_lower in LDAP_USER_ATTRS:
-                                counter_inc(ldap_users, val)
-                            elif key_lower == "cn":
-                                if val.endswith("$"):
-                                    counter_inc(ldap_systems, val)
-                                else:
-                                    counter_inc(ldap_users, val)
-                            if key_lower in {"dnshostname", "serviceprincipalname"}:
-                                counter_inc(ldap_systems, val)
-
-                        if any(
-                            word in lower
-                            for word in (
-                                "bind",
-                                "search",
-                                "modify",
-                                "add",
-                                "delete",
-                                "compare",
-                                "extended",
-                                "unbind",
-                            )
-                        ):
-                            if "bind" in lower:
-                                counter_inc(request_counts, "Bind")
-                                for identity in _extract_bind_identities(value):
-                                    if identity:
-                                        counter_inc(ldap_binds, identity)
-                                        key = (src_ip, dst_ip, dport or sport, identity)
-                                        if key not in bind_identity_seen:
-                                            bind_identity_seen.add(key)
-                                            bind_identities.append(
-                                                {
-                                                    "src_ip": src_ip,
-                                                    "dst_ip": dst_ip,
-                                                    "dst_port": dport or sport,
-                                                    "protocol": "TCP",
-                                                    "identity": identity,
-                                                }
-                                            )
-                                if ts is not None:
-                                    minute_bucket = int(ts // 60)
-                                    counter_inc(bind_buckets, (src_ip, minute_bucket))
-                            if "search" in lower:
-                                counter_inc(request_counts, "Search")
-                            if "modify" in lower:
-                                counter_inc(request_counts, "Modify")
-                            if "add" in lower:
-                                counter_inc(request_counts, "Add")
-                            if "delete" in lower:
-                                counter_inc(request_counts, "Delete")
-                            if "compare" in lower:
-                                counter_inc(request_counts, "Compare")
-                            if "extended" in lower:
-                                counter_inc(request_counts, "Extended")
-                            if "unbind" in lower:
-                                counter_inc(request_counts, "Unbind")
-
-                        for pattern in SECRET_PATTERNS:
-                            match = pattern.search(value)
-                            if match:
-                                counter_inc(secrets, match.group(0))
-                                set_add_cap(artifacts, match.group(0))
-
-                        if (
-                            "resultcode" in lower
-                            or "invalidcredentials" in lower
-                            or "insufficientaccessrights" in lower
-                        ):
-                            for name_lower, name in LDAP_RESULT_NAMES.items():
-                                if name_lower in lower:
-                                    counter_inc(response_codes, name)
-                                    if name_lower in {
-                                        "invalidcredentials",
-                                        "insufficientaccessrights",
-                                    }:
-                                        counter_inc(ldap_error_codes, name)
-                            numeric_match = re.search(
-                                r"resultcode\s*[:=]\s*(\d+)", lower
-                            )
-                            if numeric_match:
-                                code = int(numeric_match.group(1))
-                                name = LDAP_RESULT_CODES.get(code, str(code))
-                                counter_inc(response_codes, f"{code} ({name})")
-                                if code != 0:
-                                    counter_inc(ldap_error_codes, f"{code} ({name})")
-
-            if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                udp_layer = pkt[UDP]  # type: ignore[index]
-                sport = int(getattr(udp_layer, "sport", 0) or 0)
-                dport = int(getattr(udp_layer, "dport", 0) or 0)
-                if dport in LDAP_PORTS or sport in LDAP_PORTS:
-                    counter_inc(servers, dst_ip)
-                    counter_inc(clients, src_ip)
-                    counter_inc(request_counts, "LDAP Traffic")
-                    counter_inc(service_counts, f"UDP/{dport or sport}")
-                    counter_inc(convos, (src_ip, dst_ip, dport or sport, "UDP"))
-                    udp_ldap_seen = True
+        proto = None
+        if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+            tcp_layer = pkt[TCP]  # type: ignore[index]
+            sport = int(getattr(tcp_layer, "sport", 0) or 0)
+            dport = int(getattr(tcp_layer, "dport", 0) or 0)
+            proto = "TCP"
+            ldap_roles = _ldap_roles(src_ip, dst_ip, sport, dport)
+            if ldap_roles is not None:
+                client_ip, server_ip, server_port = ldap_roles
+                _mark_window(ts)
+                counter_inc(servers, server_ip)
+                counter_inc(clients, client_ip)
+                counter_inc(request_counts, "LDAP Traffic")
+                counter_inc(service_counts, f"TCP/{server_port}")
+                counter_inc(convos, (client_ip, server_ip, server_port, "TCP"))
+                if server_port in LDAP_CLEAR_PORTS:
+                    cleartext_ldap_seen = True
                     cleartext_packets += 1
-                    if _is_public_ip(src_ip):
-                        counter_inc(public_endpoints, src_ip)
-                    if _is_public_ip(dst_ip):
-                        counter_inc(public_endpoints, dst_ip)
+                if server_port in {636, 3269}:
+                    ldaps_packets += 1
+                if _is_public_ip(src_ip):
+                    counter_inc(public_endpoints, src_ip)
+                if _is_public_ip(dst_ip):
+                    counter_inc(public_endpoints, dst_ip)
 
-    finally:
-        status.finish()
-        reader.close()
+            payload = bytes(getattr(tcp_layer, "payload", b""))
+            if payload and payload.startswith(
+                (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ")
+            ):
+                url, ua, method = _parse_http_request(payload)
+                if url:
+                    counter_inc(urls, url)
+                if ua:
+                    counter_inc(user_agents, ua)
+                if method:
+                    counter_inc(http_methods, method)
+                counter_inc(http_clients, src_ip)
+
+            if payload and ldap_roles is not None:
+                for token in _extract_ldap_strings(payload):
+                    if token:
+                        counter_inc(ldap_queries, token)
+                        filter_type = _ldap_filter_type(token)
+                        if filter_type:
+                            counter_inc(ldap_filter_types, filter_type)
+                        lower_token = token.lower()
+                        if "unicodepwd" in lower_token:
+                            counter_inc(suspicious_attributes, "unicodePwd")
+                        if "ms-mcs-admpwd" in lower_token:
+                            counter_inc(suspicious_attributes, "ms-Mcs-AdmPwd")
+                        if "userpassword" in lower_token:
+                            counter_inc(suspicious_attributes, "userPassword")
+                        if token.lower().startswith("cn="):
+                            counter_inc(ldap_users, token)
+                            set_add_cap(artifacts, token)
+                            key = (
+                                src_ip,
+                                dst_ip,
+                                server_port,
+                                proto or "TCP",
+                                "cn",
+                                token,
+                            )
+                            if key not in user_evidence_seen:
+                                user_evidence_seen.add(key)
+                                user_evidence.append(
+                                    {
+                                        "src_ip": src_ip,
+                                        "dst_ip": dst_ip,
+                                        "dst_port": server_port,
+                                        "protocol": proto or "TCP",
+                                        "attr": "cn",
+                                        "value": token.partition("=")[2].strip()
+                                        if "=" in token
+                                        else token,
+                                    }
+                                )
+
+                # Recover result codes from the binary BER (the ASCII
+                # heuristics below never match real LDAP responses).
+                for code in _ldap_result_codes_from_payload(payload):
+                    name = LDAP_RESULT_CODES.get(code, str(code))
+                    counter_inc(response_codes, f"{code} ({name})")
+                    # 0=success, 5/6=compareFalse/True, 14=saslBindInProgress
+                    # are normal results, not errors.
+                    if code not in (0, 5, 6, 14):
+                        counter_inc(ldap_error_codes, f"{code} ({name})")
+
+                for value in _extract_ascii_strings(
+                    payload
+                ) + _extract_utf16le_strings(payload):
+                    if not value:
+                        continue
+                    lower = value.lower()
+
+                    if (
+                        any(hint in lower for hint in FILTER_HINTS)
+                        or "(objectclass" in lower
+                    ):
+                        counter_inc(ldap_queries, value)
+                        set_add_cap(artifacts, value)
+                        filter_type = _ldap_filter_type(value)
+                        if filter_type:
+                            counter_inc(ldap_filter_types, filter_type)
+                        if "unicodepwd" in lower:
+                            counter_inc(suspicious_attributes, "unicodePwd")
+                        if "ms-mcs-admpwd" in lower:
+                            counter_inc(suspicious_attributes, "ms-Mcs-AdmPwd")
+                        if "userpassword" in lower:
+                            counter_inc(suspicious_attributes, "userPassword")
+
+                    for match in DN_TOKEN_RE.findall(value):
+                        counter_inc(ldap_queries, match)
+                        set_add_cap(artifacts, match)
+                        key, _, val = match.partition("=")
+                        key_lower = key.strip().lower()
+                        val = val.strip()
+                        if key_lower in LDAP_USER_ATTRS or key_lower in {
+                            "cn",
+                            "sn",
+                        }:
+                            ev_key = (
+                                src_ip,
+                                dst_ip,
+                                server_port,
+                                proto or "TCP",
+                                key_lower,
+                                val,
+                            )
+                            if ev_key not in user_evidence_seen:
+                                user_evidence_seen.add(ev_key)
+                                user_evidence.append(
+                                    {
+                                        "src_ip": src_ip,
+                                        "dst_ip": dst_ip,
+                                        "dst_port": server_port,
+                                        "protocol": proto or "TCP",
+                                        "attr": key_lower,
+                                        "value": val,
+                                    }
+                                )
+                        if key_lower in LDAP_USER_ATTRS:
+                            counter_inc(ldap_users, val)
+                        elif key_lower == "cn":
+                            if val.endswith("$"):
+                                counter_inc(ldap_systems, val)
+                            else:
+                                counter_inc(ldap_users, val)
+                        if key_lower in {"dnshostname", "serviceprincipalname"}:
+                            counter_inc(ldap_systems, val)
+
+                    if any(
+                        word in lower
+                        for word in (
+                            "bind",
+                            "search",
+                            "modify",
+                            "add",
+                            "delete",
+                            "compare",
+                            "extended",
+                            "unbind",
+                        )
+                    ):
+                        if "bind" in lower:
+                            counter_inc(request_counts, "Bind")
+                            for identity in _extract_bind_identities(value):
+                                if identity:
+                                    counter_inc(ldap_binds, identity)
+                                    key = (client_ip, server_ip, server_port, identity)
+                                    if key not in bind_identity_seen:
+                                        bind_identity_seen.add(key)
+                                        bind_identities.append(
+                                            {
+                                                "src_ip": src_ip,
+                                                "dst_ip": dst_ip,
+                                                "dst_port": server_port,
+                                                "protocol": "TCP",
+                                                "identity": identity,
+                                            }
+                                        )
+                            if ts is not None:
+                                minute_bucket = int(ts // 60)
+                                counter_inc(bind_buckets, (client_ip, minute_bucket))
+                        if "search" in lower:
+                            counter_inc(request_counts, "Search")
+                        if "modify" in lower:
+                            counter_inc(request_counts, "Modify")
+                        if "add" in lower:
+                            counter_inc(request_counts, "Add")
+                        if "delete" in lower:
+                            counter_inc(request_counts, "Delete")
+                        if "compare" in lower:
+                            counter_inc(request_counts, "Compare")
+                        if "extended" in lower:
+                            counter_inc(request_counts, "Extended")
+                        if "unbind" in lower:
+                            counter_inc(request_counts, "Unbind")
+
+                    for pattern in SECRET_PATTERNS:
+                        match = pattern.search(value)
+                        if match:
+                            counter_inc(secrets, match.group(0))
+                            set_add_cap(artifacts, match.group(0))
+
+                    if (
+                        "resultcode" in lower
+                        or "invalidcredentials" in lower
+                        or "insufficientaccessrights" in lower
+                    ):
+                        for name_lower, name in LDAP_RESULT_NAMES.items():
+                            if name_lower in lower:
+                                counter_inc(response_codes, name)
+                                if name_lower in {
+                                    "invalidcredentials",
+                                    "insufficientaccessrights",
+                                }:
+                                    counter_inc(ldap_error_codes, name)
+                        numeric_match = re.search(
+                            r"resultcode\s*[:=]\s*(\d+)", lower
+                        )
+                        if numeric_match:
+                            code = int(numeric_match.group(1))
+                            name = LDAP_RESULT_CODES.get(code, str(code))
+                            counter_inc(response_codes, f"{code} ({name})")
+                            if code != 0:
+                                counter_inc(ldap_error_codes, f"{code} ({name})")
+
+        if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+            udp_layer = pkt[UDP]  # type: ignore[index]
+            sport = int(getattr(udp_layer, "sport", 0) or 0)
+            dport = int(getattr(udp_layer, "dport", 0) or 0)
+            ldap_roles = _ldap_roles(src_ip, dst_ip, sport, dport)
+            if ldap_roles is not None:
+                client_ip, server_ip, server_port = ldap_roles
+                _mark_window(ts)
+                counter_inc(servers, server_ip)
+                counter_inc(clients, client_ip)
+                counter_inc(request_counts, "LDAP Traffic")
+                counter_inc(service_counts, f"UDP/{server_port}")
+                counter_inc(convos, (client_ip, server_ip, server_port, "UDP"))
+                udp_ldap_seen = True
+                cleartext_packets += 1
+                if _is_public_ip(src_ip):
+                    counter_inc(public_endpoints, src_ip)
+                if _is_public_ip(dst_ip):
+                    counter_inc(public_endpoints, dst_ip)
+
 
     duration = 0.0
     if first_seen is not None and last_seen is not None:
@@ -630,7 +645,7 @@ def analyze_ldap(
         LdapConversation(src, dst, port, proto, count)
         for (src, dst, port, proto), count in convos.items()
     ]
-    conversations.sort(key=lambda c: c.packets, reverse=True)
+    conversations.sort(key=lambda c: (-c.packets, c.src_ip, c.dst_ip, c.dst_port, c.proto))
 
     session_stats = {
         "total_sessions": len(conversations),

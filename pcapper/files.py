@@ -40,15 +40,15 @@ except Exception:  # pragma: no cover
 from .aim import analyze_aim
 from .cip import CIP_SERVICE_NAMES
 from .nfs import analyze_nfs
-from .pcap_cache import get_reader
+from .pcap_cache import iter_packets
 from .utils import (
     detect_file_type_bytes,
     extract_packet_endpoints,
     memoize_analysis,
     packet_length,
     restrict_dir_permissions,
-    restrict_permissions,
     safe_float,
+    safe_write_bytes,
 )
 
 try:
@@ -4390,8 +4390,7 @@ def _export_with_dpkt(
                     if out_p is None:
                         continue
                     try:
-                        out_p.write_bytes(art.payload)
-                        restrict_permissions(out_p)
+                        safe_write_bytes(out_p, art.payload)
                         extracted_paths.append(out_p)
                     except Exception:
                         continue
@@ -4494,29 +4493,13 @@ def _export_with_scapy(
         except Exception as exc:
             errors.append(f"Scapy file extraction failed: {exc}")
     else:
-        reader = None
-        status = None
         try:
-            reader, status, _stream, _size_bytes, _file_type = get_reader(
-                path, show_status=show_status
-            )
-            for idx, pkt in enumerate(reader, start=1):
+            for idx, pkt in enumerate(iter_packets(path, show_status=show_status), start=1):
                 if _packet_in_scope(pkt):
                     extractor.process_packet(pkt, idx)
             extractor.finalize()
         except Exception as exc:
             errors.append(f"Scapy file extraction failed: {exc}")
-        finally:
-            try:
-                if status is not None:
-                    status.finish()
-            except Exception:
-                pass
-            try:
-                if reader is not None:
-                    reader.close()
-            except Exception:
-                pass
 
     if extractor.artifacts:
         detections.append(

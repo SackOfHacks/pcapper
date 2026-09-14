@@ -7,15 +7,26 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from .pcap_cache import PcapMeta, get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .progress import build_statusbar
-from .utils import counter_inc, decode_payload, extract_packet_endpoints, memoize_analysis, packet_length, safe_float, set_add_cap, setdict_add
+from .utils import (
+    counter_inc,
+    decode_payload,
+    env_int,
+    extract_packet_endpoints,
+    memoize_analysis,
+    packet_length,
+    safe_float,
+    set_add_cap,
+    setdict_add,
+)
 
 try:
     from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore
@@ -30,13 +41,45 @@ except Exception:  # pragma: no cover
     TCP = None  # type: ignore
     IPv6 = None  # type: ignore
 
-MAX_DNS_UNIQUE = int(os.getenv("PCAPPER_MAX_DNS_UNIQUE", "50000"))
-MAX_VT_CACHE = int(os.getenv("PCAPPER_VT_CACHE_SIZE", "2048"))
-MAX_VT_LOOKUPS = int(os.getenv("PCAPPER_VT_MAX_LOOKUPS", "500"))
-VT_TIMEOUT = float(os.getenv("PCAPPER_VT_TIMEOUT", "8"))
+MAX_DNS_UNIQUE = env_int("PCAPPER_MAX_DNS_UNIQUE", 50000, minimum=1)
+MAX_VT_CACHE = env_int("PCAPPER_VT_CACHE_SIZE", 2048, minimum=1)
+MAX_VT_LOOKUPS = env_int("PCAPPER_VT_MAX_LOOKUPS", 500)
+VT_TIMEOUT = float(env_int("PCAPPER_VT_TIMEOUT", 8, minimum=1))
+# Wall-clock budget for the whole VirusTotal pass. 500 lookups at an 8 s
+# timeout each is over an hour with nothing to show for it; when the budget
+# is spent the remaining names are reported as not looked up.
+VT_BUDGET_SECONDS = float(env_int("PCAPPER_VT_BUDGET_SECONDS", 120, minimum=1))
+# Bounded per-key sample lists. Periodicity needs a handful of timestamps,
+# TTL churn a handful of TTLs; unbounded lists on a busy resolver capture
+# were the analyzer's largest allocation.
+_MAX_TIMES_PER_QNAME = 512
+_MAX_TIMES_PER_CLIENT_QNAME = 64
+_MAX_TTL_SAMPLES = 128
+_MAX_ORPHAN_RESPONSES = 1000
+_MAX_PENDING_QUERIES = 100_000
 
 
 _VT_CACHE: "OrderedDict[str, dict[str, object]]" = OrderedDict()
+
+# A name that may be sent to a third-party reputation service: a syntactically
+# valid public hostname. Anything else — internal TLDs, reverse-lookup zones,
+# mDNS/LLMNR names, single labels, IP literals — stays on the box, because
+# every name sent to VirusTotal is a disclosure of the investigated network.
+_PUBLIC_HOSTNAME_RE = re.compile(
+    r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
+)
+_NON_PUBLIC_SUFFIXES = (
+    ".local", ".lan", ".localdomain", ".home", ".corp", ".internal", ".intranet",
+    ".arpa", ".localhost", ".test", ".example", ".invalid", ".onion", ".home.arpa",
+)
+
+
+def vt_lookup_candidate(name: str) -> bool:
+    """True when ``name`` is a public hostname safe to submit for reputation."""
+    text = str(name or "").strip().strip(".").lower()
+    if not text or not _PUBLIC_HOSTNAME_RE.match(text):
+        return False
+    return not any(text.endswith(suffix) or text == suffix[1:] for suffix in _NON_PUBLIC_SUFFIXES)
 
 
 PUBLIC_DNS_RESOLVERS: dict[str, str] = {
@@ -329,7 +372,9 @@ def _vt_rating(stats: dict[str, object]) -> str:
 def _vt_lookup_domain(
     domain: str, api_key: str
 ) -> tuple[Optional[dict[str, object]], Optional[str]]:
-    url = f"https://www.virustotal.com/api/v3/domains/{domain}"
+    # The name came off the wire; percent-encode it so a "/" or "?" in a
+    # hostile qname cannot rewrite the request path or query.
+    url = "https://www.virustotal.com/api/v3/domains/" + urllib.parse.quote(domain, safe="")
     headers = {"x-apikey": api_key}
     req = urllib.request.Request(url, headers=headers)
     try:
@@ -368,11 +413,22 @@ def _vt_lookup_domains(
     domains: list[str],
     api_key: str,
     progress_cb: Callable[[int, int, str], None] | None = None,
+    *,
+    lookup: Callable[[str, str], tuple[Optional[dict[str, object]], Optional[str]]] | None = None,
+    budget_seconds: float | None = None,
 ) -> tuple[dict[str, dict[str, object]], list[str]]:
+    """Look up ``domains`` in order until the count cap or the time budget.
+
+    Only names that pass :func:`vt_lookup_candidate` are sent; the rest are
+    counted and reported, never transmitted. ``lookup`` and ``budget_seconds``
+    are injectable for tests.
+    """
     results: dict[str, dict[str, object]] = {}
     errors: list[str] = []
     if not domains:
         return results, errors
+    lookup = lookup or _vt_lookup_domain
+    budget = VT_BUDGET_SECONDS if budget_seconds is None else budget_seconds
 
     max_lookups = MAX_VT_LOOKUPS
     if max_lookups <= 0:
@@ -380,12 +436,21 @@ def _vt_lookup_domains(
 
     ordered_domains: list[str] = []
     seen_domains: set[str] = set()
+    withheld = 0
     for domain in domains:
         domain_text = str(domain or "").strip().lower()
         if not domain_text or domain_text in seen_domains:
             continue
         seen_domains.add(domain_text)
+        if not vt_lookup_candidate(domain_text):
+            withheld += 1
+            continue
         ordered_domains.append(domain_text)
+    if withheld:
+        errors.append(
+            f"VT: {withheld} internal/non-public name(s) withheld from lookup "
+            "(local TLDs, reverse zones, mDNS/LLMNR names are never sent)."
+        )
 
     if len(ordered_domains) > max_lookups:
         errors.append(
@@ -397,13 +462,21 @@ def _vt_lookup_domains(
     if total == 0:
         return results, errors
 
+    started = time.monotonic()
     for idx, domain in enumerate(ordered_domains, start=1):
         cached = _VT_CACHE.get(domain)
         if cached is not None:
             _VT_CACHE.move_to_end(domain)
             results[domain] = cached
         else:
-            vt_result, err = _vt_lookup_domain(domain, api_key)
+            if time.monotonic() - started > budget:
+                errors.append(
+                    f"VT time budget of {budget:.0f}s spent after {idx - 1}/{total} "
+                    "lookups; remaining names not looked up "
+                    "(PCAPPER_VT_BUDGET_SECONDS)."
+                )
+                break
+            vt_result, err = lookup(domain, api_key)
             if vt_result:
                 results[domain] = vt_result
                 _VT_CACHE[domain] = vt_result
@@ -411,13 +484,13 @@ def _vt_lookup_domains(
                     _VT_CACHE.popitem(last=False)
             if err:
                 errors.append(err)
+            if idx < total:
+                time.sleep(0.05)
         if progress_cb is not None:
             try:
                 progress_cb(idx, total, domain)
             except Exception:
                 pass
-        if idx > 1:
-            time.sleep(0.05)
     return results, errors
 
 
@@ -490,12 +563,6 @@ def analyze_dns(
             errors=errors,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
-
-    size_bytes = size_bytes
-
     total_packets = 0
     total_bytes = 0
     query_packets = 0
@@ -557,8 +624,9 @@ def analyze_dns(
     client_nxdomain: Counter[str] = Counter()
     base_domain_priv_pub: dict[str, set[str]] = defaultdict(set)
     client_resolvers: dict[str, Counter[str]] = defaultdict(Counter)
-    pending_queries: dict[tuple[str, str, int], dict[str, object]] = {}
+    pending_queries: "OrderedDict[tuple[str, str, int], dict[str, object]]" = OrderedDict()
     orphan_responses: list[dict[str, object]] = []
+    record_parse_errors = 0
     qname_ttl_values: dict[str, list[int]] = defaultdict(list)
     cname_targets: dict[str, set[str]] = defaultdict(set)
     one_off_high_entropy: list[tuple[str, int, int]] = []
@@ -608,20 +676,14 @@ def analyze_dns(
     bucket_counts: dict[str, int] = defaultdict(int)
     bucket_sizes: dict[str, list[int]] = defaultdict(list)
     bucket_times: dict[str, list[float]] = defaultdict(list)
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
-            if not pkt.haslayer(DNS):  # type: ignore[truthy-bool]
-                continue
-
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        dns_layer = pkt.getlayer(DNS)  # type: ignore[arg-type]
+        if dns_layer is None:
+            continue
+        try:
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -639,10 +701,9 @@ def analyze_dns(
             udp_layer = pkt.getlayer(UDP) if UDP is not None else None  # type: ignore[arg-type]
             if udp_layer is not None:
                 udp_packets += 1
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+            if TCP is not None and pkt.getlayer(TCP) is not None:  # type: ignore[arg-type]
                 tcp_packets += 1
 
-            dns_layer = pkt[DNS]  # type: ignore[index]
             # mDNS/LLMNR use large packets by design (known-answer suppression,
             # service records), so keep them out of the *unicast* query/response
             # size stats — otherwise they trip the "large DNS query/response"
@@ -716,28 +777,31 @@ def analyze_dns(
                     counter_inc(opcode_clients[int(opcode)], op_client)
                     counter_inc(opcode_servers[int(opcode)], op_server)
 
-                if src_ip and dst_ip:
-                    dns_id = int(getattr(dns_layer, "id", 0) or 0)
-                    if getattr(dns_layer, "qr", 0) == 0:
-                        pending_queries[(src_ip, dst_ip, dns_id)] = {
-                            "ts": ts,
-                            "src": src_ip,
-                            "dst": dst_ip,
-                            "id": dns_id,
-                        }
-                    else:
-                        match_key = (dst_ip, src_ip, dns_id)
-                        if match_key in pending_queries:
-                            pending_queries.pop(match_key, None)
-                        elif dns_id != 0:
-                            orphan_responses.append(
-                                {
-                                    "ts": ts,
-                                    "src": src_ip,
-                                    "dst": dst_ip,
-                                    "id": dns_id,
-                                }
-                            )
+                dns_id = int(getattr(dns_layer, "id", 0) or 0)
+                if getattr(dns_layer, "qr", 0) == 0:
+                    # Unanswered queries are never removed, so bound the table:
+                    # the oldest pending entry is dropped once it is full.
+                    if len(pending_queries) >= _MAX_PENDING_QUERIES:
+                        pending_queries.popitem(last=False)
+                    pending_queries[(src_ip, dst_ip, dns_id)] = {
+                        "ts": ts,
+                        "src": src_ip,
+                        "dst": dst_ip,
+                        "id": dns_id,
+                    }
+                else:
+                    match_key = (dst_ip, src_ip, dns_id)
+                    if match_key in pending_queries:
+                        pending_queries.pop(match_key, None)
+                    elif dns_id != 0 and len(orphan_responses) < _MAX_ORPHAN_RESPONSES:
+                        orphan_responses.append(
+                            {
+                                "ts": ts,
+                                "src": src_ip,
+                                "dst": dst_ip,
+                                "id": dns_id,
+                            }
+                        )
 
                 if udp_layer is not None:
                     if dst_ip.startswith("224.") or dst_ip.startswith("ff02::"):
@@ -821,8 +885,7 @@ def analyze_dns(
                         counter_inc(tld_counts, tld)
                         if tld in INTERNAL_TLDS and not is_mdns:
                             counter_inc(local_unicast_qname_counts, name)
-                        lower_name = name.lower()
-                        ot_hits = OT_KEYWORD_RE.findall(lower_name)
+                        ot_hits = OT_KEYWORD_RE.findall(name)
                         if ot_hits:
                             counter_inc(ot_qname_counts, name)
                             for keyword in ot_hits:
@@ -853,7 +916,7 @@ def analyze_dns(
                                     or len(qname_query_times) < MAX_DNS_UNIQUE
                                 ):
                                     q_times = qname_query_times[name]
-                                    if len(q_times) < 512:
+                                    if len(q_times) < _MAX_TIMES_PER_QNAME:
                                         q_times.append(ts)
                                 pair_key = (src_ip, name)
                                 if (
@@ -861,7 +924,7 @@ def analyze_dns(
                                     or len(client_qname_times) < MAX_DNS_UNIQUE
                                 ):
                                     cq_times = client_qname_times[pair_key]
-                                    if len(cq_times) < 256:
+                                    if len(cq_times) < _MAX_TIMES_PER_CLIENT_QNAME:
                                         cq_times.append(ts)
                     qtype = getattr(qd, "qtype", None)
                     if qtype is not None:
@@ -915,7 +978,9 @@ def analyze_dns(
                                 )
                                 rr_ttl = int(getattr(rr, "ttl", 0) or 0)
                                 if rr_ttl > 0:
-                                    qname_ttl_values[rrname_str].append(rr_ttl)
+                                    ttl_samples = qname_ttl_values[rrname_str]
+                                    if len(ttl_samples) < _MAX_TTL_SAMPLES:
+                                        ttl_samples.append(rr_ttl)
                                 if rrtype in {1, 28}:  # A or AAAA
                                     setdict_add(
                                         base_domain_answers,
@@ -966,16 +1031,30 @@ def analyze_dns(
                                             mdns_service_counts, service_name
                                         )
                     except Exception:
-                        pass
+                        # Counted, not hidden: the records of this response
+                        # are lost to every answer-derived finding.
+                        record_parse_errors += 1
 
             if ts is not None:
                 if first_seen is None or ts < first_seen:
                     first_seen = ts
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
-    finally:
-        status.finish()
-        reader.close()
+        except Exception as exc:  # noqa: BLE001 — one malformed packet must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
+
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} DNS packet(s) skipped after a dissection error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
+    if record_parse_errors:
+        errors.append(
+            f"Answer records could not be parsed in {record_parse_errors} "
+            "response(s); answer-derived findings are lower bounds."
+        )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:

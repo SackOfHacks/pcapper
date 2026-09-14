@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 
-from .utils import shannon_entropy as _shannon_entropy
 import ipaddress
 import math
 import re
@@ -11,23 +10,36 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
-from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, memoize_analysis, safe_float
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import (
+    extract_packet_endpoints,
+    is_public_ip,
+    memoize_analysis,
+    safe_float,
+    shannon_entropy,
+)
 
 try:
     from scapy.layers.dhcp import BOOTP, DHCP  # type: ignore
-    from scapy.layers.inet import IP, UDP  # type: ignore
+    from scapy.layers.inet import UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
     from scapy.layers.l2 import Ether  # type: ignore
     from scapy.packet import Raw  # type: ignore
 except Exception:
-    IP = UDP = IPv6 = Ether = DHCP = BOOTP = Raw = None
+    UDP = IPv6 = Ether = DHCP = BOOTP = Raw = None
 
 
 _FILENAME_RE = re.compile(
     r"[\w\-.()\[\] ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|txt|bat|ps1|jpg|jpeg|png|gif|iso|img|tar|gz|7z|rar)",
     re.IGNORECASE,
 )
+_PRINTABLE_RUN_RE = re.compile(r"[ -~]{6,}")
+_MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+_ZERO_MAC = "00:00:00:00:00:00"
+# Per-packet evidence lists are capped at insertion; the report shows at most
+# this many anyway, and a NAK storm used to buffer one dict per packet.
+_MAX_TRANSACTION_VIOLATIONS = 120
+_MAX_CHECK_LINES = 50
 
 _BENIGN_DHCP_IDENTITY_TOKENS = (
     "msft",
@@ -220,9 +232,9 @@ def _format_mac(value: object) -> str:
             raw = raw[:6]
             return ":".join(f"{b:02x}" for b in raw)
     text = _decode_name(value).lower().replace("-", ":")
-    if re.match(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$", text):
+    if _MAC_RE.match(text):
         return text
-    return text or "00:00:00:00:00:00"
+    return text or _ZERO_MAC
 
 
 def _extract_ip_pair(pkt) -> tuple[str, str]:
@@ -231,26 +243,47 @@ def _extract_ip_pair(pkt) -> tuple[str, str]:
 
 
 def _extract_mac_pair(pkt) -> tuple[str, str]:
-    if Ether is not None and pkt.haslayer(Ether):
-        try:
-            return str(pkt[Ether].src), str(pkt[Ether].dst)
-        except Exception:
-            return "00:00:00:00:00:00", "00:00:00:00:00:00"
-    return "00:00:00:00:00:00", "00:00:00:00:00:00"
+    ether = pkt.getlayer(Ether) if Ether is not None else None
+    if ether is None:
+        return _ZERO_MAC, _ZERO_MAC
+    return str(ether.src), str(ether.dst)
 
 
-def _extract_payload(pkt) -> bytes:
-    if Raw is not None and pkt.haslayer(Raw):
-        try:
-            return bytes(pkt[Raw].load)
-        except Exception:
-            return b""
-    if UDP is not None and pkt.haslayer(UDP):
-        try:
-            return bytes(pkt[UDP].payload)
-        except Exception:
-            return b""
-    return b""
+def _extract_payload(udp_layer) -> bytes:
+    """The UDP payload bytes, whether scapy left them as Raw or dissected them."""
+    raw_layer = udp_layer.getlayer(Raw) if Raw is not None else None
+    try:
+        if raw_layer is not None:
+            return bytes(raw_layer.load)
+        return bytes(udp_layer.payload)
+    except Exception:
+        return b""
+
+
+def _decode_dns_names(data: bytes) -> list[str]:
+    """Decode a sequence of uncompressed DNS wire-format names (RFC 1035 §3.1).
+
+    DHCPv6 carries the Client FQDN (option 39) and Domain Search List (option
+    24) this way; reading them as text leaves the length bytes in the string.
+    """
+    names: list[str] = []
+    labels: list[str] = []
+    pos = 0
+    while pos < len(data):
+        length = data[pos]
+        pos += 1
+        if length == 0:
+            if labels:
+                names.append(".".join(labels))
+            labels = []
+            continue
+        if length >= 0xC0 or pos + length > len(data):
+            break  # compression pointers are not valid here; truncated otherwise
+        labels.append(data[pos : pos + length].decode("latin-1", errors="ignore"))
+        pos += length
+    if labels:  # a name without the terminating zero label
+        names.append(".".join(labels))
+    return [name for name in names if name]
 
 
 def _extract_payload_strings(payload: bytes) -> list[str]:
@@ -258,7 +291,7 @@ def _extract_payload_strings(payload: bytes) -> list[str]:
         return []
     text = payload.decode("latin-1", errors="ignore")
     tokens: list[str] = []
-    for token in re.findall(r"[ -~]{6,}", text):
+    for token in _PRINTABLE_RUN_RE.findall(text):
         cleaned = " ".join(token.split())
         if cleaned:
             tokens.append(cleaned[:120])
@@ -429,10 +462,10 @@ def _parse_dhcp6_options(payload: bytes) -> tuple[str, dict[str, object], int]:
                 idx += 16
             if addrs:
                 options["name_server"] = addrs
-        elif code == 24:  # Domain Search List
-            decoded = _decode_name(value)
-            if decoded:
-                options["domain_name"] = decoded
+        elif code == 24:  # Domain Search List (DNS wire-format names)
+            names = _decode_dns_names(value)
+            if names:
+                options["domain_name"] = names
         elif code == 59:  # Bootfile URL
             decoded = _decode_name(value)
             if decoded:
@@ -454,27 +487,29 @@ def _parse_dhcp6_options(payload: bytes) -> tuple[str, dict[str, object], int]:
             decoded = _decode_name(value)
             if decoded:
                 options["vendor_class"] = decoded
-        elif code == 15:  # User Class
+        elif code == 15:  # User Class (was mislabelled as the hostname)
             decoded = _decode_name(value)
             if decoded:
-                options["hostname"] = decoded
+                options["user_class"] = decoded
+        elif code == 39 and len(value) >= 2:  # Client FQDN: flags byte + DNS name
+            names = _decode_dns_names(value[1:])
+            if names:
+                options["hostname"] = names[0]
 
     return msg_type, options, xid
 
 
 @memoize_analysis
-def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
+def analyze_dhcp(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> DhcpSummary:
     if DHCP is None or BOOTP is None or UDP is None:
         return DhcpSummary(
             path=path, errors=["Scapy unavailable (DHCP/BOOTP/UDP layer missing)"]
         )
-
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as exc:
-        return DhcpSummary(path=path, errors=[f"Error opening pcap: {exc}"])
 
     summary = DhcpSummary(path=path)
     start_ts: Optional[float] = None
@@ -543,41 +578,38 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             )
         )
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    status.update(int(min(100, (stream.tell() / size_bytes) * 100)))
-                except Exception:
-                    pass
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-            summary.total_packets += 1
-            if not pkt.haslayer(UDP):
-                continue
-
-            udp_layer = pkt[UDP]
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        summary.total_packets += 1
+        udp_layer = pkt.getlayer(UDP)
+        if udp_layer is None:
+            continue
+        try:
             sport = int(getattr(udp_layer, "sport", 0) or 0)
             dport = int(getattr(udp_layer, "dport", 0) or 0)
-            is_dhcpv4 = (
-                (not {sport, dport}.isdisjoint({67, 68}))
-                and pkt.haslayer(DHCP)
-                and pkt.haslayer(BOOTP)
-            )
+            dhcp_layer = bootp_layer = None
+            if sport in (67, 68) or dport in (67, 68):
+                dhcp_layer = udp_layer.getlayer(DHCP)
+                bootp_layer = udp_layer.getlayer(BOOTP)
+            is_dhcpv4 = dhcp_layer is not None and bootp_layer is not None
             is_dhcpv6 = False
+            payload = b""
             if (
                 not is_dhcpv4
-                and not {sport, dport}.isdisjoint({546, 547})
+                and (sport in (546, 547) or dport in (546, 547))
                 and IPv6 is not None
-                and pkt.haslayer(IPv6)
+                and pkt.getlayer(IPv6) is not None
             ):
-                payload_probe = _extract_payload(pkt)
-                if payload_probe:
-                    msg_code = int(payload_probe[0])
-                    if msg_code in _DHCP6_MESSAGE_TYPES:
-                        is_dhcpv6 = True
+                payload = _extract_payload(udp_layer)
+                if payload and int(payload[0]) in _DHCP6_MESSAGE_TYPES:
+                    is_dhcpv6 = True
 
             if not (is_dhcpv4 or is_dhcpv6):
                 continue
+            if is_dhcpv4:
+                payload = _extract_payload(udp_layer)
 
             summary.dhcp_packets += 1
             ts = safe_float(getattr(pkt, "time", None)) or 0.0
@@ -588,7 +620,6 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
 
             src_ip, dst_ip = _extract_ip_pair(pkt)
             src_mac, dst_mac = _extract_mac_pair(pkt)
-            payload = _extract_payload(pkt)
             if src_ip and src_ip not in source_first_seen:
                 source_first_seen[src_ip] = ts
 
@@ -597,7 +628,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             summary.src_macs[src_mac] += 1
             summary.dst_macs[dst_mac] += 1
 
-            chaddr = src_mac if src_mac and src_mac != "00:00:00:00:00:00" else src_ip
+            chaddr = src_mac if src_mac and src_mac != _ZERO_MAC else src_ip
             ciaddr = src_ip
             yiaddr = "0.0.0.0"
             siaddr = dst_ip
@@ -606,8 +637,6 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             msg_type = "UNKNOWN"
 
             if is_dhcpv4:
-                dhcp_layer = pkt[DHCP]
-                bootp_layer = pkt[BOOTP]
                 chaddr = _format_mac(getattr(bootp_layer, "chaddr", b""))
                 ciaddr = str(getattr(bootp_layer, "ciaddr", "0.0.0.0") or "0.0.0.0")
                 yiaddr = str(getattr(bootp_layer, "yiaddr", "0.0.0.0") or "0.0.0.0")
@@ -663,22 +692,19 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
 
             session_client_ip = ciaddr if ciaddr != "0.0.0.0" else src_ip
 
-            relay_ip = _decode_name(
-                option_map.get(
-                    "relay_agent_Information",
-                    option_map.get("relay_agent_information", ""),
-                )
-            )
+            relay_ip = _decode_name(option_map.get("relay_agent_information", ""))
             if relay_ip:
                 summary.relay_agents[relay_ip] += 1
 
+            lease_seconds: Optional[int] = None
             lease_time_val = option_map.get("lease_time")
             if lease_time_val is not None:
                 try:
                     lease_seconds = int(lease_time_val)
-                    summary.lease_time_buckets[_lease_bucket(lease_seconds)] += 1
-                except Exception:
-                    pass
+                except (TypeError, ValueError):
+                    lease_seconds = None
+            if lease_seconds is not None:
+                summary.lease_time_buckets[_lease_bucket(lease_seconds)] += 1
 
             if requested_ip:
                 summary.requested_ips[requested_ip] += 1
@@ -808,6 +834,11 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 )
                 sessions[sess_key] = session
 
+            # Any client message opens a transaction: an OFFER answers a
+            # DISCOVER, an ACK answers a REQUEST or INFORM. Remembering only
+            # REQUEST xids reported every DISCOVER/OFFER pair as a violation.
+            if xid and msg_type in _CLIENT_MSG_TYPES:
+                xid_client_requests[chaddr].add(xid)
             if msg_type in {
                 "REQUEST",
                 "REQUESTv6",
@@ -818,8 +849,6 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 "INFO-REQUESTv6",
             }:
                 session.requests += 1
-                if xid:
-                    xid_client_requests[chaddr].add(xid)
             elif msg_type in {"OFFER", "ADVERTISEv6"}:
                 session.offers += 1
                 offer_servers_by_client[chaddr].add(server_id or src_ip)
@@ -871,17 +900,10 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                     if lease.lease_start is None or ts < lease.lease_start:
                         lease.lease_start = ts
 
-                if lease_time_val is not None:
-                    try:
-                        lease_seconds = int(lease_time_val)
-                    except Exception:
-                        lease_seconds = None
-                    if lease_seconds is not None and lease_seconds > 0:
-                        lease.lease_seconds = lease_seconds
-                        lease_base = (
-                            lease.lease_start if lease.lease_start is not None else ts
-                        )
-                        lease.lease_end_estimate = lease_base + float(lease_seconds)
+                if lease_seconds is not None and lease_seconds > 0:
+                    lease.lease_seconds = lease_seconds
+                    lease_base = lease.lease_start if lease.lease_start is not None else ts
+                    lease.lease_end_estimate = lease_base + float(lease_seconds)
 
                 lease.message_count += 1
 
@@ -900,27 +922,31 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             if yiaddr and yiaddr != "0.0.0.0" and msg_type in {"OFFER", "ACK"}:
                 yiaddr_clients[yiaddr].add(chaddr)
 
-            has_client_identity = bool(chaddr and chaddr != "00:00:00:00:00:00")
+            has_client_identity = bool(chaddr and chaddr != _ZERO_MAC)
             if (
                 msg_type in _SERVER_MSG_TYPES
                 and xid
                 and has_client_identity
                 and xid not in xid_client_requests.get(chaddr, set())
             ):
-                summary.transaction_violations.append(
-                    {
-                        "server": server_key,
-                        "client_mac": chaddr,
-                        "xid": xid,
-                        "type": msg_type,
-                        "src": src_ip,
-                        "dst": dst_ip,
-                        "ts": ts,
-                    }
-                )
-                deterministic_checks["transaction_integrity_violation"].append(
-                    f"{msg_type} xid={xid} server={server_key} client={chaddr} without prior REQUEST"
-                )
+                if len(summary.transaction_violations) < _MAX_TRANSACTION_VIOLATIONS:
+                    summary.transaction_violations.append(
+                        {
+                            "server": server_key,
+                            "client_mac": chaddr,
+                            "xid": xid,
+                            "type": msg_type,
+                            "src": src_ip,
+                            "dst": dst_ip,
+                            "ts": ts,
+                        }
+                    )
+                violation_lines = deterministic_checks["transaction_integrity_violation"]
+                if len(violation_lines) < _MAX_CHECK_LINES:
+                    violation_lines.append(
+                        f"{msg_type} xid={xid} server={server_key} client={chaddr} "
+                        "without a client message opening that transaction"
+                    )
 
             # Exfil/abuse heuristics for option values
             for value in (hostname, domain, vendor_class, client_id):
@@ -929,7 +955,7 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
                 low_value = value.lower()
                 if any(token in low_value for token in _BENIGN_DHCP_IDENTITY_TOKENS):
                     continue
-                entropy = _shannon_entropy(value)
+                entropy = shannon_entropy(value)
                 if len(value) >= 80 or entropy >= 3.8:
                     exfil_signals[chaddr] += 1
                     summary.exfil_candidates[chaddr] += 1
@@ -947,15 +973,16 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
             for token in strings:
                 strings_counter[token] += 1
             files.update(_extract_files(strings))
+        except Exception as exc:  # noqa: BLE001 — one malformed message must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
 
-    except Exception as exc:
-        summary.errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
+    if skipped_packets:
+        summary.errors.append(
+            f"{skipped_packets} DHCP message(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     if start_ts is not None and end_ts is not None:
         summary.duration = max(0.0, end_ts - start_ts)
@@ -1183,12 +1210,9 @@ def analyze_dhcp(path: Path, show_status: bool = True) -> DhcpSummary:
         )
 
     # Bonus endpoint details for public-facing DHCP relays/servers
-    for ip_value in list(summary.server_details.keys()):
-        try:
-            if ipaddress.ip_address(ip_value).is_global:
-                summary.threat_summary["Public DHCP Infrastructure Exposure"] += 1
-        except Exception:
-            continue
+    for ip_value in summary.server_details:
+        if is_public_ip(ip_value):
+            summary.threat_summary["Public DHCP Infrastructure Exposure"] += 1
 
     for yiaddr, clients in yiaddr_clients.items():
         if yiaddr == "0.0.0.0" or len(clients) < 2:

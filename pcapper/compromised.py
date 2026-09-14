@@ -13,10 +13,11 @@ from .beacon import analyze_beacons
 from .creds import analyze_creds
 from .exfil import analyze_exfil
 from .hosts import analyze_hosts
+from .pcap_cache import PcapMeta
 from .progress import run_with_busy_status
 from .secrets import analyze_secrets
 from .threats import OT_PORTS, analyze_threats
-from .utils import format_bytes_as_mb
+from .utils import format_bytes_as_mb, memoize_analysis
 
 IOC_DOMAIN_RE = re.compile(
     r"\b([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9-]{2,})+)\b", re.IGNORECASE
@@ -40,6 +41,11 @@ IOC_FILENAME_RE = re.compile(
     r"\b[\w\-.()\[\]]{1,64}\.(?:exe|dll|sys|scr|cpl|ocx|bat|ps1|vbs|js|jar|zip|rar|7z|gz|iso|img|pdf|doc|docx|xls|xlsx|ppt|pptx)\b",
     re.IGNORECASE,
 )
+
+_IPV4_TOKEN_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_IPV6_TOKEN_RE = re.compile(r"\b[0-9a-fA-F:]{3,}\b")
+_FLOW_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\s*->\s*(\d{1,3}(?:\.\d{1,3}){3})\b")
+_HASH_RE = re.compile(r"[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}")
 
 SEVERITY_WEIGHT = {
     "critical": 8,
@@ -103,10 +109,10 @@ def _extract_ips_from_text(text: str) -> set[str]:
     if not text:
         return set()
     hits = set()
-    for token in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text):
+    for token in _IPV4_TOKEN_RE.findall(text):
         if _valid_ip(token):
             hits.add(token)
-    for token in re.findall(r"\b[0-9a-fA-F:]{3,}\b", text):
+    for token in _IPV6_TOKEN_RE.findall(text):
         if ":" in token and _valid_ip(token):
             hits.add(token)
     return hits
@@ -180,14 +186,11 @@ def _extract_source_ips_from_detection(entry: dict[str, object]) -> set[str]:
                 if _valid_ip(str(item[0])):
                     ips.add(str(item[0]))
 
-    flow_pattern = re.compile(
-        r"\b(\d{1,3}(?:\.\d{1,3}){3})\s*->\s*(\d{1,3}(?:\.\d{1,3}){3})\b"
-    )
     for blob_key in ("details", "summary"):
         blob = entry.get(blob_key)
         if not isinstance(blob, str):
             continue
-        for src_value, _dst_value in flow_pattern.findall(blob):
+        for src_value, _dst_value in _FLOW_RE.findall(blob):
             if _valid_ip(src_value):
                 ips.add(src_value)
 
@@ -196,7 +199,7 @@ def _extract_source_ips_from_detection(entry: dict[str, object]) -> set[str]:
         for item in evidence:
             if not isinstance(item, str):
                 continue
-            for src_value, _dst_value in flow_pattern.findall(item):
+            for src_value, _dst_value in _FLOW_RE.findall(item):
                 if _valid_ip(src_value):
                     ips.add(src_value)
 
@@ -353,12 +356,18 @@ def _add_host_evidence(
             entry["first_ts"] = ts
 
 
+@memoize_analysis
 def analyze_compromised(
-    path: Path, show_status: bool = True, vt_lookup: bool = False
+    path: Path,
+    show_status: bool = True,
+    vt_lookup: bool = False,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> CompromiseSummary:
     errors: list[str] = []
+    view = {"packets": packets, "meta": meta}
 
-    hosts_summary = analyze_hosts(path, show_status=show_status)
+    hosts_summary = analyze_hosts(path, show_status=show_status, **view)
 
     def _busy(desc: str, func, *args, **kwargs):
         return run_with_busy_status(
@@ -368,10 +377,10 @@ def analyze_compromised(
     threat_summary = _busy(
         "Threats", analyze_threats, path, show_status=False, vt_lookup=vt_lookup
     )
-    beacon_summary = _busy("Beacons", analyze_beacons, path, show_status=False)
-    exfil_summary = _busy("Exfil", analyze_exfil, path, show_status=False)
-    creds_summary = _busy("Creds", analyze_creds, path, show_status=False)
-    secrets_summary = _busy("Secrets", analyze_secrets, path, show_status=False)
+    beacon_summary = _busy("Beacons", analyze_beacons, path, show_status=False, **view)
+    exfil_summary = _busy("Exfil", analyze_exfil, path, show_status=False, **view)
+    creds_summary = _busy("Creds", analyze_creds, path, show_status=False, **view)
+    secrets_summary = _busy("Secrets", analyze_secrets, path, show_status=False, **view)
 
     errors.extend(getattr(hosts_summary, "errors", []) or [])
     errors.extend(getattr(threat_summary, "errors", []) or [])
@@ -978,7 +987,7 @@ def analyze_compromised(
             return False
         if text.startswith(("http://", "https://")):
             return True
-        if re.fullmatch(r"[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}", text):
+        if _HASH_RE.fullmatch(text):
             return True
         if _valid_ip(text):
             return _is_public_ip(text)

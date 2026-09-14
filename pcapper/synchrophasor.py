@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import safe_float, memoize_analysis
 
 try:
@@ -86,28 +86,11 @@ def _looks_like_c37118(payload: bytes) -> Optional[int]:
 
 @memoize_analysis
 def analyze_synchrophasor(
-    path: Path, show_status: bool = True
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> SynchrophasorSummary:
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as exc:
-        return SynchrophasorSummary(
-            path=path,
-            total_packets=0,
-            synchrophasor_packets=0,
-            frame_types=Counter(),
-            id_codes=Counter(),
-            commands=Counter(),
-            src_ips=Counter(),
-            dst_ips=Counter(),
-            detections=[],
-            errors=[f"{type(exc).__name__}: {exc}"],
-            first_seen=None,
-            last_seen=None,
-            duration_seconds=None,
-        )
 
     total_packets = 0
     synchrophasor_packets = 0
@@ -140,21 +123,9 @@ def analyze_synchrophasor(
         )
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
 
             l4 = None
             if pkt.haslayer(TCP):  # type: ignore[truthy-bool]
@@ -183,6 +154,12 @@ def analyze_synchrophasor(
                 continue
 
             synchrophasor_packets += 1
+            # The report window spans this protocol's traffic, not every packet.
+            if ts is not None:
+                if first_seen is None or ts < first_seen:
+                    first_seen = ts
+                if last_seen is None or ts > last_seen:
+                    last_seen = ts
             frame_types[C37118_FRAME_TYPES[frame_type]] += 1
             id_codes[int.from_bytes(payload[4:6], "big")] += 1
 
@@ -207,15 +184,6 @@ def analyze_synchrophasor(
                 command_sources.setdefault(src_ip or "?", Counter())[cmd_name] += 1
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        try:
-            status.finish()
-        except Exception:
-            pass
-        try:
-            reader.close()
-        except Exception:
-            pass
 
     # A command to turn OFF data transmission stops the PMU stream a PDC/operator
     # relies on — a denial-of-view against grid monitoring/protection.

@@ -5,19 +5,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
-    from scapy.layers.inet import IP, UDP  # type: ignore
-    from scapy.layers.inet6 import IPv6  # type: ignore
+    from scapy.layers.inet import UDP  # type: ignore
 except Exception:  # pragma: no cover
-    IP = None  # type: ignore
     UDP = None  # type: ignore
-    IPv6 = None  # type: ignore
 
 
 QUIC_PORTS = {443, 4433, 8443, 9443, 784}
+# A packet *from* a QUIC port is a server response only when it goes back to
+# a client's ephemeral port. Without this, any flow whose ephemeral source port
+# happens to be 443/784 and whose payload passes the header check is reported
+# as a QUIC server.
+_EPHEMERAL_PORT_MIN = 1024
 
 
 @dataclass(frozen=True)
@@ -60,7 +62,7 @@ def _looks_like_quic(payload: bytes) -> bool:
 
 
 def _parse_version(payload: bytes) -> Optional[str]:
-    if len(payload) < 6:
+    if len(payload) < 5:
         return None
     if (payload[0] & 0x80) == 0:
         return None
@@ -68,8 +70,25 @@ def _parse_version(payload: bytes) -> Optional[str]:
     return f"0x{version:08x}"
 
 
+def _quic_roles(
+    src_ip: str, dst_ip: str, sport: int, dport: int
+) -> Optional[tuple[str, str, int]]:
+    """(client, server, server_port) for a UDP packet, or None if the QUIC
+    port is not on the server side of the exchange."""
+    if dport in QUIC_PORTS:
+        return src_ip, dst_ip, dport
+    if sport in QUIC_PORTS and dport >= _EPHEMERAL_PORT_MIN:
+        return dst_ip, src_ip, sport
+    return None
+
+
 @memoize_analysis
-def analyze_quic(path: Path, show_status: bool = True) -> QuicSummary:
+def analyze_quic(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> QuicSummary:
     if UDP is None:
         return QuicSummary(
             path,
@@ -86,9 +105,6 @@ def analyze_quic(path: Path, show_status: bool = True) -> QuicSummary:
             None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
     total_packets = 0
     quic_packets = 0
     clients: Counter[str] = Counter()
@@ -100,55 +116,46 @@ def analyze_quic(path: Path, show_status: bool = True) -> QuicSummary:
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        udp = pkt.getlayer(UDP)  # type: ignore[arg-type]
+        if udp is None:
+            continue
+        sport = int(getattr(udp, "sport", 0) or 0)
+        dport = int(getattr(udp, "dport", 0) or 0)
+        if sport not in QUIC_PORTS and dport not in QUIC_PORTS:
+            continue
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+        payload = bytes(getattr(udp, "payload", b""))
+        if not _looks_like_quic(payload):
+            continue
 
-            if not pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                continue
-            udp = pkt[UDP]  # type: ignore[index]
-            sport = int(getattr(udp, "sport", 0) or 0)
-            dport = int(getattr(udp, "dport", 0) or 0)
-            if sport not in QUIC_PORTS and dport not in QUIC_PORTS:
-                continue
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
+        if not src_ip or not dst_ip:
+            continue
+        roles = _quic_roles(src_ip, dst_ip, sport, dport)
+        if roles is None:
+            continue
+        client, server, server_port = roles
 
-            payload = bytes(getattr(udp, "payload", b""))
-            if not _looks_like_quic(payload):
-                continue
+        quic_packets += 1
+        # The report window spans QUIC traffic, not every packet in scope.
+        ts = safe_float(getattr(pkt, "time", None))
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
 
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-            if not src_ip or not dst_ip:
-                continue
-
-            quic_packets += 1
-            if dport in QUIC_PORTS:
-                clients[src_ip] += 1
-                servers[dst_ip] += 1
-            else:
-                servers[src_ip] += 1
-                clients[dst_ip] += 1
-
-            version = _parse_version(payload)
-            if version:
-                versions[version] += 1
-            flow_counts[f"{src_ip}->{dst_ip}:{dport}"] += 1
-
-    finally:
-        status.finish()
-        reader.close()
+        clients[client] += 1
+        servers[server] += 1
+        version = _parse_version(payload)
+        if version:
+            versions[version] += 1
+        # One flow per client/server pair, whichever direction the packet
+        # travelled; keying on the packet's dport split every flow in two,
+        # one of them named after the client's ephemeral port.
+        flow_counts[f"{client}->{server}:{server_port}"] += 1
 
     if quic_packets:
         detections.append(

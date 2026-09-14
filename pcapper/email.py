@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
-from .pcap_cache import get_reader
+from .pcap_cache import iter_packets
 from .utils import (
     beacon_score,
     extract_packet_endpoints,
@@ -874,13 +874,6 @@ def analyze_email(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path,
-        packets=packets,
-        meta=meta,
-        show_status=show_status,
-    )
-
     total_packets = 0
     email_packets = 0
     total_bytes = 0
@@ -1700,38 +1693,24 @@ def analyze_email(
                     }
                 )
 
-    try:
-        for pkt_no, pkt in enumerate(reader, start=1):
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
-            total_packets += 1
-            pkt_len = packet_length(pkt)
-            total_bytes += pkt_len
-
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
-
+    skipped_packets = 0
+    first_skip_error: Optional[str] = None
+    for pkt_no, pkt in enumerate(
+        iter_packets(path, packets=packets, meta=meta, show_status=show_status), start=1
+    ):
+        total_packets += 1
+        pkt_len = packet_length(pkt)
+        total_bytes += pkt_len
+        tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
+        if tcp_layer is None:
+            continue
+        try:
             src_ip, dst_ip = extract_packet_endpoints(pkt)
-
             if not src_ip or not dst_ip:
                 continue
-            if not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                continue
 
-            tcp_layer = pkt[TCP]  # type: ignore[index]
             sport = int(getattr(tcp_layer, "sport", 0) or 0)
             dport = int(getattr(tcp_layer, "dport", 0) or 0)
-            payload: bytes
             try:
                 payload = bytes(tcp_layer.payload)
             except Exception:
@@ -1743,6 +1722,8 @@ def analyze_email(
             if not text:
                 continue
 
+            ts = safe_float(getattr(pkt, "time", None))
+
             webmail_context = _detect_webmail_context(text)
             known_port_mail = sport in MAIL_PORTS or dport in MAIL_PORTS
             if (
@@ -1753,6 +1734,12 @@ def analyze_email(
                 continue
 
             email_packets += 1
+            # The report window spans mail traffic, not every packet in scope.
+            if ts is not None:
+                if first_seen is None or ts < first_seen:
+                    first_seen = ts
+                if last_seen is None or ts > last_seen:
+                    last_seen = ts
             if webmail_context is not None:
                 proto = "WEBMAIL"
             else:
@@ -1896,14 +1883,16 @@ def analyze_email(
                     state,
                 )
 
-    except Exception as exc:
-        errors.append(str(exc))
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — one malformed packet must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
+
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} packet(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     deterministic_checks: dict[str, list[str]] = {
         "credential_exposure": [],

@@ -9,6 +9,7 @@ from .industrial_helpers import (
     IndustrialAnomaly,
     analyze_port_protocol,
 )
+from .utils import memoize_analysis
 
 OPC_UA_PORT = 4840
 
@@ -574,6 +575,7 @@ def _detect_anomalies(
     return anomalies
 
 
+@memoize_analysis
 def analyze_opc(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,

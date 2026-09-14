@@ -8,6 +8,7 @@ from .industrial_helpers import (
     IndustrialAnomaly,
     analyze_port_protocol,
 )
+from .utils import memoize_analysis
 
 HART_PORT = 5094
 
@@ -98,6 +99,7 @@ def _detect_anomalies(
     return anomalies
 
 
+@memoize_analysis
 def analyze_hart(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,

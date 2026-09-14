@@ -60,7 +60,7 @@ from .codesys import analyze_codesys
 from .opc import analyze_opc
 from .opc_classic import analyze_opc_classic
 from .ot_risk import compute_ot_risk_posture, dedupe_findings
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .pccc import analyze_pccc
 from .pcworx import analyze_pcworx
 from .powershell import analyze_powershell
@@ -97,7 +97,17 @@ from .skeptical import apply_skeptical_filter
 from .tcp import analyze_tcp
 from .tls import analyze_tls
 from .udp import analyze_udp
-from .utils import counter_inc, extract_packet_endpoints, format_ts, memoize_analysis, packet_length, safe_float, setdict_add, shannon_entropy
+from .utils import (
+    counter_inc,
+    dns_questions,
+    extract_packet_endpoints,
+    format_ts,
+    memoize_analysis,
+    packet_length,
+    safe_float,
+    setdict_add,
+    shannon_entropy,
+)
 from .vpn import analyze_vpn
 from .winrm import analyze_winrm
 from .wmic import analyze_wmic
@@ -2496,9 +2506,122 @@ def _file_detection_evidence(
     return _dedupe_evidence(evidence, limit=8)
 
 
+def _elevate_crown_jewel_detections(
+    detections: list[dict[str, object]], nb_facts: dict[str, dict[str, object]]
+) -> None:
+    """Annotate and bump detections that touch a browser-announced DC /
+    critical-infrastructure host.
+
+    When a detection names more than one such asset, the one credited is the
+    first in its ranked ``top_sources`` then ``top_destinations`` order -- a
+    fixed, meaningful choice. Picking from a ``set`` of the IPs, as this used
+    to, made the label (and so the report text) depend on string-hash order.
+    """
+    infra_assets = {
+        ip: facts
+        for ip, facts in nb_facts.items()
+        if facts.get("is_dc")
+        or facts.get("is_master_browser")
+        or any(
+            r in ("SQL Server", "Domain Master Browser")
+            for r in (facts.get("roles", []) or [])
+        )
+    }
+    if not infra_assets:
+        return
+    sev_bump = {"warning": "high", "high": "critical"}
+    for det in detections:
+        hit = None
+        for key in ("top_sources", "top_destinations"):
+            for pair in det.get(key, []) or []:
+                try:
+                    ip = str(pair[0])
+                except Exception:
+                    continue
+                if ip in infra_assets:
+                    hit = ip
+                    break
+            if hit:
+                break
+        if not hit:
+            continue
+        facts = infra_assets[hit]
+        label = (
+            "Domain Controller"
+            if facts.get("is_dc")
+            else (", ".join((facts.get("roles", []) or [])[:2]) or "critical infrastructure")
+        )
+        hostname = str(facts.get("hostname", "") or "")
+        det["details"] = (
+            f"{str(det.get('details', '') or '')} "
+            f"[ASSET: {hit}{f' ({hostname})' if hostname else ''} announces {label} role — "
+            "crown-jewel / high-value]"
+        ).strip()
+        sev = str(det.get("severity", "info"))
+        if sev in sev_bump:
+            det["severity"] = sev_bump[sev]
+            det["asset_elevated"] = True
+
+
+# A run of connection attempts only reads as brute force when it is
+# *concentrated*: 20 SMB sessions from a workstation to its file server over
+# an eight-hour capture is a normal working day, 20 within a few minutes is
+# not. The attempts must average at least one per this-many seconds.
+_BRUTE_FORCE_MIN_ATTEMPTS = 20
+_BRUTE_FORCE_MAX_SECONDS_PER_ATTEMPT = 30.0
+
+
+def _brute_force_candidates(
+    auth_attempts: Counter[tuple[str, str, str]],
+    auth_windows: dict[tuple[str, str, str], tuple[float, float]],
+) -> list[tuple[str, str, str, int]]:
+    hits: list[tuple[str, str, str, int]] = []
+    for key, count in auth_attempts.items():
+        if count < _BRUTE_FORCE_MIN_ATTEMPTS:
+            continue
+        window = auth_windows.get(key)
+        if window is not None:
+            span = max(0.0, window[1] - window[0])
+            if span > count * _BRUTE_FORCE_MAX_SECONDS_PER_ATTEMPT:
+                continue
+        hits.append((key[0], key[1], key[2], count))
+    return hits
+
+
+# A UDP "flood" is a rate, not a total: a DNS resolver or syslog collector
+# receives far more than 5000 datagrams over a day without being flooded.
+_UDP_FLOOD_MIN_PACKETS = 5000
+_UDP_FLOOD_MIN_RATE = 500.0  # packets per second
+
+
+def _udp_flood_target(
+    udp_target_counts: Counter[str], duration_seconds: Optional[float]
+) -> tuple[str, int] | None:
+    if not udp_target_counts:
+        return None
+    top_dst, top_count = udp_target_counts.most_common(1)[0]
+    if top_count < _UDP_FLOOD_MIN_PACKETS:
+        return None
+    if duration_seconds is None or duration_seconds < 1.0:
+        # A sub-second capture cannot establish a sustained rate.
+        return None
+    if top_count / duration_seconds < _UDP_FLOOD_MIN_RATE:
+        return None
+    return top_dst, top_count
+
+
+def _dns_question_names(dns_layer: object) -> list[tuple[str, int]]:
+    """``(qname, qtype)`` for every question; see ``utils.dns_questions``."""
+    return dns_questions(dns_layer)
+
+
 @memoize_analysis
 def analyze_threats(
-    path: Path, show_status: bool = True, vt_lookup: bool = False
+    path: Path,
+    show_status: bool = True,
+    vt_lookup: bool = False,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> ThreatSummary:
     if show_status:
         return run_with_busy_status(
@@ -2509,6 +2632,8 @@ def analyze_threats(
             path,
             show_status=False,
             vt_lookup=vt_lookup,
+            packets=packets,
+            meta=meta,
         )
 
     errors: list[str] = []
@@ -3114,10 +3239,6 @@ def analyze_threats(
             }
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
-
     src_counts: Counter[str] = Counter()
     dst_counts: Counter[str] = Counter()
     syn_counts: Counter[str] = Counter()
@@ -3127,6 +3248,7 @@ def analyze_threats(
     src_ports: dict[str, set[int]] = defaultdict(set)
     src_targets: dict[str, set[str]] = defaultdict(set)
     auth_attempts: Counter[tuple[str, str, str]] = Counter()
+    auth_windows: dict[tuple[str, str, str], tuple[float, float]] = {}
     auth_failures: Counter[tuple[str, str, str]] = Counter()
     lateral_targets: dict[str, set[str]] = defaultdict(set)
     lateral_service_targets: dict[str, dict[str, set[str]]] = defaultdict(
@@ -3153,218 +3275,201 @@ def analyze_threats(
     total_packets = 0
     control_command_total = 0
 
-    try:
-        for pkt in reader:
-            total_packets += 1
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
 
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+        ts = safe_float(getattr(pkt, "time", None))
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
 
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
 
-            if not src_ip or not dst_ip:
-                continue
+        if not src_ip or not dst_ip:
+            continue
 
-            counter_inc(src_counts, src_ip)
-            counter_inc(dst_counts, dst_ip)
+        counter_inc(src_counts, src_ip)
+        counter_inc(dst_counts, dst_ip)
 
-            pkt_len = packet_length(pkt)
-            if _is_private_ip(src_ip) and _is_public_ip(dst_ip):
-                outbound_bytes_public[(src_ip, dst_ip)] += pkt_len
-                setdict_add(outbound_public_dests_by_src, src_ip, dst_ip)
+        pkt_len = packet_length(pkt)
+        if _is_private_ip(src_ip) and _is_public_ip(dst_ip):
+            outbound_bytes_public[(src_ip, dst_ip)] += pkt_len
+            setdict_add(outbound_public_dests_by_src, src_ip, dst_ip)
 
-            payload_data = _payload_bytes(pkt)
-            payload_lower = payload_data.lower() if payload_data else b""
-            if payload_lower:
-                # Single scan over the marker list; record hits as we go.
-                matched_any = False
-                for marker_text, marker_bytes in zip(
-                    SUSPICIOUS_PAYLOAD_MARKERS, SUSPICIOUS_PAYLOAD_MARKERS_BYTES
-                ):
-                    if marker_bytes in payload_lower:
-                        matched_any = True
-                        command_markers[src_ip].add(marker_text)
-                if matched_any:
-                    counter_inc(suspicious_payload_sources, src_ip)
+        payload_data = _payload_bytes(pkt)
+        payload_lower = payload_data.lower() if payload_data else b""
+        if payload_lower:
+            # Single scan over the marker list; record hits as we go.
+            matched_any = False
+            for marker_text, marker_bytes in zip(
+                SUSPICIOUS_PAYLOAD_MARKERS, SUSPICIOUS_PAYLOAD_MARKERS_BYTES
+            ):
+                if marker_bytes in payload_lower:
+                    matched_any = True
+                    command_markers[src_ip].add(marker_text)
+            if matched_any:
+                counter_inc(suspicious_payload_sources, src_ip)
 
-            if DNS is not None and DNSQR is not None and pkt.haslayer(DNS):
-                dns_layer = pkt[DNS]
-                if int(getattr(dns_layer, "qr", 0) or 0) == 0:
-                    qd = getattr(dns_layer, "qd", None)
-                    if qd is not None:
-                        qname_raw = getattr(qd, "qname", b"")
-                        qname = (
-                            qname_raw.decode("utf-8", errors="ignore")
-                            if isinstance(qname_raw, (bytes, bytearray))
-                            else str(qname_raw)
-                        )
-                        qname = qname.strip(".").lower()
-                        qtype = int(getattr(qd, "qtype", 0) or 0)
-                        labels = [label for label in qname.split(".") if label]
-                        longest_label = max((len(label) for label in labels), default=0)
-                        # DNS-tunneling signal. Entropy alone is a weak signal:
-                        # benign CDN/cloud names ("d1a2b3c4.cloudfront.net") have
-                        # entropy ~3.8 and short hex labels, so an entropy-only
-                        # threshold floods on normal traffic. Require either a
-                        # genuinely long encoded label, an oversized qname, or
-                        # high entropy *combined* with a long label (the shape of
-                        # base32/hex tunneling). Reverse-DNS is excluded.
-                        if not qname.endswith((".in-addr.arpa", ".ip6.arpa")) and (
-                            longest_label >= 32
-                            or len(qname) >= 80
-                            or (longest_label >= 20 and shannon_entropy(qname) >= 4.0)
-                        ):
-                            counter_inc(dns_tunnel_sources, src_ip)
-                        if qtype == 16:
-                            counter_inc(dns_txt_query_sources, src_ip)
+        if DNS is not None and DNSQR is not None and pkt.haslayer(DNS):
+            dns_layer = pkt[DNS]
+            if int(getattr(dns_layer, "qr", 0) or 0) == 0:
+                for qname, qtype in _dns_question_names(dns_layer):
+                    labels = [label for label in qname.split(".") if label]
+                    longest_label = max((len(label) for label in labels), default=0)
+                    # DNS-tunneling signal. Entropy alone is a weak signal:
+                    # benign CDN/cloud names ("d1a2b3c4.cloudfront.net") have
+                    # entropy ~3.8 and short hex labels, so an entropy-only
+                    # threshold floods on normal traffic. Require either a
+                    # genuinely long encoded label, an oversized qname, or
+                    # high entropy *combined* with a long label (the shape of
+                    # base32/hex tunneling). Reverse-DNS is excluded.
+                    if not qname.endswith((".in-addr.arpa", ".ip6.arpa")) and (
+                        longest_label >= 32
+                        or len(qname) >= 80
+                        or (longest_label >= 20 and shannon_entropy(qname) >= 4.0)
+                    ):
+                        counter_inc(dns_tunnel_sources, src_ip)
+                    if qtype == 16:
+                        counter_inc(dns_txt_query_sources, src_ip)
 
-            if TCP is not None and pkt.haslayer(TCP):
-                tcp_layer = pkt[TCP]
-                dport = int(getattr(tcp_layer, "dport", 0) or 0)
-                sport = int(getattr(tcp_layer, "sport", 0) or 0)
+        if TCP is not None and pkt.haslayer(TCP):
+            tcp_layer = pkt[TCP]
+            dport = int(getattr(tcp_layer, "dport", 0) or 0)
+            sport = int(getattr(tcp_layer, "sport", 0) or 0)
 
-                ot_match = _ot_proto_for_flow(sport, dport)
-                if ot_match is not None:
-                    proto, _ot_port = ot_match
-                    if _is_public_ip(src_ip) or _is_public_ip(dst_ip):
-                        public_ot_pairs.add((proto, src_ip, dst_ip))
-                        if _is_public_ip(src_ip):
-                            counter_inc(ot_peer_external, src_ip)
-                        if _is_public_ip(dst_ip):
-                            counter_inc(ot_peer_external, dst_ip)
-                    if _is_private_ip(src_ip):
-                        counter_inc(ot_peer_internal, src_ip)
-                    if _is_private_ip(dst_ip):
-                        counter_inc(ot_peer_internal, dst_ip)
-                    counter_inc(ot_protocol_counts, proto)
+            ot_match = _ot_proto_for_flow(sport, dport)
+            if ot_match is not None:
+                proto, _ot_port = ot_match
+                if _is_public_ip(src_ip) or _is_public_ip(dst_ip):
+                    public_ot_pairs.add((proto, src_ip, dst_ip))
+                    if _is_public_ip(src_ip):
+                        counter_inc(ot_peer_external, src_ip)
+                    if _is_public_ip(dst_ip):
+                        counter_inc(ot_peer_external, dst_ip)
+                if _is_private_ip(src_ip):
+                    counter_inc(ot_peer_internal, src_ip)
+                if _is_private_ip(dst_ip):
+                    counter_inc(ot_peer_internal, dst_ip)
+                counter_inc(ot_protocol_counts, proto)
 
-                if _ot_proto_for_flow(sport, dport) is not None and (
-                    sport in ENIP_PORTS or dport in ENIP_PORTS
-                ):
-                    enip_ok, cip_ok = _strict_enip_cip_marker(payload_data)
-                    if enip_ok:
-                        strict_ot_counts["EtherNet/IP"] += 1
-                        setdict_add(strict_ot_pairs, "EtherNet/IP", (src_ip, dst_ip))
-                    if cip_ok:
-                        strict_ot_counts["CIP"] += 1
-                        setdict_add(strict_ot_pairs, "CIP", (src_ip, dst_ip))
+            if _ot_proto_for_flow(sport, dport) is not None and (
+                sport in ENIP_PORTS or dport in ENIP_PORTS
+            ):
+                enip_ok, cip_ok = _strict_enip_cip_marker(payload_data)
+                if enip_ok:
+                    strict_ot_counts["EtherNet/IP"] += 1
+                    setdict_add(strict_ot_pairs, "EtherNet/IP", (src_ip, dst_ip))
+                if cip_ok:
+                    strict_ot_counts["CIP"] += 1
+                    setdict_add(strict_ot_pairs, "CIP", (src_ip, dst_ip))
 
-                if (sport == DNP3_PORT or dport == DNP3_PORT) and _ot_proto_for_flow(
-                    sport, dport
-                ) is not None:
-                    if _strict_dnp3_marker(payload_data):
-                        strict_ot_counts["DNP3"] += 1
-                        setdict_add(strict_ot_pairs, "DNP3", (src_ip, dst_ip))
+            if (sport == DNP3_PORT or dport == DNP3_PORT) and _ot_proto_for_flow(
+                sport, dport
+            ) is not None:
+                if _strict_dnp3_marker(payload_data):
+                    strict_ot_counts["DNP3"] += 1
+                    setdict_add(strict_ot_pairs, "DNP3", (src_ip, dst_ip))
 
-                flags = getattr(tcp_layer, "flags", None)
-                if flags is not None and _tcp_is_syn(flags):
-                    if dport:
-                        setdict_add(pair_ports, (src_ip, dst_ip), dport)
-                        setdict_add(src_ports, src_ip, dport)
-                    setdict_add(src_targets, src_ip, dst_ip)
-                    counter_inc(syn_counts, src_ip)
-                    if dport in AUTH_PORTS:
-                        counter_inc(auth_attempts, (src_ip, dst_ip, AUTH_PORTS[dport]))
-
-                service = AUTH_PORTS.get(dport) or AUTH_PORTS.get(sport)
-                if (
-                    service
-                    and payload_lower
-                    and any(
-                        pattern in payload_lower
-                        for pattern in FAILED_AUTH_PATTERNS_BYTES
-                    )
-                ):
-                    if dport in AUTH_PORTS:
-                        counter_inc(auth_failures, (src_ip, dst_ip, service))
-                    elif sport in AUTH_PORTS:
-                        counter_inc(auth_failures, (dst_ip, src_ip, service))
-                    else:
-                        counter_inc(auth_failures, (src_ip, dst_ip, service))
-
-                lateral_service = LATERAL_PORTS.get(dport)
-                if (
-                    lateral_service
-                    and _is_private_ip(src_ip)
-                    and _is_private_ip(dst_ip)
-                ):
-                    setdict_add(lateral_targets, src_ip, dst_ip)
-                    lateral_service_targets[src_ip][lateral_service].add(dst_ip)
-
-                safety_service = SAFETY_PORTS.get(dport) or SAFETY_PORTS.get(sport)
-                if safety_service:
-                    safety_sources[src_ip] += 1
-                    safety_destinations[dst_ip] += 1
-                    safety_services[safety_service] += 1
-                    safety_pairs.add((src_ip, dst_ip))
-
-                if dport in WEB_PORTS and payload_lower.startswith((b"post ", b"put ")):
-                    if _is_private_ip(src_ip) and _is_public_ip(dst_ip):
-                        outbound_bytes_public[(src_ip, dst_ip)] += pkt_len
-
-            if UDP is not None and pkt.haslayer(UDP):
-                udp_layer = pkt[UDP]
-                dport = int(getattr(udp_layer, "dport", 0) or 0)
-                sport = int(getattr(udp_layer, "sport", 0) or 0)
-
-                ot_match = _ot_proto_for_flow(sport, dport)
-                if ot_match is not None:
-                    proto, _ot_port = ot_match
-                    if _is_public_ip(src_ip) or _is_public_ip(dst_ip):
-                        public_ot_pairs.add((proto, src_ip, dst_ip))
-                        if _is_public_ip(src_ip):
-                            counter_inc(ot_peer_external, src_ip)
-                        if _is_public_ip(dst_ip):
-                            counter_inc(ot_peer_external, dst_ip)
-                    if _is_private_ip(src_ip):
-                        counter_inc(ot_peer_internal, src_ip)
-                    if _is_private_ip(dst_ip):
-                        counter_inc(ot_peer_internal, dst_ip)
-                    counter_inc(ot_protocol_counts, proto)
-
-                if _ot_proto_for_flow(sport, dport) is not None and (
-                    sport in ENIP_PORTS or dport in ENIP_PORTS
-                ):
-                    enip_ok, cip_ok = _strict_enip_cip_marker(payload_data)
-                    if enip_ok:
-                        strict_ot_counts["EtherNet/IP"] += 1
-                        setdict_add(strict_ot_pairs, "EtherNet/IP", (src_ip, dst_ip))
-                    if cip_ok:
-                        strict_ot_counts["CIP"] += 1
-                        setdict_add(strict_ot_pairs, "CIP", (src_ip, dst_ip))
-
-                if (sport == DNP3_PORT or dport == DNP3_PORT) and _ot_proto_for_flow(
-                    sport, dport
-                ) is not None:
-                    if _strict_dnp3_marker(payload_data):
-                        strict_ot_counts["DNP3"] += 1
-                        setdict_add(strict_ot_pairs, "DNP3", (src_ip, dst_ip))
-
+            flags = getattr(tcp_layer, "flags", None)
+            if flags is not None and _tcp_is_syn(flags):
                 if dport:
-                    counter_inc(udp_target_counts, dst_ip)
+                    setdict_add(pair_ports, (src_ip, dst_ip), dport)
                     setdict_add(src_ports, src_ip, dport)
+                setdict_add(src_targets, src_ip, dst_ip)
+                counter_inc(syn_counts, src_ip)
+                if dport in AUTH_PORTS:
+                    auth_key = (src_ip, dst_ip, AUTH_PORTS[dport])
+                    counter_inc(auth_attempts, auth_key)
+                    if ts is not None:
+                        window = auth_windows.get(auth_key)
+                        auth_windows[auth_key] = (
+                            (ts, ts)
+                            if window is None
+                            else (min(window[0], ts), max(window[1], ts))
+                        )
 
-                safety_service = SAFETY_PORTS.get(dport) or SAFETY_PORTS.get(sport)
-                if safety_service:
-                    safety_sources[src_ip] += 1
-                    safety_destinations[dst_ip] += 1
-                    safety_services[safety_service] += 1
-                    safety_pairs.add((src_ip, dst_ip))
+            service = AUTH_PORTS.get(dport) or AUTH_PORTS.get(sport)
+            if (
+                service
+                and payload_lower
+                and any(
+                    pattern in payload_lower
+                    for pattern in FAILED_AUTH_PATTERNS_BYTES
+                )
+            ):
+                if dport in AUTH_PORTS:
+                    counter_inc(auth_failures, (src_ip, dst_ip, service))
+                elif sport in AUTH_PORTS:
+                    counter_inc(auth_failures, (dst_ip, src_ip, service))
+                else:
+                    counter_inc(auth_failures, (src_ip, dst_ip, service))
 
-    finally:
-        status.finish()
-        reader.close()
+            lateral_service = LATERAL_PORTS.get(dport)
+            if (
+                lateral_service
+                and _is_private_ip(src_ip)
+                and _is_private_ip(dst_ip)
+            ):
+                setdict_add(lateral_targets, src_ip, dst_ip)
+                lateral_service_targets[src_ip][lateral_service].add(dst_ip)
+
+            safety_service = SAFETY_PORTS.get(dport) or SAFETY_PORTS.get(sport)
+            if safety_service:
+                safety_sources[src_ip] += 1
+                safety_destinations[dst_ip] += 1
+                safety_services[safety_service] += 1
+                safety_pairs.add((src_ip, dst_ip))
+
+        if UDP is not None and pkt.haslayer(UDP):
+            udp_layer = pkt[UDP]
+            dport = int(getattr(udp_layer, "dport", 0) or 0)
+            sport = int(getattr(udp_layer, "sport", 0) or 0)
+
+            ot_match = _ot_proto_for_flow(sport, dport)
+            if ot_match is not None:
+                proto, _ot_port = ot_match
+                if _is_public_ip(src_ip) or _is_public_ip(dst_ip):
+                    public_ot_pairs.add((proto, src_ip, dst_ip))
+                    if _is_public_ip(src_ip):
+                        counter_inc(ot_peer_external, src_ip)
+                    if _is_public_ip(dst_ip):
+                        counter_inc(ot_peer_external, dst_ip)
+                if _is_private_ip(src_ip):
+                    counter_inc(ot_peer_internal, src_ip)
+                if _is_private_ip(dst_ip):
+                    counter_inc(ot_peer_internal, dst_ip)
+                counter_inc(ot_protocol_counts, proto)
+
+            if _ot_proto_for_flow(sport, dport) is not None and (
+                sport in ENIP_PORTS or dport in ENIP_PORTS
+            ):
+                enip_ok, cip_ok = _strict_enip_cip_marker(payload_data)
+                if enip_ok:
+                    strict_ot_counts["EtherNet/IP"] += 1
+                    setdict_add(strict_ot_pairs, "EtherNet/IP", (src_ip, dst_ip))
+                if cip_ok:
+                    strict_ot_counts["CIP"] += 1
+                    setdict_add(strict_ot_pairs, "CIP", (src_ip, dst_ip))
+
+            if (sport == DNP3_PORT or dport == DNP3_PORT) and _ot_proto_for_flow(
+                sport, dport
+            ) is not None:
+                if _strict_dnp3_marker(payload_data):
+                    strict_ot_counts["DNP3"] += 1
+                    setdict_add(strict_ot_pairs, "DNP3", (src_ip, dst_ip))
+
+            if dport:
+                counter_inc(udp_target_counts, dst_ip)
+                setdict_add(src_ports, src_ip, dport)
+
+            safety_service = SAFETY_PORTS.get(dport) or SAFETY_PORTS.get(sport)
+            if safety_service:
+                safety_sources[src_ip] += 1
+                safety_destinations[dst_ip] += 1
+                safety_services[safety_service] += 1
+                safety_pairs.add((src_ip, dst_ip))
 
     duration_seconds = (
         max(0.0, (last_seen or 0.0) - (first_seen or 0.0))
@@ -3839,11 +3944,7 @@ def analyze_threats(
                 }
             )
 
-    brute_force_hits = [
-        (src, dst, service, count)
-        for (src, dst, service), count in auth_attempts.items()
-        if count >= 20
-    ]
+    brute_force_hits = _brute_force_candidates(auth_attempts, auth_windows)
     if brute_force_hits:
         top = sorted(brute_force_hits, key=lambda item: item[3], reverse=True)[:8]
         auth_evidence = [
@@ -4017,18 +4118,21 @@ def analyze_threats(
             }
         )
 
-    if udp_target_counts:
-        top_dst, top_count = udp_target_counts.most_common(1)[0]
-        if top_count >= 5000:
-            detections.append(
-                {
-                    "source": "UDP",
-                    "severity": "warning",
-                    "summary": "Potential UDP flood",
-                    "details": f"Destination {top_dst} received {top_count} UDP packets.",
-                    "top_destinations": udp_target_counts.most_common(5),
-                }
-            )
+    udp_flood = _udp_flood_target(udp_target_counts, duration_seconds)
+    if udp_flood is not None:
+        top_dst, top_count = udp_flood
+        detections.append(
+            {
+                "source": "UDP",
+                "severity": "warning",
+                "summary": "Potential UDP flood",
+                "details": (
+                    f"Destination {top_dst} received {top_count} UDP packets "
+                    f"(~{top_count / duration_seconds:.0f} pkt/s)."
+                ),
+                "top_destinations": udp_target_counts.most_common(5),
+            }
+        )
 
     # Sustained concentration only — a near-zero duration would otherwise turn a
     # handful of packets into a fake multi-thousand pkt/s "flood".
@@ -4353,45 +4457,9 @@ def analyze_threats(
         _nb_facts = collect_netbios_host_intel(netbios_summary)
     except Exception:
         _nb_facts = {}
-    _infra_assets = {
-        ip: facts
-        for ip, facts in _nb_facts.items()
-        if facts.get("is_dc")
-        or facts.get("is_master_browser")
-        or any(
-            r in ("SQL Server", "Domain Master Browser")
-            for r in (facts.get("roles", []) or [])
-        )
-    }
-    if _infra_assets:
-        _sev_bump = {"warning": "high", "high": "critical"}
-        for _det in detections:
-            _ips: set[str] = set()
-            for _key in ("top_sources", "top_destinations"):
-                for _pair in _det.get(_key, []) or []:
-                    try:
-                        _ips.add(str(_pair[0]))
-                    except Exception:
-                        continue
-            _hit = next((ip for ip in _ips if ip in _infra_assets), None)
-            if not _hit:
-                continue
-            _facts = _infra_assets[_hit]
-            _label = (
-                "Domain Controller"
-                if _facts.get("is_dc")
-                else (", ".join((_facts.get("roles", []) or [])[:2]) or "critical infrastructure")
-            )
-            _hn = str(_facts.get("hostname", "") or "")
-            _det["details"] = (
-                f"{str(_det.get('details', '') or '')} "
-                f"[ASSET: {_hit}{f' ({_hn})' if _hn else ''} announces {_label} role — "
-                "crown-jewel / high-value]"
-            ).strip()
-            _sev = str(_det.get("severity", "info"))
-            if _sev in _sev_bump:
-                _det["severity"] = _sev_bump[_sev]
-                _det["asset_elevated"] = True
+    # `detections` holds fresh dicts built by _curate_threat_detections, so the
+    # annotation below never touches a memoized analyzer result.
+    _elevate_crown_jewel_detections(detections, _nb_facts)
 
     risk_score, risk_findings = _ot_risk_posture_from_detections(
         detections,

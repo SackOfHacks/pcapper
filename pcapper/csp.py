@@ -8,6 +8,7 @@ from .industrial_helpers import (
     IndustrialAnomaly,
     analyze_port_protocol,
 )
+from .utils import memoize_analysis
 
 CSP_PORTS = {2222, 44818}
 
@@ -69,6 +70,7 @@ def _detect_anomalies(
     return anomalies
 
 
+@memoize_analysis
 def analyze_csp(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,

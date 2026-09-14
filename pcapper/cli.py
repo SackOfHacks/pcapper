@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import difflib
 import glob
 import inspect
@@ -38,7 +39,7 @@ from .coloring import (
     use_color,
 )
 from .compromised import analyze_compromised, merge_compromised_summaries
-from .config import find_config, load_config
+from .config import EGRESS_KEYS, find_config, load_config
 from .control_loop import analyze_control_loop, merge_control_loop_summaries
 from .correlation import correlate
 from .creds import analyze_creds, merge_creds_summaries
@@ -108,8 +109,8 @@ from .ot_commands import OtControlConfig, analyze_ot_commands, load_ot_control_c
 from .pcap_cache import (
     clear_forced_packet_view,
     get_cache_config,
-    get_reader,
     is_scapy_available,
+    iter_packets,
     load_filtered_packets,
     load_packets_if_allowed,
     set_forced_packet_view,
@@ -296,10 +297,11 @@ from .timeline import (
 from .tls import analyze_tls
 from .udp import analyze_udp
 from .utils import (
+    detect_file_type,
     hexdump,
+    open_private,
     parse_time_arg,
     restrict_dir_permissions,
-    restrict_permissions,
     safe_write_text,
 )
 from .vlan import analyze_vlans
@@ -727,16 +729,33 @@ def _extract_config_defaults(config: dict[str, Any]) -> dict[str, Any]:
     return defaults
 
 
+@dataclass(frozen=True)
+class ConfigApplication:
+    """What a config file actually changed, so the CLI can say so."""
+
+    applied: tuple[str, ...]
+    unknown: tuple[str, ...]
+    egress: tuple[str, ...]
+
+
 def _apply_config_defaults(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
     config: dict[str, Any],
     argv: list[str],
-) -> None:
+) -> ConfigApplication:
+    """Fill argparse defaults from the config's ``[defaults]`` table.
+
+    Explicit command-line options always win. Returns which keys were applied,
+    which matched no option (a typo, or a key from another version — reported
+    rather than dropped), and which enable network egress.
+    """
     defaults = _extract_config_defaults(config)
     if not defaults:
-        return
+        return ConfigApplication((), (), ())
     provided = _collect_argv_options(argv)
+    known_dests = {a.dest for a in parser._actions if a.option_strings}
+    applied: list[str] = []
     for action in parser._actions:
         if not action.option_strings:
             continue
@@ -747,6 +766,10 @@ def _apply_config_defaults(
             continue
         value = _coerce_config_value(action, defaults[dest])
         setattr(args, dest, value)
+        applied.append(dest)
+    unknown = sorted(k for k in defaults if k not in known_dests and k != "config")
+    egress = sorted(k for k in applied if k in EGRESS_KEYS and getattr(args, k, False))
+    return ConfigApplication(tuple(applied), tuple(unknown), tuple(egress))
 
 
 def _log_event(log_config: LogConfig | None, event: str, **fields: Any) -> None:
@@ -764,10 +787,7 @@ def _log_event(log_config: LogConfig | None, event: str, **fields: Any) -> None:
     try:
         if log_config.path:
             restrict_dir_permissions(log_config.path.parent)
-            existed = log_config.path.exists()
-            with log_config.path.open("a", encoding="utf-8") as handle:
-                if not existed:
-                    restrict_permissions(log_config.path)
+            with open_private(log_config.path, "a", encoding="utf-8") as handle:
                 handle.write(f"{line}\n")
         elif log_config.stream:
             log_config.stream.write(f"{line}\n")
@@ -1071,9 +1091,14 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         "  pcapper capture.pcap --timeline -ip 10.0.0.5 Per-host forensic timeline\n"
         "  pcapper capture.pcap --files -hash app.exe   Carve files; hash a specific one\n"
         "  pcapper capture.pcap --dns --http --tls -vt  Web/DNS/TLS hunt with VirusTotal lookups\n"
+        "  pcapper capture.pcap --kerberos --ldap --ntlm Identity abuse: roasting, binds, Net-NTLM hashes\n"
+        "  pcapper capture.pcap --voip --voip-out calls/ Phone calls: signalling, digits, creds, audio\n"
+        "  pcapper plant.pcap --modbus --dnp3 --ot-commands  OT/ICS: who wrote what to which controller\n"
         "  pcapper *.pcap -summarize --threats          Roll up many captures into one view\n\n"
         "Run a function flag (e.g. --dns) for that analysis; combine flags freely. "
-        "Use -v for full detail, --no-color to disable color."
+        "Use -v for full detail, --no-color to disable color, --config FILE to load defaults. "
+        "Only public hostnames and routable addresses are ever sent to a reputation service, "
+        "and only when -vt/--ip-geo is given."
     )
     parser = PcapperArgumentParser(
         prog="pcapper",
@@ -2289,23 +2314,14 @@ def _analyze_paths(
                 _print_error(f"Packet {index} not found in loaded packet list.")
                 return
         else:
-            reader, status, _stream, _size_bytes, _file_type = get_reader(
-                path,
-                packets=None,
-                meta=None,
-                show_status=step_status,
-            )
+            stream = iter_packets(path, show_status=step_status)
             try:
-                for i, item in enumerate(reader, start=1):
+                for i, item in enumerate(stream, start=1):
                     if i == index:
                         pkt = item
                         break
             finally:
-                status.finish()
-                try:
-                    reader.close()
-                except Exception:
-                    pass
+                stream.close()
             if pkt is None:
                 _print_error(f"Packet {index} not found in capture.")
                 return
@@ -2398,12 +2414,7 @@ def _analyze_paths(
                     candidates.add(mapped)
 
         if has_port:
-            # Note: analyze_ips only accepts (path, show_status); passing
-            # other kwargs raises TypeError.
-            ips_summary = analyze_ips(
-                pcap_path,
-                show_status=False,
-            )
+            ips_summary = analyze_ips(pcap_path, show_status=False)
             for conv in getattr(ips_summary, "conversations", []) or []:
                 ports = set(getattr(conv, "ports", []) or [])
                 if port_value in ports:
@@ -2422,89 +2433,82 @@ def _analyze_paths(
         timeline_ip and any(step in _IP_TARGET_FILTER_STEPS for step in ordered_steps)
     )
 
-    def _annotate_smb_with_quic(smb_summary, quic_summary) -> None:
+    def _ip_preview(ips: set[str]) -> str:
+        if not ips:
+            return "-"
+        items = sorted(ips)
+        if len(items) > 3:
+            return ", ".join(items[:3]) + f" (+{len(items) - 3} more)"
+        return ", ".join(items)
+
+    def _with_quic_note(
+        summary,
+        quic_summary,
+        *,
+        servers: set[str],
+        clients: set[str],
+        label: str,
+        overlap_text: str,
+        no_overlap_text: str,
+    ):
+        """Return ``summary`` with a QUIC cross-reference appended to its
+        ``analysis_notes`` — as a *new* object. Analyzer results are shared
+        through the memo cache, so they are never edited in place."""
         if not quic_summary or not getattr(quic_summary, "quic_packets", 0):
-            return
-        if (
-            not hasattr(smb_summary, "analysis_notes")
-            or smb_summary.analysis_notes is None
-        ):
-            smb_summary.analysis_notes = []
-        notes: list[str] = smb_summary.analysis_notes
-        smb_servers = {
-            srv.ip
-            for srv in getattr(smb_summary, "servers", [])
-            if getattr(srv, "ip", None)
-        }
-        smb_clients = {
-            cli.ip
-            for cli in getattr(smb_summary, "clients", [])
-            if getattr(cli, "ip", None)
-        }
+            return summary
         quic_servers = set(getattr(quic_summary, "servers", {}).keys())
         quic_clients = set(getattr(quic_summary, "clients", {}).keys())
-        overlap_servers = smb_servers & quic_servers
-        overlap_clients = smb_clients & quic_clients
-
-        def _preview(ips: set[str]) -> str:
-            if not ips:
-                return "-"
-            items = sorted(ips)
-            if len(items) > 3:
-                return ", ".join(items[:3]) + f" (+{len(items) - 3} more)"
-            return ", ".join(items)
-
+        overlap_servers = servers & quic_servers
+        overlap_clients = clients & quic_clients
         if overlap_servers or overlap_clients:
             note = (
-                "QUIC traffic observed involving SMB endpoints "
-                f"(servers: {_preview(overlap_servers)}; clients: {_preview(overlap_clients)}). "
-                "If SMB-over-QUIC is enabled, SMB activity may be encapsulated in QUIC and not visible in TCP SMB parsing."
+                f"QUIC traffic observed involving {label} endpoints "
+                f"(servers: {_ip_preview(overlap_servers)}; "
+                f"clients: {_ip_preview(overlap_clients)}). {overlap_text}"
             )
         else:
-            note = (
-                "QUIC traffic observed; SMB-over-QUIC (UDP/443) can encapsulate SMB and will not appear in TCP-based SMB parsing. "
-                "Confirm SMB-over-QUIC policy or endpoint logs if suspected."
-            )
-        if note not in notes:
-            notes.append(note)
+            note = f"QUIC traffic observed; {no_overlap_text}"
+        notes = list(getattr(summary, "analysis_notes", None) or [])
+        if note in notes:
+            return summary
+        notes.append(note)
+        return dataclasses.replace(summary, analysis_notes=notes)
 
-    def _annotate_tls_with_quic(tls_summary, quic_summary) -> None:
-        if not quic_summary or not getattr(quic_summary, "quic_packets", 0):
-            return
-        if (
-            not hasattr(tls_summary, "analysis_notes")
-            or tls_summary.analysis_notes is None
-        ):
-            tls_summary.analysis_notes = []
-        notes: list[str] = tls_summary.analysis_notes
-        tls_servers = set(getattr(tls_summary, "server_counts", {}).keys())
-        tls_clients = set(getattr(tls_summary, "client_counts", {}).keys())
-        quic_servers = set(getattr(quic_summary, "servers", {}).keys())
-        quic_clients = set(getattr(quic_summary, "clients", {}).keys())
-        overlap_servers = tls_servers & quic_servers
-        overlap_clients = tls_clients & quic_clients
+    def _annotate_smb_with_quic(smb_summary, quic_summary):
+        return _with_quic_note(
+            smb_summary,
+            quic_summary,
+            servers={
+                srv.ip for srv in getattr(smb_summary, "servers", []) if getattr(srv, "ip", None)
+            },
+            clients={
+                cli.ip for cli in getattr(smb_summary, "clients", []) if getattr(cli, "ip", None)
+            },
+            label="SMB",
+            overlap_text=(
+                "If SMB-over-QUIC is enabled, SMB activity may be encapsulated in QUIC "
+                "and not visible in TCP SMB parsing."
+            ),
+            no_overlap_text=(
+                "SMB-over-QUIC (UDP/443) can encapsulate SMB and will not appear in "
+                "TCP-based SMB parsing. Confirm SMB-over-QUIC policy or endpoint logs "
+                "if suspected."
+            ),
+        )
 
-        def _preview(ips: set[str]) -> str:
-            if not ips:
-                return "-"
-            items = sorted(ips)
-            if len(items) > 3:
-                return ", ".join(items[:3]) + f" (+{len(items) - 3} more)"
-            return ", ".join(items)
-
-        if overlap_servers or overlap_clients:
-            note = (
-                "QUIC traffic observed involving TLS endpoints "
-                f"(servers: {_preview(overlap_servers)}; clients: {_preview(overlap_clients)}). "
-                "HTTP/3/TLS over QUIC will not appear in TCP TLS parsing."
-            )
-        else:
-            note = (
-                "QUIC traffic observed; HTTP/3/TLS over QUIC uses UDP/443 and is not visible in TCP TLS parsing. "
-                "Use --quic for QUIC metadata."
-            )
-        if note not in notes:
-            notes.append(note)
+    def _annotate_tls_with_quic(tls_summary, quic_summary):
+        return _with_quic_note(
+            tls_summary,
+            quic_summary,
+            servers=set(getattr(tls_summary, "server_counts", {}).keys()),
+            clients=set(getattr(tls_summary, "client_counts", {}).keys()),
+            label="TLS",
+            overlap_text="HTTP/3/TLS over QUIC will not appear in TCP TLS parsing.",
+            no_overlap_text=(
+                "HTTP/3/TLS over QUIC uses UDP/443 and is not visible in TCP TLS "
+                "parsing. Use --quic for QUIC metadata."
+            ),
+        )
 
     for idx, path in enumerate(paths, start=1):
         packets = None
@@ -2594,7 +2598,9 @@ def _analyze_paths(
             elif step == "packet" and packet_index is not None:
                 _render_packet(path, packet_index, packets)
             elif step == "vlan" and show_vlan:
-                vlan_summary = analyze_vlans(path, show_status=step_status)
+                vlan_summary = analyze_vlans(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("vlan", []).append(vlan_summary)
                 else:
@@ -2707,7 +2713,7 @@ def _analyze_paths(
                     search_query=stream_search,
                 )
                 if quic_summary is not None:
-                    _annotate_tls_with_quic(tls_summary, quic_summary)
+                    tls_summary = _annotate_tls_with_quic(tls_summary, quic_summary)
                 if summarize_rollups:
                     rollups.setdefault("tls", []).append(tls_summary)
                 else:
@@ -2888,7 +2894,7 @@ def _analyze_paths(
                 export_summaries["sizes"] = size_summary
             elif step == "ips" and show_ips:
                 ips_summary = analyze_ips(
-                    path, show_status=step_status, geo_lookup=ip_geo
+                    path, show_status=step_status, geo_lookup=ip_geo, packets=packets, meta=meta
                 )
                 if summarize_rollups:
                     rollups.setdefault("ips", []).append(ips_summary)
@@ -2922,7 +2928,9 @@ def _analyze_paths(
                     print(render_mac_lookup_summary(mac_lookup_summary))
                 export_summaries["mac_lookup"] = mac_lookup_summary
             elif step == "beacon" and show_beacon:
-                beacon_summary = analyze_beacons(path, show_status=step_status)
+                beacon_summary = analyze_beacons(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("beacon", []).append(beacon_summary)
                 else:
@@ -3024,7 +3032,9 @@ def _analyze_paths(
                     print(render_encrypted_dns_summary(edns_summary))
                 export_summaries["encrypted_dns"] = edns_summary
             elif step == "ntp" and show_ntp:
-                ntp_summary = analyze_ntp(path, show_status=step_status)
+                ntp_summary = analyze_ntp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("ntp", []).append(ntp_summary)
                 else:
@@ -3040,7 +3050,9 @@ def _analyze_paths(
                     print(render_ssdp_summary(ssdp_summary, verbose=verbose))
                 export_summaries["ssdp"] = ssdp_summary
             elif step == "vpn" and show_vpn:
-                vpn_summary = analyze_vpn(path, show_status=step_status)
+                vpn_summary = analyze_vpn(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("vpn", []).append(vpn_summary)
                 else:
@@ -3089,14 +3101,18 @@ def _analyze_paths(
                     print(render_overview_summary(overview_summary, verbose=verbose))
                 export_summaries["overview"] = overview_summary
             elif step == "protocols" and show_protocols:
-                proto_summary = analyze_protocols(path, show_status=step_status)
+                proto_summary = analyze_protocols(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("protocols", []).append(proto_summary)
                 else:
                     print(render_protocols_summary(proto_summary, verbose=verbose))
                 export_summaries["protocols"] = proto_summary
             elif step == "routing" and show_routing:
-                routing_summary = analyze_routing(path, show_status=step_status)
+                routing_summary = analyze_routing(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("routing", []).append(routing_summary)
                 else:
@@ -3126,23 +3142,29 @@ def _analyze_paths(
                     if quic_summary is None:
                         quic_summary = analyze_quic(path, show_status=step_status)
                         export_summaries["quic"] = quic_summary
-                smb_summary = analyze_smb(path, show_status=step_status)
+                smb_summary = analyze_smb(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if quic_summary is not None:
-                    _annotate_smb_with_quic(smb_summary, quic_summary)
+                    smb_summary = _annotate_smb_with_quic(smb_summary, quic_summary)
                 if summarize_rollups:
                     rollups.setdefault("smb", []).append(smb_summary)
                 else:
                     print(render_smb_summary(smb_summary, verbose=verbose))
                 export_summaries["smb"] = smb_summary
             elif step == "nfs" and show_nfs:
-                nfs_summary = analyze_nfs(path, show_status=step_status)
+                nfs_summary = analyze_nfs(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("nfs", []).append(nfs_summary)
                 else:
                     print(render_nfs_summary(nfs_summary))
                 export_summaries["nfs"] = nfs_summary
             elif step == "strings" and show_strings:
-                strings_summary = analyze_strings(path, show_status=step_status)
+                strings_summary = analyze_strings(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("strings", []).append(strings_summary)
                 else:
@@ -3176,14 +3198,18 @@ def _analyze_paths(
                     print(render_secrets_summary(secrets_summary, verbose=verbose))
                 export_summaries["secrets"] = secrets_summary
             elif step == "certificates" and show_certificates:
-                cert_summary = analyze_certificates(path, show_status=step_status)
+                cert_summary = analyze_certificates(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("certificates", []).append(cert_summary)
                 else:
                     print(render_certificates_summary(cert_summary))
                 export_summaries["certificates"] = cert_summary
             elif step == "health" and show_health:
-                health_summary = analyze_health(path, show_status=step_status)
+                health_summary = analyze_health(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("health", []).append(health_summary)
                 else:
@@ -3191,7 +3217,7 @@ def _analyze_paths(
                 export_summaries["health"] = health_summary
             elif step == "compromised" and show_compromised:
                 compromised_summary = analyze_compromised(
-                    path, show_status=step_status, vt_lookup=dns_vt
+                    path, show_status=step_status, vt_lookup=dns_vt, packets=packets, meta=meta
                 )
                 if summarize_rollups:
                     rollups.setdefault("compromised", []).append(compromised_summary)
@@ -3247,7 +3273,9 @@ def _analyze_paths(
                     print(render_carve_summary(carve_summary))
                 export_summaries["carve"] = carve_summary
             elif step == "ctf" and show_ctf:
-                ctf_summary = analyze_ctf(path, show_status=step_status)
+                ctf_summary = analyze_ctf(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("ctf", []).append(ctf_summary)
                 else:
@@ -3263,7 +3291,9 @@ def _analyze_paths(
                     print(render_ioc_summary(ioc_summary))
                 export_summaries["ioc"] = ioc_summary
             elif step == "opc_classic" and show_opc_classic:
-                opc_summary = analyze_opc_classic(path, show_status=step_status)
+                opc_summary = analyze_opc_classic(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("opc_classic", []).append(opc_summary)
                 else:
@@ -3383,14 +3413,18 @@ def _analyze_paths(
                     print(render_kerberos_summary(kerberos_summary, verbose=verbose))
                 export_summaries["kerberos"] = kerberos_summary
             elif step == "ntlm" and show_ntlm:
-                ntlm_summary = analyze_ntlm(path, show_status=step_status)
+                ntlm_summary = analyze_ntlm(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("ntlm", []).append(ntlm_summary)
                 else:
                     print(render_ntlm_summary(ntlm_summary))
                 export_summaries["ntlm"] = ntlm_summary
             elif step == "netbios" and show_netbios:
-                nb_summary = analyze_netbios(path, show_status=step_status)
+                nb_summary = analyze_netbios(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("netbios", []).append(nb_summary)
                 else:
@@ -3406,14 +3440,18 @@ def _analyze_paths(
                     print(render_arp_summary(arp_summary, verbose=verbose))
                 export_summaries["arp"] = arp_summary
             elif step == "dhcp" and show_dhcp:
-                dhcp_summary = analyze_dhcp(path, show_status=step_status)
+                dhcp_summary = analyze_dhcp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("dhcp", []).append(dhcp_summary)
                 else:
                     print(render_dhcp_summary(dhcp_summary, verbose=verbose))
                 export_summaries["dhcp"] = dhcp_summary
             elif step == "modbus" and show_modbus:
-                modbus_summary = analyze_modbus(path, show_status=step_status)
+                modbus_summary = analyze_modbus(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     modbus_rollups.append(modbus_summary)
                 else:
@@ -3448,7 +3486,9 @@ def _analyze_paths(
                     print(render_bacnet_summary(summary))
                 export_summaries["bacnet"] = summary
             elif step == "enip" and show_enip:
-                summary = analyze_enip(path, show_status=step_status)
+                summary = analyze_enip(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("enip", []).append(summary)
                 else:
@@ -3511,7 +3551,9 @@ def _analyze_paths(
                     print(render_melsec_summary(summary))
                 export_summaries["melsec"] = summary
             elif step == "cip" and show_cip:
-                summary = analyze_cip(path, show_status=step_status)
+                summary = analyze_cip(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("cip", []).append(summary)
                 else:
@@ -3623,42 +3665,54 @@ def _analyze_paths(
                     print(render_iccp_summary(summary))
                 export_summaries["iccp"] = summary
             elif step == "safety" and show_safety:
-                summary = analyze_safety(path, show_status=step_status)
+                summary = analyze_safety(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("safety", []).append(summary)
                 else:
                     print(render_safety_summary(summary))
                 export_summaries["safety"] = summary
             elif step == "goose" and show_goose:
-                summary = analyze_goose(path, show_status=step_status)
+                summary = analyze_goose(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("goose", []).append(summary)
                 else:
                     print(render_goose_summary(summary, verbose=verbose))
                 export_summaries["goose"] = summary
             elif step == "sv" and show_sv:
-                summary = analyze_sv(path, show_status=step_status)
+                summary = analyze_sv(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("sv", []).append(summary)
                 else:
                     print(render_sv_summary(summary, verbose=verbose))
                 export_summaries["sv"] = summary
             elif step == "lldp" and show_lldp:
-                summary = analyze_lldp_dcp(path, show_status=step_status)
+                summary = analyze_lldp_dcp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("lldp", []).append(summary)
                 else:
                     print(render_lldp_dcp_summary(summary, verbose=verbose))
                 export_summaries["lldp"] = summary
             elif step == "ptp" and show_ptp:
-                summary = analyze_ptp(path, show_status=step_status)
+                summary = analyze_ptp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("ptp", []).append(summary)
                 else:
                     print(render_ptp_summary(summary, verbose=verbose))
                 export_summaries["ptp"] = summary
             elif step == "synchrophasor" and show_synchrophasor:
-                summary = analyze_synchrophasor(path, show_status=step_status)
+                summary = analyze_synchrophasor(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("synchrophasor", []).append(summary)
                 else:
@@ -3699,7 +3753,9 @@ def _analyze_paths(
                 if baseline_requested:
                     baseline_ot_summaries.append(summary)
             elif step == "iec101_103" and show_iec101_103:
-                summary = analyze_iec101_103(path, show_status=step_status)
+                summary = analyze_iec101_103(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("iec101_103", []).append(summary)
                 else:
@@ -4418,6 +4474,12 @@ def main() -> int:
         print("Run with -h for full help and options.")
         return 0
     args = parser.parse_args(argv)
+    # With --quiet, __init__ parked stderr in a buffer so scapy's import-time
+    # noise never reaches the user. Imports are done now; every diagnostic
+    # from here on (config notices, usage errors) must be visible.
+    from . import _restore_stderr_if_suppressed
+
+    _restore_stderr_if_suppressed()
     # `-hash` takes an optional FILENAME, so `--files -hash <pcap>` (target given
     # last) lets argparse hand the capture path to -hash and leaves no target.
     # If the -hash value is actually an existing path and no target was supplied,
@@ -4444,7 +4506,25 @@ def main() -> int:
         getattr(args, "config", None) or os.environ.get("PCAPPER_CONFIG")
     )
     config_result = load_config(config_path)
-    _apply_config_defaults(parser, args, config_result.data, argv)
+    if config_result.error:
+        # A config the analyst pointed at (or keeps in their home) that cannot
+        # be used is an error, not a silent fallback to defaults.
+        _print_error(f"Config: {config_result.error}")
+        return 2
+    config_applied = _apply_config_defaults(parser, args, config_result.data, argv)
+    if config_result.path is not None:
+        # Always visible on stderr, so a run's behaviour can be traced to the
+        # file that shaped it; stdout stays a clean report.
+        _print_error(f"Config: {config_result.path}")
+        if config_applied.unknown:
+            _print_error(
+                "Config: ignored unknown key(s): " + ", ".join(config_applied.unknown)
+            )
+        for key in config_applied.egress:
+            _print_error(
+                f"Config: '{key}' enables outbound lookups (observed IOCs/IPs are "
+                f"sent to a third party) — set by {config_result.path}"
+            )
     cache_mb = getattr(args, "cache_mb", None)
     if cache_mb is not None:
         if cache_mb <= 0:
@@ -4506,19 +4586,17 @@ def main() -> int:
         )
         parser.print_usage(sys.stderr)
         return 2
-    # --quiet wires four things: tell the reporter to skip the trailing
+    # --quiet wires three things: tell the reporter to skip the trailing
     # "Output is summarized" footer; skip the startup ASCII banner here;
     # imply --no-color and --no-status so we don't emit ANSI escapes or a
-    # progress bar into a programmatic consumer's pipe; restore real stderr
-    # (it was redirected to a buffer in __init__.py for the scapy import
-    # chain). Defaults unchanged when --quiet is absent.
+    # progress bar into a programmatic consumer's pipe. (The stderr buffer
+    # from __init__.py was already restored right after argument parsing.)
+    # Defaults unchanged when --quiet is absent.
     if getattr(args, "quiet", False):
         set_quiet_mode(True)
         args.no_color = True
         args.no_status = True
         args.oui = True
-        from . import _restore_stderr_if_suppressed
-        _restore_stderr_if_suppressed()
     if getattr(args, "oui", False):
         set_oui_annotation(True)
     if not getattr(args, "quiet", False):
@@ -4864,6 +4942,15 @@ def main() -> int:
         if target.is_file():
             if not is_supported_pcap(target):
                 _print_error("Target is not a supported pcap/pcapng file.")
+                return 2
+            if detect_file_type(target) == "unknown":
+                # A file with the right extension but no capture magic used
+                # to be read as an empty capture and reported as zero packets
+                # with no error — a compressed or renamed file passed silently.
+                _print_error(
+                    f"Target is not a pcap/pcapng capture (unrecognised file "
+                    f"header): {raw_target}"
+                )
                 return 2
             resolved = target
             if resolved not in seen_paths:

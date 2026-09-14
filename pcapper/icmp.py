@@ -2,39 +2,54 @@ from __future__ import annotations
 
 from .utils import is_private_ip as _is_private_ip, packet_length
 from .utils import is_public_ip as _is_public_ip
-import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import memoize_analysis, safe_float
+from .pcap_cache import iter_packets
+from .utils import memoize_analysis, safe_float, shannon_entropy
 
 try:
     from scapy.layers.inet import ICMP, IP  # type: ignore
-    from scapy.layers.inet6 import (
-        ICMPv6DestUnreach,
-        ICMPv6EchoReply,
-        ICMPv6EchoRequest,
-        ICMPv6PacketTooBig,
-        ICMPv6ParamProblem,
-        ICMPv6TimeExceeded,
-        ICMPv6Unknown,
-        IPv6,
-    )  # type: ignore
+    from scapy.layers.inet6 import IPv6  # type: ignore
 except Exception:  # pragma: no cover
     IP = None  # type: ignore
     ICMP = None  # type: ignore
     IPv6 = None  # type: ignore
-    ICMPv6Unknown = None  # type: ignore
-    ICMPv6EchoRequest = None  # type: ignore
-    ICMPv6EchoReply = None  # type: ignore
-    ICMPv6DestUnreach = None  # type: ignore
-    ICMPv6TimeExceeded = None  # type: ignore
-    ICMPv6ParamProblem = None  # type: ignore
-    ICMPv6PacketTooBig = None  # type: ignore
+
+_IP_PROTO_ICMP = 1
+_IPV6_NH_ICMPV6 = 58
+
+# Filenames worth surfacing from an ICMP payload (covert-channel carriers and
+# staged tooling). Compiled once; this runs inside the per-packet loop.
+_PAYLOAD_FILENAME_RE = re.compile(
+    r"[\w\-.()\[\] ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|txt|bat|ps1|jpg|jpeg|png|gif|bmp|tiff)",
+    re.IGNORECASE,
+)
+
+
+def _icmpv6_layer(ip6_layer: object) -> object | None:
+    """The ICMPv6 message under an IPv6 header, skipping extension headers.
+
+    scapy models each ICMPv6 message type as its own class; they all carry
+    ``type``/``code``, which is all this analyzer reads, so the class does
+    not matter — only that it is an ICMPv6 message.
+    """
+    layer = getattr(ip6_layer, "payload", None)
+    while layer is not None:
+        name = type(layer).__name__
+        if name.startswith("ICMPv6"):
+            return layer
+        if not name.startswith("IPv6ExtHdr"):
+            return None
+        layer = getattr(layer, "payload", None)
+    return None
+
+
+def _preview_text(data: bytes) -> str:
+    return "".join(chr(b) if 32 <= b <= 126 else "." for b in data)
 
 
 @dataclass(frozen=True)
@@ -201,44 +216,45 @@ def _build_icmp_enrichment(
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
     }
 
+def _empty_summary(path: Path, errors: list[str]) -> IcmpSummary:
+    return IcmpSummary(
+        path=path,
+        total_packets=0,
+        total_bytes=0,
+        ipv4_packets=0,
+        ipv6_packets=0,
+        type_counts=Counter(),
+        code_counts=Counter(),
+        src_ip_counts=Counter(),
+        dst_ip_counts=Counter(),
+        src_ips=set(),
+        dst_ips=set(),
+        first_seen=None,
+        last_seen=None,
+        duration_seconds=None,
+        avg_payload_bytes=0.0,
+        max_payload_bytes=0,
+        payload_size_variants=0,
+        payload_summaries=[],
+        detections=[],
+        conversations=[],
+        sessions=[],
+        request_counts=Counter(),
+        response_counts=Counter(),
+        artifacts=[],
+        observed_users=Counter(),
+        files_discovered=[],
+        errors=errors,
+    )
+
+
 @memoize_analysis
 def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
     errors: list[str] = []
-    if ICMP is None and ICMPv6Unknown is None:
-        errors.append("Scapy ICMP layers unavailable; install scapy for ICMP analysis.")
-        return IcmpSummary(
-            path=path,
-            total_packets=0,
-            total_bytes=0,
-            ipv4_packets=0,
-            ipv6_packets=0,
-            type_counts=Counter(),
-            code_counts=Counter(),
-            src_ip_counts=Counter(),
-            dst_ip_counts=Counter(),
-            src_ips=set(),
-            dst_ips=set(),
-            first_seen=None,
-            last_seen=None,
-            duration_seconds=None,
-            avg_payload_bytes=0.0,
-            max_payload_bytes=0,
-            payload_size_variants=0,
-            payload_summaries=[],
-            detections=[],
-            conversations=[],
-            sessions=[],
-            request_counts=Counter(),
-            response_counts=Counter(),
-            artifacts=[],
-            observed_users=Counter(),
-            files_discovered=[],
-            errors=errors,
+    if IP is None and IPv6 is None:
+        return _empty_summary(
+            path, ["Scapy IP layers unavailable; install scapy for ICMP analysis."]
         )
-
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
 
     total_packets = 0
     total_bytes = 0
@@ -265,403 +281,244 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
     files_discovered: set[str] = set()
     observed_users: Counter[str] = Counter()
 
-    try:
-        for pkt in reader:
-            src: Optional[str] = None
-            dst: Optional[str] = None
-            ts = safe_float(getattr(pkt, "time", None))
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, show_status=show_status):
+        src: Optional[str] = None
+        dst: Optional[str] = None
+        ts = safe_float(getattr(pkt, "time", None))
 
-            # Resolve each scapy layer class at most once per packet via
-            # getlayer (haslayer + pkt[X] would walk the layer chain twice).
-            icmp_layer = pkt.getlayer(ICMP) if ICMP is not None else None  # type: ignore[arg-type]
-            is_icmpv4 = icmp_layer is not None
-            ip_layer = None
-            ip_layer_resolved = False
-            ip6_layer = None
-            ip6_layer_resolved = False
-            icmp6_unknown = None
-            icmp6_echo_request = None
-            icmp6_echo_reply = None
-            icmp6_dest_unreach = None
-            icmp6_time_exceeded = None
-            icmp6_param_problem = None
-            icmp6_packet_too_big = None
-            is_icmpv6 = False
-            if (
-                ICMPv6Unknown is not None
-                and (icmp6_unknown := pkt.getlayer(ICMPv6Unknown)) is not None
-            ):
-                is_icmpv6 = True
-            elif (
-                ICMPv6EchoRequest is not None
-                and (icmp6_echo_request := pkt.getlayer(ICMPv6EchoRequest)) is not None
-            ):
-                is_icmpv6 = True
-            elif (
-                ICMPv6EchoReply is not None
-                and (icmp6_echo_reply := pkt.getlayer(ICMPv6EchoReply)) is not None
-            ):
-                is_icmpv6 = True
-            elif (
-                ICMPv6DestUnreach is not None
-                and (icmp6_dest_unreach := pkt.getlayer(ICMPv6DestUnreach)) is not None
-            ):
-                is_icmpv6 = True
-            elif (
-                ICMPv6TimeExceeded is not None
-                and (icmp6_time_exceeded := pkt.getlayer(ICMPv6TimeExceeded))
-                is not None
-            ):
-                is_icmpv6 = True
-            elif (
-                ICMPv6ParamProblem is not None
-                and (icmp6_param_problem := pkt.getlayer(ICMPv6ParamProblem))
-                is not None
-            ):
-                is_icmpv6 = True
-            elif (
-                ICMPv6PacketTooBig is not None
-                and (icmp6_packet_too_big := pkt.getlayer(ICMPv6PacketTooBig))
-                is not None
-            ):
-                is_icmpv6 = True
-            # Fallback: detect ICMP by IP protocol/next-header if layers are missing
-            if not is_icmpv4 and not is_icmpv6:
-                if IP is not None:
-                    ip_layer = pkt.getlayer(IP)  # type: ignore[arg-type]
-                ip_layer_resolved = True
-                if ip_layer is not None:
-                    if getattr(ip_layer, "proto", None) == 1:
-                        is_icmpv4 = True
-                if not is_icmpv4:
-                    if IPv6 is not None:
-                        ip6_layer = pkt.getlayer(IPv6)  # type: ignore[arg-type]
-                    ip6_layer_resolved = True
-                    if ip6_layer is not None and getattr(ip6_layer, "nh", None) == 58:
-                        is_icmpv6 = True
-            if not is_icmpv4 and not is_icmpv6:
-                continue
+        # Cheap test first: the IP protocol / IPv6 next-header field says
+        # whether this is ICMP at all. Only then walk to the ICMP layer.
+        # The old code ran up to seven getlayer() walks per packet before
+        # this test, on every non-ICMP packet in the capture.
+        ip_layer = pkt.getlayer(IP) if IP is not None else None  # type: ignore[arg-type]
+        ip6_layer = None
+        is_icmpv4 = ip_layer is not None and getattr(ip_layer, "proto", None) == _IP_PROTO_ICMP
+        is_icmpv6 = False
+        if not is_icmpv4:
+            ip6_layer = pkt.getlayer(IPv6) if IPv6 is not None else None  # type: ignore[arg-type]
+            is_icmpv6 = (
+                ip6_layer is not None and getattr(ip6_layer, "nh", None) == _IPV6_NH_ICMPV6
+            )
+        if not is_icmpv4 and not is_icmpv6:
+            continue
 
-            total_packets += 1
-            pkt_len = packet_length(pkt)
-            total_bytes += pkt_len
+        total_packets += 1
+        pkt_len = packet_length(pkt)
+        total_bytes += pkt_len
 
-            if is_icmpv4:
-                ipv4_packets += 1
-                try:
-                    if icmp_layer is not None:
-                        payload_bytes = bytes(icmp_layer.payload)
-                        payload_len = len(payload_bytes)
-                    else:
-                        if not ip_layer_resolved:
-                            ip_layer = (
-                                pkt.getlayer(IP) if IP is not None else None  # type: ignore[arg-type]
-                            )
-                            ip_layer_resolved = True
-                        payload_bytes = (
-                            bytes(ip_layer.payload) if ip_layer is not None else b""
-                        )
-                        payload_len = len(payload_bytes)
-                except Exception:
-                    payload_bytes = b""
-                    payload_len = 0
+        if is_icmpv4:
+            ipv4_packets += 1
+            icmp_layer = ip_layer.getlayer(ICMP) if ICMP is not None else None
+            try:
                 if icmp_layer is not None:
-                    icmp_type = getattr(icmp_layer, "type", None)
-                    icmp_code = getattr(icmp_layer, "code", None)
+                    payload_bytes = bytes(icmp_layer.payload)
                 else:
-                    icmp_type = payload_bytes[0] if len(payload_bytes) >= 1 else None
-                    icmp_code = payload_bytes[1] if len(payload_bytes) >= 2 else None
-                if icmp_type is not None:
-                    type_counts[f"icmpv4:{icmp_type}"] += 1
+                    # Header present but scapy did not dissect an ICMP layer
+                    # (truncated capture): read type/code from the bytes.
+                    payload_bytes = bytes(ip_layer.payload)
+                payload_len = len(payload_bytes)
+            except Exception:
+                payload_bytes = b""
+                payload_len = 0
+            if icmp_layer is not None:
+                icmp_type = getattr(icmp_layer, "type", None)
+                icmp_code = getattr(icmp_layer, "code", None)
+            else:
+                icmp_type = payload_bytes[0] if len(payload_bytes) >= 1 else None
+                icmp_code = payload_bytes[1] if len(payload_bytes) >= 2 else None
+            if icmp_type is not None:
+                type_counts[f"icmpv4:{icmp_type}"] += 1
+                if icmp_type == 8:
+                    request_counts["ICMPv4 Echo"] += 1
+                elif icmp_type == 0:
+                    response_counts["ICMPv4 Echo Reply"] += 1
+                elif icmp_type == 3:
+                    response_counts["ICMPv4 Destination Unreachable"] += 1
+                elif icmp_type == 11:
+                    response_counts["ICMPv4 Time Exceeded"] += 1
+            if icmp_code is not None:
+                code_counts[f"icmpv4:{icmp_type}:{icmp_code}"] += 1
+            if ip_layer is not None:
+                if getattr(ip_layer, "src", None):
+                    src = str(ip_layer.src)
+                    src_ips.add(src)
+                    src_ip_counts[src] += 1
+                if getattr(ip_layer, "dst", None):
+                    dst = str(ip_layer.dst)
+                    dst_ips.add(dst)
+                    dst_ip_counts[dst] += 1
+
+            if icmp_type in (0, 8):
+                icmp_id = getattr(icmp_layer, "id", None)
+                if icmp_id is not None and src and dst:
+                    sess_key = (src, dst, int(icmp_id))
+                    sess = sessions.setdefault(
+                        sess_key,
+                        {
+                            "src": src,
+                            "dst": dst,
+                            "id": int(icmp_id),
+                            "requests": 0,
+                            "replies": 0,
+                            "first_seen": None,
+                            "last_seen": None,
+                            "packets": 0,
+                        },
+                    )
+                    sess["packets"] += 1
                     if icmp_type == 8:
-                        request_counts["ICMPv4 Echo"] += 1
-                    elif icmp_type == 0:
-                        response_counts["ICMPv4 Echo Reply"] += 1
-                    elif icmp_type == 3:
-                        response_counts["ICMPv4 Destination Unreachable"] += 1
-                    elif icmp_type == 11:
-                        response_counts["ICMPv4 Time Exceeded"] += 1
-                if icmp_code is not None:
-                    code_counts[f"icmpv4:{icmp_type}:{icmp_code}"] += 1
-                if not ip_layer_resolved:
-                    ip_layer = pkt.getlayer(IP) if IP is not None else None  # type: ignore[arg-type]
-                    ip_layer_resolved = True
-                if ip_layer is not None:
-                    if getattr(ip_layer, "src", None):
-                        src = str(ip_layer.src)
-                        src_ips.add(src)
-                        src_ip_counts[src] += 1
-                    if getattr(ip_layer, "dst", None):
-                        dst = str(ip_layer.dst)
-                        dst_ips.add(dst)
-                        dst_ip_counts[dst] += 1
-
-                if icmp_type in (0, 8):
-                    icmp_id = getattr(icmp_layer, "id", None)
-                    if icmp_id is not None and src and dst:
-                        sess_key = (src, dst, int(icmp_id))
-                        sess = sessions.setdefault(
-                            sess_key,
-                            {
-                                "src": src,
-                                "dst": dst,
-                                "id": int(icmp_id),
-                                "requests": 0,
-                                "replies": 0,
-                                "first_seen": None,
-                                "last_seen": None,
-                                "packets": 0,
-                            },
-                        )
-                        sess["packets"] += 1
-                        if icmp_type == 8:
-                            sess["requests"] += 1
-                        else:
-                            sess["replies"] += 1
-                        if ts is not None:
-                            if sess["first_seen"] is None or ts < sess["first_seen"]:
-                                sess["first_seen"] = ts
-                            if sess["last_seen"] is None or ts > sess["last_seen"]:
-                                sess["last_seen"] = ts
-
-            if is_icmpv6:
-                ipv6_packets += 1
-                icmp6_layer = None
-                if icmp6_unknown is None:
-                    # Detection above resolved (to None) every class earlier in
-                    # this extraction order than its match, so reuse the locals.
-                    if icmp6_echo_request is not None:
-                        icmp6_layer = icmp6_echo_request
-                    elif icmp6_echo_reply is not None:
-                        icmp6_layer = icmp6_echo_reply
-                    elif icmp6_dest_unreach is not None:
-                        icmp6_layer = icmp6_dest_unreach
-                    elif icmp6_time_exceeded is not None:
-                        icmp6_layer = icmp6_time_exceeded
-                    elif icmp6_param_problem is not None:
-                        icmp6_layer = icmp6_param_problem
-                    elif icmp6_packet_too_big is not None:
-                        icmp6_layer = icmp6_packet_too_big
-                else:
-                    # Detection short-circuited at ICMPv6Unknown, so the other
-                    # classes are still unresolved; check them in extraction
-                    # order before falling back to the unknown layer.
-                    if (
-                        ICMPv6EchoRequest is not None
-                        and (icmp6_echo_request := pkt.getlayer(ICMPv6EchoRequest))
-                        is not None
-                    ):
-                        icmp6_layer = icmp6_echo_request
-                    elif (
-                        ICMPv6EchoReply is not None
-                        and (icmp6_echo_reply := pkt.getlayer(ICMPv6EchoReply))
-                        is not None
-                    ):
-                        icmp6_layer = icmp6_echo_reply
-                    elif (
-                        ICMPv6DestUnreach is not None
-                        and (icmp6_dest_unreach := pkt.getlayer(ICMPv6DestUnreach))
-                        is not None
-                    ):
-                        icmp6_layer = icmp6_dest_unreach
-                    elif (
-                        ICMPv6TimeExceeded is not None
-                        and (icmp6_time_exceeded := pkt.getlayer(ICMPv6TimeExceeded))
-                        is not None
-                    ):
-                        icmp6_layer = icmp6_time_exceeded
-                    elif (
-                        ICMPv6ParamProblem is not None
-                        and (icmp6_param_problem := pkt.getlayer(ICMPv6ParamProblem))
-                        is not None
-                    ):
-                        icmp6_layer = icmp6_param_problem
-                    elif (
-                        ICMPv6PacketTooBig is not None
-                        and (icmp6_packet_too_big := pkt.getlayer(ICMPv6PacketTooBig))
-                        is not None
-                    ):
-                        icmp6_layer = icmp6_packet_too_big
+                        sess["requests"] += 1
                     else:
-                        icmp6_layer = icmp6_unknown
+                        sess["replies"] += 1
+                    if ts is not None:
+                        if sess["first_seen"] is None or ts < sess["first_seen"]:
+                            sess["first_seen"] = ts
+                        if sess["last_seen"] is None or ts > sess["last_seen"]:
+                            sess["last_seen"] = ts
+
+        if is_icmpv6:
+            ipv6_packets += 1
+            icmp6_layer = _icmpv6_layer(ip6_layer)
+            try:
+                payload_bytes = bytes(
+                    icmp6_layer.payload if icmp6_layer is not None else ip6_layer.payload
+                )
+                payload_len = len(payload_bytes)
+            except Exception:
+                payload_bytes = b""
+                payload_len = 0
+            icmp6_type = getattr(icmp6_layer, "type", None) if icmp6_layer is not None else None
+            icmp6_code = getattr(icmp6_layer, "code", None) if icmp6_layer is not None else None
+            if icmp6_type is None:
+                # Header says ICMPv6 but no message layer was dissected:
+                # type/code are the first two bytes after the IPv6 header.
                 try:
-                    if icmp6_layer is not None:
-                        payload_bytes = bytes(icmp6_layer.payload)
-                        payload_len = len(payload_bytes)
-                    else:
-                        if not ip6_layer_resolved:
-                            ip6_layer = (
-                                pkt.getlayer(IPv6) if IPv6 is not None else None  # type: ignore[arg-type]
-                            )
-                            ip6_layer_resolved = True
-                        if ip6_layer is not None:
-                            payload_bytes = bytes(ip6_layer.payload)
-                            payload_len = len(payload_bytes)
-                        else:
-                            payload_bytes = b""
-                            payload_len = 0
-                except Exception:
-                    payload_bytes = b""
-                    payload_len = 0
-                icmp6_type = (
-                    getattr(icmp6_layer, "type", None)
-                    if icmp6_layer is not None
-                    else None
-                )
-                icmp6_code = (
-                    getattr(icmp6_layer, "code", None)
-                    if icmp6_layer is not None
-                    else None
-                )
-                if icmp6_type is None:
-                    if not ip6_layer_resolved:
-                        ip6_layer = pkt.getlayer(IPv6) if IPv6 is not None else None  # type: ignore[arg-type]
-                        ip6_layer_resolved = True
-                    if ip6_layer is not None:
-                        try:
-                            raw_bytes = bytes(ip6_layer.payload)
-                            icmp6_type = raw_bytes[0] if len(raw_bytes) >= 1 else None
-                            icmp6_code = raw_bytes[1] if len(raw_bytes) >= 2 else None
-                            payload_bytes = raw_bytes
-                            payload_len = len(raw_bytes)
-                        except Exception:
-                            pass
-                if icmp6_type is not None:
-                    type_counts[f"icmpv6:{icmp6_type}"] += 1
-                    if icmp6_type == 128:
-                        request_counts["ICMPv6 Echo"] += 1
-                    elif icmp6_type == 129:
-                        response_counts["ICMPv6 Echo Reply"] += 1
-                    elif icmp6_type == 1:
-                        response_counts["ICMPv6 Destination Unreachable"] += 1
-                    elif icmp6_type == 3:
-                        response_counts["ICMPv6 Time Exceeded"] += 1
-                if icmp6_code is not None:
-                    code_counts[f"icmpv6:{icmp6_type}:{icmp6_code}"] += 1
-                if not ip6_layer_resolved:
-                    ip6_layer = pkt.getlayer(IPv6) if IPv6 is not None else None  # type: ignore[arg-type]
-                    ip6_layer_resolved = True
-                if ip6_layer is not None:
-                    if getattr(ip6_layer, "src", None):
-                        src = str(ip6_layer.src)
-                        src_ips.add(src)
-                        src_ip_counts[src] += 1
-                    if getattr(ip6_layer, "dst", None):
-                        dst = str(ip6_layer.dst)
-                        dst_ips.add(dst)
-                        dst_ip_counts[dst] += 1
-
-                if icmp6_type in (128, 129):
-                    icmp_id = (
-                        getattr(icmp6_layer, "id", None)
-                        if icmp6_layer is not None
-                        else None
-                    )
-                    if icmp_id is not None and src and dst:
-                        sess_key = (src, dst, int(icmp_id))
-                        sess = sessions.setdefault(
-                            sess_key,
-                            {
-                                "src": src,
-                                "dst": dst,
-                                "id": int(icmp_id),
-                                "requests": 0,
-                                "replies": 0,
-                                "first_seen": None,
-                                "last_seen": None,
-                                "packets": 0,
-                            },
-                        )
-                        sess["packets"] += 1
-                        if icmp6_type == 128:
-                            sess["requests"] += 1
-                        else:
-                            sess["replies"] += 1
-                        if ts is not None:
-                            if sess["first_seen"] is None or ts < sess["first_seen"]:
-                                sess["first_seen"] = ts
-                            if sess["last_seen"] is None or ts > sess["last_seen"]:
-                                sess["last_seen"] = ts
-
-            payload_total += payload_len
-            payload_max = max(payload_max, payload_len)
-            payload_sizes[payload_len] += 1
-
-            if payload_len > 0:
-                digest = payload_bytes[:64].hex()
-                payload_counts[digest] += 1
-                entry = payload_meta.setdefault(
-                    digest,
-                    {
-                        "size": payload_len,
-                        "sources": Counter(),
-                        "destinations": Counter(),
-                        "samples": payload_bytes[:64],
-                    },
-                )
-                if src:
-                    entry["sources"][src] += 1  # type: ignore[index]
-                if dst:
-                    entry["destinations"][dst] += 1  # type: ignore[index]
-
-                # Artifact extraction
-                try:
-                    text = "".join(
-                        chr(b) if 32 <= b <= 126 else " " for b in payload_bytes[:128]
-                    )
-                    for token in text.split():
-                        if len(token) >= 4:
-                            artifacts.add(token)
-                            if token.lower().startswith(
-                                ("user=", "username=", "login=")
-                            ):
-                                observed_users[token] += 1
-                    for name in re.findall(
-                        r"[\w\-.()\[\] ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|txt|bat|ps1|jpg|jpeg|png|gif|bmp|tiff)",
-                        text,
-                        re.IGNORECASE,
-                    ):
-                        files_discovered.add(name)
+                    raw_bytes = bytes(ip6_layer.payload)
+                    icmp6_type = raw_bytes[0] if len(raw_bytes) >= 1 else None
+                    icmp6_code = raw_bytes[1] if len(raw_bytes) >= 2 else None
+                    payload_bytes = raw_bytes
+                    payload_len = len(raw_bytes)
                 except Exception:
                     pass
+            if icmp6_type is not None:
+                type_counts[f"icmpv6:{icmp6_type}"] += 1
+                if icmp6_type == 128:
+                    request_counts["ICMPv6 Echo"] += 1
+                elif icmp6_type == 129:
+                    response_counts["ICMPv6 Echo Reply"] += 1
+                elif icmp6_type == 1:
+                    response_counts["ICMPv6 Destination Unreachable"] += 1
+                elif icmp6_type == 3:
+                    response_counts["ICMPv6 Time Exceeded"] += 1
+            if icmp6_code is not None:
+                code_counts[f"icmpv6:{icmp6_type}:{icmp6_code}"] += 1
+            if ip6_layer is not None:
+                if getattr(ip6_layer, "src", None):
+                    src = str(ip6_layer.src)
+                    src_ips.add(src)
+                    src_ip_counts[src] += 1
+                if getattr(ip6_layer, "dst", None):
+                    dst = str(ip6_layer.dst)
+                    dst_ips.add(dst)
+                    dst_ip_counts[dst] += 1
 
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
-
-            if src and dst:
-                convo_key = (src, dst, "icmpv4" if is_icmpv4 else "icmpv6")
-                convo = conversations.setdefault(
-                    convo_key,
-                    {
-                        "src": src,
-                        "dst": dst,
-                        "protocol": "icmpv4" if is_icmpv4 else "icmpv6",
-                        "packets": 0,
-                        "bytes": 0,
-                        "first_seen": None,
-                        "last_seen": None,
-                    },
+            if icmp6_type in (128, 129):
+                icmp_id = (
+                    getattr(icmp6_layer, "id", None)
+                    if icmp6_layer is not None
+                    else None
                 )
-                convo["packets"] += 1
-                convo["bytes"] += pkt_len
-                if ts is not None:
-                    if convo["first_seen"] is None or ts < convo["first_seen"]:
-                        convo["first_seen"] = ts
-                    if convo["last_seen"] is None or ts > convo["last_seen"]:
-                        convo["last_seen"] = ts
-    finally:
-        status.finish()
-        reader.close()
+                if icmp_id is not None and src and dst:
+                    sess_key = (src, dst, int(icmp_id))
+                    sess = sessions.setdefault(
+                        sess_key,
+                        {
+                            "src": src,
+                            "dst": dst,
+                            "id": int(icmp_id),
+                            "requests": 0,
+                            "replies": 0,
+                            "first_seen": None,
+                            "last_seen": None,
+                            "packets": 0,
+                        },
+                    )
+                    sess["packets"] += 1
+                    if icmp6_type == 128:
+                        sess["requests"] += 1
+                    else:
+                        sess["replies"] += 1
+                    if ts is not None:
+                        if sess["first_seen"] is None or ts < sess["first_seen"]:
+                            sess["first_seen"] = ts
+                        if sess["last_seen"] is None or ts > sess["last_seen"]:
+                            sess["last_seen"] = ts
+
+        payload_total += payload_len
+        payload_max = max(payload_max, payload_len)
+        payload_sizes[payload_len] += 1
+
+        if payload_len > 0:
+            digest = payload_bytes[:64].hex()
+            payload_counts[digest] += 1
+            entry = payload_meta.setdefault(
+                digest,
+                {
+                    "size": payload_len,
+                    "sources": Counter(),
+                    "destinations": Counter(),
+                    "samples": payload_bytes[:64],
+                },
+            )
+            if src:
+                entry["sources"][src] += 1  # type: ignore[index]
+            if dst:
+                entry["destinations"][dst] += 1  # type: ignore[index]
+
+            # Artifact extraction
+            try:
+                text = "".join(
+                    chr(b) if 32 <= b <= 126 else " " for b in payload_bytes[:128]
+                )
+                for token in text.split():
+                    if len(token) >= 4:
+                        artifacts.add(token)
+                        if token.lower().startswith(
+                            ("user=", "username=", "login=")
+                        ):
+                            observed_users[token] += 1
+                for name in _PAYLOAD_FILENAME_RE.findall(text):
+                    files_discovered.add(name)
+            except Exception:
+                pass
+
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
+
+        if src and dst:
+            convo_key = (src, dst, "icmpv4" if is_icmpv4 else "icmpv6")
+            convo = conversations.setdefault(
+                convo_key,
+                {
+                    "src": src,
+                    "dst": dst,
+                    "protocol": "icmpv4" if is_icmpv4 else "icmpv6",
+                    "packets": 0,
+                    "bytes": 0,
+                    "first_seen": None,
+                    "last_seen": None,
+                },
+            )
+            convo["packets"] += 1
+            convo["bytes"] += pkt_len
+            if ts is not None:
+                if convo["first_seen"] is None or ts < convo["first_seen"]:
+                    convo["first_seen"] = ts
+                if convo["last_seen"] is None or ts > convo["last_seen"]:
+                    convo["last_seen"] = ts
 
     detections: list[dict[str, str]] = []
     duration_seconds: Optional[float] = None
@@ -671,20 +528,6 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
     avg_payload = (payload_total / total_packets) if total_packets else 0.0
     payload_variants = len(payload_sizes)
     payload_summaries: list[dict[str, object]] = []
-
-    def _entropy(data: bytes) -> float:
-        if not data:
-            return 0.0
-        freq = Counter(data)
-        total = len(data)
-        return -sum(
-            (count / total) * math.log2(count / total) for count in freq.values()
-        )
-
-    def _preview_text(data: bytes) -> str:
-        if not data:
-            return ""
-        return "".join(chr(b) if 32 <= b <= 126 else "." for b in data)
 
     for digest, count in payload_counts.most_common(12):
         meta = payload_meta.get(digest, {})
@@ -708,7 +551,7 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                 "payload_preview": _preview_text(bytes(sample_bytes)[:64]),
                 "count": count,
                 "size": size,
-                "entropy": _entropy(bytes(sample_bytes)),
+                "entropy": shannon_entropy(bytes(sample_bytes)),
                 "top_sources": top_src,
                 "top_destinations": top_dst,
             }

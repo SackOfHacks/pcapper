@@ -15,19 +15,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from scapy.layers.inet import TCP, UDP
+    from scapy.layers.inet import IP, TCP, UDP
+    from scapy.layers.inet6 import IPv6
     from scapy.packet import Raw
 except ImportError:  # pragma: no cover - scapy optional at runtime
-    TCP = UDP = Raw = None
+    IP = IPv6 = TCP = UDP = Raw = None
 
 from .ot_ports import OT_PORT_PROTOCOLS
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     extract_packet_endpoints,
     is_public_ip as _is_public_ip,
     memoize_analysis,
     safe_float,
     tcp_flags_int,
+    tcp_segment_length,
 )
 
 # Inbound services that constitute interactive/remote-execution access. A
@@ -85,20 +87,35 @@ class RemoteAccessAnalysis:
     errors: list[str] = field(default_factory=list)
 
 
-def _payload_len(layer) -> int:
+def _payload_len(pkt, layer) -> int:
+    """Application bytes carried by a transport layer.
+
+    For TCP the length comes from the IP/TCP headers: a padded minimum frame
+    makes ``bytes(tcp.payload)`` of a pure ACK six bytes long, and every
+    pure ACK to a PLC port used to count as an "OT command out".
+    """
     try:
+        if TCP is not None and isinstance(layer, TCP):
+            ip_layer = pkt.getlayer(IP) if IP is not None else None
+            if ip_layer is None and IPv6 is not None:
+                ip_layer = pkt.getlayer(IPv6)
+            length = tcp_segment_length(layer, ip_layer)
+            if length is not None:
+                return length
         payload = layer.payload
         if payload is None:
             return 0
-        raw = bytes(payload)
-        return len(raw)
+        return len(bytes(payload))
     except Exception:
         return 0
 
 
 @memoize_analysis
 def analyze_remote_access(
-    path: Path, show_status: bool = True
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> RemoteAccessAnalysis:
     errors: list[str] = []
     analysis = RemoteAccessAnalysis(path=path)
@@ -107,7 +124,6 @@ def analyze_remote_access(
         analysis.errors = errors
         return analysis
 
-    reader, status, stream, size_bytes, _ft = get_reader(path, show_status=show_status)
 
     # Handshake state per directed flow (client_ip, server_ip, client_port,
     # server_port): which of SYN / SYN-ACK / ACK we have observed and the ts.
@@ -117,12 +133,7 @@ def analyze_remote_access(
     ot_out_by_host: dict[str, list[tuple[float, str, str]]] = {}
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    status.update(int(min(100, (stream.tell() / size_bytes) * 100)))
-                except Exception:
-                    pass
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             ts = safe_float(getattr(pkt, "time", None)) or 0.0
             src, dst = extract_packet_endpoints(pkt)
             if not src or not dst or src == dst:
@@ -190,16 +201,13 @@ def analyze_remote_access(
             if (
                 transport is not None
                 and ot_dport in OT_PORT_PROTOCOLS
-                and _payload_len(transport) > 0
+                and _payload_len(pkt, transport) > 0
             ):
                 bucket = ot_out_by_host.setdefault(src, [])
                 if len(bucket) < _MAX_OT_OUT_PER_HOST:
                     bucket.append((ts, dst, OT_PORT_PROTOCOLS[ot_dport]))
     except Exception as exc:  # pragma: no cover - defensive
         errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        status.finish()
-        reader.close()
 
     # --- correlate: host received remote-in, then issued an OT command out ---
     sessions_by_host: dict[str, list[RemoteInSession]] = {}

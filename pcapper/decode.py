@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import bz2
-import gzip
 import html
 import json
 import lzma
@@ -149,54 +148,74 @@ def _decode_jwt_payload(token: str) -> str:
     return json.dumps(data, indent=2, sort_keys=True)
 
 
+# Every decompressor is bounded: a 1 KB input can expand to gigabytes and the
+# decoder runs on operator-supplied text with no other guard.
+MAX_DECOMPRESSED_BYTES = 32 * 1024 * 1024
+
+
+def _bounded_zlib(data: bytes, wbits: int) -> bytes:
+    decompressor = zlib.decompressobj(wbits)
+    out = decompressor.decompress(data, MAX_DECOMPRESSED_BYTES)
+    if decompressor.unconsumed_tail:
+        raise ValueError(f"decompressed output exceeds {MAX_DECOMPRESSED_BYTES} bytes")
+    return out
+
+
+def _bounded_stream(decompressor, data: bytes) -> bytes:
+    out = decompressor.decompress(data, MAX_DECOMPRESSED_BYTES)
+    if not decompressor.eof and len(out) >= MAX_DECOMPRESSED_BYTES:
+        raise ValueError(f"decompressed output exceeds {MAX_DECOMPRESSED_BYTES} bytes")
+    return out
+
+
 def _gzip_decompress_raw(text: str) -> bytes:
-    return gzip.decompress(text.encode("latin-1", errors="ignore"))
+    return _bounded_zlib(text.encode("latin-1", errors="ignore"), 16 + zlib.MAX_WBITS)
 
 
 def _zlib_decompress_raw(text: str) -> bytes:
-    return zlib.decompress(text.encode("latin-1", errors="ignore"))
+    return _bounded_zlib(text.encode("latin-1", errors="ignore"), zlib.MAX_WBITS)
 
 
 def _gzip_decompress_b64(text: str) -> bytes:
     payload = _maybe_b64decode(text, urlsafe=False)
-    return gzip.decompress(payload)
+    return _bounded_zlib(payload, 16 + zlib.MAX_WBITS)
 
 
 def _zlib_decompress_b64(text: str) -> bytes:
     payload = _maybe_b64decode(text, urlsafe=False)
-    return zlib.decompress(payload)
+    return _bounded_zlib(payload, zlib.MAX_WBITS)
 
 
 def _gzip_decompress_hex(text: str) -> bytes:
-    return gzip.decompress(_decode_hex(text))
+    return _bounded_zlib(_decode_hex(text), 16 + zlib.MAX_WBITS)
 
 
 def _zlib_decompress_hex(text: str) -> bytes:
-    return zlib.decompress(_decode_hex(text))
+    return _bounded_zlib(_decode_hex(text), zlib.MAX_WBITS)
 
 
 def _bz2_decompress_raw(text: str) -> bytes:
-    return bz2.decompress(text.encode("latin-1", errors="ignore"))
+    return _bounded_stream(bz2.BZ2Decompressor(), text.encode("latin-1", errors="ignore"))
 
 
 def _bz2_decompress_b64(text: str) -> bytes:
-    return bz2.decompress(_maybe_b64decode(text))
+    return _bounded_stream(bz2.BZ2Decompressor(), _maybe_b64decode(text))
 
 
 def _bz2_decompress_hex(text: str) -> bytes:
-    return bz2.decompress(_decode_hex(text))
+    return _bounded_stream(bz2.BZ2Decompressor(), _decode_hex(text))
 
 
 def _lzma_decompress_raw(text: str) -> bytes:
-    return lzma.decompress(text.encode("latin-1", errors="ignore"))
+    return _bounded_stream(lzma.LZMADecompressor(), text.encode("latin-1", errors="ignore"))
 
 
 def _lzma_decompress_b64(text: str) -> bytes:
-    return lzma.decompress(_maybe_b64decode(text))
+    return _bounded_stream(lzma.LZMADecompressor(), _maybe_b64decode(text))
 
 
 def _lzma_decompress_hex(text: str) -> bytes:
-    return lzma.decompress(_decode_hex(text))
+    return _bounded_stream(lzma.LZMADecompressor(), _decode_hex(text))
 
 
 def _decode_base58(text: str) -> bytes:

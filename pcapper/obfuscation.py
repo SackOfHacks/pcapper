@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import math
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -9,8 +8,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, memoize_analysis, safe_float
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float, shannon_entropy
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -221,18 +220,6 @@ def _empty_summary(path: Path) -> ObfuscationSummary:
         detections=[],
         errors=[],
     )
-
-
-def _entropy(data: bytes) -> float:
-    if not data:
-        return 0.0
-    counts = Counter(data)
-    length = len(data)
-    entropy_val = 0.0
-    for count in counts.values():
-        p = count / length
-        entropy_val -= p * math.log2(p)
-    return entropy_val
 
 
 def _printable_ratio(data: bytes) -> float:
@@ -902,7 +889,7 @@ def analyze_obfuscation(
     show_status: bool = True,
     *,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> ObfuscationSummary:
     if TCP is None and UDP is None:
         summary = _empty_summary(path)
@@ -913,9 +900,6 @@ def analyze_obfuscation(
     # Reuse the single pre-loaded packet set / file metadata when the CLI passes
     # them, instead of re-reading the pcap from disk (perf on large captures in
     # multi-function runs).
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
     total_packets = 0
     total_payload_bytes = 0
     suspicious_packets = 0
@@ -944,15 +928,8 @@ def analyze_obfuscation(
 
     pkt_index = 0
     try:
-        for pkt in reader:
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             pkt_index += 1
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
-
             total_packets += 1
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
@@ -987,7 +964,7 @@ def analyze_obfuscation(
                 first_seen = ts if first_seen is None else min(first_seen, ts)
                 last_seen = ts if last_seen is None else max(last_seen, ts)
 
-            entropy_val = _entropy(sample)
+            entropy_val = shannon_entropy(sample)
             printable_val = _printable_ratio(sample)
             flow = _flow_id(proto, src_ip, src_port, dst_ip, dst_port)
             state = _session_state(
@@ -1234,9 +1211,6 @@ def analyze_obfuscation(
 
     except Exception as exc:
         errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        status.finish()
-        reader.close()
 
     session_stats: list[ObfuscationSessionStat] = []
     for state in flow_state.values():

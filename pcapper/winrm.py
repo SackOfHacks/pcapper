@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, extract_ascii_strings as _extract_ascii_strings
 from .utils import is_public_ip as _is_public_ip
 from .utils import beacon_score as _beaconing_score
@@ -27,6 +27,9 @@ except Exception:  # pragma: no cover
 WINRM_PORTS = {5985, 5986}
 HTTP_PORTS = {80, 5985, 8080, 8000}
 HTTPS_PORTS = {443, 5986, 8443}
+# A WinRM port on the *source* side is the service only when the destination
+# is an ephemeral port; a flow from ephemeral 5985 to 443 is not WinRM.
+_EPHEMERAL_MIN = 1024
 
 WSMAN_RE = re.compile(r"(WSMAN|WinRM|wsman)", re.IGNORECASE)
 SOAP_ACTION_RE = re.compile(r"SOAPAction:\s*([^\r\n]+)", re.IGNORECASE)
@@ -264,7 +267,7 @@ def _direction(
 ) -> tuple[str, str, int, int]:
     if dport in WINRM_PORTS:
         return src_ip, dst_ip, sport, dport
-    if sport in WINRM_PORTS:
+    if sport in WINRM_PORTS and dport >= _EPHEMERAL_MIN:
         return dst_ip, src_ip, dport, sport
     if dport < 1024 and sport >= 1024:
         return src_ip, dst_ip, sport, dport
@@ -278,7 +281,7 @@ def analyze_winrm(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> WinrmSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
@@ -325,9 +328,6 @@ def analyze_winrm(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     total_packets = 0
     winrm_packets = 0
@@ -362,15 +362,7 @@ def analyze_winrm(
     pair_first_seen: dict[tuple[str, str], list[float]] = defaultdict(list)
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -405,8 +397,8 @@ def analyze_winrm(
                 else ""
             )
             is_winrm = (
-                sport in WINRM_PORTS
-                or dport in WINRM_PORTS
+                dport in WINRM_PORTS
+                or (sport in WINRM_PORTS and dport >= _EPHEMERAL_MIN)
                 or (text_hint and WSMAN_RE.search(text_hint))
             )
             if not is_winrm:
@@ -513,9 +505,6 @@ def analyze_winrm(
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:

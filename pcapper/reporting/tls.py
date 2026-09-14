@@ -637,7 +637,7 @@ def _render_tls_summary_impl(
                 ", ".join(issue_tags) if issue_tags else "none-observed",
                 _truncate_text(
                     _redact_in_text(
-                        str(getattr(cert, "sni", "") or getattr(cert, "dst_ip", "") or "-")
+                        str(getattr(cert, "sni", "") or getattr(cert, "src_ip", "") or "-")
                     ),
                     28,
                 ),
@@ -675,7 +675,7 @@ def _render_tls_summary_impl(
                         _redact_in_text(
                             str(
                                 getattr(cert, "sni", "")
-                                or getattr(cert, "dst_ip", "")
+                                or getattr(cert, "src_ip", "")
                                 or "-"
                             )
                         ),

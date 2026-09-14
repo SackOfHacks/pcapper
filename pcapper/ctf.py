@@ -11,8 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, memoize_analysis, safe_float
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import dns_questions, extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore
@@ -245,10 +245,12 @@ def _proto_label(pkt) -> str:
 
 
 @memoize_analysis
-def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
+def analyze_ctf(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> CtfSummary:
     total_packets = 0
     hits: list[CtfHit] = []
     decoded_hits: list[str] = []
@@ -376,42 +378,109 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
                     f"pkt={packet_number} {_pattern_name(pattern)} via {decode_chain}"
                 )
 
-    try:
-        for pkt_index, pkt in enumerate(reader, start=1):
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
+    for pkt_index, pkt in enumerate(
+        iter_packets(path, packets=packets, meta=meta, show_status=show_status), start=1
+    ):
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
+        if not src_ip or not dst_ip:
+            continue
 
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-            if not src_ip or not dst_ip:
-                continue
+        protocol = _proto_label(pkt)
 
-            protocol = _proto_label(pkt)
+        payload = _extract_payload(pkt)
+        if not payload:
+            continue
+        text = payload.decode("latin-1", errors="ignore")
 
-            payload = _extract_payload(pkt)
-            if not payload:
-                continue
-            text = payload.decode("latin-1", errors="ignore")
+        # Raw payload wrapper checks.
+        for pattern in FLAG_PATTERNS:
+            for match in pattern.findall(text):
+                _record_candidate(
+                    value=match,
+                    decode_chain="raw",
+                    source="payload",
+                    context="raw payload wrapper match",
+                    packet_number=pkt_index,
+                    ts=ts,
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    protocol=protocol,
+                )
 
-            # Raw payload wrapper checks.
-            for pattern in FLAG_PATTERNS:
-                for match in pattern.findall(text):
+        # HTTP-aware extraction for URI/body candidates.
+        lines = text.splitlines()
+        if lines:
+            method_match = HTTP_METHOD_RE.match(lines[0].strip())
+            if method_match:
+                uri = method_match.group(2)
+                for token in GENERIC_TOKEN_RE.findall(uri):
+                    for value, chain in _iter_decode_candidates(token):
+                        if any(pattern.search(value) for pattern in FLAG_PATTERNS):
+                            _record_candidate(
+                                value=value,
+                                decode_chain=chain,
+                                source="http",
+                                context=f"http-uri token={token[:40]}",
+                                packet_number=pkt_index,
+                                ts=ts,
+                                src_ip=src_ip,
+                                dst_ip=dst_ip,
+                                protocol=protocol,
+                            )
+                # HTTP Basic credentials (e.g., Authorization: Basic YWRtaW46YWRtaW4=).
+                for match in HTTP_BASIC_AUTH_RE.finditer(text):
+                    token = str(match.group(1) or "").strip()
+                    if not token:
+                        continue
+                    decoded = ""
+                    try:
+                        padded = token + ("=" * (-len(token) % 4))
+                        decoded = (
+                            base64.b64decode(padded, validate=False)
+                            .decode("utf-8", errors="ignore")
+                            .strip()
+                        )
+                    except Exception:
+                        decoded = ""
+                    if decoded and PLAUSIBLE_CRED_PAIR_RE.fullmatch(decoded):
+                        deterministic_checks["credential_pattern_present"].append(
+                            f"pkt={pkt_index} http-basic {src_ip}->{dst_ip} credential-pair observed"
+                        )
+                        _record_candidate(
+                            value=decoded,
+                            decode_chain="http-basic",
+                            source="http",
+                            context="http authorization basic decoded credential",
+                            packet_number=pkt_index,
+                            ts=ts,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            protocol=protocol,
+                        )
+
+                # Passphrase/password style key=value parameters in URI/body.
+                for match in HTTP_CRED_PARAM_RE.finditer(text):
+                    key = str(match.group(1) or "").strip()
+                    value = str(match.group(2) or "").strip()
+                    if not key or not value:
+                        continue
+                    candidate = f"{key}={value}"
+                    deterministic_checks["passphrase_parameter_present"].append(
+                        f"pkt={pkt_index} {src_ip}->{dst_ip} parameter {key}={value}"
+                    )
                     _record_candidate(
-                        value=match,
-                        decode_chain="raw",
-                        source="payload",
-                        context="raw payload wrapper match",
+                        value=candidate,
+                        decode_chain="http-param",
+                        source="http",
+                        context=f"http credential parameter {key}",
                         packet_number=pkt_index,
                         ts=ts,
                         src_ip=src_ip,
@@ -419,159 +488,76 @@ def analyze_ctf(path: Path, show_status: bool = True) -> CtfSummary:
                         protocol=protocol,
                     )
 
-            # HTTP-aware extraction for URI/body candidates.
-            lines = text.splitlines()
-            if lines:
-                method_match = HTTP_METHOD_RE.match(lines[0].strip())
-                if method_match:
-                    uri = method_match.group(2)
-                    for token in GENERIC_TOKEN_RE.findall(uri):
-                        for value, chain in _iter_decode_candidates(token):
-                            if any(pattern.search(value) for pattern in FLAG_PATTERNS):
+        # Generic token decode pipeline.
+        token_budget = 80
+        seen_tokens: set[str] = set()
+        for token in GENERIC_TOKEN_RE.findall(text):
+            if token in seen_tokens:
+                continue
+            seen_tokens.add(token)
+            if len(seen_tokens) > token_budget:
+                break
+            for value, chain in _iter_decode_candidates(token):
+                if any(pattern.search(value) for pattern in FLAG_PATTERNS):
+                    _record_candidate(
+                        value=value,
+                        decode_chain=chain,
+                        source="payload",
+                        context=f"decoded token={token[:40]}",
+                        packet_number=pkt_index,
+                        ts=ts,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        protocol=protocol,
+                    )
+
+        # Simple stream-boundary reconstruction to catch split wrappers.
+        flow_key = (src_ip, dst_ip, protocol)
+        prior = flow_text_tail.get(flow_key, "")
+        combined = (prior + text)[-8192:]
+        for pattern in FLAG_PATTERNS:
+            for match in pattern.findall(combined):
+                if match not in text and match in combined:
+                    deterministic_checks["stream_reassembled_match"].append(
+                        f"pkt={pkt_index} flow={src_ip}->{dst_ip} protocol={protocol}"
+                    )
+                    _record_candidate(
+                        value=match,
+                        decode_chain="raw",
+                        source="reassembly",
+                        context="flow tail reassembly",
+                        packet_number=pkt_index,
+                        ts=ts,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        protocol=protocol,
+                        reassembled=True,
+                    )
+        flow_text_tail[flow_key] = combined[-256:]
+
+        if DNS is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
+            try:
+                dns_layer = pkt[DNS]  # type: ignore[index]
+                for qname, _qtype in dns_questions(dns_layer):
+                    if qname:
+                        for value, chain in _iter_decode_candidates(qname):
+                            if any(
+                                pattern.search(value) for pattern in FLAG_PATTERNS
+                            ):
                                 _record_candidate(
                                     value=value,
                                     decode_chain=chain,
-                                    source="http",
-                                    context=f"http-uri token={token[:40]}",
+                                    source="dns",
+                                    context=f"dns-qname={qname[:80]}",
                                     packet_number=pkt_index,
                                     ts=ts,
                                     src_ip=src_ip,
                                     dst_ip=dst_ip,
                                     protocol=protocol,
                                 )
-                    # HTTP Basic credentials (e.g., Authorization: Basic YWRtaW46YWRtaW4=).
-                    for match in HTTP_BASIC_AUTH_RE.finditer(text):
-                        token = str(match.group(1) or "").strip()
-                        if not token:
-                            continue
-                        decoded = ""
-                        try:
-                            padded = token + ("=" * (-len(token) % 4))
-                            decoded = (
-                                base64.b64decode(padded, validate=False)
-                                .decode("utf-8", errors="ignore")
-                                .strip()
-                            )
-                        except Exception:
-                            decoded = ""
-                        if decoded and PLAUSIBLE_CRED_PAIR_RE.fullmatch(decoded):
-                            deterministic_checks["credential_pattern_present"].append(
-                                f"pkt={pkt_index} http-basic {src_ip}->{dst_ip} credential-pair observed"
-                            )
-                            _record_candidate(
-                                value=decoded,
-                                decode_chain="http-basic",
-                                source="http",
-                                context="http authorization basic decoded credential",
-                                packet_number=pkt_index,
-                                ts=ts,
-                                src_ip=src_ip,
-                                dst_ip=dst_ip,
-                                protocol=protocol,
-                            )
+            except Exception:
+                pass
 
-                    # Passphrase/password style key=value parameters in URI/body.
-                    for match in HTTP_CRED_PARAM_RE.finditer(text):
-                        key = str(match.group(1) or "").strip()
-                        value = str(match.group(2) or "").strip()
-                        if not key or not value:
-                            continue
-                        candidate = f"{key}={value}"
-                        deterministic_checks["passphrase_parameter_present"].append(
-                            f"pkt={pkt_index} {src_ip}->{dst_ip} parameter {key}={value}"
-                        )
-                        _record_candidate(
-                            value=candidate,
-                            decode_chain="http-param",
-                            source="http",
-                            context=f"http credential parameter {key}",
-                            packet_number=pkt_index,
-                            ts=ts,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            protocol=protocol,
-                        )
-
-            # Generic token decode pipeline.
-            token_budget = 80
-            seen_tokens: set[str] = set()
-            for token in GENERIC_TOKEN_RE.findall(text):
-                if token in seen_tokens:
-                    continue
-                seen_tokens.add(token)
-                if len(seen_tokens) > token_budget:
-                    break
-                for value, chain in _iter_decode_candidates(token):
-                    if any(pattern.search(value) for pattern in FLAG_PATTERNS):
-                        _record_candidate(
-                            value=value,
-                            decode_chain=chain,
-                            source="payload",
-                            context=f"decoded token={token[:40]}",
-                            packet_number=pkt_index,
-                            ts=ts,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            protocol=protocol,
-                        )
-
-            # Simple stream-boundary reconstruction to catch split wrappers.
-            flow_key = (src_ip, dst_ip, protocol)
-            prior = flow_text_tail.get(flow_key, "")
-            combined = (prior + text)[-8192:]
-            for pattern in FLAG_PATTERNS:
-                for match in pattern.findall(combined):
-                    if match not in text and match in combined:
-                        deterministic_checks["stream_reassembled_match"].append(
-                            f"pkt={pkt_index} flow={src_ip}->{dst_ip} protocol={protocol}"
-                        )
-                        _record_candidate(
-                            value=match,
-                            decode_chain="raw",
-                            source="reassembly",
-                            context="flow tail reassembly",
-                            packet_number=pkt_index,
-                            ts=ts,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            protocol=protocol,
-                            reassembled=True,
-                        )
-            flow_text_tail[flow_key] = combined[-256:]
-
-            if DNS is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
-                try:
-                    dns_layer = pkt[DNS]  # type: ignore[index]
-                    qd = getattr(dns_layer, "qd", None)
-                    if qd is not None and hasattr(qd, "qname"):
-                        qname_raw = getattr(qd, "qname", b"")
-                        qname = (
-                            qname_raw.decode("latin-1", errors="ignore")
-                            if isinstance(qname_raw, (bytes, bytearray))
-                            else str(qname_raw)
-                        ).rstrip(".")
-                        if qname:
-                            for value, chain in _iter_decode_candidates(qname):
-                                if any(
-                                    pattern.search(value) for pattern in FLAG_PATTERNS
-                                ):
-                                    _record_candidate(
-                                        value=value,
-                                        decode_chain=chain,
-                                        source="dns",
-                                        context=f"dns-qname={qname[:80]}",
-                                        packet_number=pkt_index,
-                                        ts=ts,
-                                        src_ip=src_ip,
-                                        dst_ip=dst_ip,
-                                        protocol=protocol,
-                                    )
-                except Exception:
-                    pass
-
-    finally:
-        status.finish()
-        reader.close()
 
     try:
         from .files import analyze_files

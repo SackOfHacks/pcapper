@@ -19,6 +19,23 @@ ANSI_RED_BG = "\x1b[41m"
 ANSI_YELLOW_BG = "\x1b[43m"
 
 _COLOR_OVERRIDE: bool | None = None
+# The isatty/NO_COLOR answer, computed once. colorize() is called for every
+# coloured token of every rendered line, and a syscall per call adds up on a
+# large report. Cleared by set_color_override so tests can flip it.
+_AUTO_COLOR: bool | None = None
+
+
+def _auto_color() -> bool:
+    global _AUTO_COLOR
+    if _AUTO_COLOR is None:
+        if os.environ.get("NO_COLOR") is not None:
+            _AUTO_COLOR = False
+        else:
+            try:
+                _AUTO_COLOR = bool(sys.stdout.isatty())
+            except Exception:
+                _AUTO_COLOR = False
+    return _AUTO_COLOR
 
 
 def use_color(enabled: bool | None = None) -> bool:
@@ -26,12 +43,7 @@ def use_color(enabled: bool | None = None) -> bool:
         return enabled
     if _COLOR_OVERRIDE is not None:
         return _COLOR_OVERRIDE
-    if os.environ.get("NO_COLOR") is not None:
-        return False
-    try:
-        return sys.stdout.isatty()
-    except Exception:
-        return False
+    return _auto_color()
 
 
 def colorize(
@@ -55,8 +67,9 @@ def colorize(
 
 
 def set_color_override(enabled: bool | None) -> None:
-    global _COLOR_OVERRIDE
+    global _COLOR_OVERRIDE, _AUTO_COLOR
     _COLOR_OVERRIDE = enabled
+    _AUTO_COLOR = None
 
 
 def header(text: str, enabled: bool | None = None) -> str:

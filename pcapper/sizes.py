@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import packet_length, safe_float, sparkline
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import memoize_analysis, packet_wirelen, safe_float, sparkline
 
 
 @dataclass(frozen=True)
@@ -35,6 +34,9 @@ class SizeSummary:
     errors: list[str]
 
 
+# The last bucket is open-ended: a capture taken with segmentation offload
+# active (Linux GRO/TSO, Windows RSC) carries "packets" of 64 KB and more,
+# and those used to fall through every bucket and vanish from the table.
 PACKET_BUCKETS = [
     (0, 19, "0-19"),
     (20, 39, "20-39"),
@@ -45,69 +47,74 @@ PACKET_BUCKETS = [
     (640, 1279, "640-1279"),
     (1280, 2559, "1280-2559"),
     (2560, 5119, "2560-5119"),
-    (5120, 65535, "5120+"),
+    (5120, None, "5120+"),
 ]
 
 
-def analyze_sizes(path: Path, show_status: bool = True) -> SizeSummary:
-    errors: list[str] = []
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
+def _bucket_label(size: int) -> str:
+    for low, high, label in PACKET_BUCKETS:
+        if size >= low and (high is None or size <= high):
+            return label
+    return PACKET_BUCKETS[-1][2]
 
+
+@memoize_analysis
+def analyze_sizes(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> SizeSummary:
+    errors: list[str] = []
     total_packets = 0
     total_bytes = 0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    bucket_counts: dict[str, int] = defaultdict(int)
-    bucket_sizes: dict[str, list[int]] = defaultdict(list)
-    bucket_times: dict[str, list[float]] = defaultdict(list)
+    # Per-bucket running stats; keeping every packet's size in a list cost a
+    # Python int per packet on multi-million-packet captures for no gain.
+    bucket_count: dict[str, int] = {}
+    bucket_sum: dict[str, int] = {}
+    bucket_min: dict[str, int] = {}
+    bucket_max: dict[str, int] = {}
+    bucket_times: dict[str, list[float]] = {}
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        # Sizes are what was on the wire. The captured length is capped by the
+        # snaplen, so a truncated capture would otherwise report every packet
+        # as at most snaplen bytes and its total volume a fraction of reality.
+        pkt_len = packet_wirelen(pkt)
+        total_bytes += pkt_len
+        ts = safe_float(getattr(pkt, "time", None))
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
 
-            total_packets += 1
-            pkt_len = packet_length(pkt)
-            total_bytes += pkt_len
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
-
-            for low, high, label in PACKET_BUCKETS:
-                if low <= pkt_len <= high:
-                    bucket_counts[label] += 1
-                    bucket_sizes[label].append(pkt_len)
-                    if ts is not None:
-                        bucket_times[label].append(ts)
-                    break
-    except Exception as exc:
-        errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
+        label = _bucket_label(pkt_len)
+        bucket_count[label] = bucket_count.get(label, 0) + 1
+        bucket_sum[label] = bucket_sum.get(label, 0) + pkt_len
+        current_min = bucket_min.get(label)
+        if current_min is None or pkt_len < current_min:
+            bucket_min[label] = pkt_len
+        current_max = bucket_max.get(label)
+        if current_max is None or pkt_len > current_max:
+            bucket_max[label] = pkt_len
+        if ts is not None:
+            bucket_times.setdefault(label, []).append(ts)
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
 
     buckets: list[SizeBucketStat] = []
-    for low, high, label in PACKET_BUCKETS:
-        count = bucket_counts.get(label, 0)
-        sizes = bucket_sizes.get(label, [])
-        avg_size = sum(sizes) / len(sizes) if sizes else 0.0
-        min_size = min(sizes) if sizes else 0
-        max_size = max(sizes) if sizes else 0
+    for _low, _high, label in PACKET_BUCKETS:
+        count = bucket_count.get(label, 0)
+        avg_size = (bucket_sum.get(label, 0) / count) if count else 0.0
+        min_size = bucket_min.get(label, 0)
+        max_size = bucket_max.get(label, 0)
         pct = (count / total_packets) * 100 if total_packets else 0.0
         rate = (
             (count / duration_seconds)
@@ -169,7 +176,9 @@ def analyze_sizes(path: Path, show_status: bool = True) -> SizeSummary:
                 }
             )
         tiny_pct = sum(
-            _pct_by_label.get(lbl, 0.0) for (_lo, hi, lbl) in PACKET_BUCKETS if hi <= 159
+            _pct_by_label.get(lbl, 0.0)
+            for (_lo, hi, lbl) in PACKET_BUCKETS
+            if hi is not None and hi <= 159
         )
         if tiny_pct > 40:
             detections.append(

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 
-import hashlib
 from collections import Counter, defaultdict
 from numbers import Real
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .pcap_cache import PcapMeta, get_reader, load_capture_meta
+from .pcap_cache import PcapMeta, capture_hashes, iter_packets, load_capture_meta
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -22,7 +21,14 @@ except Exception:  # pragma: no cover
 
 from .models import InterfaceStat, PcapSummary
 from .services import COMMON_PORTS
-from .utils import detect_file_type, extract_packet_endpoints, memoize_analysis
+from .utils import (
+    detect_file_type,
+    extract_ethertype,
+    extract_packet_endpoints,
+    memoize_analysis,
+    packet_length,
+    packet_wirelen,
+)
 
 IGNORE_LAYERS = {"Raw", "Padding", "NoPayload"}
 
@@ -61,23 +67,8 @@ def _port_protocol_name(pkt) -> str | None:
     return None
 
 
-def _extract_ethertype(pkt) -> int | None:
-    if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-        try:
-            return int(pkt[Ether].type)
-        except Exception:
-            return None
-    try:
-        raw = bytes(pkt)
-        if len(raw) >= 14:
-            return int.from_bytes(raw[12:14], "big")
-    except Exception:
-        return None
-    return None
-
-
 def _ethertype_protocol_name(pkt) -> str | None:
-    ethertype = _extract_ethertype(pkt)
+    ethertype = extract_ethertype(pkt)
     if ethertype is None:
         return None
     return ETHERTYPE_PROTOCOLS.get(ethertype)
@@ -158,19 +149,6 @@ def _as_int(value: object | None) -> Optional[int]:
         return None
 
 
-def _hash_capture_file(path: Path) -> tuple[str | None, str | None]:
-    sha256 = hashlib.sha256()
-    sha1 = hashlib.sha1()
-    try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                sha256.update(chunk)
-                sha1.update(chunk)
-    except Exception:
-        return None, None
-    return sha256.hexdigest(), sha1.hexdigest()
-
-
 @memoize_analysis
 def analyze_pcap(
     path: Path,
@@ -187,8 +165,9 @@ def analyze_pcap(
 
     file_type = capture_meta.file_type if capture_meta else detect_file_type(path)
     size_bytes = capture_meta.size_bytes if capture_meta else path.stat().st_size
-    hash_sha256, hash_sha1 = _hash_capture_file(path)
+    hash_sha256, hash_sha1 = capture_hashes(path)
     packet_count = 0
+    truncated_packets = 0
     start_ts: Optional[float] = None
     end_ts: Optional[float] = None
     protocol_counts: Counter[str] = Counter()
@@ -199,78 +178,75 @@ def analyze_pcap(
     seen_seq: defaultdict[tuple[str, str, int, int], set[tuple[int, int]]] = (
         defaultdict(set)
     )
-
-    reader, status, stream, _size_bytes, _file_type = get_reader(
+    for pkt in iter_packets(
         path, packets=packets, meta=capture_meta, show_status=show_status
-    )
-
-    try:
-        for pkt in reader:
-            packet_count += 1
-            ts = getattr(pkt, "time", None)
-            ts_value: Optional[float] = None
-            if isinstance(ts, Real):
+    ):
+        packet_count += 1
+        if packet_wirelen(pkt) > packet_length(pkt):
+            truncated_packets += 1
+        ts = getattr(pkt, "time", None)
+        ts_value: Optional[float] = None
+        if isinstance(ts, Real):
+            ts_value = float(ts)
+        elif ts is not None:
+            try:
                 ts_value = float(ts)
-            elif ts is not None:
+            except (TypeError, ValueError):
+                ts_value = None
+
+        if ts_value is not None:
+            if start_ts is None or ts_value < start_ts:
+                start_ts = ts_value
+            if end_ts is None or ts_value > end_ts:
+                end_ts = ts_value
+
+        iface_key = _get_iface_key(pkt)
+        if iface_key is None:
+            iface_key = "unknown"
+        iface_counts[iface_key] += 1
+
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
+
+        if Dot1Q is not None:
+            try:
+                if pkt.haslayer(Dot1Q):  # type: ignore[truthy-bool]
+                    vlan_layer = pkt[Dot1Q]  # type: ignore[index]
+                    vlan_id = int(getattr(vlan_layer, "vlan", 0) or 0)
+                    if vlan_id > 0:
+                        iface_vlans[iface_key].add(vlan_id)
+            except Exception:
+                pass
+
+        port_proto = _port_protocol_name(pkt)
+        ethertype_proto = _ethertype_protocol_name(pkt)
+        layer_names = set(_layer_names(pkt))
+        if port_proto:
+            layer_names.discard("TCP")
+            layer_names.discard("UDP")
+
+        for name in layer_names:
+            protocol_counts[name] += 1
+
+        if port_proto:
+            protocol_counts[port_proto] += 1
+        if ethertype_proto:
+            protocol_counts[ethertype_proto] += 1
+
+        tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
+        if tcp_layer is not None:
+            tcp_packets += 1
+            if src_ip and dst_ip:
                 try:
-                    ts_value = float(ts)
-                except (TypeError, ValueError):
-                    ts_value = None
-
-            if ts_value is not None:
-                if start_ts is None or ts_value < start_ts:
-                    start_ts = ts_value
-                if end_ts is None or ts_value > end_ts:
-                    end_ts = ts_value
-
-            iface_key = _get_iface_key(pkt)
-            if iface_key is None:
-                iface_key = "unknown"
-            iface_counts[iface_key] += 1
-
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-
-            if Dot1Q is not None:
-                try:
-                    if pkt.haslayer(Dot1Q):  # type: ignore[truthy-bool]
-                        vlan_layer = pkt[Dot1Q]  # type: ignore[index]
-                        vlan_id = int(getattr(vlan_layer, "vlan", 0) or 0)
-                        if vlan_id > 0:
-                            iface_vlans[iface_key].add(vlan_id)
-                except Exception:
-                    pass
-
-            port_proto = _port_protocol_name(pkt)
-            ethertype_proto = _ethertype_protocol_name(pkt)
-            layer_names = set(_layer_names(pkt))
-            if port_proto:
-                layer_names.discard("TCP")
-                layer_names.discard("UDP")
-
-            for name in layer_names:
-                protocol_counts[name] += 1
-
-            if port_proto:
-                protocol_counts[port_proto] += 1
-            if ethertype_proto:
-                protocol_counts[ethertype_proto] += 1
-
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                tcp_packets += 1
-                if src_ip and dst_ip:
-                    try:
-                        tcp_layer = pkt[TCP]  # type: ignore[index]
-                        seq = int(getattr(tcp_layer, "seq", 0) or 0)
-                        sport = int(getattr(tcp_layer, "sport", 0) or 0)
-                        dport = int(getattr(tcp_layer, "dport", 0) or 0)
-                        payload_len = 0
-                        if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                            payload_len = len(bytes(pkt[Raw]))  # type: ignore[index]
-                        else:
-                            try:
-                                payload_len = len(bytes(tcp_layer.payload))
-                            except Exception:
-                                payload_len = 0
+                    seq = int(getattr(tcp_layer, "seq", 0) or 0)
+                    sport = int(getattr(tcp_layer, "sport", 0) or 0)
+                    dport = int(getattr(tcp_layer, "dport", 0) or 0)
+                    raw_layer = tcp_layer.getlayer(Raw) if Raw is not None else None
+                    payload_len = len(raw_layer.load) if raw_layer is not None else 0
+                    # Only a data-bearing segment can be a retransmission
+                    # of data. Pure ACKs, keep-alives and window probes
+                    # legitimately repeat a sequence number with no
+                    # payload and used to inflate the rate.
+                    if payload_len > 0:
                         key = (src_ip, dst_ip, sport, dport)
                         sig = (seq, payload_len)
                         if sig in seen_seq[key]:
@@ -279,19 +255,8 @@ def analyze_pcap(
                             seen_seq[key].add(sig)
                         if len(seen_seq[key]) > 20000:
                             seen_seq[key].clear()
-                    except Exception:
-                        pass
-
-            if status.enabled and stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
                 except Exception:
                     pass
-    finally:
-        status.finish()
-        reader.close()
 
     duration_seconds = None
     if start_ts is not None and end_ts is not None:
@@ -310,7 +275,7 @@ def analyze_pcap(
         return total, sorted(vlan_ids)
 
     interfaces = (
-        capture_meta.interfaces if capture_meta else getattr(reader, "interfaces", None)
+        capture_meta.interfaces if capture_meta else None
     )
     if interfaces and len(interfaces) > 0:
         all_vlan_ids: set[int] = set()
@@ -375,10 +340,10 @@ def analyze_pcap(
             )
     else:
         linktype = (
-            capture_meta.linktype if capture_meta else getattr(reader, "linktype", None)
+            capture_meta.linktype if capture_meta else None
         )
         snaplen = (
-            capture_meta.snaplen if capture_meta else getattr(reader, "snaplen", None)
+            capture_meta.snaplen if capture_meta else None
         )
         observed_ifaces = list(iface_counts.keys()) or ["unknown"]
         for iface_key in sorted(observed_ifaces, key=lambda value: str(value)):
@@ -422,6 +387,7 @@ def analyze_pcap(
         else None,
         hash_sha256=hash_sha256,
         hash_sha1=hash_sha1,
+        truncated_packets=truncated_packets,
     )
 
 
@@ -479,20 +445,7 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
     )
 
     def _merge_capture_field(field_name: str) -> str | None:
-        values = sorted(
-            {
-                str(getattr(summary, field_name, "") or "").strip()
-                for summary in summaries
-                if str(getattr(summary, field_name, "") or "").strip()
-            }
-        )
-        if not values:
-            return None
-        if len(values) == 1:
-            return values[0]
-        return "multiple"
-
-    def _merge_hash_field(field_name: str) -> str | None:
+        # One value across all captures -> that value; several -> "multiple".
         values = sorted(
             {
                 str(getattr(summary, field_name, "") or "").strip()
@@ -609,6 +562,7 @@ def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:
         capture_hardware=_merge_capture_field("capture_hardware"),
         capture_os=_merge_capture_field("capture_os"),
         capture_application=_merge_capture_field("capture_application"),
-        hash_sha256=_merge_hash_field("hash_sha256"),
-        hash_sha1=_merge_hash_field("hash_sha1"),
+        hash_sha256=_merge_capture_field("hash_sha256"),
+        hash_sha1=_merge_capture_field("hash_sha1"),
+        truncated_packets=sum(int(getattr(s, "truncated_packets", 0) or 0) for s in summaries),
     )

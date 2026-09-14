@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .pcap_cache import PcapMeta, get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
@@ -22,6 +22,21 @@ except Exception:  # pragma: no cover
 
 
 KERBEROS_PORTS = {88, 464}
+# A source port equal to a KDC port only identifies the KDC when the other
+# side is an ephemeral port; otherwise a flow whose ephemeral source happens
+# to be 88 would be reported as a KDC serving some unrelated service.
+_EPHEMERAL_MIN = 1024
+
+
+def _kerberos_roles(
+    src_ip: str, dst_ip: str, sport: int, dport: int
+) -> tuple[str, str, int] | None:
+    """(client_ip, kdc_ip, kdc_port) for a packet, or None if not Kerberos."""
+    if dport in KERBEROS_PORTS:
+        return src_ip, dst_ip, dport
+    if sport in KERBEROS_PORTS and dport >= _EPHEMERAL_MIN:
+        return dst_ip, src_ip, sport
+    return None
 
 UPN_RE = re.compile(r"\b([A-Za-z0-9._$-]{3,})@([A-Za-z0-9.-]{3,})\b")
 SPN_RE = re.compile(
@@ -89,6 +104,121 @@ def _krb_error_code_from_payload(payload: bytes) -> Optional[str]:
     if idx >= 0 and idx + 4 < len(payload):
         return _KRB_ERROR_CODE_NAMES.get(payload[idx + 4])
     return None
+
+
+def _der_len(payload: bytes, pos: int) -> tuple[int, int] | None:
+    """(length, offset of first content byte) for the DER length at ``pos``."""
+    if pos >= len(payload):
+        return None
+    first = payload[pos]
+    if first < 0x80:
+        return first, pos + 1
+    count = first & 0x7F
+    if count == 0 or count > 2 or pos + 1 + count > len(payload):
+        return None
+    return int.from_bytes(payload[pos + 1 : pos + 1 + count], "big"), pos + 1 + count
+
+
+# PrincipalName ::= SEQUENCE { name-type [0] Int32, name-string [1] SEQUENCE OF
+# KerberosString }. The names on the wire are *separate* GeneralStrings
+# ("HTTP", "web01.corp.example"), never the "HTTP/web01.corp.example" text the
+# SPN regex expects, so the regexes below only ever matched captures of tool
+# output. The walker below is what actually recovers cname/sname from real
+# AS-REQ/TGS-REQ/AS-REP/TGS-REP/KRB-ERROR PDUs. name-type 1 = user principal,
+# 2 = service instance (SPN, krbtgt/REALM), 3 = host, 10 = enterprise (UPN).
+_PRINCIPAL_ANCHOR = b"\xa0\x03\x02\x01"
+
+
+def _krb_principal_names(payload: bytes) -> list[tuple[int, list[str]]]:
+    """Every PrincipalName in a Kerberos PDU as (name-type, components)."""
+    out: list[tuple[int, list[str]]] = []
+    n = len(payload)
+    start = 0
+    while True:
+        idx = payload.find(_PRINCIPAL_ANCHOR, start)
+        if idx < 0:
+            break
+        start = idx + 1
+        if idx + 6 > n or payload[idx + 5] != 0xA1:
+            continue
+        name_type = payload[idx + 4]
+        outer = _der_len(payload, idx + 6)
+        if outer is None:
+            continue
+        _outer_len, seq_pos = outer
+        if seq_pos >= n or payload[seq_pos] != 0x30:
+            continue
+        seq = _der_len(payload, seq_pos + 1)
+        if seq is None:
+            continue
+        seq_len, pos = seq
+        end = min(n, pos + seq_len)
+        components: list[str] = []
+        ok = True
+        while pos < end:
+            if payload[pos] != 0x1B:
+                ok = False
+                break
+            item = _der_len(payload, pos + 1)
+            if item is None:
+                ok = False
+                break
+            item_len, val_pos = item
+            if val_pos + item_len > end or item_len == 0:
+                ok = False
+                break
+            components.append(
+                payload[val_pos : val_pos + item_len].decode("latin-1", errors="ignore")
+            )
+            pos = val_pos + item_len
+        if ok and components:
+            out.append((name_type, components))
+    return out
+
+
+# Realm ::= KerberosString carried as a tagged field: KDC-REQ-BODY realm [2],
+# AS-REP/TGS-REP crealm [3], Ticket realm [1], KRB-ERROR crealm [7] / realm [9].
+_REALM_TAGS = {0xA1, 0xA2, 0xA3, 0xA7, 0xA9}
+
+
+def _krb_realms(payload: bytes) -> list[str]:
+    """Realm strings in a Kerberos PDU, in wire order, plausibility-filtered."""
+    out: list[str] = []
+    n = len(payload)
+    idx = payload.find(b"\x1b", 0)
+    while 0 <= idx < n - 1:
+        item = _der_len(payload, idx + 1)
+        if item is not None:
+            length, val_pos = item
+            if (
+                2 <= length < 0x80
+                and idx >= 2
+                and payload[idx - 2] in _REALM_TAGS
+                and payload[idx - 1] == length + 2
+                and val_pos + length <= n
+            ):
+                realm = _normalize_realm(
+                    payload[val_pos : val_pos + length].decode("latin-1", errors="ignore")
+                )
+                if _is_plausible_realm(realm) and realm not in out:
+                    out.append(realm)
+        idx = payload.find(b"\x1b", idx + 1)
+    return out
+
+
+# PA-DATA padata-type [1] Int32 values that prove the client pre-authenticated:
+# 2 PA-ENC-TIMESTAMP, 16 PA-PK-AS-REQ (PKINIT), 138 PA-ENCRYPTED-CHALLENGE (FAST).
+# PA-PAC-REQUEST (128) is in every Windows AS-REQ, including the first one
+# sent without pre-authentication, so it must not count.
+_PREAUTH_MARKERS = (
+    b"\xa1\x03\x02\x01\x02",
+    b"\xa1\x03\x02\x01\x10",
+    b"\xa1\x04\x02\x02\x00\x8a",
+)
+
+
+def _krb_preauth_present(payload: bytes) -> bool:
+    return any(marker in payload for marker in _PREAUTH_MARKERS)
 
 
 # RFC 3961/4120 + Microsoft etype numbers. AES (17/18) is the modern default;
@@ -439,6 +569,8 @@ def _build_kerberos_attack_overview(
     spns_by_client: dict[str, set[str]],
     realms_by_client: dict[str, set[str]],
     error_by_client: dict[str, Counter[str]],
+    asrep_without_preauth: Counter[str] | None = None,
+    asrep_roastable_accounts: set[str] | None = None,
 ) -> tuple[Dict[str, List[str]], List[Dict[str, str]]]:
     checks: Dict[str, List[str]] = {
         "kerberoasting": [],
@@ -502,18 +634,42 @@ def _build_kerberos_attack_overview(
             f"TGS-REQ={tgs_req}, unique SPNs={unique_spn}",
         )
 
+    # AS-REP roasting is an AS-REP issued for an AS-REQ that carried no
+    # pre-authentication: the KDC hands out an encrypted blob for an account
+    # with "Do not require Kerberos preauthentication" set, and that blob is
+    # crackable offline. The evidence is therefore the AS-REQ/AS-REP pairing,
+    # not the AS-REP count — a normal domain logon produces an AS-REP too.
     as_rep = int(request_types.get("AS-REP", 0))
+    as_req = int(request_types.get("AS-REQ", 0))
     preauth_required = int(error_codes.get("KDC_ERR_PREAUTH_REQUIRED", 0))
-    if as_rep >= 5 and preauth_required == 0:
+    no_preauth = asrep_without_preauth or Counter()
+    no_preauth_total = int(sum(no_preauth.values()))
+    roastable = sorted(asrep_roastable_accounts or set())
+    if no_preauth_total:
         checks["asrep_roasting"].append(
-            f"AS-REP={as_rep} with no KDC_ERR_PREAUTH_REQUIRED"
+            f"AS-REP issued without pre-authentication={no_preauth_total} "
+            f"(accounts={len(roastable)})"
         )
+        if roastable:
+            checks["asrep_roasting"].append(
+                f"Roastable accounts: {', '.join(roastable[:5])}"
+            )
+        checks["asrep_roasting"].append(
+            "Requesting clients: "
+            + ", ".join(f"{ip}({count})" for ip, count in no_preauth.most_common(5))
+        )
+        severe = no_preauth_total >= 5 or len(roastable) >= 3
         _status_row(
-            "AS-REP roasting", "suspicious", "high", checks["asrep_roasting"][0]
+            "AS-REP roasting",
+            "suspicious" if severe else "watch",
+            "high" if severe else "warning",
+            "; ".join(checks["asrep_roasting"]),
         )
-    elif as_rep >= 10 and as_rep > preauth_required:
+    elif as_req == 0 and as_rep >= 10 and preauth_required == 0:
+        # One-directional capture: replies without the requests that would
+        # prove or disprove pre-authentication.
         checks["asrep_roasting"].append(
-            f"AS-REP={as_rep} exceeds preauth-required errors={preauth_required}"
+            f"AS-REP={as_rep} with no AS-REQ visible (one-directional capture)"
         )
         _status_row("AS-REP roasting", "watch", "warning", checks["asrep_roasting"][0])
     else:
@@ -521,7 +677,7 @@ def _build_kerberos_attack_overview(
             "AS-REP roasting",
             "not observed",
             "info",
-            f"AS-REP={as_rep}, KDC_ERR_PREAUTH_REQUIRED={preauth_required}",
+            f"AS-REP={as_rep}, without pre-auth=0, KDC_ERR_PREAUTH_REQUIRED={preauth_required}",
         )
 
     preauth_failed = int(error_codes.get("KDC_ERR_PREAUTH_FAILED", 0))
@@ -748,10 +904,6 @@ def analyze_kerberos(
     detections: List[Dict[str, object]] = []
     anomalies: List[str] = []
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
-
     total_packets = 0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -778,216 +930,245 @@ def analyze_kerberos(
     error_by_client: dict[str, Counter[str]] = defaultdict(Counter)
     etype_counts: Counter[int] = Counter()  # encryption types offered across all KDC-REQs
     weak_only_etype_clients: Dict[str, list[int]] = {}  # client -> RC4/DES-only request list
+    # (client, kdc) -> whether the last AS-REQ carried pre-authentication data;
+    # an AS-REP answering a False entry is a roastable ticket hand-out.
+    last_asreq_preauth: Dict[Tuple[str, str], bool] = {}
+    asrep_without_preauth: Counter[str] = Counter()
+    asrep_roastable_accounts: set[str] = set()
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
+        if not src_ip or not dst_ip:
+            continue
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+        payload = b""
+        proto = None
+        roles = None
+        if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+            tcp_layer = pkt[TCP]  # type: ignore[index]
+            sport = int(getattr(tcp_layer, "sport", 0) or 0)
+            dport = int(getattr(tcp_layer, "dport", 0) or 0)
+            roles = _kerberos_roles(src_ip, dst_ip, sport, dport)
+            if roles is not None:
+                proto = "TCP"
+                tcp_packets += 1
+                payload = bytes(getattr(tcp_layer, "payload", b""))
+        elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+            udp_layer = pkt[UDP]  # type: ignore[index]
+            sport = int(getattr(udp_layer, "sport", 0) or 0)
+            dport = int(getattr(udp_layer, "dport", 0) or 0)
+            roles = _kerberos_roles(src_ip, dst_ip, sport, dport)
+            if roles is not None:
+                proto = "UDP"
+                udp_packets += 1
+                payload = bytes(getattr(udp_layer, "payload", b""))
 
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
+        if proto is None or roles is None:
+            continue
 
-            if not src_ip or not dst_ip:
-                continue
+        # The report window spans Kerberos traffic, not every packet in scope.
+        ts = safe_float(getattr(pkt, "time", None))
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
 
-            payload = b""
-            sport = 0
-            dport = 0
-            proto = None
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                tcp_layer = pkt[TCP]  # type: ignore[index]
-                sport = int(getattr(tcp_layer, "sport", 0) or 0)
-                dport = int(getattr(tcp_layer, "dport", 0) or 0)
-                if dport in KERBEROS_PORTS or sport in KERBEROS_PORTS:
-                    proto = "TCP"
-                    tcp_packets += 1
-                    payload = bytes(getattr(tcp_layer, "payload", b""))
-            elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                udp_layer = pkt[UDP]  # type: ignore[index]
-                sport = int(getattr(udp_layer, "sport", 0) or 0)
-                dport = int(getattr(udp_layer, "dport", 0) or 0)
-                if dport in KERBEROS_PORTS or sport in KERBEROS_PORTS:
-                    proto = "UDP"
-                    udp_packets += 1
-                    payload = bytes(getattr(udp_layer, "payload", b""))
+        # Roles come from the KDC port, not from packet direction: a KDC reply
+        # is still the KDC's traffic and must be attributed to the client that
+        # asked, otherwise every spray/enumeration check names the KDC itself.
+        client_ip, server_ip, server_port = roles
+        servers[server_ip] += 1
+        clients[client_ip] += 1
+        service_counts[f"{proto}/{server_port}"] += 1
+        convos[(client_ip, server_ip, server_port, proto)] += 1
 
-            if proto is None:
-                continue
+        if _is_public_ip(src_ip):
+            public_endpoints[src_ip] += 1
+        if _is_public_ip(dst_ip):
+            public_endpoints[dst_ip] += 1
 
-            servers[dst_ip] += 1
-            clients[src_ip] += 1
-            service_counts[f"{proto}/{dport or sport}"] += 1
-            convos[(src_ip, dst_ip, dport or sport, proto)] += 1
+        if not payload:
+            continue
 
-            if _is_public_ip(src_ip):
-                public_endpoints[src_ip] += 1
-            if _is_public_ip(dst_ip):
-                public_endpoints[dst_ip] += 1
+        extracted = _extract_ascii_strings(payload) + _extract_utf16le_strings(
+            payload
+        )
+        candidate_strings: set[str] = set()
+        for text in extracted:
+            normalized = _clean_identity_token(text)
+            if normalized:
+                candidate_strings.add(normalized)
+        packet_req_tokens: set[str] = set()
+        packet_err_tokens: set[str] = set()
+        packet_krbtgt = False
+        saw_asrep_preauth = False
+        saw_pa_enc_timestamp = False
 
-            if not payload:
-                continue
-
-            extracted = _extract_ascii_strings(payload) + _extract_utf16le_strings(
-                payload
-            )
-            candidate_strings: set[str] = set()
-            for text in extracted:
-                normalized = _clean_identity_token(text)
-                if normalized:
-                    candidate_strings.add(normalized)
-            packet_req_tokens: set[str] = set()
-            packet_err_tokens: set[str] = set()
-            packet_krbtgt = False
-            saw_asrep_preauth = False
-            saw_pa_enc_timestamp = False
-
-            # Recover msg-type / error-code from the binary ASN.1 (the ASCII
-            # regexes never match real Kerberos). This is what feeds the attack
-            # heuristics below.
-            binary_msgtype = _krb_msgtype_from_payload(payload)
-            if binary_msgtype:
-                packet_req_tokens.add(
-                    "KRB_ERROR" if binary_msgtype == "KRB-ERROR" else binary_msgtype
+        def _record_principal(principal: str, realm: str, kind: str) -> None:
+            principals[principal] += 1
+            realms[realm] += 1
+            realms_by_client[client_ip].add(realm)
+            key = (src_ip, dst_ip, server_port, proto, principal)
+            if key not in principal_seen:
+                principal_seen.add(key)
+                principal_evidence.append(
+                    {
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "dst_port": server_port,
+                        "protocol": proto,
+                        "principal": principal,
+                        "kind": kind,
+                    }
                 )
-                if binary_msgtype == "KRB-ERROR":
-                    err_name = _krb_error_code_from_payload(payload)
-                    if err_name:
-                        packet_err_tokens.add(err_name)
-                elif binary_msgtype in ("AS-REQ", "TGS-REQ"):
-                    req_etypes = _krb_reqbody_etypes(payload)
-                    if req_etypes:
-                        # Only count recognized cryptographic etypes; Windows
-                        # also lists Microsoft-proprietary negative markers that
-                        # are not session-crypto choices.
-                        crypto_etypes = [
-                            e for e in req_etypes if e in _KRB_ETYPE_NAMES
-                        ]
-                        etype_counts.update(crypto_etypes)
-                        # A request offering ONLY single-DES/RC4 (no AES) is an
-                        # encryption downgrade — the kerberoast / AS-REP-roast
-                        # signature. Normal Windows clients list AES first and
-                        # only fall back to RC4, so a mixed list is benign.
-                        if crypto_etypes and all(
-                            e in _KRB_WEAK_ETYPES for e in crypto_etypes
-                        ):
-                            weak_only_etype_clients.setdefault(
-                                src_ip, crypto_etypes
-                            )
 
-            for value in candidate_strings:
-                if _is_useful_kerberos_artifact(value):
-                    artifacts.add(value)
-
-                for match in UPN_RE.finditer(value):
-                    user = _normalize_principal_local(match.group(1))
-                    realm = _normalize_realm(match.group(2))
-                    if not _is_plausible_principal_local(
-                        user
-                    ) or not _is_plausible_realm(realm):
-                        continue
-                    principal = f"{user}@{realm}"
-                    principals[principal] += 1
-                    realms[realm] += 1
-                    realms_by_client[src_ip].add(realm)
-                    key = (src_ip, dst_ip, dport or sport, proto, principal)
-                    if key not in principal_seen:
-                        principal_seen.add(key)
-                        principal_evidence.append(
-                            {
-                                "src_ip": src_ip,
-                                "dst_ip": dst_ip,
-                                "dst_port": dport or sport,
-                                "protocol": proto,
-                                "principal": principal,
-                                "kind": "UPN",
-                            }
+        # Recover msg-type / error-code from the binary ASN.1 (the ASCII
+        # regexes never match real Kerberos). This is what feeds the attack
+        # heuristics below.
+        binary_msgtype = _krb_msgtype_from_payload(payload)
+        if binary_msgtype:
+            packet_req_tokens.add(
+                "KRB_ERROR" if binary_msgtype == "KRB-ERROR" else binary_msgtype
+            )
+            if binary_msgtype == "KRB-ERROR":
+                err_name = _krb_error_code_from_payload(payload)
+                if err_name:
+                    packet_err_tokens.add(err_name)
+            elif binary_msgtype in ("AS-REQ", "TGS-REQ"):
+                req_etypes = _krb_reqbody_etypes(payload)
+                if req_etypes:
+                    # Only count recognized cryptographic etypes; Windows
+                    # also lists Microsoft-proprietary negative markers that
+                    # are not session-crypto choices.
+                    crypto_etypes = [
+                        e for e in req_etypes if e in _KRB_ETYPE_NAMES
+                    ]
+                    etype_counts.update(crypto_etypes)
+                    # A request offering ONLY single-DES/RC4 (no AES) is an
+                    # encryption downgrade — the kerberoast / AS-REP-roast
+                    # signature. Normal Windows clients list AES first and
+                    # only fall back to RC4, so a mixed list is benign.
+                    if crypto_etypes and all(
+                        e in _KRB_WEAK_ETYPES for e in crypto_etypes
+                    ):
+                        weak_only_etype_clients.setdefault(
+                            client_ip, crypto_etypes
                         )
+            if binary_msgtype == "AS-REQ":
+                last_asreq_preauth[(client_ip, server_ip)] = _krb_preauth_present(
+                    payload
+                )
+            elif binary_msgtype == "AS-REP":
+                if last_asreq_preauth.get((client_ip, server_ip)) is False:
+                    asrep_without_preauth[client_ip] += 1
+                    packet_realms = _krb_realms(payload)
+                    for name_type, components in _krb_principal_names(payload):
+                        if name_type in (1, 10) and len(components) == 1:
+                            account = _normalize_principal_local(components[0])
+                            if account.lower() != "krbtgt":
+                                asrep_roastable_accounts.add(
+                                    f"{account}@{packet_realms[0]}"
+                                    if packet_realms
+                                    else account
+                                )
 
-                cname = _split_cname_concat(value)
-                if cname:
-                    user, realm = cname
+            # Binary cname/sname/realm: the only source that works on real
+            # Kerberos (see _krb_principal_names).
+            packet_realms = _krb_realms(payload)
+            for realm in packet_realms:
+                realms_by_client[client_ip].add(realm)
+            for name_type, components in _krb_principal_names(payload):
+                if components[0].lower() == "krbtgt":
+                    packet_krbtgt = True
+                    continue
+                if len(components) >= 2:
+                    spn = "/".join(components)
+                    if _is_plausible_spn(spn):
+                        spns[spn] += 1
+                        spns_by_client[client_ip].add(spn)
+                        artifacts.add(spn)
+                    continue
+                local = components[0]
+                if name_type == 10 and "@" in local:
+                    user, _, realm = local.partition("@")
                     user = _normalize_principal_local(user)
                     realm = _normalize_realm(realm)
-                    if _is_plausible_principal_local(user) and _is_plausible_realm(
-                        realm
-                    ):
-                        principal = f"{user}@{realm}"
-                        principals[principal] += 1
-                        realms[realm] += 1
-                        realms_by_client[src_ip].add(realm)
-                        key = (src_ip, dst_ip, dport or sport, proto, principal)
-                        if key not in principal_seen:
-                            principal_seen.add(key)
-                            principal_evidence.append(
-                                {
-                                    "src_ip": src_ip,
-                                    "dst_ip": dst_ip,
-                                    "dst_port": dport or sport,
-                                    "protocol": proto,
-                                    "principal": principal,
-                                    "kind": "CNameString",
-                                }
-                            )
+                    if _is_plausible_principal_local(user) and _is_plausible_realm(realm):
+                        _record_principal(f"{user}@{realm}", realm, "UPN")
+                    continue
+                user = _normalize_principal_local(local)
+                if packet_realms and _is_plausible_principal_local(user):
+                    realm = packet_realms[0]
+                    _record_principal(f"{user}@{realm}", realm, "CNameString")
 
-                for match in SPN_RE.finditer(value):
-                    spn = _normalize_spn(match.group(1))
-                    if not _is_plausible_spn(spn):
-                        continue
-                    spns[spn] += 1
-                    spns_by_client[src_ip].add(spn)
-                    realm = match.group(2)
-                    if realm:
-                        normalized_realm = _normalize_realm(realm)
-                        if _is_plausible_realm(normalized_realm):
-                            realms[normalized_realm] += 1
-                            realms_by_client[src_ip].add(normalized_realm)
+        for value in candidate_strings:
+            if _is_useful_kerberos_artifact(value):
+                artifacts.add(value)
 
-                lower = value.lower()
-                if "krbtgt" in lower:
-                    packet_krbtgt = True
-                for req in REQ_RE.findall(value):
-                    packet_req_tokens.add(req.upper())
-                for err in ERR_RE.findall(value):
-                    packet_err_tokens.add(err)
-                if "as-rep" in lower and "preauth" in lower:
-                    saw_asrep_preauth = True
-                if "pa-enc-timestamp" in lower:
-                    saw_pa_enc_timestamp = True
+            for match in UPN_RE.finditer(value):
+                user = _normalize_principal_local(match.group(1))
+                realm = _normalize_realm(match.group(2))
+                if not _is_plausible_principal_local(
+                    user
+                ) or not _is_plausible_realm(realm):
+                    continue
+                _record_principal(f"{user}@{realm}", realm, "UPN")
 
-            if packet_krbtgt:
-                spns["krbtgt"] += 1
-                spns_by_client[src_ip].add("krbtgt")
+            cname = _split_cname_concat(value)
+            if cname:
+                user, realm = cname
+                user = _normalize_principal_local(user)
+                realm = _normalize_realm(realm)
+                if _is_plausible_principal_local(user) and _is_plausible_realm(
+                    realm
+                ):
+                    _record_principal(f"{user}@{realm}", realm, "CNameString")
 
-            for req_name in packet_req_tokens:
-                request_types[req_name] += 1
-                request_types_by_client[src_ip][req_name] += 1
-                if ts is not None and req_name in {"AS-REQ", "TGS-REQ"}:
-                    bind_buckets[(src_ip, int(ts // 60))] += 1
+            for match in SPN_RE.finditer(value):
+                spn = _normalize_spn(match.group(1))
+                if not _is_plausible_spn(spn):
+                    continue
+                spns[spn] += 1
+                spns_by_client[client_ip].add(spn)
+                realm = match.group(2)
+                if realm:
+                    normalized_realm = _normalize_realm(realm)
+                    if _is_plausible_realm(normalized_realm):
+                        realms[normalized_realm] += 1
+                        realms_by_client[client_ip].add(normalized_realm)
 
-            for err in packet_err_tokens:
-                error_codes[err] += 1
-                error_by_client[src_ip][err] += 1
+            lower = value.lower()
+            if "krbtgt" in lower:
+                packet_krbtgt = True
+            for req in REQ_RE.findall(value):
+                packet_req_tokens.add(req.upper())
+            for err in ERR_RE.findall(value):
+                packet_err_tokens.add(err)
+            if "as-rep" in lower and "preauth" in lower:
+                saw_asrep_preauth = True
+            if "pa-enc-timestamp" in lower:
+                saw_pa_enc_timestamp = True
 
-            if saw_asrep_preauth:
-                suspicious_attributes["AS-REP (preauth)"] += 1
-            if saw_pa_enc_timestamp:
-                suspicious_attributes["PA-ENC-TIMESTAMP"] += 1
+        if packet_krbtgt:
+            spns["krbtgt"] += 1
+            spns_by_client[client_ip].add("krbtgt")
 
-    finally:
-        status.finish()
-        reader.close()
+        for req_name in packet_req_tokens:
+            request_types[req_name] += 1
+            request_types_by_client[client_ip][req_name] += 1
+            if ts is not None and req_name in {"AS-REQ", "TGS-REQ"}:
+                bind_buckets[(client_ip, int(ts // 60))] += 1
+
+        for err in packet_err_tokens:
+            error_codes[err] += 1
+            error_by_client[client_ip][err] += 1
+
+        if saw_asrep_preauth:
+            suspicious_attributes["AS-REP (preauth)"] += 1
+        if saw_pa_enc_timestamp:
+            suspicious_attributes["PA-ENC-TIMESTAMP"] += 1
 
     duration = 0.0
     if first_seen is not None and last_seen is not None:
@@ -997,7 +1178,9 @@ def analyze_kerberos(
         KerberosConversation(src, dst, port, proto, count)
         for (src, dst, port, proto), count in convos.items()
     ]
-    conversations.sort(key=lambda c: c.packets, reverse=True)
+    conversations.sort(
+        key=lambda c: (-c.packets, c.src_ip, c.dst_ip, c.dst_port, c.proto)
+    )
 
     session_stats = {
         "total_sessions": len(conversations),
@@ -1051,13 +1234,27 @@ def analyze_kerberos(
             }
         )
 
-    as_rep = request_types.get("AS-REP", 0)
-    if as_rep and "KDC_ERR_PREAUTH_REQUIRED" not in error_codes:
+    if asrep_without_preauth:
+        roastable = sorted(asrep_roastable_accounts)
         detections.append(
             {
-                "severity": "warning",
-                "summary": "Possible AS-REP roasting indicators",
-                "details": f"AS-REP observed ({as_rep}) without preauth requirement errors.",
+                "severity": "high",
+                "summary": "AS-REP issued without pre-authentication (AS-REP roastable)",
+                "details": (
+                    f"{sum(asrep_without_preauth.values())} AS-REP(s) answered an AS-REQ "
+                    "that carried no pre-authentication data; the encrypted part is "
+                    "crackable offline (hashcat -m 18200). "
+                    + (
+                        f"Accounts: {', '.join(roastable[:10])}. "
+                        if roastable
+                        else ""
+                    )
+                    + "Clients: "
+                    + ", ".join(
+                        f"{ip}({count})"
+                        for ip, count in asrep_without_preauth.most_common(5)
+                    )
+                ),
                 "source": "Kerberos",
             }
         )
@@ -1140,6 +1337,8 @@ def analyze_kerberos(
         spns_by_client=spns_by_client,
         realms_by_client=realms_by_client,
         error_by_client=error_by_client,
+        asrep_without_preauth=asrep_without_preauth,
+        asrep_roastable_accounts=asrep_roastable_accounts,
     )
 
     attack_detection_map = {

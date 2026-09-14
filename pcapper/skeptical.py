@@ -26,9 +26,13 @@ document the concrete FP shape they defend against.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Callable, Iterable, Sequence
+
+from .utils import is_private_ip, is_valid_ip
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -120,6 +124,13 @@ def _min_ack_ratio(details: str) -> float | None:
     return min(ratios) if ratios else None
 
 
+def _ack_ratio_at_most(details: str, limit: float) -> bool:
+    """True when a ratio is present and at or below ``limit`` (a ratio of
+    exactly 0.0 is a real value, so the None case is tested explicitly)."""
+    ratio = _min_ack_ratio(details)
+    return ratio is not None and ratio <= limit
+
+
 # Vendor-management-platform URL fragments — polling endpoints that
 # generate the "Periodic HTTP check-in behavior" flag with a rock-solid
 # vendor-legitimate provenance. Extend as new vendor platforms surface.
@@ -149,46 +160,52 @@ def _has_vendor_polling_url(details: str) -> bool:
     return bool(_VENDOR_POLLING_URL_RE.search(details))
 
 
-# Well-known CDN / public-cloud IP prefixes — traffic to these blocked
+# Well-known CDN / public-cloud address blocks — traffic to these blocked
 # at the egress firewall commonly shows the same 0% SYN-ACK pattern as
 # a SYN flood, but it's blocked-egress + client retries, not a flood.
-# List is intentionally short — well-known top-tier CDNs only.
-_CDN_PREFIXES: tuple[str, ...] = (
-    # Cloudflare — v4 primary
-    "104.16.", "104.17.", "104.18.", "104.19.", "104.20.", "104.21.",
-    "104.22.", "104.23.", "104.24.", "104.25.", "104.26.", "104.27.",
-    "104.28.", "104.29.", "104.30.", "104.31.",
-    "172.64.", "172.65.", "172.66.", "172.67.",
-    "162.159.", "141.101.", "108.162.", "173.245.", "190.93.", "197.234.",
-    "198.41.",
-    # Akamai
-    "23.11.", "23.15.", "23.32.", "23.35.", "23.43.", "23.48.", "23.53.",
-    "23.55.", "23.62.", "23.65.", "23.66.", "23.67.", "23.72.", "23.79.",
-    "23.192.", "23.201.", "23.203.", "23.208.", "23.209.", "23.210.",
-    "23.212.", "23.213.", "23.215.", "23.216.", "23.219.",
-    "184.24.", "184.25.", "184.26.", "184.27.", "184.28.", "184.29.",
-    "184.50.", "184.51.",
-    # Fastly
-    "151.101.", "199.232.",
-    # AWS CloudFront primary
-    "13.32.", "13.33.", "13.35.", "13.224.", "13.225.", "13.226.", "13.227.",
-    "13.249.", "52.84.", "52.85.", "52.222.", "54.192.", "54.230.", "54.239.",
-    "54.240.",
-    # Google — Cloud CDN / static
-    "34.64.", "34.72.", "34.96.", "34.104.", "34.128.", "34.144.", "35.190.",
-    "35.201.", "35.244.", "216.58.", "142.250.", "216.239.",
-    # Azure Front Door / CDN
-    "13.107.", "20.36.", "20.37.", "20.38.", "20.39.", "20.40.", "20.41.",
-    "20.42.", "20.43.", "20.44.", "20.45.", "20.46.", "20.47.", "20.48.",
-    "20.49.", "20.50.",
+# Real CIDRs rather than string prefixes: "23.11." as a prefix cannot say
+# whether 23.11.x is inside a /16 or a /13, and the list is a point-in-time
+# snapshot of published ranges (Cloudflare, Akamai, Fastly, CloudFront,
+# Google, Azure Front Door) — extend from the vendors' published lists.
+_CDN_NETWORKS: tuple[ipaddress.IPv4Network, ...] = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        # Cloudflare
+        "104.16.0.0/12", "172.64.0.0/13", "162.158.0.0/15", "141.101.64.0/18",
+        "108.162.192.0/18", "173.245.48.0/20", "190.93.240.0/20",
+        "197.234.240.0/22", "198.41.128.0/17",
+        # Akamai (largest published aggregates)
+        "23.0.0.0/12", "23.32.0.0/11", "23.64.0.0/14", "23.72.0.0/13",
+        "23.192.0.0/11", "184.24.0.0/13", "184.50.0.0/15",
+        # Fastly
+        "151.101.0.0/16", "199.232.0.0/16",
+        # AWS CloudFront
+        "13.32.0.0/15", "13.35.0.0/16", "13.224.0.0/14", "13.249.0.0/16",
+        "52.84.0.0/15", "52.222.128.0/17", "54.192.0.0/16", "54.230.0.0/16",
+        "54.239.128.0/18", "54.240.128.0/18",
+        # Google (Cloud CDN / front ends)
+        "34.64.0.0/10", "35.190.0.0/17", "35.201.0.0/16", "35.244.0.0/16",
+        "216.58.192.0/19", "142.250.0.0/15", "216.239.32.0/19",
+        # Azure Front Door / CDN
+        "13.107.0.0/16", "20.36.0.0/14", "20.40.0.0/13", "20.48.0.0/15",
+    )
 )
 
 _IP_TOKEN_RE = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
 
 
+@lru_cache(maxsize=4096)
+def _is_cdn_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _CDN_NETWORKS)
+
+
 def _details_contains_only_cdn_destinations(details: str) -> bool:
-    """True when every destination IP in the details string starts with a
-    known-CDN prefix. Used to distinguish a "SYN flood to Cloudflare"
+    """True when every destination IP in the details string sits in a
+    known-CDN block. Used to distinguish a "SYN flood to Cloudflare"
     (= blocked egress + retries) from a real SYN flood.
 
     Conservative — if the details string contains no destinations at all,
@@ -197,17 +214,7 @@ def _details_contains_only_cdn_destinations(details: str) -> bool:
     ips = _extract_destination_ips(details)
     if not ips:
         return False
-    return all(any(ip.startswith(p) for p in _CDN_PREFIXES) for ip in ips)
-
-
-def _is_rfc1918(ip: str) -> bool:
-    return (
-        ip.startswith("10.")
-        or ip.startswith("192.168.")
-        or (ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31)
-        if ip.count(".") == 3 and all(p.isdigit() for p in ip.split("."))
-        else False
-    )
+    return all(_is_cdn_ip(ip) for ip in ips)
 
 
 _ARROW_DST_RE = re.compile(
@@ -220,11 +227,12 @@ def _extract_destination_ips(details: str) -> list[str]:
     Falls back to all IPs when no arrows are present (matches TCP module
     ``SYN flood`` shape which lists only destinations)."""
     dests = _ARROW_DST_RE.findall(details)
-    if dests:
-        return dests
-    # Fall back to all IPs — details is destination-only (e.g. TCP-flood
-    # module which lists ``DST:PORT SYN=N SYN-ACK=M ...``).
-    return _IP_TOKEN_RE.findall(details)
+    if not dests:
+        # Fall back to all IPs — details is destination-only (e.g. TCP-flood
+        # module which lists ``DST:PORT SYN=N SYN-ACK=M ...``).
+        dests = _IP_TOKEN_RE.findall(details)
+    # The regexes accept 999.1.1.1; keep only real addresses.
+    return [ip for ip in dests if is_valid_ip(ip)]
 
 
 def _details_all_destinations_are_public(details: str) -> bool:
@@ -239,9 +247,9 @@ def _details_all_destinations_are_public(details: str) -> bool:
     if len(ips) < 2:
         return False
     for ip in ips:
-        if ip.startswith("127.") or ip.startswith("224.") or ip == "255.255.255.255":
-            return False
-        if _is_rfc1918(ip):
+        # is_private_ip covers RFC 1918, loopback, link-local, CGNAT and the
+        # reserved ranges; multicast and limited broadcast are checked here.
+        if is_private_ip(ip) or ip.startswith("224.") or ip == "255.255.255.255":
             return False
     return True
 
@@ -259,6 +267,7 @@ def _http_fanout_single_host(details: str) -> bool:
 _TLS_MISSING_SNI_100PCT_RE = re.compile(
     r"missing_sni\s*=\s*(\d+)\s*/\s*(\d+)"
 )
+_PROXY_SHAPE_RE = re.compile(r"\bCONNECT\b|:\s*80\b|proxy", re.I)
 
 
 def _tls_handshake_all_missing_sni(details: str) -> bool:
@@ -267,13 +276,18 @@ def _tls_handshake_all_missing_sni(details: str) -> bool:
     tunnel-through-proxy (details mentions CONNECT or a proxy port such
     as ``:80`` for TLS traffic). That's the standard blocked-outbound-
     tunnel shape."""
-    all_missing = all(
-        int(m.group(1)) == int(m.group(2)) and int(m.group(2)) > 0
+    ratios = [
+        (int(m.group(1)), int(m.group(2)))
         for m in _TLS_MISSING_SNI_100PCT_RE.finditer(details)
-    )
-    if not all_missing:
+    ]
+    # No missing_sni evidence at all must mean "rule does not apply" — an
+    # all() over an empty sequence is True and used to let any handshake
+    # failure that merely mentioned "proxy" or ":80" be downgraded.
+    if not ratios:
         return False
-    return bool(re.search(r"\bCONNECT\b|:\s*80\b|proxy", details, re.I))
+    if not all(missing == total and total > 0 for missing, total in ratios):
+        return False
+    return bool(_PROXY_SHAPE_RE.search(details))
 
 
 # ---------------------------------------------------------------------------
@@ -290,13 +304,8 @@ _RULES: tuple[SkepticalRule, ...] = (
         details_predicate=lambda d: (
             # Real SYN floods produce SOME SYN-ACK from the target's TCP stack;
             # 0.0-0.4% ratio to a CDN is characteristic of dropped-at-egress.
-            # (Careful: _min_ack_ratio may return exactly 0.0 which is falsy;
-            #  handle the None case explicitly rather than via ``or``.)
             _details_contains_only_cdn_destinations(d)
-            or (
-                (_min_ack_ratio(d) is not None)
-                and _min_ack_ratio(d) <= 0.4
-            )
+            or _ack_ratio_at_most(d, 0.4)
         ),
         downgrade_to="warning",
         reason=(
@@ -475,9 +484,12 @@ def apply_skeptical_filter(
 def apply_skeptical_filter_many(
     detections: Iterable[Detection],
     *,
-    strict: bool = False,
+    strict: bool | None = None,
 ) -> list[Detection]:
-    """Vectorised convenience wrapper — apply to every detection."""
+    """Vectorised convenience wrapper — apply to every detection.
+
+    ``strict=None`` follows the CLI-set default exactly as the scalar form
+    does; the old ``False`` default silently ignored ``--strict``."""
     return [apply_skeptical_filter(d, strict=strict) for d in detections]
 
 

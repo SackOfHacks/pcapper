@@ -671,7 +671,9 @@ def _ip_activity(protocols, services, limit: int = 20) -> list[dict[str, object]
         if isinstance(targets, set):
             targets.update(clients)
 
-        for client_ip in clients:
+        # Sorted: bucket creation order is row order later, and a set of IP
+        # strings iterates in hash order.
+        for client_ip in sorted(clients):
             client_bucket = _ensure_ip_bucket(buckets, client_ip)
             used_counter = client_bucket.get("used_service_counter")
             if isinstance(used_counter, Counter):

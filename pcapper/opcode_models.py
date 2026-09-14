@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -17,8 +17,11 @@ class OpcodeModel:
     opcode_endian: str
     opcodes: dict[int, str]
     max_scan: int = 256
+    # Encoded once at construction; extract_opcodes runs per packet and used
+    # to re-encode the magic list on every call.
+    magic_bytes: tuple[bytes, ...] = field(init=False, default=())
 
-    def _magic_bytes(self) -> list[bytes]:
+    def __post_init__(self) -> None:
         values: list[bytes] = []
         for text in self.magic_ascii:
             if text:
@@ -26,9 +29,9 @@ class OpcodeModel:
         for hex_text in self.magic_hex:
             try:
                 values.append(bytes.fromhex(hex_text))
-            except Exception:
+            except ValueError:
                 continue
-        return [val for val in values if val]
+        object.__setattr__(self, "magic_bytes", tuple(val for val in values if val))
 
     def extract_opcodes(self, payload: bytes) -> list[tuple[int, str | None, int]]:
         if not payload or self.opcode_size <= 0:
@@ -36,7 +39,7 @@ class OpcodeModel:
         results: list[tuple[int, str | None, int]] = []
         max_len = min(len(payload), self.max_scan)
         payload = payload[:max_len]
-        magic_values = self._magic_bytes()
+        magic_values = self.magic_bytes
         if not magic_values:
             return results
         for magic in magic_values:

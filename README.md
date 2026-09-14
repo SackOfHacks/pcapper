@@ -1,9 +1,13 @@
 # Pcapper
 
-![Python](https://img.shields.io/badge/python-3.9%2B-0B7285)
+![Python](https://img.shields.io/badge/python-3.9%20%E2%80%93%203.13-0B7285)
+![CI](https://github.com/SackOfHacks/pcapper/actions/workflows/ci.yml/badge.svg)
+![Tests](https://img.shields.io/badge/tests-531%20passing-1B5E20)
+![Analyzers](https://img.shields.io/badge/analyzers-120%2B-3D5A80)
+![Version](https://img.shields.io/badge/release-v2.4.0-7C3AED)
+![License](https://img.shields.io/badge/license-MIT-6C757D)
 ![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
 ![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
-![License](https://img.shields.io/badge/license-MIT-6C757D)
 ![SOC](https://img.shields.io/badge/designed%20for-SOC-0F766E)
 ![DFIR](https://img.shields.io/badge/designed%20for-DFIR-7C3AED)
 ![OT/ICS Defenders](https://img.shields.io/badge/designed%20for-OT%2FICS%20Defenders-0B7285)
@@ -26,6 +30,19 @@
 Built for blue teams, DFIR responders, and OT defenders who need fast answers with evidence-rich outputs.
 
 > Install and run in under a minute: `pip install -r requirements.txt` then `python -m pcapper capture.pcap --threats --ips --timeline -ip 10.0.0.5`
+
+## Why you can put its output in a report
+
+A PCAP tool is only useful if what it prints is *true*. Every analyzer in pcapper now holds to four rules, each one pinned by a regression test on a synthetic capture:
+
+| Rule | What it means in the report |
+| --- | --- |
+| **Roles come from the service port, not packet direction** | A server's replies never make it a "client"; a client's ephemeral port is never a "top port". A flow from ephemeral 389 to 443 is not LDAP. |
+| **Windows are per protocol** | A one-minute Kerberos exchange in an eight-hour capture reports a one-minute window, and every rate derived from it is right. |
+| **Padding is not payload** | Segment lengths come from the IP/TCP headers, so a padded pure ACK is zero bytes of data, not six NULs in your Telnet transcript or a phantom retransmission. |
+| **Same capture, same report** | Every sort has a total order. Two analysts running the same command get byte-identical output, whatever Python's hash seed did that day. |
+
+And nothing internal leaves the box: reputation lookups (`-vt`, `--ip-geo`) only ever see public hostnames and routable addresses, only when you ask, and a config file planted in the evidence directory is never loaded.
 
 ## Why Teams Pick Pcapper
 
@@ -182,6 +199,18 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
+## What's New in v2.4.0 🔍
+
+**v2.4.0 is the "wrong rather than failing" release.** Every one of the 120-plus analyzers was read line by line in a two-day production-readiness review, and the pattern that kept turning up was a report that was confidently wrong: a server counted as its own busiest client, a window that spanned the whole capture, a padded frame read as protocol bytes, a heuristic that fired on healthy traffic. The suite grew from 255 to 531 tests, each new one built on a synthetic capture that reproduced the defect.
+
+- 🎭 **Roles are right everywhere.** UDP, TCP, SNMP, LDAP, Kerberos, NTLM, QUIC, DoT/DoQ, HTTP/2, WinRM, RDP, WMI, PowerShell, Telnet, VNC, TeamViewer, VPN, AIM, syslog, BGP, Modbus, DNP3, safety-system ports, IEC 101/103 (from the FT1.2 PRM bit) and OPC Classic (from the DCE/RPC PDU type) all had the sender as "client". The top-clients table on a normal capture used to list the directory server and the KDC.
+- 🎫 **Kerberos AS-REP roasting is evidence-based.** It used to fire on "five AS-REPs and no pre-auth error", which every healthy domain logon satisfies. It now requires an AS-REP answering an AS-REQ with no pre-authentication data, names the roastable accounts, and points at `hashcat -m 18200`. Principal names and realms are read from the ASN.1 — the old SPN regexes only ever matched captures of tool output.
+- 📬 **`--ftp` no longer reports your mail.** Any `NNN text` line or `USER`/`PASS` on any port was FTP, so every SMTP and POP3 session appeared in the FTP report with its credentials. A flow off the control ports must now be confirmed by an FTP-specific command or reply.
+- 📈 **Brute force and UDP flood are rates**, not totals: twenty SMB sessions over a working day and a resolver's daily 5,000 datagrams are no longer attacks.
+- ⏱️ **Per-protocol windows** in 25 analyzers, and **padding-aware segment lengths** in Telnet (one keystroke per padded segment), the IT→OT pivot check, the beacon scorer, retransmission counting and the carver.
+- 🔒 **Nothing internal leaves the box.** VirusTotal/OTX/AbuseIPDB passes used to send `fileserver.corp`, `printer.local`, reverse-lookup zones and RFC 1918 addresses. Only public names go out, percent-encoded, under a time budget. A `pcapper.toml` in the evidence directory is no longer loaded, a non-capture with a `.pcap` extension is rejected instead of read as empty, `--decode` decompression is bounded, and recovered secrets are owner-only from the moment the file exists.
+- 🧩 **One packet loop, one home for shared helpers.** All 81 analyzers with a packet loop use `iter_packets()`; the 24 module-local copies of utils helpers are gone and a ratchet test keeps them gone; memoized results are shared rather than deep-copied.
+
 ## What's New in v2.3.0 ☎️
 
 **v2.3.0 is the phone-over-IP release**, plus the packaging fix that made the
@@ -274,9 +303,14 @@ CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0
   source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
 ```
 
-## Current Release: v2.3.0
+## Current Release: v2.4.0
 
 Headline changes in this release:
+- **Every analyzer reviewed for reports that were wrong rather than failing** — client/server roles, per-protocol windows, padding-aware lengths and total-order sorts across the board, each pinned by a test. 531 tests, CI on Python 3.9 and 3.13.
+- **Detection heuristics that fire on attacks, not on Tuesday** — evidence-based AS-REP roasting, FTP that ignores SMTP, brute force and UDP floods as rates, domain exposure limited to domain-control protocols, syslog that ignores HTML.
+- **Nothing internal leaves the box** — reputation lookups restricted to public names, percent-encoded and time-budgeted; no config from the evidence directory; bounded decompression; owner-only secrets.
+
+Carried forward from v2.3.0:
 - **`--voip` / `--sip`** — phone-over-IP forensics across SIP/SDP, SCCP, MGCP, MEGACO, IAX2, H.323, RTP/RTCP/SRTP, T.38 fax, STUN/TURN, provisioning and ENUM; recovered credentials, SRTP keys and DTMF digits; G.711 call audio to WAV via `--voip-out`.
 - **The distribution actually installs** — the wheel was shipping no `reporting` package at all; CI now installs and runs the built artifact rather than only checking its metadata.
 - **`reporting.py` split into 120 per-analyzer modules**, with no behaviour change.
@@ -321,11 +355,15 @@ What you get:
 pip install -r requirements.txt
 ```
 
-For development:
+For development (tests and lint):
 
 ```bash
-pip install -e .
+pip install -e .[dev]
+ruff check pcapper tests
+pytest -q            # 531 tests; add -m "not slow" to skip the subprocess ones
 ```
+
+The suite runs on synthetic captures generated by `tests/make_fixtures.py`; no real traffic is committed, and the repository's `.gitignore` is an allow-list so carved files, decrypted streams, key logs and case exports cannot be added by accident.
 
 ### Platform Notes
 

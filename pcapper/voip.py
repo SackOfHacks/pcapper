@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     extract_packet_endpoints,
     is_public_ip,
@@ -1265,7 +1265,7 @@ def analyze_voip(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
     target_ip: str | None = None,
     output_dir: Path | None = None,
 ) -> VoipSummary:
@@ -1279,13 +1279,6 @@ def analyze_voip(
             path=path,
             errors=["Scapy unavailable (UDP layer missing); cannot analyze VoIP."],
         )
-
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, show_status=show_status, packets=packets, meta=meta
-        )
-    except Exception as exc:
-        return VoipSummary(path=path, errors=[f"Error opening pcap: {exc}"])
 
     keep_audio = output_dir is not None
     counters: dict[str, Counter] = {
@@ -1382,14 +1375,7 @@ def analyze_voip(
         )
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             totals["total_packets"] += 1
             ts = safe_float(getattr(pkt, "time", None))
             _touch(ts)
@@ -1669,15 +1655,6 @@ def analyze_voip(
 
     except Exception as exc:  # pragma: no cover - reader failure path
         errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        try:
-            status.finish()
-        except Exception:
-            pass
-        try:
-            reader.close()
-        except Exception:
-            pass
 
     for key, label_text, cap, env in (
         ("calls", "call", MAX_CALLS, "PCAPPER_VOIP_MAX_CALLS"),

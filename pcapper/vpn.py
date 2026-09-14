@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
@@ -136,6 +136,13 @@ def _packet_ip_proto(pkt: object) -> Optional[int]:
     except Exception:
         pass
     return None
+
+
+def _vpn_port_match(sport: int, dport: int) -> bool:
+    """A VPN port on the source side only identifies the service when the
+    destination is an ephemeral port; a flow from ephemeral 1194 to 443 is
+    not OpenVPN."""
+    return dport in VPN_PORTS or (sport in VPN_PORTS and dport >= 1024)
 
 
 def _infer_client_server(
@@ -345,10 +352,12 @@ def _extract_tls_certificates(pkt: object) -> list[dict[str, object]]:
 
 
 @memoize_analysis
-def analyze_vpn(path: Path, show_status: bool = True) -> VpnSummary:
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
+def analyze_vpn(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> VpnSummary:
     total_packets = 0
     vpn_packets = 0
     service_counts: Counter[str] = Counter()
@@ -372,22 +381,20 @@ def analyze_vpn(path: Path, show_status: bool = True) -> VpnSummary:
     last_seen: Optional[float] = None
     seen_cert_fingerprints: set[str] = set()
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
+    def _mark_window(ts: Optional[float]) -> None:
+        # The report window spans VPN traffic, not every packet in scope.
+        nonlocal first_seen, last_seen
+        if ts is None:
+            return
+        if first_seen is None or ts < first_seen:
+            first_seen = ts
+        if last_seen is None or ts > last_seen:
+            last_seen = ts
 
+    try:
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
@@ -397,6 +404,7 @@ def analyze_vpn(path: Path, show_status: bool = True) -> VpnSummary:
             if ip_proto in VPN_IP_PROTOCOLS:
                 service = VPN_IP_PROTOCOLS[ip_proto]
                 vpn_packets += 1
+                _mark_window(ts)
                 service_counts[service] += 1
                 protocol_counts[service] += 1
                 client_ip, server_ip, _server_port = _infer_client_server(
@@ -413,8 +421,9 @@ def analyze_vpn(path: Path, show_status: bool = True) -> VpnSummary:
                 tcp = pkt[TCP]  # type: ignore[index]
                 sport = int(getattr(tcp, "sport", 0) or 0)
                 dport = int(getattr(tcp, "dport", 0) or 0)
-                if sport in VPN_PORTS or dport in VPN_PORTS:
+                if _vpn_port_match(sport, dport):
                     vpn_packets += 1
+                    _mark_window(ts)
                     service = VPN_PORTS.get(dport) or VPN_PORTS.get(sport) or "VPN"
                     service_counts[service] += 1
                     protocol_counts["TCP"] += 1
@@ -520,8 +529,9 @@ def analyze_vpn(path: Path, show_status: bool = True) -> VpnSummary:
                 udp = pkt[UDP]  # type: ignore[index]
                 sport = int(getattr(udp, "sport", 0) or 0)
                 dport = int(getattr(udp, "dport", 0) or 0)
-                if sport in VPN_PORTS or dport in VPN_PORTS:
+                if _vpn_port_match(sport, dport):
                     vpn_packets += 1
+                    _mark_window(ts)
                     service = VPN_PORTS.get(dport) or VPN_PORTS.get(sport) or "VPN"
                     service_counts[service] += 1
                     protocol_counts["UDP"] += 1
@@ -580,9 +590,6 @@ def analyze_vpn(path: Path, show_status: bool = True) -> VpnSummary:
         # Don't let one malformed IKE/ESP/cert packet abort the whole VPN
         # analysis — record it and return what we have (other analyzers do this).
         errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        status.finish()
-        reader.close()
 
     if int(service_counts.get("PPTP", 0)) > 0:
         threat_counts["Legacy PPTP tunnel observed"] += int(service_counts["PPTP"])

@@ -9,6 +9,7 @@ from .industrial_helpers import (
     IndustrialAnomaly,
     analyze_port_protocol,
 )
+from .utils import memoize_analysis
 
 MMS_PORT = 102
 
@@ -200,6 +201,7 @@ def _detect_mms_anomalies(
     return anomalies
 
 
+@memoize_analysis
 def analyze_mms(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,

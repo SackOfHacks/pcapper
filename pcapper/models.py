@@ -40,3 +40,7 @@ class PcapSummary:
     capture_application: Optional[str] = None
     hash_sha256: Optional[str] = None
     hash_sha1: Optional[str] = None
+    # Packets whose on-wire length exceeds the captured length: the capture
+    # was taken with a snaplen and every byte total derived from it is a
+    # lower bound. Zero for a full-length capture.
+    truncated_packets: int = 0

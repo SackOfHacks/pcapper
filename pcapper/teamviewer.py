@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_ascii_strings as _extract_ascii_strings
+from .utils import extract_packet_endpoints, memoize_analysis, packet_length, safe_float
 from .utils import beacon_score as _beaconing_score
 
 try:
@@ -25,6 +26,9 @@ except Exception:  # pragma: no cover
 
 
 TEAMVIEWER_PORTS = {5938}
+# 5938 on the *source* side is the service only when the destination is an
+# ephemeral port; a flow from ephemeral 5938 to 443 is not TeamViewer.
+_EPHEMERAL_MIN = 1024
 TEAMVIEWER_HINT_RE = re.compile(r"teamviewer|tv\[?id\]?", re.IGNORECASE)
 
 SUSPICIOUS_PLAINTEXT = [
@@ -213,7 +217,7 @@ def _direction(
     ports = TEAMVIEWER_PORTS
     if dport in ports:
         return src_ip, dst_ip, sport, dport
-    if sport in ports:
+    if sport in ports and dport >= _EPHEMERAL_MIN:
         return dst_ip, src_ip, dport, sport
     if dport < 1024 and sport >= 1024:
         return src_ip, dst_ip, sport, dport
@@ -222,11 +226,12 @@ def _direction(
     return src_ip, dst_ip, sport, dport
 
 
+@memoize_analysis
 def analyze_teamviewer(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> TeamviewerSummary:
     errors: list[str] = []
     if (TCP is None and UDP is None) or (IP is None and IPv6 is None):
@@ -268,9 +273,6 @@ def analyze_teamviewer(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     total_packets = 0
     tv_packets = 0
@@ -303,15 +305,7 @@ def analyze_teamviewer(
     pair_first_seen: dict[tuple[str, str], list[float]] = defaultdict(list)
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -350,7 +344,10 @@ def analyze_teamviewer(
                     payload = b""
 
             payload_prefix = payload[:64] if payload else b""
-            is_tv = (sport in TEAMVIEWER_PORTS or dport in TEAMVIEWER_PORTS) or (
+            is_tv = (
+                dport in TEAMVIEWER_PORTS
+                or (sport in TEAMVIEWER_PORTS and dport >= _EPHEMERAL_MIN)
+            ) or (
                 payload_prefix
                 and TEAMVIEWER_HINT_RE.search(
                     payload_prefix.decode("latin-1", errors="ignore")
@@ -450,9 +447,6 @@ def analyze_teamviewer(
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:

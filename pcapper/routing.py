@@ -3,12 +3,11 @@ from __future__ import annotations
 import ipaddress
 from collections import Counter
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints, safe_float
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, is_public_ip, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import ICMP, IP, TCP, UDP  # type: ignore
@@ -946,15 +945,13 @@ def _parse_hsrp(payload: bytes) -> dict[str, object]:
     }
 
 
-@lru_cache(maxsize=100000)
-def _public_ip(ip_text: str) -> bool:
-    try:
-        return ipaddress.ip_address(ip_text).is_global
-    except Exception:
-        return False
-
-
-def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
+@memoize_analysis
+def analyze_routing(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> RoutingSummary:
     if IP is None and IPv6 is None:
         return RoutingSummary(
             path=path,
@@ -1001,9 +998,6 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
 
     total_packets = 0
     routing_packets = 0
@@ -1067,6 +1061,14 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
         ts: Optional[float],
         detail: str | None = None,
     ) -> None:
+        nonlocal first_seen, last_seen
+        # Every routing packet passes through here: the report window spans
+        # routing traffic, not every packet in scope.
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
         key = (protocol, src, dst, sport, dport)
         session = sessions_map.get(key)
         if session is None:
@@ -1094,21 +1096,9 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
             session["details"] = detail
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             proto_val = None
@@ -1141,9 +1131,9 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
             # hosts triggered "routing traffic with public IPs"; eBGP peering
             # legitimately uses public IPs so it is intentionally excluded here.
             if proto_val in _ROUTING_IGP_PROTOS:
-                if src_ip and _public_ip(src_ip):
+                if src_ip and is_public_ip(src_ip):
                     public_endpoints.add(src_ip)
-                if dst_ip and _public_ip(dst_ip):
+                if dst_ip and is_public_ip(dst_ip):
                     public_endpoints.add(dst_ip)
 
             # ICMP redirect detection
@@ -1674,8 +1664,11 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
                 tcp = pkt[TCP]  # type: ignore[index]
                 sport = int(getattr(tcp, "sport", 0) or 0)
                 dport = int(getattr(tcp, "dport", 0) or 0)
-                if sport in ROUTING_PORTS or dport in ROUTING_PORTS:
-                    proto_name = ROUTING_PORTS.get(sport) or ROUTING_PORTS.get(dport)
+                # A routing port on the source side only identifies the
+                # protocol when the destination is ephemeral: a flow from
+                # ephemeral 179 to 443 is not BGP.
+                if dport in ROUTING_PORTS or (sport in ROUTING_PORTS and dport >= 1024):
+                    proto_name = ROUTING_PORTS.get(dport) or ROUTING_PORTS.get(sport)
                     if proto_name == "BGP":
                         routing_packets += 1
                         protocol_counts["BGP"] += 1
@@ -1900,9 +1893,6 @@ def analyze_routing(path: Path, show_status: bool = True) -> RoutingSummary:
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
 
     duration = (
         (last_seen - first_seen)

@@ -14,7 +14,7 @@ try:
 except ImportError:
     TCP = UDP = Raw = None
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, safe_float, memoize_analysis
 
 # --- Constants ---
@@ -631,30 +631,15 @@ class Dnp3Analysis:
 
 
 @memoize_analysis
-def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
+def analyze_dnp3(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> Dnp3Analysis:
     if TCP is None:
         return Dnp3Analysis(path=path, errors=["Scapy unavailable (TCP missing)"])
 
-    try:
-        reader, status, _stream, _size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as e:
-        return Dnp3Analysis(
-            path,
-            0.0,
-            0,
-            0,
-            Counter(),
-            Counter(),
-            Counter(),
-            Counter(),
-            [],
-            Counter(),
-            Counter(),
-            [],
-            [f"Error: {e}"],
-        )
 
     total_packets = 0
     dnp3_packets = 0
@@ -742,506 +727,490 @@ def analyze_dnp3(path: Path, show_status: bool = True) -> Dnp3Analysis:
         return group, variation, qualifier, count, start, stop
 
     try:
-        with status as pbar:
-            try:
-                total_count = len(reader)
-            except Exception:
-                total_count = None
-            for i, pkt in enumerate(reader):
-                if total_count and i % 10 == 0:
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+            total_packets += 1
+            ts = safe_float(getattr(pkt, "time", 0))
+            if start_time is None:
+                start_time = ts
+            last_time = ts
+
+            # Check ports
+            has_transport = False
+            sport, dport = 0, 0
+            payload = b""
+
+            if pkt.haslayer(TCP):
+                has_transport = True
+                sport = int(pkt[TCP].sport)
+                dport = int(pkt[TCP].dport)
+                payload_obj = pkt[TCP].payload
+                payload = bytes(payload_obj) if payload_obj else b""
+                if not payload and Raw is not None and pkt.haslayer(Raw):
                     try:
-                        pbar.update(int((i / max(1, total_count)) * 100))
+                        payload = bytes(pkt[Raw].load)
                     except Exception:
                         pass
-
-                total_packets += 1
-                ts = safe_float(getattr(pkt, "time", 0))
-                if start_time is None:
-                    start_time = ts
-                last_time = ts
-
-                # Check ports
-                has_transport = False
-                sport, dport = 0, 0
-                payload = b""
-
-                if pkt.haslayer(TCP):
-                    has_transport = True
-                    sport = int(pkt[TCP].sport)
-                    dport = int(pkt[TCP].dport)
-                    payload_obj = pkt[TCP].payload
-                    payload = bytes(payload_obj) if payload_obj else b""
-                    if not payload and Raw is not None and pkt.haslayer(Raw):
-                        try:
-                            payload = bytes(pkt[Raw].load)
-                        except Exception:
-                            pass
-                elif pkt.haslayer(UDP):
-                    has_transport = True
-                    sport = int(pkt[UDP].sport)
-                    dport = int(pkt[UDP].dport)
-                    payload_obj = pkt[UDP].payload
-                    payload = bytes(payload_obj) if payload_obj else b""
-                    if not payload and Raw is not None and pkt.haslayer(Raw):
-                        try:
-                            payload = bytes(pkt[Raw].load)
-                        except Exception:
-                            pass
-                else:
-                    # Fallback: parse TCP/UDP from raw bytes if scapy didn't dissect layers
+            elif pkt.haslayer(UDP):
+                has_transport = True
+                sport = int(pkt[UDP].sport)
+                dport = int(pkt[UDP].dport)
+                payload_obj = pkt[UDP].payload
+                payload = bytes(payload_obj) if payload_obj else b""
+                if not payload and Raw is not None and pkt.haslayer(Raw):
                     try:
-                        raw = bytes(pkt)
-                        if (
-                            len(raw) >= 34 and raw[12:14] == b"\x08\x00"
-                        ):  # Ethernet + IPv4
-                            ihl = (raw[14] & 0x0F) * 4
-                            proto = raw[23]
-                            ip_start = 14
-                            total_len = int.from_bytes(raw[16:18], "big")
-                            transport_start = ip_start + ihl
-                            if proto == 6 and len(raw) >= transport_start + 20:
-                                data_offset = (raw[transport_start + 12] >> 4) * 4
-                                sport = int.from_bytes(
-                                    raw[transport_start : transport_start + 2], "big"
-                                )
-                                dport = int.from_bytes(
-                                    raw[transport_start + 2 : transport_start + 4],
-                                    "big",
-                                )
-                                payload_start = transport_start + data_offset
-                                ip_end = ip_start + total_len
-                                payload = (
-                                    raw[payload_start:ip_end]
-                                    if ip_end <= len(raw)
-                                    else raw[payload_start:]
-                                )
-                                has_transport = True
-                            elif proto == 17 and len(raw) >= transport_start + 8:
-                                sport = int.from_bytes(
-                                    raw[transport_start : transport_start + 2], "big"
-                                )
-                                dport = int.from_bytes(
-                                    raw[transport_start + 2 : transport_start + 4],
-                                    "big",
-                                )
-                                payload_start = transport_start + 8
-                                ip_end = ip_start + total_len
-                                payload = (
-                                    raw[payload_start:ip_end]
-                                    if ip_end <= len(raw)
-                                    else raw[payload_start:]
-                                )
-                                has_transport = True
+                        payload = bytes(pkt[Raw].load)
                     except Exception:
                         pass
-
-                if not has_transport:
-                    continue
-
-                frames = _parse_dnp3_frames(payload) if payload else []
-                on_dnp3_port = sport == DNP3_PORT or dport == DNP3_PORT
-
-                # Off the standard DNP3 port, only a CRC-VALID frame counts as
-                # real DNP3: a chance 0x05 0x64 match in IT/malware traffic
-                # parses into a "frame" but fails CRC, and previously still
-                # triggered "DNP3 on Non-Standard Port"/"Exposure" false
-                # positives. On-port, accept frames even with CRC errors (real
-                # DNP3 corruption/tampering is itself worth surfacing).
-                has_valid_frame = any(f[4] for f in frames)
-                is_dnp3 = on_dnp3_port or has_valid_frame
-                if not is_dnp3:
-                    continue
-
-                if has_valid_frame and not on_dnp3_port:
-                    nonstandard_port_counts[f"{sport}->{dport}"] += 1
-
-                dnp3_packets += 1
-
-                # Network-layer addresses (DNP3 runs over TCP/UDP) — not the
-                # Ethernet MACs that pkt[0].src would yield.
-                src_ip, dst_ip = extract_packet_endpoints(pkt)
-                if not src_ip:
-                    src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
-                if not dst_ip:
-                    dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "?"
-
-                for dl_src, dl_dst, dl_ctrl, user_data, crc_ok in frames:
-                    ip_endpoints[src_ip] += 1
-                    ip_endpoints[dst_ip] += 1
-
-                    src_addrs[dl_src] += 1
-                    dst_addrs[dl_dst] += 1
-
-                    # A CRC-failed frame is not a trustworthy DNP3 frame: its
-                    # "user data" is garbage, so parsing it as DNP3 application
-                    # layer manufactures phantom File-Op/Write findings. This is
-                    # also how a chance 0x05 0x64 match in non-DNP3 (IT/malware)
-                    # traffic produced false DNP3 detections. Only flag the CRC
-                    # mismatch as corruption on the actual DNP3 port (where the
-                    # traffic really is DNP3), and never parse its app layer.
-                    if not crc_ok:
-                        on_dnp3_port = sport == DNP3_PORT or dport == DNP3_PORT
-                        if on_dnp3_port and len(anomalies) < max_anomalies:
-                            anomalies.append(
-                                Dnp3Anomaly(
-                                    "LOW",
-                                    "DNP3 CRC Mismatch",
-                                    "DNP3 frame CRC mismatch detected (possible corruption or tampering).",
-                                    src_ip,
-                                    dst_ip,
-                                    ts,
-                                )
-                            )
-                        continue
-
-                    if not user_data or len(user_data) < 2:
-                        continue
-
-                    tp_header = user_data[0]
-                    fir = bool(tp_header & 0x80)
-                    fin = bool(tp_header & 0x40)
-                    transport_seq = tp_header & 0x3F
-                    _ = transport_seq
-
-                    key = (src_ip, dst_ip, dl_src, dl_dst)
-                    if fir:
-                        reassembly_buffers[key] = bytearray()
-                    buffer = reassembly_buffers.setdefault(key, bytearray())
-                    buffer.extend(user_data[1:])
-                    if not fin:
-                        continue
-                    app_data = bytes(reassembly_buffers.pop(key, buffer))
-                    if len(app_data) < 2:
-                        continue
-
-                    func_code = app_data[1]
-                    func_name = FUNC_CODES.get(func_code, f"Unknown ({func_code})")
-                    func_counts[func_name] += 1
-
-                    is_response = func_code in RESPONSE_FUNCTIONS
-                    ip_dnp3_addrs[src_ip].add(dl_src)
-                    ip_dnp3_addrs[dst_ip].add(dl_dst)
-                    # Attribute the function to its ACTUAL sender direction so the
-                    # conversation view isn't conflated (a master's Confirm and an
-                    # outstation's Unsolicited Response are different directions).
-                    directed_conversations[(src_ip, dst_ip)][func_name] += 1
-                    if func_code == 3:
-                        select_count += 1
-                    elif func_code in {4, 5, 6}:
-                        operate_count += 1
-                    if func_code in SAV5_FUNCTIONS:
-                        sav5_present = True
-                    if is_response:
-                        src_responses[src_ip] += 1
-                        outstation_funcs[func_name] += 1
-                        # The responder is the OUTSTATION (RTU/IED); its peer is
-                        # the master.
-                        outstation_ips[src_ip] += 1
-                        conversations[(dst_ip, src_ip)][func_name] += 1
-                        if func_code == 130:
-                            unsolicited_responses += 1
-                        # Parse IIN (the 2 bytes after the function code).
-                        if len(app_data) >= 4:
-                            iin1, iin2 = app_data[2], app_data[3]
-                            for bit, name in IIN1_BITS.items():
-                                if iin1 & bit:
-                                    iin_flags[name] += 1
-                            for bit, name in IIN2_BITS.items():
-                                if iin2 & bit:
-                                    iin_flags[name] += 1
-                    else:
-                        src_requests[src_ip] += 1
-                        src_dst_counts[src_ip][dst_ip] += 1
-                        src_dst_addrs[src_ip].add(dl_dst)
-                        master_funcs[func_name] += 1
-                        # The requester is the MASTER (issues commands/polls).
-                        master_ips[src_ip] += 1
-                        conversations[(src_ip, dst_ip)][func_name] += 1
-
-                    # Select (3) arms a control point (group-12 CROB) in the
-                    # select-before-operate sequence — control-plane intent even
-                    # without the Operate. Track it alongside Write/Operate.
-                    if func_code in CONTROL_FUNCTIONS or func_code == 3:
-                        src_control_counts[src_ip] += 1
-                        # Record each control command with evidence (deduped per
-                        # src->dst+func+outstation-addr). This is the load-bearing
-                        # forensic artifact: an Operate/Direct Operate/Write to an
-                        # output is an actuation/setpoint change (ATT&CK T0855
-                        # Unauthorized Command Message / T0831 Manipulation of
-                        # Control). A single one is worth surfacing.
-                        _cc_key = (src_ip, dst_ip, func_code, dl_dst)
-                        if _cc_key not in control_cmd_seen:
-                            control_cmd_seen.add(_cc_key)
-                            control_commands.append(
-                                {
-                                    "ts": ts,
-                                    "src_ip": src_ip,
-                                    "dst_ip": dst_ip,
-                                    "src_addr": dl_src,
-                                    "dst_addr": dl_dst,
-                                    "func": func_name,
-                                    "func_code": func_code,
-                                }
-                            )
-                            # Operate / Direct Operate drive an output (relay/
-                            # setpoint). Surface each distinct one — even a single
-                            # command matters in OT.
-                            if (
-                                func_code in {4, 5, 6}
-                                and len(anomalies) < max_anomalies
-                            ):
-                                anomalies.append(
-                                    Dnp3Anomaly(
-                                        "HIGH",
-                                        "DNP3 Outstation Control Command",
-                                        f"{func_name} issued to outstation Addr "
-                                        f"{dl_dst} ({dst_ip}) — drives a control "
-                                        "output (relay/analog setpoint). Confirm the "
-                                        "source is the authorized master and within "
-                                        "a change window.",
-                                        src_ip,
-                                        dst_ip,
-                                        ts,
-                                        attack="T0855 Unauthorized Command Message; T0831 Manipulation of Control",
-                                        evidence=f"master {src_ip} (Addr {dl_src}) -> outstation {dst_ip} (Addr {dl_dst}) func={func_name}",
-                                    )
-                                )
-                    if func_code in UNSOLICITED_FUNCTIONS:
-                        src_unsolicited_counts[src_ip] += 1
-                    if func_code in RESTART_FUNCTIONS:
-                        src_restart_counts[src_ip] += 1
-                    if func_code in APP_CONTROL_FUNCTIONS:
-                        src_app_control_counts[src_ip] += 1
-                    if func_code in FILE_FUNCTIONS:
-                        src_file_counts[src_ip] += 1
-                    if func_code in TIME_FUNCTIONS:
-                        src_time_counts[src_ip] += 1
-
+            else:
+                # Fallback: parse TCP/UDP from raw bytes if scapy didn't dissect layers
+                try:
+                    raw = bytes(pkt)
                     if (
-                        func_code in RESTART_FUNCTIONS
-                        and len(anomalies) < max_anomalies
-                    ):
+                        len(raw) >= 34 and raw[12:14] == b"\x08\x00"
+                    ):  # Ethernet + IPv4
+                        ihl = (raw[14] & 0x0F) * 4
+                        proto = raw[23]
+                        ip_start = 14
+                        total_len = int.from_bytes(raw[16:18], "big")
+                        transport_start = ip_start + ihl
+                        if proto == 6 and len(raw) >= transport_start + 20:
+                            data_offset = (raw[transport_start + 12] >> 4) * 4
+                            sport = int.from_bytes(
+                                raw[transport_start : transport_start + 2], "big"
+                            )
+                            dport = int.from_bytes(
+                                raw[transport_start + 2 : transport_start + 4],
+                                "big",
+                            )
+                            payload_start = transport_start + data_offset
+                            ip_end = ip_start + total_len
+                            payload = (
+                                raw[payload_start:ip_end]
+                                if ip_end <= len(raw)
+                                else raw[payload_start:]
+                            )
+                            has_transport = True
+                        elif proto == 17 and len(raw) >= transport_start + 8:
+                            sport = int.from_bytes(
+                                raw[transport_start : transport_start + 2], "big"
+                            )
+                            dport = int.from_bytes(
+                                raw[transport_start + 2 : transport_start + 4],
+                                "big",
+                            )
+                            payload_start = transport_start + 8
+                            ip_end = ip_start + total_len
+                            payload = (
+                                raw[payload_start:ip_end]
+                                if ip_end <= len(raw)
+                                else raw[payload_start:]
+                            )
+                            has_transport = True
+                except Exception:
+                    pass
+
+            if not has_transport:
+                continue
+
+            frames = _parse_dnp3_frames(payload) if payload else []
+            on_dnp3_port = dport == DNP3_PORT or (sport == DNP3_PORT and dport >= 1024)
+
+            # Off the standard DNP3 port, only a CRC-VALID frame counts as
+            # real DNP3: a chance 0x05 0x64 match in IT/malware traffic
+            # parses into a "frame" but fails CRC, and previously still
+            # triggered "DNP3 on Non-Standard Port"/"Exposure" false
+            # positives. On-port, accept frames even with CRC errors (real
+            # DNP3 corruption/tampering is itself worth surfacing).
+            has_valid_frame = any(f[4] for f in frames)
+            is_dnp3 = on_dnp3_port or has_valid_frame
+            if not is_dnp3:
+                continue
+
+            if has_valid_frame and not on_dnp3_port:
+                nonstandard_port_counts[f"{sport}->{dport}"] += 1
+
+            dnp3_packets += 1
+
+            # Network-layer addresses (DNP3 runs over TCP/UDP) — not the
+            # Ethernet MACs that pkt[0].src would yield.
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
+            if not src_ip:
+                src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
+            if not dst_ip:
+                dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "?"
+
+            for dl_src, dl_dst, dl_ctrl, user_data, crc_ok in frames:
+                ip_endpoints[src_ip] += 1
+                ip_endpoints[dst_ip] += 1
+
+                src_addrs[dl_src] += 1
+                dst_addrs[dl_dst] += 1
+
+                # A CRC-failed frame is not a trustworthy DNP3 frame: its
+                # "user data" is garbage, so parsing it as DNP3 application
+                # layer manufactures phantom File-Op/Write findings. This is
+                # also how a chance 0x05 0x64 match in non-DNP3 (IT/malware)
+                # traffic produced false DNP3 detections. Only flag the CRC
+                # mismatch as corruption on the actual DNP3 port (where the
+                # traffic really is DNP3), and never parse its app layer.
+                if not crc_ok:
+                    on_dnp3_port = sport == DNP3_PORT or dport == DNP3_PORT
+                    if on_dnp3_port and len(anomalies) < max_anomalies:
                         anomalies.append(
                             Dnp3Anomaly(
-                                "HIGH",
-                                "DNP3 Restart",
-                                f"System restart command ({func_name}) issued to "
-                                f"outstation Addr {dl_dst} ({dst_ip}) — forces the "
-                                "RTU/IED offline (loss of monitoring & control).",
+                                "LOW",
+                                "DNP3 CRC Mismatch",
+                                "DNP3 frame CRC mismatch detected (possible corruption or tampering).",
                                 src_ip,
                                 dst_ip,
                                 ts,
-                                attack="T0816 Device Restart/Shutdown",
-                                evidence=f"{src_ip} (Addr {dl_src}) -> {dst_ip} (Addr {dl_dst}) func={func_name}",
                             )
                         )
+                    continue
 
-                    if func_code == 2 and len(anomalies) < max_anomalies:
-                        anomalies.append(
-                            Dnp3Anomaly(
-                                "MEDIUM",
-                                "DNP3 Write",
-                                f"Write command detected to {dst_ip} (Addr {dl_dst})",
-                                src_ip,
-                                dst_ip,
-                                ts,
-                            )
+                if not user_data or len(user_data) < 2:
+                    continue
+
+                tp_header = user_data[0]
+                fir = bool(tp_header & 0x80)
+                fin = bool(tp_header & 0x40)
+                transport_seq = tp_header & 0x3F
+                _ = transport_seq
+
+                key = (src_ip, dst_ip, dl_src, dl_dst)
+                if fir:
+                    reassembly_buffers[key] = bytearray()
+                buffer = reassembly_buffers.setdefault(key, bytearray())
+                buffer.extend(user_data[1:])
+                if not fin:
+                    continue
+                app_data = bytes(reassembly_buffers.pop(key, buffer))
+                if len(app_data) < 2:
+                    continue
+
+                func_code = app_data[1]
+                func_name = FUNC_CODES.get(func_code, f"Unknown ({func_code})")
+                func_counts[func_name] += 1
+
+                is_response = func_code in RESPONSE_FUNCTIONS
+                ip_dnp3_addrs[src_ip].add(dl_src)
+                ip_dnp3_addrs[dst_ip].add(dl_dst)
+                # Attribute the function to its ACTUAL sender direction so the
+                # conversation view isn't conflated (a master's Confirm and an
+                # outstation's Unsolicited Response are different directions).
+                directed_conversations[(src_ip, dst_ip)][func_name] += 1
+                if func_code == 3:
+                    select_count += 1
+                elif func_code in {4, 5, 6}:
+                    operate_count += 1
+                if func_code in SAV5_FUNCTIONS:
+                    sav5_present = True
+                if is_response:
+                    src_responses[src_ip] += 1
+                    outstation_funcs[func_name] += 1
+                    # The responder is the OUTSTATION (RTU/IED); its peer is
+                    # the master.
+                    outstation_ips[src_ip] += 1
+                    conversations[(dst_ip, src_ip)][func_name] += 1
+                    if func_code == 130:
+                        unsolicited_responses += 1
+                    # Parse IIN (the 2 bytes after the function code).
+                    if len(app_data) >= 4:
+                        iin1, iin2 = app_data[2], app_data[3]
+                        for bit, name in IIN1_BITS.items():
+                            if iin1 & bit:
+                                iin_flags[name] += 1
+                        for bit, name in IIN2_BITS.items():
+                            if iin2 & bit:
+                                iin_flags[name] += 1
+                else:
+                    src_requests[src_ip] += 1
+                    src_dst_counts[src_ip][dst_ip] += 1
+                    src_dst_addrs[src_ip].add(dl_dst)
+                    master_funcs[func_name] += 1
+                    # The requester is the MASTER (issues commands/polls).
+                    master_ips[src_ip] += 1
+                    conversations[(src_ip, dst_ip)][func_name] += 1
+
+                # Select (3) arms a control point (group-12 CROB) in the
+                # select-before-operate sequence — control-plane intent even
+                # without the Operate. Track it alongside Write/Operate.
+                if func_code in CONTROL_FUNCTIONS or func_code == 3:
+                    src_control_counts[src_ip] += 1
+                    # Record each control command with evidence (deduped per
+                    # src->dst+func+outstation-addr). This is the load-bearing
+                    # forensic artifact: an Operate/Direct Operate/Write to an
+                    # output is an actuation/setpoint change (ATT&CK T0855
+                    # Unauthorized Command Message / T0831 Manipulation of
+                    # Control). A single one is worth surfacing.
+                    _cc_key = (src_ip, dst_ip, func_code, dl_dst)
+                    if _cc_key not in control_cmd_seen:
+                        control_cmd_seen.add(_cc_key)
+                        control_commands.append(
+                            {
+                                "ts": ts,
+                                "src_ip": src_ip,
+                                "dst_ip": dst_ip,
+                                "src_addr": dl_src,
+                                "dst_addr": dl_dst,
+                                "func": func_name,
+                                "func_code": func_code,
+                            }
                         )
-
-                    # Select-before-Operate state tracking. Select (3) arms a
-                    # control point; Operate (4) should follow a prior Select.
-                    # DirectOperate (5/6) is one-step by design, so only a bare
-                    # Operate-4 with no observed Select is the SBO-bypass signal.
-                    if func_code == 3:
-                        selected_pairs.add((src_ip, dl_dst))
-                    elif func_code == 4 and (src_ip, dl_dst) not in selected_pairs:
+                        # Operate / Direct Operate drive an output (relay/
+                        # setpoint). Surface each distinct one — even a single
+                        # command matters in OT.
                         if (
-                            (src_ip, dl_dst) not in op_no_select_flagged
+                            func_code in {4, 5, 6}
                             and len(anomalies) < max_anomalies
                         ):
-                            op_no_select_flagged.add((src_ip, dl_dst))
                             anomalies.append(
                                 Dnp3Anomaly(
-                                    "MEDIUM",
-                                    "DNP3 Operate Without Select",
-                                    f"Operate to Addr {dl_dst} with no preceding Select "
-                                    "(single-stage control / possible SBO bypass; "
-                                    "may also be a capture gap).",
+                                    "HIGH",
+                                    "DNP3 Outstation Control Command",
+                                    f"{func_name} issued to outstation Addr "
+                                    f"{dl_dst} ({dst_ip}) — drives a control "
+                                    "output (relay/analog setpoint). Confirm the "
+                                    "source is the authorized master and within "
+                                    "a change window.",
                                     src_ip,
                                     dst_ip,
                                     ts,
+                                    attack="T0855 Unauthorized Command Message; T0831 Manipulation of Control",
+                                    evidence=f"master {src_ip} (Addr {dl_src}) -> outstation {dst_ip} (Addr {dl_dst}) func={func_name}",
                                 )
                             )
+                if func_code in UNSOLICITED_FUNCTIONS:
+                    src_unsolicited_counts[src_ip] += 1
+                if func_code in RESTART_FUNCTIONS:
+                    src_restart_counts[src_ip] += 1
+                if func_code in APP_CONTROL_FUNCTIONS:
+                    src_app_control_counts[src_ip] += 1
+                if func_code in FILE_FUNCTIONS:
+                    src_file_counts[src_ip] += 1
+                if func_code in TIME_FUNCTIONS:
+                    src_time_counts[src_ip] += 1
 
-                    # Broadcast control: a command to a DNP3 broadcast link
-                    # address (0xFFFD-0xFFFF) actuates every outstation at once.
-                    if (
-                        dl_dst in (0xFFFD, 0xFFFE, 0xFFFF)
-                        and func_code in (2, 3, 4, 5, 6, 13, 14)
-                        and (src_ip, dl_dst) not in broadcast_flagged
-                        and len(anomalies) < max_anomalies
-                    ):
-                        broadcast_flagged.add((src_ip, dl_dst))
-                        anomalies.append(
-                            Dnp3Anomaly(
-                                "HIGH",
-                                "DNP3 Broadcast Control",
-                                f"Control/write ({func_name}) sent to broadcast address "
-                                f"0x{dl_dst:04X}; affects all outstations.",
-                                src_ip,
-                                dst_ip,
-                                ts,
-                            )
-                        )
-
-                    if func_code in FILE_FUNCTIONS and len(anomalies) < max_anomalies:
-                        anomalies.append(
-                            Dnp3Anomaly(
-                                "HIGH",
-                                "DNP3 File Op",
-                                f"File operation ({func_name}) detected",
-                                src_ip,
-                                dst_ip,
-                                ts,
-                            )
-                        )
-
-                    app_payload_start = 2
-                    if is_response and len(app_data) >= 4:
-                        iin = int.from_bytes(app_data[2:4], "little")
-                        if iin & 0x0080 and len(anomalies) < max_anomalies:
-                            anomalies.append(
-                                Dnp3Anomaly(
-                                    "MEDIUM",
-                                    "IIN Device Restart",
-                                    "Internal Indication: Device Restart detected",
-                                    src_ip,
-                                    dst_ip,
-                                    ts,
-                                )
-                            )
-                        if iin & 0x0040 and len(anomalies) < max_anomalies:
-                            anomalies.append(
-                                Dnp3Anomaly(
-                                    "MEDIUM",
-                                    "IIN Device Trouble",
-                                    "Internal Indication: Device Trouble/Error",
-                                    src_ip,
-                                    dst_ip,
-                                    ts,
-                                )
-                            )
-                        app_payload_start = 4
-
-                    object_summary = None
-                    if app_payload_start < len(app_data):
-                        obj_items, obj_keys = _parse_objects(
-                            app_data[app_payload_start:]
-                        )
-                        if obj_items:
-                            object_summary = str(obj_items[0].get("summary") or "")
-                        for key in obj_keys:
-                            object_counts[key] += 1
-                            try:
-                                group_id = int(key.split(".")[0])
-                            except Exception:
-                                group_id = None
-                            if group_id is not None:
-                                group_name = OBJECT_GROUPS.get(
-                                    group_id, f"Group {group_id}"
-                                )
-                                object_group_counts[group_name] += 1
-                        for item in obj_items:
-                            values = item.get("values")
-                            if not values:
-                                continue
-                            group_id = item.get("group")
-                            variation = item.get("variation")
-                            start_index = item.get("start") or 0
-                            if not isinstance(group_id, int) or not isinstance(
-                                variation, int
-                            ):
-                                continue
-                            for offset, value in enumerate(values):
-                                if len(value_changes) >= 200:
-                                    break
-                                index = start_index + offset
-                                key = (group_id, variation, index)
-                                prev = last_values.get(key)
-                                if prev is not None and prev != value:
-                                    value_changes.append(
-                                        {
-                                            "group": group_id,
-                                            "variation": variation,
-                                            "index": index,
-                                            "old": prev,
-                                            "new": value,
-                                            "src": src_ip,
-                                            "dst": dst_ip,
-                                            "ts": ts,
-                                        }
-                                    )
-                                last_values[key] = value
-                        if obj_items and func_code in {2, 3, 4, 5, 6}:
-                            for item in obj_items:
-                                group_id = item.get("group")
-                                if (
-                                    isinstance(group_id, int)
-                                    and group_id in CONTROL_OBJECT_GROUPS
-                                ):
-                                    if len(anomalies) < max_anomalies:
-                                        anomalies.append(
-                                            Dnp3Anomaly(
-                                                "HIGH",
-                                                "DNP3 Control Object Operation",
-                                                f"{func_name} on {item.get('summary')}",
-                                                src_ip,
-                                                dst_ip,
-                                                ts,
-                                            )
-                                        )
-                                        break
-                                if (
-                                    isinstance(group_id, int)
-                                    and group_id in FILE_OBJECT_GROUPS
-                                ):
-                                    if len(anomalies) < max_anomalies:
-                                        anomalies.append(
-                                            Dnp3Anomaly(
-                                                "HIGH",
-                                                "DNP3 File Object Operation",
-                                                f"{func_name} on {item.get('summary')}",
-                                                src_ip,
-                                                dst_ip,
-                                                ts,
-                                            )
-                                        )
-                                        break
-
-                    messages.append(
-                        Dnp3Message(
-                            ts=ts,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            src_addr=dl_src,
-                            dst_addr=dl_dst,
-                            len=len(app_data),
-                            func_code=func_code,
-                            func_name=func_name,
-                            is_master=(dl_src < 65500),
-                            object_summary=object_summary,
+                if (
+                    func_code in RESTART_FUNCTIONS
+                    and len(anomalies) < max_anomalies
+                ):
+                    anomalies.append(
+                        Dnp3Anomaly(
+                            "HIGH",
+                            "DNP3 Restart",
+                            f"System restart command ({func_name}) issued to "
+                            f"outstation Addr {dl_dst} ({dst_ip}) — forces the "
+                            "RTU/IED offline (loss of monitoring & control).",
+                            src_ip,
+                            dst_ip,
+                            ts,
+                            attack="T0816 Device Restart/Shutdown",
+                            evidence=f"{src_ip} (Addr {dl_src}) -> {dst_ip} (Addr {dl_dst}) func={func_name}",
                         )
                     )
 
-                continue
+                if func_code == 2 and len(anomalies) < max_anomalies:
+                    anomalies.append(
+                        Dnp3Anomaly(
+                            "MEDIUM",
+                            "DNP3 Write",
+                            f"Write command detected to {dst_ip} (Addr {dl_dst})",
+                            src_ip,
+                            dst_ip,
+                            ts,
+                        )
+                    )
+
+                # Select-before-Operate state tracking. Select (3) arms a
+                # control point; Operate (4) should follow a prior Select.
+                # DirectOperate (5/6) is one-step by design, so only a bare
+                # Operate-4 with no observed Select is the SBO-bypass signal.
+                if func_code == 3:
+                    selected_pairs.add((src_ip, dl_dst))
+                elif func_code == 4 and (src_ip, dl_dst) not in selected_pairs:
+                    if (
+                        (src_ip, dl_dst) not in op_no_select_flagged
+                        and len(anomalies) < max_anomalies
+                    ):
+                        op_no_select_flagged.add((src_ip, dl_dst))
+                        anomalies.append(
+                            Dnp3Anomaly(
+                                "MEDIUM",
+                                "DNP3 Operate Without Select",
+                                f"Operate to Addr {dl_dst} with no preceding Select "
+                                "(single-stage control / possible SBO bypass; "
+                                "may also be a capture gap).",
+                                src_ip,
+                                dst_ip,
+                                ts,
+                            )
+                        )
+
+                # Broadcast control: a command to a DNP3 broadcast link
+                # address (0xFFFD-0xFFFF) actuates every outstation at once.
+                if (
+                    dl_dst in (0xFFFD, 0xFFFE, 0xFFFF)
+                    and func_code in (2, 3, 4, 5, 6, 13, 14)
+                    and (src_ip, dl_dst) not in broadcast_flagged
+                    and len(anomalies) < max_anomalies
+                ):
+                    broadcast_flagged.add((src_ip, dl_dst))
+                    anomalies.append(
+                        Dnp3Anomaly(
+                            "HIGH",
+                            "DNP3 Broadcast Control",
+                            f"Control/write ({func_name}) sent to broadcast address "
+                            f"0x{dl_dst:04X}; affects all outstations.",
+                            src_ip,
+                            dst_ip,
+                            ts,
+                        )
+                    )
+
+                if func_code in FILE_FUNCTIONS and len(anomalies) < max_anomalies:
+                    anomalies.append(
+                        Dnp3Anomaly(
+                            "HIGH",
+                            "DNP3 File Op",
+                            f"File operation ({func_name}) detected",
+                            src_ip,
+                            dst_ip,
+                            ts,
+                        )
+                    )
+
+                app_payload_start = 2
+                if is_response and len(app_data) >= 4:
+                    iin = int.from_bytes(app_data[2:4], "little")
+                    if iin & 0x0080 and len(anomalies) < max_anomalies:
+                        anomalies.append(
+                            Dnp3Anomaly(
+                                "MEDIUM",
+                                "IIN Device Restart",
+                                "Internal Indication: Device Restart detected",
+                                src_ip,
+                                dst_ip,
+                                ts,
+                            )
+                        )
+                    if iin & 0x0040 and len(anomalies) < max_anomalies:
+                        anomalies.append(
+                            Dnp3Anomaly(
+                                "MEDIUM",
+                                "IIN Device Trouble",
+                                "Internal Indication: Device Trouble/Error",
+                                src_ip,
+                                dst_ip,
+                                ts,
+                            )
+                        )
+                    app_payload_start = 4
+
+                object_summary = None
+                if app_payload_start < len(app_data):
+                    obj_items, obj_keys = _parse_objects(
+                        app_data[app_payload_start:]
+                    )
+                    if obj_items:
+                        object_summary = str(obj_items[0].get("summary") or "")
+                    for key in obj_keys:
+                        object_counts[key] += 1
+                        try:
+                            group_id = int(key.split(".")[0])
+                        except Exception:
+                            group_id = None
+                        if group_id is not None:
+                            group_name = OBJECT_GROUPS.get(
+                                group_id, f"Group {group_id}"
+                            )
+                            object_group_counts[group_name] += 1
+                    for item in obj_items:
+                        values = item.get("values")
+                        if not values:
+                            continue
+                        group_id = item.get("group")
+                        variation = item.get("variation")
+                        start_index = item.get("start") or 0
+                        if not isinstance(group_id, int) or not isinstance(
+                            variation, int
+                        ):
+                            continue
+                        for offset, value in enumerate(values):
+                            if len(value_changes) >= 200:
+                                break
+                            index = start_index + offset
+                            key = (group_id, variation, index)
+                            prev = last_values.get(key)
+                            if prev is not None and prev != value:
+                                value_changes.append(
+                                    {
+                                        "group": group_id,
+                                        "variation": variation,
+                                        "index": index,
+                                        "old": prev,
+                                        "new": value,
+                                        "src": src_ip,
+                                        "dst": dst_ip,
+                                        "ts": ts,
+                                    }
+                                )
+                            last_values[key] = value
+                    if obj_items and func_code in {2, 3, 4, 5, 6}:
+                        for item in obj_items:
+                            group_id = item.get("group")
+                            if (
+                                isinstance(group_id, int)
+                                and group_id in CONTROL_OBJECT_GROUPS
+                            ):
+                                if len(anomalies) < max_anomalies:
+                                    anomalies.append(
+                                        Dnp3Anomaly(
+                                            "HIGH",
+                                            "DNP3 Control Object Operation",
+                                            f"{func_name} on {item.get('summary')}",
+                                            src_ip,
+                                            dst_ip,
+                                            ts,
+                                        )
+                                    )
+                                    break
+                            if (
+                                isinstance(group_id, int)
+                                and group_id in FILE_OBJECT_GROUPS
+                            ):
+                                if len(anomalies) < max_anomalies:
+                                    anomalies.append(
+                                        Dnp3Anomaly(
+                                            "HIGH",
+                                            "DNP3 File Object Operation",
+                                            f"{func_name} on {item.get('summary')}",
+                                            src_ip,
+                                            dst_ip,
+                                            ts,
+                                        )
+                                    )
+                                    break
+
+                messages.append(
+                    Dnp3Message(
+                        ts=ts,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        src_addr=dl_src,
+                        dst_addr=dl_dst,
+                        len=len(app_data),
+                        func_code=func_code,
+                        func_name=func_name,
+                        is_master=(dl_src < 65500),
+                        object_summary=object_summary,
+                    )
+                )
+
+            continue
 
     except Exception as e:
         errors.append(f"{type(e).__name__}: {e}")
-    finally:
-        try:
-            reader.close()
-        except Exception:
-            pass
 
     duration = 0.0
     if start_time and last_time:

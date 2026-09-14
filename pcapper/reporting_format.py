@@ -18,6 +18,10 @@ def format_table(rows: Iterable[list[str]]) -> str:
         return str(value)
 
     rows = [[_cell_text(cell) for cell in row] for row in rows]
+    # A ragged row (a renderer that appended fewer cells than the header)
+    # used to raise IndexError in the width pass and kill the whole report.
+    columns = max(len(row) for row in rows)
+    rows = [row + [""] * (columns - len(row)) for row in rows]
 
     def _visible_len(text: str) -> int:
         return len(re.sub(r"\x1b\[[0-9;]*m", "", text))

@@ -16,8 +16,8 @@ try:
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
 
-from .pcap_cache import get_reader
-from .utils import extract_packet_endpoints
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, memoize_analysis
 
 SUSPICIOUS_PATTERNS = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential exposure"),
@@ -181,8 +181,13 @@ def _append_check(
     bucket.append(evidence)
 
 
+@memoize_analysis
 def analyze_strings(
-    path: Path, show_status: bool = True, max_unique: int = 5000
+    path: Path,
+    show_status: bool = True,
+    max_unique: int = 5000,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> StringsSummary:
     if TCP is None:
         return StringsSummary(
@@ -207,35 +212,6 @@ def analyze_strings(
             errors=[],
         )
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as e:
-        return StringsSummary(
-            path=path,
-            total_packets=0,
-            strings_found=0,
-            unique_strings=0,
-            top_strings=[],
-            bottom_strings=[],
-            suspicious_strings=[],
-            suspicious_details=[],
-            urls=[],
-            emails=[],
-            domains=[],
-            client_strings={},
-            server_strings={},
-            anomalies=[f"Error opening pcap: {e}"],
-            deterministic_checks={},
-            threat_hypotheses=[],
-            ot_findings=[],
-            ctf_indicators=[],
-            errors=[],
-        )
-
-    size_bytes = size_bytes
-
     total_packets = 0
     string_counter: Counter[str] = Counter()
     suspicious_counter: Counter[str] = Counter()
@@ -250,15 +226,7 @@ def analyze_strings(
     errors: List[str] = []
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             payload = b""
             if Raw in pkt:
@@ -308,9 +276,6 @@ def analyze_strings(
 
     except Exception as e:
         errors.append(str(e))
-    finally:
-        status.finish()
-        reader.close()
 
     anomalies: List[str] = []
     if suspicious_counter:

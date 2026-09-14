@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Optional
 
 from .device_detection import device_fingerprints_from_text
-from .pcap_cache import get_reader
-from .utils import safe_float
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import memoize_analysis, safe_float
 
 try:
     from scapy.layers.l2 import Ether  # type: ignore
@@ -153,7 +153,13 @@ def _parse_dcp(payload: bytes) -> tuple[list[str], list[str], list[str]]:
     return services, names, ips
 
 
-def analyze_lldp_dcp(path: Path, show_status: bool = True) -> LldpDcpSummary:
+@memoize_analysis
+def analyze_lldp_dcp(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> LldpDcpSummary:
     if Ether is None:
         return LldpDcpSummary(
             path,
@@ -175,9 +181,6 @@ def analyze_lldp_dcp(path: Path, show_status: bool = True) -> LldpDcpSummary:
             None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
     total_packets = 0
     lldp_packets = 0
     dcp_packets = 0
@@ -195,43 +198,65 @@ def analyze_lldp_dcp(path: Path, show_status: bool = True) -> LldpDcpSummary:
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
+        if not pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+            continue
+        eth = pkt[Ether]  # type: ignore[index]
+        eth_type = int(getattr(eth, "type", 0) or 0)
+        try:
+            payload = bytes(eth.payload)
+        except Exception:
+            payload = b""
+
+        if eth_type == LLDP_ETHERTYPE:
+            lldp_packets += 1
+            # The report window spans this protocol's traffic, not every packet.
             if ts is not None:
                 if first_seen is None or ts < first_seen:
                     first_seen = ts
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
+            chassis, port, sysname = _parse_lldp_tlvs(payload)
+            if chassis:
+                chassis_ids[chassis] += 1
+            if port:
+                port_ids[port] += 1
+            if sysname:
+                system_names[sysname] += 1
+                for detail in device_fingerprints_from_text(
+                    sysname, source="LLDP system name"
+                ):
+                    key = f"device:{detail}"
+                    if key in seen_device_artifacts:
+                        continue
+                    seen_device_artifacts.add(key)
+                    artifacts.append(
+                        LldpDcpArtifact(
+                            kind="device", detail=detail, src=eth.src, dst=eth.dst
+                        )
+                    )
 
-            if not pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-                continue
-            eth = pkt[Ether]  # type: ignore[index]
-            eth_type = int(getattr(eth, "type", 0) or 0)
-            try:
-                payload = bytes(eth.payload)
-            except Exception:
-                payload = b""
-
-            if eth_type == LLDP_ETHERTYPE:
-                lldp_packets += 1
-                chassis, port, sysname = _parse_lldp_tlvs(payload)
-                if chassis:
-                    chassis_ids[chassis] += 1
-                if port:
-                    port_ids[port] += 1
-                if sysname:
-                    system_names[sysname] += 1
+        if eth_type == PROFINET_ETHERTYPE and len(payload) >= 2:
+            dcp_packets += 1
+            # The report window spans this protocol's traffic, not every packet.
+            if ts is not None:
+                if first_seen is None or ts < first_seen:
+                    first_seen = ts
+                if last_seen is None or ts > last_seen:
+                    last_seen = ts
+            frame_id = int.from_bytes(payload[0:2], "big")
+            dcp_frame_ids[f"0x{frame_id:04x}"] += 1
+            if 0xFE00 <= frame_id <= 0xFEFF:
+                services, names, ips = _parse_dcp(payload)
+                for svc in services:
+                    dcp_services[svc] += 1
+                for name in names:
+                    dcp_device_names[name] += 1
                     for detail in device_fingerprints_from_text(
-                        sysname, source="LLDP system name"
+                        name, source="DCP device name"
                     ):
                         key = f"device:{detail}"
                         if key in seen_device_artifacts:
@@ -239,41 +264,15 @@ def analyze_lldp_dcp(path: Path, show_status: bool = True) -> LldpDcpSummary:
                         seen_device_artifacts.add(key)
                         artifacts.append(
                             LldpDcpArtifact(
-                                kind="device", detail=detail, src=eth.src, dst=eth.dst
+                                kind="device",
+                                detail=detail,
+                                src=eth.src,
+                                dst=eth.dst,
                             )
                         )
+                for ip in ips:
+                    dcp_ips[ip] += 1
 
-            if eth_type == PROFINET_ETHERTYPE and len(payload) >= 2:
-                dcp_packets += 1
-                frame_id = int.from_bytes(payload[0:2], "big")
-                dcp_frame_ids[f"0x{frame_id:04x}"] += 1
-                if 0xFE00 <= frame_id <= 0xFEFF:
-                    services, names, ips = _parse_dcp(payload)
-                    for svc in services:
-                        dcp_services[svc] += 1
-                    for name in names:
-                        dcp_device_names[name] += 1
-                        for detail in device_fingerprints_from_text(
-                            name, source="DCP device name"
-                        ):
-                            key = f"device:{detail}"
-                            if key in seen_device_artifacts:
-                                continue
-                            seen_device_artifacts.add(key)
-                            artifacts.append(
-                                LldpDcpArtifact(
-                                    kind="device",
-                                    detail=detail,
-                                    src=eth.src,
-                                    dst=eth.dst,
-                                )
-                            )
-                    for ip in ips:
-                        dcp_ips[ip] += 1
-
-    finally:
-        status.finish()
-        reader.close()
 
     if lldp_packets:
         detections.append(

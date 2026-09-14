@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .utils import restrict_dir_permissions, restrict_permissions
+from .utils import env_int, open_private, restrict_dir_permissions
 
 
 @dataclass(frozen=True)
@@ -40,7 +39,7 @@ def _tshark_available() -> bool:
     return shutil.which("tshark") is not None
 
 
-TSHARK_TIMEOUT = float(os.environ.get("PCAPPER_TSHARK_TIMEOUT", "120"))
+TSHARK_TIMEOUT = float(env_int("PCAPPER_TSHARK_TIMEOUT", 120, minimum=1))
 
 # Fields requested, in order, by the single stream-enumeration pass. Every one is
 # emitted as a column whether or not it matched, so the row width is fixed and a
@@ -172,17 +171,31 @@ def _follow_stream(
     return proc.stdout, proc.stderr
 
 
-def decrypt_tls(
-    path: Path, keylog: Path, output_dir: Path, limit: int
+def _decrypt_protocol(
+    path: Path,
+    keylog: Path,
+    output_dir: Path,
+    limit: int,
+    *,
+    protocol: str,
+    pref_key: str,
+    display_filter: str,
+    follow_protos: tuple[str, ...],
 ) -> DecryptSummary:
+    """Shared body of :func:`decrypt_tls` and :func:`decrypt_ssh`.
+
+    ``follow_protos`` lists the ``-z follow,<proto>`` names to try in order;
+    TLS needs the ``ssl`` fallback for tshark builds that predate the rename.
+    """
     errors: list[str] = []
     notes: list[str] = []
     outputs: list[Path] = []
+    tag = protocol.lower()
 
     if not _tshark_available():
         return DecryptSummary(
             path=path,
-            protocol="TLS",
+            protocol=protocol,
             keylog_path=keylog,
             output_dir=output_dir,
             stream_count=0,
@@ -191,49 +204,48 @@ def decrypt_tls(
             notes=[],
         )
 
-    pref = f"tls.keylog_file:{keylog}"
-    streams, labels, stream_errors = _collect_streams(path, "tls", pref)
-    if stream_errors:
-        errors.extend(stream_errors)
+    pref = f"{pref_key}:{keylog}"
+    streams, labels, stream_errors = _collect_streams(path, display_filter, pref)
+    errors.extend(stream_errors)
     if not streams:
-        notes.append("No TLS streams detected for decryption.")
+        notes.append(f"No {protocol} streams detected for decryption.")
 
     restrict_dir_permissions(output_dir)
     count = 0
     for stream_id in streams:
         if limit and count >= limit:
-            notes.append(f"TLS stream limit reached ({limit}).")
+            notes.append(f"{protocol} stream limit reached ({limit}).")
             break
         label = _stream_label(stream_id, labels)
-        filename = output_dir / f"tls_{stream_id}_{label}.txt"
-        followed = _follow_stream(path, stream_id, pref, "tls")
-        if followed is None:
-            errors.append(
-                f"tshark timed out after {TSHARK_TIMEOUT:.0f}s following TLS stream"
-                f" {stream_id}; skipped."
-            )
-            continue
-        stdout, stderr = followed
-        if not stdout and stderr:
-            followed = _follow_stream(path, stream_id, pref, "ssl")
+        filename = output_dir / f"{tag}_{stream_id}_{label}.txt"
+        stdout = stderr = ""
+        timed_out = False
+        for index, follow_proto in enumerate(follow_protos):
+            followed = _follow_stream(path, stream_id, pref, follow_proto)
             if followed is None:
+                suffix = f" as {follow_proto}" if index else ""
                 errors.append(
-                    f"tshark timed out after {TSHARK_TIMEOUT:.0f}s following TLS"
-                    f" stream {stream_id} as ssl; skipped."
+                    f"tshark timed out after {TSHARK_TIMEOUT:.0f}s following "
+                    f"{protocol} stream {stream_id}{suffix}; skipped."
                 )
-                continue
+                timed_out = True
+                break
             stdout, stderr = followed
+            if stdout or not stderr:
+                break  # got data, or a clean empty result: no fallback needed
+        if timed_out:
+            continue
         if stderr.strip():
             errors.append(stderr.strip())
         if stdout:
-            filename.write_text(stdout, encoding="utf-8", errors="ignore")
-            restrict_permissions(filename)
+            with open_private(filename, "w", encoding="utf-8", errors="ignore") as handle:
+                handle.write(stdout)
             outputs.append(filename)
             count += 1
 
     return DecryptSummary(
         path=path,
-        protocol="TLS",
+        protocol=protocol,
         keylog_path=keylog,
         output_dir=output_dir,
         stream_count=count,
@@ -243,63 +255,21 @@ def decrypt_tls(
     )
 
 
+def decrypt_tls(
+    path: Path, keylog: Path, output_dir: Path, limit: int
+) -> DecryptSummary:
+    return _decrypt_protocol(
+        path, keylog, output_dir, limit,
+        protocol="TLS", pref_key="tls.keylog_file", display_filter="tls",
+        follow_protos=("tls", "ssl"),
+    )
+
+
 def decrypt_ssh(
     path: Path, keylog: Path, output_dir: Path, limit: int
 ) -> DecryptSummary:
-    errors: list[str] = []
-    notes: list[str] = []
-    outputs: list[Path] = []
-
-    if not _tshark_available():
-        return DecryptSummary(
-            path=path,
-            protocol="SSH",
-            keylog_path=keylog,
-            output_dir=output_dir,
-            stream_count=0,
-            outputs=[],
-            errors=["tshark not found on PATH."],
-            notes=[],
-        )
-
-    pref = f"ssh.keylog_file:{keylog}"
-    streams, labels, stream_errors = _collect_streams(path, "ssh", pref)
-    if stream_errors:
-        errors.extend(stream_errors)
-    if not streams:
-        notes.append("No SSH streams detected for decryption.")
-
-    restrict_dir_permissions(output_dir)
-    count = 0
-    for stream_id in streams:
-        if limit and count >= limit:
-            notes.append(f"SSH stream limit reached ({limit}).")
-            break
-        label = _stream_label(stream_id, labels)
-        filename = output_dir / f"ssh_{stream_id}_{label}.txt"
-        followed = _follow_stream(path, stream_id, pref, "ssh")
-        if followed is None:
-            errors.append(
-                f"tshark timed out after {TSHARK_TIMEOUT:.0f}s following SSH stream"
-                f" {stream_id}; skipped."
-            )
-            continue
-        stdout, stderr = followed
-        if stderr.strip():
-            errors.append(stderr.strip())
-        if stdout:
-            filename.write_text(stdout, encoding="utf-8", errors="ignore")
-            restrict_permissions(filename)
-            outputs.append(filename)
-            count += 1
-
-    return DecryptSummary(
-        path=path,
-        protocol="SSH",
-        keylog_path=keylog,
-        output_dir=output_dir,
-        stream_count=count,
-        outputs=outputs,
-        errors=errors,
-        notes=notes,
+    return _decrypt_protocol(
+        path, keylog, output_dir, limit,
+        protocol="SSH", pref_key="ssh.keylog_file", display_filter="ssh",
+        follow_protos=("ssh",),
     )

@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
-from .pcap_cache import get_reader
-from .utils import memoize_analysis, safe_float
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import get_packet_ports, memoize_analysis, safe_float
 
 try:
     from scapy.layers.dhcp import BOOTP, DHCP
@@ -230,7 +230,29 @@ def _decode_name(value: object) -> str:
     return text
 
 
+# NetBIOS name suffixes that identify a DOMAIN/WORKGROUP role rather than a
+# host: <1B> domain master browser, <1C> domain controllers group, <1D> local
+# master browser, <1E> browser service elections. The 15-character name that
+# carries one of these is the domain or workgroup name, never the machine name.
+_NBNS_DOMAIN_ROLE_SUFFIXES = {0x1B, 0x1C, 0x1D, 0x1E}
+_NBNS_MSBROWSE = "\x01\x02__MSBROWSE__\x02"
+_NBNS_OPCODE_REGISTRATION = {5, 8, 9, 15}  # registration, refresh, refresh(alt), multi-homed
+
+
 def _decode_nbns_level1_name(value: object) -> Optional[str]:
+    decoded = _decode_nbns_level1_name_suffix(value)
+    return decoded[0] if decoded is not None else None
+
+
+def _decode_nbns_level1_name_suffix(value: object) -> Optional[tuple[str, int]]:
+    """Decode a first-level-encoded NetBIOS name into ``(name, suffix)``.
+
+    The 32-character encoding carries 16 bytes: 15 characters of name padded
+    with spaces and a 16th *suffix* byte that says what the name is (<00>
+    workstation, <20> file server, <1C> domain controllers group, ...). The
+    suffix is what separates a machine name from a domain/workgroup name, so
+    it is returned alongside the name rather than discarded.
+    """
     raw_text = ""
     if isinstance(value, (bytes, bytearray)):
         raw_bytes = bytes(value)
@@ -275,7 +297,32 @@ def _decode_nbns_level1_name(value: object) -> Optional[str]:
         return None
     if not host:
         return None
-    return host
+    return host, int(decoded_bytes[15])
+
+
+def _nbns_registers_group_name(pkt, payload: bytes) -> bool:
+    """True when an NBNS registration/refresh registers a GROUP name.
+
+    A group registration (NB_FLAGS G bit set) announces membership of a
+    workgroup or domain — the name is ``CORP``, not the host. Read the flag
+    from the dissected layer when scapy bound one, else from the raw record:
+    header(12) + question(34 encoded name + 2 type + 2 class) + RR name
+    pointer(2) + type(2) + class(2) + TTL(4) + RDLENGTH(2), NB_FLAGS next.
+    """
+    try:
+        layer = pkt.getlayer("NBNSRegistrationRequest") if hasattr(pkt, "getlayer") else None
+    except Exception:
+        layer = None
+    if layer is not None:
+        try:
+            return int(getattr(layer, "G", 0) or 0) == 1
+        except Exception:
+            return False
+    if not payload or len(payload) < 64:
+        return False
+    if payload[12] != 0x20 or payload[45] != 0x00:
+        return False
+    return bool(payload[62] & 0x80)
 
 
 def _target_reverse_ptr(target_ip: str) -> str:
@@ -333,20 +380,6 @@ def _extract_payload(raw_layer, tcp_layer, udp_layer) -> bytes:
         except Exception:
             return b""
     return b""
-
-
-def _extract_ports(tcp_layer, udp_layer) -> tuple[Optional[int], Optional[int]]:
-    if tcp_layer is not None:
-        try:
-            return int(tcp_layer.sport), int(tcp_layer.dport)
-        except Exception:
-            return None, None
-    if udp_layer is not None:
-        try:
-            return int(udp_layer.sport), int(udp_layer.dport)
-        except Exception:
-            return None, None
-    return None, None
 
 
 def _normalize_mac(value: object) -> str:
@@ -421,25 +454,42 @@ def _extract_nbns_hostnames(pkt, payload: bytes) -> list[str]:
     # falling back to the raw header flags byte (NBNS byte 2: bit 0x80 = QR,
     # bits 0x78 = opcode).
     is_name_query_request = False
+    is_response = False
+    opcode = 0
     try:
         hdr = pkt.getlayer("NBNSHeader") if hasattr(pkt, "getlayer") else None
     except Exception:
         hdr = None
     if hdr is not None:
-        if (
-            int(getattr(hdr, "RESPONSE", 0) or 0) == 0
-            and int(getattr(hdr, "OPCODE", 0) or 0) == 0
-        ):
-            is_name_query_request = True
+        is_response = int(getattr(hdr, "RESPONSE", 0) or 0) == 1
+        opcode = int(getattr(hdr, "OPCODE", 0) or 0)
     elif payload and len(payload) >= 3:
         flags = payload[2]
-        if (flags & 0x80) == 0 and ((flags >> 3) & 0x0F) == 0:
-            is_name_query_request = True
+        is_response = (flags & 0x80) != 0
+        opcode = (flags >> 3) & 0x0F
+    if not is_response and opcode == 0:
+        is_name_query_request = True
     if is_name_query_request:
         return results
 
-    def _append(name: Optional[str]) -> None:
+    # A group registration names the workgroup/domain the sender belongs to,
+    # not the sender itself.
+    if (
+        not is_response
+        and opcode in _NBNS_OPCODE_REGISTRATION
+        and _nbns_registers_group_name(pkt, payload)
+    ):
+        return results
+
+    def _append(decoded: Optional[tuple[str, int]]) -> None:
+        if not decoded:
+            return
+        name, suffix = decoded
         if not name:
+            return
+        # Domain/workgroup role names (<1B>/<1C>/<1D>/<1E>) and the browser
+        # election group are the domain's identity, not a host's.
+        if suffix in _NBNS_DOMAIN_ROLE_SUFFIXES or name == _NBNS_MSBROWSE:
             return
         normalized = _normalize_hostname(name)
         if not normalized:
@@ -454,14 +504,12 @@ def _extract_nbns_hostnames(pkt, payload: bytes) -> list[str]:
             layer = pkt.getlayer("NBNSQueryRequest")
             if layer is not None:
                 for attr in ("QUESTION_NAME", "qname", "RR_NAME", "rrname"):
-                    decoded = _decode_nbns_level1_name(getattr(layer, attr, None))
-                    _append(decoded)
+                    _append(_decode_nbns_level1_name_suffix(getattr(layer, attr, None)))
         if hasattr(pkt, "getlayer"):
             layer = pkt.getlayer("NBNSQueryResponse")
             if layer is not None:
                 for attr in ("QUESTION_NAME", "qname", "RR_NAME", "rrname"):
-                    decoded = _decode_nbns_level1_name(getattr(layer, attr, None))
-                    _append(decoded)
+                    _append(_decode_nbns_level1_name_suffix(getattr(layer, attr, None)))
     except Exception:
         pass
 
@@ -471,8 +519,7 @@ def _extract_nbns_hostnames(pkt, payload: bytes) -> list[str]:
         except Exception:
             text = ""
         for token in re.findall(r"[A-Pa-p]{32}", text):
-            decoded = _decode_nbns_level1_name(token)
-            _append(decoded)
+            _append(_decode_nbns_level1_name_suffix(token))
 
     return results
 
@@ -2003,6 +2050,11 @@ def _record_finding(
     normalized = _normalize_hostname(hostname)
     if not _is_valid_hostname(normalized):
         return False
+    # An address literal is not a hostname. URL hosts (SSDP LOCATION, OPC UA
+    # endpoints, SIP URIs, UNC paths) are routinely bare IPs, and recording
+    # "192.168.1.5" as the hostname of 192.168.1.5 is noise in every consumer.
+    if _is_ip_literal(normalized):
+        return False
 
     key = (normalized, mapped_ip, protocol, method, src_ip, dst_ip, details)
     existing = findings_map.get(key)
@@ -2200,6 +2252,8 @@ def analyze_hostname(
     port_filter: int | None = None,
     search_query: str | None = None,
     apply_filters: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> HostnameSummary:
     query_text = str(hostname_query or "").strip()
     search_text = str(search_query or "").strip()
@@ -2236,22 +2290,11 @@ def analyze_hostname(
     )
 
     try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as exc:
-        summary.errors.append(f"Error opening pcap: {exc}")
-        return summary
-
-    try:
-        for pkt in reader:
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status
+        ):
             summary.total_packets += 1
             packet_index = summary.total_packets
-            if stream is not None and size_bytes:
-                try:
-                    status.update(int(min(100, (stream.tell() / size_bytes) * 100)))
-                except Exception:
-                    pass
 
             ts = safe_float(getattr(pkt, "time", None))
             # Dissect each commonly needed layer once per packet and share
@@ -2266,7 +2309,7 @@ def analyze_hostname(
             udp_layer = pkt.getlayer(UDP) if UDP is not None else None
             raw_layer = pkt.getlayer(Raw) if Raw is not None else None
             src_ip, dst_ip = _extract_ip_pair(ip_layer, ipv6_layer, arp_layer)
-            sport, dport = _extract_ports(tcp_layer, udp_layer)
+            sport, dport, _transport = get_packet_ports(pkt)
             if ether_layer is not None:
                 try:
                     src_mac = getattr(ether_layer, "src", "")
@@ -2822,7 +2865,12 @@ def analyze_hostname(
                             summary.method_counts[method] += 1
 
                 if (sport in SSDP_PORTS) or (dport in SSDP_PORTS):
-                    mapped_ip = src_ip if sport in SSDP_PORTS else dst_ip
+                    # LOCATION/AL URLs (NOTIFY, M-SEARCH 200 OK) advertise the
+                    # SENDER's own description document. A NOTIFY goes to the
+                    # 239.255.255.250 group from an ephemeral port, so mapping
+                    # by "whichever side is on 1900" pinned the device's name
+                    # to the multicast address.
+                    mapped_ip = src_ip
                     for (
                         host_value,
                         method,
@@ -3297,12 +3345,6 @@ def analyze_hostname(
 
     except Exception as exc:
         summary.errors.append(f"{type(exc).__name__}: {exc}")
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
 
     # Browser (MS-BRWS) announcements self-identify a host's computer name (and
     # its OS/roles) — a high-confidence IP->hostname source that the packet loop
@@ -3330,7 +3372,7 @@ def analyze_hostname(
             mapped_ip=str(_bip),
             protocol="BROWSER",
             method="Browser announcement",
-            confidence="high",
+            confidence="HIGH",
             details=_detail,
             src_ip=str(_bip),
             dst_ip="-",

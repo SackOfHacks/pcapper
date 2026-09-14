@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import safe_float
 
 try:
@@ -234,7 +234,12 @@ def _parse_goose_payload(payload: bytes) -> dict[str, object]:
 
 
 @memoize_analysis
-def analyze_goose(path: Path, show_status: bool = True) -> GooseSummary:
+def analyze_goose(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> GooseSummary:
     if Ether is None:
         return GooseSummary(
             path,
@@ -260,9 +265,6 @@ def analyze_goose(path: Path, show_status: bool = True) -> GooseSummary:
             None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
     total_packets = 0
     goose_packets = 0
     src_macs: Counter[str] = Counter()
@@ -298,226 +300,216 @@ def analyze_goose(path: Path, show_status: bool = True) -> GooseSummary:
     gocbref_spoof_flagged: set[str] = set()
     data_len_map: dict[tuple[str, str, str], int] = {}
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+        if not pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+            continue
+        eth = pkt[Ether]  # type: ignore[index]
+        eth_type = int(getattr(eth, "type", 0) or 0)
+        if eth_type != GOOSE_ETHERTYPE:
+            continue
 
-            if not pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-                continue
-            eth = pkt[Ether]  # type: ignore[index]
-            eth_type = int(getattr(eth, "type", 0) or 0)
-            if eth_type != GOOSE_ETHERTYPE:
-                continue
+        goose_packets += 1
+        # The report window spans this protocol's traffic, not every packet.
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
+        src_mac = str(getattr(eth, "src", "-"))
+        dst_mac = str(getattr(eth, "dst", "-"))
+        src_macs[src_mac] += 1
+        dst_macs[dst_mac] += 1
+        try:
+            first_octet = int(dst_mac.split(":")[0], 16)
+            if (first_octet & 1) == 0:
+                unicast_dsts.add(dst_mac)
+        except Exception:
+            pass
+        try:
+            payload = bytes(eth.payload)
+        except Exception:
+            payload = b""
+        appid = _extract_appid(payload)
+        if appid is not None:
+            appid_label = f"0x{appid:04x}"
+            app_ids[appid_label] += 1
+            src_appids.setdefault(src_mac, set()).add(appid_label)
+        length = _extract_length(payload)
+        if length is not None:
+            lengths[length] += 1
 
-            goose_packets += 1
-            src_mac = str(getattr(eth, "src", "-"))
-            dst_mac = str(getattr(eth, "dst", "-"))
-            src_macs[src_mac] += 1
-            dst_macs[dst_mac] += 1
-            try:
-                first_octet = int(dst_mac.split(":")[0], 16)
-                if (first_octet & 1) == 0:
-                    unicast_dsts.add(dst_mac)
-            except Exception:
-                pass
-            try:
-                payload = bytes(eth.payload)
-            except Exception:
-                payload = b""
-            appid = _extract_appid(payload)
-            if appid is not None:
-                appid_label = f"0x{appid:04x}"
-                app_ids[appid_label] += 1
-                src_appids.setdefault(src_mac, set()).add(appid_label)
-            length = _extract_length(payload)
-            if length is not None:
-                lengths[length] += 1
+        goose_info = _parse_goose_payload(payload) if payload else {}
+        dataset = str(goose_info.get("datSet", "") or "")
+        gocb_ref = str(goose_info.get("gocbRef", "") or "")
+        st_num = goose_info.get("stNum")
+        sq_num = goose_info.get("sqNum")
+        conf_rev = goose_info.get("confRev")
+        num_entries_val = goose_info.get("numDatSetEntries")
+        data_len = goose_info.get("allData_len")
+        data_values = goose_info.get("allData_values") or []
 
-            goose_info = _parse_goose_payload(payload) if payload else {}
-            dataset = str(goose_info.get("datSet", "") or "")
-            gocb_ref = str(goose_info.get("gocbRef", "") or "")
-            st_num = goose_info.get("stNum")
-            sq_num = goose_info.get("sqNum")
-            conf_rev = goose_info.get("confRev")
-            num_entries_val = goose_info.get("numDatSetEntries")
-            data_len = goose_info.get("allData_len")
-            data_values = goose_info.get("allData_values") or []
-
-            # Simulation/test bit (IEC 61850-8-1 "simulation"/"test"): an IED in
-            # Sim mode acts on these frames, so a test frame on a production bus
-            # is a classic GOOSE-injection vector (ATT&CK ICS T0852/T0856).
-            # ndsCom=true means the GoCB is not properly commissioned.
-            sim_key = (src_mac, f"0x{appid:04x}" if appid is not None else "-",
-                       dataset or gocb_ref or "-")
-            if goose_info.get("simulation") and sim_key not in sim_flagged:
-                sim_flagged.add(sim_key)
+        # Simulation/test bit (IEC 61850-8-1 "simulation"/"test"): an IED in
+        # Sim mode acts on these frames, so a test frame on a production bus
+        # is a classic GOOSE-injection vector (ATT&CK ICS T0852/T0856).
+        # ndsCom=true means the GoCB is not properly commissioned.
+        sim_key = (src_mac, f"0x{appid:04x}" if appid is not None else "-",
+                   dataset or gocb_ref or "-")
+        if goose_info.get("simulation") and sim_key not in sim_flagged:
+            sim_flagged.add(sim_key)
+            detections.append(
+                {
+                    "severity": "warning",
+                    "summary": "GOOSE Simulation/Test Bit Set",
+                    "details": (
+                        f"{src_mac} {sim_key[2]} published GOOSE with the "
+                        "simulation/test bit set; IEDs in Sim mode will act "
+                        "on it (possible test-frame injection)."
+                    ),
+                }
+            )
+        if goose_info.get("ndsCom") and sim_key not in ndscom_flagged:
+            ndscom_flagged.add(sim_key)
+            detections.append(
+                {
+                    "severity": "info",
+                    "summary": "GOOSE needsCommissioning Set",
+                    "details": (
+                        f"{src_mac} {sim_key[2]} published GOOSE with "
+                        "ndsCom=true (control block not commissioned / "
+                        "configuration incomplete)."
+                    ),
+                }
+            )
+        if dataset:
+            datasets[dataset] += 1
+        if gocb_ref:
+            gocb_refs[gocb_ref] += 1
+            # Publisher-spoofing: same control block (gocbRef) from >1 MAC.
+            macs = gocbref_macs.setdefault(gocb_ref, set())
+            macs.add(src_mac)
+            if len(macs) >= 2 and gocb_ref not in gocbref_spoof_flagged:
+                gocbref_spoof_flagged.add(gocb_ref)
                 detections.append(
                     {
-                        "severity": "warning",
-                        "summary": "GOOSE Simulation/Test Bit Set",
+                        "severity": "high",
+                        "summary": "GOOSE Publisher Spoofing",
                         "details": (
-                            f"{src_mac} {sim_key[2]} published GOOSE with the "
-                            "simulation/test bit set; IEDs in Sim mode will act "
-                            "on it (possible test-frame injection)."
+                            f"gocbRef {gocb_ref} published from multiple source "
+                            f"MACs ({', '.join(sorted(macs))}); a control block has "
+                            "one legitimate publisher — likely GOOSE spoofing/"
+                            "injection (ATT&CK ICS T0856)."
                         ),
                     }
                 )
-            if goose_info.get("ndsCom") and sim_key not in ndscom_flagged:
-                ndscom_flagged.add(sim_key)
-                detections.append(
-                    {
-                        "severity": "info",
-                        "summary": "GOOSE needsCommissioning Set",
-                        "details": (
-                            f"{src_mac} {sim_key[2]} published GOOSE with "
-                            "ndsCom=true (control block not commissioned / "
-                            "configuration incomplete)."
-                        ),
-                    }
-                )
-            if dataset:
-                datasets[dataset] += 1
-            if gocb_ref:
-                gocb_refs[gocb_ref] += 1
-                # Publisher-spoofing: same control block (gocbRef) from >1 MAC.
-                macs = gocbref_macs.setdefault(gocb_ref, set())
-                macs.add(src_mac)
-                if len(macs) >= 2 and gocb_ref not in gocbref_spoof_flagged:
-                    gocbref_spoof_flagged.add(gocb_ref)
+        if isinstance(st_num, int):
+            st_nums[st_num] += 1
+        if isinstance(sq_num, int):
+            sq_nums[sq_num] += 1
+        if isinstance(conf_rev, int):
+            conf_revs[conf_rev] += 1
+        if isinstance(num_entries_val, int):
+            num_entries[num_entries_val] += 1
+        if isinstance(data_len, int):
+            all_data_lengths[data_len] += 1
+        if data_values:
+            for dtype, value in data_values[:16]:
+                data_type_counts[str(dtype)] += 1
+                sample = f"{dtype}={value}"
+                data_value_samples[sample] += 1
+
+        if (
+            appid is not None
+            and isinstance(st_num, int)
+            and isinstance(sq_num, int)
+        ):
+            key = (src_mac, f"0x{appid:04x}", dataset or gocb_ref or "-")
+            prev = state_map.get(key)
+            if prev:
+                prev_st, prev_sq = prev
+                if st_num < prev_st:
                     detections.append(
                         {
-                            "severity": "high",
-                            "summary": "GOOSE Publisher Spoofing",
-                            "details": (
-                                f"gocbRef {gocb_ref} published from multiple source "
-                                f"MACs ({', '.join(sorted(macs))}); a control block has "
-                                "one legitimate publisher — likely GOOSE spoofing/"
-                                "injection (ATT&CK ICS T0856)."
-                            ),
+                            "severity": "warning",
+                            "summary": "GOOSE State Number Decrease",
+                            "details": f"{key[0]} {key[2]} stNum decreased {prev_st}->{st_num}.",
                         }
                     )
-            if isinstance(st_num, int):
-                st_nums[st_num] += 1
-            if isinstance(sq_num, int):
-                sq_nums[sq_num] += 1
-            if isinstance(conf_rev, int):
-                conf_revs[conf_rev] += 1
-            if isinstance(num_entries_val, int):
-                num_entries[num_entries_val] += 1
-            if isinstance(data_len, int):
-                all_data_lengths[data_len] += 1
-            if data_values:
-                for dtype, value in data_values[:16]:
-                    data_type_counts[str(dtype)] += 1
-                    sample = f"{dtype}={value}"
-                    data_value_samples[sample] += 1
-
-            if (
-                appid is not None
-                and isinstance(st_num, int)
-                and isinstance(sq_num, int)
-            ):
-                key = (src_mac, f"0x{appid:04x}", dataset or gocb_ref or "-")
-                prev = state_map.get(key)
-                if prev:
-                    prev_st, prev_sq = prev
-                    if st_num < prev_st:
-                        detections.append(
-                            {
-                                "severity": "warning",
-                                "summary": "GOOSE State Number Decrease",
-                                "details": f"{key[0]} {key[2]} stNum decreased {prev_st}->{st_num}.",
-                            }
-                        )
-                    if st_num == prev_st and sq_num < prev_sq:
-                        detections.append(
-                            {
-                                "severity": "warning",
-                                "summary": "GOOSE Sequence Reset",
-                                "details": f"{key[0]} {key[2]} sqNum decreased {prev_sq}->{sq_num}.",
-                            }
-                        )
-                    # Forward-injection coverage: per IEC 61850-8-1, a new
-                    # state (stNum increment) restarts sqNum at 0 (some
-                    # stacks use 1). A state advance that starts mid-sequence
-                    # suggests an injected frame or missed frames; a multi-
-                    # state skip likewise. Info severity (capture gaps look
-                    # the same) and flagged once per publisher/dataset.
-                    if st_num > prev_st and key not in jump_flagged:
-                        skipped_states = st_num - prev_st > 1
-                        high_start_sq = sq_num > 1
-                        if skipped_states or high_start_sq:
-                            jump_flagged.add(key)
-                            reasons = []
-                            if skipped_states:
-                                reasons.append(
-                                    f"stNum jumped {prev_st}->{st_num}"
-                                )
-                            if high_start_sq:
-                                reasons.append(
-                                    f"new state started at sqNum={sq_num}"
-                                )
-                            detections.append(
-                                {
-                                    "severity": "info",
-                                    "summary": "GOOSE State Jump",
-                                    "details": (
-                                        f"{key[0]} {key[2]} {'; '.join(reasons)} "
-                                        "(possible missed frames or injected GOOSE)."
-                                    ),
-                                }
+                if st_num == prev_st and sq_num < prev_sq:
+                    detections.append(
+                        {
+                            "severity": "warning",
+                            "summary": "GOOSE Sequence Reset",
+                            "details": f"{key[0]} {key[2]} sqNum decreased {prev_sq}->{sq_num}.",
+                        }
+                    )
+                # Forward-injection coverage: per IEC 61850-8-1, a new
+                # state (stNum increment) restarts sqNum at 0 (some
+                # stacks use 1). A state advance that starts mid-sequence
+                # suggests an injected frame or missed frames; a multi-
+                # state skip likewise. Info severity (capture gaps look
+                # the same) and flagged once per publisher/dataset.
+                if st_num > prev_st and key not in jump_flagged:
+                    skipped_states = st_num - prev_st > 1
+                    high_start_sq = sq_num > 1
+                    if skipped_states or high_start_sq:
+                        jump_flagged.add(key)
+                        reasons = []
+                        if skipped_states:
+                            reasons.append(
+                                f"stNum jumped {prev_st}->{st_num}"
                             )
-                state_map[key] = (st_num, sq_num)
-                if isinstance(conf_rev, int):
-                    prev_conf = conf_map.get(key)
-                    if prev_conf is not None and conf_rev != prev_conf:
+                        if high_start_sq:
+                            reasons.append(
+                                f"new state started at sqNum={sq_num}"
+                            )
                         detections.append(
                             {
-                                "severity": "warning",
-                                "summary": "GOOSE Config Revision Change",
-                                "details": f"{key[0]} {key[2]} confRev changed {prev_conf}->{conf_rev}.",
+                                "severity": "info",
+                                "summary": "GOOSE State Jump",
+                                "details": (
+                                    f"{key[0]} {key[2]} {'; '.join(reasons)} "
+                                    "(possible missed frames or injected GOOSE)."
+                                ),
                             }
                         )
-                    conf_map[key] = conf_rev
-                if isinstance(num_entries_val, int):
-                    prev_entries = entries_map.get(key)
-                    if prev_entries is not None and num_entries_val != prev_entries:
-                        detections.append(
-                            {
-                                "severity": "warning",
-                                "summary": "GOOSE Dataset Size Change",
-                                "details": f"{key[0]} {key[2]} numDatSetEntries changed {prev_entries}->{num_entries_val}.",
-                            }
-                        )
-                    entries_map[key] = num_entries_val
-                if isinstance(data_len, int):
-                    prev_len = data_len_map.get(key)
-                    if prev_len is not None and data_len != prev_len:
-                        detections.append(
-                            {
-                                "severity": "warning",
-                                "summary": "GOOSE Dataset Payload Size Change",
-                                "details": f"{key[0]} {key[2]} allData length changed {prev_len}->{data_len}.",
-                            }
-                        )
-                    data_len_map[key] = data_len
+            state_map[key] = (st_num, sq_num)
+            if isinstance(conf_rev, int):
+                prev_conf = conf_map.get(key)
+                if prev_conf is not None and conf_rev != prev_conf:
+                    detections.append(
+                        {
+                            "severity": "warning",
+                            "summary": "GOOSE Config Revision Change",
+                            "details": f"{key[0]} {key[2]} confRev changed {prev_conf}->{conf_rev}.",
+                        }
+                    )
+                conf_map[key] = conf_rev
+            if isinstance(num_entries_val, int):
+                prev_entries = entries_map.get(key)
+                if prev_entries is not None and num_entries_val != prev_entries:
+                    detections.append(
+                        {
+                            "severity": "warning",
+                            "summary": "GOOSE Dataset Size Change",
+                            "details": f"{key[0]} {key[2]} numDatSetEntries changed {prev_entries}->{num_entries_val}.",
+                        }
+                    )
+                entries_map[key] = num_entries_val
+            if isinstance(data_len, int):
+                prev_len = data_len_map.get(key)
+                if prev_len is not None and data_len != prev_len:
+                    detections.append(
+                        {
+                            "severity": "warning",
+                            "summary": "GOOSE Dataset Payload Size Change",
+                            "details": f"{key[0]} {key[2]} allData length changed {prev_len}->{data_len}.",
+                        }
+                    )
+                data_len_map[key] = data_len
 
-    finally:
-        status.finish()
-        reader.close()
 
     if goose_packets:
         detections.append(

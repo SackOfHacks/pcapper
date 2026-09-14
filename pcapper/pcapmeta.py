@@ -57,9 +57,11 @@ def analyze_pcapmeta(path: Path, show_status: bool = True) -> PcapMetaSummary:
                 if name:
                     interface_names.append(str(name))
                 if iface.get("dropcount") is not None:
+                    # Summed across interfaces; it used to keep only the
+                    # last interface's figure.
                     try:
-                        dropcount = int(iface.get("dropcount"))
-                    except Exception:
+                        dropcount = (dropcount or 0) + int(iface.get("dropcount"))
+                    except (TypeError, ValueError):
                         pass
             else:
                 interfaces.append({"detail": str(iface)})

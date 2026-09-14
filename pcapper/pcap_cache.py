@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import os
 import re
@@ -7,7 +8,7 @@ import struct
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 try:
     from scapy.utils import PcapNgReader, PcapReader  # type: ignore
@@ -26,12 +27,14 @@ except Exception:  # pragma: no cover
     IPv6 = None  # type: ignore
 
 from .progress import build_busy_statusbar, build_statusbar
-from .utils import detect_file_type
+from .utils import PCAP_MAGIC, detect_file_type
 
 _PACKET_CACHE: "OrderedDict[Path, tuple[list[object], 'PcapMeta']]" = OrderedDict()
 _CACHE_BYTES = 0
 _FORCED_PACKET_VIEWS: dict[Path, tuple[list[object], "PcapMeta | None"]] = {}
 _HOST_ONLY_BPF_RE = re.compile(r"^\s*\(?\s*host\s+([0-9A-Fa-f:.]+)\s*\)?\s*$")
+
+__all__ = ["PCAP_MAGIC"]  # re-exported for callers that imported it from here
 
 
 @dataclass(frozen=True)
@@ -45,14 +48,6 @@ class PcapMeta:
     capture_hardware: str | None = None
     capture_os: str | None = None
     capture_application: str | None = None
-
-
-PCAP_MAGIC = {
-    0xA1B2C3D4: ">",
-    0xD4C3B2A1: "<",
-    0xA1B23C4D: ">",
-    0x4D3CB2A1: "<",
-}
 
 
 def _read_pcap_header(path: Path) -> tuple[object | None, object | None]:
@@ -340,26 +335,22 @@ def _extract_host_only_bpf_ip(bpf: str | None) -> str | None:
 
 
 def _packet_matches_host(pkt: object, host_addr: object) -> bool:
-    if IP is not None and getattr(pkt, "haslayer", None) and pkt.haslayer(IP):  # type: ignore[truthy-bool]
+    getlayer = getattr(pkt, "getlayer", None)
+    if not callable(getlayer):
+        return False
+    for layer_cls in (IP, IPv6):
+        if layer_cls is None:
+            continue
         try:
-            src = ipaddress.ip_address(str(pkt[IP].src))  # type: ignore[index]
-            dst = ipaddress.ip_address(str(pkt[IP].dst))  # type: ignore[index]
+            layer = getlayer(layer_cls)
+            if layer is None:
+                continue
+            src = ipaddress.ip_address(str(layer.src))
+            dst = ipaddress.ip_address(str(layer.dst))
             if src == host_addr or dst == host_addr:
                 return True
         except Exception:
-            pass
-
-    if (
-        IPv6 is not None and getattr(pkt, "haslayer", None) and pkt.haslayer(IPv6)  # type: ignore[truthy-bool]
-    ):
-        try:
-            src = ipaddress.ip_address(str(pkt[IPv6].src))  # type: ignore[index]
-            dst = ipaddress.ip_address(str(pkt[IPv6].dst))  # type: ignore[index]
-            if src == host_addr or dst == host_addr:
-                return True
-        except Exception:
-            pass
-
+            continue
     return False
 
 
@@ -538,22 +529,34 @@ def load_filtered_packets(
     if bpf and sniff is not None and host_only_ip is None:
         try:
             status = build_busy_statusbar(path, enabled=show_status, desc="Filtering")
+            has_time_filter = time_start is not None or time_end is not None
+
+            def _in_window(pkt: object) -> bool:
+                if not has_time_filter:
+                    return True
+                ts = getattr(pkt, "time", None)
+                if ts is None:
+                    return False
+                if time_start is not None and ts < time_start:
+                    return False
+                if time_end is not None and ts > time_end:
+                    return False
+                return True
+
+            # store=False + lfilter keeps only the packets that pass the time
+            # window resident, instead of materialising every BPF match first
+            # and then filtering the list a second time.
+            packets = []
             with status:
-                packets = list(sniff(offline=str(path), filter=bpf))
+                sniff(
+                    offline=str(path),
+                    filter=bpf,
+                    store=False,
+                    lfilter=_in_window,
+                    prn=packets.append,
+                )
             if bpf_status is not None:
                 bpf_status["used_bpf"] = True
-            if time_start is not None or time_end is not None:
-                filtered: list[object] = []
-                for pkt in packets:
-                    ts = getattr(pkt, "time", None)
-                    if ts is None:
-                        continue
-                    if time_start is not None and ts < time_start:
-                        continue
-                    if time_end is not None and ts > time_end:
-                        continue
-                    filtered.append(pkt)
-                packets = filtered
             meta = _finalize_meta(
                 path=path,
                 file_type=file_type,
@@ -632,6 +635,80 @@ def load_filtered_packets(
 
 def has_cached_packets(path: Path) -> bool:
     return path in _PACKET_CACHE
+
+
+_HASH_CACHE: dict[tuple[str, int, int], tuple[str | None, str | None]] = {}
+
+
+def capture_hashes(path: Path) -> tuple[str | None, str | None]:
+    """SHA-256 and SHA-1 of the capture file, computed once per file version.
+
+    Keyed on (path, size, mtime) so a re-written capture is re-hashed. The
+    base summary and the case-metadata writer both need these; before this
+    each made its own full pass over the file.
+    """
+    try:
+        st = Path(path).stat()
+        key = (str(path), st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None, None
+    cached = _HASH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    sha256 = hashlib.sha256()
+    sha1 = hashlib.sha1()
+    try:
+        with Path(path).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                sha256.update(chunk)
+                sha1.update(chunk)
+    except OSError:
+        return None, None
+    result = (sha256.hexdigest(), sha1.hexdigest())
+    _HASH_CACHE[key] = result
+    return result
+
+
+# Progress is refreshed every this-many packets. A tell() per packet is
+# measurable on multi-million-packet captures and buys nothing visible.
+_PROGRESS_EVERY = 0x1FF
+
+
+def iter_packets(
+    path: Path,
+    *,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+    show_status: bool = True,
+) -> Iterator[object]:
+    """Yield every packet of a capture with throttled progress and clean-up.
+
+    The one loop every analyzer used to write by hand — get the reader,
+    ``tell()`` the stream on each packet for the status bar, close both in a
+    ``finally`` — as a single generator. Serves the shared in-memory packet
+    list when one is active (see :func:`get_reader`), so chained steps never
+    re-read the file.
+    """
+    reader, status, stream, size_bytes, _file_type = get_reader(
+        path, packets=packets, meta=meta, show_status=show_status
+    )
+    track = status.enabled and stream is not None and bool(size_bytes)
+    count = 0
+    try:
+        for pkt in reader:
+            count += 1
+            if track and not (count & _PROGRESS_EVERY):
+                try:
+                    status.update(int(min(100, (stream.tell() / size_bytes) * 100)))
+                except Exception:
+                    pass
+            yield pkt
+    finally:
+        status.finish()
+        try:
+            reader.close()
+        except Exception:
+            pass
 
 
 def set_forced_packet_view(

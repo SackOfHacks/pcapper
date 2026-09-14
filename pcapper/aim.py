@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import parse_qsl
 
-from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints, packet_length
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import decode_payload, extract_packet_endpoints, memoize_analysis, packet_length, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -99,13 +99,6 @@ class AimSummary:
     duration_seconds: Optional[float]
 
 
-def _decode_payload(payload: bytes) -> str:
-    try:
-        return payload.decode("latin-1", errors="ignore")
-    except Exception:
-        return ""
-
-
 def _looks_like_aim_payload(
     payload: bytes, text: str, *, require_strong: bool = False
 ) -> bool:
@@ -175,11 +168,12 @@ def _add_from_query_like(
             files[val] += 1
 
 
+@memoize_analysis
 def analyze_aim(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> AimSummary:
     errors: list[str] = []
     if TCP is None:
@@ -209,9 +203,6 @@ def analyze_aim(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     total_packets = 0
     aim_packets = 0
@@ -234,23 +225,11 @@ def analyze_aim(
     non_standard_ports: Counter[int] = Counter()
 
     try:
-        for idx, pkt in enumerate(reader, start=1):
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
-
+        for idx, pkt in enumerate(iter_packets(path, packets=packets, meta=meta, show_status=show_status), start=1):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
 
             if not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 continue
@@ -266,8 +245,8 @@ def analyze_aim(
                 payload = bytes(tcp_layer.payload)
             except Exception:
                 payload = b""
-            text = _decode_payload(payload)
-            is_standard_aim = sport in AIM_PORTS or dport in AIM_PORTS
+            text = decode_payload(payload, encoding="latin-1")
+            is_standard_aim = dport in AIM_PORTS or (sport in AIM_PORTS and dport >= 1024)
             looks_tunneled_aim = False
             if (sport in TLS_TUNNEL_PORTS or dport in TLS_TUNNEL_PORTS) and payload:
                 looks_tunneled_aim = _looks_like_aim_payload(
@@ -277,6 +256,12 @@ def analyze_aim(
                 continue
 
             aim_packets += 1
+            # The report window spans this protocol's traffic, not every packet.
+            if ts is not None:
+                if first_seen is None or ts < first_seen:
+                    first_seen = ts
+                if last_seen is None or ts > last_seen:
+                    last_seen = ts
             aim_bytes += pkt_len
             if dport in AIM_PORTS:
                 server_port = dport
@@ -419,12 +404,6 @@ def analyze_aim(
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
 
     if password_counts:
         detections.append(

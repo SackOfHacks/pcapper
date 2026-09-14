@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,14 +7,19 @@ from typing import Optional
 
 from .dns import analyze_dns
 from .http import analyze_http
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .services import COMMON_PORTS
 from .utils import (
     extract_packet_endpoints,
+    is_private_ip,
+    is_public_ip,
     is_unicast_host_ip,
+    is_valid_ip,
+    memoize_analysis,
     packet_length,
     safe_float,
-    memoize_analysis,
+    tcp_flags_int,
+    tcp_segment_length,
 )
 
 try:
@@ -78,6 +82,10 @@ MGMT_PORTS = {
 TUNNEL_PORTS = {53, 123, 443, 784, 853, 1194, 1701, 1723, 4500, 500, 51820}
 
 MAX_BEACON_PACKET_SAMPLES = 10
+# Timestamps/sizes kept per connectionless session for cadence statistics.
+# A beacon has hundreds of events; a busy DNS or RTP session has millions,
+# and every one used to be buffered as a float and an int.
+MAX_SESSION_SAMPLES = 50_000
 
 L2_ETHERTYPE_NAMES: dict[int, str] = {
     0x0806: "L2:ARP",
@@ -146,21 +154,14 @@ class BeaconSummary:
     errors: list[str] = field(default_factory=list)
 
 
-def _looks_like_ip(value: str) -> bool:
-    try:
-        ipaddress.ip_address(value)
-        return True
-    except (ValueError, TypeError):
-        return False
-
-
-def _flow_key(pkt) -> Optional[tuple[str, str, str, Optional[int], Optional[int]]]:
+def _flow_key(
+    pkt, ether, tcp_layer, udp_layer, icmp_layer
+) -> Optional[tuple[str, str, str, Optional[int], Optional[int]]]:
+    """Flow identity for beacon grouping; layers are resolved once by the caller."""
     src_ip, dst_ip = extract_packet_endpoints(pkt)
-    if not src_ip or not dst_ip:
-        if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-            eth = pkt[Ether]  # type: ignore[index]
-            src_ip = str(getattr(eth, "src", ""))
-            dst_ip = str(getattr(eth, "dst", ""))
+    if (not src_ip or not dst_ip) and ether is not None:
+        src_ip = str(getattr(ether, "src", ""))
+        dst_ip = str(getattr(ether, "dst", ""))
 
     if not src_ip or not dst_ip:
         return None
@@ -173,33 +174,31 @@ def _flow_key(pkt) -> Optional[tuple[str, str, str, Optional[int], Optional[int]
     # Gate only genuine IP destinations here; MAC-only L2 fallback (which never
     # reaches this because extract_packet_endpoints returned IPs) keeps its
     # broadcast/multicast handling in the ethertype branch below.
-    if _looks_like_ip(dst_ip) and not is_unicast_host_ip(dst_ip):
+    if is_valid_ip(dst_ip) and not is_unicast_host_ip(dst_ip):
         return None
 
-    if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-        layer = pkt[TCP]  # type: ignore[index]
+    if tcp_layer is not None:
         # Drop the EPHEMERAL port (keep only the stable service port). HTTP/TCP
         # C2 opens a fresh connection per check-in (new client sport each time);
         # keying on the 4-tuple split every beacon into a 1-event flow, so
         # reconnecting beacons (Ursnif, most HTTP C2) were never detected.
-        sport = int(getattr(layer, "sport", 0))
-        dport = int(getattr(layer, "dport", 0))
+        sport = int(getattr(tcp_layer, "sport", 0))
+        dport = int(getattr(tcp_layer, "dport", 0))
         if sport > dport:
             return (src_ip, dst_ip, "TCP", None, dport)
         return (src_ip, dst_ip, "TCP", sport, None)
-    if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-        layer = pkt[UDP]  # type: ignore[index]
-        sport = int(getattr(layer, "sport", 0))
-        dport = int(getattr(layer, "dport", 0))
+    if udp_layer is not None:
+        sport = int(getattr(udp_layer, "sport", 0))
+        dport = int(getattr(udp_layer, "dport", 0))
         if sport > dport:
             return (src_ip, dst_ip, "UDP", None, dport)
         return (src_ip, dst_ip, "UDP", sport, None)
-    if ICMP is not None and pkt.haslayer(ICMP):  # type: ignore[truthy-bool]
+    if icmp_layer is not None:
         return (src_ip, dst_ip, "ICMP", None, None)
 
-    if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+    if ether is not None:
         try:
-            ethertype = int(getattr(pkt[Ether], "type", 0))  # type: ignore[index]
+            ethertype = int(getattr(ether, "type", 0))
         except Exception:
             ethertype = 0
         # ARP (0x0806) is L2 address resolution, not a beaconing/C2 channel — its
@@ -228,15 +227,11 @@ def _flow_key(pkt) -> Optional[tuple[str, str, str, Optional[int], Optional[int]
 
 
 def _normalize_pair(src_ip: str, dst_ip: str) -> tuple[str, str]:
-    try:
-        src_addr = ipaddress.ip_address(src_ip)
-        dst_addr = ipaddress.ip_address(dst_ip)
-        if src_addr.is_private and dst_addr.is_global:
-            return src_ip, dst_ip
-        if dst_addr.is_private and src_addr.is_global:
-            return dst_ip, src_ip
-    except Exception:
-        pass
+    """(client, server): the private side first when the pair crosses to the internet."""
+    if is_private_ip(src_ip) and is_public_ip(dst_ip):
+        return src_ip, dst_ip
+    if is_private_ip(dst_ip) and is_public_ip(src_ip):
+        return dst_ip, src_ip
     if src_ip <= dst_ip:
         return src_ip, dst_ip
     return dst_ip, src_ip
@@ -323,7 +318,11 @@ def _burst_sleep_score(timeline: list[int]) -> float:
 
 @memoize_analysis
 def analyze_beacons(
-    path: Path, show_status: bool = True, min_events: int = 20
+    path: Path,
+    show_status: bool = True,
+    min_events: int = 20,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> BeaconSummary:
     errors: list[str] = []
     if IP is None and IPv6 is None and Ether is None:
@@ -338,10 +337,6 @@ def analyze_beacons(
             detections=[],
             errors=errors,
         )
-
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
 
     session_conn_times: dict[tuple[str, str, str, Optional[int]], list[float]] = (
         defaultdict(list)
@@ -397,67 +392,71 @@ def analyze_beacons(
     )
     conn_established: set[tuple[str, str, str, Optional[int], Optional[int]]] = set()
     total_packets = 0
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-    try:
-        for pkt_index, pkt in enumerate(reader, start=1):
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    def _sample(
+        times: dict, sizes: dict, packet_ids: dict, session_key, ts: float, pkt_len: int, pkt_index: int
+    ) -> None:
+        session_times = times[session_key]
+        if len(session_times) < MAX_SESSION_SAMPLES:
+            session_times.append(ts)
+            sizes[session_key].append(pkt_len)
+        if len(packet_ids[session_key]) < MAX_BEACON_PACKET_SAMPLES:
+            packet_ids[session_key].append(pkt_index)
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is None:
-                continue
+    for pkt_index, pkt in enumerate(
+        iter_packets(path, packets=packets, meta=meta, show_status=show_status), start=1
+    ):
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
+        if ts is None:
+            continue
+        try:
             # packet_length() reads len(pkt.original) (~50x faster than len(pkt),
             # which re-serializes the packet) - matters in this per-packet loop.
             pkt_len = packet_length(pkt)
+            # Resolve each layer once; _flow_key and the branches below share them
+            # (this loop used to walk the layer chain up to ten times per packet).
+            ether = pkt.getlayer(Ether) if Ether is not None else None
+            tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
+            udp_layer = icmp_layer = None
+            if tcp_layer is None:
+                udp_layer = pkt.getlayer(UDP) if UDP is not None else None
+                if udp_layer is None:
+                    icmp_layer = pkt.getlayer(ICMP) if ICMP is not None else None
+            key = _flow_key(pkt, ether, tcp_layer, udp_layer, icmp_layer)
+            if not key:
+                continue
+            src_ip, dst_ip, proto, sport, dport = key
 
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                tcp_layer = pkt[TCP]  # type: ignore[index]
-                flags = getattr(tcp_layer, "flags", None)
-                is_syn = False
-                is_synack = False
-                # scapy exposes TCP flags as a FlagValue (not a plain int/str),
-                # so isinstance(flags, int) is False - int(flags) coerces it
-                # (FlagValue, int, and bool all work); a str fallback covers
-                # "SA"-style flag strings.
-                flag_int = None
-                try:
-                    flag_int = int(flags)
-                except Exception:
-                    flag_int = None
-                if flag_int is not None:
-                    is_syn = (flag_int & 0x02) != 0 and (flag_int & 0x10) == 0
-                    is_synack = (flag_int & 0x02) != 0 and (flag_int & 0x10) != 0
-                elif isinstance(flags, str):
-                    is_syn = "S" in flags and "A" not in flags
-                    is_synack = "S" in flags and "A" in flags
-                key = _flow_key(pkt)
-                if not key:
-                    continue
-                src_ip, dst_ip, proto, sport, dport = key
+            if tcp_layer is not None:
+                flag_int = tcp_flags_int(getattr(tcp_layer, "flags", None))
+                is_syn = (flag_int & 0x02) != 0 and (flag_int & 0x10) == 0
+                is_synack = (flag_int & 0x12) == 0x12
                 ports = [p for p in (sport, dport) if p is not None]
                 if not ports:
                     continue
                 server_port = min(ports)
                 client_port = max(ports)
                 client_ip, server_ip = _normalize_pair(src_ip, dst_ip)
-                session_key = (client_ip, server_ip, proto, server_port)
                 conn_key = (client_ip, server_ip, proto, server_port, client_port)
 
                 if conn_key not in conn_first_ts:
                     conn_first_ts[conn_key] = ts
                     conn_first_idx[conn_key] = pkt_index
                 conn_bytes[conn_key] += pkt_len
-                seg_len = 0
-                try:
-                    seg_len = len(tcp_layer.payload)
-                except Exception:
-                    seg_len = 0
+                # Header arithmetic, not len(payload): Ethernet padding under a
+                # SYN/RST would otherwise make refused connections "data-bearing".
+                ip_layer = pkt.getlayer(IP) if IP is not None else None
+                if ip_layer is None and IPv6 is not None:
+                    ip_layer = pkt.getlayer(IPv6)
+                seg_len = tcp_segment_length(tcp_layer, ip_layer)
+                if seg_len is None:
+                    try:
+                        seg_len = len(tcp_layer.payload)
+                    except Exception:
+                        seg_len = 0
                 if seg_len:
                     conn_data_bytes[conn_key] += int(seg_len)
                 if is_synack:
@@ -465,48 +464,34 @@ def analyze_beacons(
                 if is_syn:
                     conn_syn_ts[conn_key] = ts
                     conn_syn_idx[conn_key] = pkt_index
-            elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                key = _flow_key(pkt)
-                if not key:
-                    continue
-                src_ip, dst_ip, proto, sport, dport = key
+            elif udp_layer is not None:
                 ports = [p for p in (sport, dport) if p is not None]
                 if not ports:
                     continue
-                server_port = min(ports)
                 client_ip, server_ip = _normalize_pair(src_ip, dst_ip)
-                session_key = (client_ip, server_ip, proto, server_port)
-                udp_session_times[session_key].append(ts)
-                udp_session_sizes[session_key].append(pkt_len)
-                if len(udp_session_packets[session_key]) < MAX_BEACON_PACKET_SAMPLES:
-                    udp_session_packets[session_key].append(pkt_index)
-            elif ICMP is not None and pkt.haslayer(ICMP):  # type: ignore[truthy-bool]
-                key = _flow_key(pkt)
-                if not key:
-                    continue
-                src_ip, dst_ip, _proto, _sport, _dport = key
+                session_key = (client_ip, server_ip, proto, min(ports))
+                _sample(udp_session_times, udp_session_sizes, udp_session_packets,
+                        session_key, ts, pkt_len, pkt_index)
+            elif icmp_layer is not None:
                 client_ip, server_ip = _normalize_pair(src_ip, dst_ip)
                 session_key = (client_ip, server_ip, "ICMP", None)
-                icmp_session_times[session_key].append(ts)
-                icmp_session_sizes[session_key].append(pkt_len)
-                if len(icmp_session_packets[session_key]) < MAX_BEACON_PACKET_SAMPLES:
-                    icmp_session_packets[session_key].append(pkt_index)
-            else:
-                key = _flow_key(pkt)
-                if not key:
-                    continue
-                src_ip, dst_ip, proto, _sport, _dport = key
-                if not proto.startswith("L2:"):
-                    continue
+                _sample(icmp_session_times, icmp_session_sizes, icmp_session_packets,
+                        session_key, ts, pkt_len, pkt_index)
+            elif proto.startswith("L2:"):
                 client_ip, server_ip = _normalize_pair(src_ip, dst_ip)
                 session_key = (client_ip, server_ip, proto, None)
-                l2_session_times[session_key].append(ts)
-                l2_session_sizes[session_key].append(pkt_len)
-                if len(l2_session_packets[session_key]) < MAX_BEACON_PACKET_SAMPLES:
-                    l2_session_packets[session_key].append(pkt_index)
-    finally:
-        status.finish()
-        reader.close()
+                _sample(l2_session_times, l2_session_sizes, l2_session_packets,
+                        session_key, ts, pkt_len, pkt_index)
+        except Exception as exc:  # noqa: BLE001 — one malformed packet must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
+
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} packet(s) skipped after a parse error "
+            f"(first: {first_skip_error}); beacon counts are lower bounds."
+        )
 
     candidates: list[BeaconCandidate] = []
 
@@ -544,27 +529,27 @@ def analyze_beacons(
     ] = []
     for (client, server, proto, server_port), times in session_conn_times.items():
         sizes = session_conn_sizes.get((client, server, proto, server_port), [])
-        packets = session_conn_packets.get((client, server, proto, server_port), [])
+        packet_ids = session_conn_packets.get((client, server, proto, server_port), [])
         combined_flows.append(
-            ((client, server, proto, server_port, None), times, sizes, packets)
+            ((client, server, proto, server_port, None), times, sizes, packet_ids)
         )
     for (client, server, proto, server_port), times in udp_session_times.items():
         sizes = udp_session_sizes.get((client, server, proto, server_port), [])
-        packets = udp_session_packets.get((client, server, proto, server_port), [])
+        packet_ids = udp_session_packets.get((client, server, proto, server_port), [])
         combined_flows.append(
-            ((client, server, proto, server_port, None), times, sizes, packets)
+            ((client, server, proto, server_port, None), times, sizes, packet_ids)
         )
     for (client, server, proto, server_port), times in icmp_session_times.items():
         sizes = icmp_session_sizes.get((client, server, proto, server_port), [])
-        packets = icmp_session_packets.get((client, server, proto, server_port), [])
+        packet_ids = icmp_session_packets.get((client, server, proto, server_port), [])
         combined_flows.append(
-            ((client, server, proto, server_port, None), times, sizes, packets)
+            ((client, server, proto, server_port, None), times, sizes, packet_ids)
         )
     for (client, server, proto, server_port), times in l2_session_times.items():
         sizes = l2_session_sizes.get((client, server, proto, server_port), [])
-        packets = l2_session_packets.get((client, server, proto, server_port), [])
+        packet_ids = l2_session_packets.get((client, server, proto, server_port), [])
         combined_flows.append(
-            ((client, server, proto, server_port, None), times, sizes, packets)
+            ((client, server, proto, server_port, None), times, sizes, packet_ids)
         )
     seen_keys: set[tuple[str, str, str, Optional[int], Optional[int]]] = set()
 
@@ -584,19 +569,7 @@ def analyze_beacons(
         88,
     }
 
-    def _is_public(ip_text: str) -> bool:
-        try:
-            return ipaddress.ip_address(ip_text).is_global
-        except Exception:
-            return False
-
-    def _is_private(ip_text: str) -> bool:
-        try:
-            return ipaddress.ip_address(ip_text).is_private
-        except Exception:
-            return False
-
-    for (src_ip, dst_ip, proto, sport, dport), times, sizes, packets in combined_flows:
+    for (src_ip, dst_ip, proto, sport, dport), times, sizes, packet_ids in combined_flows:
         key_id = (src_ip, dst_ip, proto, sport, dport)
         if key_id in seen_keys:
             continue
@@ -633,7 +606,7 @@ def analyze_beacons(
             max(0.0, 1.0 - min(1.0, _lc_mad / _lc_med)) if _lc_med > 0 else 0.0
         )
         high_conf_external_data = (
-            (_is_public(src_ip) or _is_public(dst_ip))
+            (is_public_ip(src_ip) or is_public_ip(dst_ip))
             and established_ratio >= 0.5
             and data_bytes_total > 0
             and (
@@ -694,8 +667,8 @@ def analyze_beacons(
 
         port_value = sport or dport
         is_l2_flow = proto.startswith("L2:")
-        has_public = _is_public(src_ip) or _is_public(dst_ip)
-        is_internal = _is_private(src_ip) and _is_private(dst_ip)
+        has_public = is_public_ip(src_ip) or is_public_ip(dst_ip)
+        is_internal = is_private_ip(src_ip) and is_private_ip(dst_ip)
         is_ot_port = port_value in OT_PORTS
         is_mgmt_port = port_value in MGMT_PORTS
 
@@ -731,8 +704,8 @@ def analyze_beacons(
                 continue
 
         packet_samples: list[int] = []
-        if packets:
-            paired = sorted(zip(times, packets), key=lambda item: item[0])
+        if packet_ids:
+            paired = sorted(zip(times, packet_ids), key=lambda item: item[0])
             packet_samples = [
                 pkt_id for _ts, pkt_id in paired[:MAX_BEACON_PACKET_SAMPLES]
             ]
@@ -952,8 +925,8 @@ def analyze_beacons(
         )
         return suspects
 
-    http_summary = analyze_http(path, show_status=False)
-    dns_summary = analyze_dns(path, show_status=False)
+    http_summary = analyze_http(path, show_status=False, packets=packets, meta=meta)
+    dns_summary = analyze_dns(path, show_status=False, packets=packets, meta=meta)
     http_post_beacons = _discover_http_post_beacons(
         list(getattr(http_summary, "post_payloads", []) or [])
     )
@@ -1056,7 +1029,7 @@ def analyze_beacons(
 
         def _candidate_severity(item: BeaconCandidate) -> str:
             port_value = item.src_port or item.dst_port
-            is_external = _is_public(item.src_ip) or _is_public(item.dst_ip)
+            is_external = is_public_ip(item.src_ip) or is_public_ip(item.dst_ip)
             is_ot = port_value in OT_PORTS
             if is_external and is_ot and item.score >= 0.75 and item.count >= 15:
                 return "critical"
@@ -1283,12 +1256,12 @@ def analyze_beacons(
         external_candidates = [
             item
             for item in candidates
-            if _is_public(item.src_ip) or _is_public(item.dst_ip)
+            if is_public_ip(item.src_ip) or is_public_ip(item.dst_ip)
         ]
         internal_candidates = [
             item
             for item in candidates
-            if _is_private(item.src_ip) and _is_private(item.dst_ip)
+            if is_private_ip(item.src_ip) and is_private_ip(item.dst_ip)
         ]
         ot_external = [
             item

@@ -24,9 +24,10 @@ except Exception:  # pragma: no cover
     IPv6 = None  # type: ignore
 
 try:
-    from scapy.layers.l2 import ARP  # type: ignore
+    from scapy.layers.l2 import ARP, Ether  # type: ignore
 except Exception:  # pragma: no cover
     ARP = None  # type: ignore
+    Ether = None  # type: ignore
 
 try:
     from scapy.layers.inet import TCP, UDP  # type: ignore
@@ -35,12 +36,41 @@ except Exception:  # pragma: no cover
 
 PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
 
+# Classic pcap magic numbers, both byte orders, microsecond and nanosecond
+# timestamp variants. Anything else is not a capture this tool can read.
+PCAP_MAGIC: dict[int, str] = {
+    0xA1B2C3D4: ">",
+    0xD4C3B2A1: "<",
+    0xA1B23C4D: ">",
+    0x4D3CB2A1: "<",
+}
+
+
+def env_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    """Read an integer tuning knob from the environment.
+
+    A malformed value falls back to the default instead of raising at import
+    time — several modules read their limits at module load, so a stray
+    ``PCAPPER_*=abc`` in a shell profile must not make ``import pcapper`` fail.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
 _DECODE_CACHE: "OrderedDict[tuple[bytes, str, bool], str]" = OrderedDict()
 _DECODE_CACHE_MAX_ITEMS = 2048
 _DECODE_CACHE_MAX_BYTES = 4096
-_MAX_COUNTER_KEYS = int(os.getenv("PCAPPER_MAX_COUNTER_KEYS", "50000"))
-_MAX_SET_ITEMS = int(os.getenv("PCAPPER_MAX_SET_ITEMS", "50000"))
-_MAX_SET_VALUES = int(os.getenv("PCAPPER_MAX_SET_VALUES", "2000"))
+_MAX_COUNTER_KEYS = env_int("PCAPPER_MAX_COUNTER_KEYS", 50000, minimum=1)
+_MAX_SET_ITEMS = env_int("PCAPPER_MAX_SET_ITEMS", 50000, minimum=1)
+_MAX_SET_VALUES = env_int("PCAPPER_MAX_SET_VALUES", 2000, minimum=1)
 
 
 def decode_payload(
@@ -135,6 +165,43 @@ def restrict_dir_permissions(path: Path) -> None:
         restrict_permissions(path)
 
 
+def open_private(
+    path: Path,
+    mode: str = "w",
+    *,
+    encoding: str | None = "utf-8",
+    errors: str | None = None,
+    newline: str | None = None,
+):
+    """Open an output file that is owner-only from the moment it exists.
+
+    ``Path.write_text()`` followed by ``chmod`` leaves a window in which the
+    file sits at the umask default — world-readable on most hosts — while it
+    is being filled with recovered credentials or a carved sample. Creating
+    it through ``os.open`` with mode ``0o600`` closes that window; the chmod
+    afterwards still covers a pre-existing file, whose mode ``O_CREAT`` does
+    not touch. Modes: ``w``, ``wb``, ``a``, ``ab``. Best effort on Windows,
+    where POSIX mode bits are mostly ignored.
+    """
+    if mode not in {"w", "wb", "a", "ab"}:
+        raise ValueError(f"open_private: unsupported mode {mode!r}")
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= os.O_APPEND if mode.startswith("a") else os.O_TRUNC
+    if "b" in mode:
+        flags |= getattr(os, "O_BINARY", 0)
+        encoding = None
+        errors = None
+        newline = None
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        handle = os.fdopen(fd, mode, encoding=encoding, errors=errors, newline=newline)
+    except Exception:
+        os.close(fd)
+        raise
+    restrict_permissions(path)
+    return handle
+
+
 def safe_write_text(
     path: Path,
     text: str,
@@ -144,12 +211,18 @@ def safe_write_text(
     context: str = "write_text",
 ) -> None:
     try:
-        path.write_text(text, encoding=encoding)
-        restrict_permissions(path)
+        with open_private(path, "w", encoding=encoding) as handle:
+            handle.write(text)
     except Exception as exc:
         record_error(errors_list, context, exc)
         if errors_list is None:
             raise IOError(f"{context}: {type(exc).__name__}: {exc}") from exc
+
+
+def safe_write_bytes(path: Path, data: bytes) -> None:
+    """Write a recovered artifact owner-only; errors propagate to the caller."""
+    with open_private(path, "wb") as handle:
+        handle.write(data)
 
 
 def counter_inc(
@@ -192,14 +265,26 @@ def set_add_cap(
 
 
 def detect_file_type(path: Path) -> str:
+    """Classify a capture by magic number: ``pcapng``, ``pcap`` or ``unknown``.
+
+    ``unknown`` used to be reported as ``pcap``; scapy then raised on open and
+    the analyzers fell back to an empty reader, so a non-capture target
+    produced a report of zero packets with no error. Callers that need a
+    reader treat ``unknown`` as a hard error instead.
+    """
     try:
         with path.open("rb") as handle:
             header = handle.read(4)
-        if header == PCAPNG_MAGIC:
-            return "pcapng"
     except Exception:
-        pass
-    return "pcap"
+        return "unknown"
+    if header == PCAPNG_MAGIC:
+        return "pcapng"
+    if len(header) == 4:
+        little = int.from_bytes(header, "little")
+        big = int.from_bytes(header, "big")
+        if little in PCAP_MAGIC or big in PCAP_MAGIC:
+            return "pcap"
+    return "unknown"
 
 
 def detect_file_type_bytes(data: bytes) -> str:
@@ -300,36 +385,32 @@ def safe_float(value: object | None) -> Optional[float]:
 
 
 @lru_cache(maxsize=100000)
-def is_valid_ip(value: str) -> bool:
+def ip_object(value: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse once, share across every predicate below (one cache, not four)."""
     try:
-        ipaddress.ip_address(value)
-        return True
+        return ipaddress.ip_address(value)  # type: ignore[arg-type]
     except (ValueError, TypeError):
-        return False
+        return None
 
 
-@lru_cache(maxsize=100000)
+def is_valid_ip(value: str) -> bool:
+    return ip_object(value) is not None
+
+
 def is_public_ip(value: str) -> bool:
     # "Public" means a routable internet UNICAST peer. Python reports
     # global-scope IPv6 multicast (e.g. ff0e::/16, and even link-local ff02::
     # solicited-node groups) as is_global=True, so multicast must be excluded or
     # benign IPv6 Neighbor Discovery / mDNS is mislabeled as public exposure.
-    try:
-        obj = ipaddress.ip_address(value)
-        return bool(obj.is_global) and not obj.is_multicast
-    except (ValueError, TypeError):
-        return False
+    obj = ip_object(value)
+    return obj is not None and bool(obj.is_global) and not obj.is_multicast
 
 
-@lru_cache(maxsize=100000)
 def is_private_ip(value: str) -> bool:
-    try:
-        return bool(ipaddress.ip_address(value).is_private)
-    except (ValueError, TypeError):
-        return False
+    obj = ip_object(value)
+    return obj is not None and bool(obj.is_private)
 
 
-@lru_cache(maxsize=100000)
 def is_unicast_host_ip(value: str) -> bool:
     """True only for a real unicast host address.
 
@@ -340,9 +421,8 @@ def is_unicast_host_ip(value: str) -> bool:
     peers. Detections that count "targets"/"peers"/"beacon destinations" must
     exclude them or benign broadcast chatter reads as scanning/beaconing.
     """
-    try:
-        obj = ipaddress.ip_address(value)
-    except (ValueError, TypeError):
+    obj = ip_object(value)
+    if obj is None:
         return False
     if obj.is_multicast or obj.is_unspecified or obj.is_reserved:
         return False
@@ -353,8 +433,8 @@ def is_unicast_host_ip(value: str) -> bool:
     return True
 
 
-def shannon_entropy(value: str) -> float:
-    """Base-2 Shannon entropy of a string (bits per symbol)."""
+def shannon_entropy(value: str | bytes) -> float:
+    """Base-2 Shannon entropy of a string or byte buffer (bits per symbol)."""
     if not value:
         return 0.0
     freq = Counter(value)
@@ -483,12 +563,21 @@ def memoize_analysis(func):
     the forced packet view registered for the path), so filtered and
     unfiltered analyses never alias. Calls with non-scalar extra arguments
     bypass the cache entirely. Set PCAPPER_ANALYSIS_MEMO=0 to disable.
+
+    The stored object itself is handed out on every hit. Results are treated
+    as immutable once returned: the builders that are post-processed in place
+    are not memoized, and tests/test_review_guards.py pins in-place mutation
+    of a memoized result at zero. Deep-copying on store and hit — the old
+    behaviour, and the dominant cost of a hit on the large summaries — can be
+    restored with PCAPPER_ANALYSIS_MEMO_COPY=1; the 920-run snapshot suite
+    was byte-identical under both settings when the default changed.
     """
 
     @functools.wraps(func)
     def wrapper(path, *args, **kwargs):
         if os.environ.get("PCAPPER_ANALYSIS_MEMO", "1") == "0":
             return func(path, *args, **kwargs)
+        copy_results = os.environ.get("PCAPPER_ANALYSIS_MEMO_COPY", "0") == "1"
         try:
             st = Path(path).stat()
             file_key = (str(path), st.st_size, st.st_mtime_ns)
@@ -531,6 +620,8 @@ def memoize_analysis(func):
         cached = _ANALYSIS_MEMO.get(key)
         if cached is not None:
             _ANALYSIS_MEMO.move_to_end(key)
+            if not copy_results:
+                return cached
             try:
                 return copy.deepcopy(cached)
             except Exception:
@@ -538,10 +629,13 @@ def memoize_analysis(func):
                 return func(path, *args, **kwargs)
 
         result = func(path, *args, **kwargs)
-        try:
-            snapshot = copy.deepcopy(result)
-        except Exception:
-            return result
+        if not copy_results:
+            snapshot = result
+        else:
+            try:
+                snapshot = copy.deepcopy(result)
+            except Exception:
+                return result
         _ANALYSIS_MEMO[key] = snapshot
         while len(_ANALYSIS_MEMO) > _ANALYSIS_MEMO_MAX:
             _ANALYSIS_MEMO.popitem(last=False)
@@ -626,10 +720,12 @@ def parse_time_arg(value: Optional[str]) -> Optional[float]:
 
 
 def packet_length(pkt: object) -> int:
-    """Length of the captured packet bytes without re-serializing.
+    """Length of the *captured* packet bytes without re-serializing.
 
     len(pkt) on a scapy Packet rebuilds the packet; for packets read from a
-    capture, pkt.original holds the raw bytes and is authoritative.
+    capture, pkt.original holds the raw bytes and is authoritative. This is
+    the caplen: on a snaplen-truncated capture it is shorter than what was on
+    the wire — see :func:`packet_wirelen`.
     """
     original = getattr(pkt, "original", None)
     if isinstance(original, (bytes, bytearray)):
@@ -638,6 +734,20 @@ def packet_length(pkt: object) -> int:
         return int(len(pkt))  # type: ignore[arg-type]
     except Exception:
         return 0
+
+
+def packet_wirelen(pkt: object) -> int:
+    """Length of the packet as it was on the wire.
+
+    scapy's pcap readers record the header's ``orig_len`` on ``pkt.wirelen``;
+    when it is missing (a packet built in memory) the captured length is the
+    best available answer. Byte totals reported as "traffic volume" should use
+    this, and ``wirelen > caplen`` is the signature of a truncated capture.
+    """
+    wirelen = getattr(pkt, "wirelen", None)
+    if isinstance(wirelen, int) and wirelen > 0:
+        return wirelen
+    return packet_length(pkt)
 
 
 def extract_ascii_strings(
@@ -725,21 +835,115 @@ def beacon_score(
     return {"avg": avg, "stddev": stddev}
 
 
+_TCP_FLAG_BITS: tuple[tuple[str, int], ...] = (
+    ("F", 0x01), ("S", 0x02), ("R", 0x04), ("P", 0x08),
+    ("A", 0x10), ("U", 0x20), ("E", 0x40), ("C", 0x80),
+)
+
+
+def tcp_segment_length(tcp_layer: object, ip_layer: object) -> Optional[int]:
+    """Application data bytes of a TCP segment, from the IP/TCP header lengths.
+
+    ``len(tcp_layer.payload)`` is wrong for small frames: scapy hangs the
+    Ethernet padding (frames are padded to the 60-byte minimum) under TCP, so
+    a data-less SYN/RST/probe reports up to 6 bytes of "payload". Header
+    arithmetic is immune to padding. Returns None when the lengths are not
+    available (no IP layer), so callers can fall back explicitly.
+    """
+    if ip_layer is None:
+        return None
+    try:
+        tcp_hlen = int(getattr(tcp_layer, "dataofs", 0) or 0) * 4 or 20
+        ihl = getattr(ip_layer, "ihl", None)
+        if ihl:
+            total = int(getattr(ip_layer, "len", 0) or 0)
+            if total <= 0:
+                return None
+            return max(0, total - int(ihl) * 4 - tcp_hlen)
+        plen = getattr(ip_layer, "plen", None)
+        if plen is not None:
+            return max(0, int(plen) - tcp_hlen)
+    except Exception:
+        return None
+    return None
+
+
 def tcp_flags_int(flags: object) -> int:
     """Normalize a scapy TCP flags value (FlagValue/str/int) to an int bitmask."""
     try:
         if isinstance(flags, str):
             value = 0
-            for ch, bit in (
-                ("F", 1), ("S", 2), ("R", 4), ("P", 8),
-                ("A", 16), ("U", 32), ("E", 64), ("C", 128),
-            ):
+            for ch, bit in _TCP_FLAG_BITS:
                 if ch in flags:
                     value |= bit
             return value
         return int(flags)  # type: ignore[arg-type]
     except Exception:
         return 0
+
+
+def tcp_flags_text(flags: int) -> str:
+    """Bitmask -> the usual letter form (``SA``, ``PA``, ``R``); ``-`` if none."""
+    out = "".join(label for label, bit in _TCP_FLAG_BITS if flags & bit)
+    return out or "-"
+
+
+def extract_ethertype(pkt: object) -> Optional[int]:
+    """The Ethernet type field, from the Ether layer or the raw frame bytes.
+
+    Canonical implementation (was duplicated in analyzer.py and
+    industrial_helpers.py). Falls back to bytes 12–13 of the frame so a
+    capture whose link type scapy could not dissect still classifies.
+    """
+    getlayer = getattr(pkt, "getlayer", None)
+    if Ether is not None and callable(getlayer):
+        try:
+            layer = getlayer(Ether)
+            if layer is not None:
+                return int(layer.type)
+        except Exception:
+            pass
+    try:
+        raw = getattr(pkt, "original", None) or bytes(pkt)  # type: ignore[arg-type]
+        if len(raw) >= 14:
+            return int.from_bytes(raw[12:14], "big")
+    except Exception:
+        return None
+    return None
+
+
+def dns_questions(dns_layer: object) -> list[tuple[str, int]]:
+    """``(qname, qtype)`` for every question of a scapy DNS layer.
+
+    ``qd`` is a list of ``DNSQR`` in scapy >= 2.6 and a single record (or
+    None) before. The 2.6 shim still proxies ``.qname`` to the first entry,
+    but warns on every packet and hides every question after the first.
+    Names are decoded and returned without the trailing dot.
+    """
+    qd = getattr(dns_layer, "qd", None)
+    if qd is None:
+        return []
+    try:
+        items = list(qd)
+    except TypeError:
+        items = [qd]
+    out: list[tuple[str, int]] = []
+    for item in items:
+        raw = getattr(item, "qname", b"")
+        name = (
+            raw.decode("utf-8", errors="ignore")
+            if isinstance(raw, (bytes, bytearray))
+            else str(raw or "")
+        )
+        name = name.rstrip(".")
+        if not name:
+            continue
+        try:
+            qtype = int(getattr(item, "qtype", 0) or 0)
+        except (TypeError, ValueError):
+            qtype = 0
+        out.append((name, qtype))
+    return out
 
 
 def get_packet_ports(pkt: object) -> tuple[Optional[int], Optional[int], str]:

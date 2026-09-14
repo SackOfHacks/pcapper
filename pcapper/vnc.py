@@ -6,8 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_ascii_strings as _extract_ascii_strings
+from .utils import (
+    extract_packet_endpoints,
+    memoize_analysis,
+    packet_length,
+    safe_float,
+    tcp_segment_length,
+)
 from .utils import beacon_score as _beaconing_score
 
 try:
@@ -24,6 +31,9 @@ except Exception:  # pragma: no cover
 
 
 VNC_PORTS = {5900, 5901, 5902, 5903, 5904, 5905, 5906, 5907, 5908, 5909, 5800}
+# A VNC port on the *source* side is the service only when the destination is
+# an ephemeral port; a flow from ephemeral 5900 to 443 is not VNC.
+_EPHEMERAL_MIN = 1024
 VNC_BANNER_RE = re.compile(r"(RFB\s+\d+\.\d+)")
 # RFB security types are BINARY bytes negotiated in the handshake (NOT text), so
 # they must be parsed from the handshake — matching the words "None"/"Tight" in
@@ -242,12 +252,32 @@ def _scan_plaintext(
             artifacts.append(item)
 
 
+def _tcp_payload_bytes(pkt: object, tcp: object) -> bytes:
+    """TCP application data without scapy's trailing Ethernet ``Padding``.
+
+    Short frames are padded to 60 bytes and scapy hangs the pad under TCP, so
+    ``bytes(tcp.payload)`` of a one-keystroke segment is the keystroke plus
+    NULs. The IP total length is immune to padding.
+    """
+    try:
+        raw = bytes(getattr(tcp, "payload", b"") or b"")
+    except Exception:
+        return b""
+    if not raw:
+        return b""
+    ip_layer = pkt.getlayer(IP) if IP is not None else None  # type: ignore[attr-defined]
+    if ip_layer is None and IPv6 is not None:
+        ip_layer = pkt.getlayer(IPv6)  # type: ignore[attr-defined]
+    length = tcp_segment_length(tcp, ip_layer)
+    return raw if length is None else raw[:length]
+
+
 def _direction(
     src_ip: str, dst_ip: str, sport: int, dport: int
 ) -> tuple[str, str, int, int]:
     if dport in VNC_PORTS:
         return src_ip, dst_ip, sport, dport
-    if sport in VNC_PORTS:
+    if sport in VNC_PORTS and dport >= _EPHEMERAL_MIN:
         return dst_ip, src_ip, dport, sport
     if dport < 1024 and sport >= 1024:
         return src_ip, dst_ip, sport, dport
@@ -256,11 +286,12 @@ def _direction(
     return src_ip, dst_ip, sport, dport
 
 
+@memoize_analysis
 def analyze_vnc(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> VncSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
@@ -301,9 +332,6 @@ def analyze_vnc(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     total_packets = 0
     vnc_packets = 0
@@ -337,15 +365,7 @@ def analyze_vnc(
     pair_first_seen: dict[tuple[str, str], list[float]] = defaultdict(list)
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -361,22 +381,12 @@ def analyze_vnc(
             sport = int(getattr(tcp, "sport", 0) or 0)
             dport = int(getattr(tcp, "dport", 0) or 0)
 
-            payload = b""
-            if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                try:
-                    payload = bytes(pkt[Raw])  # type: ignore[index]
-                except Exception:
-                    payload = b""
-            else:
-                try:
-                    payload = bytes(tcp.payload)
-                except Exception:
-                    payload = b""
+            payload = _tcp_payload_bytes(pkt, tcp)
 
             payload_prefix = payload[:12] if payload else b""
             is_vnc = (
-                sport in VNC_PORTS
-                or dport in VNC_PORTS
+                dport in VNC_PORTS
+                or (sport in VNC_PORTS and dport >= _EPHEMERAL_MIN)
                 or payload_prefix.startswith(b"RFB ")
             )
             if not is_vnc:
@@ -503,9 +513,6 @@ def analyze_vnc(
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:

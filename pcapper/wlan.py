@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .pcap_cache import get_reader
-from .utils import safe_float
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import memoize_analysis, safe_float
 
 try:
     from scapy.layers.dot11 import (  # type: ignore
@@ -354,11 +354,12 @@ def _infer_bssid(dot11: object, ftype: int, addr1: str, addr2: str, addr3: str) 
     return addr3 or addr1 or addr2
 
 
+@memoize_analysis
 def analyze_wlan(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> WlanSummary:
     if Dot11 is None:
         return WlanSummary(
@@ -403,9 +404,6 @@ def analyze_wlan(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     total_packets = 0
     wlan_packets = 0
@@ -489,26 +487,20 @@ def analyze_wlan(
     detections: list[dict[str, object]] = []
 
     try:
-        for pkt in reader:
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
-
             ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
 
             if not pkt.haslayer(Dot11):  # type: ignore[truthy-bool]
                 continue
 
             wlan_packets += 1
+            # The report window spans this protocol's traffic, not every packet.
+            if ts is not None:
+                if first_seen is None or ts < first_seen:
+                    first_seen = ts
+                if last_seen is None or ts > last_seen:
+                    last_seen = ts
             dot11 = pkt[Dot11]  # type: ignore[index]
             try:
                 ftype_raw = getattr(dot11, "type", -1)
@@ -963,9 +955,6 @@ def analyze_wlan(
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
 
     for src, count in deauth_by_src.items():
         if count >= 20:

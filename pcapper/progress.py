@@ -60,21 +60,24 @@ class StatusBar:
         if percent == self._last_percent:
             return
         self._last_percent = percent
-        sys.stdout.write(f"\r{self.label} {percent:3d}%")
-        sys.stdout.flush()
+        # Progress is a diagnostic, not part of the report: it goes to stderr
+        # so `pcapper ... > report.txt` on a TTY does not interleave "\r..."
+        # progress with the rendered output.
+        sys.stderr.write(f"\r{self.label} {percent:3d}%")
+        sys.stderr.flush()
 
     def finish(self) -> None:
         if not self.enabled:
             return
         if self._last_percent < 100:
             self.update(100)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        sys.stderr.write("\n")
+        sys.stderr.flush()
 
 
 def should_show_statusbar() -> bool:
     try:
-        return sys.stdout.isatty()
+        return sys.stderr.isatty()
     except Exception:
         return False
 
@@ -112,13 +115,13 @@ class BusyStatusBar:
         spinner = itertools.cycle("|/-\\")
         while not self._stop_event.is_set():
             elapsed = time.monotonic() - self._start_time
-            sys.stdout.write(f"\r{self.label} {next(spinner)} {elapsed:5.1f}s")
-            sys.stdout.flush()
+            sys.stderr.write(f"\r{self.label} {next(spinner)} {elapsed:5.1f}s")
+            sys.stderr.flush()
             self._stop_event.wait(self.interval)
         elapsed = time.monotonic() - self._start_time
         clear_width = len(f"{self.label} done {elapsed:5.1f}s")
-        sys.stdout.write("\r" + (" " * clear_width) + "\r")
-        sys.stdout.flush()
+        sys.stderr.write("\r" + (" " * clear_width) + "\r")
+        sys.stderr.flush()
 
     def finish(self) -> None:
         if not self.enabled:

@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from .utils import shannon_entropy as _shannon_entropy
-from .utils import is_private_ip as _is_private_ip
-from .utils import is_public_ip as _is_public_ip
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -11,10 +8,19 @@ from typing import Optional
 
 from .files import analyze_files
 from .http import analyze_http
-from .pcap_cache import get_reader
+from .pcap_cache import iter_packets
 from .progress import run_with_busy_status
 from .services import analyze_services
-from .utils import extract_packet_endpoints, memoize_analysis, packet_length, safe_float
+from .utils import (
+    dns_questions,
+    extract_packet_endpoints,
+    is_private_ip,
+    is_public_ip,
+    memoize_analysis,
+    packet_length,
+    safe_float,
+    shannon_entropy,
+)
 
 try:
     from scapy.layers.dns import DNS  # type: ignore
@@ -157,36 +163,25 @@ def _is_likely_udp_initiator_packet(sport: int, dport: int) -> bool:
     return dport != sport
 
 
-def _build_udp_enrichment(
-    *,
-    udp_packets: int,
-    conversations: list[UdpConversation],
-    detections: list[dict[str, object]],
-    src_to_ports: dict[str, set[int]],
-    src_to_dsts: dict[str, set[str]],
-    src_port_dsts: dict[tuple[str, int], set[str]],
-    amp_flows: dict[tuple[str, str, int], dict[str, int]],
-    outbound_flow_bytes: Counter[tuple[str, str]],
-    dns_query_counts: Counter[str],
-    dns_unique_queries: dict[str, set[str]],
-    dns_long_queries: Counter[str],
-    avg_dns_len: float,
-    avg_dns_entropy: float,
-) -> dict[str, object]:
-    _ = (
-        udp_packets,
-        conversations,
-        src_to_ports,
-        src_to_dsts,
-        src_port_dsts,
-        amp_flows,
-        outbound_flow_bytes,
-        dns_query_counts,
-        dns_unique_queries,
-        dns_long_queries,
-        avg_dns_len,
-        avg_dns_entropy,
-    )
+def _is_likely_udp_responder_packet(sport: int, dport: int) -> bool:
+    """A reply from a service port to an ephemeral port.
+
+    Only the unambiguous cases flip the roles; symmetric (123<->123) or
+    same-class (RTP 40000<->40002) traffic keeps the packet's own direction.
+    """
+    if sport in AMPLIFICATION_PORTS and dport not in AMPLIFICATION_PORTS:
+        return True
+    if dport in AMPLIFICATION_PORTS and sport not in AMPLIFICATION_PORTS:
+        return False
+    if sport <= 1024 < dport:
+        return True
+    if dport <= 1024 < sport:
+        return False
+    return sport <= 49151 < dport
+
+
+def _build_udp_enrichment(detections: list[dict[str, object]]) -> dict[str, object]:
+    """Verdict, confidence and check buckets derived from the thresholded detections."""
     checks: dict[str, list[str]] = defaultdict(list)
 
     # Map the analyzer's already-thresholded detections to triage categories.
@@ -303,10 +298,6 @@ def analyze_udp(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
-
     total_packets = 0
     total_bytes = 0
     udp_packets = 0
@@ -334,12 +325,8 @@ def analyze_udp(
     zero_payload_packets = 0
     packet_size_samples: list[int] = []
     payload_size_samples: list[int] = []
-    src_to_ports: dict[str, set[int]] = defaultdict(set)
-    src_to_dsts: dict[str, set[str]] = defaultdict(set)
-    dst_to_ports: dict[str, set[int]] = defaultdict(set)
-    dst_to_srcs: dict[str, set[str]] = defaultdict(set)
-    src_dst_ports: dict[tuple[str, str], set[int]] = defaultdict(set)
-    src_port_dsts: dict[tuple[str, int], set[str]] = defaultdict(set)
+    # Recon sets are built from initiator-direction packets only, so a busy
+    # DNS server's replies never read as a "port sweep" from the server.
     req_src_to_ports: dict[str, set[int]] = defaultdict(set)
     req_src_to_dsts: dict[str, set[str]] = defaultdict(set)
     req_src_dst_ports: dict[tuple[str, str], set[int]] = defaultdict(set)
@@ -347,9 +334,10 @@ def analyze_udp(
     amp_flows: dict[tuple[str, str, int], dict[str, int]] = defaultdict(
         lambda: {"client": 0, "server": 0}
     )
-    dns_query_lengths: list[int] = []
+    dns_queries = 0
+    dns_length_total = 0
+    dns_entropy_total = 0.0
     dns_long_queries = Counter()
-    dns_entropy_scores: list[float] = []
     dns_unique_queries: dict[str, set[str]] = defaultdict(set)
     dns_query_counts: Counter[str] = Counter()
     outbound_flow_bytes: Counter[tuple[str, str]] = Counter()
@@ -364,41 +352,39 @@ def analyze_udp(
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
-            total_packets += 1
-            pkt_len = packet_length(pkt)
-            total_bytes += pkt_len
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        pkt_len = packet_length(pkt)
+        total_bytes += pkt_len
+        udp_layer = pkt.getlayer(UDP) if UDP is not None else None
+        if udp_layer is None:
+            continue
+        try:
             ts = safe_float(getattr(pkt, "time", None))
-
             src_ip, dst_ip = extract_packet_endpoints(pkt)
 
-            if src_ip and dst_ip and ts is not None:
+            udp_packets += 1
+            udp_bytes += pkt_len
+            # The report window spans UDP traffic, not every packet in scope.
+            if ts is not None:
                 if first_seen is None or ts < first_seen:
                     first_seen = ts
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
-
-            if UDP is None or not pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                continue
-
-            udp_packets += 1
-            udp_bytes += pkt_len
-            udp_layer = pkt[UDP]  # type: ignore[index]
             sport = int(getattr(udp_layer, "sport", 0))
             dport = int(getattr(udp_layer, "dport", 0))
 
-            client_key = src_ip or "-"
-            server_key = dst_ip or "-"
+            # Roles: a reply from a service port to an ephemeral port belongs to
+            # the flow's client/server, not to the packet's src/dst — otherwise
+            # every DNS server is also a top "client" and every client's
+            # ephemeral port is a top "port".
+            if _is_likely_udp_responder_packet(sport, dport):
+                client_key, server_key, server_port = dst_ip or "-", src_ip or "-", sport
+            else:
+                client_key, server_key, server_port = src_ip or "-", dst_ip or "-", dport
             client_counts[client_key] += 1
             server_counts[server_key] += 1
             client_bytes[client_key] += pkt_len
@@ -407,16 +393,10 @@ def analyze_udp(
             endpoint_packets[server_key] += 1
             endpoint_bytes[client_key] += pkt_len
             endpoint_bytes[server_key] += pkt_len
-            port_counts[dport] += 1
-            if dst_ip:
-                port_destinations[dport][dst_ip] += 1
+            port_counts[server_port] += 1
+            if server_key != "-":
+                port_destinations[server_port][server_key] += 1
 
-            src_to_ports[client_key].add(dport)
-            src_to_dsts[client_key].add(server_key)
-            dst_to_ports[server_key].add(dport)
-            dst_to_srcs[server_key].add(client_key)
-            src_dst_ports[(client_key, server_key)].add(dport)
-            src_port_dsts[(client_key, dport)].add(server_key)
             if _is_likely_udp_initiator_packet(sport, dport):
                 req_src_to_ports[client_key].add(dport)
                 req_src_to_dsts[client_key].add(server_key)
@@ -454,7 +434,7 @@ def analyze_udp(
             if payload_len == 0:
                 zero_payload_packets += 1
 
-            if src_ip and dst_ip and _is_private_ip(src_ip) and _is_public_ip(dst_ip):
+            if src_ip and dst_ip and is_private_ip(src_ip) and is_public_ip(dst_ip):
                 outbound_flow_bytes[(src_ip, dst_ip)] += pkt_len
 
             tracker = beacon_trackers[convo_key]
@@ -484,29 +464,28 @@ def analyze_udp(
                     server_port = sport
                     amp_flows[(client, server, server_port)]["server"] += payload_len
 
-            if DNS is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
-                dns_layer = pkt[DNS]  # type: ignore[index]
-                if getattr(dns_layer, "qr", 0) == 0:
-                    qname = None
-                    if getattr(dns_layer, "qd", None):
-                        qname = getattr(dns_layer.qd, "qname", None)
-                    if isinstance(qname, bytes):
-                        qname = qname.decode("utf-8", errors="ignore")
-                    if qname:
-                        qname = qname.strip(".")
-                        dns_query_counts[src_ip or "-"] += 1
-                        dns_unique_queries[src_ip or "-"].add(qname)
-                        dns_query_lengths.append(len(qname))
-                        if len(qname) >= 50:
-                            dns_long_queries[src_ip or "-"] += 1
-                        entropy = _shannon_entropy(qname)
-                        dns_entropy_scores.append(entropy)
+            dns_layer = udp_layer.getlayer(DNS) if DNS is not None else None
+            if dns_layer is not None and getattr(dns_layer, "qr", 0) == 0:
+                questions = dns_questions(dns_layer)
+                qname = questions[0][0] if questions else None
+                if qname:
+                    dns_query_counts[src_ip or "-"] += 1
+                    dns_unique_queries[src_ip or "-"].add(qname)
+                    dns_queries += 1
+                    dns_length_total += len(qname)
+                    dns_entropy_total += shannon_entropy(qname)
+                    if len(qname) >= 50:
+                        dns_long_queries[src_ip or "-"] += 1
+        except Exception as exc:  # noqa: BLE001 — one malformed datagram must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
 
-    except Exception as exc:
-        errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} UDP packet(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -536,7 +515,9 @@ def analyze_udp(
         "HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta
     )
     file_summary = _busy("Files", analyze_files, path, show_status=False)
-    services_summary = _busy("Services", analyze_services, path, show_status=False)
+    services_summary = _busy(
+        "Services", analyze_services, path, show_status=False, packets=packets, meta=meta
+    )
 
     file_artifacts = Counter()
     for art in getattr(file_summary, "artifacts", []) or []:
@@ -633,11 +614,9 @@ def analyze_udp(
             }
         )
 
-    avg_len = 0.0
-    avg_entropy = 0.0
-    if dns_query_counts:
-        avg_len = sum(dns_query_lengths) / max(len(dns_query_lengths), 1)
-        avg_entropy = sum(dns_entropy_scores) / max(len(dns_entropy_scores), 1)
+    if dns_queries:
+        avg_len = dns_length_total / dns_queries
+        avg_entropy = dns_entropy_total / dns_queries
         suspicious_clients = []
         for src_ip, total in dns_query_counts.items():
             unique = len(dns_unique_queries.get(src_ip, set()))
@@ -720,21 +699,7 @@ def analyze_udp(
     conversations_sorted = sorted(
         conversation_rows, key=lambda c: c.packets, reverse=True
     )
-    context = _build_udp_enrichment(
-        udp_packets=udp_packets,
-        conversations=conversations_sorted,
-        detections=detections,
-        src_to_ports=req_src_to_ports,
-        src_to_dsts=req_src_to_dsts,
-        src_port_dsts=req_src_port_dsts,
-        amp_flows=amp_flows,
-        outbound_flow_bytes=outbound_flow_bytes,
-        dns_query_counts=dns_query_counts,
-        dns_unique_queries=dns_unique_queries,
-        dns_long_queries=dns_long_queries,
-        avg_dns_len=avg_len,
-        avg_dns_entropy=avg_entropy,
-    )
+    context = _build_udp_enrichment(detections)
 
     return UdpSummary(
         path=path,

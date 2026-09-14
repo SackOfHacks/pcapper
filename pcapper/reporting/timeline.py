@@ -440,7 +440,7 @@ def render_timeline_summary(
                 tokens[idx] = token.replace(stripped, ok(stripped))
         return " ".join(tokens)
 
-    def _extract_ips(text: str) -> list[str]:
+    def _ips_in_text(text: str) -> list[str]:
         candidates: list[str] = []
         for token in re.split(r"[\s,;()\[\]{}<>]", text):
             if not token:
@@ -976,7 +976,7 @@ def render_timeline_summary(
         details_text = _highlight_ips(_redact_in_text(event.details), summary.target_ip)
         actor_ip = None
         if event.ts is not None:
-            ips = _extract_ips(event.details)
+            ips = _ips_in_text(event.details)
             if ips:
                 if summary.target_ip in ips and len(ips) > 1:
                     actor_ip = next((ip for ip in ips if ip != summary.target_ip), None)

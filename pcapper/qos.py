@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .pcap_cache import get_reader
-from .utils import safe_float
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -120,7 +120,8 @@ def _parse_l3(pkt) -> tuple[Optional[str], Optional[str], Optional[int]]:
     return None, None, None
 
 
-def _payload_text(pkt) -> str:
+def _packet_payload_text(pkt) -> str:
+    """UTF-8 text of the first 8 KB of a packet's L4 payload (Raw, TCP or UDP)."""
     payload = b""
     if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
         try:
@@ -140,11 +141,12 @@ def _payload_text(pkt) -> str:
     return payload[:8192].decode("utf-8", errors="ignore")
 
 
+@memoize_analysis
 def analyze_qos(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
     filter_ip: str | None = None,
 ) -> QosSummary:
     if IP is None and IPv6 is None:
@@ -181,9 +183,6 @@ def analyze_qos(
             duration_seconds=None,
         )
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, packets=packets, meta=meta, show_status=show_status
-    )
 
     total_packets = 0
     total_ip_packets = 0
@@ -231,15 +230,8 @@ def analyze_qos(
     detections: list[dict[str, object]] = []
 
     try:
-        for pkt_num, pkt in enumerate(reader, start=1):
+        for pkt_num, pkt in enumerate(iter_packets(path, packets=packets, meta=meta, show_status=show_status), start=1):
             total_packets += 1
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
-
             ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:
                 if first_seen is None or ts < first_seen:
@@ -381,7 +373,7 @@ def analyze_qos(
             if isinstance(tid_set, set) and wmm_tid is not None:
                 tid_set.add(wmm_tid)
 
-            text = _payload_text(pkt)
+            text = _packet_payload_text(pkt)
             if text and SECRET_PATTERN.search(text):
                 secret_value = "-"
                 kv_match = SECRET_KV_PATTERN.search(text)
@@ -407,9 +399,6 @@ def analyze_qos(
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
 
     if qos_packets > 0:
         checks["qos_marking_presence"].append(

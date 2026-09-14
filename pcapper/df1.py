@@ -3,7 +3,14 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .industrial_helpers import append_public_exposure_anomaly, IndustrialAnalysis, IndustrialAnomaly, analyze_port_protocol
+from .industrial_helpers import (
+    IndustrialAnalysis,
+    IndustrialAnomaly,
+    analyze_port_protocol,
+    append_public_exposure_anomaly,
+    cleared_analysis,
+)
+from .utils import memoize_analysis
 
 DF1_DLE_STX = b"\x10\x02"
 DF1_DLE_ETX = b"\x10\x03"
@@ -172,6 +179,7 @@ def _detect_anomalies(
     return anomalies
 
 
+@memoize_analysis
 def analyze_df1(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,
@@ -183,24 +191,7 @@ def analyze_df1(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         show_status=show_status,
     )
     if _is_low_confidence_detection(analysis):
-        analysis.protocol_packets = 0
-        analysis.protocol_bytes = 0
-        analysis.requests = 0
-        analysis.responses = 0
-        analysis.src_ips.clear()
-        analysis.dst_ips.clear()
-        analysis.client_ips.clear()
-        analysis.server_ips.clear()
-        analysis.sessions.clear()
-        analysis.ports.clear()
-        analysis.commands.clear()
-        analysis.service_endpoints.clear()
-        analysis.packet_size_buckets = []
-        analysis.payload_size_buckets = []
-        analysis.command_events = []
-        analysis.artifacts = []
-        analysis.anomalies = []
-        return analysis
+        return cleared_analysis(analysis)
 
     append_public_exposure_anomaly(analysis, "DF1")
     return analysis

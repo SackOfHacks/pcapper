@@ -5,8 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import safe_float
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, UDP  # type: ignore
@@ -77,10 +77,13 @@ def _parse_ptp_sequence(payload: bytes) -> Optional[int]:
     return int.from_bytes(payload[30:32], "big")
 
 
-def analyze_ptp(path: Path, show_status: bool = True) -> PtpSummary:
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
+@memoize_analysis
+def analyze_ptp(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> PtpSummary:
     total_packets = 0
     ptp_packets = 0
     msg_types: Counter[str] = Counter()
@@ -98,97 +101,84 @@ def analyze_ptp(path: Path, show_status: bool = True) -> PtpSummary:
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
+
+        is_ptp = False
+        payload = b""
+        if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+            eth = pkt[Ether]  # type: ignore[index]
+            if int(getattr(eth, "type", 0) or 0) == PTP_ETHERTYPE:
                 try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
+                    payload = bytes(eth.payload)
+                except Exception:
+                    payload = b""
+                is_ptp = True
+                src_mac = str(getattr(eth, "src", "-"))
+                dst_mac = str(getattr(eth, "dst", "-"))
+                src_macs[src_mac] += 1
+                dst_macs[dst_mac] += 1
+                try:
+                    first_octet = int(dst_mac.split(":")[0], 16)
+                    if (first_octet & 1) == 0:
+                        unicast_dsts.add(dst_mac)
                 except Exception:
                     pass
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+        if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+            udp = pkt[UDP]  # type: ignore[index]
+            sport = int(getattr(udp, "sport", 0) or 0)
+            dport = int(getattr(udp, "dport", 0) or 0)
+            if sport in {PTP_EVENT_PORT, PTP_GENERAL_PORT} or dport in {
+                PTP_EVENT_PORT,
+                PTP_GENERAL_PORT,
+            }:
+                is_ptp = True
+                payload = bytes(getattr(udp, "payload", b""))
+                if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
+                    src_ips[str(pkt[IP].src)] += 1  # type: ignore[index]
+                    dst_ips[str(pkt[IP].dst)] += 1  # type: ignore[index]
+                elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
+                    src_ips[str(pkt[IPv6].src)] += 1  # type: ignore[index]
+                    dst_ips[str(pkt[IPv6].dst)] += 1  # type: ignore[index]
 
-            is_ptp = False
-            payload = b""
-            if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-                eth = pkt[Ether]  # type: ignore[index]
-                if int(getattr(eth, "type", 0) or 0) == PTP_ETHERTYPE:
-                    try:
-                        payload = bytes(eth.payload)
-                    except Exception:
-                        payload = b""
-                    is_ptp = True
-                    src_mac = str(getattr(eth, "src", "-"))
-                    dst_mac = str(getattr(eth, "dst", "-"))
-                    src_macs[src_mac] += 1
-                    dst_macs[dst_mac] += 1
-                    try:
-                        first_octet = int(dst_mac.split(":")[0], 16)
-                        if (first_octet & 1) == 0:
-                            unicast_dsts.add(dst_mac)
-                    except Exception:
-                        pass
+        if not is_ptp:
+            continue
 
-            if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                udp = pkt[UDP]  # type: ignore[index]
-                sport = int(getattr(udp, "sport", 0) or 0)
-                dport = int(getattr(udp, "dport", 0) or 0)
-                if sport in {PTP_EVENT_PORT, PTP_GENERAL_PORT} or dport in {
-                    PTP_EVENT_PORT,
-                    PTP_GENERAL_PORT,
-                }:
-                    is_ptp = True
-                    payload = bytes(getattr(udp, "payload", b""))
-                    if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                        src_ips[str(pkt[IP].src)] += 1  # type: ignore[index]
-                        dst_ips[str(pkt[IP].dst)] += 1  # type: ignore[index]
-                    elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                        src_ips[str(pkt[IPv6].src)] += 1  # type: ignore[index]
-                        dst_ips[str(pkt[IPv6].dst)] += 1  # type: ignore[index]
+        ptp_packets += 1
+        # The report window spans this protocol's traffic, not every packet.
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
+        msg_type = _parse_ptp_message_type(payload)
+        if msg_type:
+            msg_types[msg_type] += 1
+            domain = _parse_ptp_domain(payload)
+            if domain is not None:
+                domain_numbers[domain] += 1
+            seq_id = _parse_ptp_sequence(payload)
+            if seq_id is not None:
+                sequence_ids[seq_id] += 1
+                seq_key = (str(getattr(pkt, "src", "?")), domain)
+                prev_seq = seq_state.get(seq_key)
+                if prev_seq is not None and seq_id < prev_seq:
+                    detections.append(
+                        {
+                            "severity": "warning",
+                            "summary": "PTP Sequence Decrease",
+                            "details": f"{seq_key[0]} domain {domain} seqId decreased {prev_seq}->{seq_id}.",
+                        }
+                    )
+                seq_state[seq_key] = seq_id
+            # The packet's own source MAC. This used to take the *first* MAC
+            # ever counted, so every message type in the capture was credited
+            # to one sender and the per-source role view was fiction.
+            src_key = str(getattr(pkt, "src", "?"))
+            src_msg_types.setdefault(src_key, set()).add(msg_type)
 
-            if not is_ptp:
-                continue
-
-            ptp_packets += 1
-            msg_type = _parse_ptp_message_type(payload)
-            if msg_type:
-                msg_types[msg_type] += 1
-                domain = _parse_ptp_domain(payload)
-                if domain is not None:
-                    domain_numbers[domain] += 1
-                seq_id = _parse_ptp_sequence(payload)
-                if seq_id is not None:
-                    sequence_ids[seq_id] += 1
-                    seq_key = (str(getattr(pkt, "src", "?")), domain)
-                    prev_seq = seq_state.get(seq_key)
-                    if prev_seq is not None and seq_id < prev_seq:
-                        detections.append(
-                            {
-                                "severity": "warning",
-                                "summary": "PTP Sequence Decrease",
-                                "details": f"{seq_key[0]} domain {domain} seqId decreased {prev_seq}->{seq_id}.",
-                            }
-                        )
-                    seq_state[seq_key] = seq_id
-                src_key = str(getattr(pkt, "src", "?"))
-                if src_macs:
-                    src_key = next(iter(src_macs.keys()))
-                if src_macs:
-                    src_mac = next(iter(src_macs.keys()))
-                    src_msg_types.setdefault(src_mac, set()).add(msg_type)
-                else:
-                    src_msg_types.setdefault(src_key, set()).add(msg_type)
-
-    finally:
-        status.finish()
-        reader.close()
 
     if ptp_packets:
         detections.append(

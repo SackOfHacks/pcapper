@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
@@ -285,7 +285,7 @@ def _direction(
 ) -> tuple[str, str, int, int]:
     if dport in WMI_PORTS:
         return src_ip, dst_ip, sport, dport
-    if sport in WMI_PORTS:
+    if sport in WMI_PORTS and dport >= 1024:
         return dst_ip, src_ip, dport, sport
     if dport < 1024 and sport >= 1024:
         return src_ip, dst_ip, sport, dport
@@ -299,7 +299,7 @@ def analyze_wmic(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> WmicSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
@@ -350,54 +350,6 @@ def analyze_wmic(
             duration_seconds=None,
         )
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, packets=packets, meta=meta, show_status=show_status
-        )
-    except Exception as exc:
-        return WmicSummary(
-            path=path,
-            total_packets=0,
-            wmic_packets=0,
-            total_bytes=0,
-            client_packets=0,
-            server_packets=0,
-            client_bytes=0,
-            server_bytes=0,
-            total_sessions=0,
-            unique_clients=0,
-            unique_servers=0,
-            client_counts=Counter(),
-            server_counts=Counter(),
-            client_macs=Counter(),
-            server_macs=Counter(),
-            ip_to_macs={},
-            server_ports=Counter(),
-            hostnames=Counter(),
-            ip_strings=Counter(),
-            mac_strings=Counter(),
-            domains=Counter(),
-            usernames=Counter(),
-            wmi_classes=Counter(),
-            wmi_namespaces=Counter(),
-            wmi_queries=Counter(),
-            wmic_commands=Counter(),
-            suspicious_commands=Counter(),
-            services=Counter(),
-            plaintext_strings=Counter(),
-            error_counts=Counter(),
-            detections=[],
-            anomalies=[],
-            artifacts=[],
-            conversations=[],
-            errors=[f"Error opening pcap: {exc}"],
-            deterministic_checks={},
-            threat_hypotheses=[],
-            benign_context=[],
-            first_seen=None,
-            last_seen=None,
-            duration_seconds=None,
-        )
 
     total_packets = 0
     wmic_packets = 0
@@ -443,15 +395,7 @@ def analyze_wmic(
     node_targets: dict[str, set[str]] = defaultdict(set)
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -625,9 +569,6 @@ def analyze_wmic(
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
 
     conversations: list[WmicConversation] = []
     for session in sessions.values():

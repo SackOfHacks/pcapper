@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from .utils import is_public_ip as _is_public_ip, get_packet_ports as _get_ports
 import base64
 import binascii
-import os
 import re
 import urllib.parse
 import zlib
@@ -12,14 +10,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import PcapMeta, get_reader
-from .utils import decode_payload, safe_float, extract_packet_endpoints
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import (
+    decode_payload,
+    env_int,
+    extract_packet_endpoints,
+    is_public_ip,
+    memoize_analysis,
+    safe_float,
+)
 
 try:
-    from scapy.layers.inet import IP, TCP, UDP  # type: ignore
+    from scapy.layers.inet import TCP, UDP  # type: ignore
     from scapy.packet import Packet, Raw  # type: ignore
 except Exception:  # pragma: no cover
-    IP = TCP = UDP = Raw = None  # type: ignore
+    TCP = UDP = Raw = None  # type: ignore
     Packet = object  # type: ignore
 
 
@@ -28,14 +33,10 @@ MAX_TOKEN_LEN = 4096
 MIN_BASE64_LEN = 16
 MIN_HEX_LEN = 16
 MIN_URLENC_LEN = 12
-try:
-    MAX_DECOMPRESSED_BYTES = int(
-        os.environ.get("PCAPPER_MAX_DECOMPRESSED_BYTES", str(10 * 1024 * 1024))
-    )
-except Exception:
-    MAX_DECOMPRESSED_BYTES = 10 * 1024 * 1024
-if MAX_DECOMPRESSED_BYTES < 0:
-    MAX_DECOMPRESSED_BYTES = 0
+MAX_DECOMPRESSED_BYTES = env_int("PCAPPER_MAX_DECOMPRESSED_BYTES", 10 * 1024 * 1024, minimum=0)
+_ALL_HEX_RE = re.compile(r"[0-9A-Fa-f]+")
+_KEY_VALUE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}\s*=")
+_WORD_RE = re.compile(r"[A-Za-z]{4,}")
 
 BASE64_RE = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{16,}={0,2}(?![A-Za-z0-9+/=])")
 BASE64URL_RE = re.compile(
@@ -116,23 +117,24 @@ def _get_ip_pair(pkt: Packet) -> tuple[str, str]:
     return src_ip or "0.0.0.0", dst_ip or "0.0.0.0"
 
 
-def _extract_payload(pkt: Packet) -> bytes:
-    if Raw is not None and Raw in pkt:
-        try:
-            return bytes(pkt[Raw])
-        except Exception:
-            return b""
-    if TCP is not None and TCP in pkt:
-        try:
-            return bytes(pkt[TCP].payload)
-        except Exception:
-            return b""
-    if UDP is not None and UDP in pkt:
-        try:
-            return bytes(pkt[UDP].payload)
-        except Exception:
-            return b""
-    return b""
+def _transport_and_payload(pkt: Packet) -> tuple[object, str, bytes]:
+    """(transport layer or None, protocol label, payload bytes) resolved once."""
+    transport = pkt.getlayer(TCP) if TCP is not None else None
+    protocol = "TCP"
+    if transport is None and UDP is not None:
+        transport = pkt.getlayer(UDP)
+        protocol = "UDP"
+    if transport is None:
+        protocol = "OTHER"
+    raw_layer = pkt.getlayer(Raw) if Raw is not None else None
+    try:
+        if raw_layer is not None:
+            return transport, protocol, bytes(raw_layer)
+        if transport is not None:
+            return transport, protocol, bytes(transport.payload)
+    except Exception:
+        pass
+    return transport, protocol, b""
 
 
 def _printable_ratio(data: bytes) -> float:
@@ -224,7 +226,7 @@ def _is_meaningful_text(text: str) -> bool:
     # Structured data is meaningful even when symbol-heavy: JSON / arrays / kv.
     if t[0] in "{[" and ":" in t and '"' in t:
         return True
-    if re.search(r"[A-Za-z][A-Za-z0-9_.-]{2,}\s*=", t):
+    if _KEY_VALUE_RE.search(t):
         return True
     # Otherwise require word-bearing, alnum-dense, varied text.
     alnum = sum(1 for c in t if c.isalnum())
@@ -232,7 +234,7 @@ def _is_meaningful_text(text: str) -> bool:
         return False
     if len(set(t)) < 5:
         return False
-    return bool(re.search(r"[A-Za-z]{4,}", t))
+    return bool(_WORD_RE.search(t))
 
 
 def _looks_like_jwt_header(text: str) -> bool:
@@ -274,6 +276,7 @@ def _decode_urlencoded(token: str) -> Optional[bytes]:
         return None
 
 
+@memoize_analysis
 def analyze_secrets(
     path: Path,
     *,
@@ -300,28 +303,6 @@ def analyze_secrets(
             ["Scapy not available"],
         )
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, packets=packets, meta=meta, show_status=show_status
-        )
-    except Exception as exc:
-        return SecretsSummary(
-            path,
-            0,
-            0,
-            [],
-            False,
-            Counter(),
-            Counter(),
-            Counter(),
-            Counter(),
-            {},
-            [],
-            [],
-            [],
-            [f"Error opening pcap: {exc}"],
-        )
-
     total_packets = 0
     matches = 0
     hits: list[SecretHit] = []
@@ -329,18 +310,13 @@ def analyze_secrets(
     errors: list[str] = []
     truncated = False
     seen: set[tuple[int, str, str, int]] = set()
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
-
-            total_packets += 1
-            payload = _extract_payload(pkt)
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        try:
+            transport, protocol, payload = _transport_and_payload(pkt)
             if not payload:
                 continue
             if len(payload) > MAX_PAYLOAD_SCAN:
@@ -351,8 +327,42 @@ def analyze_secrets(
                 continue
 
             src_ip, dst_ip = _get_ip_pair(pkt)
-            src_port, dst_port, protocol = _get_ports(pkt)
+            src_port = dst_port = None
+            if transport is not None:
+                src_port = int(getattr(transport, "sport", 0) or 0)
+                dst_port = int(getattr(transport, "dport", 0) or 0)
             ts = safe_float(getattr(pkt, "time", None))
+
+            def _record(kind: str, token: str, decoded: str, note: str, offset: int) -> None:
+                # Same accounting in every decoder: every match counts, the
+                # first sighting of (packet, kind, token, offset) is kept up
+                # to max_hits, and anything past the cap only sets truncated.
+                nonlocal matches, truncated
+                matches += 1
+                kind_counts[kind] += 1
+                key = (total_packets, kind, token, offset)
+                if key in seen:
+                    return
+                if len(hits) >= max_hits:
+                    truncated = True
+                    return
+                seen.add(key)
+                hits.append(
+                    SecretHit(
+                        packet_number=total_packets,
+                        ts=ts,
+                        src_ip=src_ip,
+                        dst_ip=dst_ip,
+                        src_port=src_port,
+                        dst_port=dst_port,
+                        protocol=protocol,
+                        offset=offset,
+                        kind=kind,
+                        encoded=token,
+                        decoded=decoded,
+                        note=note,
+                    )
+                )
 
             jwt_spans: list[tuple[int, int]] = []
             base64_spans: list[tuple[int, int]] = []
@@ -379,30 +389,13 @@ def analyze_secrets(
                     decoded_parts.append(f"payload={_decode_text(payload_raw).strip()}")
                     note_parts.append("payload")
                 if decoded_parts:
-                    matches += 1
-                    kind_counts["JWT"] += 1
-                    key = (total_packets, "JWT", token, match.start())
-                    if key not in seen:
-                        seen.add(key)
-                        if len(hits) < max_hits:
-                            hits.append(
-                                SecretHit(
-                                    packet_number=total_packets,
-                                    ts=ts,
-                                    src_ip=src_ip,
-                                    dst_ip=dst_ip,
-                                    src_port=src_port,
-                                    dst_port=dst_port,
-                                    protocol=protocol,
-                                    offset=match.start(),
-                                    kind="JWT",
-                                    encoded=token,
-                                    decoded=" | ".join(decoded_parts),
-                                    note="JWT " + "/".join(note_parts),
-                                )
-                            )
-                        else:
-                            truncated = True
+                    _record(
+                        "JWT",
+                        token,
+                        " | ".join(decoded_parts),
+                        "JWT " + "/".join(note_parts),
+                        match.start(),
+                    )
                 jwt_spans.append((match.start(), match.end()))
 
             def _overlaps_jwt(start: int, end: int) -> bool:
@@ -417,7 +410,7 @@ def analyze_secrets(
                     continue
                 if _overlaps_jwt(match.start(), match.end()):
                     continue
-                if re.fullmatch(r"[0-9A-Fa-f]+", token or ""):
+                if _ALL_HEX_RE.fullmatch(token):
                     continue
                 raw = _decode_base64(token, urlsafe=False)
                 if not raw:
@@ -436,31 +429,7 @@ def analyze_secrets(
                 # Standard-base64 tokens also match BASE64URL_RE; record the
                 # span so the base64url pass below doesn't double-report them.
                 base64_spans.append((match.start(), match.end()))
-                matches += 1
-                kind_counts["Base64"] += 1
-                key = (total_packets, "Base64", token, match.start())
-                if key in seen:
-                    continue
-                seen.add(key)
-                if len(hits) < max_hits:
-                    hits.append(
-                        SecretHit(
-                            packet_number=total_packets,
-                            ts=ts,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            src_port=src_port,
-                            dst_port=dst_port,
-                            protocol=protocol,
-                            offset=match.start(),
-                            kind="Base64",
-                            encoded=token,
-                            decoded=decoded_text,
-                            note=note,
-                        )
-                    )
-                else:
-                    truncated = True
+                _record("Base64", token, decoded_text, note, match.start())
 
             def _overlaps_base64(start: int, end: int) -> bool:
                 for s, e in base64_spans:
@@ -490,31 +459,7 @@ def analyze_secrets(
                 decoded_text = _decode_text(decoded_bytes).strip()
                 if not decoded_text or not _is_meaningful_text(decoded_text):
                     continue
-                matches += 1
-                kind_counts["Base64URL"] += 1
-                key = (total_packets, "Base64URL", token, match.start())
-                if key in seen:
-                    continue
-                seen.add(key)
-                if len(hits) < max_hits:
-                    hits.append(
-                        SecretHit(
-                            packet_number=total_packets,
-                            ts=ts,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            src_port=src_port,
-                            dst_port=dst_port,
-                            protocol=protocol,
-                            offset=match.start(),
-                            kind="Base64URL",
-                            encoded=token,
-                            decoded=decoded_text,
-                            note=note,
-                        )
-                    )
-                else:
-                    truncated = True
+                _record("Base64URL", token, decoded_text, note, match.start())
 
             for match in HEX_RE.finditer(text):
                 token = match.group(0)
@@ -539,31 +484,7 @@ def analyze_secrets(
                 decoded_text = _decode_text(raw).strip()
                 if not decoded_text or not _is_meaningful_text(decoded_text):
                     continue
-                matches += 1
-                kind_counts["Hex"] += 1
-                key = (total_packets, "Hex", token, match.start())
-                if key in seen:
-                    continue
-                seen.add(key)
-                if len(hits) < max_hits:
-                    hits.append(
-                        SecretHit(
-                            packet_number=total_packets,
-                            ts=ts,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            src_port=src_port,
-                            dst_port=dst_port,
-                            protocol=protocol,
-                            offset=match.start(),
-                            kind="Hex",
-                            encoded=token,
-                            decoded=decoded_text,
-                            note="hex",
-                        )
-                    )
-                else:
-                    truncated = True
+                _record("Hex", token, decoded_text, "hex", match.start())
 
             for match in URLENC_RE.finditer(text):
                 token = match.group(0)
@@ -581,40 +502,17 @@ def analyze_secrets(
                     or not _is_meaningful_text(decoded_text)
                 ):
                     continue
-                matches += 1
-                kind_counts["URL-Encoded"] += 1
-                key = (total_packets, "URL-Encoded", token, match.start())
-                if key in seen:
-                    continue
-                seen.add(key)
-                if len(hits) < max_hits:
-                    hits.append(
-                        SecretHit(
-                            packet_number=total_packets,
-                            ts=ts,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            src_port=src_port,
-                            dst_port=dst_port,
-                            protocol=protocol,
-                            offset=match.start(),
-                            kind="URL-Encoded",
-                            encoded=token,
-                            decoded=decoded_text,
-                            note="url-decode",
-                        )
-                    )
-                else:
-                    truncated = True
+                _record("URL-Encoded", token, decoded_text, "url-decode", match.start())
+        except Exception as exc:  # noqa: BLE001 — one malformed payload must not end the scan
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
 
-    except Exception as exc:
-        errors.append(f"Error during scan: {type(exc).__name__}: {exc}")
-    finally:
-        status.finish()
-        try:
-            reader.close()
-        except Exception:
-            pass
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} packet(s) skipped after a decode error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
 
     top_sources: Counter[str] = Counter()
     top_destinations: Counter[str] = Counter()
@@ -673,7 +571,7 @@ def analyze_secrets(
             deterministic_checks["multi_stage_decoding_chain"].append(
                 f"pkt {hit.packet_number} {src}->{dst} multi-stage decoding path ({hit.note})"
             )
-        if _is_public_ip(dst):
+        if is_public_ip(dst):
             deterministic_checks["external_public_secret_flow"].append(
                 f"pkt {hit.packet_number} {src}->{dst} decoded secret material to public destination"
             )
@@ -694,7 +592,7 @@ def analyze_secrets(
                 host = urllib.parse.urlsplit(url).hostname or ""
             except Exception:
                 host = ""
-            if host and _is_public_ip(host):
+            if host and is_public_ip(host):
                 deterministic_checks["external_public_secret_flow"].append(
                     f"pkt {hit.packet_number} URL host is public IP ({host}) in decoded secret payload"
                 )

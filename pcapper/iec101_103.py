@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
-from .utils import safe_float, extract_packet_endpoints
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -94,6 +94,13 @@ def _parse_asdu(
     return type_name, cause_name, type_id, cot
 
 
+def _iec_from_primary(payload: bytes) -> bool:
+    """PRM bit of the FT1.2 control field (variable frame: 0x68 L L 0x68 C)."""
+    if len(payload) < 5 or payload[0] != 0x68:
+        return True
+    return bool(payload[4] & 0x40)
+
+
 def _iec_apdu_candidate(payload: bytes) -> bool:
     # IEC 60870-5-101/103 FT1.2 *variable*-length frame: 0x68 L L 0x68 <L user
     # bytes> CS 0x16. Requiring the repeated start byte AND the repeated length
@@ -115,28 +122,13 @@ def _iec_apdu_candidate(payload: bytes) -> bool:
     return True
 
 
-def analyze_iec101_103(path: Path, show_status: bool = True) -> Iec101103Summary:
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, show_status=show_status
-        )
-    except Exception as exc:
-        # Unreadable/unsupported capture — return gracefully like the other
-        # analyzers instead of propagating the exception and crashing the run.
-        return Iec101103Summary(
-            path=path,
-            total_packets=0,
-            candidate_packets=0,
-            client_counts=Counter(),
-            server_counts=Counter(),
-            type_counts=Counter(),
-            cause_counts=Counter(),
-            detections=[],
-            errors=[f"{type(exc).__name__}: {exc}"],
-            first_seen=None,
-            last_seen=None,
-            duration_seconds=None,
-        )
+@memoize_analysis
+def analyze_iec101_103(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> Iec101103Summary:
     total_packets = 0
     candidate_packets = 0
     client_counts: Counter[str] = Counter()
@@ -151,54 +143,51 @@ def analyze_iec101_103(path: Path, show_status: bool = True) -> Iec101103Summary
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    status.update(int(min(100, (pos / size_bytes) * 100)))
-                except Exception:
-                    pass
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
 
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+        payload = b""
+        if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+            payload = bytes(getattr(pkt[TCP], "payload", b""))  # type: ignore[index]
+        elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+            payload = bytes(getattr(pkt[UDP], "payload", b""))  # type: ignore[index]
+        if not _iec_apdu_candidate(payload):
+            continue
 
-            payload = b""
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                payload = bytes(getattr(pkt[TCP], "payload", b""))  # type: ignore[index]
-            elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                payload = bytes(getattr(pkt[UDP], "payload", b""))  # type: ignore[index]
-            if not _iec_apdu_candidate(payload):
-                continue
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
+        if not src_ip or not dst_ip:
+            continue
 
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-            if not src_ip or not dst_ip:
-                continue
+        candidate_packets += 1
+        # FT1.2 control field: PRM=1 marks a frame from the primary (master)
+        # station. Counting the sender of every frame as the "client" made the
+        # outstation's replies look like a second master.
+        if _iec_from_primary(payload):
+            client_ip, server_ip = src_ip, dst_ip
+        else:
+            client_ip, server_ip = dst_ip, src_ip
+        # The report window spans this protocol's traffic, not every packet.
+        if ts is not None:
+            if first_seen is None or ts < first_seen:
+                first_seen = ts
+            if last_seen is None or ts > last_seen:
+                last_seen = ts
+        client_counts[client_ip] += 1
+        server_counts[server_ip] += 1
 
-            candidate_packets += 1
-            client_counts[src_ip] += 1
-            server_counts[dst_ip] += 1
+        type_name, cause_name, type_id, cot = _parse_asdu(payload)
+        if type_name:
+            type_counts[type_name] += 1
+        if cause_name:
+            cause_counts[cause_name] += 1
+        if (
+            type_id in IEC_COMMAND_TYPES
+            and cot in _IEC_ACTIVATION_COTS
+        ):
+            key = (src_ip, dst_ip, type_id)
+            command_activations[key] = command_activations.get(key, 0) + 1
 
-            type_name, cause_name, type_id, cot = _parse_asdu(payload)
-            if type_name:
-                type_counts[type_name] += 1
-            if cause_name:
-                cause_counts[cause_name] += 1
-            if (
-                type_id in IEC_COMMAND_TYPES
-                and cot in _IEC_ACTIVATION_COTS
-            ):
-                key = (src_ip, dst_ip, type_id)
-                command_activations[key] = command_activations.get(key, 0) + 1
-
-    finally:
-        status.finish()
-        reader.close()
 
     if candidate_packets:
         detections.append(

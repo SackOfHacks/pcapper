@@ -22,12 +22,18 @@ from .modbus import FUNC_NAMES as MODBUS_FUNC_NAMES
 from .modbus import MODBUS_TCP_PORT
 from .opc import OPC_TYPES, OPC_UA_PORT
 from .ot_risk import compute_ot_risk_posture, dedupe_findings
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .powershell import PS_COMMAND_RE
 from .progress import build_statusbar, run_with_busy_status
 from .s7 import S7_PORT, analyze_s7
 from .telnet import TELNET_PORTS
-from .utils import decode_payload, safe_float, extract_packet_endpoints
+from .utils import (
+    decode_payload,
+    dns_questions,
+    extract_packet_endpoints,
+    memoize_analysis,
+    safe_float,
+)
 from .winrm import WINRM_PORTS, WSMAN_RE
 from .wmic import WMIC_COMMAND_RE
 
@@ -1488,6 +1494,7 @@ def _netbios_session_hint(payload: bytes | None) -> str | None:
     return None
 
 
+@memoize_analysis
 def analyze_timeline(
     path: Path,
     target_ip: str,
@@ -1497,6 +1504,8 @@ def analyze_timeline(
     categories: set[str] | None = None,
     invert_categories: bool = False,
     vt_lookup: bool = False,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> TimelineSummary:
     errors: list[str] = []
     events: list[TimelineEvent] = []
@@ -1517,9 +1526,6 @@ def analyze_timeline(
     }
     creds_summary = _busy("Credentials", analyze_creds, path, show_status=False)
 
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
 
     total_packets = 0
     idx = 0
@@ -1672,164 +1678,188 @@ def analyze_timeline(
     domain_ports = {88, 464, 445, 139, 135, 593, 3268, 3269}
     ldap_ports = {389, 636, 3268, 3269}
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        idx += 1
+        total_packets += 1
+        ts = safe_float(getattr(pkt, "time", None))
+
+        src_ip, dst_ip = extract_packet_endpoints(pkt)
+
+        if idx in artifact_indices and ts is not None:
+            index_ts[idx] = ts
+
+        if not src_ip or not dst_ip:
+            continue
+
+        if src_ip == target_ip or dst_ip == target_ip:
+            if ts is not None:
+                if first_seen is None or ts < first_seen:
+                    first_seen = ts
+                if last_seen is None or ts > last_seen:
+                    last_seen = ts
+        if src_ip == target_ip or dst_ip == target_ip:
+            label = _icmp_label(pkt)
+            if label:
+                dedupe_key = ("icmp", src_ip, dst_ip, label, _icmp_signature(pkt))
+                _emit_event(
+                    ts=ts,
+                    category="ICMP",
+                    summary=label,
+                    details=f"{src_ip} -> {dst_ip}",
+                    dedupe_key=dedupe_key,
+                )
+
+        if ARP is not None and pkt.haslayer(ARP):  # type: ignore[truthy-bool]
+            try:
+                arp_layer = pkt[ARP]  # type: ignore[index]
+                op = int(getattr(arp_layer, "op", 0) or 0)
+                arp_src_ip = str(getattr(arp_layer, "psrc", "") or "").strip()
+                arp_dst_ip = str(getattr(arp_layer, "pdst", "") or "").strip()
+                arp_src_mac = str(getattr(arp_layer, "hwsrc", "") or "").strip()
+                arp_dst_mac = str(getattr(arp_layer, "hwdst", "") or "").strip()
+                if (
+                    target_ip
+                    and target_ip
+                    not in {src_ip, dst_ip, arp_src_ip, arp_dst_ip}
+                ):
                     pass
-
-            idx += 1
-            total_packets += 1
-            ts = safe_float(getattr(pkt, "time", None))
-
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-
-            if idx in artifact_indices and ts is not None:
-                index_ts[idx] = ts
-
-            if not src_ip or not dst_ip:
-                continue
-
-            if src_ip == target_ip or dst_ip == target_ip:
-                if ts is not None:
-                    if first_seen is None or ts < first_seen:
-                        first_seen = ts
-                    if last_seen is None or ts > last_seen:
-                        last_seen = ts
-            if src_ip == target_ip or dst_ip == target_ip:
-                label = _icmp_label(pkt)
-                if label:
-                    dedupe_key = ("icmp", src_ip, dst_ip, label, _icmp_signature(pkt))
+                else:
+                    summary = "ARP traffic"
+                    if op == 1:
+                        if (
+                            arp_src_ip == "0.0.0.0"
+                            and arp_dst_ip
+                            and arp_dst_ip != "0.0.0.0"
+                        ):
+                            summary = "ARP probe"
+                        elif arp_src_ip and arp_src_ip == arp_dst_ip:
+                            summary = "Gratuitous ARP request"
+                        else:
+                            summary = "ARP request"
+                    elif op == 2:
+                        if arp_src_ip and arp_src_ip == arp_dst_ip:
+                            summary = "Gratuitous ARP reply"
+                        else:
+                            summary = "ARP reply"
+                    op_detail = (
+                        {1: "request", 2: "reply"}.get(op) or f"op {op}"
+                    )
+                    detail_parts = [f"{arp_src_ip or src_ip} -> {arp_dst_ip or dst_ip}"]
+                    if arp_src_mac:
+                        detail_parts.append(f"src-mac {arp_src_mac}")
+                    if arp_dst_mac and arp_dst_mac != "00:00:00:00:00:00":
+                        detail_parts.append(f"dst-mac {arp_dst_mac}")
+                    detail_parts.append(f"opcode {op_detail}")
                     _emit_event(
                         ts=ts,
-                        category="ICMP",
-                        summary=label,
-                        details=f"{src_ip} -> {dst_ip}",
-                        dedupe_key=dedupe_key,
+                        category="ARP",
+                        summary=summary,
+                        details=" | ".join(detail_parts),
+                        dedupe_key=(
+                            "arp",
+                            arp_src_ip or src_ip,
+                            arp_dst_ip or dst_ip,
+                            arp_src_mac,
+                            arp_dst_mac,
+                            op,
+                        ),
                     )
+            except Exception:
+                pass
 
-            if ARP is not None and pkt.haslayer(ARP):  # type: ignore[truthy-bool]
-                try:
-                    arp_layer = pkt[ARP]  # type: ignore[index]
-                    op = int(getattr(arp_layer, "op", 0) or 0)
-                    arp_src_ip = str(getattr(arp_layer, "psrc", "") or "").strip()
-                    arp_dst_ip = str(getattr(arp_layer, "pdst", "") or "").strip()
-                    arp_src_mac = str(getattr(arp_layer, "hwsrc", "") or "").strip()
-                    arp_dst_mac = str(getattr(arp_layer, "hwdst", "") or "").strip()
-                    if (
-                        target_ip
-                        and target_ip
-                        not in {src_ip, dst_ip, arp_src_ip, arp_dst_ip}
+        if DNS is not None and DNSQR is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
+            dns_layer = pkt[DNS]  # type: ignore[index]
+            if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+                udp_layer = pkt[UDP]  # type: ignore[index]
+                sport = int(getattr(udp_layer, "sport", 0) or 0)
+                dport = int(getattr(udp_layer, "dport", 0) or 0)
+                if sport == 5353 or dport == 5353:
+                    try:
+                        questions = dns_questions(dns_layer)
+                        name, qtype = questions[0] if questions else ("", None)
+                        qtype_label = _dns_qtype_label(qtype)
+                    except Exception:
+                        name = "-"
+                        qtype = None
+                        qtype_label = "-"
+                    direction = (
+                        "query" if getattr(dns_layer, "qr", 1) == 0 else "response"
+                    )
+                    key = (direction, name, str(qtype))
+                    if key not in seen_mdns_events and (
+                        src_ip == target_ip or dst_ip == target_ip
                     ):
-                        pass
-                    else:
-                        summary = "ARP traffic"
-                        if op == 1:
-                            if (
-                                arp_src_ip == "0.0.0.0"
-                                and arp_dst_ip
-                                and arp_dst_ip != "0.0.0.0"
-                            ):
-                                summary = "ARP probe"
-                            elif arp_src_ip and arp_src_ip == arp_dst_ip:
-                                summary = "Gratuitous ARP request"
-                            else:
-                                summary = "ARP request"
-                        elif op == 2:
-                            if arp_src_ip and arp_src_ip == arp_dst_ip:
-                                summary = "Gratuitous ARP reply"
-                            else:
-                                summary = "ARP reply"
-                        op_detail = (
-                            {1: "request", 2: "reply"}.get(op) or f"op {op}"
-                        )
-                        detail_parts = [f"{arp_src_ip or src_ip} -> {arp_dst_ip or dst_ip}"]
-                        if arp_src_mac:
-                            detail_parts.append(f"src-mac {arp_src_mac}")
-                        if arp_dst_mac and arp_dst_mac != "00:00:00:00:00:00":
-                            detail_parts.append(f"dst-mac {arp_dst_mac}")
-                        detail_parts.append(f"opcode {op_detail}")
+                        seen_mdns_events.add(key)
                         _emit_event(
                             ts=ts,
-                            category="ARP",
-                            summary=summary,
-                            details=" | ".join(detail_parts),
-                            dedupe_key=(
-                                "arp",
-                                arp_src_ip or src_ip,
-                                arp_dst_ip or dst_ip,
-                                arp_src_mac,
-                                arp_dst_mac,
-                                op,
-                            ),
+                            category="mDNS",
+                            summary=f"mDNS {direction}",
+                            details=f"{src_ip} -> {dst_ip} {name} ({qtype_label})",
                         )
-                except Exception:
-                    pass
-
-            if DNS is not None and DNSQR is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
-                dns_layer = pkt[DNS]  # type: ignore[index]
-                if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                    udp_layer = pkt[UDP]  # type: ignore[index]
-                    sport = int(getattr(udp_layer, "sport", 0) or 0)
-                    dport = int(getattr(udp_layer, "dport", 0) or 0)
-                    if sport == 5353 or dport == 5353:
-                        try:
-                            qd = dns_layer.qd  # type: ignore[attr-defined]
-                            qname = getattr(qd, "qname", b"")
-                            qtype = getattr(qd, "qtype", None)
-                            qtype_label = _dns_qtype_label(qtype)
-                            name = (
-                                qname.decode("utf-8", errors="ignore").rstrip(".")
-                                if isinstance(qname, (bytes, bytearray))
-                                else str(qname)
-                            )
-                        except Exception:
-                            name = "-"
-                            qtype = None
-                            qtype_label = "-"
-                        direction = (
-                            "query" if getattr(dns_layer, "qr", 1) == 0 else "response"
-                        )
-                        key = (direction, name, str(qtype))
-                        if key not in seen_mdns_events and (
-                            src_ip == target_ip or dst_ip == target_ip
-                        ):
-                            seen_mdns_events.add(key)
-                            _emit_event(
+            if getattr(dns_layer, "qr", 1) == 0 and src_ip == target_ip:
+                try:
+                    questions = dns_questions(dns_layer)
+                    name, qtype = questions[0] if questions else ("", None)
+                    qtype_label = _dns_qtype_label(qtype)
+                    dns_id = int(getattr(dns_layer, "id", 0) or 0)
+                    transport = "-"
+                    dst_port: Optional[int] = None
+                    if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+                        udp_layer = pkt[UDP]  # type: ignore[index]
+                        dst_port = int(getattr(udp_layer, "dport", 0) or 0) or None
+                        transport = "UDP"
+                    elif TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+                        tcp_layer = pkt[TCP]  # type: ignore[index]
+                        dst_port = int(getattr(tcp_layer, "dport", 0) or 0) or None
+                        transport = "TCP"
+                    qname_lower = name.lower()
+                    dedupe_key = (
+                        "dns-query",
+                        src_ip,
+                        dst_ip,
+                        dns_id,
+                        qname_lower,
+                        qtype,
+                    )
+                    _emit_event(
+                        ts=ts,
+                        category="DNS",
+                        summary="DNS query",
+                        details=f"{target_ip} queried {name} ({qtype_label})",
+                        dedupe_key=dedupe_key,
+                    )
+                    query_key = (
+                        src_ip,
+                        dst_ip,
+                        dns_id,
+                        qname_lower,
+                        str(qtype),
+                        dst_port,
+                    )
+                    if query_key not in seen_dns_queries:
+                        seen_dns_queries.add(query_key)
+                        dns_queries.append(
+                            DNSQueryDetail(
                                 ts=ts,
-                                category="mDNS",
-                                summary=f"mDNS {direction}",
-                                details=f"{src_ip} -> {dst_ip} {name} ({qtype_label})",
+                                name=name,
+                                qtype=qtype_label if qtype is not None else None,
+                                src_ip=src_ip,
+                                dst_ip=dst_ip,
+                                protocol=transport,
+                                dst_port=dst_port,
                             )
-                if getattr(dns_layer, "qr", 1) == 0 and src_ip == target_ip:
-                    try:
-                        qd = dns_layer.qd  # type: ignore[attr-defined]
-                        qname = getattr(qd, "qname", b"")
-                        qtype = getattr(qd, "qtype", None)
-                        qtype_label = _dns_qtype_label(qtype)
-                        name = (
-                            qname.decode("utf-8", errors="ignore").rstrip(".")
-                            if isinstance(qname, (bytes, bytearray))
-                            else str(qname)
                         )
-                        dns_id = int(getattr(dns_layer, "id", 0) or 0)
-                        transport = "-"
-                        dst_port: Optional[int] = None
-                        if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                            udp_layer = pkt[UDP]  # type: ignore[index]
-                            dst_port = int(getattr(udp_layer, "dport", 0) or 0) or None
-                            transport = "UDP"
-                        elif TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                            tcp_layer = pkt[TCP]  # type: ignore[index]
-                            dst_port = int(getattr(tcp_layer, "dport", 0) or 0) or None
-                            transport = "TCP"
-                        qname_lower = name.lower()
+                    if any(
+                        token in qname_lower
+                        for token in (
+                            "_ldap._tcp",
+                            "_kerberos._tcp",
+                            "_gc._tcp",
+                            "_msdcs",
+                        )
+                    ):
                         dedupe_key = (
-                            "dns-query",
+                            "domain-discovery",
                             src_ip,
                             dst_ip,
                             dns_id,
@@ -1838,321 +1868,780 @@ def analyze_timeline(
                         )
                         _emit_event(
                             ts=ts,
-                            category="DNS",
-                            summary="DNS query",
-                            details=f"{target_ip} queried {name} ({qtype_label})",
+                            category="MS Domain",
+                            summary="Domain service discovery",
+                            details=f"{target_ip} queried {name}",
                             dedupe_key=dedupe_key,
                         )
-                        query_key = (
-                            src_ip,
-                            dst_ip,
-                            dns_id,
-                            qname_lower,
-                            str(qtype),
-                            dst_port,
-                        )
-                        if query_key not in seen_dns_queries:
-                            seen_dns_queries.add(query_key)
-                            dns_queries.append(
-                                DNSQueryDetail(
-                                    ts=ts,
-                                    name=name,
-                                    qtype=qtype_label if qtype is not None else None,
-                                    src_ip=src_ip,
-                                    dst_ip=dst_ip,
-                                    protocol=transport,
-                                    dst_port=dst_port,
-                                )
-                            )
-                        if any(
-                            token in qname_lower
-                            for token in (
-                                "_ldap._tcp",
-                                "_kerberos._tcp",
-                                "_gc._tcp",
-                                "_msdcs",
-                            )
-                        ):
-                            dedupe_key = (
-                                "domain-discovery",
-                                src_ip,
-                                dst_ip,
-                                dns_id,
-                                qname_lower,
-                                qtype,
-                            )
-                            _emit_event(
-                                ts=ts,
-                                category="MS Domain",
-                                summary="Domain service discovery",
-                                details=f"{target_ip} queried {name}",
-                                dedupe_key=dedupe_key,
-                            )
-                    except Exception:
-                        pass
-
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                tcp_layer = pkt[TCP]  # type: ignore[index]
-                flags = getattr(tcp_layer, "flags", None)
-                is_syn = False
-                is_ack = False
-                is_rst = False
-                is_fin = False
-                if isinstance(flags, str):
-                    flag_text = flags
-                else:
-                    flag_text = None
-                flag_bits: Optional[int] = None
-                if flag_text is None and flags is not None:
-                    try:
-                        flag_bits = int(flags)
-                    except Exception:
-                        try:
-                            flag_text = str(flags)
-                        except Exception:
-                            flag_text = None
-                if flag_text is not None:
-                    is_syn = "S" in flag_text
-                    is_ack = "A" in flag_text
-                    is_rst = "R" in flag_text
-                    is_fin = "F" in flag_text
-                elif flag_bits is not None:
-                    is_syn = (flag_bits & 0x02) != 0
-                    is_ack = (flag_bits & 0x10) != 0
-                    is_rst = (flag_bits & 0x04) != 0
-                    is_fin = (flag_bits & 0x01) != 0
-                is_synack = is_syn and is_ack
-                is_syn_only = is_syn and not is_ack
-                is_final_ack = is_ack and not is_syn and not is_rst and not is_fin
-                sport = int(getattr(tcp_layer, "sport", 0) or 0)
-                dport = int(getattr(tcp_layer, "dport", 0) or 0)
-                seq = int(getattr(tcp_layer, "seq", 0) or 0)
-                ack = int(getattr(tcp_layer, "ack", 0) or 0)
-                payload = None
-                try:
-                    payload = bytes(tcp_layer.payload)
                 except Exception:
-                    payload = None
-                if (src_ip == target_ip or dst_ip == target_ip) and sport and dport:
-                    if is_syn_only:
-                        syn_key = (src_ip, dst_ip, sport, dport, seq)
-                        if syn_key not in seen_tcp_syns:
-                            seen_tcp_syns.add(syn_key)
-                            key = (src_ip, dst_ip, sport, dport)
-                            tcp_handshakes[key].append(_new_handshake(syn_ts=ts))
-                    elif is_synack:
-                        synack_key = (src_ip, dst_ip, sport, dport, seq, ack)
-                        if synack_key not in seen_tcp_synacks:
-                            seen_tcp_synacks.add(synack_key)
-                            key = (dst_ip, src_ip, dport, sport)
-                            bucket = tcp_handshakes[key]
-                            handshake = _find_handshake_for_synack(bucket)
-                            if handshake is None:
-                                handshake = _new_handshake()
-                                bucket.append(handshake)
-                            handshake["synack"] = ts
-                    elif is_final_ack:
-                        key = (src_ip, dst_ip, sport, dport)
-                        bucket = tcp_handshakes.get(key)
-                        if bucket:
-                            handshake = _find_handshake_for_ack(bucket)
-                            if handshake is not None:
-                                handshake["ack"] = ts
-                if src_ip == target_ip or dst_ip == target_ip:
-                    port_key = dport if src_ip == target_ip else sport
-                    if port_key:
-                        proto = OT_PORT_PROTOCOLS.get(port_key)
-                        if proto:
-                            ot_protocol_counts[proto] += 1
-                            direction = "outbound" if src_ip == target_ip else "inbound"
-                            peer_ip = dst_ip if src_ip == target_ip else src_ip
-                            if peer_ip:
-                                cmd_event_added = False
-                                if proto == "Modbus" and port_key == MODBUS_TCP_PORT:
-                                    parsed = _parse_modbus_command(payload)
-                                    if parsed:
-                                        (
-                                            func_code,
-                                            func_name,
-                                            is_exc,
-                                            unit_id,
-                                            exc_desc,
-                                        ) = parsed
-                                        label = f"Modbus {func_name}"
-                                        if is_exc:
-                                            label = f"Modbus exception {func_name}"
-                                        key = (
-                                            proto,
-                                            direction,
-                                            peer_ip,
-                                            port_key,
-                                            label,
-                                        )
-                                        if key not in seen_ot_commands:
-                                            seen_ot_commands.add(key)
-                                            detail = f"{target_ip} -> {peer_ip}:{port_key} unit {unit_id} {func_name}"
-                                            if is_exc and exc_desc:
-                                                detail += f" (Exception: {exc_desc})"
-                                            _emit_event(
-                                                ts=ts,
-                                                category="Modbus",
-                                                summary=label,
-                                                details=detail,
-                                            )
-                                            cmd_event_added = True
-                                elif proto in {"ENIP", "CIP"} and port_key in {
-                                    44818,
-                                    2222,
-                                }:
-                                    enip = _parse_enip_command(payload)
-                                    if enip:
-                                        cmd, name = enip
-                                        label = name or f"ENIP cmd 0x{cmd:04x}"
-                                        key = (
-                                            proto,
-                                            direction,
-                                            peer_ip,
-                                            port_key,
-                                            label,
-                                        )
-                                        if key not in seen_ot_commands:
-                                            seen_ot_commands.add(key)
-                                            _emit_event(
-                                                ts=ts,
-                                                category=proto,
-                                                summary=f"{proto} {label}",
-                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            )
-                                            cmd_event_added = True
-                                elif proto == "OPC UA" and port_key == OPC_UA_PORT:
-                                    msg = _parse_opcua_message(payload)
-                                    if msg:
-                                        label = f"OPC UA {msg}"
-                                        key = (
-                                            proto,
-                                            direction,
-                                            peer_ip,
-                                            port_key,
-                                            label,
-                                        )
-                                        if key not in seen_ot_commands:
-                                            seen_ot_commands.add(key)
-                                            _emit_event(
-                                                ts=ts,
-                                                category="OPC UA",
-                                                summary=label,
-                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            )
-                                            cmd_event_added = True
-                                elif proto == "IEC-104" and port_key == IEC104_PORT:
-                                    frame = _iec104_frame_type(payload)
-                                    if frame:
-                                        label = f"IEC-104 {frame}"
-                                        key = (
-                                            proto,
-                                            direction,
-                                            peer_ip,
-                                            port_key,
-                                            label,
-                                        )
-                                        if key not in seen_ot_commands:
-                                            seen_ot_commands.add(key)
-                                            _emit_event(
-                                                ts=ts,
-                                                category="IEC-104",
-                                                summary=label,
-                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            )
-                                            cmd_event_added = True
-                                elif proto == "DNP3" and port_key == DNP3_PORT:
-                                    if _dnp3_frame_seen(payload):
-                                        label = "DNP3 frame"
-                                        key = (
-                                            proto,
-                                            direction,
-                                            peer_ip,
-                                            port_key,
-                                            label,
-                                        )
-                                        if key not in seen_ot_commands:
-                                            seen_ot_commands.add(key)
-                                            _emit_event(
-                                                ts=ts,
-                                                category="DNP3",
-                                                summary=label,
-                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            )
-                                            cmd_event_added = True
-                                elif proto == "S7" and port_key == S7_PORT:
-                                    # S7 command and COTP detail extraction is handled
-                                    # below via analyze_s7(); keep only flow context here.
-                                    pass
+                    pass
 
-                                if not cmd_event_added:
-                                    flow_key = (proto, direction, peer_ip, port_key)
-                                    if flow_key not in seen_ot_flows:
-                                        seen_ot_flows.add(flow_key)
+        if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+            tcp_layer = pkt[TCP]  # type: ignore[index]
+            flags = getattr(tcp_layer, "flags", None)
+            is_syn = False
+            is_ack = False
+            is_rst = False
+            is_fin = False
+            if isinstance(flags, str):
+                flag_text = flags
+            else:
+                flag_text = None
+            flag_bits: Optional[int] = None
+            if flag_text is None and flags is not None:
+                try:
+                    flag_bits = int(flags)
+                except Exception:
+                    try:
+                        flag_text = str(flags)
+                    except Exception:
+                        flag_text = None
+            if flag_text is not None:
+                is_syn = "S" in flag_text
+                is_ack = "A" in flag_text
+                is_rst = "R" in flag_text
+                is_fin = "F" in flag_text
+            elif flag_bits is not None:
+                is_syn = (flag_bits & 0x02) != 0
+                is_ack = (flag_bits & 0x10) != 0
+                is_rst = (flag_bits & 0x04) != 0
+                is_fin = (flag_bits & 0x01) != 0
+            is_synack = is_syn and is_ack
+            is_syn_only = is_syn and not is_ack
+            is_final_ack = is_ack and not is_syn and not is_rst and not is_fin
+            sport = int(getattr(tcp_layer, "sport", 0) or 0)
+            dport = int(getattr(tcp_layer, "dport", 0) or 0)
+            seq = int(getattr(tcp_layer, "seq", 0) or 0)
+            ack = int(getattr(tcp_layer, "ack", 0) or 0)
+            payload = None
+            try:
+                payload = bytes(tcp_layer.payload)
+            except Exception:
+                payload = None
+            if (src_ip == target_ip or dst_ip == target_ip) and sport and dport:
+                if is_syn_only:
+                    syn_key = (src_ip, dst_ip, sport, dport, seq)
+                    if syn_key not in seen_tcp_syns:
+                        seen_tcp_syns.add(syn_key)
+                        key = (src_ip, dst_ip, sport, dport)
+                        tcp_handshakes[key].append(_new_handshake(syn_ts=ts))
+                elif is_synack:
+                    synack_key = (src_ip, dst_ip, sport, dport, seq, ack)
+                    if synack_key not in seen_tcp_synacks:
+                        seen_tcp_synacks.add(synack_key)
+                        key = (dst_ip, src_ip, dport, sport)
+                        bucket = tcp_handshakes[key]
+                        handshake = _find_handshake_for_synack(bucket)
+                        if handshake is None:
+                            handshake = _new_handshake()
+                            bucket.append(handshake)
+                        handshake["synack"] = ts
+                elif is_final_ack:
+                    key = (src_ip, dst_ip, sport, dport)
+                    bucket = tcp_handshakes.get(key)
+                    if bucket:
+                        handshake = _find_handshake_for_ack(bucket)
+                        if handshake is not None:
+                            handshake["ack"] = ts
+            if src_ip == target_ip or dst_ip == target_ip:
+                port_key = dport if src_ip == target_ip else sport
+                if port_key:
+                    proto = OT_PORT_PROTOCOLS.get(port_key)
+                    if proto:
+                        ot_protocol_counts[proto] += 1
+                        direction = "outbound" if src_ip == target_ip else "inbound"
+                        peer_ip = dst_ip if src_ip == target_ip else src_ip
+                        if peer_ip:
+                            cmd_event_added = False
+                            if proto == "Modbus" and port_key == MODBUS_TCP_PORT:
+                                parsed = _parse_modbus_command(payload)
+                                if parsed:
+                                    (
+                                        func_code,
+                                        func_name,
+                                        is_exc,
+                                        unit_id,
+                                        exc_desc,
+                                    ) = parsed
+                                    label = f"Modbus {func_name}"
+                                    if is_exc:
+                                        label = f"Modbus exception {func_name}"
+                                    key = (
+                                        proto,
+                                        direction,
+                                        peer_ip,
+                                        port_key,
+                                        label,
+                                    )
+                                    if key not in seen_ot_commands:
+                                        seen_ot_commands.add(key)
+                                        detail = f"{target_ip} -> {peer_ip}:{port_key} unit {unit_id} {func_name}"
+                                        if is_exc and exc_desc:
+                                            detail += f" (Exception: {exc_desc})"
+                                        _emit_event(
+                                            ts=ts,
+                                            category="Modbus",
+                                            summary=label,
+                                            details=detail,
+                                        )
+                                        cmd_event_added = True
+                            elif proto in {"ENIP", "CIP"} and port_key in {
+                                44818,
+                                2222,
+                            }:
+                                enip = _parse_enip_command(payload)
+                                if enip:
+                                    cmd, name = enip
+                                    label = name or f"ENIP cmd 0x{cmd:04x}"
+                                    key = (
+                                        proto,
+                                        direction,
+                                        peer_ip,
+                                        port_key,
+                                        label,
+                                    )
+                                    if key not in seen_ot_commands:
+                                        seen_ot_commands.add(key)
                                         _emit_event(
                                             ts=ts,
                                             category=proto,
-                                            summary=f"{proto} flow",
+                                            summary=f"{proto} {label}",
                                             details=f"{target_ip} -> {peer_ip}:{port_key}",
                                         )
-                if src_ip == target_ip:
-                    if dport in TELNET_PORTS:
-                        key = (dst_ip, dport, "TCP", "outbound")
-                        if key not in seen_telnet_flows:
-                            seen_telnet_flows.add(key)
+                                        cmd_event_added = True
+                            elif proto == "OPC UA" and port_key == OPC_UA_PORT:
+                                msg = _parse_opcua_message(payload)
+                                if msg:
+                                    label = f"OPC UA {msg}"
+                                    key = (
+                                        proto,
+                                        direction,
+                                        peer_ip,
+                                        port_key,
+                                        label,
+                                    )
+                                    if key not in seen_ot_commands:
+                                        seen_ot_commands.add(key)
+                                        _emit_event(
+                                            ts=ts,
+                                            category="OPC UA",
+                                            summary=label,
+                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                        )
+                                        cmd_event_added = True
+                            elif proto == "IEC-104" and port_key == IEC104_PORT:
+                                frame = _iec104_frame_type(payload)
+                                if frame:
+                                    label = f"IEC-104 {frame}"
+                                    key = (
+                                        proto,
+                                        direction,
+                                        peer_ip,
+                                        port_key,
+                                        label,
+                                    )
+                                    if key not in seen_ot_commands:
+                                        seen_ot_commands.add(key)
+                                        _emit_event(
+                                            ts=ts,
+                                            category="IEC-104",
+                                            summary=label,
+                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                        )
+                                        cmd_event_added = True
+                            elif proto == "DNP3" and port_key == DNP3_PORT:
+                                if _dnp3_frame_seen(payload):
+                                    label = "DNP3 frame"
+                                    key = (
+                                        proto,
+                                        direction,
+                                        peer_ip,
+                                        port_key,
+                                        label,
+                                    )
+                                    if key not in seen_ot_commands:
+                                        seen_ot_commands.add(key)
+                                        _emit_event(
+                                            ts=ts,
+                                            category="DNP3",
+                                            summary=label,
+                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                        )
+                                        cmd_event_added = True
+                            elif proto == "S7" and port_key == S7_PORT:
+                                # S7 command and COTP detail extraction is handled
+                                # below via analyze_s7(); keep only flow context here.
+                                pass
+
+                            if not cmd_event_added:
+                                flow_key = (proto, direction, peer_ip, port_key)
+                                if flow_key not in seen_ot_flows:
+                                    seen_ot_flows.add(flow_key)
+                                    _emit_event(
+                                        ts=ts,
+                                        category=proto,
+                                        summary=f"{proto} flow",
+                                        details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                    )
+            if src_ip == target_ip:
+                if dport in TELNET_PORTS:
+                    key = (dst_ip, dport, "TCP", "outbound")
+                    if key not in seen_telnet_flows:
+                        seen_telnet_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="Telnet",
+                            summary="Telnet connection",
+                            details=f"{target_ip} -> {dst_ip}:{dport}",
+                        )
+                if dport in REMOTE_ADMIN_PORT_SUMMARY:
+                    service = REMOTE_ADMIN_PORT_SUMMARY[dport]
+                    key = (dst_ip, dport, "outbound", service)
+                    if key not in seen_remote_admin_flows:
+                        seen_remote_admin_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="Connection",
+                            summary=service,
+                            details=f"{target_ip} -> {dst_ip}:{dport}",
+                        )
+                if dport in {139, 445}:
+                    key = (dst_ip, dport, "outbound")
+                    if key not in seen_smb_flows:
+                        seen_smb_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="SMB",
+                            summary="SMB connection",
+                            details=f"{target_ip} -> {dst_ip}:{dport}",
+                        )
+                tls_label = _tls_handshake_label(payload)
+                if tls_label and dport in TLS_HANDSHAKE_PORTS:
+                    key = (dst_ip, dport, "outbound", tls_label)
+                    if key not in seen_tls_handshakes:
+                        seen_tls_handshakes.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="Connection",
+                            summary=tls_label,
+                            details=f"{target_ip} -> {dst_ip}:{dport}",
+                        )
+                if dport in {139, 445}:
+                    hint = _netbios_session_hint(payload)
+                    if hint:
+                        key = (src_ip, dst_ip, dport)
+                        if key not in seen_netbios_sessions:
+                            seen_netbios_sessions.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="NetBIOS",
+                                summary=hint,
+                                details=f"{target_ip} -> {dst_ip}:{dport}",
+                            )
+                rpc_type = _rpc_packet_type(payload)
+                if rpc_type and dport in {135, 445, 593}:
+                    key = (src_ip, dst_ip, dport, rpc_type)
+                    if key not in seen_rpc_events:
+                        seen_rpc_events.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="RPC",
+                            summary=f"RPC {rpc_type}",
+                            details=f"{target_ip} -> {dst_ip}:{dport}",
+                        )
+                ps_cmd = _extract_powershell_command(payload)
+                if ps_cmd:
+                    key = (src_ip, dst_ip, dport, ps_cmd)
+                    if key not in seen_ps_commands:
+                        seen_ps_commands.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="PowerShell",
+                            summary="PowerShell command",
+                            details=f"{target_ip} -> {dst_ip}:{dport} {ps_cmd}",
+                        )
+                wmic_cmd = _extract_wmic_command(payload)
+                if wmic_cmd:
+                    key = (src_ip, dst_ip, dport, wmic_cmd)
+                    if key not in seen_wmic_commands:
+                        seen_wmic_commands.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="WMIC",
+                            summary="WMIC command",
+                            details=f"{target_ip} -> {dst_ip}:{dport} {wmic_cmd}",
+                        )
+                payload_text = (
+                    decode_payload(payload, encoding="latin-1") if payload else ""
+                )
+                if payload and (
+                    dport in WINRM_PORTS
+                    or (payload_text and WSMAN_RE.search(payload_text))
+                ):
+                    winrm_cmd = _extract_winrm_command(payload)
+                    if winrm_cmd:
+                        key = (src_ip, dst_ip, dport, winrm_cmd)
+                        if key not in seen_winrm_commands:
+                            seen_winrm_commands.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="WinRM",
+                                summary="WinRM command",
+                                details=f"{target_ip} -> {dst_ip}:{dport} {winrm_cmd}",
+                            )
+                if payload and dport in TELNET_PORTS:
+                    telnet_cmd = _extract_telnet_command(payload)
+                    if telnet_cmd:
+                        key = (src_ip, dst_ip, dport, telnet_cmd)
+                        if key not in seen_telnet_commands:
+                            seen_telnet_commands.add(key)
                             _emit_event(
                                 ts=ts,
                                 category="Telnet",
-                                summary="Telnet connection",
-                                details=f"{target_ip} -> {dst_ip}:{dport}",
+                                summary="Telnet command",
+                                details=f"{target_ip} -> {dst_ip}:{dport} {telnet_cmd}",
                             )
-                    if dport in REMOTE_ADMIN_PORT_SUMMARY:
-                        service = REMOTE_ADMIN_PORT_SUMMARY[dport]
-                        key = (dst_ip, dport, "outbound", service)
-                        if key not in seen_remote_admin_flows:
-                            seen_remote_admin_flows.add(key)
+                if payload and dport in FTP_CONTROL_PORTS:
+                    ftp_cmd = _extract_ftp_command(_decode_payload_line(payload))
+                    if ftp_cmd:
+                        key = (src_ip, dst_ip, dport, ftp_cmd)
+                        if key not in seen_ftp_commands:
+                            seen_ftp_commands.add(key)
                             _emit_event(
                                 ts=ts,
-                                category="Connection",
-                                summary=service,
-                                details=f"{target_ip} -> {dst_ip}:{dport}",
+                                category="FTP",
+                                summary="FTP command",
+                                details=f"{target_ip} -> {dst_ip}:{dport} {ftp_cmd}",
                             )
-                    if dport in {139, 445}:
-                        key = (dst_ip, dport, "outbound")
-                        if key not in seen_smb_flows:
-                            seen_smb_flows.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="SMB",
-                                summary="SMB connection",
-                                details=f"{target_ip} -> {dst_ip}:{dport}",
-                            )
-                    tls_label = _tls_handshake_label(payload)
-                    if tls_label and dport in TLS_HANDSHAKE_PORTS:
-                        key = (dst_ip, dport, "outbound", tls_label)
-                        if key not in seen_tls_handshakes:
-                            seen_tls_handshakes.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="Connection",
-                                summary=tls_label,
-                                details=f"{target_ip} -> {dst_ip}:{dport}",
-                            )
-                    if dport in {139, 445}:
-                        hint = _netbios_session_hint(payload)
-                        if hint:
-                            key = (src_ip, dst_ip, dport)
-                            if key not in seen_netbios_sessions:
-                                seen_netbios_sessions.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="NetBIOS",
-                                    summary=hint,
-                                    details=f"{target_ip} -> {dst_ip}:{dport}",
+                if payload and payload.startswith(b"POST "):
+                    try:
+                        line = payload.split(b"\r\n", 1)[0].decode(
+                            "latin-1", errors="ignore"
+                        )
+                        host = "-"
+                        for header in payload.split(b"\r\n"):
+                            if header.lower().startswith(b"host:"):
+                                host = (
+                                    header.decode("latin-1", errors="ignore")
+                                    .split(":", 1)[1]
+                                    .strip()
                                 )
+                                break
+                        dedupe_key = (
+                            "http-post",
+                            src_ip,
+                            dst_ip,
+                            dport,
+                            seq,
+                            line,
+                            host,
+                        )
+                        _emit_event(
+                            ts=ts,
+                            category="HTTP",
+                            summary="HTTP POST",
+                            details=f"{target_ip} -> {dst_ip}:{dport} {line} Host: {host}",
+                            dedupe_key=dedupe_key,
+                        )
+                    except Exception:
+                        dedupe_key = ("http-post", src_ip, dst_ip, dport, seq)
+                        _emit_event(
+                            ts=ts,
+                            category="HTTP",
+                            summary="HTTP POST",
+                            details=f"{target_ip} -> {dst_ip}:{dport}",
+                            dedupe_key=dedupe_key,
+                        )
+                if dport in EMAIL_PORT_SERVICES:
+                    service = EMAIL_PORT_SERVICES[dport]
+                    flow_key = (dst_ip, dport, "TCP", "outbound", service)
+                    if flow_key not in seen_email_flows:
+                        seen_email_flows.add(flow_key)
+                        _emit_event(
+                            ts=ts,
+                            category="Email",
+                            summary=f"{service} connection",
+                            details=f"{target_ip} -> {dst_ip}:{dport}",
+                        )
+                    first_line = _decode_payload_line(payload)
+                    command = _extract_email_command(service, first_line)
+                    if command:
+                        action_key = (
+                            dst_ip,
+                            dport,
+                            "TCP",
+                            "outbound",
+                            service,
+                            command,
+                        )
+                        if action_key not in seen_email_actions:
+                            seen_email_actions.add(action_key)
+                            _emit_event(
+                                ts=ts,
+                                category="Email",
+                                summary=f"{service} command",
+                                details=f"{target_ip} -> {dst_ip}:{dport} {command}",
+                            )
+                if dport in ldap_ports:
+                    key = (dst_ip, dport, "TCP", "outbound")
+                    if key not in seen_ldap_flows:
+                        seen_ldap_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="LDAP",
+                            summary="LDAP connection",
+                            details=f"{target_ip} -> {dst_ip}:{dport}",
+                        )
+                if dport in domain_ports:
+                    key = (dst_ip, dport, "TCP", "outbound")
+                    if key not in seen_domain_flows:
+                        seen_domain_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="MS Domain",
+                            summary="Domain service access",
+                            details=f"{target_ip} -> {dst_ip}:{dport}",
+                        )
+                if is_syn_only and dport:
+                    dedupe_key = ("tcp-syn", src_ip, dst_ip, sport, dport, seq)
+                    _emit_event(
+                        ts=ts,
+                        category="Connection",
+                        summary="TCP connect attempt",
+                        details=f"{target_ip} -> {dst_ip}:{dport} (SYN)",
+                        dedupe_key=dedupe_key,
+                    )
+                    scan_ports[dst_ip].add(dport)
+                    if ts is not None:
+                        scan_first.setdefault(dst_ip, ts)
+                        scan_last[dst_ip] = ts
+                if is_synack and sport:
+                    dedupe_key = (
+                        "tcp-synack",
+                        src_ip,
+                        dst_ip,
+                        sport,
+                        dport,
+                        seq,
+                        ack,
+                    )
+                    _emit_event(
+                        ts=ts,
+                        category="Connection",
+                        summary="TCP SYN-ACK",
+                        details=f"{target_ip} -> {dst_ip}:{sport} (SYN-ACK)",
+                        dedupe_key=dedupe_key,
+                    )
+            elif dst_ip == target_ip:
+                if sport in TELNET_PORTS:
+                    key = (src_ip, sport, "TCP", "inbound")
+                    if key not in seen_telnet_flows:
+                        seen_telnet_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="Telnet",
+                            summary="Telnet connection",
+                            details=f"{src_ip} -> {target_ip}:{sport}",
+                        )
+                if sport in REMOTE_ADMIN_PORT_SUMMARY:
+                    service = REMOTE_ADMIN_PORT_SUMMARY[sport]
+                    key = (src_ip, sport, "inbound", service)
+                    if key not in seen_remote_admin_flows:
+                        seen_remote_admin_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="Connection",
+                            summary=service,
+                            details=f"{src_ip} -> {target_ip}:{sport}",
+                        )
+                if sport in {139, 445}:
+                    key = (src_ip, sport, "inbound")
+                    if key not in seen_smb_flows:
+                        seen_smb_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="SMB",
+                            summary="SMB connection",
+                            details=f"{src_ip} -> {target_ip}:{sport}",
+                        )
+                tls_label = _tls_handshake_label(payload)
+                if tls_label and sport in TLS_HANDSHAKE_PORTS:
+                    key = (src_ip, sport, "inbound", tls_label)
+                    if key not in seen_tls_handshakes:
+                        seen_tls_handshakes.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="Connection",
+                            summary=tls_label,
+                            details=f"{src_ip} -> {target_ip}:{sport}",
+                        )
+                if is_syn_only and dport:
+                    dedupe_key = ("tcp-syn", src_ip, dst_ip, sport, dport, seq)
+                    _emit_event(
+                        ts=ts,
+                        category="Connection",
+                        summary="TCP connect attempt",
+                        details=f"{src_ip} -> {target_ip}:{dport} (SYN)",
+                        dedupe_key=dedupe_key,
+                    )
+                if is_synack and sport:
+                    dedupe_key = (
+                        "tcp-synack",
+                        src_ip,
+                        dst_ip,
+                        sport,
+                        dport,
+                        seq,
+                        ack,
+                    )
+                    _emit_event(
+                        ts=ts,
+                        category="Connection",
+                        summary="TCP SYN-ACK",
+                        details=f"{src_ip} -> {target_ip}:{sport} (SYN-ACK)",
+                        dedupe_key=dedupe_key,
+                    )
+                if sport in {139, 445}:
+                    hint = _netbios_session_hint(payload)
+                    if hint:
+                        key = (src_ip, dst_ip, sport)
+                        if key not in seen_netbios_sessions:
+                            seen_netbios_sessions.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="NetBIOS",
+                                summary=hint,
+                                details=f"{src_ip} -> {target_ip}:{sport}",
+                            )
+                rpc_type = _rpc_packet_type(payload)
+                if rpc_type and sport in {135, 445, 593}:
+                    key = (src_ip, dst_ip, sport, rpc_type)
+                    if key not in seen_rpc_events:
+                        seen_rpc_events.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="RPC",
+                            summary=f"RPC {rpc_type}",
+                            details=f"{src_ip} -> {target_ip}:{sport}",
+                        )
+                ps_cmd = _extract_powershell_command(payload)
+                if ps_cmd:
+                    key = (src_ip, dst_ip, sport, ps_cmd)
+                    if key not in seen_ps_commands:
+                        seen_ps_commands.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="PowerShell",
+                            summary="PowerShell command",
+                            details=f"{src_ip} -> {target_ip}:{sport} {ps_cmd}",
+                        )
+                wmic_cmd = _extract_wmic_command(payload)
+                if wmic_cmd:
+                    key = (src_ip, dst_ip, sport, wmic_cmd)
+                    if key not in seen_wmic_commands:
+                        seen_wmic_commands.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="WMIC",
+                            summary="WMIC command",
+                            details=f"{src_ip} -> {target_ip}:{sport} {wmic_cmd}",
+                        )
+                payload_text = (
+                    decode_payload(payload, encoding="latin-1") if payload else ""
+                )
+                if payload and (
+                    sport in WINRM_PORTS
+                    or (payload_text and WSMAN_RE.search(payload_text))
+                ):
+                    winrm_cmd = _extract_winrm_command(payload)
+                    if winrm_cmd:
+                        key = (src_ip, dst_ip, sport, winrm_cmd)
+                        if key not in seen_winrm_commands:
+                            seen_winrm_commands.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="WinRM",
+                                summary="WinRM command",
+                                details=f"{src_ip} -> {target_ip}:{sport} {winrm_cmd}",
+                            )
+                if payload and sport in TELNET_PORTS:
+                    telnet_cmd = _extract_telnet_command(payload)
+                    if telnet_cmd:
+                        key = (src_ip, dst_ip, sport, telnet_cmd)
+                        if key not in seen_telnet_commands:
+                            seen_telnet_commands.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="Telnet",
+                                summary="Telnet command",
+                                details=f"{src_ip} -> {target_ip}:{sport} {telnet_cmd}",
+                            )
+                if payload and sport in FTP_CONTROL_PORTS:
+                    ftp_cmd = _extract_ftp_command(_decode_payload_line(payload))
+                    if ftp_cmd:
+                        key = (src_ip, dst_ip, sport, ftp_cmd)
+                        if key not in seen_ftp_commands:
+                            seen_ftp_commands.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="FTP",
+                                summary="FTP command",
+                                details=f"{src_ip} -> {target_ip}:{sport} {ftp_cmd}",
+                            )
+                if sport in EMAIL_PORT_SERVICES:
+                    service = EMAIL_PORT_SERVICES[sport]
+                    flow_key = (src_ip, sport, "TCP", "inbound", service)
+                    if flow_key not in seen_email_flows:
+                        seen_email_flows.add(flow_key)
+                        _emit_event(
+                            ts=ts,
+                            category="Email",
+                            summary=f"{service} connection",
+                            details=f"{src_ip} -> {target_ip}:{sport}",
+                        )
+                    first_line = _decode_payload_line(payload)
+                    command = _extract_email_command(service, first_line)
+                    if command:
+                        action_key = (
+                            src_ip,
+                            sport,
+                            "TCP",
+                            "inbound",
+                            service,
+                            command,
+                        )
+                        if action_key not in seen_email_actions:
+                            seen_email_actions.add(action_key)
+                            _emit_event(
+                                ts=ts,
+                                category="Email",
+                                summary=f"{service} command",
+                                details=f"{src_ip} -> {target_ip}:{sport} {command}",
+                            )
+                if sport in ldap_ports:
+                    key = (src_ip, sport, "TCP", "inbound")
+                    if key not in seen_ldap_flows:
+                        seen_ldap_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="LDAP",
+                            summary="LDAP connection",
+                            details=f"{src_ip} -> {target_ip}:{sport}",
+                        )
+                if sport in domain_ports:
+                    key = (src_ip, sport, "TCP", "inbound")
+                    if key not in seen_domain_flows:
+                        seen_domain_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="MS Domain",
+                            summary="Domain service access",
+                            details=f"{src_ip} -> {target_ip}:{sport}",
+                        )
+
+        if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+            udp_layer = pkt[UDP]  # type: ignore[index]
+            sport = int(getattr(udp_layer, "sport", 0) or 0)
+            dport = int(getattr(udp_layer, "dport", 0) or 0)
+            payload = None
+            try:
+                payload = bytes(udp_layer.payload)
+            except Exception:
+                payload = None
+
+            if src_ip == target_ip or dst_ip == target_ip:
+                dhcp_msg = _extract_dhcp_message_type(pkt)
+                if dhcp_msg and (
+                    {sport, dport} & {67, 68} or {sport, dport} & {546, 547}
+                ):
+                    dedupe_key = (
+                        "dhcp",
+                        src_ip,
+                        dst_ip,
+                        sport,
+                        dport,
+                        dhcp_msg,
+                    )
+                    _emit_event(
+                        ts=ts,
+                        category="DHCP",
+                        summary=f"DHCP {dhcp_msg}",
+                        details=f"{src_ip}:{sport} -> {dst_ip}:{dport}",
+                        dedupe_key=dedupe_key,
+                    )
+                elif payload and ({sport, dport} & {546, 547}):
+                    try:
+                        msg_code = int(payload[0])
+                        msg_name = _DHCP6_MESSAGE_TYPES.get(
+                            msg_code, f"TYPE{msg_code}v6"
+                        )
+                        dedupe_key = (
+                            "dhcp6",
+                            src_ip,
+                            dst_ip,
+                            sport,
+                            dport,
+                            msg_name,
+                        )
+                        _emit_event(
+                            ts=ts,
+                            category="DHCP",
+                            summary=f"DHCP {msg_name}",
+                            details=f"{src_ip}:{sport} -> {dst_ip}:{dport}",
+                            dedupe_key=dedupe_key,
+                        )
+                    except Exception:
+                        pass
+            if src_ip == target_ip or dst_ip == target_ip:
+                port_key = dport if src_ip == target_ip else sport
+                if port_key:
+                    proto = OT_PORT_PROTOCOLS.get(port_key)
+                    if proto:
+                        ot_protocol_counts[proto] += 1
+                        direction = "outbound" if src_ip == target_ip else "inbound"
+                        peer_ip = dst_ip if src_ip == target_ip else src_ip
+                        if peer_ip:
+                            cmd_event_added = False
+                            if proto == "DNP3" and port_key == DNP3_PORT:
+                                if _dnp3_frame_seen(payload):
+                                    label = "DNP3 frame"
+                                    key = (
+                                        proto,
+                                        direction,
+                                        peer_ip,
+                                        port_key,
+                                        label,
+                                    )
+                                    if key not in seen_ot_commands:
+                                        seen_ot_commands.add(key)
+                                        _emit_event(
+                                            ts=ts,
+                                            category="DNP3",
+                                            summary=label,
+                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                        )
+                                        cmd_event_added = True
+                            if not cmd_event_added:
+                                flow_key = (proto, direction, peer_ip, port_key)
+                                if flow_key not in seen_ot_flows:
+                                    seen_ot_flows.add(flow_key)
+                                    _emit_event(
+                                        ts=ts,
+                                        category=proto,
+                                        summary=f"{proto} flow",
+                                        details=f"{target_ip} -> {peer_ip}:{port_key}",
+                                    )
+            if src_ip == target_ip:
+                if dport:
+                    key = (dst_ip, dport)
+                    if key not in seen_udp_flows:
+                        seen_udp_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="Connection",
+                            summary="UDP flow",
+                            details=f"{target_ip} -> {dst_ip}:{dport}",
+                        )
                     rpc_type = _rpc_packet_type(payload)
                     if rpc_type and dport in {135, 445, 593}:
                         key = (src_ip, dst_ip, dport, rpc_type)
@@ -2164,611 +2653,104 @@ def analyze_timeline(
                                 summary=f"RPC {rpc_type}",
                                 details=f"{target_ip} -> {dst_ip}:{dport}",
                             )
-                    ps_cmd = _extract_powershell_command(payload)
-                    if ps_cmd:
-                        key = (src_ip, dst_ip, dport, ps_cmd)
-                        if key not in seen_ps_commands:
-                            seen_ps_commands.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="PowerShell",
-                                summary="PowerShell command",
-                                details=f"{target_ip} -> {dst_ip}:{dport} {ps_cmd}",
-                            )
-                    wmic_cmd = _extract_wmic_command(payload)
-                    if wmic_cmd:
-                        key = (src_ip, dst_ip, dport, wmic_cmd)
-                        if key not in seen_wmic_commands:
-                            seen_wmic_commands.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="WMIC",
-                                summary="WMIC command",
-                                details=f"{target_ip} -> {dst_ip}:{dport} {wmic_cmd}",
-                            )
-                    payload_text = (
-                        decode_payload(payload, encoding="latin-1") if payload else ""
-                    )
-                    if payload and (
-                        dport in WINRM_PORTS
-                        or (payload_text and WSMAN_RE.search(payload_text))
-                    ):
-                        winrm_cmd = _extract_winrm_command(payload)
-                        if winrm_cmd:
-                            key = (src_ip, dst_ip, dport, winrm_cmd)
-                            if key not in seen_winrm_commands:
-                                seen_winrm_commands.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="WinRM",
-                                    summary="WinRM command",
-                                    details=f"{target_ip} -> {dst_ip}:{dport} {winrm_cmd}",
-                                )
-                    if payload and dport in TELNET_PORTS:
-                        telnet_cmd = _extract_telnet_command(payload)
-                        if telnet_cmd:
-                            key = (src_ip, dst_ip, dport, telnet_cmd)
-                            if key not in seen_telnet_commands:
-                                seen_telnet_commands.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="Telnet",
-                                    summary="Telnet command",
-                                    details=f"{target_ip} -> {dst_ip}:{dport} {telnet_cmd}",
-                                )
-                    if payload and dport in FTP_CONTROL_PORTS:
-                        ftp_cmd = _extract_ftp_command(_decode_payload_line(payload))
-                        if ftp_cmd:
-                            key = (src_ip, dst_ip, dport, ftp_cmd)
-                            if key not in seen_ftp_commands:
-                                seen_ftp_commands.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="FTP",
-                                    summary="FTP command",
-                                    details=f"{target_ip} -> {dst_ip}:{dport} {ftp_cmd}",
-                                )
-                    if payload and payload.startswith(b"POST "):
-                        try:
-                            line = payload.split(b"\r\n", 1)[0].decode(
-                                "latin-1", errors="ignore"
-                            )
-                            host = "-"
-                            for header in payload.split(b"\r\n"):
-                                if header.lower().startswith(b"host:"):
-                                    host = (
-                                        header.decode("latin-1", errors="ignore")
-                                        .split(":", 1)[1]
-                                        .strip()
-                                    )
-                                    break
-                            dedupe_key = (
-                                "http-post",
-                                src_ip,
-                                dst_ip,
-                                dport,
-                                seq,
-                                line,
-                                host,
-                            )
-                            _emit_event(
-                                ts=ts,
-                                category="HTTP",
-                                summary="HTTP POST",
-                                details=f"{target_ip} -> {dst_ip}:{dport} {line} Host: {host}",
-                                dedupe_key=dedupe_key,
-                            )
-                        except Exception:
-                            dedupe_key = ("http-post", src_ip, dst_ip, dport, seq)
-                            _emit_event(
-                                ts=ts,
-                                category="HTTP",
-                                summary="HTTP POST",
-                                details=f"{target_ip} -> {dst_ip}:{dport}",
-                                dedupe_key=dedupe_key,
-                            )
-                    if dport in EMAIL_PORT_SERVICES:
-                        service = EMAIL_PORT_SERVICES[dport]
-                        flow_key = (dst_ip, dport, "TCP", "outbound", service)
-                        if flow_key not in seen_email_flows:
-                            seen_email_flows.add(flow_key)
-                            _emit_event(
-                                ts=ts,
-                                category="Email",
-                                summary=f"{service} connection",
-                                details=f"{target_ip} -> {dst_ip}:{dport}",
-                            )
-                        first_line = _decode_payload_line(payload)
-                        command = _extract_email_command(service, first_line)
-                        if command:
-                            action_key = (
-                                dst_ip,
-                                dport,
-                                "TCP",
-                                "outbound",
-                                service,
-                                command,
-                            )
-                            if action_key not in seen_email_actions:
-                                seen_email_actions.add(action_key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="Email",
-                                    summary=f"{service} command",
-                                    details=f"{target_ip} -> {dst_ip}:{dport} {command}",
-                                )
-                    if dport in ldap_ports:
-                        key = (dst_ip, dport, "TCP", "outbound")
-                        if key not in seen_ldap_flows:
-                            seen_ldap_flows.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="LDAP",
-                                summary="LDAP connection",
-                                details=f"{target_ip} -> {dst_ip}:{dport}",
-                            )
-                    if dport in domain_ports:
-                        key = (dst_ip, dport, "TCP", "outbound")
-                        if key not in seen_domain_flows:
-                            seen_domain_flows.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="MS Domain",
-                                summary="Domain service access",
-                                details=f"{target_ip} -> {dst_ip}:{dport}",
-                            )
-                    if is_syn_only and dport:
-                        dedupe_key = ("tcp-syn", src_ip, dst_ip, sport, dport, seq)
-                        _emit_event(
-                            ts=ts,
-                            category="Connection",
-                            summary="TCP connect attempt",
-                            details=f"{target_ip} -> {dst_ip}:{dport} (SYN)",
-                            dedupe_key=dedupe_key,
-                        )
-                        scan_ports[dst_ip].add(dport)
-                        if ts is not None:
-                            scan_first.setdefault(dst_ip, ts)
-                            scan_last[dst_ip] = ts
-                    if is_synack and sport:
-                        dedupe_key = (
-                            "tcp-synack",
-                            src_ip,
-                            dst_ip,
-                            sport,
-                            dport,
-                            seq,
-                            ack,
-                        )
-                        _emit_event(
-                            ts=ts,
-                            category="Connection",
-                            summary="TCP SYN-ACK",
-                            details=f"{target_ip} -> {dst_ip}:{sport} (SYN-ACK)",
-                            dedupe_key=dedupe_key,
-                        )
-                elif dst_ip == target_ip:
-                    if sport in TELNET_PORTS:
-                        key = (src_ip, sport, "TCP", "inbound")
-                        if key not in seen_telnet_flows:
-                            seen_telnet_flows.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="Telnet",
-                                summary="Telnet connection",
-                                details=f"{src_ip} -> {target_ip}:{sport}",
-                            )
-                    if sport in REMOTE_ADMIN_PORT_SUMMARY:
-                        service = REMOTE_ADMIN_PORT_SUMMARY[sport]
-                        key = (src_ip, sport, "inbound", service)
-                        if key not in seen_remote_admin_flows:
-                            seen_remote_admin_flows.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="Connection",
-                                summary=service,
-                                details=f"{src_ip} -> {target_ip}:{sport}",
-                            )
-                    if sport in {139, 445}:
-                        key = (src_ip, sport, "inbound")
-                        if key not in seen_smb_flows:
-                            seen_smb_flows.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="SMB",
-                                summary="SMB connection",
-                                details=f"{src_ip} -> {target_ip}:{sport}",
-                            )
-                    tls_label = _tls_handshake_label(payload)
-                    if tls_label and sport in TLS_HANDSHAKE_PORTS:
-                        key = (src_ip, sport, "inbound", tls_label)
-                        if key not in seen_tls_handshakes:
-                            seen_tls_handshakes.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="Connection",
-                                summary=tls_label,
-                                details=f"{src_ip} -> {target_ip}:{sport}",
-                            )
-                    if is_syn_only and dport:
-                        dedupe_key = ("tcp-syn", src_ip, dst_ip, sport, dport, seq)
-                        _emit_event(
-                            ts=ts,
-                            category="Connection",
-                            summary="TCP connect attempt",
-                            details=f"{src_ip} -> {target_ip}:{dport} (SYN)",
-                            dedupe_key=dedupe_key,
-                        )
-                    if is_synack and sport:
-                        dedupe_key = (
-                            "tcp-synack",
-                            src_ip,
-                            dst_ip,
-                            sport,
-                            dport,
-                            seq,
-                            ack,
-                        )
-                        _emit_event(
-                            ts=ts,
-                            category="Connection",
-                            summary="TCP SYN-ACK",
-                            details=f"{src_ip} -> {target_ip}:{sport} (SYN-ACK)",
-                            dedupe_key=dedupe_key,
-                        )
-                    if sport in {139, 445}:
-                        hint = _netbios_session_hint(payload)
-                        if hint:
-                            key = (src_ip, dst_ip, sport)
-                            if key not in seen_netbios_sessions:
-                                seen_netbios_sessions.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="NetBIOS",
-                                    summary=hint,
-                                    details=f"{src_ip} -> {target_ip}:{sport}",
-                                )
-                    rpc_type = _rpc_packet_type(payload)
-                    if rpc_type and sport in {135, 445, 593}:
-                        key = (src_ip, dst_ip, sport, rpc_type)
-                        if key not in seen_rpc_events:
-                            seen_rpc_events.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="RPC",
-                                summary=f"RPC {rpc_type}",
-                                details=f"{src_ip} -> {target_ip}:{sport}",
-                            )
-                    ps_cmd = _extract_powershell_command(payload)
-                    if ps_cmd:
-                        key = (src_ip, dst_ip, sport, ps_cmd)
-                        if key not in seen_ps_commands:
-                            seen_ps_commands.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="PowerShell",
-                                summary="PowerShell command",
-                                details=f"{src_ip} -> {target_ip}:{sport} {ps_cmd}",
-                            )
-                    wmic_cmd = _extract_wmic_command(payload)
-                    if wmic_cmd:
-                        key = (src_ip, dst_ip, sport, wmic_cmd)
-                        if key not in seen_wmic_commands:
-                            seen_wmic_commands.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="WMIC",
-                                summary="WMIC command",
-                                details=f"{src_ip} -> {target_ip}:{sport} {wmic_cmd}",
-                            )
-                    payload_text = (
-                        decode_payload(payload, encoding="latin-1") if payload else ""
-                    )
-                    if payload and (
-                        sport in WINRM_PORTS
-                        or (payload_text and WSMAN_RE.search(payload_text))
-                    ):
-                        winrm_cmd = _extract_winrm_command(payload)
-                        if winrm_cmd:
-                            key = (src_ip, dst_ip, sport, winrm_cmd)
-                            if key not in seen_winrm_commands:
-                                seen_winrm_commands.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="WinRM",
-                                    summary="WinRM command",
-                                    details=f"{src_ip} -> {target_ip}:{sport} {winrm_cmd}",
-                                )
-                    if payload and sport in TELNET_PORTS:
-                        telnet_cmd = _extract_telnet_command(payload)
-                        if telnet_cmd:
-                            key = (src_ip, dst_ip, sport, telnet_cmd)
-                            if key not in seen_telnet_commands:
-                                seen_telnet_commands.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="Telnet",
-                                    summary="Telnet command",
-                                    details=f"{src_ip} -> {target_ip}:{sport} {telnet_cmd}",
-                                )
-                    if payload and sport in FTP_CONTROL_PORTS:
-                        ftp_cmd = _extract_ftp_command(_decode_payload_line(payload))
-                        if ftp_cmd:
-                            key = (src_ip, dst_ip, sport, ftp_cmd)
-                            if key not in seen_ftp_commands:
-                                seen_ftp_commands.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="FTP",
-                                    summary="FTP command",
-                                    details=f"{src_ip} -> {target_ip}:{sport} {ftp_cmd}",
-                                )
-                    if sport in EMAIL_PORT_SERVICES:
-                        service = EMAIL_PORT_SERVICES[sport]
-                        flow_key = (src_ip, sport, "TCP", "inbound", service)
-                        if flow_key not in seen_email_flows:
-                            seen_email_flows.add(flow_key)
-                            _emit_event(
-                                ts=ts,
-                                category="Email",
-                                summary=f"{service} connection",
-                                details=f"{src_ip} -> {target_ip}:{sport}",
-                            )
-                        first_line = _decode_payload_line(payload)
-                        command = _extract_email_command(service, first_line)
-                        if command:
-                            action_key = (
-                                src_ip,
-                                sport,
-                                "TCP",
-                                "inbound",
-                                service,
-                                command,
-                            )
-                            if action_key not in seen_email_actions:
-                                seen_email_actions.add(action_key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="Email",
-                                    summary=f"{service} command",
-                                    details=f"{src_ip} -> {target_ip}:{sport} {command}",
-                                )
-                    if sport in ldap_ports:
-                        key = (src_ip, sport, "TCP", "inbound")
-                        if key not in seen_ldap_flows:
-                            seen_ldap_flows.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="LDAP",
-                                summary="LDAP connection",
-                                details=f"{src_ip} -> {target_ip}:{sport}",
-                            )
-                    if sport in domain_ports:
-                        key = (src_ip, sport, "TCP", "inbound")
-                        if key not in seen_domain_flows:
-                            seen_domain_flows.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="MS Domain",
-                                summary="Domain service access",
-                                details=f"{src_ip} -> {target_ip}:{sport}",
-                            )
-
-            if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                udp_layer = pkt[UDP]  # type: ignore[index]
-                sport = int(getattr(udp_layer, "sport", 0) or 0)
-                dport = int(getattr(udp_layer, "dport", 0) or 0)
-                payload = None
-                try:
-                    payload = bytes(udp_layer.payload)
-                except Exception:
-                    payload = None
-
-                if src_ip == target_ip or dst_ip == target_ip:
-                    dhcp_msg = _extract_dhcp_message_type(pkt)
-                    if dhcp_msg and (
-                        {sport, dport} & {67, 68} or {sport, dport} & {546, 547}
-                    ):
-                        dedupe_key = (
-                            "dhcp",
-                            src_ip,
-                            dst_ip,
-                            sport,
-                            dport,
-                            dhcp_msg,
-                        )
-                        _emit_event(
-                            ts=ts,
-                            category="DHCP",
-                            summary=f"DHCP {dhcp_msg}",
-                            details=f"{src_ip}:{sport} -> {dst_ip}:{dport}",
-                            dedupe_key=dedupe_key,
-                        )
-                    elif payload and ({sport, dport} & {546, 547}):
-                        try:
-                            msg_code = int(payload[0])
-                            msg_name = _DHCP6_MESSAGE_TYPES.get(
-                                msg_code, f"TYPE{msg_code}v6"
-                            )
-                            dedupe_key = (
-                                "dhcp6",
-                                src_ip,
-                                dst_ip,
-                                sport,
-                                dport,
-                                msg_name,
-                            )
-                            _emit_event(
-                                ts=ts,
-                                category="DHCP",
-                                summary=f"DHCP {msg_name}",
-                                details=f"{src_ip}:{sport} -> {dst_ip}:{dport}",
-                                dedupe_key=dedupe_key,
-                            )
-                        except Exception:
-                            pass
-                if src_ip == target_ip or dst_ip == target_ip:
-                    port_key = dport if src_ip == target_ip else sport
-                    if port_key:
-                        proto = OT_PORT_PROTOCOLS.get(port_key)
-                        if proto:
-                            ot_protocol_counts[proto] += 1
-                            direction = "outbound" if src_ip == target_ip else "inbound"
-                            peer_ip = dst_ip if src_ip == target_ip else src_ip
-                            if peer_ip:
-                                cmd_event_added = False
-                                if proto == "DNP3" and port_key == DNP3_PORT:
-                                    if _dnp3_frame_seen(payload):
-                                        label = "DNP3 frame"
-                                        key = (
-                                            proto,
-                                            direction,
-                                            peer_ip,
-                                            port_key,
-                                            label,
-                                        )
-                                        if key not in seen_ot_commands:
-                                            seen_ot_commands.add(key)
-                                            _emit_event(
-                                                ts=ts,
-                                                category="DNP3",
-                                                summary=label,
-                                                details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                            )
-                                            cmd_event_added = True
-                                if not cmd_event_added:
-                                    flow_key = (proto, direction, peer_ip, port_key)
-                                    if flow_key not in seen_ot_flows:
-                                        seen_ot_flows.add(flow_key)
-                                        _emit_event(
-                                            ts=ts,
-                                            category=proto,
-                                            summary=f"{proto} flow",
-                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                        )
-                if src_ip == target_ip:
-                    if dport:
-                        key = (dst_ip, dport)
-                        if key not in seen_udp_flows:
-                            seen_udp_flows.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="Connection",
-                                summary="UDP flow",
-                                details=f"{target_ip} -> {dst_ip}:{dport}",
-                            )
-                        rpc_type = _rpc_packet_type(payload)
-                        if rpc_type and dport in {135, 445, 593}:
-                            key = (src_ip, dst_ip, dport, rpc_type)
-                            if key not in seen_rpc_events:
-                                seen_rpc_events.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="RPC",
-                                    summary=f"RPC {rpc_type}",
-                                    details=f"{target_ip} -> {dst_ip}:{dport}",
-                                )
-                        if dport in {137, 138, 139}:
-                            action, name = _nbns_info(pkt)
-                            key = ("outbound", action, name)
-                            if key not in seen_nbns_events:
-                                seen_nbns_events.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="NetBIOS",
-                                    summary=action,
-                                    details=f"{target_ip} -> {dst_ip}:{dport} {name}",
-                                )
-                        if dport in {161, 162}:
-                            snmp_type = _snmp_pdu_type(payload)
-                            if snmp_type:
-                                key = (src_ip, dst_ip, dport, snmp_type)
-                                if key not in seen_snmp_events:
-                                    seen_snmp_events.add(key)
-                                    _emit_event(
-                                        ts=ts,
-                                        category="SNMP",
-                                        summary=f"SNMP {snmp_type}",
-                                        details=f"{target_ip} -> {dst_ip}:{dport}",
-                                    )
-                        if dport in ldap_ports:
-                            key = (dst_ip, dport, "UDP", "outbound")
-                            if key not in seen_ldap_flows:
-                                seen_ldap_flows.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="LDAP",
-                                    summary="LDAP activity",
-                                    details=f"{target_ip} -> {dst_ip}:{dport}",
-                                )
-                        if dport in domain_ports:
-                            key = (dst_ip, dport, "UDP", "outbound")
-                            if key not in seen_domain_flows:
-                                seen_domain_flows.add(key)
-                                _emit_event(
-                                    ts=ts,
-                                    category="MS Domain",
-                                    summary="Domain service activity",
-                                    details=f"{target_ip} -> {dst_ip}:{dport}",
-                                )
-                elif dst_ip == target_ip:
-                    rpc_type = _rpc_packet_type(payload)
-                    if rpc_type and sport in {135, 445, 593}:
-                        key = (src_ip, dst_ip, sport, rpc_type)
-                        if key not in seen_rpc_events:
-                            seen_rpc_events.add(key)
-                            _emit_event(
-                                ts=ts,
-                                category="RPC",
-                                summary=f"RPC {rpc_type}",
-                                details=f"{src_ip} -> {target_ip}:{sport}",
-                            )
-                    if sport in {137, 138, 139}:
+                    if dport in {137, 138, 139}:
                         action, name = _nbns_info(pkt)
-                        key = ("inbound", action, name)
+                        key = ("outbound", action, name)
                         if key not in seen_nbns_events:
                             seen_nbns_events.add(key)
                             _emit_event(
                                 ts=ts,
                                 category="NetBIOS",
                                 summary=action,
-                                details=f"{src_ip} -> {target_ip}:{sport} {name}",
+                                details=f"{target_ip} -> {dst_ip}:{dport} {name}",
                             )
-                    if sport in {161, 162}:
+                    if dport in {161, 162}:
                         snmp_type = _snmp_pdu_type(payload)
                         if snmp_type:
-                            key = (src_ip, dst_ip, sport, snmp_type)
+                            key = (src_ip, dst_ip, dport, snmp_type)
                             if key not in seen_snmp_events:
                                 seen_snmp_events.add(key)
                                 _emit_event(
                                     ts=ts,
                                     category="SNMP",
                                     summary=f"SNMP {snmp_type}",
-                                    details=f"{src_ip} -> {target_ip}:{sport}",
+                                    details=f"{target_ip} -> {dst_ip}:{dport}",
                                 )
-                    if sport in ldap_ports:
-                        key = (src_ip, sport, "UDP", "inbound")
+                    if dport in ldap_ports:
+                        key = (dst_ip, dport, "UDP", "outbound")
                         if key not in seen_ldap_flows:
                             seen_ldap_flows.add(key)
                             _emit_event(
                                 ts=ts,
                                 category="LDAP",
                                 summary="LDAP activity",
-                                details=f"{src_ip} -> {target_ip}:{sport}",
+                                details=f"{target_ip} -> {dst_ip}:{dport}",
                             )
-                    if sport in domain_ports:
-                        key = (src_ip, sport, "UDP", "inbound")
+                    if dport in domain_ports:
+                        key = (dst_ip, dport, "UDP", "outbound")
                         if key not in seen_domain_flows:
                             seen_domain_flows.add(key)
                             _emit_event(
                                 ts=ts,
                                 category="MS Domain",
                                 summary="Domain service activity",
+                                details=f"{target_ip} -> {dst_ip}:{dport}",
+                            )
+            elif dst_ip == target_ip:
+                rpc_type = _rpc_packet_type(payload)
+                if rpc_type and sport in {135, 445, 593}:
+                    key = (src_ip, dst_ip, sport, rpc_type)
+                    if key not in seen_rpc_events:
+                        seen_rpc_events.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="RPC",
+                            summary=f"RPC {rpc_type}",
+                            details=f"{src_ip} -> {target_ip}:{sport}",
+                        )
+                if sport in {137, 138, 139}:
+                    action, name = _nbns_info(pkt)
+                    key = ("inbound", action, name)
+                    if key not in seen_nbns_events:
+                        seen_nbns_events.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="NetBIOS",
+                            summary=action,
+                            details=f"{src_ip} -> {target_ip}:{sport} {name}",
+                        )
+                if sport in {161, 162}:
+                    snmp_type = _snmp_pdu_type(payload)
+                    if snmp_type:
+                        key = (src_ip, dst_ip, sport, snmp_type)
+                        if key not in seen_snmp_events:
+                            seen_snmp_events.add(key)
+                            _emit_event(
+                                ts=ts,
+                                category="SNMP",
+                                summary=f"SNMP {snmp_type}",
                                 details=f"{src_ip} -> {target_ip}:{sport}",
                             )
-    finally:
-        status.finish()
-        reader.close()
+                if sport in ldap_ports:
+                    key = (src_ip, sport, "UDP", "inbound")
+                    if key not in seen_ldap_flows:
+                        seen_ldap_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="LDAP",
+                            summary="LDAP activity",
+                            details=f"{src_ip} -> {target_ip}:{sport}",
+                        )
+                if sport in domain_ports:
+                    key = (src_ip, sport, "UDP", "inbound")
+                    if key not in seen_domain_flows:
+                        seen_domain_flows.add(key)
+                        _emit_event(
+                            ts=ts,
+                            category="MS Domain",
+                            summary="Domain service activity",
+                            details=f"{src_ip} -> {target_ip}:{sport}",
+                        )
 
     for art in artifacts_for_ip:
         ts = index_ts.get(art.packet_index)

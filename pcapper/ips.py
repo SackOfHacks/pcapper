@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 
-from .utils import shannon_entropy as _shannon_entropy, tcp_flags_int as _tcp_flags_int
-from .utils import is_public_ip as _is_public_ip
 import hashlib
 import ipaddress
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -15,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .tls_fingerprints import (
     _extract_alpn,
     _extract_sni,
@@ -24,48 +23,35 @@ from .tls_fingerprints import (
     _ja4_from_client_hello,
     _ja4s_from_server_hello,
 )
-from .utils import counter_inc, memoize_analysis, packet_length, safe_float, safe_read_text, set_add_cap, setdict_add
+from .utils import (
+    counter_inc,
+    env_int,
+    ip_object,
+    is_private_ip,
+    is_public_ip,
+    memoize_analysis,
+    packet_length,
+    safe_float,
+    safe_read_text,
+    set_add_cap,
+    setdict_add,
+    shannon_entropy,
+    tcp_flags_int,
+)
 
-MAX_ENDPOINTS = int(os.getenv("PCAPPER_MAX_ENDPOINTS", "20000"))
-MAX_CONVERSATIONS = int(os.getenv("PCAPPER_MAX_CONVERSATIONS", "50000"))
-MAX_UNIQUE_IPS = int(os.getenv("PCAPPER_MAX_UNIQUE_IPS", "200000"))
-MAX_SET_VALUES = int(os.getenv("PCAPPER_MAX_SET_VALUES", "2000"))
-
-try:
-    from scapy.layers.inet import IP  # type: ignore
-except Exception:  # pragma: no cover
-    IP = None  # type: ignore
-
-try:
-    from scapy.layers.inet import TCP  # type: ignore
-except Exception:  # pragma: no cover
-    TCP = None  # type: ignore
-
-try:
-    from scapy.layers.inet import UDP  # type: ignore
-except Exception:  # pragma: no cover
-    UDP = None  # type: ignore
-
-try:
-    from scapy.layers.inet import ICMP  # type: ignore
-except Exception:  # pragma: no cover
-    ICMP = None  # type: ignore
+MAX_ENDPOINTS = env_int("PCAPPER_MAX_ENDPOINTS", 20000, minimum=1)
+MAX_CONVERSATIONS = env_int("PCAPPER_MAX_CONVERSATIONS", 50000, minimum=1)
+MAX_UNIQUE_IPS = env_int("PCAPPER_MAX_UNIQUE_IPS", 200000, minimum=1)
+MAX_SET_VALUES = env_int("PCAPPER_MAX_SET_VALUES", 2000, minimum=1)
 
 try:
+    from scapy.layers.inet import ICMP, IP, TCP, UDP  # type: ignore
+    from scapy.layers.inet6 import IPv6  # type: ignore
     from scapy.layers.l2 import ARP, Ether  # type: ignore
 except Exception:  # pragma: no cover
-    ARP = None  # type: ignore
-    Ether = None  # type: ignore
+    IP = TCP = UDP = ICMP = IPv6 = ARP = Ether = None  # type: ignore
 
-try:
-    from scapy.layers.inet6 import IPv6  # type: ignore
-except Exception:  # pragma: no cover
-    IPv6 = None  # type: ignore
-
-try:
-    from scapy.layers.inet6 import ICMPv6  # type: ignore
-except Exception:  # pragma: no cover
-    ICMPv6 = None  # type: ignore
+_IPV6_NH_ICMPV6 = 58
 
 try:
     import geoip2.database  # type: ignore
@@ -237,17 +223,17 @@ def _enrich_ips_online(
 
 
 def _tcp_is_syn(flags: object) -> bool:
-    value = _tcp_flags_int(flags)
+    value = tcp_flags_int(flags)
     return bool(value & 0x02) and not bool(value & 0x10)
 
 
 def _tcp_is_synack(flags: object) -> bool:
-    value = _tcp_flags_int(flags)
+    value = tcp_flags_int(flags)
     return bool(value & 0x02) and bool(value & 0x10)
 
 
 def _tcp_is_final_handshake_ack(flags: object) -> bool:
-    value = _tcp_flags_int(flags)
+    value = tcp_flags_int(flags)
     return (
         bool(value & 0x10)
         and not bool(value & 0x02)
@@ -256,16 +242,33 @@ def _tcp_is_final_handshake_ack(flags: object) -> bool:
     )
 
 
+def _is_unicast_host_address(addr: str) -> bool:
+    """A real host address: not multicast/link-local/loopback/unspecified and
+    not a .0/.255 network or broadcast literal (discovery chatter, not a peer)."""
+    ip = ip_object(addr)
+    if ip is None:
+        return False
+    if ip.is_multicast or ip.is_link_local or ip.is_loopback or ip.is_unspecified:
+        return False
+    return not (addr.endswith(".255") or addr.endswith(".0"))
+
+
+def _is_internal_host_address(addr: str) -> bool:
+    """An RFC1918-style unicast host (see :func:`_is_unicast_host_address`)."""
+    ip = ip_object(addr)
+    if ip is None or not ip.is_private or ip.is_reserved:
+        return False
+    return _is_unicast_host_address(addr)
+
+
 def _build_ips_enrichment(
     *,
-    endpoints: list[IpEndpoint],
     conversations: list[IpConversation],
     suspicious_port_profiles: list[dict[str, object]],
     lateral_movement_scores: list[dict[str, object]],
     intel_findings: list[dict[str, object]],
     detections: list[dict[str, object]],
 ) -> dict[str, object]:
-    _ = (endpoints,)
     checks: dict[str, list[str]] = defaultdict(list)
 
     # Indicator quality gate: external IOC hits (AbuseIPDB/OTX/VT) and TLS
@@ -331,19 +334,6 @@ def _build_ips_enrichment(
     # Boundary cross-zone contact, but only for IPs already flagged by another
     # signal — private<->public contact alone is normal internet traffic and
     # would fire on every capture, so it is reported as corroborating context.
-    def _is_priv(addr: str) -> bool:
-        try:
-            return ipaddress.ip_address(addr).is_private
-        except Exception:
-            return False
-
-    def _is_global_unicast(addr: str) -> bool:
-        try:
-            ip = ipaddress.ip_address(addr)
-            return ip.is_global and not ip.is_multicast
-        except Exception:
-            return False
-
     flagged_ips = set(signal_sources.keys())
     if flagged_ips:
         boundary_seen: set[frozenset[str]] = set()
@@ -352,8 +342,8 @@ def _build_ips_enrichment(
             if not (s in flagged_ips or d in flagged_ips):
                 continue
             if not (
-                (_is_priv(s) and _is_global_unicast(d))
-                or (_is_priv(d) and _is_global_unicast(s))
+                (is_private_ip(s) and is_public_ip(d))
+                or (is_private_ip(d) and is_public_ip(s))
             ):
                 continue
             pair = frozenset((s, d))
@@ -681,14 +671,13 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     ipv4_count = 0
     ipv6_count = 0
     for ip_text in all_ips:
-        try:
-            addr = ipaddress.ip_address(ip_text)
-            if addr.version == 4:
-                ipv4_count += 1
-            elif addr.version == 6:
-                ipv6_count += 1
-        except Exception:
+        addr = ip_object(ip_text)
+        if addr is None:
             continue
+        if addr.version == 4:
+            ipv4_count += 1
+        else:
+            ipv6_count += 1
 
     ja_reputation_hits = [
         {
@@ -706,7 +695,6 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
             ip_enrichment.setdefault(ip_text, dict(rec))
 
     enrichment = _build_ips_enrichment(
-        endpoints=endpoint_rows,
         conversations=conversation_rows,
         suspicious_port_profiles=suspicious_port_profiles,
         lateral_movement_scores=lateral_movement_scores,
@@ -996,6 +984,8 @@ def _fetch_json(
 
 
 def _abuseipdb_lookup(ip_text: str, api_key: str) -> Optional[dict[str, object]]:
+    # Wire-derived text goes into a URL: percent-encode it (no path/query games).
+    ip_text = urllib.parse.quote(ip_text, safe="")
     url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip_text}&maxAgeInDays=90&verbose=true"
     headers = {"Key": api_key, "Accept": "application/json"}
     data = _fetch_json(url, headers)
@@ -1015,6 +1005,7 @@ def _abuseipdb_lookup(ip_text: str, api_key: str) -> Optional[dict[str, object]]
 
 
 def _otx_lookup(ip_text: str, api_key: str) -> Optional[dict[str, object]]:
+    ip_text = urllib.parse.quote(ip_text, safe="")
     url = f"https://otx.alienvault.com/api/v1/indicators/IPv4/{ip_text}/general"
     headers = {"X-OTX-API-KEY": api_key, "Accept": "application/json"}
     data = _fetch_json(url, headers)
@@ -1033,6 +1024,7 @@ def _otx_lookup(ip_text: str, api_key: str) -> Optional[dict[str, object]]:
 
 
 def _virustotal_lookup(ip_text: str, api_key: str) -> Optional[dict[str, object]]:
+    ip_text = urllib.parse.quote(ip_text, safe="")
     url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip_text}"
     headers = {"x-apikey": api_key, "Accept": "application/json"}
     data = _fetch_json(url, headers)
@@ -1058,23 +1050,29 @@ def _virustotal_lookup(ip_text: str, api_key: str) -> Optional[dict[str, object]
     }
 
 
-def _infer_protocol(pkt) -> str:
-    if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-        return "TCP"
-    if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-        return "UDP"
-    if ICMP is not None and pkt.haslayer(ICMP):  # type: ignore[truthy-bool]
-        return "ICMP"
-    if ICMPv6 is not None and pkt.haslayer(ICMPv6):  # type: ignore[truthy-bool]
-        return "ICMPv6"
-    if ARP is not None and pkt.haslayer(ARP):  # type: ignore[truthy-bool]
+def _infer_other_protocol(pkt, ip_layer, is_arp: bool) -> str:
+    """Protocol label for a packet that is neither TCP nor UDP.
+
+    scapy has no single ``ICMPv6`` layer class (the old import of one silently
+    failed, so ICMPv6 was always reported as OTHER); the IPv6 next-header
+    field is the reliable test.
+    """
+    if is_arp:
         return "ARP"
+    if ICMP is not None and pkt.getlayer(ICMP) is not None:
+        return "ICMP"
+    if ip_layer is not None and getattr(ip_layer, "nh", None) == _IPV6_NH_ICMPV6:
+        return "ICMPv6"
     return "OTHER"
 
 
 @memoize_analysis
 def analyze_ips(
-    path: Path, show_status: bool = True, geo_lookup: bool = False
+    path: Path,
+    show_status: bool = True,
+    geo_lookup: bool = False,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> IpSummary:
     errors: list[str] = []
     if IP is None and IPv6 is None and ARP is None:
@@ -1113,10 +1111,6 @@ def analyze_ips(
             detections=[],
             errors=errors,
         )
-
-    reader, status, stream, size_bytes, _file_type = get_reader(
-        path, show_status=show_status
-    )
 
     total_packets = 0
     total_bytes = 0
@@ -1191,50 +1185,40 @@ def analyze_ips(
         if mac_value in counter or len(counter) < MAX_SET_VALUES:
             counter[mac_value] += 1
 
-    try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
+    skipped_packets = 0
+    first_skip_error: str | None = None
 
-            src_ip = None
-            dst_ip = None
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IP]  # type: ignore[index]
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        try:
+            is_arp = False
+            ip_layer = pkt.getlayer(IP) if IP is not None else None
+            if ip_layer is not None:
                 src_ip = str(getattr(ip_layer, "src", ""))
                 dst_ip = str(getattr(ip_layer, "dst", ""))
-                if src_ip:
-                    set_add_cap(ipv4_set, src_ip, max_size=MAX_UNIQUE_IPS)
-                if dst_ip:
-                    set_add_cap(ipv4_set, dst_ip, max_size=MAX_UNIQUE_IPS)
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                ip_layer = pkt[IPv6]  # type: ignore[index]
-                src_ip = str(getattr(ip_layer, "src", ""))
-                dst_ip = str(getattr(ip_layer, "dst", ""))
-                if src_ip:
-                    set_add_cap(ipv6_set, src_ip, max_size=MAX_UNIQUE_IPS)
-                if dst_ip:
-                    set_add_cap(ipv6_set, dst_ip, max_size=MAX_UNIQUE_IPS)
-            elif ARP is not None and pkt.haslayer(ARP):  # type: ignore[truthy-bool]
-                arp_layer = pkt[ARP]  # type: ignore[index]
-                src_ip = str(getattr(arp_layer, "psrc", ""))
-                dst_ip = str(getattr(arp_layer, "pdst", ""))
-                if src_ip:
-                    set_add_cap(ipv4_set, src_ip, max_size=MAX_UNIQUE_IPS)
-                if dst_ip:
-                    set_add_cap(ipv4_set, dst_ip, max_size=MAX_UNIQUE_IPS)
+                family_set = ipv4_set
             else:
-                continue
-
+                ip_layer = pkt.getlayer(IPv6) if IPv6 is not None else None
+                if ip_layer is not None:
+                    src_ip = str(getattr(ip_layer, "src", ""))
+                    dst_ip = str(getattr(ip_layer, "dst", ""))
+                    family_set = ipv6_set
+                else:
+                    arp_layer = pkt.getlayer(ARP) if ARP is not None else None
+                    if arp_layer is None:
+                        continue
+                    is_arp = True
+                    src_ip = str(getattr(arp_layer, "psrc", ""))
+                    dst_ip = str(getattr(arp_layer, "pdst", ""))
+                    family_set = ipv4_set
+            if src_ip:
+                set_add_cap(family_set, src_ip, max_size=MAX_UNIQUE_IPS)
+            if dst_ip:
+                set_add_cap(family_set, dst_ip, max_size=MAX_UNIQUE_IPS)
             if not src_ip or not dst_ip:
                 continue
 
-            if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-                eth_layer = pkt[Ether]  # type: ignore[index]
+            eth_layer = pkt.getlayer(Ether) if Ether is not None else None
+            if eth_layer is not None:
                 _record_mac(src_ip, str(getattr(eth_layer, "src", "")))
                 _record_mac(dst_ip, str(getattr(eth_layer, "dst", "")))
 
@@ -1255,7 +1239,7 @@ def analyze_ips(
             elif udp_layer is not None:
                 protocol = "UDP"
             else:
-                protocol = _infer_protocol(pkt)
+                protocol = _infer_other_protocol(pkt, ip_layer, is_arp)
             counter_inc(protocol_counts, protocol)
 
             set_add_cap(unique_ips, src_ip, max_size=MAX_UNIQUE_IPS)
@@ -1397,9 +1381,14 @@ def analyze_ips(
                     if entry["last_seen"] is None or ts > entry["last_seen"]:  # type: ignore[operator]
                         entry["last_seen"] = ts
 
-            if TLSClientHello is not None and pkt.haslayer(TLSClientHello):  # type: ignore[truthy-bool]
+            # TLS layers exist only under TCP; skip the three walks otherwise.
+            client_hello = (
+                pkt.getlayer(TLSClientHello)
+                if tcp_layer is not None and TLSClientHello is not None
+                else None
+            )
+            if client_hello is not None:
                 tls_client_hellos += 1
-                client_hello = pkt[TLSClientHello]  # type: ignore[index]
                 exts = _iter_tls_extensions(client_hello)
                 sni_val = None
                 alpn_vals: list[str] = []
@@ -1410,7 +1399,8 @@ def analyze_ips(
                         alpn_vals = _extract_alpn(ext)
                 if sni_val:
                     sni_counts[sni_val] += 1
-                    sni_entropy[sni_val] = _shannon_entropy(sni_val)
+                    if sni_val not in sni_entropy:
+                        sni_entropy[sni_val] = shannon_entropy(sni_val)
                     ip_hostnames[dst_ip][str(sni_val).strip(".").lower()] += 1
 
                 ja3 = _ja3_from_client_hello(client_hello)
@@ -1424,8 +1414,12 @@ def analyze_ips(
                 if ja4:
                     ja4_counts[ja4] += 1
 
-            if TLSServerHello is not None and pkt.haslayer(TLSServerHello):  # type: ignore[truthy-bool]
-                server_hello = pkt[TLSServerHello]  # type: ignore[index]
+            server_hello = (
+                pkt.getlayer(TLSServerHello)
+                if tcp_layer is not None and TLSServerHello is not None
+                else None
+            )
+            if server_hello is not None:
                 server_alpn: list[str] = []
                 for ext in _iter_tls_extensions(server_hello):
                     if not server_alpn:
@@ -1434,8 +1428,12 @@ def analyze_ips(
                 if ja4s:
                     ja4s_counts[ja4s] += 1
 
-            if TLSCertificate is not None and pkt.haslayer(TLSCertificate):  # type: ignore[truthy-bool]
-                cert_layer = pkt[TLSCertificate]  # type: ignore[index]
+            cert_layer = (
+                pkt.getlayer(TLSCertificate)
+                if tcp_layer is not None and TLSCertificate is not None
+                else None
+            )
+            if cert_layer is not None:
                 risks = _tls_cert_risks_from_payload(cert_layer)
                 if risks:
                     key = (src_ip, dst_ip, str(len(risks)))
@@ -1448,13 +1446,19 @@ def analyze_ips(
                                 "risks": risks,
                             }
                         )
-    finally:
-        status.finish()
-        reader.close()
+        except Exception as exc:  # noqa: BLE001 — one malformed packet must not end the pass
+            skipped_packets += 1
+            if first_skip_error is None:
+                first_skip_error = f"{type(exc).__name__}: {exc}"
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
+    if skipped_packets:
+        errors.append(
+            f"{skipped_packets} packet(s) skipped after a parse error "
+            f"(first: {first_skip_error}); counts are lower bounds."
+        )
     if skipped_endpoints:
         errors.append(
             f"Endpoint cap reached; {skipped_endpoints} endpoint updates skipped."
@@ -1500,33 +1504,19 @@ def analyze_ips(
             )
         )
 
-    def _is_scan_target(addr: str) -> bool:
-        # A real scan/sweep targets unicast hosts. Broadcast/multicast/link-local
-        # destinations are service-discovery chatter (mDNS/SSDP/NAT-PMP), not
-        # scan targets, and must not count toward the destination breadth.
-        try:
-            ip = ipaddress.ip_address(addr)
-        except Exception:
-            return False
-        if ip.is_multicast or ip.is_link_local or ip.is_loopback or ip.is_unspecified:
-            return False
-        if str(addr).endswith(".255") or str(addr).endswith(".0"):
-            return False
-        return True
-
     def _dst_is_internal(addr: str) -> bool:
-        try:
-            ip = ipaddress.ip_address(addr)
-            return ip.is_private and not (
-                ip.is_link_local or ip.is_multicast or ip.is_loopback
-            )
-        except Exception:
-            return False
+        ip = ip_object(addr)
+        return ip is not None and ip.is_private and not (
+            ip.is_link_local or ip.is_multicast or ip.is_loopback
+        )
 
     suspicious_port_profiles: list[dict[str, object]] = []
     for src_ip, ports in src_to_ports.items():
         unique_ports = len(ports)
-        dsts = {d for d in src_to_dsts.get(src_ip, set()) if _is_scan_target(str(d))}
+        # A real scan/sweep targets unicast hosts. Broadcast/multicast/link-local
+        # destinations are service-discovery chatter (mDNS/SSDP/NAT-PMP), not
+        # scan targets, and must not count toward the destination breadth.
+        dsts = {d for d in src_to_dsts.get(src_ip, set()) if _is_unicast_host_address(str(d))}
         unique_dsts = len(dsts)
         high_ports = sum(1 for p in ports if p >= 1024)
         # Distinguish internal-network reconnaissance from ordinary outbound
@@ -1589,25 +1579,7 @@ def analyze_ips(
         # (169.254), loopback, multicast, or the unspecified address. Counting
         # those inflated the score with gateways/broadcast/self and produced
         # false lateral-movement verdicts on ordinary hosts.
-        if addr == self_ip:
-            return False
-        try:
-            ip = ipaddress.ip_address(addr)
-        except Exception:
-            return False
-        if not ip.is_private:
-            return False
-        if (
-            ip.is_link_local
-            or ip.is_loopback
-            or ip.is_multicast
-            or ip.is_unspecified
-            or ip.is_reserved
-        ):
-            return False
-        if str(addr).endswith(".255") or str(addr).endswith(".0"):
-            return False
-        return True
+        return addr != self_ip and _is_internal_host_address(addr)
 
     lateral_movement_scores: list[dict[str, object]] = []
     for endpoint in endpoint_rows:
@@ -1659,10 +1631,7 @@ def analyze_ips(
         abuse_key = None
         otx_key = None
         vt_key = None
-    try:
-        intel_limit = int(os.environ.get("PCAPPER_IP_INTEL_LIMIT", "10"))
-    except Exception:
-        intel_limit = 10
+    intel_limit = env_int("PCAPPER_IP_INTEL_LIMIT", 10, minimum=0)
 
     top_endpoints = sorted(
         endpoint_rows,
@@ -1674,7 +1643,7 @@ def analyze_ips(
     for endpoint in top_endpoints:
         if len(enriched) >= intel_limit:
             break
-        if not _is_public_ip(endpoint.ip):
+        if not is_public_ip(endpoint.ip):
             continue
 
         geo_label, asn_label = _geoip_lookup(endpoint.ip, geo_reader, asn_reader)
@@ -1745,20 +1714,12 @@ def analyze_ips(
         if rec.get("geo") or rec.get("asn"):
             ip_enrichment[ip_text] = rec
     if geo_lookup:
-        public_ips = [e.ip for e in endpoint_rows if _is_public_ip(e.ip)]
         # Prioritise the highest-volume public peers within the rate-limit window.
-        public_ips = sorted(
-            public_ips,
-            key=lambda ip: next(
-                (
-                    e.bytes_sent + e.bytes_recv
-                    for e in endpoint_rows
-                    if e.ip == ip
-                ),
-                0,
-            ),
-            reverse=True,
-        )[:100]
+        public_ips = [
+            e.ip
+            for e in sorted(endpoint_rows, key=lambda e: e.bytes_sent + e.bytes_recv, reverse=True)
+            if is_public_ip(e.ip)
+        ][:100]
         online, online_errors = _enrich_ips_online(public_ips)
         errors.extend(online_errors)
         for ip_text, rec in online.items():
@@ -2011,7 +1972,6 @@ def analyze_ips(
             ip_os[_bip] = _os
 
     enrichment = _build_ips_enrichment(
-        endpoints=endpoint_rows,
         conversations=conversation_rows,
         suspicious_port_profiles=suspicious_port_profiles,
         lateral_movement_scores=lateral_movement_scores,

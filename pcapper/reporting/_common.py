@@ -29,6 +29,7 @@ from ..utils import (
     format_bytes_as_mb,
     format_duration,
     format_ts,
+    safe_float,
     sparkline,
 )
 
@@ -283,6 +284,9 @@ def _merge_detection_evidence_lines(values: list[object], limit: int = 10) -> li
     return list(dict.fromkeys(merged))[:limit]
 
 
+_NUMBER_RE = re.compile(r"\d+")
+
+
 def _collapse_detection_details(details: list[str]) -> str:
     cleaned = [str(item).strip() for item in details if str(item).strip()]
     if not cleaned:
@@ -290,7 +294,7 @@ def _collapse_detection_details(details: list[str]) -> str:
     if len(set(cleaned)) == 1:
         return cleaned[0]
 
-    num_re = re.compile(r"\d+")
+    num_re = _NUMBER_RE
     templates = [num_re.sub("#", item) for item in cleaned]
     number_groups = [[int(v) for v in num_re.findall(item)] for item in cleaned]
     if (
@@ -415,6 +419,50 @@ def _collapse_rollup_detections(
     return collapsed
 
 
+_OT_ALIASES = {
+    "DF1": ["DF1"],
+    "PCCC": ["PCCC"],
+    "MODBUS": ["MODBUS"],
+    "DNP3": ["DNP3"],
+    "IEC-104": ["IEC-104"],
+    "BACNET": ["BACNET"],
+    # CIP rides EtherNet/IP, so CIP traffic is counted under "EtherNet/IP"
+    # (not a separate "CIP" key). Without these cross-aliases the OT-presence
+    # gate dropped every genuine CIP detection (high-risk commands, unexpected
+    # writes, multi-service bundles) on real EtherNet/IP captures.
+    "ETHERNET/IP": ["ETHERNET/IP", "ENIP", "CIP"],
+    "CIP": ["CIP", "ETHERNET/IP", "ENIP"],
+    "PROFINET": ["PROFINET"],
+    "S7": ["S7"],
+    "OPC UA": ["OPC UA"],
+    "OPC CLASSIC": ["OPC CLASSIC"],
+    "ETHERCAT": ["ETHERCAT"],
+    "FINS": ["FINS"],
+    "CRIMSON": ["CRIMSON"],
+    "PCWORX": ["PCWORX"],
+    "MELSEC": ["MELSEC"],
+    "ODESYS": ["ODESYS"],
+    "NIAGARA": ["NIAGARA"],
+    "MMS": ["MMS"],
+    "SRTP": ["SRTP"],
+    "CSP": ["CSP"],
+    "MODICON": ["MODICON"],
+    "YOKOGAWA": ["YOKOGAWA"],
+    "HONEYWELL": ["HONEYWELL"],
+    "MQTT": ["MQTT"],
+    "COAP": ["COAP"],
+    "HART-IP": ["HART-IP", "HART"],
+    "PROCONOS": ["PROCONOS"],
+    "ICCP": ["ICCP"],
+    "GOOSE": ["GOOSE"],
+    "SV": ["SV"],
+    "PTP": ["PTP"],
+    "LLDP/DCP": ["LLDP", "DCP"],
+    "LLDP": ["LLDP"],
+    "DCP": ["DCP"],
+}
+
+
 def _filtered_detections(summary, verbose: bool) -> list[dict[str, object]]:
     detections = list(getattr(summary, "detections", []) or [])
     if not detections:
@@ -435,48 +483,7 @@ def _filtered_detections(summary, verbose: bool) -> list[dict[str, object]]:
         if ot_counts_raw
         else {}
     )
-    ot_aliases = {
-        "DF1": ["DF1"],
-        "PCCC": ["PCCC"],
-        "MODBUS": ["MODBUS"],
-        "DNP3": ["DNP3"],
-        "IEC-104": ["IEC-104"],
-        "BACNET": ["BACNET"],
-        # CIP rides EtherNet/IP, so CIP traffic is counted under "EtherNet/IP"
-        # (not a separate "CIP" key). Without these cross-aliases the OT-presence
-        # gate dropped every genuine CIP detection (high-risk commands, unexpected
-        # writes, multi-service bundles) on real EtherNet/IP captures.
-        "ETHERNET/IP": ["ETHERNET/IP", "ENIP", "CIP"],
-        "CIP": ["CIP", "ETHERNET/IP", "ENIP"],
-        "PROFINET": ["PROFINET"],
-        "S7": ["S7"],
-        "OPC UA": ["OPC UA"],
-        "OPC CLASSIC": ["OPC CLASSIC"],
-        "ETHERCAT": ["ETHERCAT"],
-        "FINS": ["FINS"],
-        "CRIMSON": ["CRIMSON"],
-        "PCWORX": ["PCWORX"],
-        "MELSEC": ["MELSEC"],
-        "ODESYS": ["ODESYS"],
-        "NIAGARA": ["NIAGARA"],
-        "MMS": ["MMS"],
-        "SRTP": ["SRTP"],
-        "CSP": ["CSP"],
-        "MODICON": ["MODICON"],
-        "YOKOGAWA": ["YOKOGAWA"],
-        "HONEYWELL": ["HONEYWELL"],
-        "MQTT": ["MQTT"],
-        "COAP": ["COAP"],
-        "HART-IP": ["HART-IP", "HART"],
-        "PROCONOS": ["PROCONOS"],
-        "ICCP": ["ICCP"],
-        "GOOSE": ["GOOSE"],
-        "SV": ["SV"],
-        "PTP": ["PTP"],
-        "LLDP/DCP": ["LLDP", "DCP"],
-        "LLDP": ["LLDP"],
-        "DCP": ["DCP"],
-    }
+    ot_aliases = _OT_ALIASES
 
     def _ot_present(label: str) -> bool:
         for token in ot_aliases.get(label, [label]):
@@ -572,13 +579,7 @@ def _format_sessions_table(
         + [label for label, _fn in extra_cols]
     ]
 
-    def _to_float(value: object | None) -> float | None:
-        if value is None:
-            return None
-        try:
-            return float(value)
-        except Exception:
-            return None
+    _to_float = safe_float
 
     def _session_sort_key(conv: object) -> tuple[float, float]:
         bytes_val = _conv_value(conv, "bytes", 0) or 0
@@ -1170,26 +1171,14 @@ def _render_industrial_summary(
     if anomalies:
         # Sort by severity BEFORE truncating so a late HIGH "Write to PLC" /
         # "Control Command" isn't cut while early LOW Test-Frame entries show.
+        # (The verdict itself was rendered once at the top by _render_ot_verdict;
+        # this section used to print a second, differently-worded one.)
         _ot_rank = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "WARNING": 1, "LOW": 0, "INFO": 0}
         ranked_anoms = sorted(
             anomalies,
             key=lambda a: _ot_rank.get(str(getattr(a, "severity", "INFO")).upper(), 0),
             reverse=True,
         )
-        worst_sev = str(getattr(ranked_anoms[0], "severity", "INFO")).upper()
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Analyst Verdict"))
-        if worst_sev in ("CRITICAL", "HIGH"):
-            lines.append(
-                danger(
-                    f"{worst_sev} - {title}: high-consequence OT activity observed "
-                    "(writes/control/program-transfer to industrial assets)."
-                )
-            )
-        elif worst_sev in ("MEDIUM", "WARNING"):
-            lines.append(warn(f"REVIEW - {title}: notable OT activity observed."))
-        else:
-            lines.append(ok(f"LOW - {title}: only low-severity/informational events."))
         lines.append(SUBSECTION_BAR)
         lines.append(header("Anomalies & Events (severity-ranked)"))
         _attack_ids: list[str] = []

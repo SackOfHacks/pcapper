@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import get_reader
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
@@ -303,7 +303,7 @@ def _direction(
 ) -> tuple[str, str, int, int]:
     if dport in POWERSHELL_PORTS:
         return src_ip, dst_ip, sport, dport
-    if sport in POWERSHELL_PORTS:
+    if sport in POWERSHELL_PORTS and dport >= 1024:
         return dst_ip, src_ip, dport, sport
     if dport < 1024 and sport >= 1024:
         return src_ip, dst_ip, sport, dport
@@ -338,7 +338,7 @@ def analyze_powershell(
     path: Path,
     show_status: bool = True,
     packets: list[object] | None = None,
-    meta: object | None = None,
+    meta: PcapMeta | None = None,
 ) -> PowershellSummary:
     errors: list[str] = []
     if TCP is None or (IP is None and IPv6 is None):
@@ -384,49 +384,6 @@ def analyze_powershell(
             duration_seconds=None,
         )
 
-    try:
-        reader, status, stream, size_bytes, _file_type = get_reader(
-            path, packets=packets, meta=meta, show_status=show_status
-        )
-    except Exception as exc:
-        return PowershellSummary(
-            path=path,
-            total_packets=0,
-            powershell_packets=0,
-            total_bytes=0,
-            client_packets=0,
-            server_packets=0,
-            client_bytes=0,
-            server_bytes=0,
-            total_sessions=0,
-            unique_clients=0,
-            unique_servers=0,
-            client_counts=Counter(),
-            server_counts=Counter(),
-            client_macs=Counter(),
-            server_macs=Counter(),
-            ip_to_macs={},
-            server_ports=Counter(),
-            hostnames=Counter(),
-            ip_strings=Counter(),
-            mac_strings=Counter(),
-            domains=Counter(),
-            usernames=Counter(),
-            commands=Counter(),
-            suspicious_indicators=Counter(),
-            urls=Counter(),
-            ad_queries=Counter(),
-            network_discovery=Counter(),
-            plaintext_strings=Counter(),
-            detections=[],
-            anomalies=[],
-            artifacts=[],
-            conversations=[],
-            errors=[f"Error opening pcap: {exc}"],
-            first_seen=None,
-            last_seen=None,
-            duration_seconds=None,
-        )
 
     total_packets = 0
     powershell_packets = 0
@@ -471,15 +428,7 @@ def analyze_powershell(
     client_targets: dict[str, set[str]] = defaultdict(set)
 
     try:
-        for pkt in reader:
-            if stream is not None and size_bytes:
-                try:
-                    pos = stream.tell()
-                    percent = int(min(100, (pos / size_bytes) * 100))
-                    status.update(percent)
-                except Exception:
-                    pass
-
+        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -682,9 +631,6 @@ def analyze_powershell(
 
     except Exception as exc:
         errors.append(str(exc))
-    finally:
-        status.finish()
-        reader.close()
 
     conversations: list[PowershellConversation] = []
     for session in sessions.values():
