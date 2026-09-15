@@ -13,7 +13,12 @@ except ImportError:  # pragma: no cover - scapy optional at runtime
     TCP = UDP = IP = Raw = None
 
 from .equipment import equipment_artifacts
-from .industrial_helpers import IndustrialAnomaly, IndustrialArtifact, _extract_transport
+from .industrial_helpers import (
+    IndustrialAnomaly,
+    IndustrialArtifact,
+    _extract_transport,
+    merge_size_buckets,
+)
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import safe_float
 
@@ -482,9 +487,13 @@ def merge_cip_summaries(summaries: list[CIPAnalysis]) -> CIPAnalysis:
 
     merged = CIPAnalysis(path=Path(f"ALL_PCAPS_{len(summaries)}"))
     error_seen: set[str] = set()
+    packet_bucket_lists: list[list[SizeBucket]] = []
+    payload_bucket_lists: list[list[SizeBucket]] = []
 
     for summary in summaries:
         merged.duration += summary.duration
+        packet_bucket_lists.append(summary.packet_size_buckets)
+        payload_bucket_lists.append(summary.payload_size_buckets)
         merged.total_packets += summary.total_packets
         merged.cip_packets += summary.cip_packets
         merged.total_bytes += summary.total_bytes
@@ -541,6 +550,8 @@ def merge_cip_summaries(summaries: list[CIPAnalysis]) -> CIPAnalysis:
             error_seen.add(err)
             merged.errors.append(err)
 
+    merged.packet_size_buckets = merge_size_buckets(packet_bucket_lists)
+    merged.payload_size_buckets = merge_size_buckets(payload_bucket_lists)
     return merged
 
 

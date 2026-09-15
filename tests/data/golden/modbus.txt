@@ -15,14 +15,14 @@ ATT&CK for ICS Mapping
 Overall Traffic Statistics
 Scan Duration           : 0.05s
 Total Packets           : 6
-Total Bytes             : 0.00 MB
+Total Bytes             : 396 B
 Packets/sec             : 120.00
 Bits/sec                : 63.36 Kbps
 ------------------------------------------------------------------------
 Modbus Protocol Statistics
 Modbus Packets          : 6 (100.0%)
-Modbus Bytes            : 0.00 MB (100.0%)
-Modbus Payload Bytes    : 0.00 MB
+Modbus Bytes            : 396 B (100.0%)
+Modbus Payload Bytes    : 30 B
 Avg Modbus Packet Size  : 66.0 bytes
 Avg Modbus Payload Size : 5.0 bytes
 Unique Clients          : 1
@@ -38,14 +38,14 @@ Active Unit IDs
   ID 1 (6)
 ------------------------------------------------------------------------
 Endpoint Statistics
-Endpoint       Packets  Bytes  
-192.168.10.10  6        0.00 MB
-192.168.10.50  6        0.00 MB
+Endpoint       Packets  Bytes
+192.168.10.10  6        396 B
+192.168.10.50  6        396 B
 ------------------------------------------------------------------------
 Client/Server Statistics
 Clients (Controllers)                         | Servers (PLCs/Sensors)
 ------------------------------------------------------------------------------------------
-192.168.10.50 (3/0.00 MB)                     | 192.168.10.10 (3/0.00 MB)
+192.168.10.50 (3/198 B)                       | 192.168.10.10 (3/198 B)
 ------------------------------------------------------------------------
 Register / Coil Map (process fingerprint)
 Server / Unit     Reads  Read Range  Writes  Write Range  Hot (addr:count)

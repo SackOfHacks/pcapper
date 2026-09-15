@@ -1430,6 +1430,20 @@ def merge_dhcp_summaries(summaries: Iterable[DhcpSummary]) -> DhcpSummary:
             merged.vendor_classes_by_mac.setdefault(key, Counter()).update(values)
         for key, values in (item.vendor_classes_by_ip or {}).items():
             merged.vendor_classes_by_ip.setdefault(key, Counter()).update(values)
+        # Leases, per-MAC hostnames, option statistics and OS fingerprints
+        # were left at their defaults, so the rolled-up report had no lease
+        # table and no option analysis at all.
+        merged.dhcp_option_counts.update(item.dhcp_option_counts or {})
+        for key, values in (item.dhcp_option_values or {}).items():
+            merged.dhcp_option_values.setdefault(key, Counter()).update(values)
+        for mac, names in (item.client_hostnames_by_mac or {}).items():
+            known = merged.client_hostnames_by_mac.setdefault(mac, [])
+            for name in names or []:
+                if name not in known:
+                    known.append(name)
+        for mac, fingerprint in (item.os_fingerprints or {}).items():
+            merged.os_fingerprints.setdefault(mac, fingerprint)
+        merged.host_leases.extend(item.host_leases)
 
         merged.conversations.extend(item.conversations)
         merged.sessions.extend(item.sessions)
@@ -1461,6 +1475,34 @@ def merge_dhcp_summaries(summaries: Iterable[DhcpSummary]) -> DhcpSummary:
         merged.sessions,
         key=lambda row: (row.requests + row.offers + row.acks + row.naks),
         reverse=True,
+    )[:500]
+    # One lease row per (MAC, IP): the same client seen in several captures
+    # keeps the earliest start and the latest sighting.
+    leases_by_key: dict[tuple[str, str], DhcpHostLease] = {}
+    for lease in merged.host_leases:
+        key = (lease.client_mac, lease.client_ip)
+        current = leases_by_key.get(key)
+        if current is None:
+            leases_by_key[key] = lease
+            continue
+        firsts = [v for v in (current.first_seen, lease.first_seen) if v is not None]
+        lasts = [v for v in (current.last_seen, lease.last_seen) if v is not None]
+        starts = [v for v in (current.lease_start, lease.lease_start) if v is not None]
+        ends = [v for v in (current.lease_end_estimate, lease.lease_end_estimate) if v is not None]
+        leases_by_key[key] = DhcpHostLease(
+            client_mac=current.client_mac,
+            client_ip=current.client_ip,
+            hostname=current.hostname if current.hostname != "-" else lease.hostname,
+            server=current.server if current.server != "-" else lease.server,
+            lease_seconds=current.lease_seconds if current.lease_seconds is not None else lease.lease_seconds,
+            lease_start=min(starts) if starts else None,
+            lease_end_estimate=max(ends) if ends else None,
+            first_seen=min(firsts) if firsts else None,
+            last_seen=max(lasts) if lasts else None,
+            message_count=current.message_count + lease.message_count,
+        )
+    merged.host_leases = sorted(
+        leases_by_key.values(), key=lambda row: (row.client_mac, row.client_ip)
     )[:500]
     merged.timeline.sort(key=lambda row: float(row.get("ts", 0.0) or 0.0))
     merged.timeline = merged.timeline[:500]

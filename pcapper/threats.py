@@ -2269,6 +2269,10 @@ def _recontextualize_ot_cyclic(
         elif current in {"critical", "high"}:
             adjusted["severity"] = "warning"
         adjusted["confidence"] = "low"
+        # Machine-readable form of the note, so downstream consumers (the
+        # compromise assessment) can treat baseline periodicity as context
+        # rather than re-deriving it from the prose.
+        adjusted["internal_periodicity"] = kind
         details = str(adjusted.get("details", "")).strip()
         note = _NOTE[kind]
         adjusted["details"] = f"{details} [{note}]" if details else note

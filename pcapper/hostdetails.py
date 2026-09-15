@@ -552,8 +552,31 @@ def merge_hostdetails_summaries(
     artifacts: list[str] = []
     error_seen: set[str] = set()
     errors: list[str] = []
+    # Dossier sections added in 2.1.0; they were never carried into the
+    # rolled-up report, so -summarize --hostdetails showed a host with no
+    # authentication, TLS, SMB, mail or peer-intel activity and no announced
+    # NetBIOS identity.
+    netbios_roles: list[str] = []
+    netbios_domain = ""
+    netbios_comment = ""
+    dossier: dict[str, list[dict[str, object]]] = {
+        "auth_events": [], "tls_fingerprints": [], "smb_access": [], "email_activity": [], "peer_intel": [],
+    }
+    dossier_seen: dict[str, set[str]] = {key: set() for key in dossier}
 
     for summary in summary_list:
+        for role in getattr(summary, "netbios_roles", None) or []:
+            if role not in netbios_roles:
+                netbios_roles.append(role)
+        netbios_domain = netbios_domain or str(getattr(summary, "netbios_domain", "") or "")
+        netbios_comment = netbios_comment or str(getattr(summary, "netbios_comment", "") or "")
+        for key, rows in dossier.items():
+            for row in getattr(summary, key, None) or []:
+                fingerprint = repr(sorted((str(k), str(v)) for k, v in dict(row).items()))
+                if fingerprint in dossier_seen[key]:
+                    continue
+                dossier_seen[key].add(fingerprint)
+                rows.append(row)
         total_packets += summary.total_packets
         relevant_packets += summary.relevant_packets
         packets_sent += summary.packets_sent
@@ -859,6 +882,14 @@ def merge_hostdetails_summaries(
         host_verdict_score=host_verdict_score,
         host_verdict_reasons=host_verdict_reasons[:16],
         errors=errors,
+        netbios_roles=netbios_roles,
+        netbios_domain=netbios_domain,
+        netbios_comment=netbios_comment,
+        auth_events=dossier["auth_events"][:200],
+        tls_fingerprints=dossier["tls_fingerprints"][:200],
+        smb_access=dossier["smb_access"][:200],
+        email_activity=dossier["email_activity"][:200],
+        peer_intel=dossier["peer_intel"][:200],
     )
 
 

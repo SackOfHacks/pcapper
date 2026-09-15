@@ -327,8 +327,27 @@ def detect_file_type_bytes(data: bytes) -> str:
 
 
 def format_bytes_as_mb(size_bytes: int) -> str:
-    mb = size_bytes / (1024 * 1024)
-    return f"{mb:.2f} MB"
+    """Human-readable byte count.
+
+    The name is historical: it always rendered megabytes with two decimals,
+    so every artifact, conversation and capture under about 5 KB was printed
+    as ``0.00 MB`` — the size of a 1.5 KB PDF or a 900-byte credential file
+    was invisible in the report. Values under 1 MB now carry their own unit;
+    at and above 1 MB the output is unchanged.
+    """
+    try:
+        value = float(size_bytes or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value < 0:
+        value = 0.0
+    if value >= 1024 * 1024 * 1024:
+        return f"{value / (1024 * 1024 * 1024):.2f} GB"
+    if value >= 1024 * 1024:
+        return f"{value / (1024 * 1024):.2f} MB"
+    if value >= 1024:
+        return f"{value / 1024:.2f} KB"
+    return f"{int(value)} B"
 
 
 def format_ts(ts: Optional[float]) -> str:
@@ -589,13 +608,15 @@ def memoize_analysis(func):
             view_key: tuple = ("packets", id(packets), len(packets))
         else:
             try:
-                from .pcap_cache import get_forced_packet_view
+                from .pcap_cache import get_forced_packet_view, get_forced_packet_view_serial
 
                 forced = get_forced_packet_view(Path(path))
+                serial = get_forced_packet_view_serial(Path(path))
             except Exception:
                 forced = None
+                serial = None
             if forced is not None:
-                view_key = ("forced", id(forced), len(forced))
+                view_key = ("forced", serial, len(forced))
             else:
                 view_key = ("disk",)
 

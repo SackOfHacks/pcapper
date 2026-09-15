@@ -879,6 +879,12 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
     ]
     conversations.sort(key=lambda c: c.packets, reverse=True)
 
+    # The rolled-up duration is the window the merged report spans (min
+    # first_seen to max last_seen), as the base summary does; summing the
+    # per-capture durations made one report show two different durations for
+    # the same inputs, and undercounted every rate derived from it.
+    if first_seen is not None and last_seen is not None:
+        duration_seconds = max(0.0, float(last_seen) - float(first_seen))
     return SnmpSummary(
         path=Path(f"ALL_PCAPS_{len(summary_list)}"),
         total_packets=total_packets,

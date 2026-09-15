@@ -107,6 +107,6 @@ Content-Type  Count
 text/plain    1    
 ------------------------------------------------------------------------
 HTTP Sessions
-Client         Server         Start                        End                          Duration  Requests  Size     Responses  Methods  Statuses
-192.168.10.50  93.184.216.34  2021-01-01T00:00:00.030000Z  2021-01-01T00:00:00.040000Z  10.0 ms   1         0.00 MB  1          GET(1)   200(1)  
+Client         Server         Start                        End                          Duration  Requests  Size   Responses  Methods  Statuses
+192.168.10.50  93.184.216.34  2021-01-01T00:00:00.030000Z  2021-01-01T00:00:00.040000Z  10.0 ms   1         338 B  1          GET(1)   200(1)  
 ========================================================================

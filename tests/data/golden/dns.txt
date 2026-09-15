@@ -2,7 +2,7 @@
 DNS ANALYSIS :: dns.pcap
 ========================================================================
 DNS Packets             : 6
-DNS Bytes               : 0.00 MB
+DNS Bytes               : 591 B
 Queries                 : 3
 Responses               : 3
 UDP                     : 6

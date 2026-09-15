@@ -2964,6 +2964,9 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
         ),
     }
 
+    # Window of the merged report, not the sum of per-capture durations.
+    if capture_start is not None and capture_end is not None:
+        duration_seconds = max(0.0, float(capture_end) - float(capture_start))
     return OverviewSummary(
         path=Path("ALL_PCAPS"),
         total_packets=total_packets,

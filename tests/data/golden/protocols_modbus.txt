@@ -23,14 +23,14 @@ Deterministic Protocol Security Checks
   - protocols (4)
 ------------------------------------------------------------------------
 Protocol Hierarchy
-Ethernet                                           6 pkts, 0.00 MB
-  |- IP                                            6 pkts, 0.00 MB
-    |- TCP                                         6 pkts, 0.00 MB
-      |- Modbus/TCP                                6 pkts, 0.00 MB
+Ethernet                                           6 pkts, 396 B
+  |- IP                                            6 pkts, 396 B
+    |- TCP                                         6 pkts, 396 B
+      |- Modbus/TCP                                6 pkts, 396 B
 ------------------------------------------------------------------------
 No clear anomalies detected.
 ------------------------------------------------------------------------
 Top Conversations (by volume)
-Src            Dst            Proto       Packets  Bytes    Duration  Ports    
-192.168.10.50  192.168.10.10  Modbus/TCP  6        0.00 MB  50.0 ms   502,44320
+Src            Dst            Proto       Packets  Bytes  Duration  Ports    
+192.168.10.50  192.168.10.10  Modbus/TCP  6        396 B  50.0 ms   502,44320
 ========================================================================

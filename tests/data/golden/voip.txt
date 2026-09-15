@@ -14,7 +14,7 @@ Focus Here First:
 Total Packets           : 85
 Signalling Packets      : 11
 RTP Packets             : 72
-RTP Bytes               : 0.01 MB
+RTP Bytes               : 13.22 KB
 RTCP Packets            : 1
 Duration                : 1.68 s
 Calls / Dialogs         : 2

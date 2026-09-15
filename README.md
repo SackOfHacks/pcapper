@@ -2,9 +2,9 @@
 
 ![Python](https://img.shields.io/badge/python-3.9%20%E2%80%93%203.13-0B7285)
 ![CI](https://github.com/SackOfHacks/pcapper/actions/workflows/ci.yml/badge.svg)
-![Tests](https://img.shields.io/badge/tests-531%20passing-1B5E20)
+![Tests](https://img.shields.io/badge/tests-584%20passing-1B5E20)
 ![Analyzers](https://img.shields.io/badge/analyzers-120%2B-3D5A80)
-![Version](https://img.shields.io/badge/release-v2.4.0-7C3AED)
+![Version](https://img.shields.io/badge/release-v2.5.0-7C3AED)
 ![License](https://img.shields.io/badge/license-MIT-6C757D)
 ![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
 ![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
@@ -199,9 +199,18 @@ Promotional highlights:
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
 
+## What's New in v2.5.0 📡
+
+**v2.5.0 is the third pass of the same review, aimed at the roll-ups, the beacon detector and the compromise assessment.**
+
+- 📡 **Reconnecting beacons are scored again.** Since 2.0.0 the flow key dropped the client port before the per-connection key was built, so an HTTP C2 that opens a fresh connection per check-in collapsed into one event and never reached the scorer. Heartbeats inside a single persistent socket (reverse shells, websocket C2) are now scored too, from the client's request cadence.
+- 🏭 **An HMI polling its PLCs is no longer the most likely compromised host.** The OT-baseline branch never fired (it read a port field that is empty for TCP), info-level context weighed like evidence, and the threat engine's own "baseline polling" downgrade came back as a warning, an incident and three Command and Control techniques in `--mitre`. Baseline periodicity is now context everywhere.
+- 🧾 **Roll-ups carry every section.** A merge check over every `merge_*` function found the `--hostdetails`, `--dhcp`, `--cip` and `--compromised` roll-ups dropping whole sections, and five roll-ups reporting the sum of durations instead of the window.
+- 📦 **Truncated downloads say so** (`TRUNCATED: 1552 of 5000 declared bytes`), sizes under a megabyte print in KB and bytes instead of `0.00 MB`, and numbers in a detection's own prose (`score 0.98`, `interval 90.00s`) are no longer domain IOCs that grouped unrelated hosts into phantom campaigns.
+
 ## What's New in v2.4.0 🔍
 
-**v2.4.0 is the "wrong rather than failing" release.** Every one of the 120-plus analyzers was read line by line in a two-day production-readiness review, and the pattern that kept turning up was a report that was confidently wrong: a server counted as its own busiest client, a window that spanned the whole capture, a padded frame read as protocol bytes, a heuristic that fired on healthy traffic. The suite grew from 255 to 531 tests, each new one built on a synthetic capture that reproduced the defect.
+**v2.4.0 is the "wrong rather than failing" release.** Every one of the 120-plus analyzers was read line by line in a two-day production-readiness review, and the pattern that kept turning up was a report that was confidently wrong: a server counted as its own busiest client, a window that spanned the whole capture, a padded frame read as protocol bytes, a heuristic that fired on healthy traffic. The suite grew from 255 to 572 tests, each new one built on a synthetic capture that reproduced the defect.
 
 - 🎭 **Roles are right everywhere.** UDP, TCP, SNMP, LDAP, Kerberos, NTLM, QUIC, DoT/DoQ, HTTP/2, WinRM, RDP, WMI, PowerShell, Telnet, VNC, TeamViewer, VPN, AIM, syslog, BGP, Modbus, DNP3, safety-system ports, IEC 101/103 (from the FT1.2 PRM bit) and OPC Classic (from the DCE/RPC PDU type) all had the sender as "client". The top-clients table on a normal capture used to list the directory server and the KDC.
 - 🎫 **Kerberos AS-REP roasting is evidence-based.** It used to fire on "five AS-REPs and no pre-auth error", which every healthy domain logon satisfies. It now requires an AS-REP answering an AS-REQ with no pre-authentication data, names the roastable accounts, and points at `hashcat -m 18200`. Principal names and realms are read from the ASN.1 — the old SPN regexes only ever matched captures of tool output.
@@ -303,10 +312,12 @@ CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0
   source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
 ```
 
-## Current Release: v2.4.0
+## Current Release: v2.5.0
 
 Headline changes in this release:
-- **Every analyzer reviewed for reports that were wrong rather than failing** — client/server roles, per-protocol windows, padding-aware lengths and total-order sorts across the board, each pinned by a test. 531 tests, CI on Python 3.9 and 3.13.
+- **Beacon detection works for reconnecting and persistent C2 again**, and routine OT polling is context rather than compromise evidence in `--compromised` and `--mitre`.
+- **Every roll-up carries every section**, checked mechanically over every merge function; truncated downloads and sub-megabyte sizes are labelled honestly.
+- **Every analyzer reviewed for reports that were wrong rather than failing** — client/server roles, per-protocol windows, padding-aware lengths and total-order sorts across the board, each pinned by a test. 584 tests, CI on Python 3.9 and 3.13.
 - **Detection heuristics that fire on attacks, not on Tuesday** — evidence-based AS-REP roasting, FTP that ignores SMTP, brute force and UDP floods as rates, domain exposure limited to domain-control protocols, syslog that ignores HTML.
 - **Nothing internal leaves the box** — reputation lookups restricted to public names, percent-encoded and time-budgeted; no config from the evidence directory; bounded decompression; owner-only secrets.
 
@@ -360,7 +371,7 @@ For development (tests and lint):
 ```bash
 pip install -e .[dev]
 ruff check pcapper tests
-pytest -q            # 531 tests; add -m "not slow" to skip the subprocess ones
+pytest -q            # 584 tests; add -m "not slow" to skip the subprocess ones
 ```
 
 The suite runs on synthetic captures generated by `tests/make_fixtures.py`; no real traffic is committed, and the repository's `.gitignore` is an allow-list so carved files, decrypted streams, key logs and case exports cannot be added by accident.

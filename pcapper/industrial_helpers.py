@@ -228,6 +228,51 @@ _SIZE_BUCKETS: tuple[tuple[int, int, str], ...] = (
 _BUCKET_UPPERS = [high for _low, high, _label in _SIZE_BUCKETS]
 
 
+def merge_size_buckets(all_buckets: list[list["SizeBucket"]]) -> list["SizeBucket"]:
+    """Roll per-capture size histograms into one, weighting averages by count.
+
+    Shared by the `-summarize` merges of the OT analyzers; the CIP merge used
+    to leave both histograms empty in the rolled-up report.
+    """
+    by_label: dict[str, dict[str, float]] = {}
+    for bucket_list in all_buckets:
+        for bucket in bucket_list or []:
+            entry = by_label.setdefault(
+                bucket.label, {"count": 0.0, "sum": 0.0, "min": 0.0, "max": 0.0}
+            )
+            count = float(bucket.count)
+            if count <= 0:
+                continue
+            if entry["count"] == 0:
+                entry["min"] = float(bucket.min)
+                entry["max"] = float(bucket.max)
+            else:
+                entry["min"] = min(entry["min"], float(bucket.min))
+                entry["max"] = max(entry["max"], float(bucket.max))
+            entry["count"] += count
+            entry["sum"] += float(bucket.avg) * count
+
+    total_count = sum(entry["count"] for entry in by_label.values())
+    merged: list[SizeBucket] = []
+    for _low, _high, label in _SIZE_BUCKETS:
+        entry = by_label.get(label)
+        if not entry or entry["count"] <= 0:
+            merged.append(SizeBucket(label=label, count=0, avg=0.0, min=0, max=0, pct=0.0))
+            continue
+        count = int(entry["count"])
+        merged.append(
+            SizeBucket(
+                label=label,
+                count=count,
+                avg=entry["sum"] / entry["count"],
+                min=int(entry["min"]),
+                max=int(entry["max"]),
+                pct=(entry["count"] / total_count) * 100 if total_count else 0.0,
+            )
+        )
+    return merged
+
+
 def _bucketize(values: list[int]) -> list[SizeBucket]:
     """Histogram of sizes into the fixed bucket ranges, in one pass
     (was one list comprehension per bucket over the whole sample)."""

@@ -478,3 +478,40 @@ class TestRouting:
         summary = analyze_routing(pcap, show_status=False)
         assert summary.routing_packets == 1
         assert summary.protocol_counts == {"BGP": 1}
+
+
+# --- HTTP file recovery / byte formatting ------------------------------------------
+
+
+class TestHttpRecoveryTruncation:
+    def test_body_shorter_than_content_length_is_labelled(self, tmp_path) -> None:
+        """A response whose stream ended before its declared Content-Length was
+        recorded as a complete artifact with an authoritative hash and no note."""
+        from pcapper.files import _parse_http_stream
+
+        pdf = b"%PDF-1.4\n" + b"x" * 500 + b"\n%%EOF\n"
+        full = b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: %d\r\n\r\n" % len(pdf) + pdf
+        cut = b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: 5000\r\n\r\n" + pdf
+        ok = _parse_http_stream(full)[0]
+        assert ok["truncated"] is False and ok["body"] == pdf
+        short = _parse_http_stream(cut)[0]
+        assert short["truncated"] is True and short["declared_length"] == 5000 and short["body"] == pdf
+
+    def test_note_names_the_shortfall(self) -> None:
+        from pcapper.files import _http_body_note
+
+        assert _http_body_note({"truncated": False}, b"abc") == "HTTP Response Body"
+        assert _http_body_note({"truncated": True, "declared_length": 5000}, b"x" * 1552) == (
+            "HTTP Response Body (TRUNCATED: 1552 of 5000 declared bytes)"
+        )
+
+
+class TestByteFormatting:
+    def test_small_sizes_are_no_longer_zero_megabytes(self) -> None:
+        """Every artifact, conversation and capture under ~5 KB printed as 0.00 MB."""
+        assert utils.format_bytes_as_mb(0) == "0 B"
+        assert utils.format_bytes_as_mb(900) == "900 B"
+        assert utils.format_bytes_as_mb(1552) == "1.52 KB"
+        assert utils.format_bytes_as_mb(5 * 1024 * 1024) == "5.00 MB"
+        assert utils.format_bytes_as_mb(3 * 1024 ** 3) == "3.00 GB"
+        assert utils.format_bytes_as_mb(None) == "0 B"  # type: ignore[arg-type]

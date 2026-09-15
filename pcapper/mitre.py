@@ -801,7 +801,7 @@ def _executive_assessment(
         )
     elif high_impact:
         score += 2
-        reasons.append(f"Objective-stage tactic present: {', '.join(high_impact)}")
+        reasons.append(f"Objective-stage tactic present: {', '.join(sorted(high_impact))}")
 
     # Kill-chain breadth (distinct tactics observed) indicates progression.
     if len(distinct_tactics) >= 4:
@@ -1048,6 +1048,17 @@ def analyze_mitre(
         summary_text = str(item.get("summary", "") or "").strip()
         details = str(item.get("details", "") or "").strip()
         if not summary_text and not details:
+            continue
+        # The threat engine has already classified this periodicity as
+        # baseline (broadcast/discovery chatter, HMI<->PLC cyclic polling).
+        # Its text still says "beacon", which mapped it to a Command and
+        # Control technique and credited the executive assessment with an
+        # objective-stage tactic for a controller being polled.
+        periodicity = str(item.get("internal_periodicity", "") or "")
+        if periodicity in {"broadcast", "ot_baseline"}:
+            checks["sequence_plausibility"].append(
+                f"Detection {idx} left unmapped: internal periodic baseline ({periodicity}), not C2"
+            )
             continue
 
         blob = f"{summary_text} {details}".lower()
@@ -1323,11 +1334,11 @@ def analyze_mitre(
         )
     technique_heat.sort(
         key=lambda item: (
-            int(item.get("count", 0) or 0),
-            int(item.get("host_count", 0) or 0),
-            int(item.get("source_count", 0) or 0),
-        ),
-        reverse=True,
+            -int(item.get("count", 0) or 0),
+            -int(item.get("host_count", 0) or 0),
+            -int(item.get("source_count", 0) or 0),
+            str(item.get("technique_id", "")),
+        )
     )
 
     low_conf_count = sum(1 for hit in hits if hit.confidence == "low")

@@ -1748,6 +1748,16 @@ def _is_cip_program_or_file_service(service_name: str) -> bool:
 # --- Protocol Parsers ---
 
 
+def _http_body_note(message: Dict[str, Any], body: bytes) -> str:
+    """Artifact note for an HTTP response body, naming a truncated transfer."""
+    if message.get("truncated"):
+        declared = message.get("declared_length")
+        if isinstance(declared, int) and declared > 0:
+            return f"HTTP Response Body (TRUNCATED: {len(body)} of {declared} declared bytes)"
+        return "HTTP Response Body (TRUNCATED)"
+    return "HTTP Response Body"
+
+
 def _parse_http_stream(stream: bytes) -> List[Dict[str, Any]]:
     messages = []
     idx = 0
@@ -1807,14 +1817,20 @@ def _parse_http_stream(stream: bytes) -> List[Dict[str, Any]]:
 
         body = b""
         next_idx = body_start
+        truncated = False
 
         if content_len is not None and content_len >= 0:
             if body_start + content_len <= len(stream):
                 body = stream[body_start : body_start + content_len]
                 next_idx = body_start + content_len
             else:
-                body = stream[body_start:]  # Truncated
+                # The stream ended before the declared length: the capture
+                # stopped, dropped packets, or was snaplen-truncated. The
+                # artifact is still recovered, but it must say so — a partial
+                # file carrying a confident hash gets pasted into reports.
+                body = stream[body_start:]
                 next_idx = len(stream)
+                truncated = True
         elif is_chunked:
             raw_body = stream[body_start:]
             body = _decode_chunked(raw_body)
@@ -1858,6 +1874,8 @@ def _parse_http_stream(stream: bytes) -> List[Dict[str, Any]]:
                 "start_line": start_line,
                 "headers": headers,
                 "body": body,
+                "truncated": truncated,
+                "declared_length": content_len,
             }
         )
 
@@ -2985,7 +3003,7 @@ class FileExtractor:
                         filename=_normalize_filename(fname),
                         size_bytes=len(body),
                         packet_index=idx,
-                        note="HTTP Response Body",
+                        note=_http_body_note(m, body),
                         file_type=ft,
                         payload=body,
                         hostname=current_hostname,
@@ -3888,7 +3906,7 @@ def _export_with_dpkt(
                         filename=fname,
                         size_bytes=len(body) if body else None,
                         packet_index=first_pkt,
-                        note="HTTP Response Body",
+                        note=_http_body_note(m, body),
                         file_type=ftype,
                         payload=body if need_payload else None,
                         hostname=hostname,

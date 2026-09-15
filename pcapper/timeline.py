@@ -310,8 +310,9 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
         peer_counts.update(item.peer_counts or {})
         port_counts.update(item.port_counts or {})
         ot_protocol_counts.update(item.ot_protocol_counts or {})
+        ot_bin_count = max(ot_bin_count, int(item.ot_activity_bin_count or 0))
+        non_ot_bin_count = max(non_ot_bin_count, int(item.non_ot_activity_bin_count or 0))
         if item.ot_activity_bins:
-            ot_bin_count = max(ot_bin_count, item.ot_activity_bin_count)
             for proto, bins in item.ot_activity_bins.items():
                 merged = ot_activity_bins.setdefault(proto, [0] * len(bins))
                 if len(merged) < len(bins):
@@ -319,7 +320,6 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
                 for idx, val in enumerate(bins):
                     merged[idx] += val
         if item.non_ot_activity_bins:
-            non_ot_bin_count = max(non_ot_bin_count, item.non_ot_activity_bin_count)
             if not non_ot_bins:
                 non_ot_bins = [0] * len(item.non_ot_activity_bins)
             if len(non_ot_bins) < len(item.non_ot_activity_bins):

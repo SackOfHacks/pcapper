@@ -10,6 +10,7 @@ from .http import analyze_http
 from .pcap_cache import PcapMeta, iter_packets
 from .services import COMMON_PORTS
 from .utils import (
+    env_int,
     extract_packet_endpoints,
     is_private_ip,
     is_public_ip,
@@ -86,6 +87,10 @@ MAX_BEACON_PACKET_SAMPLES = 10
 # A beacon has hundreds of events; a busy DNS or RTP session has millions,
 # and every one used to be buffered as a float and an int.
 MAX_SESSION_SAMPLES = 50_000
+# The per-connection tables (first/SYN time, bytes, handshake state, request
+# times) grow with the number of distinct TCP connections. Beyond this many,
+# further connections are counted but not tracked, and the report says so.
+MAX_TRACKED_CONNECTIONS = env_int("PCAPPER_MAX_BEACON_CONNECTIONS", 250_000, minimum=1000)
 
 L2_ETHERTYPE_NAMES: dict[int, str] = {
     0x0806: "L2:ARP",
@@ -133,6 +138,10 @@ class BeaconCandidate:
     # data_bytes==0 means failed/refused connection attempts, not a data channel.
     established_ratio: float = 1.0
     data_bytes: int = 0
+    # "connection": events are connection start times (reconnect-per-check-in
+    # C2). "request": events are the client's data segments inside a single
+    # persistent connection (heartbeats over one long-lived socket).
+    event_basis: str = "connection"
 
 
 @dataclass(frozen=True)
@@ -178,15 +187,17 @@ def _flow_key(
         return None
 
     if tcp_layer is not None:
-        # Drop the EPHEMERAL port (keep only the stable service port). HTTP/TCP
-        # C2 opens a fresh connection per check-in (new client sport each time);
-        # keying on the 4-tuple split every beacon into a 1-event flow, so
-        # reconnecting beacons (Ursnif, most HTTP C2) were never detected.
+        # Both ports are returned. The caller derives the per-CONNECTION key
+        # (service port + client port) and the per-SESSION key (service port
+        # only); a session is the list of its connections' start times, which
+        # is what makes a reconnect-per-check-in HTTP C2 (Ursnif, Cobalt Strike
+        # HTTP) score as one periodic flow. Dropping the ephemeral port here,
+        # as this used to, made every connection between the same pair share
+        # one connection key, so a reconnecting beacon collapsed into a single
+        # event and was never scored at all.
         sport = int(getattr(tcp_layer, "sport", 0))
         dport = int(getattr(tcp_layer, "dport", 0))
-        if sport > dport:
-            return (src_ip, dst_ip, "TCP", None, dport)
-        return (src_ip, dst_ip, "TCP", sport, None)
+        return (src_ip, dst_ip, "TCP", sport, dport)
     if udp_layer is not None:
         sport = int(getattr(udp_layer, "sport", 0))
         dport = int(getattr(udp_layer, "dport", 0))
@@ -391,6 +402,18 @@ def analyze_beacons(
         defaultdict(int)
     )
     conn_established: set[tuple[str, str, str, Optional[int], Optional[int]]] = set()
+    # Client->server data segments inside each connection: the event stream
+    # for a beacon that keeps one socket open and heartbeats over it.
+    conn_request_times: dict[tuple[str, str, str, Optional[int], Optional[int]], list[float]] = (
+        defaultdict(list)
+    )
+    conn_request_sizes: dict[tuple[str, str, str, Optional[int], Optional[int]], list[int]] = (
+        defaultdict(list)
+    )
+    conn_request_packets: dict[tuple[str, str, str, Optional[int], Optional[int]], list[int]] = (
+        defaultdict(list)
+    )
+    untracked_connections = 0
     total_packets = 0
     skipped_packets = 0
     first_skip_error: str | None = None
@@ -443,6 +466,9 @@ def analyze_beacons(
                 conn_key = (client_ip, server_ip, proto, server_port, client_port)
 
                 if conn_key not in conn_first_ts:
+                    if len(conn_first_ts) >= MAX_TRACKED_CONNECTIONS:
+                        untracked_connections += 1
+                        continue
                     conn_first_ts[conn_key] = ts
                     conn_first_idx[conn_key] = pkt_index
                 conn_bytes[conn_key] += pkt_len
@@ -459,6 +485,15 @@ def analyze_beacons(
                         seg_len = 0
                 if seg_len:
                     conn_data_bytes[conn_key] += int(seg_len)
+                    # A data segment sent from the ephemeral side is a client
+                    # request (equal ports are ambiguous and skipped).
+                    if sport == client_port and sport != dport:
+                        req_times = conn_request_times[conn_key]
+                        if len(req_times) < MAX_SESSION_SAMPLES:
+                            req_times.append(ts)
+                            conn_request_sizes[conn_key].append(int(seg_len))
+                        if len(conn_request_packets[conn_key]) < MAX_BEACON_PACKET_SAMPLES:
+                            conn_request_packets[conn_key].append(pkt_index)
                 if is_synack:
                     conn_established.add(conn_key)
                 if is_syn:
@@ -492,6 +527,12 @@ def analyze_beacons(
             f"{skipped_packets} packet(s) skipped after a parse error "
             f"(first: {first_skip_error}); beacon counts are lower bounds."
         )
+    if untracked_connections:
+        errors.append(
+            f"{untracked_connections} packet(s) from TCP connections beyond the "
+            f"{MAX_TRACKED_CONNECTIONS}-connection tracking cap were not scored "
+            "(PCAPPER_MAX_BEACON_CONNECTIONS raises it); beacon counts are lower bounds."
+        )
 
     candidates: list[BeaconCandidate] = []
 
@@ -499,12 +540,21 @@ def analyze_beacons(
     # connection attempts is distinguished from a real data-bearing beacon.
     session_tcp_established: dict[tuple[str, str, str, Optional[int]], int] = defaultdict(int)
     session_tcp_total: dict[tuple[str, str, str, Optional[int]], int] = defaultdict(int)
+    session_request_times: dict[tuple[str, str, str, Optional[int]], list[float]] = defaultdict(list)
+    session_request_sizes: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)
+    session_request_packets: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)
 
     for conn_key, first_ts in conn_first_ts.items():
         client_ip, server_ip, proto, server_port, _client_port = conn_key
         session_key = (client_ip, server_ip, proto, server_port)
         ts = conn_syn_ts.get(conn_key, first_ts)
         session_conn_times[session_key].append(ts)
+        req_times = conn_request_times.get(conn_key)
+        if req_times and len(session_request_times[session_key]) < MAX_SESSION_SAMPLES:
+            session_request_times[session_key].extend(req_times)
+            session_request_sizes[session_key].extend(conn_request_sizes.get(conn_key, []))
+            if len(session_request_packets[session_key]) < MAX_BEACON_PACKET_SAMPLES:
+                session_request_packets[session_key].extend(conn_request_packets.get(conn_key, []))
         # Size is the connection's application payload, not total frame bytes:
         # SYN/RST overhead would otherwise make a refused-connection flow look
         # like a perfectly stable-sized data channel (size score 1.0).
@@ -527,9 +577,19 @@ def analyze_beacons(
             list[int],
         ]
     ] = []
+    request_basis_flows: set[tuple[str, str, str, Optional[int], Optional[int]]] = set()
     for (client, server, proto, server_port), times in session_conn_times.items():
         sizes = session_conn_sizes.get((client, server, proto, server_port), [])
         packet_ids = session_conn_packets.get((client, server, proto, server_port), [])
+        # Too few connections to score, but the connection(s) carry enough
+        # client requests: a beacon heartbeating over one persistent socket.
+        # Its events are then the request times, not the connection starts.
+        req_times = session_request_times.get((client, server, proto, server_port), [])
+        if len(times) < min_events and len(req_times) >= max(min_events, 2 * len(times)):
+            times = req_times
+            sizes = session_request_sizes.get((client, server, proto, server_port), [])
+            packet_ids = session_request_packets.get((client, server, proto, server_port), [])
+            request_basis_flows.add((client, server, proto, server_port, None))
         combined_flows.append(
             ((client, server, proto, server_port, None), times, sizes, packet_ids)
         )
@@ -680,6 +740,12 @@ def analyze_beacons(
             len(times_sorted) < max(min_events, 15) or periodicity_score < 0.6
         ):
             continue
+        # Requests inside one persistent connection are held to the same
+        # cadence bar as datagrams: a keep-alive HTTP session, an SSH login
+        # or an SMB session carries hundreds of irregular requests, and
+        # "many events" alone must not make it a candidate.
+        if key_id in request_basis_flows and periodicity_score < 0.6:
+            continue
         if not is_l2_flow:
             if port_value in benign_service_ports:
                 if has_public:
@@ -742,6 +808,7 @@ def analyze_beacons(
                 packet_samples=packet_samples,
                 established_ratio=round(float(established_ratio), 3),
                 data_bytes=data_bytes_total,
+                event_basis="request" if key_id in request_basis_flows else "connection",
             )
         )
 
@@ -1052,8 +1119,9 @@ def analyze_beacons(
                 if item.packet_samples
                 else "-"
             )
+            basis = " basis=requests-in-one-connection" if item.event_basis == "request" else ""
             return (
-                f"{item.src_ip}->{item.dst_ip} {_proto_label(item)} count={item.count} "
+                f"{item.src_ip}->{item.dst_ip} {_proto_label(item)} count={item.count}{basis} "
                 f"interval={item.top_interval}s size={item.top_size} pkt={pkt_text}"
             )
 
@@ -1229,10 +1297,17 @@ def analyze_beacons(
                     f"{item.src_ip}->{item.dst_ip} interval≈{item.mean_interval:.0f}s duration={_format_duration(item.duration_seconds)}"
                 )
 
+        # Burst-then-sleep is a C2 *shape* (bursts of stable-sized check-ins
+        # separated by long sleeps), so it also needs a moderately stable
+        # candidate. Every candidate passes the 0.35 admission gate, and an
+        # ordinary browsing session — forty reconnects to one CDN with random
+        # gaps and random sizes — is bursty and idle by nature; without the
+        # score floor it was reported as a WARNING beacon profile.
         burst_sleep = [
             item
             for item in candidates
             if _burst_sleep_score(item.timeline) >= 0.65
+            and item.score >= 0.5
             and item.count >= 12
             and item.duration_seconds >= 900
         ]

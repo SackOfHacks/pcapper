@@ -19,8 +19,14 @@ from .secrets import analyze_secrets
 from .threats import OT_PORTS, analyze_threats
 from .utils import format_bytes_as_mb, memoize_analysis
 
+# The last label must be alphabetic: a real TLD is letters. Without that, the
+# numbers in a detection's own prose ("score 0.98", "interval 90.00s",
+# "duration 58.50m") were captured as domain IOCs, listed under the host, and
+# — being identical for every host with a similar cadence — grouped unrelated
+# hosts into phantom campaigns.
 IOC_DOMAIN_RE = re.compile(
-    r"\b([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9-]{2,})+)\b", re.IGNORECASE
+    r"\b([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9-]{2,})*\.[a-z]{2,63})\b",
+    re.IGNORECASE,
 )
 _HOSTNAME_BLACKLIST = {
     "localdomain",
@@ -47,11 +53,16 @@ _IPV6_TOKEN_RE = re.compile(r"\b[0-9a-fA-F:]{3,}\b")
 _FLOW_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\s*->\s*(\d{1,3}(?:\.\d{1,3}){3})\b")
 _HASH_RE = re.compile(r"[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}")
 
+# Info-level evidence is context, not a compromise indicator, so it carries no
+# weight toward the listing threshold: with a weight of 1, an HMI polling five
+# PLCs (five info-level "periodic OT control-channel" entries) or a client
+# sending five API tokens crossed the score-5 threshold on info alone and was
+# printed under "Most Likely Compromised Hosts".
 SEVERITY_WEIGHT = {
     "critical": 8,
     "high": 5,
     "warning": 3,
-    "info": 1,
+    "info": 0,
 }
 
 
@@ -249,43 +260,55 @@ def _ips_for_compromise_attribution(
     return _extract_ips_from_detection(entry)
 
 
+def _host_priority_key(item: dict[str, object]) -> tuple[int, int, str]:
+    """Highest score first; the IP breaks the frequent ties so the order is total."""
+    return (
+        -int(item.get("score", 0) or 0),
+        -int(item.get("stage_count", 0) or 0),
+        str(item.get("ip", "")),
+    )
+
+
+def _incident_key(item: dict[str, object]) -> tuple[float, int, str]:
+    """Latest incident first; the IP breaks ties between simultaneous clusters."""
+    return (
+        -float(item.get("first_ts", 0.0) or 0.0),
+        -int(item.get("count", 0) or 0),
+        str(item.get("ip", "")),
+    )
+
+
 def _score_weight(severity: str) -> int:
-    return SEVERITY_WEIGHT.get(severity, 1)
+    return SEVERITY_WEIGHT.get(severity, 0)
+
+
+_STAGE_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("recon", ("scan", "recon", "sweep", "probe", "probing", "enumeration")),
+    (
+        "credential",
+        ("credential", "creds", "password", "kerberos", "ntlm", "authentication", "login", "logon", "brute"),
+    ),
+    ("c2", ("beacon", "c2", "command and control", "check-in")),
+    ("exfil", ("exfil", "tunnel", "http post", "file exfil", "outbound", "data transfer", "large outbound")),
+    ("lateral", ("smb", "rdp", "winrm", "ssh", "lateral")),
+    ("secrets", ("secret", "token", "api key")),
+)
+# Tokens match at a word start only: a bare substring test made "Unauthorized
+# command message" a credential-stage event (via "auth") and an "ec2-…
+# .amazonaws.com" peer a C2-stage one (via "c2"). Stages feed the multi-stage
+# bonus and the "multi-stage compromise sequencing" verdict reason, so a
+# mis-tokenised stage inflates the compromise verdict.
+_STAGE_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = tuple(
+    (stage, re.compile(r"(?<![a-z0-9])(?:" + "|".join(re.escape(t) for t in tokens) + ")"))
+    for stage, tokens in _STAGE_TOKENS
+)
 
 
 def _classify_stage(summary: str, details: str, source: str) -> str:
     blob = f"{summary} {details} {source}".lower()
-    if any(
-        token in blob
-        for token in ("scan", "recon", "sweep", "probe", "probing", "enumeration")
-    ):
-        return "recon"
-    if any(
-        token in blob
-        for token in ("credential", "creds", "password", "kerberos", "ntlm", "auth")
-    ):
-        return "credential"
-    if any(
-        token in blob for token in ("beacon", "c2", "command and control", "check-in")
-    ):
-        return "c2"
-    if any(
-        token in blob
-        for token in (
-            "exfil",
-            "tunnel",
-            "http post",
-            "file exfil",
-            "outbound",
-            "data transfer",
-            "large outbound",
-        )
-    ):
-        return "exfil"
-    if any(token in blob for token in ("smb", "rdp", "winrm", "ssh", "lateral")):
-        return "lateral"
-    if any(token in blob for token in ("secret", "token", "api key")):
-        return "secrets"
+    for stage, pattern in _STAGE_PATTERNS:
+        if pattern.search(blob):
+            return stage
     return "other"
 
 
@@ -412,6 +435,12 @@ def analyze_compromised(
         if not isinstance(item, dict):
             continue
         severity = _normalize_severity(item.get("severity"))
+        # The threat engine has already classified internal-only periodicity
+        # on OT ports / to broadcast as baseline (HMI polling, discovery
+        # chatter) and says so in the detail text. It is context here, not
+        # evidence that the poller is compromised.
+        if str(item.get("internal_periodicity", "") or "") in {"broadcast", "ot_baseline"}:
+            severity = "info"
         summary = str(item.get("summary", "Threat detection"))
         details = str(item.get("details", ""))
         evidence = []
@@ -508,22 +537,31 @@ def analyze_compromised(
         # context at info severity so it does not push an OT host over the
         # compromise threshold; genuine C2 (a private->public beacon) is
         # unaffected.
-        dst_port = 0
-        try:
-            dst_port = int(getattr(candidate, "dst_port", 0) or 0)
-        except Exception:
-            dst_port = 0
+        # The beacon analyzer keys a TCP session on its service port and stores
+        # it in whichever of src_port/dst_port survived (dst_port is None for
+        # every TCP candidate), so the service port is "whichever is set" —
+        # reading dst_port alone saw 0, never matched an OT port, and rated an
+        # HMI's Modbus polls as HIGH-severity beaconing.
+        service_port = 0
+        for attr in ("src_port", "dst_port"):
+            try:
+                value = int(getattr(candidate, attr, 0) or 0)
+            except Exception:
+                value = 0
+            if value:
+                service_port = value
+                break
         internal_ot_cyclic = (
             _is_private_ip(src_ip)
             and dst_ip
             and _is_private_ip(dst_ip)
-            and dst_port in OT_PORTS
+            and service_port in OT_PORTS
         )
         if internal_ot_cyclic:
             severity = "info"
             summary = "Periodic OT control-channel (likely baseline polling)"
             message = (
-                f"{src_ip}->{dst_ip} {getattr(candidate, 'proto', '-')}/{dst_port} "
+                f"{src_ip}->{dst_ip} {getattr(candidate, 'proto', '-')}/{service_port} "
                 f"interval≈{getattr(candidate, 'median_interval', 0.0):.1f}s "
                 "(internal OT cyclic; verify against process baseline)"
             )
@@ -533,7 +571,7 @@ def analyze_compromised(
             summary = "Beaconing behavior detected"
         details = (
             f"{src_ip} -> {dst_ip} {getattr(candidate, 'proto', '-')}/"
-            f"{getattr(candidate, 'dst_port', '-')}"
+            f"{service_port or '-'}"
         )
         evidence = [
             f"count={int(getattr(candidate, 'count', 0) or 0)}",
@@ -923,8 +961,14 @@ def analyze_compromised(
     incidents: list[dict[str, object]] = []
     incident_gap_seconds = 900.0
     for ip_value, items in detection_by_host.items():
+        # Info-level entries are context (baseline polling, tokens in
+        # transit); a cluster made only of them is not an incident, and the
+        # verdict credits every incident cluster.
         sortable = [
-            entry for entry in items if isinstance(entry.get("timestamp"), (int, float))
+            entry
+            for entry in items
+            if isinstance(entry.get("timestamp"), (int, float))
+            and str(entry.get("severity", "info")) != "info"
         ]
         sortable.sort(key=lambda item: float(item.get("timestamp", 0.0) or 0.0))
         if not sortable:
@@ -1006,7 +1050,7 @@ def analyze_compromised(
     campaigns: list[dict[str, object]] = []
     campaign_idx = 1
     for ioc, hosts in sorted(
-        ioc_to_hosts.items(), key=lambda item: len(item[1]), reverse=True
+        ioc_to_hosts.items(), key=lambda item: (-len(item[1]), item[0])
     ):
         if len(hosts) < 2:
             continue
@@ -1044,20 +1088,8 @@ def analyze_compromised(
                 benign_context.append(message)
                 deterministic_checks["benign_automation_likely"].append(message)
 
-    host_priority.sort(
-        key=lambda item: (
-            int(item.get("score", 0) or 0),
-            int(item.get("stage_count", 0) or 0),
-        ),
-        reverse=True,
-    )
-    incidents.sort(
-        key=lambda item: (
-            float(item.get("first_ts", 0.0) or 0.0),
-            int(item.get("count", 0) or 0),
-        ),
-        reverse=True,
-    )
+    host_priority.sort(key=_host_priority_key)
+    incidents.sort(key=_incident_key)
 
     normalized_checks: dict[str, list[str]] = {}
     for key, values in deterministic_checks.items():
@@ -1118,6 +1150,8 @@ def merge_compromised_summaries(
                     "iocs": set(host.iocs),
                     "severity": host.severity,
                     "score": host.score,
+                    "roles": list(host.roles),
+                    "is_infra": bool(host.is_infra),
                 }
                 merged_hosts[host.ip] = entry
                 continue
@@ -1135,6 +1169,10 @@ def merge_compromised_summaries(
             ):
                 entry["severity"] = host.severity
             entry["score"] = max(int(entry.get("score", 0)), host.score)
+            for role in host.roles:
+                if role not in entry["roles"]:
+                    entry["roles"].append(role)
+            entry["is_infra"] = bool(entry.get("is_infra")) or bool(host.is_infra)
 
     merged_list: list[CompromisedHost] = []
     for ip_value, entry in merged_hosts.items():
@@ -1149,31 +1187,22 @@ def merge_compromised_summaries(
                 iocs=sorted(entry.get("iocs", set()))[:10],
                 severity=str(entry.get("severity", "info")),
                 score=int(entry.get("score", 0) or 0),
+                roles=list(entry.get("roles", []) or []),
+                is_infra=bool(entry.get("is_infra", False)),
             )
         )
 
+    # Same total order as the single-capture list (severity, score, then IP).
     merged_list.sort(
         key=lambda host: (
-            SEVERITY_WEIGHT.get(host.severity, 0),
-            host.score,
-        ),
-        reverse=True,
+            -SEVERITY_WEIGHT.get(host.severity, 0),
+            -host.score,
+            host.ip,
+        )
     )
 
-    host_priority.sort(
-        key=lambda item: (
-            int(item.get("score", 0) or 0),
-            int(item.get("stage_count", 0) or 0),
-        ),
-        reverse=True,
-    )
-    incidents.sort(
-        key=lambda item: (
-            float(item.get("first_ts", 0.0) or 0.0),
-            int(item.get("count", 0) or 0),
-        ),
-        reverse=True,
-    )
+    host_priority.sort(key=_host_priority_key)
+    incidents.sort(key=_incident_key)
     dedup_checks: dict[str, list[str]] = {}
     for key, values in deterministic_checks.items():
         seen: set[str] = set()

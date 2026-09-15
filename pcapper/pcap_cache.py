@@ -711,19 +711,36 @@ def iter_packets(
             pass
 
 
+# Each registration gets a fresh serial. The analysis memo keys on it rather
+# than on id(list): a list freed after clear_forced_packet_view() can have
+# its id reused by the next view of the same capture, and two different
+# filtered views of equal length would then alias in the memo.
+_FORCED_VIEW_SERIAL = 0
+_FORCED_VIEW_SERIALS: dict[Path, int] = {}
+
+
 def set_forced_packet_view(
     path: Path, packets: list[object], meta: PcapMeta | None = None
 ) -> None:
+    global _FORCED_VIEW_SERIAL
+    _FORCED_VIEW_SERIAL += 1
     _FORCED_PACKET_VIEWS[Path(path)] = (packets, meta)
+    _FORCED_VIEW_SERIALS[Path(path)] = _FORCED_VIEW_SERIAL
 
 
 def clear_forced_packet_view(path: Path) -> None:
     _FORCED_PACKET_VIEWS.pop(Path(path), None)
+    _FORCED_VIEW_SERIALS.pop(Path(path), None)
 
 
 def get_forced_packet_view(path: Path) -> list[object] | None:
     forced = _FORCED_PACKET_VIEWS.get(Path(path))
     return forced[0] if forced is not None else None
+
+
+def get_forced_packet_view_serial(path: Path) -> int | None:
+    """Registration serial of the forced view for ``path`` (None when unset)."""
+    return _FORCED_VIEW_SERIALS.get(Path(path))
 
 
 def get_reader(
