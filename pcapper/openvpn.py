@@ -30,6 +30,15 @@ class OpenVpnFrame:
     frame_len: int
 
 
+@dataclass(frozen=True)
+class OpenVpnControlPayload:
+    opcode: int
+    key_id: int
+    packet_id: int | None
+    data: bytes
+    frame_len: int
+
+
 def openvpn_opcode_name(opcode: int) -> str:
     return OPENVPN_OPCODES.get(opcode, f"OpenVPN opcode {opcode}")
 
@@ -102,6 +111,52 @@ def iter_openvpn_tcp_frame_payloads(payload: bytes) -> Iterable[bytes]:
         offset = frame_end
 
 
+def _parse_openvpn_control_payload(frame_payload: bytes) -> OpenVpnControlPayload | None:
+    parsed = _parse_opcode_byte(frame_payload[0]) if frame_payload else None
+    if parsed is None:
+        return None
+    opcode, key_id = parsed
+    if opcode not in OPENVPN_CONTROL_OPCODES:
+        return None
+
+    pos = 1 + 8  # opcode/key-id + local session_id
+    if pos >= len(frame_payload):
+        return None
+    ack_count = frame_payload[pos]
+    pos += 1
+    ack_bytes = ack_count * 4
+    if pos + ack_bytes > len(frame_payload):
+        return None
+    pos += ack_bytes
+    if ack_count:
+        if pos + 8 > len(frame_payload):
+            return None
+        pos += 8  # remote_session_id
+
+    packet_id: int | None = None
+    if opcode != 5:  # P_ACK_V1 has no message packet-id or payload.
+        if pos + 4 > len(frame_payload):
+            return None
+        packet_id = int.from_bytes(frame_payload[pos : pos + 4], "big")
+        pos += 4
+
+    return OpenVpnControlPayload(
+        opcode=opcode,
+        key_id=key_id,
+        packet_id=packet_id,
+        data=bytes(frame_payload[pos:]),
+        frame_len=len(frame_payload),
+    )
+
+
+def iter_openvpn_tcp_control_payloads(payload: bytes) -> Iterable[OpenVpnControlPayload]:
+    """Yield OpenVPN control-channel data after stripping protocol headers."""
+    for frame_payload in iter_openvpn_tcp_frame_payloads(payload):
+        parsed = _parse_openvpn_control_payload(frame_payload)
+        if parsed is not None:
+            yield parsed
+
+
 def openvpn_tcp_control_opcodes(payload: bytes) -> list[int]:
     return [
         frame.opcode
@@ -126,7 +181,9 @@ def is_openvpn_udp_control(payload: bytes) -> bool:
     return bool(openvpn_udp_control_opcodes(payload))
 
 
-def tcp_flow_id(src_ip: str, sport: int, dst_ip: str, dport: int) -> tuple[tuple[str, int], tuple[str, int]]:
+def tcp_flow_id(
+    src_ip: str, sport: int, dst_ip: str, dport: int
+) -> tuple[tuple[str, int], tuple[str, int]]:
     left = (str(src_ip), int(sport))
     right = (str(dst_ip), int(dport))
     return (left, right) if left <= right else (right, left)

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
-from .openvpn import iter_openvpn_tcp_frame_payloads
+from .openvpn import iter_openvpn_tcp_control_payloads
 from .utils import extract_packet_endpoints, memoize_analysis
 
 try:
@@ -242,6 +242,7 @@ def analyze_certificates(
     serial_contexts: dict[str, set[str]] = {}
     tls_buffers: dict[tuple[str, str, int, int], bytearray] = {}
     openvpn_tls_buffers: dict[tuple[str, str, int, int], bytearray] = {}
+    openvpn_seen_packet_ids: dict[tuple[str, str, int, int], set[int]] = {}
     weak_signatures: list[dict[str, object]] = []
     eku_mismatches: list[dict[str, object]] = []
     key_usage_issues: list[dict[str, object]] = []
@@ -735,12 +736,30 @@ def analyze_certificates(
             # the record header says so on any port — the raw reassembly path
             # below is what actually yields certificates off non-443 ports.
             tls_on_wire = payload is not None and _is_tls_record_start(payload)
-            openvpn_frame_payloads = (
-                list(iter_openvpn_tcp_frame_payloads(payload or b"")) if payload else []
+            openvpn_control_payloads = (
+                list(iter_openvpn_tcp_control_payloads(payload or b"")) if payload else []
             )
             openvpn_tls_on_wire = any(
-                _contains_tls_record(frame_payload)
-                for frame_payload in openvpn_frame_payloads
+                _contains_tls_record(item.data)
+                for item in openvpn_control_payloads
+                if item.data
+            )
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
+            src_ip = src_ip or "0.0.0.0"
+            dst_ip = dst_ip or "0.0.0.0"
+            openvpn_flow_key = (
+                (
+                    src_ip,
+                    dst_ip,
+                    int(getattr(tcp_layer, "sport", 0)),
+                    int(getattr(tcp_layer, "dport", 0)),
+                )
+                if tcp_layer is not None
+                else None
+            )
+            openvpn_has_buffer = (
+                openvpn_flow_key is not None
+                and bool(openvpn_tls_buffers.get(openvpn_flow_key))
             )
             if tls_layer is not None or tls_on_wire or openvpn_tls_on_wire:
                 tls_packets += 1
@@ -768,12 +787,13 @@ def analyze_certificates(
                         cert_payloads.extend(value)
                     else:
                         cert_payloads.append(value)
-            if not cert_payloads and not tls_on_wire and not openvpn_tls_on_wire:
+            if (
+                not cert_payloads
+                and not tls_on_wire
+                and not openvpn_tls_on_wire
+                and not openvpn_has_buffer
+            ):
                 continue
-
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-            src_ip = src_ip or "0.0.0.0"
-            dst_ip = dst_ip or "0.0.0.0"
 
             for cert_payload in cert_payloads:
                 for cert_bytes in _collect_cert_items(cert_payload):
@@ -836,16 +856,22 @@ def analyze_certificates(
                 for cert_bytes in certs:
                     _handle_cert_bytes(cert_bytes, src_ip, dst_ip)
 
-            if openvpn_tls_on_wire and tcp_layer is not None and openvpn_frame_payloads:
-                flow_key = (
-                    src_ip,
-                    dst_ip,
-                    int(getattr(tcp_layer, "sport", 0)),
-                    int(getattr(tcp_layer, "dport", 0)),
-                )
+            if (
+                (openvpn_tls_on_wire or openvpn_has_buffer)
+                and openvpn_flow_key is not None
+                and openvpn_control_payloads
+            ):
+                flow_key = openvpn_flow_key
                 buf = openvpn_tls_buffers.setdefault(flow_key, bytearray())
-                for frame_payload in openvpn_frame_payloads:
-                    buf.extend(frame_payload)
+                seen_ids = openvpn_seen_packet_ids.setdefault(flow_key, set())
+                for item in openvpn_control_payloads:
+                    if not item.data:
+                        continue
+                    if item.packet_id is not None:
+                        if item.packet_id in seen_ids:
+                            continue
+                        seen_ids.add(item.packet_id)
+                    buf.extend(item.data)
                 certs, consumed = _parse_tls_from_buffer(buf)
                 if consumed > 0:
                     del buf[:consumed]

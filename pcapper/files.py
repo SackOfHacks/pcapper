@@ -40,7 +40,7 @@ except Exception:  # pragma: no cover
 from .aim import analyze_aim
 from .cip import CIP_SERVICE_NAMES
 from .nfs import analyze_nfs
-from .openvpn import iter_openvpn_tcp_frame_payloads, openvpn_tcp_control_opcodes
+from .openvpn import iter_openvpn_tcp_control_payloads, openvpn_tcp_control_opcodes
 from .pcap_cache import iter_packets
 from .utils import (
     detect_file_type_bytes,
@@ -1547,7 +1547,17 @@ def _parse_tls_certificate_records(stream: bytes) -> List[bytes]:
 def _extract_openvpn_tls_certificates(stream: bytes) -> List[bytes]:
     if not stream or not openvpn_tcp_control_opcodes(stream):
         return []
-    openvpn_payload = b"".join(iter_openvpn_tcp_frame_payloads(stream))
+    chunks: List[bytes] = []
+    seen_packet_ids: set[int] = set()
+    for item in iter_openvpn_tcp_control_payloads(stream):
+        if not item.data:
+            continue
+        if item.packet_id is not None:
+            if item.packet_id in seen_packet_ids:
+                continue
+            seen_packet_ids.add(item.packet_id)
+        chunks.append(item.data)
+    openvpn_payload = b"".join(chunks)
     if not openvpn_payload:
         return []
     return [

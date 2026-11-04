@@ -187,6 +187,28 @@ class TestVpn:
         body = bytes([(opcode << 3) & 0xF8]) + fill
         return len(body).to_bytes(2, "big") + body
 
+    def _ovpn_control_tcp(
+        self,
+        opcode: int,
+        packet_id: int,
+        data: bytes = b"",
+        *,
+        session_id: bytes = b"\x11\x22\x33\x44\x55\x66\x77\x88",
+        ack_ids: tuple[int, ...] = (),
+        remote_session_id: bytes = b"\x88\x77\x66\x55\x44\x33\x22\x11",
+    ) -> bytes:
+        body = bytearray([(opcode << 3) & 0xF8])
+        body.extend(session_id)
+        body.append(len(ack_ids))
+        for ack_id in ack_ids:
+            body.extend(int(ack_id).to_bytes(4, "big"))
+        if ack_ids:
+            body.extend(remote_session_id)
+        if opcode != 5:
+            body.extend(int(packet_id).to_bytes(4, "big"))
+            body.extend(data)
+        return len(body).to_bytes(2, "big") + bytes(body)
+
     def test_port_match_needs_the_vpn_port_on_the_server_side(self) -> None:
         from pcapper.vpn import _vpn_port_match
 
@@ -251,15 +273,27 @@ class TestVpn:
 
         client, server = "192.168.10.50", "54.209.141.127"
         pcap = _write(tmp_path, "openvpn_cert_443.pcap", [
-            _at(_tcp(client, server, 54636, 443, self._ovpn_tcp(7), seq=100), T0),
-            _at(_tcp(server, client, 443, 54636, self._ovpn_tcp(8), seq=500), T0 + 0.01),
+            _at(_tcp(client, server, 54636, 443, self._ovpn_control_tcp(7, 0), seq=100), T0),
             _at(
                 _tcp(
                     server,
                     client,
                     443,
                     54636,
-                    self._ovpn_tcp(4, _certificate_record(_fixture_certificate())),
+                    self._ovpn_control_tcp(8, 0, ack_ids=(0,)),
+                    seq=500,
+                ),
+                T0 + 0.01,
+            ),
+            _at(
+                _tcp(
+                    server,
+                    client,
+                    443,
+                    54636,
+                    self._ovpn_control_tcp(
+                        4, 1, _certificate_record(_fixture_certificate())
+                    ),
                     seq=520,
                 ),
                 T0 + 0.02,
