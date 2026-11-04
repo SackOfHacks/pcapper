@@ -47,6 +47,22 @@ class TestDetectFileType:
         assert utils.detect_file_type(tmp_path / "absent.pcap") == "unknown"
 
 
+class TestPcapSummary:
+    def test_classic_pcap_header_uses_capture_byte_order(self, pcap) -> None:
+        from pcapper.analyzer import analyze_pcap
+
+        summary = analyze_pcap(pcap("dns.pcap"), show_status=False)
+        assert summary.interface_stats[0].linktype == "1"
+        assert summary.interface_stats[0].snaplen == 65535
+
+    def test_protocol_presence_counts_each_packet_once_per_protocol(self, pcap) -> None:
+        from pcapper.analyzer import analyze_pcap
+
+        summary = analyze_pcap(pcap("dns.pcap"), show_status=False)
+        assert summary.packet_count == 6
+        assert summary.protocol_counts["DNS"] == 6
+
+
 class TestOpenPrivate:
     def test_writes_text_and_bytes(self, tmp_path) -> None:
         p = tmp_path / "a.txt"
@@ -946,3 +962,14 @@ class TestCliRejectsNonCapture:
         )
         assert proc.returncode == 2, proc.stdout[-500:]
         assert "not a pcap/pcapng capture" in proc.stderr
+
+    def test_decrypt_without_keylog_exits_2(self, pcap) -> None:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pcapper", str(pcap("dns.pcap")), "--decrypt", "--quiet"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=dict(os.environ, NO_COLOR="1", PYTHONIOENCODING="utf-8"),
+            cwd=REPO, timeout=300,
+        )
+        assert proc.returncode == 2, proc.stdout[-500:]
+        assert "Decrypt requested but no keylog file provided" in proc.stderr
+        assert "PCAPPER REPORT" not in proc.stdout

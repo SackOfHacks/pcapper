@@ -4913,6 +4913,7 @@ def main() -> int:
             _print_error(
                 "Decrypt requested but no keylog file provided (--tls-keylog/--ssh-keylog)."
             )
+            return 2
 
     paths: list[Path] = []
     seen_paths: set[Path] = set()

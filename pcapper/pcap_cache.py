@@ -56,11 +56,14 @@ def _read_pcap_header(path: Path) -> tuple[object | None, object | None]:
             header = handle.read(24)
         if len(header) < 24:
             return None, None
-        magic = struct.unpack("<I", header[:4])[0]
-        endian = PCAP_MAGIC.get(magic)
-        if endian is None:
-            magic = struct.unpack(">I", header[:4])[0]
-            endian = PCAP_MAGIC.get(magic)
+        magic_bytes = header[:4]
+        endian_by_magic = {
+            b"\xa1\xb2\xc3\xd4": ">",
+            b"\xd4\xc3\xb2\xa1": "<",
+            b"\xa1\xb2\x3c\x4d": ">",
+            b"\x4d\x3c\xb2\xa1": "<",
+        }
+        endian = endian_by_magic.get(magic_bytes)
         if endian is None:
             return None, None
         snaplen = struct.unpack(f"{endian}I", header[16:20])[0]

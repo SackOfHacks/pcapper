@@ -18,6 +18,7 @@ except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
 
 from .pcap_cache import PcapMeta, iter_packets
+from .openvpn import openvpn_tcp_control_opcodes, openvpn_udp_control_opcodes
 from .utils import extract_packet_endpoints, memoize_analysis, packet_length, safe_float
 
 import ipaddress as _ipaddress
@@ -180,6 +181,7 @@ def _build_services_enrichment(
     admin_ports_by_host: Dict[str, Set[int]] = defaultdict(set)
     ot_ports_by_host: Dict[str, Set[int]] = defaultdict(set)
     boundary_exposure_profiles: List[Dict[str, object]] = []
+    false_positive_context: List[str] = []
     for asset in assets or []:
         name = str(getattr(asset, "service_name", ""))
         port = int(getattr(asset, "port", 0) or 0)
@@ -205,6 +207,13 @@ def _build_services_enrichment(
                 }
             )
             checks["internet_exposed_surface"].append(f"{ip}:{port} ({name})")
+        if name == "OpenVPN" and port == 443:
+            fp_note = (
+                f"{ip}:443 OpenVPN-over-443 detected — likely protocol-confusion false positive "
+                "when raw-TCP C2 content signatures match the OpenVPN/TLS control handshake."
+            )
+            false_positive_context.append(fp_note)
+            checks["protocol_confusion_false_positive"].append(fp_note)
 
     # OT/IT boundary mix: an IT admin service and an OT service observed in the
     # same capture is a segmentation red flag (engineering access reachable from
@@ -316,6 +325,7 @@ def _build_services_enrichment(
         "lateral_surface_profiles": lateral_surface_profiles,
         "ot_it_crossing_profiles": ot_it_crossing_profiles,
         "service_mismatch_profiles": service_mismatch_profiles,
+        "false_positive_context": list(dict.fromkeys(false_positive_context)),
     }
 
 def merge_services_summaries(
@@ -588,6 +598,12 @@ def _guess_service(payload: bytes, port: int) -> tuple[Optional[str], Optional[s
         return "FTP", banner
 
     return None, None
+
+
+def _openvpn_software_note(port: int) -> str:
+    if port == 443:
+        return "OpenVPN control channel over TCP/443 (TLS-in-tunnel; not HTTPS)"
+    return "OpenVPN control channel (TLS-in-tunnel)"
 
 
 def _tcp_is_syn(flags: object) -> bool:
@@ -863,6 +879,12 @@ def analyze_services(
 
                 # Check payloads for banners only on handshake-confirmed TCP services.
                 if payload:
+                    if openvpn_tcp_control_opcodes(payload):
+                        s.service_name = "OpenVPN"
+                        if not s.software:
+                            s.software = _openvpn_software_note(server_port)
+                        s.discovery_method = "openvpn_control_handshake"
+                        continue
                     sample_key = (
                         "payload_samples_ab" if src_is_left else "payload_samples_ba"
                     )
@@ -888,20 +910,25 @@ def analyze_services(
                 udp = pkt[UDP]
                 sport = udp.sport
                 dport = udp.dport
+                try:
+                    udp_payload = bytes(udp.payload)
+                except Exception:
+                    udp_payload = b""
+                udp_openvpn = (
+                    sport in {1194, 4433} or dport in {1194, 4433}
+                ) and bool(openvpn_udp_control_opcodes(udp_payload))
 
                 ntp_mode: Optional[int] = None
                 if sport == 123 or dport == 123:
-                    try:
-                        udp_payload = bytes(udp.payload)
-                    except Exception:
-                        udp_payload = b""
                     if udp_payload:
                         ntp_mode = udp_payload[0] & 0x07
 
                 server_ip: Optional[str] = None
                 server_port: Optional[int] = None
                 client_ip: Optional[str] = None
-                if ntp_mode == 3:
+                if udp_openvpn:
+                    server_ip, server_port, client_ip = dst, dport, src
+                elif ntp_mode == 3:
                     # NTP client request -> the destination is the NTP server.
                     server_ip, server_port, client_ip = dst, dport, src
                 elif ntp_mode in (4, 5):
@@ -928,7 +955,7 @@ def analyze_services(
                     continue
                 k = (server_ip, server_port, "UDP")
                 if k not in services:
-                    s_name = COMMON_PORTS.get(server_port, f"UDP/{server_port}")
+                    s_name = "OpenVPN" if udp_openvpn else COMMON_PORTS.get(server_port, f"UDP/{server_port}")
                     services[k] = ServiceAsset(
                         server_ip,
                         server_port,
@@ -940,6 +967,11 @@ def analyze_services(
                         discovery_method="udp_observed",
                     )
                 s = services[k]
+                if udp_openvpn:
+                    s.service_name = "OpenVPN"
+                    if not s.software:
+                        s.software = _openvpn_software_note(int(server_port or 0))
+                    s.discovery_method = "openvpn_control_handshake"
                 s.clients.add(client_ip)
                 s.packets += 1
                 s.bytes += pkt_len
@@ -1014,6 +1046,12 @@ def analyze_services(
                     item for item in data if isinstance(item, (bytes, bytearray))
                 )
         for sample in payload_samples:
+            if openvpn_tcp_control_opcodes(bytes(sample)):
+                s.service_name = "OpenVPN"
+                if not s.software:
+                    s.software = _openvpn_software_note(server_port)
+                s.discovery_method = "openvpn_control_handshake"
+                continue
             guessed_service, banner = _guess_service(bytes(sample), server_port)
             if guessed_service and s.service_name.startswith("TCP/"):
                 s.service_name = guessed_service

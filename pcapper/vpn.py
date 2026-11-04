@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
+from .openvpn import OPENVPN_OPCODES, openvpn_tcp_control_opcodes, openvpn_udp_control_opcodes
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
@@ -76,19 +77,6 @@ WIREGUARD_MESSAGE_TYPES = {
     2: "WireGuard Handshake Response",
     3: "WireGuard Cookie Reply",
     4: "WireGuard Transport",
-}
-
-OPENVPN_OPCODES = {
-    1: "OpenVPN P_CONTROL_HARD_RESET_CLIENT_V1",
-    2: "OpenVPN P_CONTROL_HARD_RESET_SERVER_V1",
-    3: "OpenVPN P_CONTROL_SOFT_RESET_V1",
-    4: "OpenVPN P_CONTROL_V1",
-    5: "OpenVPN P_ACK_V1",
-    6: "OpenVPN P_DATA_V1",
-    7: "OpenVPN P_CONTROL_HARD_RESET_CLIENT_V2",
-    8: "OpenVPN P_CONTROL_HARD_RESET_SERVER_V2",
-    9: "OpenVPN P_DATA_V2",
-    10: "OpenVPN P_CONTROL_HARD_RESET_CLIENT_V3",
 }
 
 WEAK_CERT_SIGS = {"md5", "sha1"}
@@ -218,25 +206,6 @@ def _parse_wireguard_message(payload: bytes) -> Optional[str]:
     if payload[1:4] != b"\x00\x00\x00":
         return None
     return WIREGUARD_MESSAGE_TYPES.get(message_type)
-
-
-def _parse_openvpn_opcode(payload: bytes, *, is_tcp: bool = False) -> Optional[str]:
-    if not payload:
-        return None
-    # OpenVPN over TCP frames each packet with a 2-byte big-endian length
-    # prefix, so the opcode/key-id byte is at offset 2. Over UDP there is no
-    # prefix and the opcode is the first byte. Reading byte 0 on TCP parses the
-    # high byte of the length field and yields a bogus opcode.
-    if is_tcp:
-        if len(payload) < 3:
-            return None
-        declared_len = int.from_bytes(payload[0:2], "big")
-        if declared_len != len(payload) - 2:
-            return None
-        opcode = payload[2] >> 3
-    else:
-        opcode = payload[0] >> 3
-    return OPENVPN_OPCODES.get(opcode)
 
 
 def _collect_cert_items(payload: object) -> list[object]:
@@ -421,10 +390,24 @@ def analyze_vpn(
                 tcp = pkt[TCP]  # type: ignore[index]
                 sport = int(getattr(tcp, "sport", 0) or 0)
                 dport = int(getattr(tcp, "dport", 0) or 0)
-                if _vpn_port_match(sport, dport):
+                payload = _extract_layer_payload(tcp)
+                openvpn_opcodes = openvpn_tcp_control_opcodes(payload)
+                tls_marker = (
+                    (TLSClientHello is not None and pkt.haslayer(TLSClientHello))  # type: ignore[truthy-bool]
+                    or (TLSServerHello is not None and pkt.haslayer(TLSServerHello))  # type: ignore[truthy-bool]
+                    or bool(_extract_tls_certificates(pkt))
+                )
+                port_match = _vpn_port_match(sport, dport)
+                if port_match and 443 in {sport, dport} and not (openvpn_opcodes or tls_marker):
+                    continue
+                if port_match or openvpn_opcodes:
                     vpn_packets += 1
                     _mark_window(ts)
-                    service = VPN_PORTS.get(dport) or VPN_PORTS.get(sport) or "VPN"
+                    service = (
+                        "OpenVPN"
+                        if openvpn_opcodes
+                        else VPN_PORTS.get(dport) or VPN_PORTS.get(sport) or "VPN"
+                    )
                     service_counts[service] += 1
                     protocol_counts["TCP"] += 1
                     client_ip, server_ip, server_port = _infer_client_server(
@@ -438,14 +421,12 @@ def analyze_vpn(
                     if server_port:
                         server_port_counts[server_port] += 1
 
-                    payload = _extract_layer_payload(tcp)
-                    if server_port in {1194, 4433}:
-                        opcode = _parse_openvpn_opcode(payload, is_tcp=True)
-                        if opcode:
-                            handshake_counts[opcode] += 1
-                            _record_artifact_correlation(
-                                artifact_correlations, opcode, client_ip, server_ip
-                            )
+                    for opcode in openvpn_opcodes:
+                        opcode_name = OPENVPN_OPCODES[opcode]
+                        handshake_counts[opcode_name] += 1
+                        _record_artifact_correlation(
+                            artifact_correlations, opcode_name, client_ip, server_ip
+                        )
                     if server_port == 1723:
                         try:
                             flags = int(getattr(tcp, "flags", 0) or 0)
@@ -529,10 +510,20 @@ def analyze_vpn(
                 udp = pkt[UDP]  # type: ignore[index]
                 sport = int(getattr(udp, "sport", 0) or 0)
                 dport = int(getattr(udp, "dport", 0) or 0)
-                if _vpn_port_match(sport, dport):
+                payload = _extract_layer_payload(udp)
+                openvpn_opcodes = (
+                    openvpn_udp_control_opcodes(payload)
+                    if sport in {1194, 4433} or dport in {1194, 4433}
+                    else []
+                )
+                if _vpn_port_match(sport, dport) or openvpn_opcodes:
                     vpn_packets += 1
                     _mark_window(ts)
-                    service = VPN_PORTS.get(dport) or VPN_PORTS.get(sport) or "VPN"
+                    service = (
+                        "OpenVPN"
+                        if openvpn_opcodes
+                        else VPN_PORTS.get(dport) or VPN_PORTS.get(sport) or "VPN"
+                    )
                     service_counts[service] += 1
                     protocol_counts["UDP"] += 1
                     client_ip, server_ip, server_port = _infer_client_server(
@@ -546,7 +537,6 @@ def analyze_vpn(
                     if server_port:
                         server_port_counts[server_port] += 1
 
-                    payload = _extract_layer_payload(udp)
                     if server_port in {500, 4500}:
                         exchange = _parse_ike_exchange(payload, server_port)
                         if exchange:
@@ -570,13 +560,12 @@ def analyze_vpn(
                                 client_ip,
                                 server_ip,
                             )
-                    if server_port in {1194, 4433}:
-                        opcode = _parse_openvpn_opcode(payload)
-                        if opcode:
-                            handshake_counts[opcode] += 1
-                            _record_artifact_correlation(
-                                artifact_correlations, opcode, client_ip, server_ip
-                            )
+                    for opcode in openvpn_opcodes:
+                        opcode_name = OPENVPN_OPCODES[opcode]
+                        handshake_counts[opcode_name] += 1
+                        _record_artifact_correlation(
+                            artifact_correlations, opcode_name, client_ip, server_ip
+                        )
                     if server_port == 1701 and payload and (payload[0] & 0x80):
                         handshake_counts["L2TP Control"] += 1
                         _record_artifact_correlation(
@@ -593,6 +582,11 @@ def analyze_vpn(
 
     if int(service_counts.get("PPTP", 0)) > 0:
         threat_counts["Legacy PPTP tunnel observed"] += int(service_counts["PPTP"])
+
+    if int(service_counts.get("OpenVPN", 0)) > 0 and int(server_port_counts.get(443, 0)) > 0:
+        anomaly_counts[
+            "OpenVPN-over-443 can trigger raw-TCP signature false positives"
+        ] += int(server_port_counts.get(443, 0))
 
     if int(service_counts.get("L2TP", 0)) > 0:
         has_ipsec_companion = any(

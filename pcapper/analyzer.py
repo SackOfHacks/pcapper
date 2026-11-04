@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover
     Ether = None  # type: ignore
 
 from .models import InterfaceStat, PcapSummary
+from .openvpn import is_openvpn_tcp_control, is_openvpn_udp_control
 from .services import COMMON_PORTS
 from .utils import (
     detect_file_type,
@@ -54,15 +55,23 @@ def _port_protocol_name(pkt) -> str | None:
         try:
             sport = int(pkt[TCP].sport)
             dport = int(pkt[TCP].dport)
+            payload = bytes(getattr(pkt[TCP], "payload", b"") or b"")
         except Exception:
+            return None
+        if is_openvpn_tcp_control(payload):
+            return "OpenVPN"
+        if (sport in {443, 8443} or dport in {443, 8443}) and not payload:
             return None
         return COMMON_PORTS.get(sport) or COMMON_PORTS.get(dport)
     if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
         try:
             sport = int(pkt[UDP].sport)
             dport = int(pkt[UDP].dport)
+            payload = bytes(getattr(pkt[UDP], "payload", b"") or b"")
         except Exception:
             return None
+        if (sport in {1194, 4433} or dport in {1194, 4433}) and is_openvpn_udp_control(payload):
+            return "OpenVPN"
         return COMMON_PORTS.get(sport) or COMMON_PORTS.get(dport)
     return None
 
@@ -227,9 +236,9 @@ def analyze_pcap(
         for name in layer_names:
             protocol_counts[name] += 1
 
-        if port_proto:
+        if port_proto and port_proto not in layer_names:
             protocol_counts[port_proto] += 1
-        if ethertype_proto:
+        if ethertype_proto and ethertype_proto not in layer_names:
             protocol_counts[ethertype_proto] += 1
 
         tcp_layer = pkt.getlayer(TCP) if TCP is not None else None

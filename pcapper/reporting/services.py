@@ -233,6 +233,7 @@ def render_services_summary(summary: ServiceSummary, verbose: bool = False) -> s
             "ot_it_boundary_mix": "OT/IT boundary mix",
             "udp_amplification_readiness": "UDP amplification readiness",
             "legacy_or_weak_service_hygiene": "Legacy/weak hygiene",
+            "protocol_confusion_false_positive": "Protocol-confusion false-positive context",
             "evidence_provenance": "Evidence provenance",
         }
         for key, label_text in check_labels.items():
@@ -350,7 +351,7 @@ def render_services_summary(summary: ServiceSummary, verbose: bool = False) -> s
         for v in list(getattr(summary, "false_positive_context", []) or [])
         if str(v).strip()
     ]
-    if false_positive_context and verbose:
+    if false_positive_context:
         lines.append(SUBSECTION_BAR)
         lines.append(header("False-Positive Context"))
         for item in false_positive_context:

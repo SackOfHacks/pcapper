@@ -183,6 +183,10 @@ class TestSyslog:
 
 
 class TestVpn:
+    def _ovpn_tcp(self, opcode: int, fill: bytes = b"\x00" * 12) -> bytes:
+        body = bytes([(opcode << 3) & 0xF8]) + fill
+        return len(body).to_bytes(2, "big") + body
+
     def test_port_match_needs_the_vpn_port_on_the_server_side(self) -> None:
         from pcapper.vpn import _vpn_port_match
 
@@ -200,6 +204,44 @@ class TestVpn:
         summary = analyze_vpn(pcap, show_status=False)
         assert summary.vpn_packets == 1
         assert summary.first_seen == pytest.approx(T0 + 100)
+
+    def test_openvpn_over_tcp_443_is_not_reported_as_https(self, tmp_path) -> None:
+        from pcapper.analyzer import analyze_pcap
+        from pcapper.beacon import analyze_beacons
+        from pcapper.services import analyze_services
+        from pcapper.vpn import analyze_vpn
+
+        client, server = "192.168.10.50", "54.209.141.127"
+        pcap = _write(tmp_path, "openvpn_443.pcap", [
+            _at(_tcp(client, server, 54636, 443, flags="S", seq=100), T0),
+            _at(_tcp(server, client, 443, 54636, flags="SA", seq=500), T0 + 0.01),
+            _at(_tcp(client, server, 54636, 443, flags="A", seq=101), T0 + 0.02),
+            _at(_tcp(client, server, 54636, 443, self._ovpn_tcp(7), seq=101), T0 + 0.03),
+            _at(_tcp(server, client, 443, 54636, self._ovpn_tcp(8), seq=501), T0 + 0.04),
+            _at(_tcp(client, server, 54636, 443, self._ovpn_tcp(5), seq=120), T0 + 0.05),
+            _at(_tcp(server, client, 443, 54636, self._ovpn_tcp(4), seq=520), T0 + 0.06),
+        ])
+
+        services = analyze_services(pcap, show_status=False)
+        assert services.hierarchy == {"OpenVPN": 1}
+        asset = services.assets[0]
+        assert (asset.ip, asset.port, asset.service_name) == (server, 443, "OpenVPN")
+        assert "not HTTPS" in (asset.software or "")
+        assert services.false_positive_context
+        assert "protocol-confusion false positive" in services.false_positive_context[0]
+
+        vpn = analyze_vpn(pcap, show_status=False)
+        assert vpn.service_counts["OpenVPN"] == 4
+        assert vpn.server_counts[server] == 4
+        assert vpn.handshake_counts["OpenVPN P_CONTROL_HARD_RESET_CLIENT_V2"] == 1
+        assert vpn.handshake_counts["OpenVPN P_CONTROL_HARD_RESET_SERVER_V2"] == 1
+
+        base = analyze_pcap(pcap, show_status=False)
+        assert base.protocol_counts["OpenVPN"] == 4
+        assert "HTTPS" not in base.protocol_counts
+
+        beacons = analyze_beacons(pcap, show_status=False, min_events=2)
+        assert not beacons.candidates
 
 
 # --- SSDP / NetBIOS / GOOSE windows ---------------------------------------------------

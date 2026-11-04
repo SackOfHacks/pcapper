@@ -7,6 +7,7 @@ from typing import Optional
 
 from .dns import analyze_dns
 from .http import analyze_http
+from .openvpn import is_openvpn_tcp_control
 from .pcap_cache import PcapMeta, iter_packets
 from .services import COMMON_PORTS
 from .utils import (
@@ -413,6 +414,7 @@ def analyze_beacons(
     conn_request_packets: dict[tuple[str, str, str, Optional[int], Optional[int]], list[int]] = (
         defaultdict(list)
     )
+    openvpn_conn_keys: set[tuple[str, str, str, Optional[int], Optional[int]]] = set()
     untracked_connections = 0
     total_packets = 0
     skipped_packets = 0
@@ -485,6 +487,14 @@ def analyze_beacons(
                         seg_len = 0
                 if seg_len:
                     conn_data_bytes[conn_key] += int(seg_len)
+                    try:
+                        tcp_payload = bytes(getattr(tcp_layer, "payload", b"") or b"")[
+                            : int(seg_len)
+                        ]
+                    except Exception:
+                        tcp_payload = b""
+                    if tcp_payload and is_openvpn_tcp_control(tcp_payload):
+                        openvpn_conn_keys.add(conn_key)
                     # A data segment sent from the ephemeral side is a client
                     # request (equal ports are ambiguous and skipped).
                     if sport == client_port and sport != dport:
@@ -545,6 +555,8 @@ def analyze_beacons(
     session_request_packets: dict[tuple[str, str, str, Optional[int]], list[int]] = defaultdict(list)
 
     for conn_key, first_ts in conn_first_ts.items():
+        if conn_key in openvpn_conn_keys:
+            continue
         client_ip, server_ip, proto, server_port, _client_port = conn_key
         session_key = (client_ip, server_ip, proto, server_port)
         ts = conn_syn_ts.get(conn_key, first_ts)
