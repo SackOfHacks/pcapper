@@ -246,6 +246,28 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
         lines.append(header("Top SANs"))
         lines.append(_counter_table(summary.sas, "SAN", limit=_limit_value(10)))
 
+    openvpn_certs = list(getattr(summary, "openvpn_certificates", []) or [])
+    if openvpn_certs:
+        lines.append(SUBSECTION_BAR)
+        lines.append(header("OpenVPN Certificate Context"))
+        lines.append(
+            muted(
+                "  Certificate(s) were carried inside the OpenVPN control channel; treat them as VPN-server certificates, not web-service certificates."
+            )
+        )
+        rows = [["Subject", "Issuer", "VPN Server", "Client", "SHA256"]]
+        for item in openvpn_certs[: _limit_value(10)]:
+            rows.append(
+                [
+                    _truncate_text(str(item.get("subject", "-")), 48),
+                    _truncate_text(str(item.get("issuer", "-")), 48),
+                    str(item.get("src", "-")),
+                    str(item.get("dst", "-")),
+                    str(item.get("sha256", "-"))[: _limit_value(32)] + "...",
+                ]
+            )
+        lines.append(_format_table(rows))
+
     if summary.weak_keys:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Weak Keys"))
@@ -303,12 +325,13 @@ def render_certificates_summary(summary: CertificateSummary) -> str:
     if summary.artifacts:
         lines.append(SUBSECTION_BAR)
         lines.append(header("Certificate Artifacts"))
-        rows = [["Subject", "Issuer", "Not After", "Key", "SHA256"]]
+        rows = [["Subject", "Issuer", "Context", "Not After", "Key", "SHA256"]]
         for cert in summary.artifacts[: _limit_value(10)]:
             rows.append(
                 [
                     cert.subject,
                     cert.issuer,
+                    getattr(cert, "transport", "TLS"),
                     cert.not_after,
                     f"{cert.pubkey_type} {cert.pubkey_size}",
                     cert.sha256[: _limit_value(32)] + "...",

@@ -78,6 +78,30 @@ def iter_openvpn_tcp_frames(payload: bytes) -> Iterable[OpenVpnFrame]:
         offset = frame_end
 
 
+def iter_openvpn_tcp_frame_payloads(payload: bytes) -> Iterable[bytes]:
+    """Yield OpenVPN TCP frame bodies, without the two-byte length prefix.
+
+    The returned bytes still include OpenVPN's opcode/key-id byte and any
+    control-channel metadata. Consumers that need embedded TLS records should
+    scan inside the frame body rather than assuming TLS starts at offset zero.
+    """
+    offset = 0
+    total = len(payload or b"")
+    while offset + 3 <= total:
+        declared_len = int.from_bytes(payload[offset : offset + 2], "big")
+        if declared_len <= 0:
+            return
+        frame_start = offset + 2
+        frame_end = frame_start + declared_len
+        if frame_end > total:
+            return
+        parsed = _parse_opcode_byte(payload[frame_start])
+        if parsed is None:
+            return
+        yield bytes(payload[frame_start:frame_end])
+        offset = frame_end
+
+
 def openvpn_tcp_control_opcodes(payload: bytes) -> list[int]:
     return [
         frame.opcode

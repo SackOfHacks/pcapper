@@ -243,6 +243,54 @@ class TestVpn:
         beacons = analyze_beacons(pcap, show_status=False, min_events=2)
         assert not beacons.candidates
 
+    def test_openvpn_control_channel_certs_surface_in_certificates_and_files(self, tmp_path) -> None:
+        from make_fixtures import _certificate_record, _fixture_certificate
+
+        from pcapper.certificates import analyze_certificates
+        from pcapper.files import analyze_files
+
+        client, server = "192.168.10.50", "54.209.141.127"
+        pcap = _write(tmp_path, "openvpn_cert_443.pcap", [
+            _at(_tcp(client, server, 54636, 443, self._ovpn_tcp(7), seq=100), T0),
+            _at(_tcp(server, client, 443, 54636, self._ovpn_tcp(8), seq=500), T0 + 0.01),
+            _at(
+                _tcp(
+                    server,
+                    client,
+                    443,
+                    54636,
+                    self._ovpn_tcp(4, _certificate_record(_fixture_certificate())),
+                    seq=520,
+                ),
+                T0 + 0.02,
+            ),
+        ])
+
+        certs = analyze_certificates(pcap, show_status=False)
+        assert certs.cert_count == 1
+        cert = certs.artifacts[0]
+        assert cert.src_ip == server
+        assert cert.dst_ip == client
+        assert cert.transport == "OpenVPN control-channel TLS"
+        assert "shop.example.net" in cert.subject
+        assert certs.openvpn_certificates
+        assert certs.openvpn_certificates[0]["context"].startswith("OpenVPN control-channel")
+
+        files = analyze_files(pcap, show_status=False)
+        ovpn_certs = [
+            artifact
+            for artifact in files.artifacts
+            if artifact.protocol == "OpenVPN" and artifact.file_type == "X509"
+        ]
+        assert len(ovpn_certs) == 1
+        assert ovpn_certs[0].src_ip == server
+        assert ovpn_certs[0].dst_ip == client
+        assert "VPN server certificate" in (ovpn_certs[0].note or "")
+        assert any(
+            item.get("summary") == "OpenVPN control-channel certificate observed"
+            for item in files.detections
+        )
+
 
 # --- SSDP / NetBIOS / GOOSE windows ---------------------------------------------------
 

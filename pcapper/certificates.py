@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
+from .openvpn import iter_openvpn_tcp_frame_payloads
 from .utils import extract_packet_endpoints, memoize_analysis
 
 try:
@@ -98,6 +99,7 @@ class CertificateInfo:
     dst_ip: str
     sni: Optional[str]
     is_ca: bool = False
+    transport: str = "TLS"
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,7 @@ class CertificateSummary:
     endpoint_profiles: list[dict[str, object]] = field(default_factory=list)
     timeline: list[dict[str, object]] = field(default_factory=list)
     known_bad_certs: list[dict[str, object]] = field(default_factory=list)
+    openvpn_certificates: list[dict[str, object]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -154,6 +157,13 @@ def _is_tls_record_start(payload: bytes) -> bool:
         and payload[0] in (20, 21, 22, 23)
         and payload[1] == 0x03
     )
+
+
+def _contains_tls_record(payload: bytes) -> bool:
+    for idx in range(0, max(0, len(payload) - 4)):
+        if _is_tls_record_start(payload[idx:]):
+            return True
+    return False
 
 
 @memoize_analysis
@@ -231,6 +241,7 @@ def analyze_certificates(
     fingerprint_contexts: dict[str, set[str]] = {}
     serial_contexts: dict[str, set[str]] = {}
     tls_buffers: dict[tuple[str, str, int, int], bytearray] = {}
+    openvpn_tls_buffers: dict[tuple[str, str, int, int], bytearray] = {}
     weak_signatures: list[dict[str, object]] = []
     eku_mismatches: list[dict[str, object]] = []
     key_usage_issues: list[dict[str, object]] = []
@@ -240,6 +251,7 @@ def analyze_certificates(
     revocation_gaps: list[dict[str, object]] = []
     chain_gaps: list[dict[str, object]] = []
     timeline: list[dict[str, object]] = []
+    openvpn_certificates: list[dict[str, object]] = []
 
     now_utc = datetime.now(timezone.utc)
     suspicious_tlds = (".ru", ".cn", ".top", ".xyz", ".gq", ".tk", ".ml", ".ga")
@@ -326,7 +338,13 @@ def analyze_certificates(
             idx += 5 + length
         return certs, idx
 
-    def _handle_cert_bytes(raw_cert: bytes, src_ip: str, dst_ip: str) -> None:
+    def _handle_cert_bytes(
+        raw_cert: bytes,
+        src_ip: str,
+        dst_ip: str,
+        *,
+        transport: str = "TLS",
+    ) -> None:
         # The Certificate message travels server -> client: src_ip is the
         # service presenting the certificate, dst_ip the client that saw it.
         der_cert = _extract_der_cert(raw_cert)
@@ -398,6 +416,7 @@ def analyze_certificates(
                     "issuer": issuer,
                     "src": src_ip,
                     "dst": dst_ip,
+                    "transport": transport,
                 }
             )
         if sha256 in seen_fingerprints:
@@ -410,6 +429,7 @@ def analyze_certificates(
                     "src": src_ip,
                     "dst": dst_ip,
                     "not_after": not_after,
+                    "transport": transport,
                 }
             )
             return
@@ -659,8 +679,21 @@ def analyze_certificates(
                 "src": src_ip,
                 "dst": dst_ip,
                 "not_after": not_after,
+                "transport": transport,
             }
         )
+
+        if transport.startswith("OpenVPN"):
+            openvpn_certificates.append(
+                {
+                    "subject": subject,
+                    "issuer": issuer,
+                    "sha256": sha256,
+                    "src": src_ip,
+                    "dst": dst_ip,
+                    "context": "OpenVPN control-channel / VPN-server certificate",
+                }
+            )
 
         artifacts.append(
             CertificateInfo(
@@ -679,6 +712,7 @@ def analyze_certificates(
                 dst_ip=dst_ip,
                 sni=None,
                 is_ca=is_ca_cert,
+                transport=transport,
             )
         )
 
@@ -701,7 +735,14 @@ def analyze_certificates(
             # the record header says so on any port — the raw reassembly path
             # below is what actually yields certificates off non-443 ports.
             tls_on_wire = payload is not None and _is_tls_record_start(payload)
-            if tls_layer is not None or tls_on_wire:
+            openvpn_frame_payloads = (
+                list(iter_openvpn_tcp_frame_payloads(payload or b"")) if payload else []
+            )
+            openvpn_tls_on_wire = any(
+                _contains_tls_record(frame_payload)
+                for frame_payload in openvpn_frame_payloads
+            )
+            if tls_layer is not None or tls_on_wire or openvpn_tls_on_wire:
                 tls_packets += 1
 
             cert_payloads: list[object] = []
@@ -727,7 +768,7 @@ def analyze_certificates(
                         cert_payloads.extend(value)
                     else:
                         cert_payloads.append(value)
-            if not cert_payloads and not tls_on_wire:
+            if not cert_payloads and not tls_on_wire and not openvpn_tls_on_wire:
                 continue
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
@@ -794,6 +835,29 @@ def analyze_certificates(
                     del buf[:-1_000_000]
                 for cert_bytes in certs:
                     _handle_cert_bytes(cert_bytes, src_ip, dst_ip)
+
+            if openvpn_tls_on_wire and tcp_layer is not None and openvpn_frame_payloads:
+                flow_key = (
+                    src_ip,
+                    dst_ip,
+                    int(getattr(tcp_layer, "sport", 0)),
+                    int(getattr(tcp_layer, "dport", 0)),
+                )
+                buf = openvpn_tls_buffers.setdefault(flow_key, bytearray())
+                for frame_payload in openvpn_frame_payloads:
+                    buf.extend(frame_payload)
+                certs, consumed = _parse_tls_from_buffer(buf)
+                if consumed > 0:
+                    del buf[:consumed]
+                if len(buf) > 1_000_000:
+                    del buf[:-1_000_000]
+                for cert_bytes in certs:
+                    _handle_cert_bytes(
+                        cert_bytes,
+                        src_ip,
+                        dst_ip,
+                        transport="OpenVPN control-channel TLS",
+                    )
     finally:
         if conf is not None and prev_verb is not None:
             try:
@@ -905,5 +969,6 @@ def analyze_certificates(
         endpoint_profiles=endpoint_profiles,
         timeline=timeline_sorted[:200],
         known_bad_certs=known_bad_certs,
+        openvpn_certificates=openvpn_certificates,
         errors=errors,
     )

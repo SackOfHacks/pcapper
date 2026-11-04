@@ -4,7 +4,7 @@
 ![CI](https://github.com/SackOfHacks/pcapper/actions/workflows/ci.yml/badge.svg)
 ![Tests](https://img.shields.io/badge/tests-584%20passing-1B5E20)
 ![Analyzers](https://img.shields.io/badge/analyzers-120%2B-3D5A80)
-![Version](https://img.shields.io/badge/release-v2.6.0-7C3AED)
+![Version](https://img.shields.io/badge/release-v2.7.0-7C3AED)
 ![License](https://img.shields.io/badge/license-MIT-6C757D)
 ![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
 ![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
