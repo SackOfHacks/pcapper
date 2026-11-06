@@ -17,6 +17,7 @@ from .utils import (
     format_ts,
     is_private_ip,
     is_public_ip,
+    env_int,
     memoize_analysis,
     packet_length,
     safe_float,
@@ -113,6 +114,7 @@ PACKET_BUCKETS = [
     (1500, "1025-1500"),
     (9000, "1501-9000"),
 ]
+MAX_TCP_FLOWS = env_int("PCAPPER_MAX_TCP_FLOWS", 50000, minimum=1)
 
 
 def _bucketize(size: int) -> str:
@@ -375,6 +377,7 @@ def analyze_tcp(
     last_seen: Optional[float] = None
     skipped_packets = 0
     first_skip_error: str | None = None
+    skipped_flows = 0
 
     for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
         total_packets += 1
@@ -420,9 +423,24 @@ def analyze_tcp(
                 else:
                     ip6 = pkt.getlayer(IPv6) if IPv6 is not None else None
                     if ip6 is not None and getattr(ip6, "plen", None) is not None:
+                        extension_header_bytes = 0
+                        layer = getattr(tcp_layer, "underlayer", None)
+                        while layer is not None and layer is not ip6:
+                            payload_layer = getattr(layer, "payload", None)
+                            extension_header_bytes += max(
+                                0,
+                                len(bytes(layer))
+                                - (
+                                    len(bytes(payload_layer))
+                                    if payload_layer is not None
+                                    else 0
+                                ),
+                            )
+                            layer = getattr(layer, "underlayer", None)
                         payload_len = max(
                             0,
                             int(ip6.plen)
+                            - extension_header_bytes
                             - int(getattr(tcp_layer, "dataofs", 5)) * 4,
                         )
                     else:
@@ -440,6 +458,10 @@ def analyze_tcp(
             sender_key = src_ip or "-"
             src_key = src_ip or "-"
             dst_key = dst_ip or "-"
+            convo_key = (src_key, dst_key, sport, dport)
+            if convo_key not in conversations and len(conversations) >= MAX_TCP_FLOWS:
+                skipped_flows += 1
+                continue
 
             # Flow roles: learned from the handshake, port heuristic otherwise.
             # Attributing every packet's source as the "client" made each busy
@@ -470,7 +492,6 @@ def analyze_tcp(
             if server_key != "-":
                 port_destinations[server_port][server_key] += 1
 
-            convo_key = (src_key, dst_key, sport, dport)
             convo = conversations[convo_key]
             convo["packets"] = int(convo["packets"]) + 1
             convo["bytes"] = int(convo["bytes"]) + pkt_len
@@ -574,6 +595,11 @@ def analyze_tcp(
             f"{skipped_packets} TCP segment(s) skipped after a parse error "
             f"(first: {first_skip_error}); counts are lower bounds."
         )
+    if skipped_flows:
+        errors.append(
+            f"TCP flow tracking cap reached; {skipped_flows} segment(s) from "
+            "additional flows were omitted from flow analysis."
+        )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -607,7 +633,9 @@ def analyze_tcp(
     http_summary = _busy(
         "HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta
     )
-    file_summary = _busy("Files", analyze_files, path, show_status=False)
+    file_summary = _busy(
+        "Files", analyze_files, path, show_status=False, packets=packets, meta=meta
+    )
     services_summary = _busy(
         "Services", analyze_services, path, show_status=False, packets=packets, meta=meta
     )

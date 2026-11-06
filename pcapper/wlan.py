@@ -276,6 +276,22 @@ def _extract_signal_dbm(pkt: object) -> Optional[int]:
     return None
 
 
+def _add_signal_sample(state: dict[str, object], signal_dbm: int) -> None:
+    state["signal_sum"] = int(state.get("signal_sum", 0) or 0) + signal_dbm
+    state["signal_count"] = int(state.get("signal_count", 0) or 0) + 1
+    peak = state.get("signal_peak")
+    if peak is None or signal_dbm > int(peak):
+        state["signal_peak"] = signal_dbm
+
+
+def _signal_summary(state: dict[str, object]) -> tuple[Optional[int], Optional[int]]:
+    count = int(state.get("signal_count", 0) or 0)
+    if not count:
+        return None, None
+    average = int(round(int(state.get("signal_sum", 0) or 0) / count))
+    return average, int(state["signal_peak"])
+
+
 def _infer_phy_protocol(pkt: object) -> str:
     has_ht = False
     has_vht = False
@@ -328,11 +344,9 @@ def _prefer_security(left: str, right: str) -> str:
 
 def _is_unicast_mac(value: str) -> bool:
     text = str(value or "").strip().lower()
-    if not text or text == "ff:ff:ff:ff:ff:ff":
+    if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", text):
         return False
-    if text.startswith("33:33:") or text.startswith("01:00:5e:"):
-        return False
-    return True
+    return (int(text[:2], 16) & 1) == 0
 
 
 def _infer_bssid(dot11: object, ftype: int, addr1: str, addr2: str, addr3: str) -> str:
@@ -436,7 +450,9 @@ def analyze_wlan(
             "deauth_frames": 0,
             "bssids": set(),
             "protection": Counter(),
-            "signals": [],
+            "signal_sum": 0,
+            "signal_count": 0,
+            "signal_peak": None,
         }
     )
     deauth_by_src: Counter[str] = Counter()
@@ -513,7 +529,8 @@ def analyze_wlan(
             bssid = _infer_bssid(dot11, ftype, addr1, addr2, addr3)
             signal_dbm = _extract_signal_dbm(pkt)
             try:
-                subtype = int(getattr(dot11, "subtype", -1) or -1)
+                subtype_raw = getattr(dot11, "subtype", -1)
+                subtype = int(-1 if subtype_raw is None else subtype_raw)
             except Exception:
                 subtype = -1
 
@@ -562,18 +579,16 @@ def analyze_wlan(
                     prot = src_entry.setdefault("protection", Counter())
                     if isinstance(prot, Counter):
                         prot[security_tag] += 1
-                    sigs = src_entry.setdefault("signals", [])
-                    if isinstance(sigs, list) and signal_dbm is not None:
-                        sigs.append(signal_dbm)
+                    if signal_dbm is not None:
+                        _add_signal_sample(src_entry, signal_dbm)
                     if bssid and _is_unicast_mac(bssid):
                         bset = src_entry.get("bssids", set())
                         if isinstance(bset, set):
                             bset.add(bssid)
                 if dst_mac and dst_mac != "-" and dst_mac != "ff:ff:ff:ff:ff:ff":
                     dst_entry = client_state[dst_mac]
-                    sigs = dst_entry.setdefault("signals", [])
-                    if isinstance(sigs, list) and signal_dbm is not None:
-                        sigs.append(signal_dbm)
+                    if signal_dbm is not None:
+                        _add_signal_sample(dst_entry, signal_dbm)
 
             if Dot11WEP is not None and pkt.haslayer(Dot11WEP):  # type: ignore[truthy-bool]
                 wep_packets += 1
@@ -608,7 +623,9 @@ def analyze_wlan(
                             "channel": None,
                             "security": "UNKNOWN",
                             "phy": "Legacy/Unknown",
-                            "signals": [],
+                            "signal_sum": 0,
+                            "signal_count": 0,
+                            "signal_peak": None,
                             "beacons": 0,
                             "probe_responses": 0,
                             "clients": set(),
@@ -623,9 +640,7 @@ def analyze_wlan(
                         if isinstance(cast, set):
                             cast.add(station)
                     if signal_dbm is not None:
-                        sigs = state.get("signals", [])
-                        if isinstance(sigs, list):
-                            sigs.append(signal_dbm)
+                        _add_signal_sample(state, signal_dbm)
 
             if ftype == 2:
                 try:
@@ -865,7 +880,9 @@ def analyze_wlan(
                         "channel": channel,
                         "security": security,
                         "phy": phy_protocol,
-                        "signals": [],
+                        "signal_sum": 0,
+                        "signal_count": 0,
+                        "signal_peak": None,
                         "beacons": 0,
                         "probe_responses": 0,
                         "clients": set(),
@@ -891,9 +908,7 @@ def analyze_wlan(
                     phy_protocol,
                 )
                 if signal_dbm is not None:
-                    sigs = state.get("signals", [])
-                    if isinstance(sigs, list):
-                        sigs.append(signal_dbm)
+                    _add_signal_sample(state, signal_dbm)
                 if ts is not None:
                     first = safe_float(state.get("first"))
                     last = safe_float(state.get("last"))
@@ -1112,13 +1127,7 @@ def analyze_wlan(
     networks: list[WlanNetwork] = []
     for bssid, data in network_state.items():
         clients = data.get("clients", set())
-        signals = (
-            [int(v) for v in data.get("signals", [])]
-            if isinstance(data.get("signals"), list)
-            else []
-        )
-        avg_signal = int(round(sum(signals) / len(signals))) if signals else None
-        peak_signal = max(signals) if signals else None
+        avg_signal, peak_signal = _signal_summary(data)
         networks.append(
             WlanNetwork(
                 bssid=bssid,
@@ -1165,13 +1174,7 @@ def analyze_wlan(
             protection = protection_counter.most_common(1)[0][0]
         else:
             protection = "-"
-        signals = (
-            [int(v) for v in data.get("signals", [])]
-            if isinstance(data.get("signals"), list)
-            else []
-        )
-        avg_signal = int(round(sum(signals) / len(signals))) if signals else None
-        peak_signal = max(signals) if signals else None
+        avg_signal, peak_signal = _signal_summary(data)
         clients.append(
             WlanClient(
                 mac=mac,

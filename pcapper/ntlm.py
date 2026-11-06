@@ -362,12 +362,12 @@ def _parse_smb1_ids(payload: bytes) -> Tuple[Optional[int], Optional[int]]:
     return int(uid), int(mid)
 
 
-_HTTP_NTLM_MARKERS = (
-    b"Authorization: NTLM ",
-    b"WWW-Authenticate: NTLM ",
-    b"Proxy-Authorization: NTLM ",
-    b"Proxy-Authenticate: NTLM ",
-)
+_HTTP_NTLM_HEADERS = {
+    b"authorization",
+    b"www-authenticate",
+    b"proxy-authorization",
+    b"proxy-authenticate",
+}
 
 
 def _extract_http_ntlm(payload: bytes) -> Optional[bytes]:
@@ -377,16 +377,16 @@ def _extract_http_ntlm(payload: bytes) -> Optional[bytes]:
     NTLMSSP message base64-encoded in an Authorization/WWW-Authenticate header, so
     the raw binary signature scan misses it entirely.
     """
-    for marker in _HTTP_NTLM_MARKERS:
-        j = payload.find(marker)
-        if j < 0:
+    for line in payload.splitlines():
+        header, separator, value = line.partition(b":")
+        if not separator or header.strip().lower() not in _HTTP_NTLM_HEADERS:
             continue
-        token = payload[j + len(marker) :].split(b"\r\n", 1)[0].strip()
-        if not token:
+        scheme, separator, token = value.strip().partition(b" ")
+        if not separator or scheme.lower() != b"ntlm" or not token.strip():
             continue
         try:
-            decoded = base64.b64decode(token, validate=False)
-        except Exception:
+            decoded = base64.b64decode(token.strip(), validate=True)
+        except (ValueError, base64.binascii.Error):
             continue
         if decoded.startswith(NTLM_SIG):
             return decoded
@@ -794,8 +794,6 @@ def analyze_ntlm(
                             )
                     if len(ntlm_data) >= 20:
                         flags = struct.unpack("<I", ntlm_data[20:24])[0]
-                        if flags & NTLMSSP_NEGOTIATE_NTLM:
-                            versions["NTLMv1"] += 1
                         if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
                             _append_ntlm_artifact(
                                 artifacts,
@@ -819,8 +817,6 @@ def analyze_ntlm(
                     handshake_state[convo_key]["negotiate"] = ts
                     if len(ntlm_data) >= 16:
                         flags = struct.unpack("<I", ntlm_data[12:16])[0]
-                        if flags & NTLMSSP_NEGOTIATE_NTLM:
-                            versions["NTLMv1"] += 1
                         if flags & NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY:
                             _append_ntlm_artifact(
                                 artifacts,
@@ -829,15 +825,16 @@ def analyze_ntlm(
                                 description="NTLM Negotiate Flag",
                             )
 
-            except Exception:
-                pass
+            except Exception as e:
+                if len(errors) < 100:
+                    errors.append(f"NTLM packet {total_packets} parse error: {e}")
 
     except Exception as e:
         errors.append(str(e))
 
     duration = 0.0
-    if start_time and last_time:
-        duration = last_time - start_time
+    if start_time is not None and last_time is not None:
+        duration = max(0.0, last_time - start_time)
 
     deterministic_checks: Dict[str, List[str]] = {
         "ntlmv1_legacy_authentication": [],

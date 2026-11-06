@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .utils import env_int, open_private, restrict_dir_permissions
+from .utils import env_int, executable_path_warnings, open_private, restrict_dir_permissions
 
 
 @dataclass(frozen=True)
@@ -35,8 +36,16 @@ def _sanitize_filename(value: str) -> str:
     return cleaned.strip("_") or "stream"
 
 
+def _tshark_path() -> str | None:
+    configured_raw = os.environ.get("PCAPPER_TSHARK_BIN", "")
+    configured = str(Path(configured_raw).expanduser()) if configured_raw else ""
+    if configured:
+        return configured if Path(configured).is_file() else None
+    return shutil.which("tshark")
+
+
 def _tshark_available() -> bool:
-    return shutil.which("tshark") is not None
+    return _tshark_path() is not None
 
 
 TSHARK_TIMEOUT = float(env_int("PCAPPER_TSHARK_TIMEOUT", 120, minimum=1))
@@ -116,7 +125,7 @@ def _collect_streams(
     labelling feature effectively inert.
     """
     errors: list[str] = []
-    cmd = ["tshark"]
+    cmd = [_tshark_path() or "tshark"]
     if pref:
         cmd.extend(["-o", pref])
     cmd.extend(["-r", str(path), "-Y", display_filter, "-T", "fields"])
@@ -159,7 +168,7 @@ def _follow_stream(
     path: Path, stream_id: int, pref: str | None, follow_proto: str
 ) -> tuple[str, str] | None:
     """Follow one stream. ``None`` means tshark timed out and was given up on."""
-    cmd = ["tshark"]
+    cmd = [_tshark_path() or "tshark"]
     if pref:
         cmd.extend(["-o", pref])
     cmd.extend(
@@ -203,6 +212,10 @@ def _decrypt_protocol(
             errors=["tshark not found on PATH."],
             notes=[],
         )
+    tool = _tshark_path()
+    if tool:
+        for warning in executable_path_warnings(Path(tool)):
+            errors.append(f"tshark trust warning: {warning}")
 
     pref = f"{pref_key}:{keylog}"
     streams, labels, stream_errors = _collect_streams(path, display_filter, pref)

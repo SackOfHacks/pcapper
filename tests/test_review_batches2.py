@@ -377,6 +377,8 @@ def _ptp_frame(src: str, msg_type: int, seq: int):
 
     body = bytearray(44)
     body[0] = msg_type
+    body[1] = 2  # IEEE 1588-2008 version
+    body[2:4] = len(body).to_bytes(2, "big")
     body[4] = 0  # domain
     body[30:32] = seq.to_bytes(2, "big")
     return Ether(src=src, dst="01:1b:19:00:00:00", type=0x88F7) / Raw(load=bytes(body))

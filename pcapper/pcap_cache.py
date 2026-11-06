@@ -37,6 +37,14 @@ _HOST_ONLY_BPF_RE = re.compile(r"^\s*\(?\s*host\s+([0-9A-Fa-f:.]+)\s*\)?\s*$")
 __all__ = ["PCAP_MAGIC"]  # re-exported for callers that imported it from here
 
 
+def _path_key(path: Path) -> Path:
+    path_obj = Path(path).expanduser()
+    try:
+        return path_obj.resolve()
+    except Exception:
+        return path_obj.absolute()
+
+
 @dataclass(frozen=True)
 class PcapMeta:
     path: Path
@@ -48,6 +56,29 @@ class PcapMeta:
     capture_hardware: str | None = None
     capture_os: str | None = None
     capture_application: str | None = None
+    modified_ns: int | None = None
+
+
+def _cached_packets(path: Path) -> tuple[list[object], PcapMeta] | None:
+    global _CACHE_BYTES
+    key = _path_key(path)
+    cached = _PACKET_CACHE.get(key)
+    if cached is None:
+        return None
+    try:
+        stat = key.stat()
+        valid = (
+            cached[1].size_bytes == stat.st_size
+            and cached[1].modified_ns == stat.st_mtime_ns
+        )
+    except OSError:
+        valid = False
+    if not valid:
+        _PACKET_CACHE.pop(key, None)
+        _CACHE_BYTES = max(0, _CACHE_BYTES - max(0, cached[1].size_bytes))
+        return None
+    _PACKET_CACHE.move_to_end(key)
+    return cached
 
 
 def _read_pcap_header(path: Path) -> tuple[object | None, object | None]:
@@ -263,6 +294,10 @@ def _finalize_meta(
     else:
         section_info = {}
 
+    try:
+        modified_ns = path.stat().st_mtime_ns
+    except OSError:
+        modified_ns = None
     return PcapMeta(
         path=path,
         file_type=file_type,
@@ -273,6 +308,7 @@ def _finalize_meta(
         capture_hardware=section_info.get("hardware"),
         capture_os=section_info.get("os"),
         capture_application=section_info.get("application"),
+        modified_ns=modified_ns,
     )
 
 
@@ -462,9 +498,9 @@ def get_cached_packets(
     path: Path, show_status: bool = True
 ) -> tuple[list[object], PcapMeta]:
     global _CACHE_BYTES
-    cached = _PACKET_CACHE.get(path)
-    if cached:
-        _PACKET_CACHE.move_to_end(path)
+    key = _path_key(path)
+    cached = _cached_packets(path)
+    if cached is not None:
         return cached
     packets, meta = load_packets(path, show_status=show_status)
     size_bytes = max(0, int(getattr(meta, "size_bytes", 0) or 0))
@@ -478,7 +514,7 @@ def get_cached_packets(
         evicted_meta = evicted[1]
         evicted_size = max(0, int(getattr(evicted_meta, "size_bytes", 0) or 0))
         _CACHE_BYTES = max(0, _CACHE_BYTES - evicted_size)
-    _PACKET_CACHE[path] = (packets, meta)
+    _PACKET_CACHE[key] = (packets, meta)
     _CACHE_BYTES += size_bytes
     return packets, meta
 
@@ -637,7 +673,7 @@ def load_filtered_packets(
 
 
 def has_cached_packets(path: Path) -> bool:
-    return path in _PACKET_CACHE
+    return _cached_packets(path) is not None
 
 
 _HASH_CACHE: dict[tuple[str, int, int], tuple[str | None, str | None]] = {}
@@ -651,8 +687,9 @@ def capture_hashes(path: Path) -> tuple[str | None, str | None]:
     each made its own full pass over the file.
     """
     try:
-        st = Path(path).stat()
-        key = (str(path), st.st_size, st.st_mtime_ns)
+        key_path = _path_key(path)
+        st = key_path.stat()
+        key = (str(key_path), st.st_size, st.st_mtime_ns)
     except OSError:
         return None, None
     cached = _HASH_CACHE.get(key)
@@ -661,7 +698,7 @@ def capture_hashes(path: Path) -> tuple[str | None, str | None]:
     sha256 = hashlib.sha256()
     sha1 = hashlib.sha1()
     try:
-        with Path(path).open("rb") as handle:
+        with key_path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 sha256.update(chunk)
                 sha1.update(chunk)
@@ -727,23 +764,25 @@ def set_forced_packet_view(
 ) -> None:
     global _FORCED_VIEW_SERIAL
     _FORCED_VIEW_SERIAL += 1
-    _FORCED_PACKET_VIEWS[Path(path)] = (packets, meta)
-    _FORCED_VIEW_SERIALS[Path(path)] = _FORCED_VIEW_SERIAL
+    key = _path_key(path)
+    _FORCED_PACKET_VIEWS[key] = (packets, meta)
+    _FORCED_VIEW_SERIALS[key] = _FORCED_VIEW_SERIAL
 
 
 def clear_forced_packet_view(path: Path) -> None:
-    _FORCED_PACKET_VIEWS.pop(Path(path), None)
-    _FORCED_VIEW_SERIALS.pop(Path(path), None)
+    key = _path_key(path)
+    _FORCED_PACKET_VIEWS.pop(key, None)
+    _FORCED_VIEW_SERIALS.pop(key, None)
 
 
 def get_forced_packet_view(path: Path) -> list[object] | None:
-    forced = _FORCED_PACKET_VIEWS.get(Path(path))
+    forced = _FORCED_PACKET_VIEWS.get(_path_key(path))
     return forced[0] if forced is not None else None
 
 
 def get_forced_packet_view_serial(path: Path) -> int | None:
     """Registration serial of the forced view for ``path`` (None when unset)."""
-    return _FORCED_VIEW_SERIALS.get(Path(path))
+    return _FORCED_VIEW_SERIALS.get(_path_key(path))
 
 
 def get_reader(
@@ -753,7 +792,8 @@ def get_reader(
     meta: PcapMeta | None = None,
     show_status: bool = True,
 ) -> tuple[object, object, Optional[object], int, str]:
-    forced = _FORCED_PACKET_VIEWS.get(Path(path))
+    key = _path_key(path)
+    forced = _FORCED_PACKET_VIEWS.get(key)
     if forced is not None:
         forced_packets, forced_meta = forced
         size_bytes = len(forced_packets)
@@ -777,9 +817,8 @@ def get_reader(
     # Serve straight from the in-process cache when the packets are already
     # loaded (e.g. preloaded by the CLI for chained steps), regardless of the
     # per-file size limit that gates *new* cache loads.
-    cached = _PACKET_CACHE.get(path)
+    cached = _cached_packets(path)
     if cached is not None:
-        _PACKET_CACHE.move_to_end(path)
         cached_packets, cached_meta = cached
         reader = PacketListReader(cached_packets, cached_meta)
         status = build_statusbar(path, enabled=show_status)

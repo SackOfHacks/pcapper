@@ -11,6 +11,7 @@ from .industrial_helpers import (
 from .utils import memoize_analysis
 
 HART_PORT = 5094
+HART_UDP_HANDOVER_PORT = 5095
 
 # HART common-practice command numbers (universal + common practice). Only the
 # names needed to classify intent are mapped; unknowns show as "Command N".
@@ -39,10 +40,18 @@ HART_LOCK = {71}
 HART_WRITE_CMDS = {35, 44, 47, 51, 52, 53, 79}
 
 
+def _is_hart_ip_message(payload: bytes) -> bool:
+    if len(payload) < 8 or payload[0] not in (1, 2):
+        return False
+    if payload[1] not in (0, 1, 12, 15):
+        return False
+    return int.from_bytes(payload[6:8], "big") == len(payload)
+
+
 def _parse_commands(payload: bytes) -> list[str]:
     # HART-IP header (8 bytes): version, msg-type, msg-id, status, seq(2), len(2).
     # Only Message ID 3 (HART PDU pass-through) carries a HART command.
-    if len(payload) < 8 or payload[0] not in (1, 2) or payload[2] != 3:
+    if not _is_hart_ip_message(payload) or payload[2] != 3:
         return []
     body = payload[8:]
     if len(body) < 3:
@@ -56,13 +65,17 @@ def _parse_commands(payload: bytes) -> list[str]:
     if cmd_off >= len(body):
         return []
     cmd = body[cmd_off]
-    return [HART_COMMANDS.get(cmd, f"Command {cmd}")]
+    direction = "Response" if payload[1] == 1 else "Request"
+    command = HART_COMMANDS.get(cmd, f"Command {cmd}")
+    return [f"{direction}: {command}"]
 
 
 def _detect_anomalies(
     payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
 ) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
+    if not _is_hart_ip_message(payload) or payload[1] != 0:
+        return anomalies
 
     def add(sev: str, title: str, desc: str, attack: str) -> None:
         anomalies.append(
@@ -105,7 +118,8 @@ def analyze_hart(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         path=path,
         protocol_name="HART-IP",
         tcp_ports={HART_PORT},
-        udp_ports={HART_PORT},
+        udp_ports={HART_PORT, HART_UDP_HANDOVER_PORT},
+        signature_matcher=_is_hart_ip_message,
         command_parser=_parse_commands,
         anomaly_detector=_detect_anomalies,
         enable_enrichment=True,

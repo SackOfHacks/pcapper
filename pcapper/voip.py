@@ -119,9 +119,10 @@ except Exception:  # pragma: no cover
 MAX_CALLS = int(os.getenv("PCAPPER_VOIP_MAX_CALLS", "5000"))
 MAX_CREDENTIALS = int(os.getenv("PCAPPER_VOIP_MAX_CREDENTIALS", "2000"))
 MAX_RTP_STREAMS = int(os.getenv("PCAPPER_VOIP_MAX_RTP_STREAMS", "5000"))
+MAX_DTMF_STREAMS = int(os.getenv("PCAPPER_VOIP_MAX_DTMF_STREAMS", "5000"))
 MAX_DTMF_DIGITS = int(os.getenv("PCAPPER_VOIP_MAX_DTMF_DIGITS", "256"))
 MAX_MESSAGE_BODY = int(os.getenv("PCAPPER_VOIP_MAX_BODY", "512"))
-# 8 kHz 16-bit mono: 16 kB per second, so 16 MB is roughly 17 minutes a stream.
+# 8 kHz 16-bit mono: 16 kB per second, so 16 MB is roughly 17 minutes total.
 MAX_AUDIO_BYTES = int(os.getenv("PCAPPER_VOIP_MAX_AUDIO_BYTES", str(16 * 1024 * 1024)))
 MIN_RTP_PACKETS = int(os.getenv("PCAPPER_VOIP_MIN_RTP_PACKETS", "4"))
 
@@ -1078,8 +1079,8 @@ def _handle_sip(
             digits = "".join(_DTMF_RELAY_RE.findall(body))
             if digits:
                 dtmf("SIP INFO", src_ip, dst_ip, call_id[:40], digits)
-                if state is not None:
-                    state.dtmf.append(digits)
+                if state is not None and len(state.dtmf) < MAX_DTMF_DIGITS:
+                    state.dtmf.append(digits[:MAX_DTMF_DIGITS])
         elif body and method in {"MESSAGE", "INFO", "NOTIFY"}:
             trimmed = body.strip()[:MAX_MESSAGE_BODY]
             if trimmed:
@@ -1308,6 +1309,7 @@ def analyze_voip(
     t38_ports: set[int] = set()
     dtmf_payload_types: set[int] = set()
     other_dtmf: list[DtmfSequence] = []
+    other_dtmf_indexes: dict[tuple[str, str, str, str], int] = {}
 
     auth_failures: Counter[str] = Counter()
     probe_targets: dict[str, set[str]] = defaultdict(set)
@@ -1316,6 +1318,7 @@ def analyze_voip(
     cleartext_secrets: list[str] = []
     flag_strings: list[str] = []
     dropped = Counter()
+    retained_audio_bytes = 0
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -1348,22 +1351,22 @@ def analyze_voip(
     def _dtmf(protocol: str, source: str, destination: str, stream_id: str, digits: str) -> None:
         if not digits:
             return
-        for entry in other_dtmf:
-            if (
-                entry.protocol == protocol
-                and entry.source == source
-                and entry.destination == destination
-                and entry.stream == stream_id
-            ):
-                combined = (entry.digits + digits)[:MAX_DTMF_DIGITS]
-                other_dtmf[other_dtmf.index(entry)] = DtmfSequence(
-                    protocol=protocol,
-                    source=source,
-                    destination=destination,
-                    stream=stream_id,
-                    digits=combined,
-                )
-                return
+        key = (protocol, source, destination, stream_id)
+        index = other_dtmf_indexes.get(key)
+        if index is not None:
+            entry = other_dtmf[index]
+            other_dtmf[index] = DtmfSequence(
+                protocol=protocol,
+                source=source,
+                destination=destination,
+                stream=stream_id,
+                digits=(entry.digits + digits)[:MAX_DTMF_DIGITS],
+            )
+            return
+        if len(other_dtmf) >= MAX_DTMF_STREAMS:
+            dropped["dtmf"] += 1
+            return
+        other_dtmf_indexes[key] = len(other_dtmf)
         other_dtmf.append(
             DtmfSequence(
                 protocol=protocol,
@@ -1507,14 +1510,30 @@ def analyze_voip(
                                 payload_type=int(parsed["payload_type"]),
                             )
                             rtp_states[key] = state
+                        audio_budget = max(
+                            0, MAX_AUDIO_BYTES - retained_audio_bytes
+                        )
+                        previous_audio_size = len(state.audio)
                         update_rtp_state(
                             state,
                             parsed,
                             ts,
                             frame_bytes,
                             keep_audio=keep_audio,
-                            max_audio_bytes=MAX_AUDIO_BYTES,
+                            max_audio_bytes=len(state.audio) + audio_budget,
                         )
+                        if keep_audio:
+                            audio_bytes_delta = len(state.audio) - previous_audio_size
+                            # update_rtp_state only appends; the global budget
+                            # prevents every tracked stream retaining 16 MiB.
+                            retained_audio_bytes += audio_bytes_delta
+                            expected_audio_bytes = (
+                                len(parsed["payload"]) * 2
+                                if int(parsed["payload_type"]) in (0, 8)
+                                else 0
+                            )
+                            if audio_bytes_delta < expected_audio_bytes:
+                                dropped["audio"] = 1
                         pt = int(parsed["payload_type"])
                         if pt in dtmf_payload_types or pt == 101:
                             event = decode_dtmf_event(parsed["payload"])
@@ -1660,12 +1679,18 @@ def analyze_voip(
         ("calls", "call", MAX_CALLS, "PCAPPER_VOIP_MAX_CALLS"),
         ("credentials", "credential", MAX_CREDENTIALS, "PCAPPER_VOIP_MAX_CREDENTIALS"),
         ("rtp", "RTP stream", MAX_RTP_STREAMS, "PCAPPER_VOIP_MAX_RTP_STREAMS"),
+        ("dtmf", "DTMF stream", MAX_DTMF_STREAMS, "PCAPPER_VOIP_MAX_DTMF_STREAMS"),
     ):
         if dropped[key]:
             notes.append(
                 f"{label_text} tracking capped at {cap}; {dropped[key]} further "
                 f"{label_text}(s) not recorded (raise {env})."
             )
+    if dropped["audio"]:
+        notes.append(
+            f"Audio extraction capped at {MAX_AUDIO_BYTES} bytes total "
+            "(raise PCAPPER_VOIP_MAX_AUDIO_BYTES)."
+        )
 
     return _finalize(
         path=path,

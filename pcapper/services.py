@@ -535,9 +535,11 @@ COMMON_PORTS = {
     1217: "ODESYS",
     1883: "MQTT",
     8883: "MQTT-TLS",
-    34378: "Yokogawa Vnet/IP",
-    34379: "Yokogawa Vnet/IP",
-    34380: "Yokogawa Vnet/IP",
+    34378: "P-NET",
+    34379: "P-NET",
+    34380: "P-NET",
+    5313: "Yokogawa Vnet/IP",
+    55565: "Honeywell CDA",
 }
 
 # --- Logic ---

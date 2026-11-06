@@ -74,14 +74,9 @@ _IEC_ACTIVATION_COTS = {6, 8}
 def _parse_asdu(
     payload: bytes,
 ) -> tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
-    if len(payload) < 9:
+    if not _iec_apdu_candidate(payload):
         return None, None, None, None
-    if payload[0] != 0x68:
-        return None, None, None, None
-    if len(payload) >= 6 and payload[3] == 0x68:
-        idx = 6
-    else:
-        idx = 6
+    idx = 6
     if idx + 6 > len(payload):
         return None, None, None, None
     type_id = payload[idx]
@@ -102,24 +97,38 @@ def _iec_from_primary(payload: bytes) -> bool:
 
 
 def _iec_apdu_candidate(payload: bytes) -> bool:
-    # IEC 60870-5-101/103 FT1.2 *variable*-length frame: 0x68 L L 0x68 <L user
-    # bytes> CS 0x16. Requiring the repeated start byte AND the repeated length
-    # field (payload[1]==payload[2]) makes the signature specific — a bare
-    # "starts with 0x68" test matches ~0.2% of arbitrary binary/IT traffic and
-    # produced false "IEC-101/103 exposure" detections on malware/HTTP captures.
-    if not payload or len(payload) < 6:
-        return False
-    if payload[0] != 0x68 or payload[3] != 0x68:
-        return False
-    length = payload[1]
-    if length != payload[2] or not (1 <= length <= 253):
-        return False
-    # The frame is 0x68 L L 0x68 + L user bytes + checksum + 0x16. Validate the
-    # declared length against the captured frame where it isn't TCP-coalesced.
-    expected = length + 6
-    if len(payload) >= expected and payload[expected - 1] != 0x16:
-        return False
-    return True
+    return bool(_extract_iec_apdus(payload))
+
+
+def _extract_iec_apdus(payload: bytes) -> list[bytes]:
+    apdus: list[bytes] = []
+    idx = 0
+    while idx + 4 <= len(payload):
+        start = payload.find(b"\x68", idx)
+        if start < 0 or start + 4 > len(payload):
+            break
+        length = payload[start + 1]
+        if (
+            payload[start + 2] != length
+            or payload[start + 3] != 0x68
+            or not 1 <= length <= 253
+        ):
+            idx = start + 1
+            continue
+        frame_end = start + length + 6
+        if frame_end > len(payload):
+            break
+        checksum_idx = start + length + 4
+        if (
+            payload[frame_end - 1] != 0x16
+            or sum(payload[start + 4 : checksum_idx]) & 0xFF
+            != payload[checksum_idx]
+        ):
+            idx = start + 1
+            continue
+        apdus.append(payload[start:frame_end])
+        idx = frame_end
+    return apdus
 
 
 @memoize_analysis
@@ -152,7 +161,8 @@ def analyze_iec101_103(
             payload = bytes(getattr(pkt[TCP], "payload", b""))  # type: ignore[index]
         elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
             payload = bytes(getattr(pkt[UDP], "payload", b""))  # type: ignore[index]
-        if not _iec_apdu_candidate(payload):
+        apdus = _extract_iec_apdus(payload)
+        if not apdus:
             continue
 
         src_ip, dst_ip = extract_packet_endpoints(pkt)
@@ -176,18 +186,18 @@ def analyze_iec101_103(
         client_counts[client_ip] += 1
         server_counts[server_ip] += 1
 
-        type_name, cause_name, type_id, cot = _parse_asdu(payload)
-        if type_name:
-            type_counts[type_name] += 1
-        if cause_name:
-            cause_counts[cause_name] += 1
-        if (
-            type_id in IEC_COMMAND_TYPES
-            and cot in _IEC_ACTIVATION_COTS
-        ):
-            key = (src_ip, dst_ip, type_id)
-            command_activations[key] = command_activations.get(key, 0) + 1
-
+        for apdu in apdus:
+            type_name, cause_name, type_id, cot = _parse_asdu(apdu)
+            if type_name:
+                type_counts[type_name] += 1
+            if cause_name:
+                cause_counts[cause_name] += 1
+            if (
+                type_id in IEC_COMMAND_TYPES
+                and cot in _IEC_ACTIVATION_COTS
+            ):
+                key = (src_ip, dst_ip, type_id)
+                command_activations[key] = command_activations.get(key, 0) + 1
 
     if candidate_packets:
         detections.append(
@@ -237,7 +247,7 @@ def analyze_iec101_103(
         try:
             if ipaddress.ip_address(ip_value).is_global:
                 public_endpoints.append(ip_value)
-        except Exception:
+        except ValueError:
             continue
     if public_endpoints:
         detections.append(

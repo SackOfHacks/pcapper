@@ -10,6 +10,7 @@ from .device_detection import device_fingerprints_from_text
 from .pcap_cache import iter_packets
 from .utils import (
     beacon_score,
+    env_int,
     extract_packet_endpoints,
     memoize_analysis,
     packet_length,
@@ -28,6 +29,7 @@ except Exception:  # pragma: no cover
 
 
 SNMP_PORTS = {161, 162}
+MAX_SNMP_FLOWS = env_int("PCAPPER_MAX_SNMP_FLOWS", 50000, minimum=1)
 _REQUEST_PDUS = frozenset(
     {"GetRequest", "GetNextRequest", "GetBulkRequest", "SetRequest", "InformRequest"}
 )
@@ -160,6 +162,7 @@ class SnmpSummary:
             "mac_addresses": dict(self.mac_addresses),
             "services": dict(self.services),
             "plaintext_strings": dict(self.plaintext_strings),
+            "usm_users": dict(self.usm_users),
             "conversations": [
                 {
                     "client_ip": conv.client_ip,
@@ -208,14 +211,23 @@ def _decode_oid(value: bytes) -> Optional[str]:
     if not value:
         return None
     try:
-        first = value[0]
-        oid = [first // 40, first % 40]
+        subidentifiers: list[int] = []
         acc = 0
-        for b in value[1:]:
+        for b in value:
             acc = (acc << 7) | (b & 0x7F)
             if not (b & 0x80):
-                oid.append(acc)
+                subidentifiers.append(acc)
                 acc = 0
+        if value[-1] & 0x80 or not subidentifiers:
+            return None
+        first = subidentifiers.pop(0)
+        if first < 40:
+            oid = [0, first]
+        elif first < 80:
+            oid = [1, first - 40]
+        else:
+            oid = [2, first - 80]
+        oid.extend(subidentifiers)
         return ".".join(str(x) for x in oid)
     except Exception:
         return None
@@ -223,7 +235,7 @@ def _decode_oid(value: bytes) -> Optional[str]:
 
 def _decode_value(tag: int, value: bytes) -> str:
     if tag == 0x02:
-        return str(int.from_bytes(value, "big", signed=False))
+        return str(int.from_bytes(value, "big", signed=True))
     if tag == 0x04:
         try:
             text = value.decode("latin-1", errors="ignore")
@@ -303,7 +315,10 @@ def _parse_snmp_message(payload: bytes) -> Optional[dict[str, object]]:
     if vb_tag == 0x30 and vb_val is not None:
         vb_idx = 0
         while vb_idx < len(vb_val):
+            previous_idx = vb_idx
             item_tag, item_val, vb_idx = _read_tlv(vb_val, vb_idx)
+            if vb_idx <= previous_idx:
+                break
             if item_tag != 0x30 or item_val is None:
                 continue
             item_idx = 0
@@ -419,6 +434,7 @@ def analyze_snmp(
     seen_detections: set[tuple[str, str]] = set()
     skipped_packets = 0
     first_skip_error: str | None = None
+    skipped_flows = 0
 
     def _detect(severity: str, summary_text: str, details: str) -> None:
         # A value repeated in every poll response is one finding, not one per packet.
@@ -490,10 +506,14 @@ def analyze_snmp(
             msg = _parse_snmp_message(payload) if payload else None
             if not msg:
                 continue
+            conv_key = (client_ip, server_ip, proto, int(server_port))
+            if conv_key not in conv_map and len(conv_map) >= MAX_SNMP_FLOWS:
+                skipped_flows += 1
+                continue
 
             total_messages += 1
             version = str(msg.get("version", "unknown"))
-            community = str(msg.get("community", "-"))
+            community = str(msg.get("community", ""))
             pdu = str(msg.get("pdu", "-"))
             varbinds = msg.get("varbinds", [])
 
@@ -501,7 +521,7 @@ def analyze_snmp(
             usm_name = str(msg.get("username", "") or "").strip()
             if usm_name:
                 usm_users[usm_name] += 1
-            if community:
+            if community and version in {"v1", "v2c"}:
                 community_counts[community] += 1
             if pdu:
                 pdu_counts[pdu] += 1
@@ -509,8 +529,15 @@ def analyze_snmp(
             flow = (client_ip, server_ip)
             client_counts[client_ip] += 1
             server_counts[server_ip] += 1
-            dst_by_src[client_ip].add(server_ip)
-            community_by_flow[flow].add(community)
+            source_destinations = dst_by_src[client_ip]
+            if len(source_destinations) < 20:
+                source_destinations.add(server_ip)
+            if community and version in {"v1", "v2c"}:
+                # Only six distinct values are needed to identify likely brute
+                # forcing; retaining every observed string wastes memory.
+                flow_communities = community_by_flow[flow]
+                if len(flow_communities) < 6:
+                    flow_communities.add(community)
 
             if ts is not None and pdu in _REQUEST_PDUS:
                 times = request_times[flow]
@@ -526,7 +553,6 @@ def analyze_snmp(
             else:
                 request_bytes[flow] += pkt_len
 
-            conv_key = (client_ip, server_ip, proto, int(server_port))
             conv = conv_map.get(conv_key)
             if conv is None:
                 conv = {
@@ -590,6 +616,11 @@ def analyze_snmp(
         errors.append(
             f"{skipped_packets} SNMP packet(s) skipped after a parse error "
             f"(first: {first_skip_error}); counts are lower bounds."
+        )
+    if skipped_flows:
+        errors.append(
+            f"SNMP flow tracking cap reached; {skipped_flows} message(s) from "
+            "additional flows were omitted from detailed analysis."
         )
 
     for community in community_counts:

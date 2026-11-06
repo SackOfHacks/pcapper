@@ -10,6 +10,7 @@ from typing import Optional
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, extract_ascii_strings as _extract_ascii_strings
 from .utils import beacon_score as _beaconing_score
+from .utils import env_int as _env_int
 from .utils import is_public_ip as _is_public_ip
 
 try:
@@ -28,6 +29,11 @@ except Exception:  # pragma: no cover
 
 RDP_TCP_PORTS = {3389, 3390, 3388}
 RDP_UDP_PORTS = {3389, 3390, 3391, 3392}
+MAX_RDP_SESSIONS = _env_int("PCAPPER_MAX_RDP_SESSIONS", 50000, minimum=1)
+MAX_RDP_AUTH_EVIDENCE = _env_int("PCAPPER_MAX_RDP_AUTH_EVIDENCE", 50000, minimum=1)
+MAX_RDP_ARTIFACTS = _env_int("PCAPPER_MAX_RDP_ARTIFACTS", 2000, minimum=1)
+MAX_RDP_MACS_PER_IP = _env_int("PCAPPER_MAX_RDP_MACS_PER_IP", 32, minimum=1)
+MAX_RDP_UNIQUE_VALUES = _env_int("PCAPPER_MAX_RDP_UNIQUE_VALUES", 2000, minimum=1)
 # An RDP port on the *source* side is the service only when the destination
 # is an ephemeral port; a flow from ephemeral 3389 to 443 is not RDP.
 _EPHEMERAL_MIN = 1024
@@ -432,8 +438,12 @@ def _scan_plaintext(
     suspicious_counter: Counter[str],
     file_counter: Counter[str],
     artifacts: list[str],
-    max_unique: int = 2000,
+    max_unique: int = MAX_RDP_UNIQUE_VALUES,
 ) -> None:
+    def _increment_limited(counter: Counter[str], key: str) -> None:
+        if key in counter or len(counter) < max_unique:
+            counter[key] += 1
+
     for item in _extract_ascii_strings(payload):
         if not item:
             continue
@@ -441,14 +451,13 @@ def _scan_plaintext(
             plaintext_counter[item] += 1
         for pattern, reason in SUSPICIOUS_PLAINTEXT:
             if pattern.search(item):
-                suspicious_counter[f"{reason}: {item}"] += 1
+                _increment_limited(suspicious_counter, f"{reason}: {item}")
         for match in FILE_NAME_RE.findall(item):
-            file_counter[match] += 1
-        if "mstshash=" in item.lower():
-            artifacts.append(item)
-        if "credssp" in item.lower():
-            artifacts.append(item)
-        if "ntlmssp" in item.lower():
+            _increment_limited(file_counter, match)
+        if (
+            any(marker in item.lower() for marker in ("mstshash=", "credssp", "ntlmssp"))
+            and len(artifacts) < MAX_RDP_ARTIFACTS
+        ):
             artifacts.append(item)
 
 
@@ -771,6 +780,8 @@ def analyze_rdp(
 
     pkt_index = 0
     decrypted_sources: set[str] = set()
+    session_cap_reached = False
+    auth_evidence_cap_reached = False
 
     try:
         for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
@@ -856,25 +867,17 @@ def analyze_rdp(
                 src_ip, dst_ip, sport, dport, is_udp
             )
 
-            client_counts[client_ip] += 1
-            server_counts[server_ip] += 1
-            if is_udp:
-                server_udp_ports[server_port] += 1
-            else:
-                server_tcp_ports[server_port] += 1
-
-            if eth_src and src_ip:
-                ip_to_macs[src_ip].add(eth_src.lower())
-            if eth_dst and dst_ip:
-                ip_to_macs[dst_ip].add(eth_dst.lower())
-            if eth_src and src_ip == client_ip:
-                client_macs[eth_src.lower()] += 1
-            if eth_dst and dst_ip == server_ip:
-                server_macs[eth_dst.lower()] += 1
-
             session_key = (client_ip, client_port, server_ip, server_port, is_udp)
             session = sessions.get(session_key)
             if session is None:
+                if len(sessions) >= MAX_RDP_SESSIONS:
+                    if not session_cap_reached:
+                        errors.append(
+                            f"RDP session tracking capped at {MAX_RDP_SESSIONS}; "
+                            "additional session details were omitted."
+                        )
+                        session_cap_reached = True
+                    continue
                 session = _SessionState(
                     client_ip=client_ip,
                     server_ip=server_ip,
@@ -885,6 +888,31 @@ def analyze_rdp(
                     last_seen=ts,
                 )
                 sessions[session_key] = session
+
+            client_counts[client_ip] += 1
+            server_counts[server_ip] += 1
+            if is_udp:
+                server_udp_ports[server_port] += 1
+            else:
+                server_tcp_ports[server_port] += 1
+
+            if eth_src and src_ip:
+                if (
+                    len(ip_to_macs[src_ip]) < MAX_RDP_MACS_PER_IP
+                    or eth_src.lower() in ip_to_macs[src_ip]
+                ):
+                    ip_to_macs[src_ip].add(eth_src.lower())
+            if eth_dst and dst_ip:
+                if (
+                    len(ip_to_macs[dst_ip]) < MAX_RDP_MACS_PER_IP
+                    or eth_dst.lower() in ip_to_macs[dst_ip]
+                ):
+                    ip_to_macs[dst_ip].add(eth_dst.lower())
+            if eth_src and src_ip == client_ip:
+                client_macs[eth_src.lower()] += 1
+            if eth_dst and dst_ip == server_ip:
+                server_macs[eth_dst.lower()] += 1
+
             if session.client_mac is None and eth_src and src_ip == client_ip:
                 session.client_mac = eth_src.lower()
             if session.server_mac is None and eth_dst and dst_ip == server_ip:
@@ -922,11 +950,17 @@ def analyze_rdp(
                     client_name = match.group(1).strip()
                     if client_name:
                         session.client_name = session.client_name or client_name
-                        client_names[client_name] += 1
+                        if (
+                            client_name in client_names
+                            or len(client_names) < MAX_RDP_UNIQUE_VALUES
+                        ):
+                            client_names[client_name] += 1
                 if "Cookie: mstshash=" in text:
-                    artifacts.append(text.strip())
+                    if len(artifacts) < MAX_RDP_ARTIFACTS:
+                        artifacts.append(text.strip())
                 if "CredSSP" in text or "NTLMSSP" in text:
-                    artifacts.append(text.strip())
+                    if len(artifacts) < MAX_RDP_ARTIFACTS:
+                        artifacts.append(text.strip())
                 requested_mask, selected_mask = _parse_rdp_negotiation(payload_prefix)
                 for item in _rdp_protocol_names(requested_mask):
                     requested_protocols[item] += 1
@@ -942,7 +976,11 @@ def analyze_rdp(
                     payload_prefix
                 )
                 if core_client:
-                    decrypted_client_name[core_client] += 1
+                    if (
+                        core_client in decrypted_client_name
+                        or len(decrypted_client_name) < MAX_RDP_UNIQUE_VALUES
+                    ):
+                        decrypted_client_name[core_client] += 1
                 if client_build:
                     client_builds[client_build] += 1
                 if not payload_prefix.startswith(
@@ -973,11 +1011,23 @@ def analyze_rdp(
                 )
                 user, domain, host = _parse_rdp_decrypted_identity(decrypted_payload)
                 if user:
-                    decrypted_username[user] += 1
+                    if (
+                        user in decrypted_username
+                        or len(decrypted_username) < MAX_RDP_UNIQUE_VALUES
+                    ):
+                        decrypted_username[user] += 1
                 if domain:
-                    decrypted_domain[domain] += 1
+                    if (
+                        domain in decrypted_domain
+                        or len(decrypted_domain) < MAX_RDP_UNIQUE_VALUES
+                    ):
+                        decrypted_domain[domain] += 1
                 if host:
-                    decrypted_client_name[host] += 1
+                    if (
+                        host in decrypted_client_name
+                        or len(decrypted_client_name) < MAX_RDP_UNIQUE_VALUES
+                    ):
+                        decrypted_client_name[host] += 1
                 if user:
                     key = (
                         session.client_ip,
@@ -989,18 +1039,25 @@ def analyze_rdp(
                         host or "-",
                     )
                     if key not in auth_evidence_seen:
-                        auth_evidence_seen.add(key)
-                        auth_evidence.append(
-                            {
-                                "client_ip": session.client_ip,
-                                "server_ip": session.server_ip,
-                                "client_port": session.client_port,
-                                "server_port": session.server_port,
-                                "username": user,
-                                "domain": domain or "-",
-                                "client_name": host or "-",
-                            }
-                        )
+                        if len(auth_evidence) < MAX_RDP_AUTH_EVIDENCE:
+                            auth_evidence_seen.add(key)
+                            auth_evidence.append(
+                                {
+                                    "client_ip": session.client_ip,
+                                    "server_ip": session.server_ip,
+                                    "client_port": session.client_port,
+                                    "server_port": session.server_port,
+                                    "username": user,
+                                    "domain": domain or "-",
+                                    "client_name": host or "-",
+                                }
+                            )
+                        elif not auth_evidence_cap_reached:
+                            errors.append(
+                                "RDP authentication evidence capped at "
+                                f"{MAX_RDP_AUTH_EVIDENCE} records."
+                            )
+                            auth_evidence_cap_reached = True
 
     except Exception as exc:
         errors.append(str(exc))

@@ -10,35 +10,22 @@ from .industrial_helpers import (
 )
 from .utils import memoize_analysis
 
-# NOTE: the 3-byte token b"CDA" was removed -- with no port constraint this
-# matcher scans every payload, and "CDA" occurs constantly in unrelated traffic
-# ("CDATA" in XML, base64, random binary), producing rampant false "Honeywell
-# CDA" detections (and public-IP-exposure anomalies) on non-OT captures. Only
-# the unambiguous vendor strings are kept.
-HONEYWELL_SIGNATURES = (b"Honeywell", b"HONEYWELL")
-
-
-def _match_signature(payload: bytes) -> bool:
-    return any(sig in payload for sig in HONEYWELL_SIGNATURES)
+HONEYWELL_CDA_PORT = 55565
 
 
 def _detect_anomalies(
     payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
 ) -> list[IndustrialAnomaly]:
-    # The Honeywell CDA / Experion protocol is proprietary and undocumented, so
-    # only asset identification is possible (no command-level parsing). Flag the
-    # presence of Honeywell control-system traffic so the analyst can scope the
-    # DCS/asset and confirm the talkers are authorized.
-    if not _match_signature(payload):
-        return []
+    # CDA is proprietary, so identify its documented service port without
+    # claiming command-level visibility.
     return [
         IndustrialAnomaly(
             severity="info",
-            title="Honeywell Control-System Traffic",
+            title="Honeywell CDA Traffic",
             description=(
-                "Honeywell DCS/control-system (CDA/Experion) traffic observed — "
-                "asset identification; the protocol is proprietary so command "
-                "content is not decoded. Confirm the endpoints are authorized."
+                "Traffic on the Honeywell CDA/Experion service port observed. "
+                "The protocol is proprietary, so command content is not decoded; "
+                "confirm the endpoints are authorized."
             ),
             src=src_ip,
             dst=dst_ip,
@@ -54,7 +41,7 @@ def analyze_honeywell(path: Path, show_status: bool = True) -> IndustrialAnalysi
     analysis = analyze_port_protocol(
         path=path,
         protocol_name="Honeywell CDA",
-        signature_matcher=_match_signature,
+        tcp_ports={HONEYWELL_CDA_PORT},
         anomaly_detector=_detect_anomalies,
         enable_enrichment=True,
         show_status=show_status,

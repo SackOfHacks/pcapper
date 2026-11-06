@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from collections import Counter
 from dataclasses import dataclass, field
@@ -133,6 +134,21 @@ class CertificateSummary:
 
 
 _SCAPY_TLS_QUIETED = False
+MAX_CERTIFICATE_ARTIFACTS = max(
+    1, int(os.getenv("PCAPPER_MAX_CERTIFICATES", "10000"))
+)
+MAX_CERTIFICATE_FLOWS = max(
+    1, int(os.getenv("PCAPPER_MAX_CERTIFICATE_FLOWS", "50000"))
+)
+MAX_CERTIFICATE_BUFFER_BYTES = max(
+    1024, int(os.getenv("PCAPPER_MAX_CERTIFICATE_BUFFER_BYTES", str(64 * 1024 * 1024)))
+)
+MAX_CERTIFICATE_PACKET_IDS = max(
+    1, int(os.getenv("PCAPPER_MAX_CERTIFICATE_PACKET_IDS", "100000"))
+)
+MAX_CERTIFICATE_ERRORS = 1000
+MAX_CERTIFICATE_CONTEXTS = 256
+MAX_CERTIFICATE_REUSE_EVENTS = 20000
 
 
 def _quiet_scapy_tls() -> None:
@@ -253,6 +269,74 @@ def analyze_certificates(
     chain_gaps: list[dict[str, object]] = []
     timeline: list[dict[str, object]] = []
     openvpn_certificates: list[dict[str, object]] = []
+    omitted_certificates = 0
+    omitted_flows = 0
+    omitted_buffer_bytes = 0
+    omitted_packet_ids = 0
+    omitted_errors = 0
+    omitted_contexts = 0
+    omitted_reuse_events = 0
+    retained_buffer_bytes = 0
+    tracked_openvpn_packet_ids = 0
+
+    def _record_error(message: str) -> None:
+        nonlocal omitted_errors
+        if len(errors) < MAX_CERTIFICATE_ERRORS:
+            errors.append(message)
+        else:
+            omitted_errors += 1
+
+    def _record_context(
+        context_map: dict[str, set[str]], key: str, context: str
+    ) -> None:
+        nonlocal omitted_contexts
+        contexts = context_map.get(key)
+        if contexts is None:
+            if len(context_map) >= MAX_CERTIFICATE_ARTIFACTS:
+                omitted_contexts += 1
+                return
+            contexts = context_map.setdefault(key, set())
+        if context in contexts or len(contexts) < MAX_CERTIFICATE_CONTEXTS:
+            contexts.add(context)
+        else:
+            omitted_contexts += 1
+
+    def _get_flow_buffer(
+        buffers: dict[tuple[str, str, int, int], bytearray],
+        flow_key: tuple[str, str, int, int],
+    ) -> Optional[bytearray]:
+        nonlocal omitted_flows
+        buffer = buffers.get(flow_key)
+        if buffer is not None:
+            return buffer
+        if len(tls_buffers) + len(openvpn_tls_buffers) >= MAX_CERTIFICATE_FLOWS:
+            omitted_flows += 1
+            return None
+        buffer = bytearray()
+        buffers[flow_key] = buffer
+        return buffer
+
+    def _append_buffer(buffer: bytearray, payload: bytes) -> None:
+        nonlocal retained_buffer_bytes, omitted_buffer_bytes
+        flow_capacity = max(0, 1_000_000 - len(buffer))
+        total_capacity = max(
+            0, MAX_CERTIFICATE_BUFFER_BYTES - retained_buffer_bytes
+        )
+        keep = min(len(payload), flow_capacity, total_capacity)
+        if keep:
+            buffer.extend(payload[:keep])
+            retained_buffer_bytes += keep
+        omitted_buffer_bytes += len(payload) - keep
+
+    def _consume_buffer(buffer: bytearray, consumed: int) -> None:
+        nonlocal retained_buffer_bytes
+        if consumed > 0:
+            del buffer[:consumed]
+            retained_buffer_bytes -= consumed
+        if len(buffer) > 1_000_000:
+            removed = len(buffer) - 1_000_000
+            del buffer[:-1_000_000]
+            retained_buffer_bytes -= removed
 
     now_utc = datetime.now(timezone.utc)
     suspicious_tlds = (".ru", ".cn", ".top", ".xyz", ".gq", ".tk", ".ml", ".ga")
@@ -346,6 +430,10 @@ def analyze_certificates(
         *,
         transport: str = "TLS",
     ) -> None:
+        nonlocal omitted_certificates, omitted_reuse_events
+        if len(artifacts) >= MAX_CERTIFICATE_ARTIFACTS:
+            omitted_certificates += 1
+            return
         # The Certificate message travels server -> client: src_ip is the
         # service presenting the certificate, dst_ip the client that saw it.
         der_cert = _extract_der_cert(raw_cert)
@@ -365,7 +453,7 @@ def analyze_certificates(
                 or "extradata" in lower
             ):
                 return
-            errors.append(exc_text)
+            _record_error(exc_text)
             return
 
         subject = cert.subject.rfc4514_string()
@@ -400,39 +488,45 @@ def analyze_certificates(
         sha1 = cert.fingerprint(hashes.SHA1()).hex() if hashes else "-"
         sha256 = cert.fingerprint(hashes.SHA256()).hex() if hashes else "-"
         context_key = f"{src_ip}->{dst_ip}"
-        serial_contexts.setdefault(serial, set()).add(context_key)
-        fingerprint_contexts.setdefault(sha256, set()).add(context_key)
+        _record_context(serial_contexts, serial, context_key)
+        _record_context(fingerprint_contexts, sha256, context_key)
 
         # Known-malicious certificate IOC match (default C2 framework certs).
         bad_label = _KNOWN_BAD_CERT_SHA256.get(
             sha256.lower()
         ) or _KNOWN_BAD_CERT_SERIALS.get(str(serial).lower())
         if bad_label:
-            known_bad_certs.append(
-                {
-                    "label": bad_label,
-                    "sha256": sha256,
-                    "serial": serial,
-                    "subject": subject,
-                    "issuer": issuer,
-                    "src": src_ip,
-                    "dst": dst_ip,
-                    "transport": transport,
-                }
-            )
+            if len(known_bad_certs) < MAX_CERTIFICATE_REUSE_EVENTS:
+                known_bad_certs.append(
+                    {
+                        "label": bad_label,
+                        "sha256": sha256,
+                        "serial": serial,
+                        "subject": subject,
+                        "issuer": issuer,
+                        "src": src_ip,
+                        "dst": dst_ip,
+                        "transport": transport,
+                    }
+                )
+            else:
+                omitted_reuse_events += 1
         if sha256 in seen_fingerprints:
-            timeline.append(
-                {
-                    "event": "cert_reuse",
-                    "subject": subject,
-                    "issuer": issuer,
-                    "sha256": sha256,
-                    "src": src_ip,
-                    "dst": dst_ip,
-                    "not_after": not_after,
-                    "transport": transport,
-                }
-            )
+            if len(timeline) < MAX_CERTIFICATE_REUSE_EVENTS:
+                timeline.append(
+                    {
+                        "event": "cert_reuse",
+                        "subject": subject,
+                        "issuer": issuer,
+                        "sha256": sha256,
+                        "src": src_ip,
+                        "dst": dst_ip,
+                        "not_after": not_after,
+                        "transport": transport,
+                    }
+                )
+            else:
+                omitted_reuse_events += 1
             return
         seen_fingerprints.add(sha256)
 
@@ -836,7 +930,7 @@ def analyze_certificates(
                         lower = exc_text.lower()
                         if "asn1" in lower and "shortdata" in lower:
                             continue
-                        errors.append(exc_text)
+                        _record_error(exc_text)
                         continue
 
             if tls_on_wire and tcp_layer is not None and payload:
@@ -846,15 +940,13 @@ def analyze_certificates(
                     int(getattr(tcp_layer, "sport", 0)),
                     int(getattr(tcp_layer, "dport", 0)),
                 )
-                buf = tls_buffers.setdefault(flow_key, bytearray())
-                buf.extend(payload)
-                certs, consumed = _parse_tls_from_buffer(buf)
-                if consumed > 0:
-                    del buf[:consumed]
-                if len(buf) > 1_000_000:
-                    del buf[:-1_000_000]
-                for cert_bytes in certs:
-                    _handle_cert_bytes(cert_bytes, src_ip, dst_ip)
+                buf = _get_flow_buffer(tls_buffers, flow_key)
+                if buf is not None:
+                    _append_buffer(buf, payload)
+                    certs, consumed = _parse_tls_from_buffer(buf)
+                    _consume_buffer(buf, consumed)
+                    for cert_bytes in certs:
+                        _handle_cert_bytes(cert_bytes, src_ip, dst_ip)
 
             if (
                 (openvpn_tls_on_wire or openvpn_has_buffer)
@@ -862,34 +954,72 @@ def analyze_certificates(
                 and openvpn_control_payloads
             ):
                 flow_key = openvpn_flow_key
-                buf = openvpn_tls_buffers.setdefault(flow_key, bytearray())
-                seen_ids = openvpn_seen_packet_ids.setdefault(flow_key, set())
-                for item in openvpn_control_payloads:
-                    if not item.data:
-                        continue
-                    if item.packet_id is not None:
-                        if item.packet_id in seen_ids:
+                buf = _get_flow_buffer(openvpn_tls_buffers, flow_key)
+                if buf is not None:
+                    seen_ids = openvpn_seen_packet_ids.setdefault(flow_key, set())
+                    for item in openvpn_control_payloads:
+                        if not item.data:
                             continue
-                        seen_ids.add(item.packet_id)
-                    buf.extend(item.data)
-                certs, consumed = _parse_tls_from_buffer(buf)
-                if consumed > 0:
-                    del buf[:consumed]
-                if len(buf) > 1_000_000:
-                    del buf[:-1_000_000]
-                for cert_bytes in certs:
-                    _handle_cert_bytes(
-                        cert_bytes,
-                        src_ip,
-                        dst_ip,
-                        transport="OpenVPN control-channel TLS",
-                    )
+                        if item.packet_id is not None:
+                            if item.packet_id in seen_ids:
+                                continue
+                            if tracked_openvpn_packet_ids < MAX_CERTIFICATE_PACKET_IDS:
+                                seen_ids.add(item.packet_id)
+                                tracked_openvpn_packet_ids += 1
+                            else:
+                                omitted_packet_ids += 1
+                        _append_buffer(buf, item.data)
+                    certs, consumed = _parse_tls_from_buffer(buf)
+                    _consume_buffer(buf, consumed)
+                    for cert_bytes in certs:
+                        _handle_cert_bytes(
+                            cert_bytes,
+                            src_ip,
+                            dst_ip,
+                            transport="OpenVPN control-channel TLS",
+                        )
     finally:
         if conf is not None and prev_verb is not None:
             try:
                 conf.verb = prev_verb
             except Exception:
                 pass
+
+    if omitted_certificates:
+        errors.append(
+            f"Certificate artifact limit reached at {MAX_CERTIFICATE_ARTIFACTS}; "
+            f"omitted {omitted_certificates} certificates."
+        )
+    if omitted_flows:
+        errors.append(
+            f"Certificate flow limit reached at {MAX_CERTIFICATE_FLOWS}; "
+            f"omitted {omitted_flows} flow buffers."
+        )
+    if omitted_buffer_bytes:
+        errors.append(
+            f"Certificate reassembly buffer limit reached at "
+            f"{MAX_CERTIFICATE_BUFFER_BYTES} bytes; omitted "
+            f"{omitted_buffer_bytes} payload bytes."
+        )
+    if omitted_packet_ids:
+        errors.append(
+            f"OpenVPN packet-ID tracking limit reached at "
+            f"{MAX_CERTIFICATE_PACKET_IDS}; omitted {omitted_packet_ids} IDs."
+        )
+    if omitted_errors:
+        errors.append(
+            f"Certificate parse error limit reached; omitted {omitted_errors} errors."
+        )
+    if omitted_contexts:
+        errors.append(
+            f"Certificate reuse-context limits reached; omitted "
+            f"{omitted_contexts} contexts."
+        )
+    if omitted_reuse_events:
+        errors.append(
+            f"Certificate reuse-event limit reached at "
+            f"{MAX_CERTIFICATE_REUSE_EVENTS}; omitted {omitted_reuse_events} events."
+        )
         if scapy_error is not None and prev_warning is not None:
             try:
                 scapy_error.warning = prev_warning  # type: ignore[assignment]

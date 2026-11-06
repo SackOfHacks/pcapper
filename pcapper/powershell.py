@@ -118,6 +118,9 @@ DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9_.-]{1,64})\b
 MAX_PLAINTEXT_UNIQUES = 1200
 MAX_INDICATOR_UNIQUES = 3000
 MAX_TEXT_LEN = 180
+MAX_POWERSHELL_SESSIONS = 50_000
+MAX_BEACON_TIMESTAMPS = 1000
+MAX_TARGETS_PER_CLIENT = 12
 
 
 SUSPICIOUS_PATTERNS = [
@@ -421,6 +424,7 @@ def analyze_powershell(
     anomalies: list[dict[str, object]] = []
     decoded_ps_commands: Counter[str] = Counter()
     errors = []
+    omitted_sessions = 0
 
     # Keyed per (client, server) flow, not per client: a host talking to
     # several servers would otherwise merge into one series and look "periodic".
@@ -515,21 +519,12 @@ def analyze_powershell(
                 src_ip, dst_ip, sport, dport
             )
 
-            server_ports[server_port] += 1
-            client_counts[client_ip] += 1
-            server_counts[server_ip] += 1
-            if eth_src and src_ip:
-                ip_to_macs[src_ip].add(eth_src.lower())
-            if eth_dst and dst_ip:
-                ip_to_macs[dst_ip].add(eth_dst.lower())
-            if eth_src and src_ip == client_ip:
-                client_macs[eth_src.lower()] += 1
-            if eth_dst and dst_ip == server_ip:
-                server_macs[eth_dst.lower()] += 1
-
             session_key = (client_ip, client_port, server_ip, server_port)
             session = sessions.get(session_key)
             if session is None:
+                if len(sessions) >= MAX_POWERSHELL_SESSIONS:
+                    omitted_sessions += 1
+                    continue
                 session = _SessionState(
                     client_ip=client_ip,
                     server_ip=server_ip,
@@ -539,6 +534,22 @@ def analyze_powershell(
                     server_mac=eth_dst if dst_ip == server_ip else None,
                 )
                 sessions[session_key] = session
+
+            server_ports[server_port] += 1
+            _record_bounded(client_counts, client_ip, MAX_POWERSHELL_SESSIONS)
+            _record_bounded(server_counts, server_ip, MAX_POWERSHELL_SESSIONS)
+            if eth_src and src_ip:
+                if src_ip in ip_to_macs or len(ip_to_macs) < MAX_POWERSHELL_SESSIONS:
+                    if len(ip_to_macs[src_ip]) < 32:
+                        ip_to_macs[src_ip].add(eth_src.lower())
+            if eth_dst and dst_ip:
+                if dst_ip in ip_to_macs or len(ip_to_macs) < MAX_POWERSHELL_SESSIONS:
+                    if len(ip_to_macs[dst_ip]) < 32:
+                        ip_to_macs[dst_ip].add(eth_dst.lower())
+            if eth_src and src_ip == client_ip:
+                _record_bounded(client_macs, eth_src.lower(), MAX_POWERSHELL_SESSIONS)
+            if eth_dst and dst_ip == server_ip:
+                _record_bounded(server_macs, eth_dst.lower(), MAX_POWERSHELL_SESSIONS)
 
             if session.client_mac is None:
                 if src_ip == client_ip and eth_src:
@@ -570,8 +581,16 @@ def analyze_powershell(
                 server_bytes += pkt_len
 
             if ts is not None:
-                client_times[(client_ip, server_ip)].append(ts)
-            client_targets[client_ip].add(server_ip)
+                beacon_key = (client_ip, server_ip)
+                if beacon_key in client_times or len(client_times) < MAX_POWERSHELL_SESSIONS:
+                    if len(client_times[beacon_key]) < MAX_BEACON_TIMESTAMPS:
+                        client_times[beacon_key].append(ts)
+            if (
+                client_ip in client_targets
+                or len(client_targets) < MAX_POWERSHELL_SESSIONS
+            ):
+                if len(client_targets[client_ip]) < MAX_TARGETS_PER_CLIENT:
+                    client_targets[client_ip].add(server_ip)
 
             for value in strings:
                 if not value:
@@ -587,7 +606,7 @@ def analyze_powershell(
                 cmd_match = PS_COMMAND_RE.search(value)
                 if cmd_match:
                     cmd = cmd_match.group(0).strip()
-                    commands[cmd] += 1
+                    _record_bounded(commands, cmd, MAX_INDICATOR_UNIQUES)
 
                 for enc_match in PS_ENCODED_ARG_RE.finditer(value):
                     decoded = _decode_ps_encoded(enc_match.group(1))
@@ -596,29 +615,39 @@ def analyze_powershell(
 
                 host_match = HOST_VALUE_RE.search(value)
                 if host_match:
-                    hostnames[host_match.group(1).lower()] += 1
+                    _record_bounded(
+                        hostnames, host_match.group(1).lower(), MAX_INDICATOR_UNIQUES
+                    )
 
                 for dom, user in DOMAIN_USER_RE.findall(value):
-                    domains[dom.lower()] += 1
-                    usernames[user.lower()] += 1
+                    _record_bounded(domains, dom.lower(), MAX_INDICATOR_UNIQUES)
+                    _record_bounded(usernames, user.lower(), MAX_INDICATOR_UNIQUES)
 
                 for ip_value in IP_RE.findall(value):
                     if _valid_ip(ip_value):
-                        ip_strings[ip_value] += 1
+                        _record_bounded(ip_strings, ip_value, MAX_INDICATOR_UNIQUES)
 
                 for mac_value in MAC_RE.findall(value):
-                    mac_strings[mac_value.lower()] += 1
+                    _record_bounded(
+                        mac_strings, mac_value.lower(), MAX_INDICATOR_UNIQUES
+                    )
 
                 for url in URL_RE.findall(value):
-                    urls[url] += 1
+                    _record_bounded(urls, url, MAX_INDICATOR_UNIQUES)
 
                 ad_match = PS_AD_RE.search(value)
                 if ad_match:
-                    ad_queries[ad_match.group(0)] += 1
+                    _record_bounded(
+                        ad_queries, ad_match.group(0), MAX_INDICATOR_UNIQUES
+                    )
 
                 netdisc_match = PS_NETDISC_RE.search(value)
                 if netdisc_match:
-                    network_discovery[netdisc_match.group(0)] += 1
+                    _record_bounded(
+                        network_discovery,
+                        netdisc_match.group(0),
+                        MAX_INDICATOR_UNIQUES,
+                    )
 
                 for pattern, label in SUSPICIOUS_PATTERNS:
                     if pattern.search(value):
@@ -631,6 +660,11 @@ def analyze_powershell(
 
     except Exception as exc:
         errors.append(str(exc))
+
+    if omitted_sessions:
+        errors.append(
+            f"PowerShell session limit reached; omitted {omitted_sessions} packets from untracked sessions."
+        )
 
     conversations: list[PowershellConversation] = []
     for session in sessions.values():
@@ -662,7 +696,7 @@ def analyze_powershell(
                 {
                     "severity": "warning",
                     "summary": "PowerShell fan-out",
-                    "details": f"{client} contacted {len(targets)} unique targets",
+                    "details": f"{client} contacted at least {len(targets)} unique targets",
                 }
             )
 

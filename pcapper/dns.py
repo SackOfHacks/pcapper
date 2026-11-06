@@ -22,6 +22,7 @@ from .utils import (
     env_int,
     extract_packet_endpoints,
     memoize_analysis,
+    network_egress_allowed,
     packet_length,
     safe_float,
     set_add_cap,
@@ -43,7 +44,7 @@ except Exception:  # pragma: no cover
 
 MAX_DNS_UNIQUE = env_int("PCAPPER_MAX_DNS_UNIQUE", 50000, minimum=1)
 MAX_VT_CACHE = env_int("PCAPPER_VT_CACHE_SIZE", 2048, minimum=1)
-MAX_VT_LOOKUPS = env_int("PCAPPER_VT_MAX_LOOKUPS", 500)
+MAX_VT_LOOKUPS = env_int("PCAPPER_VT_MAX_LOOKUPS", 500, minimum=1)
 VT_TIMEOUT = float(env_int("PCAPPER_VT_TIMEOUT", 8, minimum=1))
 # Wall-clock budget for the whole VirusTotal pass. 500 lookups at an 8 s
 # timeout each is over an hour with nothing to show for it; when the budget
@@ -372,6 +373,8 @@ def _vt_rating(stats: dict[str, object]) -> str:
 def _vt_lookup_domain(
     domain: str, api_key: str
 ) -> tuple[Optional[dict[str, object]], Optional[str]]:
+    if not network_egress_allowed():
+        return None, f"VT lookup skipped for {domain}: network egress is disabled."
     # The name came off the wire; percent-encode it so a "/" or "?" in a
     # hostile qname cannot rewrite the request path or query.
     url = "https://www.virustotal.com/api/v3/domains/" + urllib.parse.quote(domain, safe="")
@@ -427,6 +430,8 @@ def _vt_lookup_domains(
     errors: list[str] = []
     if not domains:
         return results, errors
+    if not network_egress_allowed():
+        return results, ["VT lookup skipped: network egress is disabled."]
     lookup = lookup or _vt_lookup_domain
     budget = VT_BUDGET_SECONDS if budget_seconds is None else budget_seconds
 
@@ -969,7 +974,7 @@ def analyze_dns(
                                 )
                                 rrname_str = decode_payload(
                                     rrname_bytes, encoding="utf-8"
-                                ).strip(".")
+                                ).strip(".").lower()
                                 setdict_add(
                                     answers_by_qname,
                                     rrname_str,
@@ -1005,7 +1010,7 @@ def analyze_dns(
                                         counter_inc(mdns_service_counts, rrname_str)
                                 if rrtype == 5 and rrname_str:
                                     try:
-                                        target = str(rdata).strip(".")
+                                        target = str(rdata).strip(".").lower()
                                     except Exception:
                                         target = str(rdata)
                                     if target:

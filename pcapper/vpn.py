@@ -111,16 +111,23 @@ class VpnSummary:
 
 def _packet_ip_proto(pkt: object) -> Optional[int]:
     try:
-        value = getattr(pkt, "proto", None)
-        if value is not None:
-            return int(value)
+        if IP is not None:
+            layer = pkt.getlayer(IP)  # type: ignore[attr-defined]
+            if layer is not None:
+                return int(getattr(layer, "proto"))
     except Exception:
         pass
     try:
-        if IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-            value = getattr(pkt[IPv6], "nh", None)  # type: ignore[index]
-            if value is not None:
-                return int(value)
+        if IPv6 is not None:
+            layer = pkt.getlayer(IPv6)  # type: ignore[attr-defined]
+            if layer is None:
+                return None
+            value = int(getattr(layer, "nh"))
+            nested = getattr(layer, "payload", None)
+            while nested is not None and type(nested).__name__.startswith("IPv6ExtHdr"):
+                value = int(getattr(nested, "nh", value))
+                nested = getattr(nested, "payload", None)
+            return value
     except Exception:
         pass
     return None
@@ -131,6 +138,11 @@ def _vpn_port_match(sport: int, dport: int) -> bool:
     destination is an ephemeral port; a flow from ephemeral 1194 to 443 is
     not OpenVPN."""
     return dport in VPN_PORTS or (sport in VPN_PORTS and dport >= 1024)
+
+
+def _looks_like_sstp(payload: bytes) -> bool:
+    lowered = payload.lower()
+    return b"sstp_duplex_post" in lowered or b"/sra_" in lowered
 
 
 def _infer_client_server(
@@ -392,27 +404,27 @@ def analyze_vpn(
                 dport = int(getattr(tcp, "dport", 0) or 0)
                 payload = _extract_layer_payload(tcp)
                 openvpn_opcodes = openvpn_tcp_control_opcodes(payload)
-                tls_marker = (
-                    (TLSClientHello is not None and pkt.haslayer(TLSClientHello))  # type: ignore[truthy-bool]
-                    or (TLSServerHello is not None and pkt.haslayer(TLSServerHello))  # type: ignore[truthy-bool]
-                    or bool(_extract_tls_certificates(pkt))
-                )
                 port_match = _vpn_port_match(sport, dport)
-                if port_match and 443 in {sport, dport} and not (openvpn_opcodes or tls_marker):
+                sstp_marker = _looks_like_sstp(payload)
+                if port_match and 443 in {sport, dport} and not (
+                    openvpn_opcodes or sstp_marker
+                ):
                     continue
                 if port_match or openvpn_opcodes:
                     vpn_packets += 1
                     _mark_window(ts)
+                    client_ip, server_ip, server_port = _infer_client_server(
+                        src_ip, dst_ip, sport, dport
+                    )
                     service = (
                         "OpenVPN"
                         if openvpn_opcodes
+                        else "SSTP/HTTPS VPN"
+                        if server_port == 443 and sstp_marker
                         else VPN_PORTS.get(dport) or VPN_PORTS.get(sport) or "VPN"
                     )
                     service_counts[service] += 1
                     protocol_counts["TCP"] += 1
-                    client_ip, server_ip, server_port = _infer_client_server(
-                        src_ip, dst_ip, sport, dport
-                    )
                     client_counts[client_ip] += 1
                     server_counts[server_ip] += 1
                     _record_artifact_correlation(
@@ -421,6 +433,7 @@ def analyze_vpn(
                     if server_port:
                         server_port_counts[server_port] += 1
 
+                    cert_infos = _extract_tls_certificates(pkt)
                     for opcode in openvpn_opcodes:
                         opcode_name = OPENVPN_OPCODES[opcode]
                         handshake_counts[opcode_name] += 1
@@ -463,7 +476,7 @@ def analyze_vpn(
                                 client_ip,
                                 server_ip,
                             )
-                        for cert_info in _extract_tls_certificates(pkt):
+                        for cert_info in cert_infos:
                             fingerprint = str(cert_info.get("fingerprint", ""))
                             if fingerprint and fingerprint in seen_cert_fingerprints:
                                 continue
@@ -513,10 +526,13 @@ def analyze_vpn(
                 payload = _extract_layer_payload(udp)
                 openvpn_opcodes = (
                     openvpn_udp_control_opcodes(payload)
-                    if sport in {1194, 4433} or dport in {1194, 4433}
+                    if sport in {1194, 4433, 443} or dport in {1194, 4433, 443}
                     else []
                 )
-                if _vpn_port_match(sport, dport) or openvpn_opcodes:
+                udp_port_match = _vpn_port_match(sport, dport)
+                if 443 in {sport, dport} and not openvpn_opcodes:
+                    udp_port_match = False
+                if udp_port_match or openvpn_opcodes:
                     vpn_packets += 1
                     _mark_window(ts)
                     service = (

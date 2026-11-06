@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 from typing import Optional
 
@@ -23,66 +24,94 @@ OPC_TYPES = {
 }
 
 OPC_UA_SERVICE_NAMES = {
-    # Common services (numeric NodeId i=xxxx)
-    428: "FindServersRequest",
-    431: "FindServersResponse",
-    432: "GetEndpointsRequest",
-    435: "GetEndpointsResponse",
-    459: "CreateSessionRequest",
-    462: "CreateSessionResponse",
+    # Service binary encoding NodeIds (the service type NodeId + 2).
+    422: "FindServersRequest",
+    425: "FindServersResponse",
+    428: "GetEndpointsRequest",
+    431: "GetEndpointsResponse",
+    437: "RegisterServerRequest",
+    440: "RegisterServerResponse",
+    446: "OpenSecureChannelRequest",
+    449: "OpenSecureChannelResponse",
+    452: "CloseSecureChannelRequest",
+    455: "CloseSecureChannelResponse",
+    461: "CreateSessionRequest",
+    464: "CreateSessionResponse",
     467: "ActivateSessionRequest",
     470: "ActivateSessionResponse",
     473: "CloseSessionRequest",
     476: "CloseSessionResponse",
+    479: "CancelRequest",
+    482: "CancelResponse",
+    488: "AddNodesRequest",
+    491: "AddNodesResponse",
+    494: "AddReferencesRequest",
+    497: "AddReferencesResponse",
+    500: "DeleteNodesRequest",
+    503: "DeleteNodesResponse",
+    506: "DeleteReferencesRequest",
+    509: "DeleteReferencesResponse",
     527: "BrowseRequest",
     530: "BrowseResponse",
+    533: "BrowseNextRequest",
+    536: "BrowseNextResponse",
+    554: "TranslateBrowsePathsToNodeIdsRequest",
+    557: "TranslateBrowsePathsToNodeIdsResponse",
+    560: "RegisterNodesRequest",
+    563: "RegisterNodesResponse",
+    566: "UnregisterNodesRequest",
+    569: "UnregisterNodesResponse",
+    615: "QueryFirstRequest",
+    618: "QueryFirstResponse",
+    621: "QueryNextRequest",
+    624: "QueryNextResponse",
     631: "ReadRequest",
     634: "ReadResponse",
+    664: "HistoryReadRequest",
+    667: "HistoryReadResponse",
     673: "WriteRequest",
     676: "WriteResponse",
-    704: "CallRequest",
-    707: "CallResponse",
-    751: "CreateSubscriptionRequest",
-    754: "CreateSubscriptionResponse",
-    787: "CreateMonitoredItemsRequest",
-    790: "CreateMonitoredItemsResponse",
-    793: "ModifyMonitoredItemsRequest",
-    796: "ModifyMonitoredItemsResponse",
-    799: "SetMonitoringModeRequest",
-    802: "SetMonitoringModeResponse",
-    805: "SetTriggeringRequest",
-    808: "SetTriggeringResponse",
-    811: "DeleteMonitoredItemsRequest",
-    814: "DeleteMonitoredItemsResponse",
-    817: "CreateSubscriptionRequest",
-    820: "CreateSubscriptionResponse",
-    823: "ModifySubscriptionRequest",
-    826: "ModifySubscriptionResponse",
-    829: "SetPublishingModeRequest",
-    832: "SetPublishingModeResponse",
-    835: "PublishRequest",
-    838: "PublishResponse",
-    841: "RepublishRequest",
-    844: "RepublishResponse",
-    847: "TransferSubscriptionsRequest",
-    850: "TransferSubscriptionsResponse",
-    853: "DeleteSubscriptionsRequest",
-    856: "DeleteSubscriptionsResponse",
-    620: "BrowseNextRequest",
-    623: "BrowseNextResponse",
-    627: "TranslateBrowsePathsToNodeIdsRequest",
-    630: "TranslateBrowsePathsToNodeIdsResponse",
-    637: "ReadRequest",
-    640: "ReadResponse",
-    736: "HistoryReadRequest",
-    739: "HistoryReadResponse",
-    742: "HistoryUpdateRequest",
-    745: "HistoryUpdateResponse",
-    746: "RegisterNodesRequest",
-    749: "RegisterNodesResponse",
-    750: "UnregisterNodesRequest",
-    753: "UnregisterNodesResponse",
+    700: "HistoryUpdateRequest",
+    703: "HistoryUpdateResponse",
+    712: "CallRequest",
+    715: "CallResponse",
+    751: "CreateMonitoredItemsRequest",
+    754: "CreateMonitoredItemsResponse",
+    763: "ModifyMonitoredItemsRequest",
+    766: "ModifyMonitoredItemsResponse",
+    769: "SetMonitoringModeRequest",
+    772: "SetMonitoringModeResponse",
+    775: "SetTriggeringRequest",
+    778: "SetTriggeringResponse",
+    781: "DeleteMonitoredItemsRequest",
+    784: "DeleteMonitoredItemsResponse",
+    787: "CreateSubscriptionRequest",
+    790: "CreateSubscriptionResponse",
+    793: "ModifySubscriptionRequest",
+    796: "ModifySubscriptionResponse",
+    799: "SetPublishingModeRequest",
+    802: "SetPublishingModeResponse",
+    826: "PublishRequest",
+    829: "PublishResponse",
+    832: "RepublishRequest",
+    835: "RepublishResponse",
+    841: "TransferSubscriptionsRequest",
+    844: "TransferSubscriptionsResponse",
+    847: "DeleteSubscriptionsRequest",
+    850: "DeleteSubscriptionsResponse",
 }
+
+_OPCUA_MESSAGE_TYPES = set(OPC_TYPES)
+_MAX_OPCUA_MESSAGE_SIZE = 16 * 1024 * 1024
+
+
+def _is_opcua_message(payload: bytes) -> bool:
+    if len(payload) < 8 or payload[:3] not in _OPCUA_MESSAGE_TYPES:
+        return False
+    if payload[3:4] not in {b"C", b"F", b"A"}:
+        return False
+    message_size = int.from_bytes(payload[4:8], "little")
+    return 8 <= message_size <= _MAX_OPCUA_MESSAGE_SIZE
 
 
 def _parse_nodeid(payload: bytes, idx: int) -> tuple[tuple[int, int] | None, int]:
@@ -139,13 +168,7 @@ def _read_uint16(payload: bytes, idx: int) -> tuple[int | None, int]:
 def _read_double(payload: bytes, idx: int) -> tuple[float | None, int]:
     if idx + 8 > len(payload):
         return None, idx
-    try:
-        import struct
-
-        value = struct.unpack("<d", payload[idx : idx + 8])[0]
-    except Exception:
-        value = None
-    return value, idx + 8
+    return struct.unpack_from("<d", payload, idx)[0], idx + 8
 
 
 def _read_string(payload: bytes, idx: int) -> tuple[str | None, int]:
@@ -466,7 +489,7 @@ def _parse_hello(payload: bytes) -> Optional[str]:
 def _parse_opcua(payload: bytes) -> tuple[list[str], list[tuple[str, str]]]:
     commands: list[str] = []
     artifacts: list[tuple[str, str]] = []
-    if len(payload) < 8:
+    if not _is_opcua_message(payload):
         return commands, artifacts
     msg_type = payload[:3]
     name = OPC_TYPES.get(msg_type)
@@ -491,7 +514,7 @@ def _parse_opcua(payload: bytes) -> tuple[list[str], list[tuple[str, str]]]:
         node, idx = _parse_nodeid(payload, 24)
         if node:
             ns, node_id = node
-            service_name = OPC_UA_SERVICE_NAMES.get(node_id)
+            service_name = OPC_UA_SERVICE_NAMES.get(node_id) if ns == 0 else None
             label = f"ns={ns};i={node_id}"
             if service_name:
                 commands.append(service_name)
@@ -581,6 +604,7 @@ def analyze_opc(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         path=path,
         protocol_name="OPC UA",
         tcp_ports={OPC_UA_PORT},
+        signature_matcher=_is_opcua_message,
         command_parser=_parse_commands,
         artifact_parser=_parse_artifacts,
         anomaly_detector=_detect_anomalies,

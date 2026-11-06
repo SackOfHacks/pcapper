@@ -361,13 +361,15 @@ INDUSTRIAL_PORTS = {
     5007: "MELSEC",
     5683: "CoAP",
     5684: "CoAP",
-    2455: "ODESYS",
-    1217: "ODESYS",
+    2455: "CODESYS",
+    1217: "CODESYS",
     1883: "MQTT",
     8883: "MQTT-TLS",
-    34378: "Yokogawa Vnet/IP",
-    34379: "Yokogawa Vnet/IP",
-    34380: "Yokogawa Vnet/IP",
+    34378: "P-NET",
+    34379: "P-NET",
+    34380: "P-NET",
+    5313: "Yokogawa Vnet/IP",
+    55565: "Honeywell CDA",
 }
 
 ETHERTYPE_PROTOCOLS = {
@@ -462,6 +464,14 @@ def _get_proto_name(
             return "ICMP"
         return "IP"
     elif ipv6_layer is not None:
+        if tcp_layer is not None:
+            sport = tcp_layer.sport  # type: ignore[attr-defined]
+            dport = tcp_layer.dport  # type: ignore[attr-defined]
+            return KNOWN_PORTS.get(sport) or KNOWN_PORTS.get(dport) or "TCP"
+        if udp_layer is not None:
+            sport = udp_layer.sport  # type: ignore[attr-defined]
+            dport = udp_layer.dport  # type: ignore[attr-defined]
+            return KNOWN_PORTS.get(sport) or KNOWN_PORTS.get(dport) or "UDP"
         return "IPv6"
     elif arp_layer is not None:
         return "ARP"
@@ -695,7 +705,24 @@ def analyze_protocols(
             elif ipv6_layer is not None:
                 src = ipv6_layer.src
                 dst = ipv6_layer.dst
-                proto = "IPv6"
+                if tcp_layer is not None:
+                    proto = (
+                        KNOWN_PORTS.get(tcp_layer.sport)
+                        or KNOWN_PORTS.get(tcp_layer.dport)
+                        or "TCP"
+                    )
+                    ports.add(tcp_layer.sport)
+                    ports.add(tcp_layer.dport)
+                elif udp_layer is not None:
+                    proto = (
+                        KNOWN_PORTS.get(udp_layer.sport)
+                        or KNOWN_PORTS.get(udp_layer.dport)
+                        or "UDP"
+                    )
+                    ports.add(udp_layer.sport)
+                    ports.add(udp_layer.dport)
+                else:
+                    proto = "IPv6"
             elif arp_layer is not None:
                 src = arp_layer.psrc
                 dst = arp_layer.pdst

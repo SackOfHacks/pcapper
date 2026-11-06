@@ -23,6 +23,7 @@ SAFETY_PORTS: dict[int, str] = {
     1501: "Triconex TSAA",
     1502: "Triconex/TriStation",  # the engineering protocol Triton/TRISIS abused
 }
+_MAX_SAFETY_HITS = 200
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,24 @@ def analyze_safety(
     destination_counts: Counter[str] = Counter()
     service_counts: Counter[str] = Counter()
     errors: list[str] = []
+    total_hits = 0
+    public_hit_seen = False
+    public_evidence_hits: list[SafetyHit] = []
+
+    def record_hit(hit: SafetyHit) -> None:
+        nonlocal total_hits, public_hit_seen
+        total_hits += 1
+        if len(hits) < _MAX_SAFETY_HITS:
+            hits.append(hit)
+        elif "Safety hit detail limit reached; counters include all matches." not in errors:
+            errors.append("Safety hit detail limit reached; counters include all matches.")
+        source_counts[hit.src] += 1
+        destination_counts[hit.dst] += 1
+        service_counts[hit.service] += 1
+        if is_public_ip(hit.src) or is_public_ip(hit.dst):
+            public_hit_seen = True
+            if len(public_evidence_hits) < 8:
+                public_evidence_hits.append(hit)
 
     try:
         for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
@@ -139,20 +158,12 @@ def analyze_safety(
                 dport = int(getattr(tcp, "dport", 0) or 0)
                 service = _safety_service(sport, dport)
                 if service:
-                    hits.append(
+                    record_hit(
                         SafetyHit(
-                            ts=ts,
-                            protocol="TCP",
-                            src=src_ip,
-                            dst=dst_ip,
-                            src_port=sport,
-                            dst_port=dport,
-                            service=service,
+                            ts=ts, protocol="TCP", src=src_ip, dst=dst_ip,
+                            src_port=sport, dst_port=dport, service=service,
                         )
                     )
-                    source_counts[src_ip] += 1
-                    destination_counts[dst_ip] += 1
-                    service_counts[service] += 1
 
             if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                 udp = pkt[UDP]  # type: ignore[index]
@@ -160,34 +171,23 @@ def analyze_safety(
                 dport = int(getattr(udp, "dport", 0) or 0)
                 service = _safety_service(sport, dport)
                 if service:
-                    hits.append(
+                    record_hit(
                         SafetyHit(
-                            ts=ts,
-                            protocol="UDP",
-                            src=src_ip,
-                            dst=dst_ip,
-                            src_port=sport,
-                            dst_port=dport,
-                            service=service,
+                            ts=ts, protocol="UDP", src=src_ip, dst=dst_ip,
+                            src_port=sport, dst_port=dport, service=service,
                         )
                     )
-                    source_counts[src_ip] += 1
-                    destination_counts[dst_ip] += 1
-                    service_counts[service] += 1
 
     except Exception as exc:
         errors.append(f"{type(exc).__name__}: {exc}")
 
     detections: list[dict[str, object]] = []
-    if hits:
-        public_hits = [
-            hit for hit in hits if is_public_ip(hit.src) or is_public_ip(hit.dst)
-        ]
-        severity = "high" if public_hits else "warning"
+    if total_hits:
+        severity = "high" if public_hit_seen else "warning"
         # When public endpoints drive the high-severity escalation, show them
         # first in the evidence sample — otherwise hits[:8] can omit the very
         # hosts the "Public endpoints observed" claim is about.
-        ordered_hits = public_hits + [
+        ordered_hits = public_evidence_hits + [
             hit for hit in hits if not (is_public_ip(hit.src) or is_public_ip(hit.dst))
         ]
         evidence = [
@@ -195,13 +195,13 @@ def analyze_safety(
             for hit in ordered_hits[:8]
         ]
         details = (
-            f"{len(hits)} packet(s) across {len(service_counts)} safety service(s). "
+            f"{total_hits} packet(s) across {len(service_counts)} safety service(s). "
             "Safety Instrumented Systems are the highest-consequence OT target "
             "(Triton/TRISIS) — any TriStation/SIS engineering traffic from a "
             "non-engineering host, or program-download activity, warrants "
             "investigation (ATT&CK ICS T0843 Program Download to a SIS)."
         )
-        if public_hits:
+        if public_hit_seen:
             details = f"{details} Public endpoints observed."
         detections.append(
             {

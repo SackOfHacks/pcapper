@@ -34,6 +34,13 @@ SMTP_PORTS = {25, 465, 587, 2525}
 POP3_PORTS = {110, 995}
 IMAP_PORTS = {143, 993}
 MAIL_PORTS = SMTP_PORTS | POP3_PORTS | IMAP_PORTS
+MAX_EMAIL_STREAMS = 50_000
+MAX_EMAIL_LINE_BUFFER_BYTES = 64 * 1024
+MAX_EMAIL_TOTAL_LINE_BUFFER_BYTES = 32 * 1024 * 1024
+MAX_EMAIL_MIME_BYTES_PER_MESSAGE = 4 * 1024 * 1024
+MAX_EMAIL_TOTAL_MIME_BYTES = 64 * 1024 * 1024
+MAX_EMAIL_MIME_LINES_PER_MESSAGE = 100_000
+MAX_EMAIL_TOTAL_MIME_LINES = 250_000
 
 EMAIL_RE = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
 DOMAIN_RE = re.compile(r"\b([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}\b")
@@ -927,15 +934,31 @@ def analyze_email(
     flow_times: dict[tuple[str, str], list[float]] = defaultdict(list)
     vrfy_expn_by_client: Counter[str] = Counter()
     stream_state: dict[tuple[str, str, int, int], dict[str, object]] = {}
+    dropped_stream_packets = 0
+    truncated_mime_messages = 0
+    dropped_partial_bytes = 0
+    dropped_mime_bytes = 0
+    retained_partial_bytes = 0
+    retained_mime_bytes = 0
+    retained_mime_lines = 0
 
-    def _stream_bucket(src: str, dst: str, sport: int, dport: int) -> dict[str, object]:
+    def _stream_bucket(
+        src: str, dst: str, sport: int, dport: int
+    ) -> Optional[dict[str, object]]:
+        nonlocal dropped_stream_packets
         key = (src, dst, sport, dport)
         state = stream_state.get(key)
         if state is None:
+            if len(stream_state) >= MAX_EMAIL_STREAMS:
+                dropped_stream_packets += 1
+                return None
             state = {
                 "buf": "",
+                "buf_bytes": 0,
                 "in_data": False,
                 "data_lines": [],
+                "data_bytes": 0,
+                "mime_truncated": False,
                 "body_preview_count": 0,
                 "smtp_auth_login": False,
                 "smtp_pending_user": None,
@@ -954,7 +977,8 @@ def analyze_email(
         direction: str,
         state: dict[str, object],
     ) -> None:
-        nonlocal total_messages
+        nonlocal total_messages, retained_mime_bytes, retained_mime_lines
+        nonlocal truncated_mime_messages, dropped_mime_bytes
         if not line:
             return
         total_messages += 1
@@ -1397,7 +1421,9 @@ def analyze_email(
                 smtp_expect = None
 
             in_data = bool(state.get("in_data"))
-            data_lines = list(state.get("data_lines") or [])
+            data_lines = state.get("data_lines")
+            if not isinstance(data_lines, list):
+                data_lines = []
             body_preview_count = int(state.get("body_preview_count") or 0)
             if in_data:
                 if line == ".":
@@ -1575,12 +1601,49 @@ def analyze_email(
                                 )
                     state["in_data"] = False
                     state["data_lines"] = []
+                    data_bytes = int(state.get("data_bytes") or 0)
+                    retained_mime_bytes = max(0, retained_mime_bytes - data_bytes)
+                    retained_mime_lines = max(
+                        0, retained_mime_lines - len(data_lines)
+                    )
+                    state["data_bytes"] = 0
+                    state["mime_truncated"] = False
                     state["body_preview_count"] = 0
                     _timeline_emit(
                         "Send", "SMTP Message End", "DATA terminator received"
                     )
                 else:
-                    data_lines.append(line)
+                    encoded_line = line.encode("utf-8", errors="replace")
+                    message_capacity = max(
+                        0,
+                        MAX_EMAIL_MIME_BYTES_PER_MESSAGE
+                        - int(state.get("data_bytes") or 0),
+                    )
+                    total_capacity = max(
+                        0, MAX_EMAIL_TOTAL_MIME_BYTES - retained_mime_bytes
+                    )
+                    keep_bytes = min(
+                        len(encoded_line), message_capacity, total_capacity
+                    )
+                    if (
+                        len(data_lines) >= MAX_EMAIL_MIME_LINES_PER_MESSAGE
+                        or retained_mime_lines >= MAX_EMAIL_TOTAL_MIME_LINES
+                    ):
+                        keep_bytes = 0
+                    kept_line = encoded_line[:keep_bytes].decode(
+                        "utf-8", errors="ignore"
+                    )
+                    kept_bytes = len(kept_line.encode("utf-8", errors="replace"))
+                    if kept_line:
+                        data_lines.append(kept_line)
+                        retained_mime_lines += 1
+                        state["data_bytes"] = int(state.get("data_bytes") or 0) + kept_bytes
+                        retained_mime_bytes += kept_bytes
+                    if keep_bytes < len(encoded_line):
+                        dropped_mime_bytes += len(encoded_line) - kept_bytes
+                        if not state.get("mime_truncated"):
+                            truncated_mime_messages += 1
+                            state["mime_truncated"] = True
                     state["data_lines"] = data_lines
                     if (
                         body_preview_count < 14
@@ -1857,8 +1920,28 @@ def analyze_email(
                     )
 
             state = _stream_bucket(src_ip, dst_ip, sport, dport)
-            state["buf"] = str(state.get("buf", "")) + text
-            buf = str(state.get("buf", ""))
+            if state is None:
+                continue
+            previous_buf = str(state.get("buf", ""))
+            previous_buf_bytes = int(state.get("buf_bytes") or 0)
+            encoded_text = text.encode("utf-8", errors="replace")
+            partial_capacity = max(
+                0, MAX_EMAIL_LINE_BUFFER_BYTES - previous_buf_bytes
+            )
+            total_partial_capacity = max(
+                0, MAX_EMAIL_TOTAL_LINE_BUFFER_BYTES - retained_partial_bytes
+            )
+            keep_bytes = min(
+                len(encoded_text), partial_capacity, total_partial_capacity
+            )
+            text_part = encoded_text[:keep_bytes].decode("utf-8", errors="ignore")
+            text_part_bytes = len(text_part.encode("utf-8", errors="replace"))
+            buf = previous_buf + text_part
+            retained_partial_bytes += text_part_bytes
+            if keep_bytes < len(encoded_text):
+                dropped_partial_bytes += len(encoded_text) - text_part_bytes
+            state["buf"] = buf
+            state["buf_bytes"] = previous_buf_bytes + text_part_bytes
             if "\n" not in buf:
                 continue
             raw_lines = buf.splitlines()
@@ -1867,6 +1950,14 @@ def analyze_email(
                 raw_lines = raw_lines[:-1]
             else:
                 state["buf"] = ""
+            remaining_buf_bytes = len(str(state["buf"]).encode("utf-8", errors="replace"))
+            retained_partial_bytes = max(
+                0,
+                retained_partial_bytes
+                - int(state.get("buf_bytes") or 0)
+                + remaining_buf_bytes,
+            )
+            state["buf_bytes"] = remaining_buf_bytes
             lines = [line.strip() for line in raw_lines if line.strip()]
 
             for line in lines[:250]:
@@ -1892,6 +1983,26 @@ def analyze_email(
         errors.append(
             f"{skipped_packets} packet(s) skipped after a parse error "
             f"(first: {first_skip_error}); counts are lower bounds."
+        )
+    if dropped_stream_packets:
+        errors.append(
+            f"Email stream limit reached at {MAX_EMAIL_STREAMS}; "
+            f"omitted {dropped_stream_packets} packet(s) from untracked streams."
+        )
+    if truncated_mime_messages:
+        errors.append(
+            f"Email MIME data limits reached; truncated "
+            f"{truncated_mime_messages} message(s) after retaining at most "
+            f"{MAX_EMAIL_MIME_BYTES_PER_MESSAGE} bytes per message and "
+            f"{MAX_EMAIL_TOTAL_MIME_BYTES} bytes/{MAX_EMAIL_TOTAL_MIME_LINES} "
+            "lines total "
+            f"({dropped_mime_bytes} bytes omitted)."
+        )
+    if dropped_partial_bytes:
+        errors.append(
+            f"Email partial-line buffer limits reached; omitted "
+            f"{dropped_partial_bytes} bytes after per-stream/total limits of "
+            f"{MAX_EMAIL_LINE_BUFFER_BYTES}/{MAX_EMAIL_TOTAL_LINE_BUFFER_BYTES}."
         )
 
     deterministic_checks: dict[str, list[str]] = {

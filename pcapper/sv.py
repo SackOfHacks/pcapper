@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from .utils import read_ber_length as _read_ber_length, memoize_analysis
-import struct
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +16,7 @@ except Exception:  # pragma: no cover
 
 
 SV_ETHERTYPE = 0x88BA
+VLAN_ETHERTYPES = {0x8100, 0x88A8, 0x9100}
 
 # Max backward smpCnt step still treated as a replay/out-of-order anomaly.
 # A normal cycle wrap-to-zero is a much larger drop (≈ smpRate, thousands) and
@@ -100,30 +100,39 @@ def _parse_sv_tlvs(data: bytes, result: dict[str, object], depth: int = 0) -> No
 def _decode_seq_of_data(value: bytes) -> tuple[str, list[str]]:
     if not value:
         return "empty", []
-    values: list[str] = []
-    if len(value) % 4 == 0:
-        for idx in range(0, min(len(value), 4 * 8), 4):
-            try:
-                val = struct.unpack(">i", value[idx : idx + 4])[0]
-            except Exception:
-                val = int.from_bytes(value[idx : idx + 4], "big", signed=True)
-            values.append(str(val))
-        return "int32", values
-    if len(value) % 2 == 0:
-        for idx in range(0, min(len(value), 2 * 8), 2):
-            val = int.from_bytes(value[idx : idx + 2], "big", signed=True)
-            values.append(str(val))
-        return "int16", values
     return "bytes", [value[:16].hex()]
 
 
 def _parse_sv_payload(payload: bytes) -> dict[str, object]:
     result: dict[str, object] = {}
     if len(payload) < 8:
+        result["_parse_error"] = "truncated SV Ethernet header"
         return result
-    data = payload[8:]
+    declared_length = int.from_bytes(payload[2:4], "big")
+    if declared_length < 8:
+        result["_parse_error"] = "invalid SV length below Ethernet header size"
+        return result
+    payload_end = declared_length
+    # Some captured SV streams count from Reserved1 rather than from AppID.
+    if declared_length + 4 == len(payload):
+        payload_end = len(payload)
+    if payload_end > len(payload):
+        result["_parse_error"] = "truncated SV payload"
+        return result
+    data = payload[8:payload_end]
     _parse_sv_tlvs(data, result)
     return result
+
+
+def _extract_sv_payload(eth: object) -> bytes | None:
+    ethertype = int(getattr(eth, "type", 0) or 0)
+    layer = getattr(eth, "payload", None)
+    while ethertype in VLAN_ETHERTYPES and layer is not None:
+        ethertype = int(getattr(layer, "type", 0) or 0)
+        layer = getattr(layer, "payload", None)
+    if ethertype != SV_ETHERTYPE or layer is None:
+        return None
+    return bytes(layer)
 
 
 @memoize_analysis
@@ -171,6 +180,7 @@ def analyze_sv(
     unicast_dsts: set[str] = set()
     detections: list[dict[str, object]] = []
     errors: list[str] = []
+    malformed_frames: Counter[str] = Counter()
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
     smp_state: dict[tuple[str, str], int] = {}
@@ -190,8 +200,12 @@ def analyze_sv(
         if not pkt.haslayer(Ether):  # type: ignore[truthy-bool]
             continue
         eth = pkt[Ether]  # type: ignore[index]
-        eth_type = int(getattr(eth, "type", 0) or 0)
-        if eth_type != SV_ETHERTYPE:
+        try:
+            payload = _extract_sv_payload(eth)
+        except Exception as exc:
+            malformed_frames[f"could not decode Ethernet payload ({type(exc).__name__})"] += 1
+            continue
+        if payload is None:
             continue
 
         sv_packets += 1
@@ -211,10 +225,6 @@ def analyze_sv(
                 unicast_dsts.add(dst_mac)
         except Exception:
             pass
-        try:
-            payload = bytes(eth.payload)
-        except Exception:
-            payload = b""
         appid = _extract_appid(payload)
         if appid is not None:
             appid_label = f"0x{appid:04x}"
@@ -225,6 +235,9 @@ def analyze_sv(
             lengths[length] += 1
 
         sv_info = _parse_sv_payload(payload) if payload else {}
+        parse_error = sv_info.get("_parse_error")
+        if parse_error:
+            malformed_frames[str(parse_error)] += 1
         sv_id = str(sv_info.get("svID", "") or "")
         smp_cnt = sv_info.get("smpCnt")
         conf_rev = sv_info.get("confRev")
@@ -286,6 +299,10 @@ def analyze_sv(
         for value in seq_values[:8]:
             data_value_samples[f"{seq_type}={value}"] += 1
 
+    errors.extend(
+        f"{count} malformed SV frame(s): {reason}."
+        for reason, count in sorted(malformed_frames.items())
+    )
 
     if sv_packets:
         detections.append(

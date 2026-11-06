@@ -28,6 +28,14 @@ RPC_CALL = 0
 RPC_REPLY = 1
 RPC_MSG_ACCEPTED = 0
 RPC_SUCCESS = 0
+RPC_ACCEPT_STATUS = {
+    0: "SUCCESS",
+    1: "PROG_UNAVAIL",
+    2: "PROG_MISMATCH",
+    3: "PROC_UNAVAIL",
+    4: "GARBAGE_ARGS",
+    5: "SYSTEM_ERR",
+}
 
 NFS_PROGRAM = 100003
 NFS_PORT = 2049
@@ -273,7 +281,7 @@ def analyze_nfs(
     conversations: Dict[Tuple[str, str], NfsConversation] = {}
     servers: Dict[str, NfsServer] = {}
     clients: Dict[str, NfsClient] = {}
-    sessions: Dict[int, NfsSession] = {}
+    sessions: Dict[Tuple[str, str, int], NfsSession] = {}
     files: List[NfsFileOp] = []
     artifacts: Set[str] = set()
     observed_users: Counter[str] = Counter()
@@ -360,7 +368,7 @@ def analyze_nfs(
                 convo.bytes += length
                 _update_time(convo, ts)
 
-                rpc_payload = _strip_record_marker(payload)
+                rpc_payload = _strip_record_marker(payload) if TCP in pkt else payload
                 if len(rpc_payload) < 8:
                     continue
 
@@ -446,7 +454,7 @@ def analyze_nfs(
                         procedure=proc_name,
                         status=None,
                     )
-                    sessions[xid] = sess
+                    sessions[(client, server, xid)] = sess
 
                     strings = set(extract_ascii_strings(rpc_payload[32 + _rpc_align(cred_len) :]))
                     for text in strings:
@@ -481,18 +489,33 @@ def analyze_nfs(
                             accept_stat = struct.unpack(
                                 ">I", rpc_payload[offset : offset + 4]
                             )[0]
-                            status_text = NFS_STATUS.get(accept_stat, f"{accept_stat}")
+                            if accept_stat == RPC_SUCCESS and offset + 8 <= len(
+                                rpc_payload
+                            ):
+                                nfs_status = struct.unpack(
+                                    ">I", rpc_payload[offset + 4 : offset + 8]
+                                )[0]
+                                status_text = NFS_STATUS.get(
+                                    nfs_status, f"NFS_STATUS_{nfs_status}"
+                                )
+                            elif accept_stat == RPC_SUCCESS:
+                                status_text = "NFS_STATUS_TRUNCATED"
+                            else:
+                                rpc_status = RPC_ACCEPT_STATUS.get(
+                                    accept_stat, f"UNKNOWN_{accept_stat}"
+                                )
+                                status_text = f"RPC_ACCEPT_{rpc_status}"
                             counter_inc(status_codes, status_text)
                             counter_inc(responses, "REPLY")
                             convo.responses += 1
                             counter_inc(convo.statuses, status_text)
 
-                            sess = sessions.get(xid)
+                            sess = sessions.get((client, server, xid))
                             if sess:
                                 sess.end_ts = ts
                                 sess.status = status_text
 
-                            if accept_stat == 13:
+                            if status_text == "ACCES":
                                 anomalies.append(
                                     NfsAnomaly(
                                         "MEDIUM",
@@ -503,7 +526,7 @@ def analyze_nfs(
                                         client,
                                     )
                                 )
-                            if accept_stat == 30:
+                            if status_text == "ROFS":
                                 anomalies.append(
                                     NfsAnomaly(
                                         "LOW",

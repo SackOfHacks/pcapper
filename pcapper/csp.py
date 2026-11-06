@@ -10,9 +10,9 @@ from .industrial_helpers import (
 )
 from .utils import memoize_analysis
 
-CSP_PORTS = {2222, 44818}
+CSP_PORT = 2222
 
-# CSP (Allen-Bradley AB/Ethernet, port 2222) carries PCCC. AB does not publish
+# CSP (Allen-Bradley AB/Ethernet, TCP port 2222) carries PCCC. AB does not publish
 # the CSP framing, but the embedded PCCC command is spec-defined: a PLC-5/SLC
 # command is CMD(1) STS(1) TNS(2) FNC(1), so the FNC sits 4 bytes after the CMD.
 # CMD 0x0F (protected typed) is the carrier; the FNC selects the operation.
@@ -75,8 +75,7 @@ def analyze_csp(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,
         protocol_name="CSP",
-        tcp_ports=CSP_PORTS,
-        udp_ports=CSP_PORTS,
+        tcp_ports={CSP_PORT},
         command_parser=_parse_commands,
         anomaly_detector=_detect_anomalies,
         enable_enrichment=True,

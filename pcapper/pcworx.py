@@ -23,7 +23,10 @@ PCWORX_FUNCTIONS = {
 
 
 def _parse_commands(payload: bytes) -> list[str]:
-    if len(payload) < 2 or payload[0] not in (0x01, 0x81):
+    if len(payload) < 4 or payload[0] not in (0x01, 0x81):
+        return []
+    message_length = int.from_bytes(payload[2:4], "big")
+    if message_length < 4 or message_length > len(payload):
         return []
     direction = "Request" if payload[0] == 0x01 else "Response"
     func = PCWORX_FUNCTIONS.get(payload[1], f"Function 0x{payload[1]:02x}")

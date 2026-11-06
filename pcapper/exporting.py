@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from .utils import (
     open_private,
+    output_redaction_enabled,
     restrict_dir_permissions,
     safe_write_text,
     to_serializable,
@@ -64,9 +67,10 @@ def _build_verdict_summary_payload(summary: Any) -> dict[str, Any] | None:
 
 def export_json(bundle: ExportBundle, output_path: Path) -> None:
     _ensure_parent(output_path)
+    redact = output_redaction_enabled()
     summaries_payload: dict[str, Any] = {}
     for name, summary in bundle.summaries.items():
-        summaries_payload[name] = to_serializable(summary)
+        summaries_payload[name] = to_serializable(summary, redact=redact)
     # Enrich with a top-level verdict-summary block. Same synthesized
     # accept/reject candidates the compromise renderer surfaces, only
     # in a structure downstream tooling can consume without markdown
@@ -82,7 +86,7 @@ def export_json(bundle: ExportBundle, output_path: Path) -> None:
         "summaries": summaries_payload,
     }
     if verdict_summaries:
-        payload["verdict_summary"] = verdict_summaries
+        payload["verdict_summary"] = to_serializable(verdict_summaries, redact=redact)
     # Include the skeptical-filter rule registry in the JSON so downstream
     # consumers understand what the `skeptical_rule` string on each
     # detection refers to. Read-only registry snapshot; small.
@@ -180,16 +184,17 @@ def _host_row(bundle_path: Path, name: str, host: Any) -> dict[str, Any]:
 
 def export_csv(bundle: ExportBundle, output_path: Path) -> None:
     _ensure_parent(output_path)
+    redact = output_redaction_enabled()
     rows: list[dict[str, Any]] = []
     host_rows: list[dict[str, Any]] = []
     for name, summary in bundle.summaries.items():
         for item in _iter_detections(summary):
             row = {"category": "detection", "module": name}
-            row.update(to_serializable(item))
+            row.update(to_serializable(item, redact=redact))
             rows.append({key: _csv_safe(value) for key, value in row.items()})
         for item in _iter_artifacts(summary):
             row = {"category": "artifact", "module": name}
-            row.update(to_serializable(item))
+            row.update(to_serializable(item, redact=redact))
             rows.append({key: _csv_safe(value) for key, value in row.items()})
         for host in _iter_hosts(summary):
             base = _host_row(bundle.path, name, host)
@@ -228,59 +233,67 @@ def export_csv(bundle: ExportBundle, output_path: Path) -> None:
 
 def export_sqlite(bundle: ExportBundle, output_path: Path) -> None:
     _ensure_parent(output_path)
+    redact = output_redaction_enabled()
     if output_path.exists():
         if output_path.is_dir():
             raise ValueError(f"SQLite export path is a directory: {output_path}")
-        output_path.unlink()
-    # Create the file owner-only *before* sqlite opens it, so it is never
-    # world-readable, even briefly, while being populated.
-    open_private(output_path, "wb").close()
-    conn = sqlite3.connect(str(output_path))
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE detections (module TEXT, data TEXT)")
-    cur.execute("CREATE TABLE artifacts (module TEXT, data TEXT)")
-    cur.execute(
-        "CREATE TABLE hosts (pcap_path TEXT, module TEXT, ip TEXT, macs TEXT, hostnames TEXT, "
-        "operating_system TEXT, os_evidence TEXT, packets_sent INTEGER, packets_recv INTEGER, "
-        "bytes_sent INTEGER, bytes_recv INTEGER, first_seen REAL, last_seen REAL, open_ports TEXT)"
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent
     )
-
-    for name, summary in bundle.summaries.items():
-        for item in _iter_detections(summary):
-            payload = to_serializable(item)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        conn = sqlite3.connect(str(temp_path))
+        try:
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE detections (module TEXT, data TEXT)")
+            cur.execute("CREATE TABLE artifacts (module TEXT, data TEXT)")
             cur.execute(
-                "INSERT INTO detections (module, data) VALUES (?, ?)",
-                (name, json.dumps(payload)),
-            )
-        for item in _iter_artifacts(summary):
-            payload = to_serializable(item)
-            cur.execute(
-                "INSERT INTO artifacts (module, data) VALUES (?, ?)",
-                (name, json.dumps(payload)),
-            )
-        for host in _iter_hosts(summary):
-            payload = _host_row(bundle.path, name, host)
-            cur.execute(
-                "INSERT INTO hosts (pcap_path, module, ip, macs, hostnames, operating_system, os_evidence, "
-                "packets_sent, packets_recv, bytes_sent, bytes_recv, first_seen, last_seen, open_ports) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    payload.get("pcap_path"),
-                    payload.get("module"),
-                    payload.get("ip"),
-                    json.dumps(payload.get("macs", [])),
-                    json.dumps(payload.get("hostnames", [])),
-                    payload.get("operating_system"),
-                    json.dumps(payload.get("os_evidence", [])),
-                    payload.get("packets_sent"),
-                    payload.get("packets_recv"),
-                    payload.get("bytes_sent"),
-                    payload.get("bytes_recv"),
-                    payload.get("first_seen"),
-                    payload.get("last_seen"),
-                    json.dumps(payload.get("open_ports", [])),
-                ),
+                "CREATE TABLE hosts (pcap_path TEXT, module TEXT, ip TEXT, macs TEXT, hostnames TEXT, "
+                "operating_system TEXT, os_evidence TEXT, packets_sent INTEGER, packets_recv INTEGER, "
+                "bytes_sent INTEGER, bytes_recv INTEGER, first_seen REAL, last_seen REAL, open_ports TEXT)"
             )
 
-    conn.commit()
-    conn.close()
+            for name, summary in bundle.summaries.items():
+                for item in _iter_detections(summary):
+                    payload = to_serializable(item, redact=redact)
+                    cur.execute(
+                        "INSERT INTO detections (module, data) VALUES (?, ?)",
+                        (name, json.dumps(payload)),
+                    )
+                for item in _iter_artifacts(summary):
+                    payload = to_serializable(item, redact=redact)
+                    cur.execute(
+                        "INSERT INTO artifacts (module, data) VALUES (?, ?)",
+                        (name, json.dumps(payload)),
+                    )
+                for host in _iter_hosts(summary):
+                    payload = _host_row(bundle.path, name, host)
+                    cur.execute(
+                        "INSERT INTO hosts (pcap_path, module, ip, macs, hostnames, operating_system, os_evidence, "
+                        "packets_sent, packets_recv, bytes_sent, bytes_recv, first_seen, last_seen, open_ports) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            payload.get("pcap_path"),
+                            payload.get("module"),
+                            payload.get("ip"),
+                            json.dumps(payload.get("macs", [])),
+                            json.dumps(payload.get("hostnames", [])),
+                            payload.get("operating_system"),
+                            json.dumps(payload.get("os_evidence", [])),
+                            payload.get("packets_sent"),
+                            payload.get("packets_recv"),
+                            payload.get("bytes_sent"),
+                            payload.get("bytes_recv"),
+                            payload.get("first_seen"),
+                            payload.get("last_seen"),
+                            json.dumps(payload.get("open_ports", [])),
+                        ),
+                    )
+
+            conn.commit()
+        finally:
+            conn.close()
+        os.replace(temp_path, output_path)
+    finally:
+        temp_path.unlink(missing_ok=True)

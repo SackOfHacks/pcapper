@@ -398,7 +398,12 @@ def analyze_compromised(
         )
 
     threat_summary = _busy(
-        "Threats", analyze_threats, path, show_status=False, vt_lookup=vt_lookup
+        "Threats",
+        analyze_threats,
+        path,
+        show_status=False,
+        vt_lookup=vt_lookup,
+        **view,
     )
     beacon_summary = _busy("Beacons", analyze_beacons, path, show_status=False, **view)
     exfil_summary = _busy("Exfil", analyze_exfil, path, show_status=False, **view)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import struct
 from pathlib import Path
 
 from .industrial_helpers import (
@@ -55,23 +54,30 @@ _UMAS_WRITE = {
 _UMAS_RESERVATION = {0x10: "Take PLC Reservation (claim exclusive control)"}
 
 
-def _parse_commands(payload: bytes) -> list[str]:
+def _modicon_frame(payload: bytes) -> tuple[int, bytes] | None:
     if len(payload) < 8:
+        return None
+    proto_id = int.from_bytes(payload[2:4], "big")
+    length = int.from_bytes(payload[4:6], "big")
+    if proto_id != 0 or not 2 <= length <= 254 or length + 6 > len(payload):
+        return None
+    return payload[7], payload[: length + 6]
+
+
+def _parse_commands(payload: bytes) -> list[str]:
+    frame = _modicon_frame(payload)
+    if frame is None:
         return []
-    try:
-        _trans_id, proto_id, _length, _unit_id = struct.unpack(">HHHB", payload[:7])
-        if proto_id != 0:
+    func, modbus_frame = frame
+    if func == UMAS_FUNC:
+        if len(modbus_frame) < 10:
             return []
-        func = payload[7]
-        if func == UMAS_FUNC and len(payload) >= 10:
-            umas_fn = payload[9]
-            if umas_fn in (0xFE, 0xFD):  # response, not a request command
-                return ["UMAS Response"]
-            name = UMAS_FUNCTIONS.get(umas_fn, f"0x{umas_fn:02x}")
-            return [f"UMAS {name} (0x{umas_fn:02x})"]
-        return [FUNC_NAMES.get(func, f"Func {func}")]
-    except Exception:
-        return []
+        umas_fn = modbus_frame[9]
+        if umas_fn in (0xFE, 0xFD):  # response, not a request command
+            return ["UMAS Response"]
+        name = UMAS_FUNCTIONS.get(umas_fn, f"0x{umas_fn:02x}")
+        return [f"UMAS {name} (0x{umas_fn:02x})"]
+    return [FUNC_NAMES.get(func, f"Func {func}")]
 
 
 def _detect_anomalies(
@@ -93,8 +99,9 @@ def _detect_anomalies(
     # operations (PLC start/stop, memory/variable writes, program download,
     # control reservation) are flagged — these are the PIPEDREAM/INCONTROLLER
     # Schneider abuse primitives.
-    if len(payload) >= 10 and payload[7] == UMAS_FUNC:
-        umas_fn = payload[9]
+    frame = _modicon_frame(payload)
+    if frame is not None and frame[0] == UMAS_FUNC and len(frame[1]) >= 10:
+        umas_fn = frame[1][9]
         if umas_fn in _UMAS_CONTROL:
             anomalies.append(
                 IndustrialAnomaly(
@@ -116,19 +123,23 @@ def _detect_anomalies(
                 )
             )
         elif umas_fn in _UMAS_WRITE:
+            is_program_download = umas_fn == 0x21
             anomalies.append(
                 IndustrialAnomaly(
                     severity="HIGH",
                     title="Modicon UMAS Write/Program",
                     description=(
                         f"Schneider UMAS {_UMAS_WRITE[umas_fn]} (0x{umas_fn:02x}) "
-                        "— writes PLC memory/variables or downloads program "
-                        "(ATT&CK ICS T0843/T0836)."
+                        "— writes PLC memory or changes process data."
                     ),
                     src=src_ip,
                     dst=dst_ip,
                     ts=ts,
-                    attack="T0843 Program Download",
+                    attack=(
+                        "T0843 Program Download"
+                        if is_program_download
+                        else "T0836 Modify Parameter"
+                    ),
                     evidence=[
                         f"UMAS function 0x{umas_fn:02x} ({_UMAS_WRITE[umas_fn]})",
                         f"{src_ip} -> {dst_ip}",

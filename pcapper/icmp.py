@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import iter_packets
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import memoize_analysis, safe_float, shannon_entropy
 
 try:
@@ -249,7 +249,12 @@ def _empty_summary(path: Path, errors: list[str]) -> IcmpSummary:
 
 
 @memoize_analysis
-def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
+def analyze_icmp(
+    path: Path,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> IcmpSummary:
     errors: list[str] = []
     if IP is None and IPv6 is None:
         return _empty_summary(
@@ -281,7 +286,7 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
     files_discovered: set[str] = set()
     observed_users: Counter[str] = Counter()
 
-    for pkt in iter_packets(path, show_status=show_status):
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
         src: Optional[str] = None
         dst: Optional[str] = None
         ts = safe_float(getattr(pkt, "time", None))
@@ -293,12 +298,13 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
         ip_layer = pkt.getlayer(IP) if IP is not None else None  # type: ignore[arg-type]
         ip6_layer = None
         is_icmpv4 = ip_layer is not None and getattr(ip_layer, "proto", None) == _IP_PROTO_ICMP
-        is_icmpv6 = False
         if not is_icmpv4:
             ip6_layer = pkt.getlayer(IPv6) if IPv6 is not None else None  # type: ignore[arg-type]
-            is_icmpv6 = (
-                ip6_layer is not None and getattr(ip6_layer, "nh", None) == _IPV6_NH_ICMPV6
-            )
+        icmp6_layer = _icmpv6_layer(ip6_layer) if ip6_layer is not None else None
+        is_icmpv6 = ip6_layer is not None and (
+            getattr(ip6_layer, "nh", None) == _IPV6_NH_ICMPV6
+            or icmp6_layer is not None
+        )
         if not is_icmpv4 and not is_icmpv6:
             continue
 
@@ -351,12 +357,15 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
             if icmp_type in (0, 8):
                 icmp_id = getattr(icmp_layer, "id", None)
                 if icmp_id is not None and src and dst:
-                    sess_key = (src, dst, int(icmp_id))
+                    session_src, session_dst = (
+                        (src, dst) if icmp_type == 8 else (dst, src)
+                    )
+                    sess_key = (session_src, session_dst, int(icmp_id))
                     sess = sessions.setdefault(
                         sess_key,
                         {
-                            "src": src,
-                            "dst": dst,
+                            "src": session_src,
+                            "dst": session_dst,
                             "id": int(icmp_id),
                             "requests": 0,
                             "replies": 0,
@@ -378,7 +387,6 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
 
         if is_icmpv6:
             ipv6_packets += 1
-            icmp6_layer = _icmpv6_layer(ip6_layer)
             try:
                 payload_bytes = bytes(
                     icmp6_layer.payload if icmp6_layer is not None else ip6_layer.payload
@@ -429,12 +437,15 @@ def analyze_icmp(path: Path, show_status: bool = True) -> IcmpSummary:
                     else None
                 )
                 if icmp_id is not None and src and dst:
-                    sess_key = (src, dst, int(icmp_id))
+                    session_src, session_dst = (
+                        (src, dst) if icmp6_type == 128 else (dst, src)
+                    )
+                    sess_key = (session_src, session_dst, int(icmp_id))
                     sess = sessions.setdefault(
                         sess_key,
                         {
-                            "src": src,
-                            "dst": dst,
+                            "src": session_src,
+                            "dst": session_dst,
                             "id": int(icmp_id),
                             "requests": 0,
                             "replies": 0,

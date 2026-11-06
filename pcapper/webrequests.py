@@ -11,7 +11,14 @@ from urllib.parse import parse_qsl, urlsplit
 
 from .dns import _vt_lookup_domains, vt_lookup_candidate
 from .pcap_cache import PcapMeta, iter_packets
-from .utils import env_int, extract_packet_endpoints, is_public_ip, memoize_analysis, safe_float
+from .utils import (
+    env_int,
+    extract_packet_endpoints,
+    is_public_ip,
+    memoize_analysis,
+    network_egress_allowed,
+    safe_float,
+)
 
 try:
     from scapy.layers.inet import TCP  # type: ignore
@@ -729,8 +736,9 @@ def analyze_webrequests(
     vt_results: dict[str, dict[str, object]] = {}
     vt_errors: list[str] = []
     if vt_lookup:
-        api_key = os.environ.get("VT_API_KEY")
-        if not api_key:
+        if not network_egress_allowed():
+            vt_errors.append("VirusTotal lookups skipped: network egress is disabled.")
+        elif not (api_key := os.environ.get("VT_API_KEY")):
             vt_errors.append("VT_API_KEY is not set; skipping VirusTotal lookups.")
         else:
             def _normalized_domain(host_value: str) -> str:

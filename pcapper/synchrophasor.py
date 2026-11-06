@@ -79,9 +79,22 @@ def _looks_like_c37118(payload: bytes) -> Optional[int]:
     framesize = int.from_bytes(payload[2:4], "big")
     # Framesize must be at least the fixed header+CRC and not absurd; allow the
     # captured payload to be >= the declared size (TCP may coalesce frames).
-    if framesize < 14 or framesize > 65535:
+    if framesize < 16 or framesize > len(payload):
         return None
     return frame_type
+
+
+def _iter_c37118_frames(payload: bytes) -> list[tuple[int, bytes]]:
+    frames: list[tuple[int, bytes]] = []
+    offset = 0
+    while offset + 14 <= len(payload):
+        frame_type = _looks_like_c37118(payload[offset:])
+        if frame_type is None:
+            break
+        frame_size = int.from_bytes(payload[offset + 2 : offset + 4], "big")
+        frames.append((frame_type, payload[offset : offset + frame_size]))
+        offset += frame_size
+    return frames
 
 
 @memoize_analysis
@@ -147,21 +160,11 @@ def analyze_synchrophasor(
             if not payload:
                 continue
 
-            frame_type = _looks_like_c37118(payload)
             # Require either the standard port or a strong signature to avoid
             # matching unrelated traffic that happens to start with 0xAA.
-            if frame_type is None or not on_port:
+            frames = _iter_c37118_frames(payload) if on_port else []
+            if not frames:
                 continue
-
-            synchrophasor_packets += 1
-            # The report window spans this protocol's traffic, not every packet.
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
-            frame_types[C37118_FRAME_TYPES[frame_type]] += 1
-            id_codes[int.from_bytes(payload[4:6], "big")] += 1
 
             src_ip = ""
             dst_ip = ""
@@ -176,12 +179,23 @@ def analyze_synchrophasor(
             if dst_ip:
                 dst_ips[dst_ip] += 1
 
-            # Command frame: decode the CMD field at offset 14.
-            if frame_type == 4 and len(payload) >= 16:
-                cmd_val = int.from_bytes(payload[14:16], "big")
-                cmd_name = C37118_COMMANDS.get(cmd_val, f"CMD 0x{cmd_val:04x}")
-                commands[cmd_name] += 1
-                command_sources.setdefault(src_ip or "?", Counter())[cmd_name] += 1
+            for frame_type, frame in frames:
+                synchrophasor_packets += 1
+                # The report window spans this protocol's traffic, not every packet.
+                if ts is not None:
+                    if first_seen is None or ts < first_seen:
+                        first_seen = ts
+                    if last_seen is None or ts > last_seen:
+                        last_seen = ts
+                frame_types[C37118_FRAME_TYPES[frame_type]] += 1
+                id_codes[int.from_bytes(frame[4:6], "big")] += 1
+
+                # A command frame needs its command field and trailing CRC.
+                if frame_type == 4 and len(frame) >= 18:
+                    cmd_val = int.from_bytes(frame[14:16], "big")
+                    cmd_name = C37118_COMMANDS.get(cmd_val, f"CMD 0x{cmd_val:04x}")
+                    commands[cmd_name] += 1
+                    command_sources.setdefault(src_ip or "?", Counter())[cmd_name] += 1
     except Exception as exc:
         errors.append(str(exc))
 

@@ -18,10 +18,11 @@ from .utils import memoize_analysis
 # These three properties together are specific enough to avoid the false matches
 # that a bare "starts 0xF*, ends 0xF6" test produces on large binary payloads.
 # Vendor framing has no authoritative public function map, so this is a presence
-# + exposure detector.
+# + exposure detector. The supported rail SCADA function set includes status,
+# polling, recall, and control operations.
 GENISYS_PORT = 10001
 _GENISYS_END = 0xF6
-_GENISYS_START = {0xF1, 0xF2, 0xFB, 0xFD}
+_GENISYS_START = {0xF1, 0xF2, 0xF3, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE}
 _GENISYS_MAX_LEN = 256
 
 

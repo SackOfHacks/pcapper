@@ -93,6 +93,16 @@ class TestOpenPrivate:
         with pytest.raises(ValueError):
             utils.open_private(tmp_path / "d", "r")
 
+    def test_refuses_symlink_targets(self, tmp_path, posix_only) -> None:
+        target = tmp_path / "target.txt"
+        target.write_text("keep", encoding="utf-8")
+        link = tmp_path / "link.txt"
+        os.symlink(target, link)
+        with pytest.raises(OSError):
+            with utils.open_private(link, "w") as h:
+                h.write("overwrite")
+        assert target.read_text(encoding="utf-8") == "keep"
+
 
 class TestEnvInt:
     def test_default_and_malformed(self, monkeypatch) -> None:
@@ -413,6 +423,23 @@ class TestDnsVirusTotalHygiene:
         monkeypatch.setattr(dns_mod.urllib.request, "urlopen", fake_urlopen)
         dns_mod._vt_lookup_domain("evil.example/../../users?x=1#f", "k")
         assert seen and "/api/v3/domains/evil.example%2F..%2F..%2Fusers%3Fx%3D1%23f" in seen[0]
+
+    def test_network_off_blocks_lookups_before_urlopen(self, monkeypatch) -> None:
+        from pcapper import dns as dns_mod
+
+        called = False
+
+        def fake_urlopen(*_args, **_kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("urlopen should not be reached")
+
+        monkeypatch.setenv("PCAPPER_NETWORK", "off")
+        monkeypatch.setattr(dns_mod.urllib.request, "urlopen", fake_urlopen)
+        results, errors = dns_mod._vt_lookup_domains(["example.net"], "k")
+        assert results == {}
+        assert errors == ["VT lookup skipped: network egress is disabled."]
+        assert not called
 
 
 class TestHttpVirusTotalHygiene:

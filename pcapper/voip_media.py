@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .utils import open_private
+
 # RFC 3551 static payload types.
 RTP_STATIC_PAYLOAD_TYPES = {
     0: "PCMU/8000", 3: "GSM/8000", 4: "G723/8000", 5: "DVI4/8000",
@@ -130,11 +132,12 @@ def decode_g711(payload: bytes, payload_type: int) -> bytes:
 
 def write_wav(path: Path, pcm: bytes, sample_rate: int = 8000) -> None:
     """Write 16-bit mono PCM to a RIFF/WAVE file."""
-    with wave.open(str(path), "wb") as handle:
-        handle.setnchannels(1)
-        handle.setsampwidth(2)
-        handle.setframerate(sample_rate)
-        handle.writeframes(pcm)
+    with open_private(path, "wb") as raw_handle:
+        with wave.open(raw_handle, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(sample_rate)
+            handle.writeframes(pcm)
 
 
 # --- RTP --------------------------------------------------------------------
@@ -162,7 +165,7 @@ class RtpState:
     jitter: float = 0.0
     _last_transit: Optional[float] = None
     _last_rtp_ts: Optional[int] = None
-    seen_seqs: set = field(default_factory=set)
+    seen_seqs: bytearray = field(default_factory=lambda: bytearray(8192))
     dtmf: list = field(default_factory=list)
     last_dtmf_event: Optional[int] = None
     payload_types: set = field(default_factory=set)
@@ -247,6 +250,7 @@ def update_rtp_state(
     if parsed["marker"]:
         state.marker_count += 1
 
+    wrapped = False
     if state.first_seq is None:
         state.first_seq = seq
         state.highest_seq = seq
@@ -255,14 +259,18 @@ def update_rtp_state(
         # being reported as a 65,000-packet gap once per stream.
         state.cycles += 1
         state.highest_seq = seq
+        state.seen_seqs[:] = b"\x00" * len(state.seen_seqs)
+        wrapped = True
     elif seq > state.highest_seq:
         state.highest_seq = seq
-    elif seq == state.highest_seq or seq in state.seen_seqs:
+    sequence_byte = seq >> 3
+    sequence_mask = 1 << (seq & 7)
+    already_seen = not wrapped and bool(state.seen_seqs[sequence_byte] & sequence_mask)
+    if already_seen:
         state.duplicates += 1
-    else:
+    elif seq < state.highest_seq and not wrapped:
         state.out_of_order += 1
-    if len(state.seen_seqs) < 65536:
-        state.seen_seqs.add(seq)
+    state.seen_seqs[sequence_byte] |= sequence_mask
 
     if state.first_seen is None:
         state.first_seen = ts

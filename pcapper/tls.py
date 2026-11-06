@@ -34,6 +34,7 @@ from .utils import (
     extract_packet_endpoints,
     is_valid_ip,
     memoize_analysis,
+    network_egress_allowed,
     packet_length,
     safe_float,
     shannon_entropy,
@@ -60,6 +61,12 @@ except Exception:  # pragma: no cover
 
 
 TLS_PORTS = {443, 8443, 9443, 4433}
+MAX_TLS_CONVERSATIONS = max(
+    1, int(os.getenv("PCAPPER_TLS_MAX_CONVERSATIONS", "50000"))
+)
+MAX_TLS_UNIQUE_VALUES = max(
+    1, int(os.getenv("PCAPPER_TLS_MAX_UNIQUE_VALUES", "50000"))
+)
 SUSPICIOUS_TLDS = {".ru", ".cn", ".top", ".xyz", ".gq", ".tk", ".ml", ".ga"}
 TLS_CONTENT_TYPES = {20, 21, 22, 23}
 WEAK_CIPHER_MARKERS = ("RC4", "3DES", "DES", "NULL", "EXPORT", "MD5", "ANON")
@@ -1029,6 +1036,8 @@ def analyze_tls(
     last_seen: Optional[float] = None
     analysis_notes: list[str] = []
     sni_ip_literals: set[str] = set()
+    omitted_conversation_packets = 0
+    omitted_tls_values = 0
 
     target_ip_value = str(target_ip or "").strip()
     hostname_token = str(hostname_query or "").strip().lower()
@@ -1042,6 +1051,27 @@ def analyze_tls(
         counter: Counter[str] = Counter()
         convo[key] = counter
         return counter
+
+    def _increment(counter: Counter, key: object, amount: int = 1) -> None:
+        nonlocal omitted_tls_values
+        if key in counter:
+            counter[key] += amount
+        elif len(counter) < MAX_TLS_UNIQUE_VALUES:
+            counter[key] = amount
+        else:
+            omitted_tls_values += 1
+
+    def _increment_nested(
+        mapping: dict, outer_key: str, inner_key: object, amount: int = 1
+    ) -> None:
+        nonlocal omitted_tls_values
+        counter = mapping.get(outer_key)
+        if counter is None:
+            if len(mapping) >= MAX_TLS_UNIQUE_VALUES:
+                omitted_tls_values += 1
+                return
+            counter = mapping[outer_key]
+        _increment(counter, inner_key, amount)
 
     def _record_client_hello_observation(
         *,
@@ -1057,59 +1087,62 @@ def analyze_tls(
         ja3_hash: Optional[str],
         ja4: Optional[str],
     ) -> None:
-        nonlocal client_hellos, ech_hellos, ech_sni_missing
+        nonlocal client_hellos, ech_hellos, ech_sni_missing, omitted_tls_values
         client_hellos += 1
-        client_hello_counts[client] += 1
+        _increment(client_hello_counts, client)
         convo["client_hellos"] = int(convo.get("client_hellos", 0) or 0) + 1
-        versions[version_label] += 1
-        _get_convo_counter(convo, "versions")[version_label] += 1
+        _increment(versions, version_label)
+        _increment(_get_convo_counter(convo, "versions"), version_label)
         if version_label in LEGACY_TLS_VERSIONS:
-            legacy_version_servers[version_label][server] += 1
+            _increment_nested(legacy_version_servers, version_label, server)
         if sni_val:
-            sni_counts[sni_val] += 1
-            client_sni_counts[client][sni_val] += 1
-            server_sni_counts[server][sni_val] += 1
-            server_endpoint_sni_counts[server_endpoint][sni_val] += 1
-            sni_to_clients[sni_val][client] += 1
-            sni_to_servers[sni_val][server_endpoint] += 1
+            _increment(sni_counts, sni_val)
+            _increment_nested(client_sni_counts, client, sni_val)
+            _increment_nested(server_sni_counts, server, sni_val)
+            _increment_nested(server_endpoint_sni_counts, server_endpoint, sni_val)
+            _increment_nested(sni_to_clients, sni_val, client)
+            _increment_nested(sni_to_servers, sni_val, server_endpoint)
             if convo.get("sni") is None:
                 convo["sni"] = sni_val
             if is_valid_ip(sni_val):
-                sni_ip_literals.add(sni_val)
+                if sni_val in sni_ip_literals or len(sni_ip_literals) < MAX_TLS_UNIQUE_VALUES:
+                    sni_ip_literals.add(sni_val)
+                else:
+                    omitted_tls_values += 1
         else:
-            client_missing_sni[client] += 1
+            _increment(client_missing_sni, client)
             if not ech_present:
-                client_missing_sni_no_ech[client] += 1
+                _increment(client_missing_sni_no_ech, client)
         if ech_present:
             ech_hellos += 1
-            client_ech_counts[client] += 1
+            _increment(client_ech_counts, client)
             if not sni_val:
                 ech_sni_missing += 1
         for alpn in alpn_vals:
-            alpn_counts[alpn] += 1
-            client_alpn_counts[client][alpn] += 1
-            _get_convo_counter(convo, "alpn")[alpn] += 1
+            _increment(alpn_counts, alpn)
+            _increment_nested(client_alpn_counts, client, alpn)
+            _increment(_get_convo_counter(convo, "alpn"), alpn)
             if sni_val:
-                sni_to_alpn[sni_val][alpn] += 1
+                _increment_nested(sni_to_alpn, sni_val, alpn)
         if sni_val and not alpn_vals:
-            sni_no_alpn[sni_val] += 1
+            _increment(sni_no_alpn, sni_val)
         if ja3_hash:
-            ja3_counts[ja3_hash] += 1
-            client_ja3_counts[client][ja3_hash] += 1
-            _get_convo_counter(convo, "ja3")[ja3_hash] += 1
+            _increment(ja3_counts, ja3_hash)
+            _increment_nested(client_ja3_counts, client, ja3_hash)
+            _increment(_get_convo_counter(convo, "ja3"), ja3_hash)
             if sni_val:
-                sni_to_ja3[sni_val][ja3_hash] += 1
-                ja3_to_sni[ja3_hash][sni_val] += 1
+                _increment_nested(sni_to_ja3, sni_val, ja3_hash)
+                _increment_nested(ja3_to_sni, ja3_hash, sni_val)
         if ja4:
-            ja4_counts[ja4] += 1
-            client_ja4_counts[client][ja4] += 1
-            _get_convo_counter(convo, "ja4")[ja4] += 1
+            _increment(ja4_counts, ja4)
+            _increment_nested(client_ja4_counts, client, ja4)
+            _increment(_get_convo_counter(convo, "ja4"), ja4)
             if sni_val:
-                sni_to_ja4[sni_val][ja4] += 1
-                ja4_to_sni[ja4][sni_val] += 1
+                _increment_nested(sni_to_ja4, sni_val, ja4)
+                _increment_nested(ja4_to_sni, ja4, sni_val)
         if server_port not in TLS_PORTS:
-            nonstandard_tls_clients[client] += 1
-            nonstandard_tls_servers[server_endpoint] += 1
+            _increment(nonstandard_tls_clients, client)
+            _increment(nonstandard_tls_servers, server_endpoint)
 
     def _record_server_hello_observation(
         *,
@@ -1123,25 +1156,25 @@ def analyze_tls(
     ) -> None:
         nonlocal server_hellos
         server_hellos += 1
-        server_hello_counts[server] += 1
+        _increment(server_hello_counts, server)
         convo["server_hellos"] = int(convo.get("server_hellos", 0) or 0) + 1
-        versions[version_label] += 1
-        _get_convo_counter(convo, "versions")[version_label] += 1
+        _increment(versions, version_label)
+        _increment(_get_convo_counter(convo, "versions"), version_label)
         if version_label in LEGACY_TLS_VERSIONS:
-            legacy_version_servers[version_label][server] += 1
+            _increment_nested(legacy_version_servers, version_label, server)
         if cipher is not None:
             cipher_name = _cipher_label(cipher)
-            cipher_suites[cipher_name] += 1
-            server_cipher_counts[server][cipher_name] += 1
+            _increment(cipher_suites, cipher_name)
+            _increment_nested(server_cipher_counts, server, cipher_name)
             if _is_weak_cipher(cipher):
-                weak_ciphers[cipher_name] += 1
+                _increment(weak_ciphers, cipher_name)
         for alpn in alpn_vals:
-            _get_convo_counter(convo, "alpn")[alpn] += 1
+            _increment(_get_convo_counter(convo, "alpn"), alpn)
         if ja4s:
-            ja4s_counts[ja4s] += 1
-            server_ja4s_counts[server][ja4s] += 1
-            server_endpoint_ja4s_counts[server_endpoint][ja4s] += 1
-            _get_convo_counter(convo, "ja4s")[ja4s] += 1
+            _increment(ja4s_counts, ja4s)
+            _increment_nested(server_ja4s_counts, server, ja4s)
+            _increment_nested(server_endpoint_ja4s_counts, server_endpoint, ja4s)
+            _increment(_get_convo_counter(convo, "ja4s"), ja4s)
 
     skipped_packets = 0
     first_skip_error: str | None = None
@@ -1264,13 +1297,17 @@ def analyze_tls(
                 server = dst_ip or "-"
                 server_port = dport
 
-            client_counts[client] += 1
-            server_counts[server] += 1
-            server_ports[server_port] += 1
-
             convo_key = (client, server, server_port)
             server_endpoint = f"{server}:{server_port}"
-            convo = conversations[convo_key]
+            convo = conversations.get(convo_key)
+            if convo is None:
+                if len(conversations) >= MAX_TLS_CONVERSATIONS:
+                    omitted_conversation_packets += 1
+                    continue
+                convo = conversations[convo_key]
+            _increment(client_counts, client)
+            _increment(server_counts, server)
+            server_ports[server_port] += 1
             convo["packets"] = int(convo["packets"]) + 1
             convo["bytes"] = int(convo["bytes"]) + pkt_len
             if src_ip == client:
@@ -1286,12 +1323,14 @@ def analyze_tls(
             if not is_tls_handshake:
                 record_version = _record_version_label(payload)
                 if record_version:
-                    versions[record_version] += 1
+                    _increment(versions, record_version)
                     convo_versions = convo.get("versions")
                     if isinstance(convo_versions, Counter):
-                        convo_versions[record_version] += 1
+                        _increment(convo_versions, record_version)
                     if record_version in LEGACY_TLS_VERSIONS:
-                        legacy_version_servers[record_version][server] += 1
+                        _increment_nested(
+                            legacy_version_servers, record_version, server
+                        )
 
             if client_hello is not None:
                 client_ver = _tls_version_label(
@@ -1575,6 +1614,17 @@ def analyze_tls(
     if raw_client_hellos or raw_server_hellos:
         analysis_notes.append(
             f"Raw TLS parser recovered {raw_client_hellos} client hello(s) and {raw_server_hellos} server hello(s) that Scapy did not expose as TLS layers."
+        )
+    if omitted_conversation_packets:
+        analysis_notes.append(
+            f"TLS conversation limit reached at {MAX_TLS_CONVERSATIONS}; "
+            f"omitted packet-level details for {omitted_conversation_packets} "
+            "packets from new conversations."
+        )
+    if omitted_tls_values:
+        analysis_notes.append(
+            f"TLS unique-value limit reached at {MAX_TLS_UNIQUE_VALUES}; "
+            f"omitted {omitted_tls_values} high-cardinality values."
         )
     if client_hellos and not server_hellos:
         analysis_notes.append(
@@ -2099,8 +2149,9 @@ def analyze_tls(
     vt_results: dict[str, dict[str, object]] = {}
     vt_errors: list[str] = []
     if vt_lookup:
-        api_key = os.environ.get("VT_API_KEY")
-        if not api_key:
+        if not network_egress_allowed():
+            vt_errors.append("VirusTotal lookups skipped: network egress is disabled.")
+        elif not (api_key := os.environ.get("VT_API_KEY")):
             vt_errors.append("VT_API_KEY is not set; skipping VirusTotal lookups.")
         else:
             # Public names only, filtered *before* taking the top 80 so

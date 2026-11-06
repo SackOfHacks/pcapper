@@ -27,9 +27,9 @@ NIAGARA_KEYWORDS = {
     "invoke": "Invoke",
 }
 
-ORD_PATTERN = re.compile(r"ord:[^\\s\\x00]+", re.IGNORECASE)
+ORD_PATTERN = re.compile(r"ord:[^\s\x00]+", re.IGNORECASE)
 OPCODE_PATTERN = re.compile(
-    r"(?:opcode|op)\\s*[:=]\\s*(0x[0-9a-fA-F]+|\\d+)", re.IGNORECASE
+    r"(?:opcode|op)\s*[:=]\s*(0x[0-9a-fA-F]+|\d+)", re.IGNORECASE
 )
 
 
@@ -43,12 +43,12 @@ def _parse_commands(payload: bytes) -> list[str]:
     text = payload[:400].decode("utf-8", errors="ignore").lower()
     commands: list[str] = []
     for key, label in NIAGARA_KEYWORDS.items():
-        if key in text:
+        if re.search(rf"\b{re.escape(key)}\b", text):
             commands.append(f"Niagara {label}")
     for match in OPCODE_PATTERN.findall(text):
         commands.append(f"Niagara Opcode {match}")
     model = _load_model()
-    if model is not None:
+    if model is not None and model.opcodes:
         for opcode, label, _offset in model.extract_opcodes(payload):
             commands.append(f"Niagara Opcode {format_opcode(opcode, label)}")
     return commands
@@ -66,7 +66,7 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
     for match in OPCODE_PATTERN.findall(text):
         artifacts.append(("niagara_opcode", match))
     model = _load_model()
-    if model is not None:
+    if model is not None and model.opcodes:
         for opcode, label, _offset in model.extract_opcodes(payload):
             artifacts.append(("niagara_opcode", format_opcode(opcode, label)))
     return artifacts

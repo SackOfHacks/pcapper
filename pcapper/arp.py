@@ -217,8 +217,6 @@ def analyze_arp(
 
     ip_to_macs: dict[str, set[str]] = defaultdict(set)
     mac_to_ips: dict[str, set[str]] = defaultdict(set)
-    req_pairs: Counter[tuple[str, str]] = Counter()
-    reply_pairs: Counter[tuple[str, str]] = Counter()
     request_targets: dict[str, set[str]] = defaultdict(set)
     request_times: dict[tuple[str, str], deque[float]] = defaultdict(
         lambda: deque(maxlen=_MAX_PENDING_REQUESTS_PER_PAIR)
@@ -326,7 +324,6 @@ def analyze_arp(
             summary.request_summary["Request"] += 1
             summary.client_details[src_ip] += 1
             summary.client_versions[version] += 1
-            req_pairs[(src_ip, dst_ip)] += 1
             if dst_ip != "0.0.0.0":
                 request_targets[src_ip].add(dst_ip)
                 if ts is not None:
@@ -345,23 +342,21 @@ def analyze_arp(
             summary.response_codes["Reply"] += 1
             summary.server_details[src_ip] += 1
             summary.server_versions[version] += 1
-            reply_pairs[(src_ip, dst_ip)] += 1
             if src_ip == dst_ip:
                 summary.gratuitous_arp += 1
                 summary.response_codes["Gratuitous Reply"] += 1
-            if req_pairs.get((dst_ip, src_ip), 0) == 0:
+            pending = request_times.get((dst_ip, src_ip))
+            if pending:
+                req_ts = pending.popleft()
+                if ts is not None and ts >= req_ts:
+                    reply_latencies_by_responder[src_ip].append(ts - req_ts)
+            else:
                 summary.unsolicited_replies += 1
                 unsolicited_by_src_ip[src_ip] += 1
                 unsolicited_by_src_mac[src_mac] += 1
                 summary.response_codes["Unsolicited Reply"] += 1
                 if dst_mac.lower() == _BROADCAST_MAC:
                     unsolicited_to_broadcast_by_src_mac[src_mac] += 1
-            elif ts is not None:
-                pending = request_times.get((dst_ip, src_ip))
-                if pending:
-                    req_ts = pending.popleft()
-                    if ts >= req_ts:
-                        reply_latencies_by_responder[src_ip].append(ts - req_ts)
             if ts is not None:
                 # Only MAC *changes* matter to the gateway-flip check, so
                 # store the run-length sequence instead of every reply.

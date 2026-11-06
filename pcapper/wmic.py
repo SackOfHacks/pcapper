@@ -273,7 +273,7 @@ def _extract_utf16le_strings(
                 value = current.decode("latin-1", errors="ignore")
                 results.append(value[:max_len])
             current = bytearray()
-            i += 2
+            i += 1
     if len(current) >= min_len:
         value = current.decode("latin-1", errors="ignore")
         results.append(value[:max_len])

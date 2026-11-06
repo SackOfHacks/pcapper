@@ -19,11 +19,11 @@ except Exception:  # pragma: no cover
 
 
 OPC_UUIDS = {
-    "39c13a4d-011e-11d0-9675-0020afd8adb3": "OPC DA 2.0",
-    "39c13a4e-011e-11d0-9675-0020afd8adb3": "OPC DA 3.0",
+    "39c13a4d-011e-11d0-9675-0020afd8adb3": "OPC DA IOPCServer",
+    "39c13a4e-011e-11d0-9675-0020afd8adb3": "OPC DA IOPCServerPublicGroups",
     "1b1f2a21-d10d-11d1-9a8f-00c04fc9e26e": "OPC AE",
     "7ea2d5b5-2b09-11d1-bcaa-00805fc59d7c": "OPC HDA",
-    "f31dfde2-07b6-11d2-b2d8-0060083ba1fb": "OPC DX",
+    "f31dfde2-07b6-11d2-b2d8-0060083ba1fb": "OPC Common IOPCCommon",
 }
 
 

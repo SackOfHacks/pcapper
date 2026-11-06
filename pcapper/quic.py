@@ -7,6 +7,7 @@ from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
+from .utils import env_int
 
 try:
     from scapy.layers.inet import UDP  # type: ignore
@@ -15,6 +16,7 @@ except Exception:  # pragma: no cover
 
 
 QUIC_PORTS = {443, 4433, 8443, 9443, 784}
+MAX_QUIC_FLOWS = env_int("PCAPPER_MAX_QUIC_FLOWS", 50000, minimum=1)
 # A packet *from* a QUIC port is a server response only when it goes back to
 # a client's ephemeral port. Without this, any flow whose ephemeral source port
 # happens to be 443/784 and whose payload passes the header check is reported
@@ -115,6 +117,7 @@ def analyze_quic(
     errors: list[str] = []
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
+    flow_cap_reached = False
 
     for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
         total_packets += 1
@@ -147,15 +150,29 @@ def analyze_quic(
             if last_seen is None or ts > last_seen:
                 last_seen = ts
 
-        clients[client] += 1
-        servers[server] += 1
+        if client in clients or len(clients) < MAX_QUIC_FLOWS:
+            clients[client] += 1
+        if server in servers or len(servers) < MAX_QUIC_FLOWS:
+            servers[server] += 1
         version = _parse_version(payload)
         if version:
             versions[version] += 1
         # One flow per client/server pair, whichever direction the packet
         # travelled; keying on the packet's dport split every flow in two,
         # one of them named after the client's ephemeral port.
-        flow_counts[f"{client}->{server}:{server_port}"] += 1
+        flow_key = f"{client}->{server}:{server_port}"
+        if flow_key in flow_counts:
+            flow_counts[flow_key] += 1
+        elif len(flow_counts) < MAX_QUIC_FLOWS:
+            flow_counts[flow_key] = 1
+        else:
+            flow_cap_reached = True
+
+    if flow_cap_reached:
+        errors.append(
+            f"QUIC flow tracking capped at {MAX_QUIC_FLOWS}; additional flows "
+            "were omitted from flow counts."
+        )
 
     if quic_packets:
         detections.append(

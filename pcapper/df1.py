@@ -54,25 +54,46 @@ def _extract_df1_frames(payload: bytes) -> list[bytes]:
     frames: list[bytes] = []
     idx = 0
     while idx + 1 < len(payload):
-        if payload[idx : idx + 2] == DF1_DLE_STX:
+        start = payload.find(DF1_DLE_STX, idx)
+        if start < 0:
+            break
+        idx = start + 2
+        data = bytearray()
+        terminated = False
+        while idx + 1 < len(payload):
+            if payload[idx] == 0x10:
+                if payload[idx + 1] == 0x10:
+                    data.append(0x10)
+                    idx += 2
+                    continue
+                if payload[idx : idx + 2] == DF1_DLE_ETX:
+                    idx += 2
+                    terminated = True
+                    break
+            data.append(payload[idx])
+            idx += 1
+        if not terminated:
+            break
+
+        frame = bytes(data)
+        crc = _df1_crc16(frame + b"\x03")
+        crc_bytes = (crc.to_bytes(2, "little"), crc.to_bytes(2, "big"))
+        if idx + 2 <= len(payload) and payload[idx : idx + 2] in crc_bytes:
+            frames.append(frame)
             idx += 2
-            data = bytearray()
-            while idx + 1 < len(payload):
-                if payload[idx] == 0x10:
-                    if payload[idx + 1] == 0x10:
-                        data.append(0x10)
-                        idx += 2
-                        continue
-                    if payload[idx : idx + 2] == DF1_DLE_ETX:
-                        idx += 2
-                        break
-                data.append(payload[idx])
-                idx += 1
-            if data:
-                frames.append(bytes(data))
-            continue
-        idx += 1
+        elif idx < len(payload) and payload[idx] == (-sum(frame)) & 0xFF:
+            frames.append(frame)
+            idx += 1
     return frames
+
+
+def _df1_crc16(data: bytes) -> int:
+    crc = 0
+    for value in data:
+        crc ^= value
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0xA001 if crc & 1 else 0)
+    return crc
 
 
 def _parse_df1_frame(frame: bytes) -> tuple[str, bool] | None:

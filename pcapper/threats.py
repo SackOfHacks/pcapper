@@ -98,8 +98,11 @@ from .tcp import analyze_tcp
 from .tls import analyze_tls
 from .udp import analyze_udp
 from .utils import (
+    call_with_packet_view,
     counter_inc,
     dns_questions,
+    env_int,
+    executable_path_warnings,
     extract_packet_endpoints,
     format_ts,
     memoize_analysis,
@@ -198,9 +201,11 @@ OT_PORTS: dict[int, str] = {
     5684: "CoAP",
     1883: "MQTT",
     8883: "MQTT-TLS",
-    34378: "Yokogawa Vnet/IP",
-    34379: "Yokogawa Vnet/IP",
-    34380: "Yokogawa Vnet/IP",
+    34378: "P-NET",
+    34379: "P-NET",
+    34380: "P-NET",
+    5313: "Yokogawa Vnet/IP",
+    55565: "Honeywell CDA",
     1502: "Triconex/SIS",
 }
 
@@ -548,6 +553,18 @@ def _parse_suricata_eve_alerts(
     try:
         with eve_path.open("r", encoding="utf-8", errors="replace") as handle:
             for line_number, raw_line in enumerate(handle, start=1):
+                if eve_lines >= SURICATA_EVE_MAX_LINES:
+                    errors.append(
+                        "Suricata: eve.json line budget reached "
+                        f"({SURICATA_EVE_MAX_LINES}); remaining events skipped."
+                    )
+                    break
+                if len(raw_line.encode("utf-8", errors="ignore")) > SURICATA_EVE_MAX_LINE_BYTES:
+                    errors.append(
+                        f"Suricata: eve.json line {line_number} exceeds "
+                        f"{SURICATA_EVE_MAX_LINE_BYTES} bytes; skipped."
+                    )
+                    continue
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -940,6 +957,10 @@ SURICATA_VERSION_TIMEOUT_SECONDS = _env_timeout_seconds(
 SURICATA_SCAN_TIMEOUT_SECONDS = _env_timeout_seconds(
     "PCAPPER_SURICATA_SCAN_TIMEOUT", 900.0
 )
+SURICATA_EVE_MAX_LINES = env_int("PCAPPER_SURICATA_EVE_MAX_LINES", 1_000_000, minimum=1)
+SURICATA_EVE_MAX_LINE_BYTES = env_int(
+    "PCAPPER_SURICATA_EVE_MAX_LINE_BYTES", 1_000_000, minimum=1024
+)
 
 
 def _run_suricata_scan(
@@ -956,9 +977,16 @@ def _run_suricata_scan(
     dict[str, list[str]],
     dict[str, object],
 ]:
-    suricata_bin = shutil.which("suricata")
+    configured_bin = os.environ.get("PCAPPER_SURICATA_BIN", "").strip()
+    suricata_bin = (
+        str(Path(configured_bin).expanduser())
+        if configured_bin
+        else shutil.which("suricata")
+    )
+    if suricata_bin and configured_bin and not Path(suricata_bin).is_file():
+        suricata_bin = None
     if not suricata_bin:
-        return [], ["Suricata binary not found in PATH."], {}, {}, {}
+        return [], ["Suricata binary not found (PATH or PCAPPER_SURICATA_BIN)."], {}, {}, {}
 
     errors: list[str] = []
     metadata: dict[str, object] = {
@@ -966,6 +994,8 @@ def _run_suricata_scan(
         "binary": suricata_bin,
         "pcap_sha256": _file_sha256(path),
     }
+    for warning in executable_path_warnings(Path(suricata_bin)):
+        errors.append(f"Suricata trust warning: {warning}")
     checks: dict[str, list[str]] = {}
     stats: dict[str, object] = {}
 
@@ -2646,54 +2676,59 @@ def analyze_threats(
     ot_peer_internal: Counter[str] = Counter()
     ot_peer_external: Counter[str] = Counter()
 
+    def _analyze(func, *args, **kwargs):
+        return call_with_packet_view(
+            func, path, *args, packets=packets, meta=meta, **kwargs
+        )
+
     # Aggregate detections from specialized modules
-    icmp_summary = analyze_icmp(path, show_status=show_status)
-    dns_summary = analyze_dns(path, show_status=show_status, vt_lookup=vt_lookup)
-    beacon_summary = analyze_beacons(path, show_status=show_status)
-    remote_access_summary = analyze_remote_access(path, show_status=show_status)
-    files_summary = analyze_files(path, show_status=show_status)
-    obfuscation_summary = analyze_obfuscation(path, show_status=show_status)
-    carving_summary = analyze_carving(path, show_status=show_status)
-    http_summary = analyze_http(path, show_status=show_status, vt_lookup=vt_lookup)
-    creds_summary = analyze_creds(path, show_status=show_status)
-    tls_summary = analyze_tls(path, show_status=show_status, vt_lookup=vt_lookup)
-    ldap_summary = analyze_ldap(path, show_status=show_status)
-    kerberos_summary = analyze_kerberos(path, show_status=show_status)
-    ntlm_summary = analyze_ntlm(path, show_status=show_status)
-    syslog_summary = analyze_syslog(path, show_status=show_status)
-    arp_summary = analyze_arp(path, show_status=show_status)
-    netbios_summary = analyze_netbios(path, show_status=show_status)
-    dhcp_summary = analyze_dhcp(path, show_status=show_status)
-    exfil_summary = analyze_exfil(path, show_status=show_status)
-    quic_summary = analyze_quic(path, show_status=show_status)
-    edns_summary = analyze_encrypted_dns(path, show_status=show_status)
-    vpn_summary = analyze_vpn(path, show_status=show_status)
-    smb_summary = analyze_smb(path, show_status=show_status)
-    rdp_summary = analyze_rdp(path, show_status=show_status)
-    winrm_summary = analyze_winrm(path, show_status=show_status)
-    wmic_summary = analyze_wmic(path, show_status=show_status)
-    powershell_summary = analyze_powershell(path, show_status=show_status)
-    ssh_summary = analyze_ssh(path, show_status=show_status)
-    ftp_summary = analyze_ftp(path, show_status=show_status)
-    nfs_summary = analyze_nfs(path, show_status=show_status)
-    malware_summary = analyze_malware(path, show_status=show_status)
-    email_summary = analyze_email(path, show_status=show_status)
-    safety_summary = analyze_safety(path, show_status=show_status)
-    telnet_summary = analyze_telnet(path, show_status=show_status)
-    vnc_summary = analyze_vnc(path, show_status=show_status)
-    voip_summary = analyze_voip(path, show_status=show_status)
-    routing_summary = analyze_routing(path, show_status=show_status)
-    rpc_summary = analyze_rpc(path, show_status=show_status)
-    snmp_summary = analyze_snmp(path, show_status=show_status)
-    tcp_summary = analyze_tcp(path, show_status=show_status)
-    udp_summary = analyze_udp(path, show_status=show_status)
-    goose_summary = analyze_goose(path, show_status=show_status)
-    sv_summary = analyze_sv(path, show_status=show_status)
-    ptp_summary = analyze_ptp(path, show_status=show_status)
-    lldp_summary = analyze_lldp_dcp(path, show_status=show_status)
-    opc_classic_summary = analyze_opc_classic(path, show_status=show_status)
-    synchrophasor_summary = analyze_synchrophasor(path, show_status=show_status)
-    iec101_103_summary = analyze_iec101_103(path, show_status=show_status)
+    icmp_summary = _analyze(analyze_icmp, show_status=show_status)
+    dns_summary = _analyze(analyze_dns, show_status=show_status, vt_lookup=vt_lookup)
+    beacon_summary = _analyze(analyze_beacons, show_status=show_status)
+    remote_access_summary = _analyze(analyze_remote_access, show_status=show_status)
+    files_summary = _analyze(analyze_files, show_status=show_status)
+    obfuscation_summary = _analyze(analyze_obfuscation, show_status=show_status)
+    carving_summary = _analyze(analyze_carving, show_status=show_status)
+    http_summary = _analyze(analyze_http, show_status=show_status, vt_lookup=vt_lookup)
+    creds_summary = _analyze(analyze_creds, show_status=show_status)
+    tls_summary = _analyze(analyze_tls, show_status=show_status, vt_lookup=vt_lookup)
+    ldap_summary = _analyze(analyze_ldap, show_status=show_status)
+    kerberos_summary = _analyze(analyze_kerberos, show_status=show_status)
+    ntlm_summary = _analyze(analyze_ntlm, show_status=show_status)
+    syslog_summary = _analyze(analyze_syslog, show_status=show_status)
+    arp_summary = _analyze(analyze_arp, show_status=show_status)
+    netbios_summary = _analyze(analyze_netbios, show_status=show_status)
+    dhcp_summary = _analyze(analyze_dhcp, show_status=show_status)
+    exfil_summary = _analyze(analyze_exfil, show_status=show_status)
+    quic_summary = _analyze(analyze_quic, show_status=show_status)
+    edns_summary = _analyze(analyze_encrypted_dns, show_status=show_status)
+    vpn_summary = _analyze(analyze_vpn, show_status=show_status)
+    smb_summary = _analyze(analyze_smb, show_status=show_status)
+    rdp_summary = _analyze(analyze_rdp, show_status=show_status)
+    winrm_summary = _analyze(analyze_winrm, show_status=show_status)
+    wmic_summary = _analyze(analyze_wmic, show_status=show_status)
+    powershell_summary = _analyze(analyze_powershell, show_status=show_status)
+    ssh_summary = _analyze(analyze_ssh, show_status=show_status)
+    ftp_summary = _analyze(analyze_ftp, show_status=show_status)
+    nfs_summary = _analyze(analyze_nfs, show_status=show_status)
+    malware_summary = _analyze(analyze_malware, show_status=show_status)
+    email_summary = _analyze(analyze_email, show_status=show_status)
+    safety_summary = _analyze(analyze_safety, show_status=show_status)
+    telnet_summary = _analyze(analyze_telnet, show_status=show_status)
+    vnc_summary = _analyze(analyze_vnc, show_status=show_status)
+    voip_summary = _analyze(analyze_voip, show_status=show_status)
+    routing_summary = _analyze(analyze_routing, show_status=show_status)
+    rpc_summary = _analyze(analyze_rpc, show_status=show_status)
+    snmp_summary = _analyze(analyze_snmp, show_status=show_status)
+    tcp_summary = _analyze(analyze_tcp, show_status=show_status)
+    udp_summary = _analyze(analyze_udp, show_status=show_status)
+    goose_summary = _analyze(analyze_goose, show_status=show_status)
+    sv_summary = _analyze(analyze_sv, show_status=show_status)
+    ptp_summary = _analyze(analyze_ptp, show_status=show_status)
+    lldp_summary = _analyze(analyze_lldp_dcp, show_status=show_status)
+    opc_classic_summary = _analyze(analyze_opc_classic, show_status=show_status)
+    synchrophasor_summary = _analyze(analyze_synchrophasor, show_status=show_status)
+    iec101_103_summary = _analyze(analyze_iec101_103, show_status=show_status)
 
     artifacts_by_name: dict[str, list[object]] = defaultdict(list)
     for artifact in files_summary.artifacts:
@@ -2702,37 +2737,37 @@ def analyze_threats(
             artifacts_by_name[name].append(artifact)
 
     ot_summaries = {
-        "Modbus": analyze_modbus(path, show_status=show_status),
-        "DNP3": analyze_dnp3(path, show_status=show_status),
-        "IEC-104": analyze_iec104(path, show_status=show_status),
-        "BACnet": analyze_bacnet(path, show_status=show_status),
-        "EtherNet/IP": analyze_enip(path, show_status=show_status),
-        "Profinet": analyze_profinet(path, show_status=show_status),
-        "S7": analyze_s7(path, show_status=show_status),
-        "OPC UA": analyze_opc(path, show_status=show_status),
-        "EtherCAT": analyze_ethercat(path, show_status=show_status),
-        "FINS": analyze_fins(path, show_status=show_status),
-        "Crimson": analyze_crimson(path, show_status=show_status),
-        "PCWorx": analyze_pcworx(path, show_status=show_status),
-        "MELSEC": analyze_melsec(path, show_status=show_status),
-        "CIP": analyze_cip(path, show_status=show_status),
-        "CODESYS": analyze_codesys(path, show_status=show_status),
-        "Niagara": analyze_niagara(path, show_status=show_status),
-        "MMS": analyze_mms(path, show_status=show_status),
-        "SRTP": analyze_srtp(path, show_status=show_status),
-        "DF1": analyze_df1(path, show_status=show_status),
-        "PCCC": analyze_pccc(path, show_status=show_status),
-        "CSP": analyze_csp(path, show_status=show_status),
-        "Modicon": analyze_modicon(path, show_status=show_status),
-        "Yokogawa": analyze_yokogawa(path, show_status=show_status),
-        "Honeywell": analyze_honeywell(path, show_status=show_status),
-        "MQTT": analyze_mqtt(path, show_status=show_status),
-        "CoAP": analyze_coap(path, show_status=show_status),
-        "HART-IP": analyze_hart(path, show_status=show_status),
-        "ProConOS": analyze_prconos(path, show_status=show_status),
-        "ICCP": analyze_iccp(path, show_status=show_status),
-        "BSAP": analyze_bsap(path, show_status=show_status),
-        "Genisys": analyze_genisys(path, show_status=show_status),
+        "Modbus": _analyze(analyze_modbus, show_status=show_status),
+        "DNP3": _analyze(analyze_dnp3, show_status=show_status),
+        "IEC-104": _analyze(analyze_iec104, show_status=show_status),
+        "BACnet": _analyze(analyze_bacnet, show_status=show_status),
+        "EtherNet/IP": _analyze(analyze_enip, show_status=show_status),
+        "Profinet": _analyze(analyze_profinet, show_status=show_status),
+        "S7": _analyze(analyze_s7, show_status=show_status),
+        "OPC UA": _analyze(analyze_opc, show_status=show_status),
+        "EtherCAT": _analyze(analyze_ethercat, show_status=show_status),
+        "FINS": _analyze(analyze_fins, show_status=show_status),
+        "Crimson": _analyze(analyze_crimson, show_status=show_status),
+        "PCWorx": _analyze(analyze_pcworx, show_status=show_status),
+        "MELSEC": _analyze(analyze_melsec, show_status=show_status),
+        "CIP": _analyze(analyze_cip, show_status=show_status),
+        "CODESYS": _analyze(analyze_codesys, show_status=show_status),
+        "Niagara": _analyze(analyze_niagara, show_status=show_status),
+        "MMS": _analyze(analyze_mms, show_status=show_status),
+        "SRTP": _analyze(analyze_srtp, show_status=show_status),
+        "DF1": _analyze(analyze_df1, show_status=show_status),
+        "PCCC": _analyze(analyze_pccc, show_status=show_status),
+        "CSP": _analyze(analyze_csp, show_status=show_status),
+        "Modicon": _analyze(analyze_modicon, show_status=show_status),
+        "Yokogawa": _analyze(analyze_yokogawa, show_status=show_status),
+        "Honeywell": _analyze(analyze_honeywell, show_status=show_status),
+        "MQTT": _analyze(analyze_mqtt, show_status=show_status),
+        "CoAP": _analyze(analyze_coap, show_status=show_status),
+        "HART-IP": _analyze(analyze_hart, show_status=show_status),
+        "ProConOS": _analyze(analyze_prconos, show_status=show_status),
+        "ICCP": _analyze(analyze_iccp, show_status=show_status),
+        "BSAP": _analyze(analyze_bsap, show_status=show_status),
+        "Genisys": _analyze(analyze_genisys, show_status=show_status),
     }
     ot_protocol_counts: Counter[str] = Counter()
     ot_enip_enum_sources: Counter[str] = Counter()

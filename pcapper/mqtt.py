@@ -40,9 +40,38 @@ MQTT_CONTROL_KEYWORDS = (
     "stop",
     "start",
 )
+_FIXED_FLAGS = {
+    1: 0,
+    2: 0,
+    4: 0,
+    5: 0,
+    6: 2,
+    7: 0,
+    8: 2,
+    9: 0,
+    10: 2,
+    11: 0,
+    12: 0,
+    13: 0,
+    14: 0,
+    15: 0,
+}
+_MIN_REMAINING_LENGTH = {
+    1: 12,
+    2: 2,
+    4: 2,
+    5: 2,
+    6: 2,
+    7: 2,
+    8: 5,
+    9: 3,
+    10: 5,
+    11: 2,
+}
 
 
 def _decode_remaining_length(payload: bytes, idx: int) -> tuple[int | None, int]:
+    start = idx
     multiplier = 1
     value = 0
     while True:
@@ -52,6 +81,8 @@ def _decode_remaining_length(payload: bytes, idx: int) -> tuple[int | None, int]
         idx += 1
         value += (digit & 0x7F) * multiplier
         if (digit & 0x80) == 0:
+            if idx - start > 1 and value < 128 ** (idx - start - 1):
+                return None, idx
             break
         multiplier *= 128
         if multiplier > 128 * 128 * 128:
@@ -68,8 +99,17 @@ def _parse_mqtt_packets(payload: bytes) -> list[dict[str, object]]:
         header = payload[idx]
         msg_type = header >> 4
         flags = header & 0x0F
+        if not 1 <= msg_type <= 15:
+            break
+        if msg_type == 3:
+            if (flags >> 1) & 0x03 == 3:
+                break
+        elif flags != _FIXED_FLAGS[msg_type]:
+            break
         remaining_len, next_idx = _decode_remaining_length(payload, idx + 1)
         if remaining_len is None:
+            break
+        if remaining_len < _MIN_REMAINING_LENGTH.get(msg_type, 0):
             break
         msg_start = next_idx
         msg_end = msg_start + remaining_len
@@ -99,16 +139,16 @@ def _parse_mqtt_packets(payload: bytes) -> list[dict[str, object]]:
                         entry["client_id"] = client_id
         elif msg_type == 3 and len(data) >= 2:
             tlen = int.from_bytes(data[0:2], "big")
-            topic = (
-                data[2 : 2 + tlen].decode("utf-8", errors="ignore")
-                if 2 + tlen <= len(data)
-                else ""
-            )
+            if 2 + tlen > len(data):
+                break
+            topic = data[2 : 2 + tlen].decode("utf-8", errors="ignore")
             if topic:
                 entry["topics"] = [topic]
             qos = (flags >> 1) & 0x03
             pos = 2 + tlen
             if qos:
+                if pos + 2 > len(data):
+                    break
                 pos += 2
             entry["payload"] = data[pos:]
         elif msg_type in {8, 10} and len(data) >= 4:
@@ -194,7 +234,10 @@ def _detect_anomalies(
     # and buries the notable findings (retained publishes, subscription changes,
     # public-IP exposure — kept below). The CONNECT/PUBLISH volume is already in
     # the command counters and command_events; not flagged per-message.
-    if any(cmd.startswith("PUBLISH") and "retain" in cmd for cmd in commands):
+    if any(
+        entry.get("type") == 3 and int(entry.get("flags", 0)) & 0x01
+        for entry in parsed
+    ):
         anomalies.append(
             IndustrialAnomaly(
                 severity="MEDIUM",
@@ -208,7 +251,8 @@ def _detect_anomalies(
     for entry in parsed:
         topics = entry.get("topics") or []
         for topic in topics:
-            if any(marker in topic.lower() for marker in MQTT_CONTROL_KEYWORDS):
+            topic_parts = topic.lower().strip("/").split("/")
+            if any(part in MQTT_CONTROL_KEYWORDS for part in topic_parts):
                 anomalies.append(
                     IndustrialAnomaly(
                         severity="MEDIUM",

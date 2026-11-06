@@ -8,57 +8,20 @@ from .industrial_helpers import (
     IndustrialAnomaly,
     analyze_port_protocol,
 )
+from .df1 import _extract_df1_frames, _parse_df1_frame
 from .utils import memoize_analysis
 
-PCCC_PORTS = {2222, 44818}
-
-PCCC_COMMANDS = {
-    0x0A: "Unprotected Logical Read",
-    0x0B: "Unprotected Logical Write",
-    0x0C: "Typed Logical Read",
-    0x0D: "Typed Logical Write",
-    0x0E: "Protected Typed Logical Read",
-    0x0F: "Protected Typed Logical Write",
-}
-
-PCCC_WRITE_CMDS = {0x0B, 0x0D, 0x0F}
-
-
-def _extract_pccc_frames(payload: bytes) -> list[bytes]:
-    frames: list[bytes] = []
-    idx = 0
-    while idx + 1 < len(payload):
-        if payload[idx] == 0x10 and payload[idx + 1] == 0x02:
-            idx += 2
-            data = bytearray()
-            while idx + 1 < len(payload):
-                if payload[idx] == 0x10:
-                    if payload[idx + 1] == 0x10:
-                        data.append(0x10)
-                        idx += 2
-                        continue
-                    if payload[idx + 1] == 0x03:
-                        idx += 2
-                        break
-                data.append(payload[idx])
-                idx += 1
-            if data:
-                frames.append(bytes(data))
-            continue
-        idx += 1
-    return frames
+def _match_signature(payload: bytes) -> bool:
+    return any(_parse_df1_frame(frame) is not None for frame in _extract_df1_frames(payload))
 
 
 def _parse_commands(payload: bytes) -> list[str]:
     commands: list[str] = []
-    for frame in _extract_pccc_frames(payload):
-        if len(frame) < 4:
-            continue
-        cmd = frame[2]
-        name = PCCC_COMMANDS.get(cmd, f"Command 0x{cmd:02x}")
-        commands.append(f"PCCC {name}")
-    if not commands and payload:
-        commands.append("PCCC Frame")
+    for frame in _extract_df1_frames(payload):
+        parsed = _parse_df1_frame(frame)
+        if parsed is not None:
+            command, _is_write = parsed
+            commands.append(command.replace("DF1 ", "PCCC ", 1))
     return commands
 
 
@@ -77,11 +40,12 @@ def _detect_anomalies(
                 ts=ts,
             )
         )
-    for frame in _extract_pccc_frames(payload):
-        if len(frame) < 4:
+    for frame in _extract_df1_frames(payload):
+        parsed = _parse_df1_frame(frame)
+        if parsed is None:
             continue
-        cmd = frame[2]
-        if cmd in PCCC_WRITE_CMDS and len(frame) > 256:
+        _command, is_write = parsed
+        if is_write and len(frame) > 256:
             anomalies.append(
                 IndustrialAnomaly(
                     severity="HIGH",
@@ -101,8 +65,7 @@ def analyze_pccc(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,
         protocol_name="PCCC",
-        tcp_ports=PCCC_PORTS,
-        udp_ports=PCCC_PORTS,
+        signature_matcher=_match_signature,
         command_parser=_parse_commands,
         anomaly_detector=_detect_anomalies,
         enable_enrichment=True,

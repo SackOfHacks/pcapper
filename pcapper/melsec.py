@@ -64,35 +64,38 @@ def _format_cmd(cmd: int, subcmd: int | None = None) -> str:
 def _parse_commands(payload: bytes) -> list[str]:
     if not payload:
         return []
-    if payload.startswith(b"5000") or payload.startswith(b"5001"):
-        if len(payload) >= 30:
-            try:
-                cmd_hex = payload[22:26].decode("ascii", errors="ignore")
-                sub_hex = (
-                    payload[26:30].decode("ascii", errors="ignore")
-                    if len(payload) >= 30
-                    else ""
-                )
-                if all(ch in "0123456789ABCDEFabcdef" for ch in cmd_hex):
-                    cmd = int(cmd_hex, 16)
-                    subcmd = (
-                        int(sub_hex, 16)
-                        if sub_hex
-                        and all(ch in "0123456789ABCDEFabcdef" for ch in sub_hex)
-                        else None
-                    )
-                    return [f"MC ASCII {_format_cmd(cmd, subcmd)}"]
-            except Exception:
-                pass
-        return ["MC ASCII"]
+    if payload.startswith(b"5000"):
+        if len(payload) < 30:
+            return ["MC ASCII (truncated)"]
+        length_field = payload[14:18]
+        cmd_hex = payload[22:26]
+        sub_hex = payload[26:30]
+        if not all(
+            byte in b"0123456789ABCDEFabcdef"
+            for byte in length_field + cmd_hex + sub_hex
+        ):
+            return ["MC ASCII (malformed)"]
+        expected_length = 18 + int(length_field, 16)
+        if expected_length > len(payload):
+            return ["MC ASCII (truncated)"]
+        cmd = int(cmd_hex, 16)
+        subcmd = int(sub_hex, 16)
+        return [f"MC ASCII {_format_cmd(cmd, subcmd)}"]
+    if payload.startswith(b"D000"):
+        return []
     if len(payload) >= 2 and payload[0] == 0x50 and payload[1] == 0x00:
-        if len(payload) >= 13:
-            cmd = int.from_bytes(payload[11:13], "little")
-            subcmd = (
-                int.from_bytes(payload[13:15], "little") if len(payload) >= 15 else None
-            )
-            return [f"MC Binary {_format_cmd(cmd, subcmd)}"]
-        return ["MC Binary"]
+        if len(payload) < 15:
+            return ["MC Binary (truncated)"]
+        data_length = int.from_bytes(payload[7:9], "little")
+        if data_length < 6:
+            return ["MC Binary (malformed)"]
+        if 9 + data_length > len(payload):
+            return ["MC Binary (truncated)"]
+        cmd = int.from_bytes(payload[11:13], "little")
+        subcmd = int.from_bytes(payload[13:15], "little")
+        return [f"MC Binary {_format_cmd(cmd, subcmd)}"]
+    if len(payload) >= 2 and payload[0] == 0xD0 and payload[1] == 0x00:
+        return []
     return []
 
 

@@ -11,6 +11,7 @@ from .industrial_helpers import (
 from .utils import memoize_analysis
 
 PRCONOS_PORT = 20547
+_PROCONOS_CPU_MODE_SERVICE = 0x400E
 
 # ProConOS / ProConOS eCLR is the IEC 61131 runtime on Phoenix Contact (and many
 # OEM) PLCs. Messages start with marker byte 0xcc. The Redpoint proconos-info
@@ -27,6 +28,16 @@ def _parse_commands(payload: bytes) -> list[str]:
     svc = int.from_bytes(payload[4:6], "big")
     if svc == 0x4002:
         label = "Read Project/Program Info"
+    elif svc == 0x4007:
+        label = "Read CPU State"
+    elif svc == _PROCONOS_CPU_MODE_SERVICE:
+        length = int.from_bytes(payload[2:4], "big")
+        if length == 4:
+            label = "Start CPU"
+        elif length == 1:
+            label = "Stop CPU"
+        else:
+            label = "CPU Mode Change"
     else:
         label = f"Service 0x{svc:04x}"
     return [f"{direction}: {label}"]
@@ -51,6 +62,26 @@ def _detect_anomalies(
                 dst=dst_ip,
                 ts=ts,
                 attack="T0845 Program Upload; T0888 Remote System Information Discovery",
+                evidence=[c for c in commands if c],
+            )
+        )
+    if any(
+        command.startswith("Request: ")
+        and any(action in command for action in ("Start CPU", "Stop CPU", "CPU Mode Change"))
+        for command in commands
+    ):
+        anomalies.append(
+            IndustrialAnomaly(
+                severity="HIGH",
+                title="ProConOS CPU Mode Change",
+                description=(
+                    "ProConOS request to start or stop the PLC CPU observed. "
+                    "Confirm the change was authorized."
+                ),
+                src=src_ip,
+                dst=dst_ip,
+                ts=ts,
+                attack="T0858 Change Operating Mode",
                 evidence=[c for c in commands if c],
             )
         )

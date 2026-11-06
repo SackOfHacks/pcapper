@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .utils import is_public_ip as _is_public_ip, packet_length
+import ipaddress
 import os
 import re
 from collections import Counter, defaultdict
@@ -570,23 +571,45 @@ def _parse_ftp_response(line: str) -> Optional[tuple[str, str, str]]:
 
 
 def _parse_port_command(arg: str) -> Optional[tuple[str, int]]:
-    parts = [p.strip() for p in arg.split(",") if p.strip()]
+    parts = [p.strip() for p in arg.split(",")]
     if len(parts) != 6:
         return None
     try:
-        host = ".".join(parts[:4])
-        port = (int(parts[4]) * 256) + int(parts[5])
+        values = [int(part, 10) for part in parts]
+        if any(not 0 <= value <= 255 for value in values):
+            return None
+        host = str(ipaddress.IPv4Address(bytes(values[:4])))
+        port = (values[4] * 256) + values[5]
+        if port == 0:
+            return None
         return host, port
     except Exception:
         return None
 
 
 def _parse_eprt_command(arg: str) -> Optional[tuple[str, int]]:
-    match = re.match(r"^\|(?P<af>\d)\|(?P<addr>[^|]+)\|(?P<port>\d+)\|", arg)
-    if not match:
+    if not arg:
         return None
     try:
-        return match.group("addr"), int(match.group("port"))
+        delimiter = arg[0]
+        if (
+            not 33 <= ord(delimiter) <= 126
+            or delimiter.isdigit()
+            or delimiter in "+-"
+        ):
+            return None
+        parts = arg.split(delimiter)
+        if len(parts) != 5 or parts[0] or parts[-1]:
+            return None
+        address_family, address_text, port_text = parts[1:4]
+        if address_family not in {"1", "2"}:
+            return None
+        address = ipaddress.ip_address(address_text)
+        port = int(port_text, 10)
+        expected_version = 4 if address_family == "1" else 6
+        if address.version != expected_version or not 1 <= port <= 65535:
+            return None
+        return str(address), port
     except Exception:
         return None
 
@@ -714,6 +737,8 @@ def analyze_ftp(
     tcp_flow_bytes: dict[tuple[str, str, int, int], int] = Counter()
     tcp_flow_first: dict[tuple[str, str, int, int], float] = {}
     tcp_flow_last: dict[tuple[str, str, int, int], float] = {}
+    flow_state_limit_reported = False
+    flow_tracking_limit_reported = False
 
     def _register_flow_state(key: tuple[str, str, int, int]) -> _FlowState:
         if key in flow_states:
@@ -1077,11 +1102,6 @@ def analyze_ftp(
                 continue
 
             flow_key = (src_ip, dst_ip, sport, dport)
-            tcp_flow_bytes[flow_key] += pkt_len
-            if ts is not None:
-                if flow_key not in tcp_flow_first:
-                    tcp_flow_first[flow_key] = ts
-                tcp_flow_last[flow_key] = ts
 
             ip_layer = pkt.getlayer(IP) if IP is not None else None
             if ip_layer is None and IPv6 is not None:
@@ -1089,6 +1109,18 @@ def analyze_ftp(
             payload = _tcp_payload_bytes(ip_layer, tcp)
             if not payload:
                 continue
+            if flow_key in tcp_flow_bytes or len(tcp_flow_bytes) < MAX_FTP_UNIQUE:
+                tcp_flow_bytes[flow_key] += len(payload)
+                if ts is not None:
+                    if flow_key not in tcp_flow_first:
+                        tcp_flow_first[flow_key] = ts
+                    tcp_flow_last[flow_key] = ts
+            elif not flow_tracking_limit_reported:
+                errors.append(
+                    "FTP data-flow tracking limit reached; additional flows "
+                    "are excluded from transfer accounting."
+                )
+                flow_tracking_limit_reported = True
 
             text = decode_payload(payload, encoding="latin-1")
             if not text:
@@ -1116,6 +1148,14 @@ def analyze_ftp(
                     continue
 
                 key = _infer_flow_key(src_ip, dst_ip, sport, dport, is_response)
+                if key not in flow_states and len(flow_states) >= MAX_FTP_UNIQUE:
+                    if not flow_state_limit_reported:
+                        errors.append(
+                            "FTP control-flow state limit reached; additional "
+                            "sessions are not decoded."
+                        )
+                        flow_state_limit_reported = True
+                    continue
                 state = _register_flow_state(key)
 
                 if not state.confirmed:

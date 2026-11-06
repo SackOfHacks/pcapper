@@ -102,6 +102,28 @@ class TestEncryptedDns:
         assert summary.clients == {client: 2}
         assert summary.servers == {resolver: 2}
 
+    def test_dot_and_doq_require_protocol_records_not_port_scans(self, tmp_path) -> None:
+        from pcapper.encrypted_dns import analyze_encrypted_dns
+
+        client, resolver = "192.168.10.50", "1.1.1.1"
+        pcap = _write(
+            tmp_path,
+            "encrypted_dns_scan.pcap",
+            [
+                _tcp(client, resolver, 51000, 853, b"not TLS"),
+                _tcp(client, resolver, 51001, 853, b"", flags="S"),
+                _udp(client, resolver, 51002, 853, b"\x00" * 40),
+                _udp(client, resolver, 51003, 853, _QUIC_INITIAL),
+            ],
+        )
+
+        summary = analyze_encrypted_dns(pcap, show_status=False)
+
+        assert summary.dot_packets == 0
+        assert summary.doq_packets == 1
+        assert summary.clients == {client: 1}
+        assert summary.servers == {resolver: 1}
+
     def test_doh_is_recognised_from_the_request_line_only(self) -> None:
         """``b"/resolve" in payload`` matched /resolver, /resolve-ticket and
         any body mentioning the word."""

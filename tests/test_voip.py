@@ -33,6 +33,7 @@ from pcapper.voip import (
 )
 from pcapper.voip_media import (
     ALAW_TABLE,
+    RtpState,
     ULAW_TABLE,
     decode_dtmf_event,
     decode_g711,
@@ -42,6 +43,7 @@ from pcapper.voip_media import (
     parse_rtcp,
     parse_rtp,
     parse_stun,
+    update_rtp_state,
 )
 from pcapper.voip_signaling import (
     classify_provisioning,
@@ -218,6 +220,24 @@ class TestRtp:
         assert parsed is not None
         assert parsed["csrc_count"] == 1
         assert len(parsed["payload"]) == 20
+
+    def test_sequence_history_is_compact_and_resets_on_wrap(self) -> None:
+        state = RtpState("10.0.0.1", 40000, "10.0.0.2", 40002, 1, 0)
+        first = {
+            "sequence": 65535,
+            "timestamp": 0,
+            "payload_type": 0,
+            "payload": b"",
+            "marker": False,
+        }
+        wrapped = {**first, "sequence": 0}
+        update_rtp_state(state, first, 0.0, 12)
+        update_rtp_state(state, first, 0.02, 12)
+        update_rtp_state(state, wrapped, 0.04, 12)
+
+        assert len(state.seen_seqs) == 8192
+        assert state.duplicates == 1
+        assert state.cycles == 1
 
 
 class TestDtmf:
@@ -482,6 +502,54 @@ class TestSipCallCapture:
                 # 30 G.711 packets x 160 samples; the telephone-event packets
                 # must not be decoded as audio.
                 assert handle.getnframes() == 4800
+
+    def test_audio_budget_applies_across_all_streams(
+        self, pcap, tmp_path: Path, monkeypatch
+    ) -> None:
+        import pcapper.voip as voip_module
+
+        monkeypatch.setattr(voip_module, "MAX_AUDIO_BYTES", 64)
+        summary = analyze_voip(
+            pcap("voip.pcap"),
+            show_status=False,
+            output_dir=tmp_path / "voip-limited",
+        )
+
+        total_audio_bytes = 0
+        for audio_path in summary.extracted_audio:
+            with wave.open(audio_path) as handle:
+                total_audio_bytes += handle.getnframes() * handle.getsampwidth()
+        assert total_audio_bytes <= 64
+        assert any("Audio extraction capped" in note for note in summary.analysis_notes)
+
+    def test_sip_info_dtmf_streams_are_bounded(self, tmp_path: Path, monkeypatch) -> None:
+        from scapy.all import Ether, IP, Raw, UDP, wrpcap
+        import pcapper.voip as voip_module
+
+        body = b"Signal=1\r\nDuration=160\r\n"
+
+        def packet(port: int, call_id: str):
+            message = (
+                f"INFO sip:1001@pbx SIP/2.0\r\nCall-ID: {call_id}\r\n"
+                "From: <sip:1000@phone>\r\nTo: <sip:1001@pbx>\r\n"
+                "CSeq: 1 INFO\r\nContent-Type: application/dtmf-relay\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n"
+            ).encode() + body
+            return (
+                Ether()
+                / IP(src="10.0.0.1", dst="10.0.0.2")
+                / UDP(sport=port, dport=5060)
+                / Raw(load=message)
+            )
+
+        capture = tmp_path / "sip_info.pcap"
+        wrpcap(str(capture), [packet(40000, "call-a"), packet(40001, "call-b")])
+        monkeypatch.setattr(voip_module, "MAX_DTMF_STREAMS", 1)
+
+        summary = analyze_voip(capture, show_status=False)
+
+        assert len(summary.dtmf) == 1
+        assert any("DTMF stream tracking capped" in note for note in summary.analysis_notes)
 
     def test_no_audio_written_without_an_output_dir(self, pcap) -> None:
         summary = analyze_voip(pcap("voip.pcap"), show_status=False)

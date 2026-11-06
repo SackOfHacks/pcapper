@@ -9,6 +9,7 @@ from typing import Optional
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_ascii_strings as _extract_ascii_strings
 from .utils import (
+    env_int,
     extract_packet_endpoints,
     memoize_analysis,
     packet_length,
@@ -31,6 +32,10 @@ except Exception:  # pragma: no cover
 
 
 VNC_PORTS = {5900, 5901, 5902, 5903, 5904, 5905, 5906, 5907, 5908, 5909, 5800}
+MAX_VNC_SESSIONS = env_int("PCAPPER_MAX_VNC_SESSIONS", 50000, minimum=1)
+MAX_VNC_UNIQUE_VALUES = env_int("PCAPPER_MAX_VNC_UNIQUE_VALUES", 2000, minimum=1)
+MAX_VNC_ARTIFACTS = env_int("PCAPPER_MAX_VNC_ARTIFACTS", 2000, minimum=1)
+MAX_VNC_MACS_PER_IP = env_int("PCAPPER_MAX_VNC_MACS_PER_IP", 32, minimum=1)
 # A VNC port on the *source* side is the service only when the destination is
 # an ephemeral port; a flow from ephemeral 5900 to 443 is not VNC.
 _EPHEMERAL_MIN = 1024
@@ -55,7 +60,7 @@ VNC_SECURITY_TYPES = {
 
 def _parse_rfb_version(payload: bytes) -> Optional[tuple[int, int]]:
     """Parse an 'RFB 003.008\\n' ProtocolVersion (exactly 12 bytes)."""
-    if len(payload) < 12 or not payload.startswith(b"RFB "):
+    if len(payload) < 12 or not payload.startswith(b"RFB ") or payload[11] != 0x0A:
         return None
     try:
         major = int(payload[4:7])
@@ -75,7 +80,7 @@ def _parse_rfb_security_types(payload: bytes, version: tuple[int, int]) -> list[
             return [int.from_bytes(payload[:4], "big")]
         return []
     count = payload[0]
-    if count == 0 or count > 13 or len(payload) < 1 + count:
+    if count == 0 or len(payload) < 1 + count:
         return []
     return list(payload[1 : 1 + count])
 
@@ -224,6 +229,7 @@ class _SessionState:
     rfb_version: tuple[int, int] = (0, 0)
     rfb_stage: int = 0  # 0=init, 1=server-version, 2=client-version, 3=sec-types parsed
     vnc_security: str = ""
+    offered_security_types: tuple[int, ...] = ()
 
 
 def _scan_plaintext(
@@ -233,8 +239,12 @@ def _scan_plaintext(
     file_counter: Counter[str],
     artifacts: list[str],
     auth_types: Counter[str],
-    max_unique: int = 2000,
+    max_unique: int = MAX_VNC_UNIQUE_VALUES,
 ) -> None:
+    def _increment_limited(counter: Counter[str], key: str) -> None:
+        if key in counter or len(counter) < max_unique:
+            counter[key] += 1
+
     for item in _extract_ascii_strings(payload):
         if not item:
             continue
@@ -242,13 +252,13 @@ def _scan_plaintext(
             plaintext_counter[item] += 1
         for pattern, reason in SUSPICIOUS_PLAINTEXT:
             if pattern.search(item):
-                suspicious_counter[f"{reason}: {item}"] += 1
+                _increment_limited(suspicious_counter, f"{reason}: {item}")
         for match in FILE_NAME_RE.findall(item):
-            file_counter[match] += 1
+            _increment_limited(file_counter, match)
         # NOTE: VNC security types are parsed from the binary RFB handshake (see
         # the analyze loop), NOT matched as text here — matching "None"/"Tight"
         # in framebuffer/clipboard text caused constant false "no auth" alerts.
-        if "RFB" in item:
+        if "RFB" in item and len(artifacts) < MAX_VNC_ARTIFACTS:
             artifacts.append(item)
 
 
@@ -363,6 +373,7 @@ def analyze_vnc(
     short_session_by_client: Counter[str] = Counter()
     short_session_targets: dict[str, set[str]] = defaultdict(set)
     pair_first_seen: dict[tuple[str, str], list[float]] = defaultdict(list)
+    session_cap_reached = False
 
     try:
         for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
@@ -415,21 +426,17 @@ def analyze_vnc(
                 src_ip, dst_ip, sport, dport
             )
 
-            server_ports[server_port] += 1
-            client_counts[client_ip] += 1
-            server_counts[server_ip] += 1
-            if eth_src and src_ip:
-                ip_to_macs[src_ip].add(eth_src.lower())
-            if eth_dst and dst_ip:
-                ip_to_macs[dst_ip].add(eth_dst.lower())
-            if eth_src and src_ip == client_ip:
-                client_macs[eth_src.lower()] += 1
-            if eth_dst and dst_ip == server_ip:
-                server_macs[eth_dst.lower()] += 1
-
             session_key = (client_ip, client_port, server_ip, server_port)
             session = sessions.get(session_key)
             if session is None:
+                if len(sessions) >= MAX_VNC_SESSIONS:
+                    if not session_cap_reached:
+                        errors.append(
+                            f"VNC session tracking capped at {MAX_VNC_SESSIONS}; "
+                            "additional session details were omitted."
+                        )
+                        session_cap_reached = True
+                    continue
                 session = _SessionState(
                     client_ip=client_ip,
                     server_ip=server_ip,
@@ -441,6 +448,27 @@ def analyze_vnc(
                     last_seen=ts,
                 )
                 sessions[session_key] = session
+
+            server_ports[server_port] += 1
+            client_counts[client_ip] += 1
+            server_counts[server_ip] += 1
+            if eth_src and src_ip:
+                if (
+                    len(ip_to_macs[src_ip]) < MAX_VNC_MACS_PER_IP
+                    or eth_src.lower() in ip_to_macs[src_ip]
+                ):
+                    ip_to_macs[src_ip].add(eth_src.lower())
+            if eth_dst and dst_ip:
+                if (
+                    len(ip_to_macs[dst_ip]) < MAX_VNC_MACS_PER_IP
+                    or eth_dst.lower() in ip_to_macs[dst_ip]
+                ):
+                    ip_to_macs[dst_ip].add(eth_dst.lower())
+            if eth_src and src_ip == client_ip:
+                client_macs[eth_src.lower()] += 1
+            if eth_dst and dst_ip == server_ip:
+                server_macs[eth_dst.lower()] += 1
+
             if session.client_mac is None and eth_src and src_ip == client_ip:
                 session.client_mac = eth_src.lower()
             if session.server_mac is None and eth_dst and dst_ip == server_ip:
@@ -487,10 +515,26 @@ def analyze_vnc(
                 sec_types = _parse_rfb_security_types(payload, session.rfb_version)
                 if sec_types:
                     session.rfb_stage = 3
-                    for st in sec_types:
-                        name = VNC_SECURITY_TYPES.get(st, f"Security Type {st}")
+                    if session.rfb_version <= (3, 3):
+                        selected_type = sec_types[0]
+                        name = VNC_SECURITY_TYPES.get(
+                            selected_type, f"Security Type {selected_type}"
+                        )
                         session.vnc_security = name
                         auth_types[name] += 1
+                    else:
+                        session.offered_security_types = tuple(sec_types)
+            elif not from_server and session.rfb_stage == 3 and not session.vnc_security:
+                # RFB 3.7+ clients select exactly one of the server's offered
+                # types. An offered "None" type is not proof that it was used.
+                if payload and payload[0] in session.offered_security_types:
+                    selected_type = payload[0]
+                    name = VNC_SECURITY_TYPES.get(
+                        selected_type, f"Security Type {selected_type}"
+                    )
+                    session.vnc_security = name
+                    auth_types[name] += 1
+                    session.rfb_stage = 4
 
             if text:
                 banner = VNC_BANNER_RE.search(text)
@@ -498,10 +542,12 @@ def analyze_vnc(
                     value = banner.group(1)
                     if src_ip == client_ip:
                         session.client_banner = session.client_banner or value
-                        client_banners[value] += 1
+                        if value in client_banners or len(client_banners) < MAX_VNC_UNIQUE_VALUES:
+                            client_banners[value] += 1
                     else:
                         session.server_banner = session.server_banner or value
-                        server_banners[value] += 1
+                        if value in server_banners or len(server_banners) < MAX_VNC_UNIQUE_VALUES:
+                            server_banners[value] += 1
                 _scan_plaintext(
                     payload,
                     plaintext_strings,

@@ -3,9 +3,12 @@ from __future__ import annotations
 import base64
 import copy
 import functools
+import inspect
 import ipaddress
 import math
 import os
+import re
+import stat
 from collections import Counter, OrderedDict
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -71,6 +74,92 @@ _DECODE_CACHE_MAX_BYTES = 4096
 _MAX_COUNTER_KEYS = env_int("PCAPPER_MAX_COUNTER_KEYS", 50000, minimum=1)
 _MAX_SET_ITEMS = env_int("PCAPPER_MAX_SET_ITEMS", 50000, minimum=1)
 _MAX_SET_VALUES = env_int("PCAPPER_MAX_SET_VALUES", 2000, minimum=1)
+_REDACT_OUTPUT = os.environ.get("PCAPPER_REDACT", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
+
+def set_output_redaction(enabled: bool) -> None:
+    """Toggle display/export redaction for the current process."""
+    global _REDACT_OUTPUT
+    _REDACT_OUTPUT = bool(enabled)
+
+
+def output_redaction_enabled() -> bool:
+    return _REDACT_OUTPUT
+
+
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?i)\b(password|passwd|pass|pwd|secret|token|api[_-]?key|apikey|session(?:id)?|authorization)\b"
+        r"(\s*[:=]\s*)([^\s,;&]{3,})"
+    ),
+    re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]{8,}\.[A-Za-z0-9._-]{8,}\b"),
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        re.DOTALL,
+    ),
+)
+
+
+def redact_sensitive_text(value: object) -> str:
+    """Best-effort redaction for terminal/export modes that should hide secrets."""
+    text = str(value or "")
+    if not text:
+        return text
+
+    def _kv_repl(match: re.Match[str]) -> str:
+        return f"{match.group(1)}{match.group(2)}[REDACTED]"
+
+    text = _SECRET_PATTERNS[0].sub(_kv_repl, text)
+    text = _SECRET_PATTERNS[1].sub(lambda m: f"{m.group(1)} [REDACTED]", text)
+    text = _SECRET_PATTERNS[2].sub("[REDACTED_JWT]", text)
+    text = _SECRET_PATTERNS[3].sub("[REDACTED_PRIVATE_KEY]", text)
+    return text
+
+
+def display_safe(value: object, *, preserve_newlines: bool = True) -> str:
+    """Escape terminal control bytes from capture-derived text.
+
+    This is display safety, not forensic redaction: exports and hashes can still
+    preserve original bytes, but terminal output must not honor ESC/OSC/control
+    sequences supplied by a packet or filename.
+    """
+    text = str(value or "")
+    if not text:
+        return text
+    out: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        if ch == "\n" and preserve_newlines:
+            out.append(ch)
+        elif ch == "\t":
+            out.append(ch)
+        elif code < 32 or 0x7F <= code < 0xA0:
+            out.append(f"\\x{code:02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def egress_mode() -> str:
+    raw = os.environ.get("PCAPPER_NETWORK", "enrichment").strip().lower()
+    if raw in {"off", "none", "disabled"}:
+        return "off"
+    if raw in {"offline", "local"}:
+        return "offline"
+    return "enrichment"
+
+
+def network_egress_allowed() -> bool:
+    return egress_mode() == "enrichment"
+
+
+def allow_plaintext_egress() -> bool:
+    return os.environ.get("PCAPPER_ALLOW_PLAINTEXT_EGRESS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def decode_payload(
@@ -146,7 +235,16 @@ def restrict_permissions(path: Path) -> None:
     failing to tighten permissions must never abort an analysis run.
     """
     try:
-        path.chmod(0o700 if path.is_dir() else 0o600)
+        st = path.lstat()
+        if stat.S_ISLNK(st.st_mode):
+            return
+        mode = 0o700 if stat.S_ISDIR(st.st_mode) else 0o600
+        if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+            return
+        try:
+            os.chmod(path, mode, follow_symlinks=False)
+        except TypeError:  # pragma: no cover - older/platform-specific Python
+            path.chmod(mode)
     except Exception:
         pass
 
@@ -185,14 +283,39 @@ def open_private(
     """
     if mode not in {"w", "wb", "a", "ab"}:
         raise ValueError(f"open_private: unsupported mode {mode!r}")
+    path = Path(path)
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        if stat.S_ISLNK(existing.st_mode):
+            raise OSError(f"refusing to write through symlink: {path}")
+        if not stat.S_ISREG(existing.st_mode):
+            raise OSError(f"refusing to write non-regular file: {path}")
+        if getattr(existing, "st_nlink", 1) > 1:
+            raise OSError(f"refusing to write hard-linked file: {path}")
+
     flags = os.O_WRONLY | os.O_CREAT
     flags |= os.O_APPEND if mode.startswith("a") else os.O_TRUNC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     if "b" in mode:
         flags |= getattr(os, "O_BINARY", 0)
         encoding = None
         errors = None
         newline = None
     fd = os.open(str(path), flags, 0o600)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(f"refusing to write non-regular file: {path}")
+        try:
+            os.fchmod(fd, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        os.close(fd)
+        raise
     try:
         handle = os.fdopen(fd, mode, encoding=encoding, errors=errors, newline=newline)
     except Exception:
@@ -223,6 +346,53 @@ def safe_write_bytes(path: Path, data: bytes) -> None:
     """Write a recovered artifact owner-only; errors propagate to the caller."""
     with open_private(path, "wb") as handle:
         handle.write(data)
+
+
+def output_path_warnings(path: Path) -> list[str]:
+    """Security notes for output locations that may leak names or allow races."""
+    warnings: list[str] = []
+    try:
+        path_obj = Path(path)
+        check = path_obj if path_obj.exists() else path_obj.parent
+        st = check.stat()
+        mode = stat.S_IMODE(st.st_mode)
+        if stat.S_ISDIR(st.st_mode) and mode & 0o077:
+            warnings.append(
+                f"Output directory is shared ({check}, mode {mode:04o}); "
+                "file contents are owner-only, but names and creation times may be visible."
+            )
+        parent = check.parent
+        if parent and parent.exists():
+            pstat = parent.stat()
+            pmode = stat.S_IMODE(pstat.st_mode)
+            if stat.S_ISDIR(pstat.st_mode) and pmode & 0o002 and not pmode & 0o1000:
+                warnings.append(
+                    f"Parent directory is world-writable without sticky bit ({parent}, mode {pmode:04o})."
+                )
+    except Exception:
+        pass
+    return warnings
+
+
+def executable_path_warnings(path: Path) -> list[str]:
+    warnings: list[str] = []
+    try:
+        p = Path(path)
+        if not p.is_absolute():
+            warnings.append(f"Executable path is not absolute: {p}")
+        for candidate in (p, p.parent):
+            try:
+                st = candidate.stat()
+            except Exception:
+                continue
+            mode = stat.S_IMODE(st.st_mode)
+            if mode & 0o022:
+                warnings.append(
+                    f"Executable trust boundary is writable by group/others: {candidate} mode {mode:04o}"
+                )
+    except Exception:
+        pass
+    return warnings
 
 
 def counter_inc(
@@ -567,6 +737,35 @@ def clear_analysis_memo() -> None:
     _ANALYSIS_MEMO.clear()
 
 
+@lru_cache(maxsize=512)
+def _call_accepts_kwarg(func: object, name: str) -> bool:
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params
+
+
+def call_with_packet_view(
+    func,
+    path: Path,
+    *args,
+    packets: list[object] | None = None,
+    meta: object | None = None,
+    **kwargs,
+):
+    """Invoke an analyzer with shared packet context when it supports it."""
+    if (
+        packets is not None
+        and "packets" not in kwargs
+        and _call_accepts_kwarg(func, "packets")
+    ):
+        kwargs["packets"] = packets
+    if meta is not None and "meta" not in kwargs and _call_accepts_kwarg(func, "meta"):
+        kwargs["meta"] = meta
+    return func(path, *args, **kwargs)
+
+
 def memoize_analysis(func):
     """Memoize an analyze_* function per capture state and arguments.
 
@@ -598,8 +797,13 @@ def memoize_analysis(func):
             return func(path, *args, **kwargs)
         copy_results = os.environ.get("PCAPPER_ANALYSIS_MEMO_COPY", "0") == "1"
         try:
-            st = Path(path).stat()
-            file_key = (str(path), st.st_size, st.st_mtime_ns)
+            path_obj = Path(path).expanduser()
+            try:
+                key_path = path_obj.resolve()
+            except Exception:
+                key_path = path_obj.absolute()
+            st = key_path.stat()
+            file_key = (str(key_path), st.st_size, st.st_mtime_ns)
         except Exception:
             return func(path, *args, **kwargs)
 
@@ -688,35 +892,40 @@ def hexdump(data: bytes, width: int = 16) -> str:
     return "\n".join(lines)
 
 
-def to_serializable(value: Any) -> Any:
+def to_serializable(value: Any, *, redact: bool = False) -> Any:
     if value is None:
         return None
-    if isinstance(value, (str, int, float, bool)):
+    if isinstance(value, str):
+        return redact_sensitive_text(value) if redact else value
+    if isinstance(value, (int, float, bool)):
         return value
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, bytes):
+        if redact:
+            return {"_bytes_redacted": len(value)}
         return {"_bytes_b64": base64.b64encode(value).decode("ascii")}
     if isinstance(value, dict):
-        return {str(k): to_serializable(v) for k, v in value.items()}
+        return {str(k): to_serializable(v, redact=redact) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
-        return [to_serializable(item) for item in value]
+        return [to_serializable(item, redact=redact) for item in value]
     if hasattr(value, "to_dict") and callable(getattr(value, "to_dict")):
         try:
-            return to_serializable(value.to_dict())
+            return to_serializable(value.to_dict(), redact=redact)
         except Exception:
             pass
     if is_dataclass(value):
         try:
-            return to_serializable(asdict(value))
+            return to_serializable(asdict(value), redact=redact)
         except Exception:
             pass
     if hasattr(value, "__dict__"):
         try:
-            return to_serializable(vars(value))
+            return to_serializable(vars(value), redact=redact)
         except Exception:
             pass
-    return str(value)
+    text = str(value)
+    return redact_sensitive_text(text) if redact else text
 
 
 def parse_time_arg(value: Optional[str]) -> Optional[float]:

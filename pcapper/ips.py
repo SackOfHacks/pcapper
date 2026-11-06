@@ -25,11 +25,13 @@ from .tls_fingerprints import (
 )
 from .utils import (
     counter_inc,
+    allow_plaintext_egress,
     env_int,
     ip_object,
     is_private_ip,
     is_public_ip,
     memoize_analysis,
+    network_egress_allowed,
     packet_length,
     safe_float,
     safe_read_text,
@@ -175,6 +177,13 @@ def _enrich_ips_online(
     high-value triage context (bulletproof hosting, VPN/anonymizer egress)."""
     out: dict[str, dict[str, str]] = {}
     errors: list[str] = []
+    if not network_egress_allowed():
+        return out, ["ip-api.com lookup skipped: network egress is disabled."]
+    if not allow_plaintext_egress():
+        return out, [
+            "ip-api.com lookup skipped: provider endpoint is plaintext HTTP; "
+            "set PCAPPER_ALLOW_PLAINTEXT_EGRESS=1 to allow this opt-in disclosure."
+        ]
     fields = "status,country,countryCode,regionName,city,isp,org,as,asname,hosting,proxy,mobile,query"
     unique = [ip for ip in dict.fromkeys(ips) if ip]
     for i in range(0, len(unique), 100):
@@ -980,6 +989,8 @@ def _geoip_lookup(
 def _fetch_json(
     url: str, headers: dict[str, str], timeout: float = 5.0
 ) -> Optional[dict[str, object]]:
+    if not network_egress_allowed():
+        return None
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:

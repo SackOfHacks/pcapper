@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -298,11 +299,16 @@ from .tls import analyze_tls
 from .udp import analyze_udp
 from .utils import (
     detect_file_type,
+    display_safe,
     hexdump,
     open_private,
+    output_redaction_enabled,
+    output_path_warnings,
     parse_time_arg,
+    redact_sensitive_text,
     restrict_dir_permissions,
     safe_write_text,
+    set_output_redaction,
 )
 from .vlan import analyze_vlans
 from .vnc import analyze_vnc, merge_vnc_summaries
@@ -316,6 +322,14 @@ from .yokogawa import analyze_yokogawa
 
 _PLUGIN_SPECS: list[PluginSpec] | None = None
 _PLUGIN_ERRORS: list[str] = []
+
+
+def _plugins_enabled_from_argv(argv: list[str]) -> bool:
+    if os.environ.get("PCAPPER_ENABLE_PLUGINS", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return True
+    return any(token in {"--enable-plugins", "--list-plugins"} for token in argv)
 
 
 def _load_plugins_once() -> tuple[list[PluginSpec], list[str]]:
@@ -450,7 +464,11 @@ def _builtin_flag_map() -> dict[str, str]:
     }
 
 
-def _filtered_plugins(flag_map: dict[str, str]) -> tuple[list[PluginSpec], list[str]]:
+def _filtered_plugins(
+    flag_map: dict[str, str], *, enabled: bool = False
+) -> tuple[list[PluginSpec], list[str]]:
+    if not enabled:
+        return [], []
     plugins, errors = _load_plugins_once()
     seen_flags = set(flag_map.keys())
     seen_steps = set(flag_map.values())
@@ -473,7 +491,7 @@ def _ordered_steps(
 ) -> list[str]:
     flag_map = _builtin_flag_map()
     if plugins is None:
-        plugins, _errors = _filtered_plugins(flag_map)
+        plugins = []
     for spec in plugins:
         flag_map[spec.flag] = spec.name
     ordered: list[str] = []
@@ -800,6 +818,49 @@ def _print_error(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+_OUTPUT_WARNED_PATHS: set[str] = set()
+
+
+def _warn_output_path(path: Path) -> None:
+    key = str(path)
+    if key in _OUTPUT_WARNED_PATHS:
+        return
+    for warning in output_path_warnings(path):
+        _print_error(f"Output security: {warning}")
+    _OUTPUT_WARNED_PATHS.add(key)
+
+
+def _dump_profile_private(profiler: Any, out_path: Path) -> None:
+    restrict_dir_permissions(out_path.parent)
+    _warn_output_path(out_path.parent)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{out_path.name}.", suffix=".tmp", dir=str(out_path.parent)
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        try:
+            os.chmod(tmp_path, 0o600)
+        except Exception:
+            pass
+        profiler.dump_stats(str(tmp_path))
+        try:
+            os.chmod(tmp_path, 0o600)
+        except Exception:
+            pass
+        os.replace(tmp_path, out_path)
+        try:
+            os.chmod(out_path, 0o600)
+        except Exception:
+            pass
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+
 def _run_self_check(
     plugins: list[PluginSpec],
     plugin_errors: list[str],
@@ -1117,7 +1178,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     general.add_argument(
         "--config",
         metavar="PATH",
-        help="Path to pcapper TOML config file (defaults: ./pcapper.toml, ~/.pcapper.toml, ~/.config/pcapper/config.toml).",
+        help="Path to pcapper TOML config file (default search: ~/.pcapper.toml, ~/.config/pcapper/config.toml; current directory is not auto-loaded).",
     )
     general.add_argument(
         "--self-check",
@@ -1128,6 +1189,33 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         "--list-plugins",
         action="store_true",
         help="List discovered plugins and exit.",
+    )
+    general.add_argument(
+        "--enable-plugins",
+        action="store_true",
+        help=(
+            "Enable third-party pcapper.plugins entry points. Plugin code runs in "
+            "this Python process, so it is opt-in for evidence handling."
+        ),
+    )
+    general.add_argument(
+        "--network",
+        choices=("enrichment", "offline", "off"),
+        default=None,
+        help=(
+            "Network egress policy for reputation/enrichment lookups. 'enrichment' "
+            "allows explicitly requested online lookups; 'offline'/'off' block them."
+        ),
+    )
+    general.add_argument(
+        "--redact",
+        action="store_true",
+        help="Redact recovered secrets/tokens in terminal output and exports.",
+    )
+    general.add_argument(
+        "--full-secrets",
+        action="store_true",
+        help="Force full-fidelity secret display/export even if PCAPPER_REDACT is set.",
     )
     general.add_argument(
         "--log-file",
@@ -1342,7 +1430,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         "--ip-geo",
         dest="ip_geo",
         action="store_true",
-        help="Enrich public IPs in --ips with geolocation/ASN/org (and hosting/proxy flags) via the free ip-api.com online lookup. Sends observed public IPs to a third party, so it is opt-in.",
+        help="Enrich public IPs in --ips with geolocation/ASN/org. Online ip-api.com lookup is plaintext HTTP and requires PCAPPER_ALLOW_PLAINTEXT_EGRESS=1.",
     )
     general.add_argument(
         "-view",
@@ -1928,7 +2016,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     for flag, kwargs in sorted(ics_entries, key=lambda item: item[0]):
         ics_group.add_argument(flag, **kwargs)
     if plugins is None:
-        plugins, _errors = _filtered_plugins(_builtin_flag_map())
+        plugins = []
     for spec in sorted(plugins, key=lambda item: item.flag):
         group = it_group if spec.group == "it" else ics_group
         group.add_argument(
@@ -2287,7 +2375,18 @@ def _analyze_paths(
     # Steps that internally fan out into many other analyzers; preloading the
     # packet list once avoids dozens of redundant pcap re-reads even when only
     # a single such step is requested.
-    fan_out_steps = {"overview", "hostdetails", "files", "ctf"}
+    fan_out_steps = {
+        "overview",
+        "hostdetails",
+        "files",
+        "ctf",
+        "threats",
+        "compromised",
+        "timeline",
+        "mitre",
+    }
+    if not show_ot_commands_fast:
+        fan_out_steps.add("ot_commands")
     use_packets = (
         len(ordered_steps) > 1
         or (render_base_summary and len(ordered_steps) > 0)
@@ -2300,6 +2399,7 @@ def _analyze_paths(
 
     if case_dir:
         restrict_dir_permissions(case_dir)
+        _warn_output_path(case_dir)
 
     def _render_packet(path: Path, index: int, packets: list[object] | None) -> None:
         if index <= 0:
@@ -2346,7 +2446,7 @@ def _analyze_paths(
         if raw:
             if view_raw:
                 text = raw.decode("latin-1", errors="ignore")
-                print(text if text else "<no printable text>")
+                print(display_safe(text) if text else "<no printable text>")
             else:
                 print(hexdump(raw))
         else:
@@ -2360,10 +2460,13 @@ def _analyze_paths(
             if multi_export:
                 out_dir = base.parent / base.stem
                 restrict_dir_permissions(out_dir)
+                _warn_output_path(out_dir)
                 return out_dir / f"{pcap_path.stem}{base.suffix}"
+            _warn_output_path(base.parent)
             return base
         out_dir = base
         restrict_dir_permissions(out_dir)
+        _warn_output_path(out_dir)
         return out_dir / f"{pcap_path.stem}.{suffix}"
 
     def _resolve_misc_path(path: Path) -> Path:
@@ -2607,7 +2710,9 @@ def _analyze_paths(
                     print(render_vlan_summary(vlan_summary, verbose=verbose))
                 export_summaries["vlan"] = vlan_summary
             elif step == "icmp" and show_icmp:
-                icmp_summary = analyze_icmp(path, show_status=step_status)
+                icmp_summary = analyze_icmp(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("icmp", []).append(icmp_summary)
                 else:
@@ -2699,7 +2804,9 @@ def _analyze_paths(
                 if show_quic and "quic" in requested_steps:
                     quic_summary = export_summaries.get("quic")
                     if quic_summary is None:
-                        quic_summary = analyze_quic(path, show_status=step_status)
+                        quic_summary = analyze_quic(
+                            path, show_status=step_status, packets=packets, meta=meta
+                        )
                         export_summaries["quic"] = quic_summary
                 tls_summary = analyze_tls(
                     path,
@@ -2886,7 +2993,9 @@ def _analyze_paths(
                     print(render_exfil_summary(exfil_summary, verbose=verbose))
                 export_summaries["exfil"] = exfil_summary
             elif step == "sizes" and show_sizes:
-                size_summary = analyze_sizes(path, show_status=step_status)
+                size_summary = analyze_sizes(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("sizes", []).append(size_summary)
                 else:
@@ -2947,7 +3056,11 @@ def _analyze_paths(
                 export_summaries["scan"] = scan_summary
             elif step == "threats" and show_threats:
                 threat_summary = analyze_threats(
-                    path, show_status=step_status, vt_lookup=dns_vt
+                    path,
+                    show_status=step_status,
+                    vt_lookup=dns_vt,
+                    packets=packets,
+                    meta=meta,
                 )
                 if summarize_rollups:
                     rollups.setdefault("threats", []).append(threat_summary)
@@ -2961,6 +3074,8 @@ def _analyze_paths(
                     show_status=step_status,
                     ioc_file=Path(ioc_file).expanduser() if ioc_file else None,
                     threat_summary=existing_threat_summary,
+                    packets=packets,
+                    meta=meta,
                 )
                 if summarize_rollups:
                     rollups.setdefault("mitre", []).append(mitre_summary)
@@ -2989,7 +3104,9 @@ def _analyze_paths(
             elif step == "quic" and show_quic:
                 quic_summary = export_summaries.get("quic")
                 if quic_summary is None:
-                    quic_summary = analyze_quic(path, show_status=step_status)
+                    quic_summary = analyze_quic(
+                        path, show_status=step_status, packets=packets, meta=meta
+                    )
                 if summarize_rollups:
                     rollups.setdefault("quic", []).append(quic_summary)
                 else:
@@ -3018,14 +3135,18 @@ def _analyze_paths(
                     print(render_wlan_summary(wlan_summary))
                 export_summaries["wlan"] = wlan_summary
             elif step == "http2" and show_http2:
-                http2_summary = analyze_http2(path, show_status=step_status)
+                http2_summary = analyze_http2(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("http2", []).append(http2_summary)
                 else:
                     print(render_http2_summary(http2_summary))
                 export_summaries["http2"] = http2_summary
             elif step == "encrypted_dns" and show_encrypted_dns:
-                edns_summary = analyze_encrypted_dns(path, show_status=step_status)
+                edns_summary = analyze_encrypted_dns(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     rollups.setdefault("encrypted_dns", []).append(edns_summary)
                 else:
@@ -3073,7 +3194,8 @@ def _analyze_paths(
                     port_filter=stream_port,
                     search_query=stream_search,
                     executable_only=files_executable_only,
-                    packets=packets,
+                    packets=packets if not timeline_ip else None,
+                    meta=meta if not timeline_ip else None,
                 )
                 if summarize_rollups:
                     rollups.setdefault("files", []).append(files_summary)
@@ -3094,6 +3216,8 @@ def _analyze_paths(
                     vt_lookup=dns_vt,
                     ot_commands_fast=show_ot_commands_fast,
                     ot_commands_config=ot_commands_config,
+                    packets=packets,
+                    meta=meta,
                 )
                 if summarize_rollups:
                     rollups.setdefault("overview", []).append(overview_summary)
@@ -3140,7 +3264,9 @@ def _analyze_paths(
                 if show_quic and "quic" in requested_steps:
                     quic_summary = export_summaries.get("quic")
                     if quic_summary is None:
-                        quic_summary = analyze_quic(path, show_status=step_status)
+                        quic_summary = analyze_quic(
+                            path, show_status=step_status, packets=packets, meta=meta
+                        )
                         export_summaries["quic"] = quic_summary
                 smb_summary = analyze_smb(
                     path, show_status=step_status, packets=packets, meta=meta
@@ -3379,6 +3505,8 @@ def _analyze_paths(
                     categories=timeline_categories,
                     invert_categories=timeline_categories_invert,
                     vt_lookup=dns_vt,
+                    packets=packets,
+                    meta=meta,
                 )
                 if summarize_rollups:
                     rollups.setdefault("timeline", []).append(timeline_summary)
@@ -3458,7 +3586,9 @@ def _analyze_paths(
                     print(render_modbus_summary(modbus_summary, verbose=verbose))
                 export_summaries["modbus"] = modbus_summary
             elif step == "dnp3" and show_dnp3:
-                dnp3_summary = analyze_dnp3(path, show_status=step_status)
+                dnp3_summary = analyze_dnp3(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
                 if summarize_rollups:
                     dnp3_rollups.append(dnp3_summary)
                 else:
@@ -3738,6 +3868,8 @@ def _analyze_paths(
                     show_status=step_status,
                     fast=show_ot_commands_fast,
                     config=ot_commands_config,
+                    packets=packets,
+                    meta=meta,
                 )
                 if summarize_rollups:
                     rollups.setdefault("ot_commands", []).append(summary)
@@ -4437,6 +4569,7 @@ def _analyze_paths(
         )
         if baseline_save:
             out_path = _resolve_misc_path(Path(baseline_save).expanduser())
+            _warn_output_path(out_path.parent)
             safe_write_text(
                 out_path,
                 json.dumps(current_baseline.to_dict(), indent=2),
@@ -4463,9 +4596,12 @@ def _analyze_paths(
 
 
 def main() -> int:
-    plugins, plugin_errors = _filtered_plugins(_builtin_flag_map())
-    parser = build_parser(plugins)
     argv = _normalize_timeline_category_argv(sys.argv[1:])
+    plugins_enabled = _plugins_enabled_from_argv(argv)
+    plugins, plugin_errors = _filtered_plugins(
+        _builtin_flag_map(), enabled=plugins_enabled
+    )
+    parser = build_parser(plugins)
     if _handle_help_request(parser, plugins, argv):
         return 0
     if len(argv) == 0:
@@ -4512,6 +4648,12 @@ def main() -> int:
         _print_error(f"Config: {config_result.error}")
         return 2
     config_applied = _apply_config_defaults(parser, args, config_result.data, argv)
+    if getattr(args, "network", None):
+        os.environ["PCAPPER_NETWORK"] = str(args.network)
+    if getattr(args, "full_secrets", False):
+        set_output_redaction(False)
+    elif getattr(args, "redact", False):
+        set_output_redaction(True)
     if config_result.path is not None:
         # Always visible on stderr, so a run's behaviour can be traced to the
         # file that shaped it; stdout stays a clean report.
@@ -5229,7 +5371,11 @@ def main() -> int:
             analyst=str(analyst),
             notes=str(notes),
             version=__version__,
-            argv=list(sys.argv),
+            argv=(
+                [redact_sensitive_text(item) for item in list(sys.argv)]
+                if output_redaction_enabled()
+                else list(sys.argv)
+            ),
             config_path=str(config_result.path) if config_result.path else "",
             inputs=paths,
             start_time=run_start,
@@ -5266,8 +5412,7 @@ def main() -> int:
         print(stream.getvalue(), file=sys.stderr)
         if args.profile_out:
             out_path = Path(args.profile_out).expanduser()
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            profiler.dump_stats(str(out_path))
+            _dump_profile_private(profiler, out_path)
     run_end = datetime.now(timezone.utc)
     _write_case_metadata(run_end)
     _log_event(log_config, "end", status="ok" if result == 0 else "fail")
