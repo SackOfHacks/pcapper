@@ -18,6 +18,7 @@
 # 2. Repository metadata and documentation
 !.gitignore
 !.gitattributes
+!.mailmap
 !.github/**/*.yml
 !.github/**/*.yaml
 !LICENSE
