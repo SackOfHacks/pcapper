@@ -15,7 +15,7 @@ import pytest
 
 REPO = Path(__file__).parent.parent
 
-ALLOWED_NAMES = {"LICENSE", ".gitignore", ".gitattributes"}
+ALLOWED_NAMES = {"LICENSE", ".gitignore", ".gitattributes", ".mailmap"}
 ALLOWED_SUFFIXES = {".py", ".md", ".toml", ".yml", ".yaml"}
 # Where the remaining shipped file types may live.
 FIXTURE_DIR = Path("tests/data")

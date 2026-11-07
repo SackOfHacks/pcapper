@@ -1,0 +1,9 @@
+# Canonical author identities for `git shortlog`, `git log`, blame, and the
+# GitHub contributors graph. This normalises display only; it does not and
+# cannot rewrite commit history.
+#
+# Every maintainer commit — whether authored as "SackOfHacks" or the earlier
+# typo "SockOfHacks", and whether it carries the plain e-mail or the GitHub
+# noreply address — maps to the single account-linked identity below. Mapping
+# by commit e-mail alone (the trailing `<...>`) collapses both name spellings.
+SackOfHacks <16657192+SackOfHacks@users.noreply.github.com> <pascal.ackerman@gmail.com>
