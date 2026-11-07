@@ -803,7 +803,7 @@ def analyze_netbios(
 ) -> NetbiosAnalysis:
     analysis = NetbiosAnalysis(path=pcap_path)
 
-    if not pcap_path.exists():
+    if packets is None and not pcap_path.exists():
         return analysis
 
     start_time: Optional[float] = None

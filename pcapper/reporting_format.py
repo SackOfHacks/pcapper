@@ -4,6 +4,8 @@ import re
 import textwrap
 from typing import Iterable
 
+from .utils import display_safe
+
 
 def format_table(rows: Iterable[list[str]]) -> str:
     rows = list(rows)
@@ -14,8 +16,8 @@ def format_table(rows: Iterable[list[str]]) -> str:
         if value is None:
             return ""
         if isinstance(value, str):
-            return value
-        return str(value)
+            return display_safe(value)
+        return display_safe(str(value))
 
     rows = [[_cell_text(cell) for cell in row] for row in rows]
     # A ragged row (a renderer that appended fewer cells than the header)

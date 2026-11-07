@@ -326,7 +326,11 @@ def analyze_ldap(
     dns_summary = _busy(
         "DNS", analyze_dns, path, show_status=False, packets=packets, meta=meta
     )
-    files_summary = _busy("Files", analyze_files, path, show_status=False)
+    files_summary = _busy(
+        "Files", analyze_files, path, show_status=False, packets=packets, meta=meta
+    )
+    errors.extend(getattr(dns_summary, "errors", []) or [])
+    errors.extend(getattr(files_summary, "errors", []) or [])
 
     ldap_domains = Counter()
     for qname, count in dns_summary.qname_counts.items():
@@ -816,7 +820,7 @@ def analyze_ldap(
     clear_pct = (float(cleartext_packets) / float(total_ldap_packets)) * 100.0
     if cleartext_packets > 0:
         deterministic_checks["cleartext_ldap_exposure"].append(
-            f"Cleartext LDAP packets={cleartext_packets}/{total_ldap_packets} ({clear_pct:.1f}%) on TCP/389 or TCP/3268"
+            f"Cleartext LDAP packets={cleartext_packets}/{total_ldap_packets} ({clear_pct:.1f}%) on TCP/389, TCP/3268, or UDP/389"
         )
     for ip, count in public_endpoints.most_common(10):
         deterministic_checks["public_ldap_endpoint_exposure"].append(

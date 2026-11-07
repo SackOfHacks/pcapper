@@ -5,16 +5,16 @@ from .utils import is_public_ip as _is_public_ip
 import math
 import re
 import struct
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
     from scapy.layers.inet import IP, TCP
-    from scapy.packet import Raw
+    from scapy.packet import Padding, Raw
 except ImportError:
-    TCP = IP = Raw = None
+    TCP = IP = Padding = Raw = None
 
 from .device_detection import device_fingerprint_from_fields
 from .equipment import equipment_artifacts
@@ -68,6 +68,8 @@ PUBLIC_FUNCTION_CODES = {1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 15, 16, 17, 20, 21, 22,
 READ_FUNCTIONS = {1, 2, 3, 4}
 
 WRITE_BASELINE_MIN = 10
+MAX_MODBUS_STREAMS = 4096
+MAX_MODBUS_ADU_SIZE = 260
 
 # Pairing / orphan / phantom thresholds — kept conservative so pre-established
 # sessions and capture cut-off (requests/responses whose counterpart falls
@@ -407,12 +409,11 @@ def _parse_modbus_response_detail(func_code: int, pdu: bytes) -> Optional[str]:
 
 
 def _parse_device_id_response(pdu: bytes) -> dict[str, str]:
-    if len(pdu) < 7:
-        return {}
-    if pdu[1] != 0x0E:
+    if len(pdu) < 7 or pdu[0] != 43 or pdu[1] != 0x0E:
         return {}
     idx = 7
     fields: dict[str, str] = {}
+    object_count = pdu[6]
     object_map = {
         0x00: "vendor",
         0x01: "product_code",
@@ -422,12 +423,14 @@ def _parse_device_id_response(pdu: bytes) -> dict[str, str]:
         0x05: "model",
         0x06: "user_app",
     }
-    while idx + 2 <= len(pdu):
+    for _ in range(object_count):
+        if idx + 2 > len(pdu):
+            return {}
         obj_id = pdu[idx]
         length = pdu[idx + 1]
         idx += 2
         if idx + length > len(pdu):
-            break
+            return {}
         raw = pdu[idx : idx + length]
         idx += length
         value = raw.decode("latin-1", errors="ignore").strip()
@@ -477,8 +480,8 @@ def analyze_modbus(
     anomalies: List[ModbusAnomaly] = []
     errors: List[str] = []
 
-    start_time = None
-    last_time = None
+    start_time: Optional[float] = None
+    last_time: Optional[float] = None
 
     flow_map: Dict[Tuple[str, str, int, int], Dict[str, Optional[float]]] = defaultdict(
         lambda: {
@@ -496,6 +499,7 @@ def analyze_modbus(
 
     # Aggregate noisy anomalies
     write_events = Counter()
+    write_event_first_seen: Dict[Tuple[str, int, str, str], float] = {}
     exception_events = Counter()
     diagnostic_events = Counter()
     dangerous_diag_events: Counter = Counter()
@@ -547,6 +551,10 @@ def analyze_modbus(
     # protocol violations
     malformed_mbap: Counter[str] = Counter()
     reserved_fc_events: Counter[Tuple[int, str, str]] = Counter()
+    stream_states: OrderedDict[
+        Tuple[str, str, int, int], Tuple[Optional[int], bytes]
+    ] = OrderedDict()
+    stream_gap_reported = False
 
     try:
         for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
@@ -554,28 +562,36 @@ def analyze_modbus(
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
             ts = safe_float(getattr(pkt, "time", 0))
-            if start_time is None:
-                start_time = ts
-            last_time = ts
+            if ts is not None:
+                start_time = ts if start_time is None else min(start_time, ts)
+                last_time = ts if last_time is None else max(last_time, ts)
 
             has_tcp = False
             sport = 0
             dport = 0
+            tcp_seq: Optional[int] = None
+            tcp_flags = 0
             payload = b""
 
             if pkt.haslayer(TCP):
                 has_tcp = True
-                sport = int(pkt[TCP].sport)
-                dport = int(pkt[TCP].dport)
+                tcp_layer = pkt[TCP]
+                sport = int(tcp_layer.sport)
+                dport = int(tcp_layer.dport)
+                tcp_seq = int(tcp_layer.seq)
+                tcp_flags = int(tcp_layer.flags)
 
-                # Check for Payload (Using generic payload access)
-                payload_obj = pkt[TCP].payload
-                payload = bytes(payload_obj) if payload_obj else b""
-                if not payload and Raw is not None and pkt.haslayer(Raw):
-                    try:
-                        payload = bytes(pkt[Raw].load)
-                    except Exception:
-                        pass
+                # Scapy exposes Ethernet padding beneath TCP on some captures;
+                # Raw.load contains the actual captured application segment.
+                payload_obj = tcp_layer.payload
+                if Raw is not None and pkt.haslayer(Raw):
+                    payload = bytes(pkt[Raw].load)
+                else:
+                    payload = bytes(payload_obj) if payload_obj else b""
+                if Padding is not None and pkt.haslayer(Padding):
+                    padding = bytes(pkt[Padding])
+                    if padding and payload.endswith(padding):
+                        payload = payload[: -len(padding)]
             else:
                 # Fallback: parse TCP from raw bytes if scapy didn't dissect layers
                 try:
@@ -597,6 +613,10 @@ def analyze_modbus(
                                 dport = int.from_bytes(
                                     raw[tcp_start + 2 : tcp_start + 4], "big"
                                 )
+                                tcp_seq = int.from_bytes(
+                                    raw[tcp_start + 4 : tcp_start + 8], "big"
+                                )
+                                tcp_flags = raw[tcp_start + 13]
                                 payload_start = tcp_start + data_offset
                                 ip_end = ip_start + total_len
                                 payload = (
@@ -657,7 +677,62 @@ def analyze_modbus(
                 except Exception:
                     pass
 
+            stream_key: Optional[Tuple[str, str, int, int]] = None
+            stream_next_seq: Optional[int] = None
+            if (
+                payload
+                and (sport == MODBUS_TCP_PORT or dport == MODBUS_TCP_PORT)
+                and tcp_seq is not None
+            ):
+                src_raw, dst_raw = extract_packet_endpoints(pkt)
+                stream_key = (
+                    src_raw or "?",
+                    dst_raw or "?",
+                    sport,
+                    dport,
+                )
+                previous = stream_states.get(stream_key)
+                stream_tail = b""
+                if previous is not None:
+                    stream_states.move_to_end(stream_key)
+                    expected_seq, stream_tail = previous
+                    stream_next_seq = expected_seq
+                    if expected_seq is not None:
+                        delta = (tcp_seq - expected_seq) & 0xFFFFFFFF
+                        if delta < 0x80000000 and delta != 0:
+                            stream_tail = b""
+                            if not stream_gap_reported:
+                                errors.append(
+                                    "Modbus TCP stream sequence gap observed; "
+                                    "affected incomplete messages were discarded."
+                                )
+                                stream_gap_reported = True
+                        elif delta >= 0x80000000:
+                            overlap = (expected_seq - tcp_seq) & 0xFFFFFFFF
+                            if overlap >= len(payload):
+                                payload = b""
+                            else:
+                                payload = payload[overlap:]
+                                tcp_seq = expected_seq
+                if payload:
+                    if previous is None and len(stream_states) >= MAX_MODBUS_STREAMS:
+                        stream_states.popitem(last=False)
+                        if not stream_gap_reported:
+                            errors.append(
+                                "Modbus TCP stream state limit reached; oldest "
+                                "incomplete stream state was discarded."
+                            )
+                            stream_gap_reported = True
+                    stream_next_seq = (
+                        (tcp_seq + len(payload)) & 0xFFFFFFFF
+                    )
+                    payload = stream_tail + payload
+
             if not payload or len(payload) < 8:
+                if stream_key is not None and not (tcp_flags & 0x05):
+                    if len(payload) <= MAX_MODBUS_ADU_SIZE:
+                        stream_states[stream_key] = (stream_next_seq, payload)
+                        stream_states.move_to_end(stream_key)
                 continue
 
             try:
@@ -680,6 +755,9 @@ def analyze_modbus(
                         continue
 
                     frame_len = 6 + length
+                    if frame_len > MAX_MODBUS_ADU_SIZE:
+                        offset += 1
+                        continue
                     if offset + frame_len > len(payload):
                         break
 
@@ -799,7 +877,10 @@ def analyze_modbus(
 
                         # Check for Write Operations (Risk)
                         if original_func in WRITE_FUNCTIONS:
-                            write_events[(func_name, unit_id, src_ip, dst_ip)] += 1
+                            write_key = (func_name, unit_id, src_ip, dst_ip)
+                            write_events[write_key] += 1
+                            if ts is not None:
+                                write_event_first_seen.setdefault(write_key, ts)
                             src_write_requests[src_ip] += 1
                             if request_detail:
                                 write_details[
@@ -1137,7 +1218,6 @@ def analyze_modbus(
 
                     messages.append(
                         ModbusMessage(
-                            ts=ts,
                             src_ip=src_ip,
                             dst_ip=dst_ip,
                             src_port=sport,
@@ -1156,6 +1236,7 @@ def analyze_modbus(
                             direction="response"
                             if is_server_response
                             else "request",
+                            ts=ts if ts is not None else 0.0,
                         )
                     )
 
@@ -1166,6 +1247,25 @@ def analyze_modbus(
                 ):
                     modbus_packets -= 1
 
+                if stream_key is not None and not (tcp_flags & 0x05):
+                    remaining = payload[offset:]
+                    if len(remaining) <= MAX_MODBUS_ADU_SIZE:
+                        stream_states[stream_key] = (
+                            stream_next_seq,
+                            remaining,
+                        )
+                        stream_states.move_to_end(stream_key)
+                    else:
+                        stream_states.pop(stream_key, None)
+                        if not stream_gap_reported:
+                            errors.append(
+                                "Modbus TCP buffered data exceeded the maximum "
+                                "ADU size and was discarded."
+                            )
+                            stream_gap_reported = True
+                elif stream_key is not None:
+                    stream_states.pop(stream_key, None)
+
             except struct.error:
                 pass
             except Exception:
@@ -1174,9 +1274,11 @@ def analyze_modbus(
     except Exception as e:
         errors.append(f"{type(e).__name__}: {e}")
 
-    duration = 0.0
-    if start_time is not None and last_time is not None:
-        duration = last_time - start_time
+    duration = (
+        max(0.0, last_time - start_time)
+        if start_time is not None and last_time is not None
+        else 0.0
+    )
 
     packet_size_stats = _stats_from_samples(packet_size_samples)
     payload_size_stats = _stats_from_samples(payload_size_samples)
@@ -1224,7 +1326,9 @@ def analyze_modbus(
                 description=f"Write command ({func_name}) sent to Unit ID {unit_id}{suffix}{detail_text}",
                 src=src_ip,
                 dst=dst_ip,
-                ts=0.0,
+                ts=write_event_first_seen.get(
+                    (func_name, unit_id, src_ip, dst_ip), 0.0
+                ),
             )
         )
         if unit_id == 0:
@@ -1236,7 +1340,9 @@ def analyze_modbus(
                         description=f"Broadcast write using {func_name} to Unit ID 0{suffix}{detail_text}",
                         src=src_ip,
                         dst=dst_ip,
-                        ts=0.0,
+                        ts=write_event_first_seen.get(
+                            (func_name, unit_id, src_ip, dst_ip), 0.0
+                        ),
                     )
                 )
 

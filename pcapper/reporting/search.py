@@ -17,6 +17,7 @@ from ..coloring import (
 )
 from ..search import SearchSummary
 from ..utils import (
+    display_safe,
     format_ts,
 )
 
@@ -54,7 +55,8 @@ def render_search_summary(summary: SearchSummary) -> str:
         for err in summary.errors:
             lines.append(danger(f"- {err}"))
 
-    lines.append(_format_kv("Query", ok(summary.query)))
+    safe_query = display_safe(summary.query)
+    lines.append(_format_kv("Query", ok(safe_query)))
     lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
     lines.append(_format_kv("Matches", str(summary.matches)))
     if summary.truncated:
@@ -71,7 +73,7 @@ def render_search_summary(summary: SearchSummary) -> str:
         for hit in summary.hits:
             context_text = _truncate_text(hit.context, 80)
             if context_text:
-                context_text = _highlight_search_text(context_text, summary.query)
+                context_text = _highlight_search_text(context_text, safe_query)
             rows.append(
                 [
                     str(hit.packet_number),
@@ -133,7 +135,8 @@ def render_search_rollup(summaries: Iterable[SearchSummary], limit: int = 20) ->
             all_errors.append(f"{summary.path.name}: {err}")
 
     query = query_counts.most_common(_limit_value(1))[0][0] if query_counts else "-"
-    lines.append(_format_kv("Query", ok(query) if query != "-" else query))
+    safe_query = display_safe(query)
+    lines.append(_format_kv("Query", ok(safe_query) if safe_query != "-" else safe_query))
     lines.append(_format_kv("PCAPs Analyzed", str(len(summary_list))))
     lines.append(_format_kv("Packets Scanned", str(total_packets)))
     lines.append(_format_kv("Total Matches", str(total_matches)))

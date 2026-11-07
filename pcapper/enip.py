@@ -334,13 +334,10 @@ def _parse_enip(
 
 
 def _parse_list_identity_response(data: bytes, src_ip: str) -> list[IdentityInfo]:
-    if len(data) < 6:
+    if len(data) < 2:
         return []
-    ptr = 0
-    ptr += 2
-    ptr += 2
-    item_count = int.from_bytes(data[ptr : ptr + 2], "little")
-    ptr += 2
+    item_count = int.from_bytes(data[:2], "little")
+    ptr = 2
     identities: list[IdentityInfo] = []
     for _ in range(item_count):
         if ptr + 4 > len(data):
@@ -354,25 +351,20 @@ def _parse_list_identity_response(data: bytes, src_ip: str) -> list[IdentityInfo
         ptr += item_len
         if item_type != 0x000C:
             continue
-        if len(item_data) < 28:
+        if len(item_data) < 34:
             continue
-        vendor_id = int.from_bytes(item_data[0:2], "little")
-        device_type = int.from_bytes(item_data[2:4], "little")
-        product_code = int.from_bytes(item_data[4:6], "little")
-        revision_major = item_data[6]
-        revision_minor = item_data[7]
-        serial_number = int.from_bytes(item_data[10:14], "little")
-        product_name_len = item_data[14]
-        name_start = 15
-        name_end = min(len(item_data), name_start + product_name_len)
-        try:
-            product_name = item_data[name_start:name_end].decode(
-                "utf-8", errors="ignore"
-            )
-        except Exception:
-            product_name = None
-        if product_name:
-            product_name = _clean_identity_text(product_name)
+        name_len = item_data[32]
+        name_end = 33 + name_len
+        if name_end + 1 > len(item_data):
+            continue
+        vendor_id = int.from_bytes(item_data[18:20], "little")
+        device_type = int.from_bytes(item_data[20:22], "little")
+        product_code = int.from_bytes(item_data[22:24], "little")
+        revision_major = item_data[24]
+        revision_minor = item_data[25]
+        serial_number = int.from_bytes(item_data[28:32], "little")
+        product_name = item_data[33:name_end].decode("utf-8", errors="replace")
+        product_name = _clean_identity_text(product_name) if product_name else None
         revision = f"{revision_major}.{revision_minor}"
         vendor_name, device_type_name, product_code_name = _resolve_identity_names(
             vendor_id, device_type, product_code
@@ -482,32 +474,6 @@ def _resolve_identity_names(
             product_code_name = flat_codes.get(str(product_code))
 
     return vendor_name, device_type_name, product_code_name
-
-
-def _scan_identity_items(payload: bytes, src_ip: str) -> list[IdentityInfo]:
-    identities: list[IdentityInfo] = []
-    if len(payload) < 8:
-        return identities
-    idx = 0
-    max_len = len(payload)
-    while idx + 4 <= max_len:
-        item_type = int.from_bytes(payload[idx : idx + 2], "little")
-        item_len = int.from_bytes(payload[idx + 2 : idx + 4], "little")
-        if item_type == 0x000C and item_len >= 28 and idx + 4 + item_len <= max_len:
-            item_data = payload[idx + 4 : idx + 4 + item_len]
-            identities.extend(
-                _parse_list_identity_response(
-                    b"\x00\x00\x00\x00\x01\x00"
-                    + b"\x0c\x00"
-                    + item_len.to_bytes(2, "little")
-                    + item_data,
-                    src_ip,
-                )
-            )
-            idx += 4 + item_len
-            continue
-        idx += 1
-    return identities
 
 
 def _bucketize(values: list[int]) -> list[SizeBucket]:
@@ -692,6 +658,11 @@ def analyze_enip(
             )
             if not has_transport:
                 continue
+            # TCP handshake/ACK packets identify a flow, not an ENIP message.
+            # Counting them as protocol packets inflated traffic and source
+            # request totals despite carrying no encapsulation data.
+            if not payload:
+                continue
 
             # Treat the ENIP port as the SERVER side only: the destination,
             # or the source paired with an ephemeral destination (a server
@@ -822,7 +793,8 @@ def analyze_enip(
                 src_enip_commands[actor_ip][cmd_label] += 1
 
                 if (
-                    cmd_label in SUSPICIOUS_ENIP_COMMANDS
+                    request_like
+                    and cmd_label in SUSPICIOUS_ENIP_COMMANDS
                     and len(analysis.anomalies) < max_anomalies
                 ):
                     analysis.anomalies.append(
@@ -835,12 +807,12 @@ def analyze_enip(
                             ts=ts or 0.0,
                         )
                     )
-                if cmd_label in ENIP_ENUMERATION_COMMANDS:
+                if request_like and cmd_label in ENIP_ENUMERATION_COMMANDS:
                     analysis.source_enip_enum_commands[actor_ip] += 1
                     analysis.source_enum_commands[actor_ip] += 1
-                if cmd_label == "RegisterSession":
+                if request_like and cmd_label == "RegisterSession":
                     src_register_commands[actor_ip] += 1
-                elif cmd_label == "UnregisterSession":
+                elif request_like and cmd_label == "UnregisterSession":
                     src_unregister_commands[actor_ip] += 1
 
                 if session_handle and len(analysis.artifacts) < 200:
@@ -920,10 +892,11 @@ def analyze_enip(
                         )
                     )
 
-            if is_connected:
-                analysis.connected_packets += 1
-            else:
-                analysis.unconnected_packets += 1
+            if is_cip_carrier:
+                if is_connected:
+                    analysis.connected_packets += 1
+                else:
+                    analysis.unconnected_packets += 1
 
             parse_payload = b""
             if is_cip_carrier and isinstance(cip_payload, (bytes, bytearray)):
@@ -946,7 +919,6 @@ def analyze_enip(
                     identities.extend(
                         _parse_list_identity_response(bytes(encap_data), src_ip)
                     )
-                identities.extend(_scan_identity_items(bytes(encap_data), src_ip))
                 for ident in identities:
                     key = (
                         ident.src_ip,

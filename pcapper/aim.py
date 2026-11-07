@@ -308,13 +308,18 @@ def analyze_aim(
             if not payload or not text:
                 continue
 
+            packet_usernames: Counter[str] = Counter()
+            packet_passwords: Counter[str] = Counter()
+            packet_secrets: Counter[str] = Counter()
+            packet_messages: Counter[str] = Counter()
+            packet_files: Counter[str] = Counter()
             _add_from_query_like(
                 text,
-                username_counts,
-                password_counts,
-                secret_counts,
-                message_counts,
-                file_counts,
+                packet_usernames,
+                packet_passwords,
+                packet_secrets,
+                packet_messages,
+                packet_files,
             )
 
             for key, value in KV_RE.findall(text):
@@ -330,10 +335,10 @@ def analyze_aim(
                     "user",
                     "login",
                 }:
-                    username_counts[val] += 1
+                    packet_usernames[val] += 1
                 elif lk in {"pass", "password", "pwd"}:
-                    password_counts[val] += 1
-                    secret_counts[val] += 1
+                    packet_passwords[val] += 1
+                    packet_secrets[val] += 1
                 elif lk in {
                     "secret",
                     "token",
@@ -345,27 +350,27 @@ def analyze_aim(
                     "auth",
                     "authorization",
                 }:
-                    secret_counts[val] += 1
+                    packet_secrets[val] += 1
                 elif lk in {"message", "msg", "im", "text", "body"}:
-                    message_counts[val] += 1
+                    packet_messages[val] += 1
 
             for user in USER_RE.findall(text):
-                username_counts[user] += 1
+                packet_usernames[user] += 1
             for password in PASS_RE.findall(text):
                 pw = password if isinstance(password, str) else password[0]
                 if pw:
-                    password_counts[pw] += 1
-                    secret_counts[pw] += 1
+                    packet_passwords[pw] += 1
+                    packet_secrets[pw] += 1
             for secret in SECRET_RE.findall(text):
                 sec = secret.strip()
                 if sec:
-                    secret_counts[sec] += 1
+                    packet_secrets[sec] += 1
             for message in MSG_RE.findall(text):
                 msg = message.strip()
                 if len(msg) >= 3:
-                    message_counts[msg] += 1
+                    packet_messages[msg] += 1
             for fname in FILE_RE.findall(text):
-                file_counts[fname] += 1
+                packet_files[fname] += 1
 
             for line in text.splitlines():
                 line = line.strip()
@@ -375,12 +380,21 @@ def analyze_aim(
                     ("host:", "user-agent:", "cookie:", "accept:", "connection:")
                 ):
                     if len(line.split()) >= 3:
-                        message_counts[line] += 1
+                        packet_messages[line] += 1
                 chat_match = CHAT_LINE_RE.match(line)
                 if chat_match:
                     msg = chat_match.group(1).strip()
                     if msg:
-                        message_counts[msg] += 1
+                        packet_messages[msg] += 1
+
+            for values, packet_values in (
+                (username_counts, packet_usernames),
+                (password_counts, packet_passwords),
+                (secret_counts, packet_secrets),
+                (message_counts, packet_messages),
+                (file_counts, packet_files),
+            ):
+                values.update({value: 1 for value in packet_values})
 
             for user in USER_RE.findall(text):
                 artifacts.append(AimArtifact("username", user, src_ip, dst_ip, idx))

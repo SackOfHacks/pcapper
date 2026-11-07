@@ -11,6 +11,7 @@ from .industrial_helpers import (
     IndustrialAnomaly,
     analyze_port_protocol,
     default_artifacts,
+    TPKTTCPReassembler,
 )
 from .utils import format_ts, memoize_analysis
 
@@ -162,6 +163,9 @@ _ERROR_CLASS_TEXT = {
     0x87: "Access",
 }
 
+_MAX_PENDING_TRANSACTIONS = 8192
+_PENDING_PRUNE_INTERVAL = 30.0
+
 
 @dataclass
 class _S7PacketEvent:
@@ -207,6 +211,8 @@ class _S7State:
     pending: dict[tuple[str, str, int], _PendingTransaction] = field(
         default_factory=dict
     )
+    errors: list[str] = field(default_factory=list)
+    last_pending_prune_ts: float = 0.0
     tpkt_frames: int = 0
     cotp_frames: int = 0
     valid_s7_frames: int = 0
@@ -279,7 +285,14 @@ class _S7State:
                 target_text = f" Targets: {preview}."
 
             if event.rosctr == 0x01 and event.pdu_ref is not None and func_name:
-                self.pending[(src_ip, dst_ip, event.pdu_ref)] = _PendingTransaction(
+                key = (src_ip, dst_ip, event.pdu_ref)
+                self.pending.pop(key, None)
+                if len(self.pending) >= _MAX_PENDING_TRANSACTIONS:
+                    self.pending.pop(next(iter(self.pending)))
+                    message = "S7 pending transaction limit reached; oldest request discarded."
+                    if message not in self.errors:
+                        self.errors.append(message)
+                self.pending[key] = _PendingTransaction(
                     func_name=func_name,
                     src=src_ip,
                     dst=dst_ip,
@@ -479,6 +492,9 @@ class _S7State:
     def _prune_pending(self, ts: float, max_age_seconds: float = 900.0) -> None:
         if ts <= 0:
             return
+        if ts <= self.last_pending_prune_ts + _PENDING_PRUNE_INTERVAL:
+            return
+        self.last_pending_prune_ts = ts
         stale_keys = [
             key for key, value in self.pending.items() if (ts - value.ts) > max_age_seconds
         ]
@@ -569,21 +585,27 @@ class _S7State:
             return
 
         rosctr = payload[1]
+        if rosctr not in ROSCTR:
+            return
         pdu_ref = int.from_bytes(payload[4:6], "big")
         param_len = int.from_bytes(payload[6:8], "big")
+        data_len = int.from_bytes(payload[8:10], "big")
 
         header_len = 10
+        error_class = error_code = 0
         if rosctr in {0x02, 0x03}:
             if len(payload) < 12:
                 return
             header_len = 12
-            event.error_class = payload[10]
-            event.error_code = payload[11]
+            error_class = payload[10]
+            error_code = payload[11]
 
-        if header_len > len(payload):
+        param_end = header_len + param_len
+        if param_end + data_len > len(payload):
             return
 
-        param_end = min(len(payload), header_len + max(param_len, 0))
+        event.error_class = error_class
+        event.error_code = error_code
         param = payload[header_len:param_end]
 
         event.rosctr = rosctr
@@ -810,7 +832,9 @@ def _parse_var_items(func_name: str, param: bytes) -> tuple[list[str], list[str]
             break
         spec_len = param[offset + 1]
         item_size = 2 + spec_len
-        if spec_len < 10 or offset + item_size > len(param):
+        if spec_len != 10 or offset + item_size > len(param):
+            break
+        if param[offset + 2] != 0x10:
             break
 
         transport = param[offset + 3]
@@ -992,6 +1016,7 @@ def _parse_commands(payload: bytes) -> list[str]:
 @memoize_analysis
 def analyze_s7(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     state = _S7State()
+    reassembler = TPKTTCPReassembler("S7")
     analysis = analyze_port_protocol(
         path=path,
         protocol_name="S7",
@@ -1001,7 +1026,11 @@ def analyze_s7(path: Path, show_status: bool = True) -> IndustrialAnalysis:
         anomaly_detector=state.detect_anomalies,
         enable_enrichment=True,
         show_status=show_status,
+        payload_reassembler=reassembler,
     )
+    reassembler.finish()
+    analysis.errors.extend(reassembler.errors)
+    analysis.errors.extend(state.errors)
 
     # A surgical attack (CR/CC + one STOP or program-download Job) has only ~1
     # semantic command and would trip the low-confidence gate — but that single

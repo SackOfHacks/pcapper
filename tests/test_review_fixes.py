@@ -47,6 +47,22 @@ class TestDetectFileType:
         assert utils.detect_file_type(tmp_path / "absent.pcap") == "unknown"
 
 
+class TestPcapSummary:
+    def test_classic_pcap_header_uses_capture_byte_order(self, pcap) -> None:
+        from pcapper.analyzer import analyze_pcap
+
+        summary = analyze_pcap(pcap("dns.pcap"), show_status=False)
+        assert summary.interface_stats[0].linktype == "1"
+        assert summary.interface_stats[0].snaplen == 65535
+
+    def test_protocol_presence_counts_each_packet_once_per_protocol(self, pcap) -> None:
+        from pcapper.analyzer import analyze_pcap
+
+        summary = analyze_pcap(pcap("dns.pcap"), show_status=False)
+        assert summary.packet_count == 6
+        assert summary.protocol_counts["DNS"] == 6
+
+
 class TestOpenPrivate:
     def test_writes_text_and_bytes(self, tmp_path) -> None:
         p = tmp_path / "a.txt"
@@ -76,6 +92,16 @@ class TestOpenPrivate:
     def test_rejects_read_modes(self, tmp_path) -> None:
         with pytest.raises(ValueError):
             utils.open_private(tmp_path / "d", "r")
+
+    def test_refuses_symlink_targets(self, tmp_path, posix_only) -> None:
+        target = tmp_path / "target.txt"
+        target.write_text("keep", encoding="utf-8")
+        link = tmp_path / "link.txt"
+        os.symlink(target, link)
+        with pytest.raises(OSError):
+            with utils.open_private(link, "w") as h:
+                h.write("overwrite")
+        assert target.read_text(encoding="utf-8") == "keep"
 
 
 class TestEnvInt:
@@ -397,6 +423,23 @@ class TestDnsVirusTotalHygiene:
         monkeypatch.setattr(dns_mod.urllib.request, "urlopen", fake_urlopen)
         dns_mod._vt_lookup_domain("evil.example/../../users?x=1#f", "k")
         assert seen and "/api/v3/domains/evil.example%2F..%2F..%2Fusers%3Fx%3D1%23f" in seen[0]
+
+    def test_network_off_blocks_lookups_before_urlopen(self, monkeypatch) -> None:
+        from pcapper import dns as dns_mod
+
+        called = False
+
+        def fake_urlopen(*_args, **_kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("urlopen should not be reached")
+
+        monkeypatch.setenv("PCAPPER_NETWORK", "off")
+        monkeypatch.setattr(dns_mod.urllib.request, "urlopen", fake_urlopen)
+        results, errors = dns_mod._vt_lookup_domains(["example.net"], "k")
+        assert results == {}
+        assert errors == ["VT lookup skipped: network egress is disabled."]
+        assert not called
 
 
 class TestHttpVirusTotalHygiene:
@@ -946,3 +989,14 @@ class TestCliRejectsNonCapture:
         )
         assert proc.returncode == 2, proc.stdout[-500:]
         assert "not a pcap/pcapng capture" in proc.stderr
+
+    def test_decrypt_without_keylog_exits_2(self, pcap) -> None:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pcapper", str(pcap("dns.pcap")), "--decrypt", "--quiet"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=dict(os.environ, NO_COLOR="1", PYTHONIOENCODING="utf-8"),
+            cwd=REPO, timeout=300,
+        )
+        assert proc.returncode == 2, proc.stdout[-500:]
+        assert "Decrypt requested but no keylog file provided" in proc.stderr
+        assert "PCAPPER REPORT" not in proc.stdout

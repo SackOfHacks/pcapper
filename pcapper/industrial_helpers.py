@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .utils import is_public_ip as _is_public_ip, packet_length
 import bisect
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -14,8 +14,8 @@ try:
 except ImportError:  # pragma: no cover - scapy optional at runtime
     TCP = UDP = IP = Raw = Ether = Padding = None
 
-from .pcap_cache import iter_packets
-from .utils import extract_ethertype, extract_packet_endpoints, safe_float
+from .pcap_cache import PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, safe_float
 
 DEFAULT_KEYWORDS = {
     "user",
@@ -176,6 +176,7 @@ AnomalyDetector = Callable[
     [bytes, str, str, float, Iterable[str]], Iterable[IndustrialAnomaly]
 ]
 SignatureMatcher = Callable[[bytes], bool]
+PayloadReassembler = Callable[[object, "_Matched"], bytes]
 
 # Ephemeral/dynamic source-port floor (Linux 32768+, Windows 49152+). A flow is
 # treated as OT-protocol traffic only when the OT port is the server side: the
@@ -359,6 +360,125 @@ class _Matched:
     session_key: str
 
 
+class TPKTTCPReassembler:
+    def __init__(self, protocol_name: str) -> None:
+        self.protocol_name = protocol_name
+        self._streams: OrderedDict[
+            tuple[str, str, int, int], tuple[int, bytes]
+        ] = OrderedDict()
+        self.errors: list[str] = []
+
+    def __call__(self, packet: object, match: object) -> bytes:
+        payload = bytes(getattr(match, "payload", b"") or b"")
+        if TCP is None:
+            return payload
+        tcp = packet.getlayer(TCP)  # type: ignore[attr-defined]
+        if tcp is None:
+            return payload
+
+        key = (
+            str(getattr(match, "src", "?")),
+            str(getattr(match, "dst", "?")),
+            int(getattr(match, "sport", 0)),
+            int(getattr(match, "dport", 0)),
+        )
+        previous = self._streams.pop(key, None)
+        flags = int(getattr(tcp, "flags", 0))
+        if flags & 0x02 and previous is not None:
+            self._report_incomplete()
+            previous = None
+
+        if not payload:
+            if previous is not None and flags & 0x05:
+                self._report_incomplete()
+            elif previous is not None:
+                self._streams[key] = previous
+            return b""
+
+        sequence = int(getattr(tcp, "seq", 0))
+        original_length = len(payload)
+        if previous is not None:
+            expected, buffered = previous
+            delta = (sequence - expected + (1 << 31)) % (1 << 32) - (1 << 31)
+            if delta < 0:
+                overlap = -delta
+                if overlap >= len(payload):
+                    self._streams[key] = previous
+                    return b""
+                payload = payload[overlap:]
+            elif delta > 0:
+                self._report_gap()
+                buffered = b""
+            payload = buffered + payload
+
+        frames, remainder = self._complete_frames(payload)
+        if remainder and not flags & 0x05:
+            if len(self._streams) >= _MAX_TPKT_TCP_STREAMS:
+                self._streams.popitem(last=False)
+                self._report_limit()
+            self._streams[key] = (
+                (sequence + original_length + int(bool(flags & 0x02))) & 0xFFFFFFFF,
+                remainder,
+            )
+        elif remainder:
+            self._report_incomplete()
+        return b"".join(frames)
+
+    def _complete_frames(self, data: bytes) -> tuple[list[bytes], bytes]:
+        frames: list[bytes] = []
+        while data:
+            start = data.find(b"\x03\x00")
+            if start < 0:
+                remainder = b"\x03" if data.endswith(b"\x03") else b""
+                if len(data) > len(remainder):
+                    self._report_framing()
+                return frames, remainder
+            if start:
+                self._report_framing()
+                data = data[start:]
+            if len(data) < 4:
+                return frames, data
+            frame_length = int.from_bytes(data[2:4], "big")
+            if frame_length < 7:
+                self._report_framing()
+                data = data[2:]
+                continue
+            if len(data) < frame_length:
+                return frames, data
+            frames.append(data[:frame_length])
+            data = data[frame_length:]
+        return frames, b""
+
+    def _report(self, message: str) -> None:
+        if message not in self.errors:
+            self.errors.append(message)
+
+    def _report_framing(self) -> None:
+        self._report(
+            f"Malformed {self.protocol_name} TPKT framing; invalid bytes or length discarded."
+        )
+
+    def _report_gap(self) -> None:
+        self._report(
+            f"{self.protocol_name} TCP sequence gap discarded an incomplete TPKT frame."
+        )
+
+    def _report_incomplete(self) -> None:
+        self._report(
+            f"{self.protocol_name} TCP stream ended with an incomplete TPKT frame."
+        )
+
+    def _report_limit(self) -> None:
+        self._report(
+            f"{self.protocol_name} TCP stream limit reached; oldest partial stream discarded."
+        )
+
+    def finish(self) -> None:
+        if self._streams:
+            self._report_incomplete()
+            self._streams.clear()
+
+
 def _strip_padding(layer: object) -> bytes:
     """Bytes of a transport payload without scapy's trailing ``Padding``.
 
@@ -416,10 +536,12 @@ def _match_ports(
     """Port/signature classification for TCP- and UDP-carried protocols."""
     getlayer = pkt.getlayer  # type: ignore[attr-defined]
     transport = getlayer(TCP) if TCP is not None else None
+    is_tcp = transport is not None
     if transport is None:
         transport = getlayer(UDP) if UDP is not None else None
         if transport is None:
             return None
+    server_ports = tcp_ports if is_tcp else udp_ports
     sport = int(getattr(transport, "sport", 0) or 0)
     dport = int(getattr(transport, "dport", 0) or 0)
     payload = _strip_padding(transport.payload)
@@ -432,10 +554,8 @@ def _match_ports(
     # ephemeral source port is 44818 would otherwise be reported as
     # EtherNet/IP/CSP/PCCC traffic to a public IP. Signature matches are
     # always honored.
-    matches_port = (
-        dport in tcp_ports
-        or dport in udp_ports
-        or ((sport in tcp_ports or sport in udp_ports) and dport >= _PORT_SERVER_EPHEMERAL_MIN)
+    matches_port = dport in server_ports or (
+        sport in server_ports and dport >= _PORT_SERVER_EPHEMERAL_MIN
     )
     matches_sig = bool(signature_matcher and payload and signature_matcher(payload))
     if not matches_port and not matches_sig:
@@ -452,8 +572,8 @@ def _match_ports(
         sport=sport,
         dport=dport,
         payload=payload,
-        is_request=(dport in tcp_ports) or (dport in udp_ports),
-        is_response=(sport in tcp_ports) or (sport in udp_ports),
+        is_request=dport in server_ports,
+        is_response=sport in server_ports,
         session_key=f"{src}:{sport} -> {dst}:{dport}",
     )
 
@@ -461,13 +581,19 @@ def _match_ports(
 def _match_ethertype(pkt: object, ethertype: int) -> _Matched | None:
     """EtherType classification for L2 protocols (GOOSE, SV, PROFINET RT, …).
     Endpoints are MAC addresses; every frame counts as a request."""
-    if extract_ethertype(pkt) != ethertype:
-        return None
-    first = pkt[0]  # type: ignore[index]
-    src = getattr(first, "src", None) or "?"
-    dst = getattr(first, "dst", None) or "?"
     ether = pkt.getlayer(Ether) if Ether is not None else None  # type: ignore[attr-defined]
-    payload = _strip_padding(ether.payload) if ether is not None else b""
+    if ether is None:
+        return None
+    src = getattr(ether, "src", None) or "?"
+    dst = getattr(ether, "dst", None) or "?"
+    inner_type = int(getattr(ether, "type", 0) or 0)
+    payload_layer = getattr(ether, "payload", None)
+    while inner_type in _VLAN_ETHERTYPES and payload_layer is not None:
+        inner_type = int(getattr(payload_layer, "type", 0) or 0)
+        payload_layer = getattr(payload_layer, "payload", None)
+    if inner_type != ethertype:
+        return None
+    payload = _strip_padding(payload_layer) if payload_layer is not None else b""
     return _Matched(
         src=src, dst=dst, sport=0, dport=0, payload=payload,
         is_request=True, is_response=False, session_key=f"{src} -> {dst}",
@@ -477,6 +603,8 @@ def _match_ethertype(pkt: object, ethertype: int) -> _Matched | None:
 _ANOMALY_CAP = 200
 _ARTIFACT_CAP = 200
 _COMMAND_EVENT_CAP = 5000
+_VLAN_ETHERTYPES = {0x8100, 0x88A8, 0x9100}
+_MAX_TPKT_TCP_STREAMS = 256
 
 
 def _industrial_pass(
@@ -490,6 +618,9 @@ def _industrial_pass(
     enable_enrichment: bool,
     show_status: bool,
     scanning_check: bool,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+    payload_reassembler: PayloadReassembler | None = None,
 ) -> IndustrialAnalysis:
     """The single packet pass behind every port- and EtherType-based OT analyzer.
 
@@ -524,7 +655,9 @@ def _industrial_pass(
     skipped = 0
     first_error: str | None = None
 
-    for pkt in iter_packets(path, show_status=show_status):
+    for pkt in iter_packets(
+        path, packets=packets, meta=meta, show_status=show_status
+    ):
         analysis.total_packets += 1
         pkt_len = packet_length(pkt)
         analysis.total_bytes += pkt_len
@@ -548,6 +681,11 @@ def _industrial_pass(
             if match.dport:
                 analysis.ports[match.dport] += 1
             payload = match.payload
+            parser_payload = (
+                payload_reassembler(pkt, match)
+                if payload_reassembler is not None
+                else payload
+            )
 
             if enable_enrichment:
                 payload_sizes.append(len(payload))
@@ -573,7 +711,7 @@ def _industrial_pass(
                 if payload:
                     src_dst_bytes[match.src][match.dst] += len(payload)
 
-            commands = list(command_parser(payload)) if command_parser else []
+            commands = list(command_parser(parser_payload)) if command_parser else []
             if commands:
                 analysis.commands.update(commands)
                 # Attribute command endpoints to the request (client -> server)
@@ -589,7 +727,11 @@ def _industrial_pass(
                             IndustrialCommandEvent(ts=ts, src=match.src, dst=match.dst, command=str(cmd))
                         )
 
-            artifacts = _default_artifacts(payload) if artifact_parser is None else list(artifact_parser(payload))
+            artifacts = (
+                _default_artifacts(parser_payload)
+                if artifact_parser is None
+                else list(artifact_parser(parser_payload))
+            )
             for kind, detail in artifacts:
                 key = f"{kind}:{detail}"
                 if key in seen_artifacts:
@@ -600,7 +742,9 @@ def _industrial_pass(
                         IndustrialArtifact(kind=kind, detail=detail, src=match.src, dst=match.dst, ts=ts)
                     )
 
-            for anomaly in detector(payload, match.src, match.dst, ts, commands):
+            for anomaly in detector(
+                parser_payload, match.src, match.dst, ts, commands
+            ):
                 akey = (
                     str(getattr(anomaly, "title", "")),
                     str(getattr(anomaly, "src", "")),
@@ -713,6 +857,9 @@ def analyze_port_protocol(
     anomaly_detector: AnomalyDetector | None = None,
     enable_enrichment: bool = False,
     show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+    payload_reassembler: PayloadReassembler | None = None,
 ) -> IndustrialAnalysis:
     """Analyse a TCP/UDP-carried OT protocol. Returns a fresh object every
     call (not memoized) so callers may post-process it in place."""
@@ -730,6 +877,9 @@ def analyze_port_protocol(
         enable_enrichment=enable_enrichment,
         show_status=show_status,
         scanning_check=True,
+        packets=packets,
+        meta=meta,
+        payload_reassembler=payload_reassembler,
     )
 
 
@@ -742,6 +892,8 @@ def analyze_ethertype_protocol(
     anomaly_detector: AnomalyDetector | None = None,
     enable_enrichment: bool = False,
     show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> IndustrialAnalysis:
     """Analyse an EtherType-carried (L2) OT protocol. Returns a fresh object
     every call (not memoized) so callers may post-process it in place."""
@@ -757,4 +909,6 @@ def analyze_ethertype_protocol(
         enable_enrichment=enable_enrichment,
         show_status=show_status,
         scanning_check=False,
+        packets=packets,
+        meta=meta,
     )

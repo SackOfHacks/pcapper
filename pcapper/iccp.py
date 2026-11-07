@@ -8,6 +8,7 @@ from .industrial_helpers import (
     IndustrialAnomaly,
     analyze_port_protocol,
 )
+from .mms import _parse_mms_commands
 from .utils import memoize_analysis
 
 ICCP_PORT = 102
@@ -15,7 +16,7 @@ ICCP_PORT = 102
 # ICCP / TASE.2 (IEC 60870-6) runs MMS over COTP/TPKT on port 102 — the same
 # stack as IEC 61850 MMS — so plain port/MMS detection cannot tell them apart.
 # These TASE.2-specific object names (IEC 60870-6-503) appear as ASCII MMS
-# ObjectName/ItemId strings and uniquely identify ICCP traffic.
+# ObjectName/ItemId strings and distinguish ICCP from other MMS traffic.
 TASE2_MARKERS = (
     b"Bilateral_Table_ID",
     b"TASE2_Version",
@@ -28,8 +29,7 @@ TASE2_MARKERS = (
 )
 # TASE.2 Block 5 device-control object/keywords. A control operation on a
 # bilaterally-agreed point is an unauthorized-command / manipulation risk.
-TASE2_CONTROL_MARKERS = (b"Operate", b"SetTag", b"Command", b"Device")
-MMS_WRITE_TAG = 0xA5  # MMS confirmed-request Write service (see mms.py).
+TASE2_CONTROL_MARKERS = (b"Operate", b"SetTag", b"Command")
 
 
 def _looks_iccp(payload: bytes) -> bool:
@@ -40,7 +40,7 @@ def _parse_commands(payload: bytes) -> list[str]:
     if not _looks_iccp(payload):
         return []
     cmds = ["ICCP/TASE.2"]
-    if MMS_WRITE_TAG in payload:
+    if "MMS Service Write" in _parse_mms_commands(payload):
         cmds.append("MMS Write")
     if any(m in payload for m in TASE2_CONTROL_MARKERS):
         cmds.append("TASE.2 Control Object")
@@ -95,7 +95,7 @@ def analyze_iccp(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,
         protocol_name="ICCP/TASE.2",
-        tcp_ports={ICCP_PORT},
+        signature_matcher=_looks_iccp,
         command_parser=_parse_commands,
         anomaly_detector=_detect_anomalies,
         enable_enrichment=True,

@@ -488,6 +488,13 @@ def analyze_syslog(
                     last_seen=ts,
                 )
             else:
+                first_seen = existing.first_seen
+                last_seen = existing.last_seen
+                if ts is not None:
+                    if first_seen is None or ts < first_seen:
+                        first_seen = ts
+                    if last_seen is None or ts > last_seen:
+                        last_seen = ts
                 conversations[conv_key] = SyslogConversation(
                     client_ip=existing.client_ip,
                     server_ip=existing.server_ip,
@@ -495,15 +502,13 @@ def analyze_syslog(
                     server_port=existing.server_port,
                     packets=existing.packets + 1,
                     bytes=existing.bytes + pkt_len,
-                    first_seen=existing.first_seen
-                    if existing.first_seen is not None
-                    else ts,
-                    last_seen=ts or existing.last_seen,
+                    first_seen=first_seen,
+                    last_seen=last_seen,
                 )
 
             parsed = _parse_syslog(text)
             pri_text = parsed.get("pri")
-            if pri_text and pri_text.isdigit():
+            if pri_text and pri_text.isdigit() and int(pri_text) <= 191:
                 pri_val = int(pri_text)
                 facility = FACILITY_NAMES.get(pri_val // 8, f"facility_{pri_val // 8}")
                 severity = SEVERITY_NAMES.get(pri_val % 8, f"severity_{pri_val % 8}")

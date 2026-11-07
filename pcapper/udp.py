@@ -16,6 +16,7 @@ from .utils import (
     extract_packet_endpoints,
     is_private_ip,
     is_public_ip,
+    env_int,
     memoize_analysis,
     packet_length,
     safe_float,
@@ -109,6 +110,7 @@ PACKET_BUCKETS = [
     (1500, "1025-1500"),
     (9000, "1501-9000"),
 ]
+MAX_UDP_FLOWS = env_int("PCAPPER_MAX_UDP_FLOWS", 50000, minimum=1)
 
 
 def _bucketize(size: int) -> str:
@@ -354,6 +356,7 @@ def analyze_udp(
     last_seen: Optional[float] = None
     skipped_packets = 0
     first_skip_error: str | None = None
+    skipped_flows = 0
 
     for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
         total_packets += 1
@@ -376,6 +379,10 @@ def analyze_udp(
                     last_seen = ts
             sport = int(getattr(udp_layer, "sport", 0))
             dport = int(getattr(udp_layer, "dport", 0))
+            convo_key = (src_ip or "-", dst_ip or "-", sport, dport)
+            if convo_key not in conversations and len(conversations) >= MAX_UDP_FLOWS:
+                skipped_flows += 1
+                continue
 
             # Roles: a reply from a service port to an ephemeral port belongs to
             # the flow's client/server, not to the packet's src/dst — otherwise
@@ -403,7 +410,6 @@ def analyze_udp(
                 req_src_dst_ports[(client_key, server_key)].add(dport)
                 req_src_port_dsts[(client_key, dport)].add(server_key)
 
-            convo_key = (src_ip or "-", dst_ip or "-", sport, dport)
             convo = conversations[convo_key]
             convo["packets"] = int(convo["packets"]) + 1
             convo["bytes"] = int(convo["bytes"]) + pkt_len
@@ -486,6 +492,11 @@ def analyze_udp(
             f"{skipped_packets} UDP packet(s) skipped after a parse error "
             f"(first: {first_skip_error}); counts are lower bounds."
         )
+    if skipped_flows:
+        errors.append(
+            f"UDP flow tracking cap reached; {skipped_flows} packet(s) from "
+            "additional flows were omitted from flow analysis."
+        )
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:
@@ -514,7 +525,9 @@ def analyze_udp(
     http_summary = _busy(
         "HTTP", analyze_http, path, show_status=False, packets=packets, meta=meta
     )
-    file_summary = _busy("Files", analyze_files, path, show_status=False)
+    file_summary = _busy(
+        "Files", analyze_files, path, show_status=False, packets=packets, meta=meta
+    )
     services_summary = _busy(
         "Services", analyze_services, path, show_status=False, packets=packets, meta=meta
     )

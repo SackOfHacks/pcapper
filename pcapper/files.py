@@ -40,9 +40,11 @@ except Exception:  # pragma: no cover
 from .aim import analyze_aim
 from .cip import CIP_SERVICE_NAMES
 from .nfs import analyze_nfs
-from .pcap_cache import iter_packets
+from .openvpn import iter_openvpn_tcp_control_payloads, openvpn_tcp_control_opcodes
+from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     detect_file_type_bytes,
+    env_int,
     extract_packet_endpoints,
     memoize_analysis,
     packet_length,
@@ -503,6 +505,9 @@ except Exception:
     MAX_DECOMPRESSED_BYTES = 10 * 1024 * 1024
 if MAX_DECOMPRESSED_BYTES < 0:
     MAX_DECOMPRESSED_BYTES = 0
+FILES_TOTAL_STREAM_BYTES = env_int(
+    "PCAPPER_FILES_TOTAL_STREAM_BYTES", 512 * 1024 * 1024, minimum=1
+)
 
 ENIP_TCP_PORT = 44818
 ENIP_UDP_PORT = 2222
@@ -1499,6 +1504,89 @@ def _looks_like_tls(stream: bytes) -> bool:
     return 0 < record_len <= 18432
 
 
+def _parse_tls_certificate_records(stream: bytes) -> List[bytes]:
+    certs: List[bytes] = []
+    idx = 0
+    while idx + 5 <= len(stream):
+        content_type = stream[idx]
+        if content_type not in (20, 21, 22, 23):
+            idx += 1
+            continue
+        if stream[idx + 1] != 0x03:
+            idx += 1
+            continue
+        record_len = int.from_bytes(stream[idx + 3 : idx + 5], "big")
+        if record_len <= 0:
+            idx += 1
+            continue
+        record_end = idx + 5 + record_len
+        if record_end > len(stream):
+            break
+        record = stream[idx + 5 : record_end]
+        if content_type == 22:
+            hidx = 0
+            while hidx + 4 <= len(record):
+                htype = record[hidx]
+                hlen = int.from_bytes(record[hidx + 1 : hidx + 4], "big")
+                body_start = hidx + 4
+                body_end = body_start + hlen
+                if body_end > len(record):
+                    break
+                body = record[body_start:body_end]
+                if htype == 11 and len(body) >= 3:
+                    list_len = int.from_bytes(body[0:3], "big")
+                    pos = 3
+                    while pos + 3 <= len(body) and (pos - 3) < list_len:
+                        cert_len = int.from_bytes(body[pos : pos + 3], "big")
+                        pos += 3
+                        if pos + cert_len > len(body):
+                            break
+                        certs.append(bytes(body[pos : pos + cert_len]))
+                        pos += cert_len
+                hidx = body_end
+        idx = record_end
+    return certs
+
+
+def _extract_openvpn_tls_certificates(stream: bytes) -> List[bytes]:
+    if not stream or not openvpn_tcp_control_opcodes(stream):
+        return []
+    chunks: List[bytes] = []
+    seen_packet_ids: set[int] = set()
+    for item in iter_openvpn_tcp_control_payloads(stream):
+        if not item.data:
+            continue
+        if item.packet_id is not None:
+            if item.packet_id in seen_packet_ids:
+                continue
+            seen_packet_ids.add(item.packet_id)
+        chunks.append(item.data)
+    openvpn_payload = b"".join(chunks)
+    if not openvpn_payload:
+        return []
+    return [
+        cert
+        for cert in _parse_tls_certificate_records(openvpn_payload)
+        if _is_der_certificate(cert)
+    ]
+
+
+def _extract_openvpn_tls_certificates_from_chunks(
+    chunks: List[Tuple[int, bytes, int]],
+) -> List[bytes]:
+    stream, _ = _assemble_stream(chunks.copy(), limit=131072)
+    certificates = _extract_openvpn_tls_certificates(stream)
+    if certificates:
+        return certificates
+    # Some captures contain inconsistent TCP sequence numbers. Preserve packet
+    # order as a conservative fallback; certificate framing and DER validation
+    # still gate any extracted artifact.
+    packet_order_stream = b"".join(
+        payload for _seq, payload, packet_index in sorted(chunks, key=lambda item: item[2])
+    )
+    return _extract_openvpn_tls_certificates(packet_order_stream)
+
+
 def _looks_like_ssh(stream: bytes) -> bool:
     return stream.startswith(b"SSH-2.0-") or stream.startswith(b"SSH-1.99-")
 
@@ -1563,6 +1651,8 @@ def _looks_like_quic_payload(payload: bytes) -> bool:
 
 def _detect_app_protocol_from_stream(stream: bytes, sport: int, dport: int) -> str:
     # Content-based detection first (handles non-standard ports)
+    if openvpn_tcp_control_opcodes(stream):
+        return "OpenVPN"
     if _looks_like_http2(stream):
         return "HTTP2"
     if _looks_like_http(stream):
@@ -3473,6 +3563,7 @@ def _export_with_dpkt(
     retain_payload = bool(extract_name or view_name or hash_name)
     seen_x509: set[str] = set()
     seen_x509_meta: set[tuple[str, str, str, int]] = set()
+    openvpn_cert_artifacts = 0
     enip_buffers: Dict[tuple[str, str, int, int, str, str], Dict[str, object]] = {}
     enip_payload_hashes: set[str] = set()
     enip_best: Dict[tuple[str, str, str, str], tuple[int, str]] = {}
@@ -3495,6 +3586,33 @@ def _export_with_dpkt(
         defaultdict(list)
     )
     udp_packets: List[Tuple[str, str, int, int, bytes, int]] = []
+    retained_payload_bytes = 0
+    payload_budget_exhausted = False
+
+    def _retain_payload_budget(payload: bytes, packet_index: int) -> bytes:
+        nonlocal retained_payload_bytes, payload_budget_exhausted
+        if not payload or payload_budget_exhausted:
+            return b""
+        remaining = FILES_TOTAL_STREAM_BYTES - retained_payload_bytes
+        if remaining <= 0:
+            payload_budget_exhausted = True
+            errors.append(
+                f"Files reconstruction budget of {FILES_TOTAL_STREAM_BYTES} bytes "
+                f"reached at packet {packet_index}; later payload was counted but not retained "
+                "(PCAPPER_FILES_TOTAL_STREAM_BYTES)."
+            )
+            return b""
+        if len(payload) > remaining:
+            payload_budget_exhausted = True
+            retained_payload_bytes += remaining
+            errors.append(
+                f"Files reconstruction budget of {FILES_TOTAL_STREAM_BYTES} bytes "
+                f"reached at packet {packet_index}; payload truncated "
+                "(PCAPPER_FILES_TOTAL_STREAM_BYTES)."
+            )
+            return payload[:remaining]
+        retained_payload_bytes += len(payload)
+        return payload
 
     def _in_scope(src_ip: str, dst_ip: str) -> bool:
         if not filter_ip:
@@ -3537,6 +3655,7 @@ def _export_with_dpkt(
                     if isinstance(ip.data, dpkt.tcp.TCP):
                         tcp = ip.data
                         payload = bytes(tcp.data or b"")
+                        payload = _retain_payload_budget(payload, idx)
                         if payload:
                             tcp_streams[
                                 (src_ip, dst_ip, int(tcp.sport), int(tcp.dport))
@@ -3544,6 +3663,7 @@ def _export_with_dpkt(
                     elif isinstance(ip.data, dpkt.udp.UDP):
                         udp = ip.data
                         payload = bytes(udp.data or b"")
+                        payload = _retain_payload_budget(payload, idx)
                         if payload:
                             udp_packets.append(
                                 (
@@ -3570,6 +3690,7 @@ def _export_with_dpkt(
             if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 tcp = pkt[TCP]  # type: ignore[index]
                 payload = _scapy_segment_payload(tcp)
+                payload = _retain_payload_budget(payload, idx)
                 if payload:
                     seq = int(getattr(tcp, "seq", 0) or 0)
                     tcp_streams[
@@ -3578,6 +3699,7 @@ def _export_with_dpkt(
             elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
                 udp = pkt[UDP]  # type: ignore[index]
                 payload = _scapy_segment_payload(udp)
+                payload = _retain_payload_budget(payload, idx)
                 if payload:
                     udp_packets.append(
                         (src_ip, dst_ip, int(udp.sport), int(udp.dport), payload, idx)
@@ -3589,6 +3711,8 @@ def _export_with_dpkt(
         if not stream:
             continue
         ports = {sport, dport}
+        if openvpn_tcp_control_opcodes(stream):
+            encrypted_flow_counts["OpenVPN control-channel TLS"] += 1
         if _looks_like_ssh(stream) or 22 in ports:
             encrypted_flow_counts["SSH/SFTP/SCP"] += 1
         if _looks_like_tls(stream):
@@ -4018,6 +4142,42 @@ def _export_with_dpkt(
                 )
             )
 
+        # OpenVPN control-channel certificates. These explain VPN-over-443
+        # captures and should be visible in normal --files output, not only
+        # in the optional generic X509 artifact view.
+        for cert_idx, der in enumerate(
+            _extract_openvpn_tls_certificates_from_chunks(chunks), start=1
+        ):
+            digest = hashlib.sha256(_normalize_x509_payload(der)).hexdigest()
+            meta_key = (
+                src,
+                dst,
+                f"openvpn_server_cert_{first_pkt}_{cert_idx}.cer",
+                len(der),
+            )
+            if digest in seen_x509 or meta_key in seen_x509_meta:
+                continue
+            seen_x509.add(digest)
+            seen_x509_meta.add(meta_key)
+            openvpn_cert_artifacts += 1
+            _add_artifact(
+                FileArtifact(
+                    protocol="OpenVPN",
+                    src_ip=src,
+                    dst_ip=dst,
+                    src_port=sport,
+                    dst_port=dport,
+                    filename=f"openvpn_server_cert_{first_pkt}_{cert_idx}.cer",
+                    size_bytes=len(der),
+                    packet_index=first_pkt,
+                    note="OpenVPN control-channel VPN server certificate",
+                    file_type="X509",
+                    payload=der if need_payload else None,
+                    hostname=None,
+                    content_type="application/pkix-cert",
+                )
+            )
+
         # X509AF
         for pem in _extract_pem_certs(stream):
             digest = hashlib.sha256(_normalize_x509_payload(pem)).hexdigest()
@@ -4138,6 +4298,19 @@ def _export_with_dpkt(
                     content_type=None,
                 )
             )
+
+    if openvpn_cert_artifacts:
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "OpenVPN control-channel certificate observed",
+                "details": (
+                    f"{openvpn_cert_artifacts} VPN server certificate artifact(s) "
+                    "were carried inside OpenVPN control-channel TLS."
+                ),
+                "source": "Files",
+            }
+        )
 
     # TFTP
     tftp_sessions: Dict[frozenset[str], Dict[str, Any]] = defaultdict(
@@ -4481,6 +4654,7 @@ def _export_with_scapy(
     show_status: bool = False,
     filter_ip: Optional[str] = None,
     packets: Optional[List[Packet]] = None,
+    meta: PcapMeta | None = None,
     hash_name: Optional[str] = None,
 ) -> Optional[FileTransferSummary]:
     if IP is None and IPv6 is None:
@@ -4512,7 +4686,9 @@ def _export_with_scapy(
             errors.append(f"Scapy file extraction failed: {exc}")
     else:
         try:
-            for idx, pkt in enumerate(iter_packets(path, show_status=show_status), start=1):
+            for idx, pkt in enumerate(
+                iter_packets(path, meta=meta, show_status=show_status), start=1
+            ):
                 if _packet_in_scope(pkt):
                     extractor.process_packet(pkt, idx)
             extractor.finalize()
@@ -4804,6 +4980,7 @@ def analyze_files(
     executable_only: bool = False,
     hash_name: Optional[str] = None,
     packets: Optional[List[Packet]] = None,
+    meta: PcapMeta | None = None,
 ) -> FileTransferSummary:
     if dpkt is None:
         return FileTransferSummary(path, 0, [], [], [], [], [], ["dpkt unavailable"])
@@ -4833,6 +5010,7 @@ def analyze_files(
             show_status=False,
             filter_ip=filter_ip,
             packets=packets,
+            meta=meta,
             hash_name=hash_name,
         )
     dpkt_summary = _merge_export_summaries(dpkt_summary, scapy_summary)

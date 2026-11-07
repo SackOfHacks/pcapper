@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
+from .openvpn import is_openvpn_tcp_control, tcp_flow_id
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import get_packet_ports, memoize_analysis, safe_float
 
@@ -2285,6 +2286,7 @@ def analyze_hostname(
     # certificates) must not be mapped to the proxy's IP. Both orientations
     # are stored so server->client tunnel bytes are recognized too.
     proxy_flows: set[tuple[str, int, str, int]] = set()
+    openvpn_flows: set[tuple[tuple[str, int], tuple[str, int]]] = set()
     reverse_ptr = (
         _target_reverse_ptr(target_ip).lower() if target_filter_enabled else ""
     )
@@ -2596,6 +2598,17 @@ def analyze_hostname(
                                         summary.method_counts[method] += 1
 
             payload = _extract_payload(raw_layer, tcp_layer, udp_layer)
+            openvpn_flow = False
+            if (
+                tcp_layer is not None
+                and payload
+                and sport is not None
+                and dport is not None
+            ):
+                flow_id = tcp_flow_id(src_ip, int(sport), dst_ip, int(dport))
+                if flow_id in openvpn_flows or is_openvpn_tcp_control(payload):
+                    openvpn_flows.add(flow_id)
+                    openvpn_flow = True
             for (
                 host_value,
                 method,
@@ -3233,7 +3246,7 @@ def analyze_hostname(
                     sni = _parse_raw_tls_client_hello_sni(payload)
                 if sni:
                     method = "TLS SNI"
-                    protocol = "HTTPS/TLS"
+                    protocol = "OpenVPN/TLS" if openvpn_flow else "HTTPS/TLS"
                     in_proxy_tunnel = (
                         src_ip,
                         sport or 0,
@@ -3246,6 +3259,8 @@ def analyze_hostname(
                     sni_details = (
                         f"ClientHello SNI inside CONNECT tunnel via proxy {dst_ip}"
                         if in_proxy_tunnel
+                        else f"OpenVPN control-channel TLS SNI seen for VPN destination {dst_ip}"
+                        if openvpn_flow
                         else f"ClientHello SNI seen for destination {dst_ip}"
                     )
                     sni_allowed = (
@@ -3292,6 +3307,8 @@ def analyze_hostname(
                 cert_details = (
                     f"{method} observed in certificate inside CONNECT tunnel via {dst_ip}"
                     if in_proxy_tunnel
+                    else f"{method} observed in OpenVPN control-channel certificate sent by VPN server {src_ip}"
+                    if openvpn_flow
                     else f"{method} observed in certificate sent by {src_ip}"
                 )
                 cert_allowed = (
@@ -3303,7 +3320,7 @@ def analyze_hostname(
                     findings_map,
                     hostname=cert_hostname,
                     mapped_ip=mapped_ip,
-                    protocol="HTTPS/TLS",
+                    protocol="OpenVPN/TLS" if openvpn_flow else "HTTPS/TLS",
                     method=method,
                     confidence=confidence,
                     details=cert_details,
@@ -3314,7 +3331,9 @@ def analyze_hostname(
                 ):
                     found_evidence = True
                     packet_relevant = True
-                    summary.protocol_counts["HTTPS/TLS"] += 1
+                    summary.protocol_counts[
+                        "OpenVPN/TLS" if openvpn_flow else "HTTPS/TLS"
+                    ] += 1
                     summary.method_counts[method] += 1
 
             if udp_layer is not None:

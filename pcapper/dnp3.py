@@ -3,16 +3,16 @@ from __future__ import annotations
 import ipaddress
 import math
 import struct
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
     from scapy.layers.inet import TCP, UDP
-    from scapy.packet import Raw
+    from scapy.packet import Padding, Raw
 except ImportError:
-    TCP = UDP = Raw = None
+    Padding = TCP = UDP = Raw = None
 
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, safe_float, memoize_analysis
@@ -137,7 +137,24 @@ CONTROL_OBJECT_GROUPS = {10, 11, 12, 40, 41, 42}
 FILE_OBJECT_GROUPS = {70}
 
 QUALIFIER_RANGE_SIZES = {0x00: 1, 0x01: 2, 0x02: 4}
-QUALIFIER_COUNT_SIZES = {0x05: 1, 0x06: 2, 0x07: 4}
+QUALIFIER_COUNT_SIZES = {
+    0x07: 1,
+    0x08: 2,
+    0x09: 4,
+    0x17: 1,
+    0x28: 2,
+}
+QUALIFIER_INDEX_PREFIX_SIZES = {0x17: 1, 0x28: 2}
+QUALIFIER_ALL_OBJECTS = 0x06
+MAX_DNP3_TCP_STREAMS = 4096
+MAX_DNP3_TCP_TAIL = 292
+MAX_DNP3_TRANSPORT_STREAMS = 4096
+MAX_DNP3_APP_FRAGMENT = 65535
+MAX_DNP3_TRANSPORT_BUFFERED = 8 * 1024 * 1024
+MAX_DNP3_MESSAGES = 100000
+MAX_DNP3_CONTROL_COMMANDS = 10000
+MAX_DNP3_VALUE_STATES = 100000
+MAX_DNP3_SELECTED_PAIRS = 100000
 
 TIME_16 = 2
 TIME_32 = 4
@@ -268,8 +285,10 @@ def _check_crc(data: bytes, crc_bytes: bytes) -> bool:
 
 
 def _strip_crc_blocks(frame: bytes) -> tuple[bytes, bool]:
-    if len(frame) <= 10:
+    if len(frame) < 10:
         return b"", False
+    if len(frame) == 10:
+        return b"", True
     data_with_crc = frame[10:]
     idx = 0
     out = bytearray()
@@ -288,22 +307,18 @@ def _strip_crc_blocks(frame: bytes) -> tuple[bytes, bool]:
     return bytes(out), all_ok
 
 
-def _parse_dnp3_frames(payload: bytes) -> list[tuple[int, int, int, bytes, bool]]:
+def _extract_dnp3_frames(
+    payload: bytes,
+) -> tuple[list[tuple[int, int, int, bytes, bool]], bytes]:
     frames: list[tuple[int, int, int, bytes, bool]] = []
     idx = 0
-    while idx + 10 <= len(payload):
+    while idx < len(payload):
         start = payload.find(DNP3_START_BYTES, idx)
-        if start < 0 or start + 10 > len(payload):
-            break
-        if start + 3 > len(payload):
-            break
+        if start < 0:
+            return frames, payload[-1:] if payload.endswith(b"\x05") else b""
+        if start + 10 > len(payload):
+            return frames, payload[start:]
         length = payload[start + 2]
-        # DNP3 LENGTH counts control+dst+src+user-data (= 5 + N), excluding the
-        # start/length octets AND every CRC. The full frame on the wire is
-        # 10 (header+header-CRC) + N user-data bytes + a 2-byte CRC per 16-byte
-        # data block. The previous `start + 3 + length` stopped at the end of the
-        # user data, truncating the data-block CRCs, so the data CRC check failed
-        # on every valid multi-byte frame ("CRC Mismatch" flood).
         n_userdata = length - 5
         if n_userdata < 0:
             idx = start + 2
@@ -311,35 +326,41 @@ def _parse_dnp3_frames(payload: bytes) -> list[tuple[int, int, int, bytes, bool]
         n_blocks = (n_userdata + 15) // 16 if n_userdata > 0 else 0
         frame_end = start + 10 + n_userdata + 2 * n_blocks
         if frame_end > len(payload):
-            break
+            return frames, payload[start:]
         frame = payload[start:frame_end]
-        if len(frame) < 10:
-            idx = start + 2
-            continue
         dl_ctrl = frame[3]
         dl_dst = struct.unpack("<H", frame[4:6])[0]
         dl_src = struct.unpack("<H", frame[6:8])[0]
         header_crc_ok = _check_crc(frame[0:8], frame[8:10])
         user_data, data_crc_ok = _strip_crc_blocks(frame)
-        crc_ok = header_crc_ok and data_crc_ok
-        frames.append((dl_src, dl_dst, dl_ctrl, user_data, crc_ok))
+        frames.append((dl_src, dl_dst, dl_ctrl, user_data, header_crc_ok and data_crc_ok))
         idx = frame_end
+    return frames, b""
+
+
+def _parse_dnp3_frames(payload: bytes) -> list[tuple[int, int, int, bytes, bool]]:
+    frames, _ = _extract_dnp3_frames(payload)
     return frames
 
 
-def _object_data_length(group: int, variation: int, count: int | None) -> int | None:
+def _object_data_length(
+    group: int,
+    variation: int,
+    count: int | None,
+    index_prefix_size: int = 0,
+) -> int | None:
     if count is None:
         return None
     if (group, variation) in PACKED_BINARY_VARIATIONS:
-        return math.ceil(count / 8)
+        return None if index_prefix_size else math.ceil(count / 8)
     if (group, variation) in PACKED_DOUBLE_VARIATIONS:
-        return math.ceil(count / 4)
+        return None if index_prefix_size else math.ceil(count / 4)
     if group == 110 and variation > 0:
-        return variation * count
+        return (variation + index_prefix_size) * count
     size = OBJECT_SIZES.get((group, variation))
     if size is None:
         return None
-    return size * count
+    return (size + index_prefix_size) * count
 
 
 def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
@@ -479,6 +500,7 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
         count = None
         start = None
         stop = None
+        index_prefix_size = QUALIFIER_INDEX_PREFIX_SIZES.get(qualifier, 0)
         if qualifier in QUALIFIER_RANGE_SIZES:
             size = QUALIFIER_RANGE_SIZES[qualifier]
             if idx + (2 * size) > len(data):
@@ -493,6 +515,8 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
                 break
             count = int.from_bytes(data[idx : idx + size], "little")
             idx += size
+        elif qualifier == QUALIFIER_ALL_OBJECTS:
+            pass
         else:
             break
 
@@ -502,6 +526,10 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
             range_text = f" range={start}-{stop}"
         elif count is not None:
             range_text = f" count={count}"
+            if index_prefix_size:
+                range_text += " indexed"
+        elif qualifier == QUALIFIER_ALL_OBJECTS:
+            range_text = " all"
         summary = f"{group_name} {group}.{variation}{range_text}"
         objects.append(
             {
@@ -515,19 +543,46 @@ def _parse_objects(data: bytes) -> tuple[list[dict[str, object]], list[str]]:
         )
         details.append(f"{group}.{variation}")
 
-        data_len = _object_data_length(group, variation, count)
+        data_len = _object_data_length(
+            group, variation, count, index_prefix_size
+        )
         if data_len is None:
             break
         if idx + data_len > len(data):
             break
+        values_data = data[idx : idx + data_len]
+        indices = []
+        if index_prefix_size:
+            object_data_size = _object_data_length(group, variation, 1)
+            if object_data_size is None:
+                break
+            values = bytearray()
+            stride = index_prefix_size + object_data_size
+            for item_idx in range(count or 0):
+                item_start = item_idx * stride
+                if item_idx < 4:
+                    indices.append(
+                        int.from_bytes(
+                            values_data[item_start : item_start + index_prefix_size],
+                            "little",
+                        )
+                    )
+                values.extend(
+                    values_data[
+                        item_start + index_prefix_size : item_start + stride
+                    ]
+                )
+            values_data = bytes(values)
         value_preview, values_out = _decode_values(
-            group, variation, data[idx : idx + data_len], count
+            group, variation, values_data, count
         )
         if value_preview:
             summary = f"{summary} values={value_preview}"
             objects[-1]["summary"] = summary
         if values_out:
             objects[-1]["values"] = values_out
+        if indices:
+            objects[-1]["indices"] = indices
         idx += data_len
     return objects, details
 
@@ -623,7 +678,7 @@ class Dnp3Analysis:
 
     @property
     def unique_dnp3_addresses(self) -> int:
-        return len(set(list(self.src_addrs.keys()) + list(self.dst_addrs.keys())))
+        return len(self.src_addrs.keys() | self.dst_addrs.keys())
 
     @property
     def master_ip_list(self) -> list[str]:
@@ -684,83 +739,66 @@ def analyze_dnp3(
     unsolicited_responses = 0
     src_time_counts: Counter[str] = Counter()
     nonstandard_port_counts: Counter[str] = Counter()
-    reassembly_buffers: dict[tuple[str, str, int, int], bytearray] = {}
+    tcp_streams: OrderedDict[
+        tuple[str, str, int, int], tuple[int, bytes]
+    ] = OrderedDict()
+    reassembly_buffers: OrderedDict[
+        tuple[str, str, int, int], tuple[bytearray, int]
+    ] = OrderedDict()
+    transport_buffered_bytes = 0
+    tcp_gap_reported = False
+    transport_error_reported = False
+    message_limit_reported = False
+    control_limit_reported = False
+    value_limit_reported = False
+    selected_pair_limit_reported = False
     selected_pairs: Set[Tuple[str, int]] = set()
     op_no_select_flagged: Set[Tuple[str, int]] = set()
     broadcast_flagged: Set[Tuple[str, int]] = set()
 
-    start_time = None
-    last_time = None
-
-    def _parse_object_header(
-        data: bytes,
-    ) -> tuple[
-        Optional[int],
-        Optional[int],
-        Optional[int],
-        Optional[int],
-        Optional[int],
-        Optional[int],
-    ]:
-        if len(data) < 3:
-            return None, None, None, None, None, None
-        group = data[0]
-        variation = data[1]
-        qualifier = data[2]
-        idx = 3
-        start = None
-        stop = None
-        count = None
-        if qualifier in QUALIFIER_RANGE_SIZES:
-            size = QUALIFIER_RANGE_SIZES[qualifier]
-            if idx + (2 * size) > len(data):
-                return group, variation, qualifier, None, None, None
-            start = int.from_bytes(data[idx : idx + size], "little")
-            stop = int.from_bytes(data[idx + size : idx + 2 * size], "little")
-            if stop is not None and start is not None:
-                count = max((stop - start + 1), 0)
-        elif qualifier in QUALIFIER_COUNT_SIZES:
-            size = QUALIFIER_COUNT_SIZES[qualifier]
-            if idx + size > len(data):
-                return group, variation, qualifier, None, None, None
-            count = int.from_bytes(data[idx : idx + size], "little")
-        return group, variation, qualifier, count, start, stop
+    start_time: float | None = None
+    last_time: float | None = None
 
     try:
         for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", 0))
-            if start_time is None:
-                start_time = ts
-            last_time = ts
-
             # Check ports
             has_transport = False
             sport, dport = 0, 0
+            tcp_seq: int | None = None
+            tcp_flags = 0
             payload = b""
 
             if pkt.haslayer(TCP):
                 has_transport = True
-                sport = int(pkt[TCP].sport)
-                dport = int(pkt[TCP].dport)
-                payload_obj = pkt[TCP].payload
-                payload = bytes(payload_obj) if payload_obj else b""
-                if not payload and Raw is not None and pkt.haslayer(Raw):
-                    try:
-                        payload = bytes(pkt[Raw].load)
-                    except Exception:
-                        pass
+                tcp_layer = pkt[TCP]
+                sport = int(tcp_layer.sport)
+                dport = int(tcp_layer.dport)
+                tcp_seq = int(tcp_layer.seq)
+                tcp_flags = int(tcp_layer.flags)
+                payload_obj = tcp_layer.payload
+                if Raw is not None and pkt.haslayer(Raw):
+                    payload = bytes(pkt[Raw].load)
+                else:
+                    payload = bytes(payload_obj) if payload_obj else b""
+                    if Padding is not None and pkt.haslayer(Padding):
+                        padding = bytes(pkt[Padding])
+                        if padding and payload.endswith(padding):
+                            payload = payload[: -len(padding)]
             elif pkt.haslayer(UDP):
                 has_transport = True
                 sport = int(pkt[UDP].sport)
                 dport = int(pkt[UDP].dport)
                 payload_obj = pkt[UDP].payload
-                payload = bytes(payload_obj) if payload_obj else b""
-                if not payload and Raw is not None and pkt.haslayer(Raw):
-                    try:
-                        payload = bytes(pkt[Raw].load)
-                    except Exception:
-                        pass
+                if Raw is not None and pkt.haslayer(Raw):
+                    payload = bytes(pkt[Raw].load)
+                else:
+                    payload = bytes(payload_obj) if payload_obj else b""
+                    if Padding is not None and pkt.haslayer(Padding):
+                        padding = bytes(pkt[Padding])
+                        if padding and payload.endswith(padding):
+                            payload = payload[: -len(padding)]
             else:
                 # Fallback: parse TCP/UDP from raw bytes if scapy didn't dissect layers
                 try:
@@ -812,8 +850,68 @@ def analyze_dnp3(
             if not has_transport:
                 continue
 
-            frames = _parse_dnp3_frames(payload) if payload else []
             on_dnp3_port = dport == DNP3_PORT or (sport == DNP3_PORT and dport >= 1024)
+            src_ip, dst_ip = extract_packet_endpoints(pkt)
+            if not src_ip:
+                src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
+            if not dst_ip:
+                dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "?"
+
+            frames: list[tuple[int, int, int, bytes, bool]] = []
+            if payload:
+                if pkt.haslayer(TCP) and tcp_seq is not None:
+                    stream_key = (src_ip, dst_ip, sport, dport)
+                    if (
+                        on_dnp3_port
+                        or stream_key in tcp_streams
+                        or DNP3_START_BYTES in payload
+                        or payload.endswith(b"\x05")
+                    ):
+                        previous = tcp_streams.pop(stream_key, None)
+                        segment_payload = payload
+                        duplicate_segment = False
+                        stream_tail = b""
+                        if previous is not None:
+                            expected_seq, stream_tail = previous
+                            delta = (tcp_seq - expected_seq) & 0xFFFFFFFF
+                            if 0 < delta < 0x80000000:
+                                stream_tail = b""
+                                if not tcp_gap_reported:
+                                    errors.append(
+                                        "DNP3 TCP sequence gap observed; incomplete frame data was discarded."
+                                    )
+                                    tcp_gap_reported = True
+                            elif delta >= 0x80000000:
+                                overlap = (expected_seq - tcp_seq) & 0xFFFFFFFF
+                                if overlap >= len(segment_payload):
+                                    segment_payload = b""
+                                    duplicate_segment = True
+                                else:
+                                    segment_payload = segment_payload[overlap:]
+                        if duplicate_segment:
+                            frames = []
+                            tcp_streams[stream_key] = previous
+                        else:
+                            frames, remainder = _extract_dnp3_frames(
+                                stream_tail + segment_payload
+                            )
+                        if not duplicate_segment and remainder and not (tcp_flags & 0x05):
+                            if len(tcp_streams) >= MAX_DNP3_TCP_STREAMS:
+                                tcp_streams.popitem(last=False)
+                                if not tcp_gap_reported:
+                                    errors.append(
+                                        "DNP3 TCP stream state limit reached; oldest incomplete stream was discarded."
+                                    )
+                                    tcp_gap_reported = True
+                            if len(remainder) <= MAX_DNP3_TCP_TAIL:
+                                next_seq = (
+                                    tcp_seq
+                                    + len(payload)
+                                    + bool(tcp_flags & 0x02)
+                                ) & 0xFFFFFFFF
+                                tcp_streams[stream_key] = (next_seq, remainder)
+                else:
+                    frames = _parse_dnp3_frames(payload)
 
             # Off the standard DNP3 port, only a CRC-VALID frame counts as
             # real DNP3: a chance 0x05 0x64 match in IT/malware traffic
@@ -822,22 +920,17 @@ def analyze_dnp3(
             # positives. On-port, accept frames even with CRC errors (real
             # DNP3 corruption/tampering is itself worth surfacing).
             has_valid_frame = any(f[4] for f in frames)
-            is_dnp3 = on_dnp3_port or has_valid_frame
+            is_dnp3 = (on_dnp3_port and bool(payload)) or has_valid_frame
             if not is_dnp3:
                 continue
+
+            start_time = ts if start_time is None else min(start_time, ts)
+            last_time = ts if last_time is None else max(last_time, ts)
 
             if has_valid_frame and not on_dnp3_port:
                 nonstandard_port_counts[f"{sport}->{dport}"] += 1
 
             dnp3_packets += 1
-
-            # Network-layer addresses (DNP3 runs over TCP/UDP) — not the
-            # Ethernet MACs that pkt[0].src would yield.
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-            if not src_ip:
-                src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
-            if not dst_ip:
-                dst_ip = pkt[0].dst if hasattr(pkt[0], "dst") else "?"
 
             for dl_src, dl_dst, dl_ctrl, user_data, crc_ok in frames:
                 ip_endpoints[src_ip] += 1
@@ -875,16 +968,57 @@ def analyze_dnp3(
                 fir = bool(tp_header & 0x80)
                 fin = bool(tp_header & 0x40)
                 transport_seq = tp_header & 0x3F
-                _ = transport_seq
 
                 key = (src_ip, dst_ip, dl_src, dl_dst)
+                previous_fragment = reassembly_buffers.pop(key, None)
+                if previous_fragment is not None:
+                    transport_buffered_bytes -= len(previous_fragment[0])
                 if fir:
-                    reassembly_buffers[key] = bytearray()
-                buffer = reassembly_buffers.setdefault(key, bytearray())
-                buffer.extend(user_data[1:])
-                if not fin:
+                    fragment = bytearray(user_data[1:])
+                    expected_transport_seq = (transport_seq + 1) & 0x3F
+                elif previous_fragment is None:
+                    if not transport_error_reported:
+                        errors.append(
+                            "DNP3 transport fragment without FIR was discarded."
+                        )
+                        transport_error_reported = True
                     continue
-                app_data = bytes(reassembly_buffers.pop(key, buffer))
+                else:
+                    fragment, expected_transport_seq = previous_fragment
+                    if transport_seq != expected_transport_seq:
+                        if not transport_error_reported:
+                            errors.append(
+                                "DNP3 transport sequence gap observed; incomplete application fragment was discarded."
+                            )
+                            transport_error_reported = True
+                        continue
+                    fragment.extend(user_data[1:])
+                    expected_transport_seq = (transport_seq + 1) & 0x3F
+
+                if len(fragment) > MAX_DNP3_APP_FRAGMENT:
+                    if not transport_error_reported:
+                        errors.append(
+                            "DNP3 application fragment exceeded the 65535-byte analysis limit and was discarded."
+                        )
+                        transport_error_reported = True
+                    continue
+                if not fin:
+                    while reassembly_buffers and (
+                        len(reassembly_buffers) >= MAX_DNP3_TRANSPORT_STREAMS
+                        or transport_buffered_bytes + len(fragment)
+                        > MAX_DNP3_TRANSPORT_BUFFERED
+                    ):
+                        _, evicted_fragment = reassembly_buffers.popitem(last=False)
+                        transport_buffered_bytes -= len(evicted_fragment[0])
+                        if not transport_error_reported:
+                            errors.append(
+                                "DNP3 transport stream state limit reached; oldest incomplete fragment was discarded."
+                            )
+                            transport_error_reported = True
+                    reassembly_buffers[key] = (fragment, expected_transport_seq)
+                    transport_buffered_bytes += len(fragment)
+                    continue
+                app_data = bytes(fragment)
                 if len(app_data) < 2:
                     continue
 
@@ -945,18 +1079,24 @@ def analyze_dnp3(
                     # Control). A single one is worth surfacing.
                     _cc_key = (src_ip, dst_ip, func_code, dl_dst)
                     if _cc_key not in control_cmd_seen:
-                        control_cmd_seen.add(_cc_key)
-                        control_commands.append(
-                            {
-                                "ts": ts,
-                                "src_ip": src_ip,
-                                "dst_ip": dst_ip,
-                                "src_addr": dl_src,
-                                "dst_addr": dl_dst,
-                                "func": func_name,
-                                "func_code": func_code,
-                            }
-                        )
+                        if len(control_commands) < MAX_DNP3_CONTROL_COMMANDS:
+                            control_cmd_seen.add(_cc_key)
+                            control_commands.append(
+                                {
+                                    "ts": ts,
+                                    "src_ip": src_ip,
+                                    "dst_ip": dst_ip,
+                                    "src_addr": dl_src,
+                                    "dst_addr": dl_dst,
+                                    "func": func_name,
+                                    "func_code": func_code,
+                                }
+                            )
+                        elif not control_limit_reported:
+                            errors.append(
+                                "DNP3 control-command evidence limit reached; additional command records were omitted."
+                            )
+                            control_limit_reported = True
                         # Operate / Direct Operate drive an output (relay/
                         # setpoint). Surface each distinct one — even a single
                         # command matters in OT.
@@ -1027,13 +1167,26 @@ def analyze_dnp3(
                 # DirectOperate (5/6) is one-step by design, so only a bare
                 # Operate-4 with no observed Select is the SBO-bypass signal.
                 if func_code == 3:
-                    selected_pairs.add((src_ip, dl_dst))
-                elif func_code == 4 and (src_ip, dl_dst) not in selected_pairs:
+                    selected_key = (src_ip, dl_dst)
                     if (
-                        (src_ip, dl_dst) not in op_no_select_flagged
+                        selected_key in selected_pairs
+                        or len(selected_pairs) < MAX_DNP3_SELECTED_PAIRS
+                    ):
+                        selected_pairs.add(selected_key)
+                    elif not selected_pair_limit_reported:
+                        errors.append(
+                            "DNP3 select tracking limit reached; additional Select/Operate pairing is incomplete."
+                        )
+                        selected_pair_limit_reported = True
+                elif func_code == 4:
+                    selected_key = (src_ip, dl_dst)
+                    if selected_key in selected_pairs:
+                        selected_pairs.remove(selected_key)
+                    elif (
+                        selected_key not in op_no_select_flagged
                         and len(anomalies) < max_anomalies
                     ):
-                        op_no_select_flagged.add((src_ip, dl_dst))
+                        op_no_select_flagged.add(selected_key)
                         anomalies.append(
                             Dnp3Anomaly(
                                 "MEDIUM",
@@ -1136,12 +1289,28 @@ def analyze_dnp3(
                             variation, int
                         ):
                             continue
+                        indices = item.get("indices")
                         for offset, value in enumerate(values):
                             if len(value_changes) >= 200:
                                 break
-                            index = start_index + offset
+                            index = (
+                                indices[offset]
+                                if isinstance(indices, list)
+                                and offset < len(indices)
+                                else start_index + offset
+                            )
                             key = (group_id, variation, index)
                             prev = last_values.get(key)
+                            if (
+                                key not in last_values
+                                and len(last_values) >= MAX_DNP3_VALUE_STATES
+                            ):
+                                if not value_limit_reported:
+                                    errors.append(
+                                        "DNP3 value tracking limit reached; additional point state was omitted."
+                                    )
+                                    value_limit_reported = True
+                                continue
                             if prev is not None and prev != value:
                                 value_changes.append(
                                     {
@@ -1192,34 +1361,50 @@ def analyze_dnp3(
                                     )
                                     break
 
-                messages.append(
-                    Dnp3Message(
-                        ts=ts,
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        src_addr=dl_src,
-                        dst_addr=dl_dst,
-                        len=len(app_data),
-                        func_code=func_code,
-                        func_name=func_name,
-                        is_master=(dl_src < 65500),
-                        object_summary=object_summary,
+                if len(messages) < MAX_DNP3_MESSAGES:
+                    messages.append(
+                        Dnp3Message(
+                            ts=ts,
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            src_addr=dl_src,
+                            dst_addr=dl_dst,
+                            len=len(app_data),
+                            func_code=func_code,
+                            func_name=func_name,
+                            is_master=bool(dl_ctrl & 0x80),
+                            object_summary=object_summary,
+                        )
                     )
-                )
+                elif not message_limit_reported:
+                    errors.append(
+                        "DNP3 message record limit reached; additional message details were omitted."
+                    )
+                    message_limit_reported = True
 
             continue
 
     except Exception as e:
         errors.append(f"{type(e).__name__}: {e}")
 
+    if tcp_streams:
+        errors.append(
+            f"{len(tcp_streams)} incomplete DNP3 TCP frame stream(s) remained at end of capture."
+        )
+    if reassembly_buffers:
+        errors.append(
+            f"{len(reassembly_buffers)} incomplete DNP3 transport fragment(s) remained at end of capture."
+        )
+
     duration = 0.0
-    if start_time and last_time:
+    if start_time is not None and last_time is not None:
         duration = last_time - start_time
     # Flag an implausible capture window (e.g. a merged/challenge pcap whose
     # frames span years) so the duration isn't read as a real monitoring period.
     noncontiguous_capture = bool(
         duration > 7 * 86400 and dnp3_packets and dnp3_packets < 100000
     )
+    summary_ts = start_time if start_time is not None else 0.0
 
     # Select-before-Operate is a two-step control sequence. Selects with no
     # matching Operate = an aborted/incomplete SBO or an operator/attacker
@@ -1235,7 +1420,7 @@ def analyze_dnp3(
                 "attempt. Confirm operator intent.",
                 "*",
                 "*",
-                0.0,
+                summary_ts,
                 attack="T0855 Unauthorized Command Message",
                 evidence=f"select={select_count} operate={operate_count}",
             )
@@ -1251,7 +1436,7 @@ def analyze_dnp3(
                         f"Observed DNP3 signature on {session} ({count} packets)",
                         "*",
                         "*",
-                        0.0,
+                        summary_ts,
                     )
                 )
 
@@ -1268,7 +1453,7 @@ def analyze_dnp3(
                         f"Source contacted {unique_dsts} endpoints with low response rate.",
                         src_ip,
                         "*",
-                        0.0,
+                        summary_ts,
                     )
                 )
 
@@ -1281,7 +1466,7 @@ def analyze_dnp3(
                     f"Source probed {addr_count} DNP3 destination addresses.",
                     src_ip,
                     "*",
-                    0.0,
+                    summary_ts,
                 )
             )
 
@@ -1296,7 +1481,7 @@ def analyze_dnp3(
                     f"{count} control/operate commands ({ratio:.0%} of requests).",
                     src_ip,
                     "*",
-                    0.0,
+                    summary_ts,
                 )
             )
 
@@ -1309,7 +1494,7 @@ def analyze_dnp3(
                     f"{count} enable/disable unsolicited operations observed.",
                     src_ip,
                     "*",
-                    0.0,
+                    summary_ts,
                 )
             )
 
@@ -1322,7 +1507,7 @@ def analyze_dnp3(
                     f"{count} restart commands observed.",
                     src_ip,
                     "*",
-                    0.0,
+                    summary_ts,
                 )
             )
 
@@ -1335,7 +1520,7 @@ def analyze_dnp3(
                     f"{count} application control/config operations observed.",
                     src_ip,
                     "*",
-                    0.0,
+                    summary_ts,
                 )
             )
 
@@ -1348,7 +1533,7 @@ def analyze_dnp3(
                     f"{count} file transfer/control operations observed.",
                     src_ip,
                     "*",
-                    0.0,
+                    summary_ts,
                 )
             )
 
@@ -1361,7 +1546,7 @@ def analyze_dnp3(
                     f"{count} time sync/delay operations observed.",
                     src_ip,
                     "*",
-                    0.0,
+                    summary_ts,
                 )
             )
 
@@ -1380,7 +1565,7 @@ def analyze_dnp3(
                 f"DNP3 traffic observed with public endpoint(s): {', '.join(sorted(public_endpoints)[:5])}.",
                 "*",
                 "*",
-                0.0,
+                summary_ts,
             )
         )
 

@@ -56,6 +56,8 @@ _FIN = 0x01
 _RST = 0x04
 
 _MAX_SESSIONS = 2000
+_MAX_HANDSHAKES = 50_000
+_MAX_OT_HOSTS = 50_000
 _MAX_OT_OUT_PER_HOST = 64
 
 
@@ -131,6 +133,23 @@ def analyze_remote_access(
     seen_sessions: set[tuple[str, str, int]] = set()
     # Per host: earliest remote-in ts and the sessions seen (for severity).
     ot_out_by_host: dict[str, list[tuple[float, str, str]]] = {}
+    omitted_handshakes = 0
+    omitted_sessions = 0
+    omitted_ot_events = 0
+
+    def _handshake_state(
+        key: tuple[str, str, int, int],
+    ) -> dict[str, object] | None:
+        nonlocal omitted_handshakes
+        state = hs.get(key)
+        if state is not None:
+            return state
+        if len(hs) >= _MAX_HANDSHAKES:
+            omitted_handshakes += 1
+            return None
+        state = {"syn": False, "synack": False, "ack": False, "ts": 0.0}
+        hs[key] = state
+        return state
 
     try:
         for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
@@ -156,13 +175,17 @@ def analyze_remote_access(
                 if is_syn and not is_ack and dport in REMOTE_ACCESS_PORTS:
                     # client=src -> server=dst:dport
                     key = (src, dst, sport, dport)
-                    st = hs.setdefault(key, {"syn": False, "synack": False, "ack": False, "ts": ts})
-                    st["syn"] = True
+                    st = _handshake_state(key)
+                    if st is not None:
+                        st["syn"] = True
+                        st["ts"] = ts
                 elif is_syn and is_ack and sport in REMOTE_ACCESS_PORTS:
                     # SYN-ACK: server=src:sport -> client=dst; flip to client view
                     key = (dst, src, dport, sport)
-                    st = hs.setdefault(key, {"syn": False, "synack": False, "ack": False, "ts": ts})
-                    st["synack"] = True
+                    st = _handshake_state(key)
+                    if st is not None:
+                        st["synack"] = True
+                        st["ts"] = ts
                 elif is_ack and not is_syn and dport in REMOTE_ACCESS_PORTS:
                     # final ACK (and subsequent data ACKs) client->server
                     key = (src, dst, sport, dport)
@@ -173,18 +196,22 @@ def analyze_remote_access(
                         if st["syn"] and st["synack"] and st["ack"]:
                             client_ip, server_ip, _cp, server_port = key
                             dedup = (client_ip, server_ip, server_port)
-                            if dedup not in seen_sessions and len(seen_sessions) < _MAX_SESSIONS:
-                                seen_sessions.add(dedup)
-                                analysis.sessions.append(
-                                    RemoteInSession(
-                                        server_ip=server_ip,
-                                        client_ip=client_ip,
-                                        port=server_port,
-                                        proto=REMOTE_ACCESS_PORTS.get(server_port, str(server_port)),
-                                        ts=float(st["ts"]),
-                                        external=_is_public_ip(client_ip),
+                            if dedup not in seen_sessions:
+                                if len(seen_sessions) < _MAX_SESSIONS:
+                                    seen_sessions.add(dedup)
+                                    analysis.sessions.append(
+                                        RemoteInSession(
+                                            server_ip=server_ip,
+                                            client_ip=client_ip,
+                                            port=server_port,
+                                            proto=REMOTE_ACCESS_PORTS.get(server_port, str(server_port)),
+                                            ts=float(st["ts"]),
+                                            external=_is_public_ip(client_ip),
+                                        )
                                     )
-                                )
+                                else:
+                                    omitted_sessions += 1
+                            hs.pop(key, None)
 
             # --- OT command-out tracking (host = client issuing OT traffic) ---
             transport = None
@@ -203,11 +230,32 @@ def analyze_remote_access(
                 and ot_dport in OT_PORT_PROTOCOLS
                 and _payload_len(pkt, transport) > 0
             ):
-                bucket = ot_out_by_host.setdefault(src, [])
+                bucket = ot_out_by_host.get(src)
+                if bucket is None:
+                    if len(ot_out_by_host) >= _MAX_OT_HOSTS:
+                        omitted_ot_events += 1
+                        continue
+                    bucket = []
+                    ot_out_by_host[src] = bucket
                 if len(bucket) < _MAX_OT_OUT_PER_HOST:
                     bucket.append((ts, dst, OT_PORT_PROTOCOLS[ot_dport]))
+                else:
+                    omitted_ot_events += 1
     except Exception as exc:  # pragma: no cover - defensive
         errors.append(f"{type(exc).__name__}: {exc}")
+
+    if omitted_handshakes:
+        errors.append(
+            f"Remote-access handshake limit reached; omitted {omitted_handshakes} handshake packets."
+        )
+    if omitted_sessions:
+        errors.append(
+            f"Remote-access session limit reached; omitted {omitted_sessions} completed sessions."
+        )
+    if omitted_ot_events:
+        errors.append(
+            f"Remote-access OT event limits reached; omitted {omitted_ot_events} events."
+        )
 
     # --- correlate: host received remote-in, then issued an OT command out ---
     sessions_by_host: dict[str, list[RemoteInSession]] = {}

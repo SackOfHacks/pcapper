@@ -25,6 +25,7 @@ _REQUEST_LINE_RE = re.compile(rb"\A[A-Z]{3,10} \S+ HTTP/1\.[01]\Z")
 _SWITCHING_LINE_RE = re.compile(rb"\AHTTP/1\.[01] 101\b")
 _UPGRADE_H2C_RE = re.compile(rb"(?im)^upgrade:[ \t]*h2c[ \t]*$")
 _HEADER_SCAN_BYTES = 4096
+MAX_HTTP2_CONNECTIONS = 50_000
 
 
 def _h2c_upgrade(head: bytes) -> Optional[str]:
@@ -107,6 +108,22 @@ def analyze_http2(
     # those connections are binary frames with nothing to grep for, so they are
     # attributed by connection, with the roles fixed by who sent the preface.
     h2_connections: set[tuple[str, int, str, int]] = set()
+    connection_limit_reported = False
+
+    def remember_connection(key: tuple[str, int, str, int]) -> bool:
+        nonlocal connection_limit_reported
+        if key in h2_connections:
+            return True
+        if len(h2_connections) < MAX_HTTP2_CONNECTIONS:
+            h2_connections.add(key)
+            return True
+        if not connection_limit_reported:
+            errors.append(
+                "HTTP/2 connection tracking limit reached; additional connections "
+                "are omitted."
+            )
+            connection_limit_reported = True
+        return False
 
     for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
         total_packets += 1
@@ -128,10 +145,12 @@ def analyze_http2(
         upgrade = _h2c_upgrade(head)
         if head.startswith(HTTP2_PREFACE) or upgrade == "request":
             client, server = src_ip, dst_ip
-            h2_connections.add((src_ip, sport, dst_ip, dport))
+            if not remember_connection((src_ip, sport, dst_ip, dport)):
+                continue
         elif upgrade == "response":
             client, server = dst_ip, src_ip
-            h2_connections.add((dst_ip, dport, src_ip, sport))
+            if not remember_connection((dst_ip, dport, src_ip, sport)):
+                continue
         elif (src_ip, sport, dst_ip, dport) in h2_connections:
             client, server = src_ip, dst_ip
         elif (dst_ip, dport, src_ip, sport) in h2_connections:

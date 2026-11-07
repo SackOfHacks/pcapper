@@ -20,7 +20,28 @@ __all__ = ["__version__"]
 # the banner still said 2.1.0, because the banner reads this attribute and the
 # wheel metadata read pyproject. tests/test_version.py fails if a second copy
 # is ever reintroduced.
-__version__ = "2.5.0"
+__version__ = "2.8.0"
+
+
+# --- Scapy/cryptography deprecation noise (always on) ------------------------
+# scapy's TLS layer imports FFDH primitives (scapy/layers/tls/crypto/groups.py)
+# and cryptography >= 46 flags those with a CryptographyDeprecationWarning at
+# import time. It is about scapy's code, not the user's capture, so it is not
+# actionable. Scoped to that category AND to warnings attributed to scapy
+# modules, so cryptography deprecations raised by pcapper's own code still show.
+def _silence_scapy_crypto_deprecations() -> None:
+    import warnings
+
+    try:
+        from cryptography.utils import CryptographyDeprecationWarning
+    except ImportError:
+        return
+    warnings.filterwarnings(
+        "ignore", category=CryptographyDeprecationWarning, module=r"scapy(\..*)?"
+    )
+
+
+_silence_scapy_crypto_deprecations()
 
 
 # --- Early quiet-mode hook ---------------------------------------------------

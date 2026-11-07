@@ -95,21 +95,19 @@ def _classify_message(start_line: str) -> str:
         return "M-SEARCH"
     if line.startswith("NOTIFY "):
         return "NOTIFY"
-    if line.startswith("HTTP/1.1 200"):
+    if re.match(r"^HTTP/1\.[01]\s+200(?:\s|$)", line):
         return "RESPONSE"
     return "OTHER"
 
 
-def _looks_like_ssdp(payload: bytes, sport: int, dport: int) -> bool:
-    if sport == SSDP_PORT or dport == SSDP_PORT:
-        return True
+def _looks_like_ssdp(payload: bytes) -> bool:
     if not payload:
         return False
-    start = payload[:64].decode("latin-1", errors="ignore").upper()
+    start = payload.split(b"\n", 1)[0].decode("latin-1", errors="ignore").strip().upper()
     return (
         start.startswith("M-SEARCH ")
         or start.startswith("NOTIFY ")
-        or start.startswith("HTTP/1.1 200")
+        or re.match(r"^HTTP/1\.[01]\s+200(?:\s|$)", start) is not None
     )
 
 
@@ -216,7 +214,7 @@ def analyze_ssdp(
         sport = int(getattr(udp, "sport", 0) or 0)
         dport = int(getattr(udp, "dport", 0) or 0)
         payload = bytes(getattr(udp, "payload", b""))
-        if not _looks_like_ssdp(payload, sport, dport):
+        if not _looks_like_ssdp(payload):
             continue
 
         src_ip, dst_ip = extract_packet_endpoints(pkt)

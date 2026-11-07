@@ -483,6 +483,29 @@ def _parse_dhcp6_options(payload: bytes) -> tuple[str, dict[str, object], int]:
                 options["requested_addr"] = str(ipaddress.IPv6Address(value[0:16]))
             except Exception:
                 pass
+        elif code in {3, 4}:  # IA_NA / IA_TA contain nested IAADDR options
+            nested_offset = 12 if code == 3 else 4
+            while nested_offset + 4 <= len(value):
+                nested_code = int.from_bytes(
+                    value[nested_offset : nested_offset + 2], "big", signed=False
+                )
+                nested_length = int.from_bytes(
+                    value[nested_offset + 2 : nested_offset + 4],
+                    "big",
+                    signed=False,
+                )
+                nested_offset += 4
+                if nested_offset + nested_length > len(value):
+                    break
+                nested_value = value[nested_offset : nested_offset + nested_length]
+                nested_offset += nested_length
+                if nested_code == 5 and len(nested_value) >= 16:
+                    try:
+                        options["requested_addr"] = str(
+                            ipaddress.IPv6Address(nested_value[:16])
+                        )
+                    except Exception:
+                        pass
         elif code == 16:  # Vendor Class
             decoded = _decode_name(value)
             if decoded:
@@ -491,8 +514,12 @@ def _parse_dhcp6_options(payload: bytes) -> tuple[str, dict[str, object], int]:
             decoded = _decode_name(value)
             if decoded:
                 options["user_class"] = decoded
-        elif code == 39 and len(value) >= 2:  # Client FQDN: flags byte + DNS name
-            names = _decode_dns_names(value[1:])
+        elif code == 39 and len(value) >= 3:  # Flags, response codes, then DNS name
+            names = _decode_dns_names(value[3:])
+            if not names:
+                # Accept the legacy one-byte-prefix form emitted by older
+                # analyzers while preferring the RFC 4704 wire layout.
+                names = _decode_dns_names(value[1:])
             if names:
                 options["hostname"] = names[0]
 
@@ -516,7 +543,7 @@ def analyze_dhcp(
     end_ts: Optional[float] = None
 
     conversations: dict[tuple[str, str, str, str, int, int, str], DhcpConversation] = {}
-    sessions: dict[tuple[str, str, str], DhcpSession] = {}
+    sessions: dict[str, DhcpSession] = {}
     host_leases: dict[tuple[str, str, str], DhcpHostLease] = {}
     vendor_classes_by_mac: dict[str, Counter[str]] = defaultdict(Counter)
     vendor_classes_by_ip: dict[str, Counter[str]] = defaultdict(Counter)
@@ -690,7 +717,19 @@ def analyze_dhcp(
                 if fp_result:
                     summary.os_fingerprints[chaddr] = fp_result
 
-            session_client_ip = ciaddr if ciaddr != "0.0.0.0" else src_ip
+            is_client_message = msg_type in _CLIENT_MSG_TYPES
+            if is_client_message:
+                session_client_ip = ciaddr if ciaddr != "0.0.0.0" else src_ip
+            else:
+                session_client_ip = (
+                    yiaddr
+                    if yiaddr != "0.0.0.0"
+                    else ciaddr
+                    if ciaddr != "0.0.0.0"
+                    else dst_ip
+                )
+                if session_client_ip in {"255.255.255.255", "::", "ff02::1:2"}:
+                    session_client_ip = "0.0.0.0"
 
             relay_ip = _decode_name(option_map.get("relay_agent_information", ""))
             if relay_ip:
@@ -822,17 +861,36 @@ def analyze_dhcp(
             if convo.last_seen is None or ts > convo.last_seen:
                 convo.last_seen = ts
 
-            session_server = server_id or siaddr or src_ip
-            session_client_ip = ciaddr if ciaddr != "0.0.0.0" else src_ip
-            sess_key = (chaddr, session_client_ip, session_server)
+            session_server = server_id or siaddr or (
+                src_ip if msg_type in _SERVER_MSG_TYPES else "0.0.0.0"
+            )
+            session_identity = (
+                chaddr
+                if chaddr != _ZERO_MAC
+                else src_mac
+                if src_mac != _ZERO_MAC
+                else src_ip
+            )
+            sess_key = session_identity
             session = sessions.get(sess_key)
             if session is None:
                 session = DhcpSession(
-                    client_mac=chaddr,
+                    client_mac=session_identity,
                     client_ip=session_client_ip,
                     server_ip=session_server,
                 )
                 sessions[sess_key] = session
+            else:
+                if (
+                    session.client_ip in {"0.0.0.0", "255.255.255.255", "::"}
+                    and session_client_ip not in {"0.0.0.0", "255.255.255.255", "::"}
+                ):
+                    session.client_ip = session_client_ip
+                if session.server_ip in {"", "0.0.0.0"} and session_server not in {
+                    "",
+                    "0.0.0.0",
+                }:
+                    session.server_ip = session_server
 
             # Any client message opens a transaction: an OFFER answers a
             # DISCOVER, an ACK answers a REQUEST or INFORM. Remembering only

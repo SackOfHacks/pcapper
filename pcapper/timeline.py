@@ -32,6 +32,7 @@ from .utils import (
     dns_questions,
     extract_packet_endpoints,
     memoize_analysis,
+    network_egress_allowed,
     safe_float,
 )
 from .winrm import WINRM_PORTS, WSMAN_RE
@@ -1515,6 +1516,7 @@ def analyze_timeline(
             path, show_status, f"Timeline: {desc}", func, *args, **kwargs
         )
 
+    view = {"packets": packets, "meta": meta}
     file_summary = _busy("Files", analyze_files, path, show_status=False)
     artifacts_for_ip = [
         art
@@ -1524,8 +1526,7 @@ def analyze_timeline(
     artifact_indices = {
         art.packet_index for art in artifacts_for_ip if art.packet_index
     }
-    creds_summary = _busy("Credentials", analyze_creds, path, show_status=False)
-
+    creds_summary = _busy("Credentials", analyze_creds, path, show_status=False, **view)
 
     total_packets = 0
     idx = 0
@@ -3065,8 +3066,11 @@ def analyze_timeline(
     timeline_vt_results: dict[str, dict[str, object]] = {}
     timeline_vt_errors: list[str] = []
     if vt_lookup:
-        api_key = os.environ.get("VT_API_KEY")
-        if not api_key:
+        if not network_egress_allowed():
+            timeline_vt_errors.append(
+                "VirusTotal lookups skipped: network egress is disabled."
+            )
+        elif not (api_key := os.environ.get("VT_API_KEY")):
             timeline_vt_errors.append(
                 "VT_API_KEY is not set; skipping VirusTotal lookups."
             )

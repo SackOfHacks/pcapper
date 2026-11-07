@@ -101,8 +101,18 @@ def analyze_ntp(
             if not src_ip or not dst_ip:
                 continue
 
+            payload = bytes(getattr(udp, "payload", b""))
+            if len(payload) < 2:
+                continue
+            first_byte = payload[0]
+            version = (first_byte >> 3) & 0x7
+            mode = first_byte & 0x7
+            minimum_length = 48 if mode in (1, 2, 3, 4, 5) else 12 if mode == 6 else 8
+            if len(payload) < minimum_length:
+                continue
+
             ntp_packets += 1
-            # The report window spans NTP traffic, not every packet in scope.
+            # The report window spans valid NTP traffic, not every packet in scope.
             ts = safe_float(getattr(pkt, "time", None))
             if ts is not None:
                 if first_seen is None or ts < first_seen:
@@ -110,12 +120,6 @@ def analyze_ntp(
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
 
-            payload = bytes(getattr(udp, "payload", b""))
-            if len(payload) < 2:
-                continue
-            first_byte = payload[0]
-            version = (first_byte >> 3) & 0x7
-            mode = first_byte & 0x7
             mode_counts[_mode_name(mode)] += 1
             version_counts[version] += 1
             stratum_counts[int(payload[1])] += 1

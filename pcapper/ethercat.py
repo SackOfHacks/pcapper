@@ -49,11 +49,12 @@ WRITE_COMMANDS = {
 ACYCLIC_WRITE_COMMANDS = WRITE_COMMANDS - {"LWR", "LRW"}
 
 MAILBOX_TYPES = {
-    0x01: "CoE",
-    0x02: "FoE",
-    0x03: "SoE",
-    0x04: "EoE",
-    0x05: "AoE",
+    0x01: "AoE",
+    0x02: "EoE",
+    0x03: "CoE",
+    0x04: "FoE",
+    0x05: "SoE",
+    0x0F: "VoE",
 }
 
 FOE_OPCODES = {
@@ -65,38 +66,41 @@ FOE_OPCODES = {
 }
 
 SOE_OPCODES = {
-    0x01: "Read",
-    0x02: "Write",
-    0x03: "Info",
+    0x01: "Read Request",
+    0x02: "Read Response",
+    0x03: "Write Request",
+    0x04: "Write Response",
+    0x05: "Notification",
+    0x06: "Emergency",
 }
 
 
 def _parse_datagrams(payload: bytes) -> list[tuple[str, bytes]]:
     datagrams: list[tuple[str, bytes]] = []
-    if not payload:
+    if len(payload) < 2:
         return datagrams
-    start_offsets = [0]
-    if len(payload) > 2:
-        start_offsets.append(2)
-    for start in start_offsets:
-        if start >= len(payload):
-            continue
-        cmd = payload[start]
-        if cmd not in ETHERCAT_CMDS:
-            continue
-        idx = start
-        while idx + 10 <= len(payload):
-            cmd = payload[idx]
-            cmd_name = ETHERCAT_CMDS.get(cmd, f"CMD 0x{cmd:02x}")
-            length = int.from_bytes(payload[idx + 6 : idx + 8], "little") & 0x07FF
-            data_start = idx + 10
-            data_end = data_start + length
-            if data_end + 2 > len(payload):
-                break
-            data = payload[data_start:data_end]
-            datagrams.append((cmd_name, data))
-            idx = data_end + 2
-        if datagrams:
+    frame_header = int.from_bytes(payload[:2], "little")
+    frame_length = frame_header & 0x07FF
+    frame_type = (frame_header >> 12) & 0x0F
+    frame_end = 2 + frame_length
+    if frame_type != 1 or frame_end > len(payload):
+        return datagrams
+
+    idx = 2
+    while idx + 10 <= frame_end:
+        cmd = payload[idx]
+        cmd_name = ETHERCAT_CMDS.get(cmd)
+        if cmd_name is None:
+            break
+        length_flags = int.from_bytes(payload[idx + 6 : idx + 8], "little")
+        length = length_flags & 0x07FF
+        data_start = idx + 10
+        data_end = data_start + length
+        if data_end + 2 > frame_end:
+            break
+        datagrams.append((cmd_name, payload[data_start:data_end]))
+        idx = data_end + 2
+        if not length_flags & 0x8000:
             break
     return datagrams
 
@@ -105,22 +109,23 @@ def _parse_mailbox(data: bytes) -> list[str]:
     commands: list[str] = []
     if len(data) < 7:
         return commands
-    mailbox_type = None
-    candidate = data[6]
-    if candidate in MAILBOX_TYPES:
-        mailbox_type = candidate
-        commands.append(f"Mailbox {MAILBOX_TYPES[candidate]}")
-        if len(data) > 7:
-            commands.append(f"{MAILBOX_TYPES[candidate]} Len {len(data) - 7}")
-    elif data[0] in MAILBOX_TYPES:
-        mailbox_type = data[0]
-        commands.append(f"Mailbox {MAILBOX_TYPES[mailbox_type]}")
+    mailbox_length = int.from_bytes(data[:2], "little")
+    if mailbox_length > len(data) - 6:
+        return commands
+    mailbox_type = data[5] & 0x0F
+    mailbox_name = MAILBOX_TYPES.get(mailbox_type)
+    if mailbox_name is None:
+        return commands
+    mailbox_data = data[6 : 6 + mailbox_length]
+    commands.append(f"Mailbox {mailbox_name}")
+    if mailbox_data:
+        commands.append(f"{mailbox_name} Len {len(mailbox_data)}")
 
-    if mailbox_type == 0x02 and len(data) >= 8:
-        opcode = data[7]
+    if mailbox_type == 0x04 and mailbox_data:
+        opcode = mailbox_data[0]
         commands.append(f"FoE {FOE_OPCODES.get(opcode, f'0x{opcode:02x}')}")
-    if mailbox_type == 0x03 and len(data) >= 8:
-        opcode = data[7]
+    if mailbox_type == 0x05 and mailbox_data:
+        opcode = mailbox_data[0] & 0x0F
         commands.append(f"SoE {SOE_OPCODES.get(opcode, f'0x{opcode:02x}')}")
     return commands
 
@@ -132,9 +137,6 @@ def _parse_commands(payload: bytes) -> list[str]:
     for cmd_name, data in _parse_datagrams(payload):
         commands.append(cmd_name)
         commands.extend(_parse_mailbox(data))
-    if not commands:
-        cmd = payload[0]
-        commands.append(ETHERCAT_CMDS.get(cmd, f"CMD 0x{cmd:02x}"))
     return commands
 
 
@@ -151,9 +153,9 @@ def _detect_anomalies(
     # are not flagged. (ACYCLIC_WRITE_COMMANDS / WRITE_COMMANDS remain available
     # for the write-volume statistics.)
     if any(cmd.startswith("Mailbox FoE") for cmd in commands):
-        severity = "HIGH"
-        detail = "FoE mailbox activity observed."
         foe_write = any("FoE WRQ" in cmd or "FoE DATA" in cmd for cmd in commands)
+        severity = "HIGH" if foe_write else "MEDIUM"
+        detail = "FoE mailbox activity observed."
         if foe_write:
             detail = (
                 "FoE file transfer/write activity observed (possible firmware update)."
@@ -191,6 +193,17 @@ def _detect_anomalies(
                 severity="LOW",
                 title="EtherCAT SoE Mailbox",
                 description="SoE mailbox traffic observed (drive/parameter exchange).",
+                src=src_ip,
+                dst=dst_ip,
+                ts=ts,
+            )
+        )
+    if any(cmd.startswith("Mailbox EoE") for cmd in commands):
+        anomalies.append(
+            IndustrialAnomaly(
+                severity="MEDIUM",
+                title="EtherCAT EoE Tunnel",
+                description="Ethernet-over-EtherCAT tunneling activity observed.",
                 src=src_ip,
                 dst=dst_ip,
                 ts=ts,

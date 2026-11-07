@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
+from .quic import _looks_like_quic
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
@@ -45,6 +46,15 @@ def _is_doh_request(payload: bytes) -> bool:
     if path == b"/resolve" and b"name=" in query:
         return True
     return bool(_DOH_CONTENT_TYPE_RE.search(payload[:4096]))
+
+
+def _is_tls_record(payload: bytes) -> bool:
+    return (
+        len(payload) >= 5
+        and payload[0] in {20, 21, 22, 23}
+        and payload[1] == 0x03
+        and 0 < int.from_bytes(payload[3:5], "big") <= 0x4800
+    )
 
 
 # Public DoH resolvers. Real DoH rides TLS/443 so the cleartext /dns-query path
@@ -143,11 +153,17 @@ def analyze_encrypted_dns(
             sport = int(getattr(tcp, "sport", 0) or 0)
             dport = int(getattr(tcp, "dport", 0) or 0)
             roles = _resolver_roles(src_ip, dst_ip, sport, dport, DOT_PORT)
-            if roles is not None:
+            raw = pkt.getlayer(Raw) if Raw is not None else None  # type: ignore[arg-type]
+            if roles is not None and raw is not None:
+                try:
+                    payload = bytes(raw.load)
+                except Exception:
+                    payload = b""
+                if not _is_tls_record(payload):
+                    continue
                 dot_packets += 1
                 _note(pkt, *roles)
                 continue
-            raw = pkt.getlayer(Raw) if Raw is not None else None  # type: ignore[arg-type]
             if raw is not None:
                 try:
                     payload = bytes(raw.load)
@@ -163,7 +179,8 @@ def analyze_encrypted_dns(
             sport = int(getattr(udp, "sport", 0) or 0)
             dport = int(getattr(udp, "dport", 0) or 0)
             roles = _resolver_roles(src_ip, dst_ip, sport, dport, DOQ_PORT)
-            if roles is not None:
+            payload = bytes(getattr(udp, "payload", b""))
+            if roles is not None and _looks_like_quic(payload):
                 doq_packets += 1
                 _note(pkt, *roles)
 

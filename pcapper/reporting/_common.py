@@ -26,9 +26,12 @@ from ..coloring import (
 from ..ipmac import mac_manufacturer
 from ..reporting_format import format_table
 from ..utils import (
+    display_safe,
     format_bytes_as_mb,
     format_duration,
     format_ts,
+    output_redaction_enabled,
+    redact_sensitive_text,
     safe_float,
     sparkline,
 )
@@ -170,22 +173,21 @@ def _limit_value(value: int) -> int:
 
 
 def _redact_secret(value: str | None) -> str:
-    # Redaction intentionally disabled. pcapper is a forensic / credential-
-    # recovery tool whose purpose is to surface secrets, passwords, tokens and
-    # keys recovered from a capture, so they are shown in full by default.
     if value is None:
         return "-"
     text = str(value).strip()
     if not text:
         return "-"
-    return text
+    if output_redaction_enabled():
+        text = "[REDACTED]"
+    return display_safe(text)
 
 
 def _redact_in_text(text: str) -> str:
-    # Redaction intentionally disabled — see _redact_secret. Inline secrets in
-    # free-text findings (e.g. "PASS hunter2", "Authorization: Bearer ...") are
-    # shown verbatim so the full recovered value is visible by default.
-    return text
+    text = str(text or "")
+    if output_redaction_enabled():
+        text = redact_sensitive_text(text)
+    return display_safe(text)
 
 
 def _format_kv(
@@ -844,6 +846,7 @@ def _render_protocol_verdict(
 
 
 def _truncate_text(value: str, max_len: int = 80) -> str:
+    value = display_safe(value)
     if _verbose_output():
         return value
     if len(value) <= max_len:

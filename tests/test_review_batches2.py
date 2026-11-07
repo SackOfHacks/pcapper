@@ -183,6 +183,32 @@ class TestSyslog:
 
 
 class TestVpn:
+    def _ovpn_tcp(self, opcode: int, fill: bytes = b"\x00" * 12) -> bytes:
+        body = bytes([(opcode << 3) & 0xF8]) + fill
+        return len(body).to_bytes(2, "big") + body
+
+    def _ovpn_control_tcp(
+        self,
+        opcode: int,
+        packet_id: int,
+        data: bytes = b"",
+        *,
+        session_id: bytes = b"\x11\x22\x33\x44\x55\x66\x77\x88",
+        ack_ids: tuple[int, ...] = (),
+        remote_session_id: bytes = b"\x88\x77\x66\x55\x44\x33\x22\x11",
+    ) -> bytes:
+        body = bytearray([(opcode << 3) & 0xF8])
+        body.extend(session_id)
+        body.append(len(ack_ids))
+        for ack_id in ack_ids:
+            body.extend(int(ack_id).to_bytes(4, "big"))
+        if ack_ids:
+            body.extend(remote_session_id)
+        if opcode != 5:
+            body.extend(int(packet_id).to_bytes(4, "big"))
+            body.extend(data)
+        return len(body).to_bytes(2, "big") + bytes(body)
+
     def test_port_match_needs_the_vpn_port_on_the_server_side(self) -> None:
         from pcapper.vpn import _vpn_port_match
 
@@ -200,6 +226,104 @@ class TestVpn:
         summary = analyze_vpn(pcap, show_status=False)
         assert summary.vpn_packets == 1
         assert summary.first_seen == pytest.approx(T0 + 100)
+
+    def test_openvpn_over_tcp_443_is_not_reported_as_https(self, tmp_path) -> None:
+        from pcapper.analyzer import analyze_pcap
+        from pcapper.beacon import analyze_beacons
+        from pcapper.services import analyze_services
+        from pcapper.vpn import analyze_vpn
+
+        client, server = "192.168.10.50", "54.209.141.127"
+        pcap = _write(tmp_path, "openvpn_443.pcap", [
+            _at(_tcp(client, server, 54636, 443, flags="S", seq=100), T0),
+            _at(_tcp(server, client, 443, 54636, flags="SA", seq=500), T0 + 0.01),
+            _at(_tcp(client, server, 54636, 443, flags="A", seq=101), T0 + 0.02),
+            _at(_tcp(client, server, 54636, 443, self._ovpn_tcp(7), seq=101), T0 + 0.03),
+            _at(_tcp(server, client, 443, 54636, self._ovpn_tcp(8), seq=501), T0 + 0.04),
+            _at(_tcp(client, server, 54636, 443, self._ovpn_tcp(5), seq=120), T0 + 0.05),
+            _at(_tcp(server, client, 443, 54636, self._ovpn_tcp(4), seq=520), T0 + 0.06),
+        ])
+
+        services = analyze_services(pcap, show_status=False)
+        assert services.hierarchy == {"OpenVPN": 1}
+        asset = services.assets[0]
+        assert (asset.ip, asset.port, asset.service_name) == (server, 443, "OpenVPN")
+        assert "not HTTPS" in (asset.software or "")
+        assert services.false_positive_context
+        assert "protocol-confusion false positive" in services.false_positive_context[0]
+
+        vpn = analyze_vpn(pcap, show_status=False)
+        assert vpn.service_counts["OpenVPN"] == 4
+        assert vpn.server_counts[server] == 4
+        assert vpn.handshake_counts["OpenVPN P_CONTROL_HARD_RESET_CLIENT_V2"] == 1
+        assert vpn.handshake_counts["OpenVPN P_CONTROL_HARD_RESET_SERVER_V2"] == 1
+
+        base = analyze_pcap(pcap, show_status=False)
+        assert base.protocol_counts["OpenVPN"] == 4
+        assert "HTTPS" not in base.protocol_counts
+
+        beacons = analyze_beacons(pcap, show_status=False, min_events=2)
+        assert not beacons.candidates
+
+    def test_openvpn_control_channel_certs_surface_in_certificates_and_files(self, tmp_path) -> None:
+        from make_fixtures import _certificate_record, _fixture_certificate
+
+        from pcapper.certificates import analyze_certificates
+        from pcapper.files import analyze_files
+
+        client, server = "192.168.10.50", "54.209.141.127"
+        pcap = _write(tmp_path, "openvpn_cert_443.pcap", [
+            _at(_tcp(client, server, 54636, 443, self._ovpn_control_tcp(7, 0), seq=100), T0),
+            _at(
+                _tcp(
+                    server,
+                    client,
+                    443,
+                    54636,
+                    self._ovpn_control_tcp(8, 0, ack_ids=(0,)),
+                    seq=500,
+                ),
+                T0 + 0.01,
+            ),
+            _at(
+                _tcp(
+                    server,
+                    client,
+                    443,
+                    54636,
+                    self._ovpn_control_tcp(
+                        4, 1, _certificate_record(_fixture_certificate())
+                    ),
+                    seq=520,
+                ),
+                T0 + 0.02,
+            ),
+        ])
+
+        certs = analyze_certificates(pcap, show_status=False)
+        assert certs.cert_count == 1
+        cert = certs.artifacts[0]
+        assert cert.src_ip == server
+        assert cert.dst_ip == client
+        assert cert.transport == "OpenVPN control-channel TLS"
+        assert "shop.example.net" in cert.subject
+        assert certs.openvpn_certificates
+        assert certs.openvpn_certificates[0]["context"].startswith("OpenVPN control-channel")
+
+        files = analyze_files(pcap, show_status=False)
+        ovpn_certs = [
+            artifact
+            for artifact in files.artifacts
+            if artifact.protocol == "OpenVPN" and artifact.file_type == "X509"
+        ]
+        assert len(ovpn_certs) == 1
+        assert ovpn_certs[0].src_ip == server
+        assert ovpn_certs[0].dst_ip == client
+        assert "VPN server certificate" in (ovpn_certs[0].note or "")
+        assert any(
+            item.get("summary") == "OpenVPN control-channel certificate observed"
+            for item in files.detections
+        )
 
 
 # --- SSDP / NetBIOS / GOOSE windows ---------------------------------------------------
@@ -253,6 +377,8 @@ def _ptp_frame(src: str, msg_type: int, seq: int):
 
     body = bytearray(44)
     body[0] = msg_type
+    body[1] = 2  # IEEE 1588-2008 version
+    body[2:4] = len(body).to_bytes(2, "big")
     body[4] = 0  # domain
     body[30:32] = seq.to_bytes(2, "big")
     return Ether(src=src, dst="01:1b:19:00:00:00", type=0x88F7) / Raw(load=bytes(body))

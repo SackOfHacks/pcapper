@@ -61,7 +61,7 @@ def _parse_coap_options(
         return commands, artifacts, info
     ver = payload[0] >> 6
     tkl = payload[0] & 0x0F
-    if ver != 1:
+    if ver != 1 or tkl > 8:
         return commands, artifacts, info
     idx = 4 + tkl
     if idx > len(payload):
@@ -132,11 +132,11 @@ def _parse_coap_options(
     if observe_val is not None:
         info["observe"] = observe_val
         artifacts.append(("coap_observe", str(observe_val)))
-        if observe_val == 0:
+        if payload[1] == 1 and observe_val == 0:
             commands.append("Observe Register")
-        elif observe_val == 1:
+        elif payload[1] == 1 and observe_val == 1:
             commands.append("Observe Cancel")
-        else:
+        elif payload[1] >= 64:
             commands.append("Observe Notification")
 
     info["uri"] = uri
@@ -148,8 +148,9 @@ def _parse_commands(payload: bytes) -> list[str]:
         return []
     ver = payload[0] >> 6
     msg_type = (payload[0] >> 4) & 0x03
+    tkl = payload[0] & 0x0F
     code = payload[1]
-    if ver != 1:
+    if ver != 1 or tkl > 8 or len(payload) < 4 + tkl:
         return []
     prefix = TYPES.get(msg_type, "UNK")
     if code in METHODS:

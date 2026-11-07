@@ -1012,15 +1012,21 @@ def analyze_mitre(
     show_status: bool = True,
     ioc_file: Path | None = None,
     threat_summary=None,
+    packets: list[object] | None = None,
+    meta=None,
 ) -> MitreSummary:
     if threat_summary is None:
-        threat_summary = analyze_threats(path, show_status=show_status)
+        threat_summary = analyze_threats(
+            path, show_status=show_status, packets=packets, meta=meta
+        )
 
     ioc_summary = None
     ioc_errors: list[str] = []
     if ioc_file:
         try:
-            ioc_summary = analyze_iocs(path, ioc_file, show_status=show_status)
+            ioc_summary = analyze_iocs(
+                path, ioc_file, show_status=show_status, packets=packets, meta=meta
+            )
         except Exception as exc:
             ioc_errors.append(f"IOC mapping unavailable: {type(exc).__name__}: {exc}")
 

@@ -38,11 +38,31 @@ FINS_COMMANDS = {
 }
 
 
-def _parse_commands(payload: bytes) -> list[str]:
+def _fins_frame(payload: bytes) -> bytes | None:
+    if payload.startswith(b"FINS"):
+        if len(payload) < 16:
+            return None
+        length = int.from_bytes(payload[4:8], "big")
+        command = int.from_bytes(payload[8:12], "big")
+        if command != 2 or length < 20 or length + 8 > len(payload):
+            return None
+        payload = payload[16 : 8 + length]
     if len(payload) < 12:
+        return None
+    icf, reserved, gateway_count = payload[:3]
+    if icf & 0x3F or reserved != 0 or gateway_count > 7:
+        return None
+    return payload
+
+
+def _parse_commands(payload: bytes) -> list[str]:
+    frame = _fins_frame(payload)
+    if frame is None:
         return []
-    cmd = int.from_bytes(payload[10:12], "big")
+    cmd = int.from_bytes(frame[10:12], "big")
     label = FINS_COMMANDS.get(cmd, f"CMD 0x{cmd:04x}")
+    if frame[0] & 0x40:
+        label += " (response)"
     return [label]
 
 
@@ -50,6 +70,9 @@ def _detect_anomalies(
     payload: bytes, src_ip: str, dst_ip: str, ts: float, commands: list[str]
 ) -> list[IndustrialAnomaly]:
     anomalies: list[IndustrialAnomaly] = []
+    frame = _fins_frame(payload)
+    if frame is None or frame[0] & 0x40:
+        return anomalies
 
     def add(sev: str, title: str, desc: str, attack: str) -> None:
         anomalies.append(
@@ -81,11 +104,18 @@ def _detect_anomalies(
             f"FINS RUN command (operating-mode change): {joined}",
             "T0858 Change Operating Mode",
         )
-    if any("Program Area" in cmd for cmd in commands):
+    if any(cmd.startswith("Program Area Read") for cmd in commands):
+        add(
+            "MEDIUM",
+            "FINS Program Upload",
+            f"FINS program-area read observed: {joined}",
+            "T0845 Program Upload",
+        )
+    if any(cmd.startswith("Program Area Write") for cmd in commands):
         add(
             "HIGH",
-            "FINS Program Area Access",
-            f"FINS program-area operation (logic read/write/clear): {joined}",
+            "FINS Program Download",
+            f"FINS program-area write observed: {joined}",
             "T0843 Program Download",
         )
     if any("Clear" in cmd for cmd in commands):
@@ -95,7 +125,12 @@ def _detect_anomalies(
             f"FINS clear operation (destructive): {joined}",
             "T0809 Data Destruction",
         )
-    if any("Write" in cmd or "Fill" in cmd or "Transfer" in cmd for cmd in commands):
+    if any(
+        ("Write" in cmd and not cmd.startswith("Program Area Write"))
+        or "Fill" in cmd
+        or "Transfer" in cmd
+        for cmd in commands
+    ):
         add(
             "MEDIUM",
             "FINS Write Operation",

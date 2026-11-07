@@ -52,7 +52,12 @@ from .mqtt import _parse_commands as _parse_mqtt_commands
 from .niagara import analyze_niagara
 from .codesys import analyze_codesys
 from .opc import analyze_opc
-from .pcap_cache import get_cached_packets, has_cached_packets, load_filtered_packets
+from .pcap_cache import (
+    PcapMeta,
+    get_cached_packets,
+    has_cached_packets,
+    load_filtered_packets,
+)
 from .pccc import analyze_pccc
 from .pcworx import analyze_pcworx
 from .prconos import analyze_prconos
@@ -61,7 +66,7 @@ from .profinet import _parse_commands as _parse_profinet_commands
 from .s7 import S7_PORT, analyze_s7
 from .s7 import _parse_commands as _parse_s7_commands
 from .srtp import analyze_srtp
-from .utils import safe_float
+from .utils import call_with_packet_view, safe_float
 from .yokogawa import analyze_yokogawa
 
 
@@ -506,6 +511,8 @@ def _analyze_ot_commands_fast(
     path: Path,
     show_status: bool = True,
     config: OtControlConfig | None = None,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> OtCommandSummary:
     base_markers = (
         _merge_markers(WRITE_MARKERS, config.write_markers) if config else WRITE_MARKERS
@@ -532,15 +539,17 @@ def _analyze_ot_commands_fast(
 
     try:
         bpf_status: dict[str, object] = {}
-        if has_cached_packets(path):
-            packets, _meta = get_cached_packets(path, show_status=show_status)
-        else:
-            packets, _meta = load_filtered_packets(
-                path,
-                show_status=show_status,
-                bpf=_build_fast_bpf(),
-                bpf_status=bpf_status,
-            )
+        scan_packets = packets
+        if scan_packets is None:
+            if has_cached_packets(path):
+                scan_packets, _meta = get_cached_packets(path, show_status=show_status)
+            else:
+                scan_packets, _meta = load_filtered_packets(
+                    path,
+                    show_status=show_status,
+                    bpf=_build_fast_bpf(),
+                    bpf_status=bpf_status,
+                )
         if bpf_status.get("error"):
             fast_notes.append(
                 f"BPF filter unavailable: {bpf_status['error']}. Falling back to full scan."
@@ -567,7 +576,7 @@ def _analyze_ot_commands_fast(
     if signature_scan:
         fast_notes.append("Signature scan enabled for DNP3/ENIP on non-standard ports.")
 
-    for pkt in packets:
+    for pkt in scan_packets:
         has_transport, src_ip, dst_ip, sport, dport, payload = _extract_transport(pkt)
         if not has_transport or not payload:
             continue
@@ -728,9 +737,13 @@ def analyze_ot_commands(
     show_status: bool = True,
     fast: bool = False,
     config: OtControlConfig | None = None,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
 ) -> OtCommandSummary:
     if fast:
-        return _analyze_ot_commands_fast(path, show_status=show_status, config=config)
+        return _analyze_ot_commands_fast(
+            path, show_status=show_status, config=config, packets=packets, meta=meta
+        )
 
     base_markers = (
         _merge_markers(WRITE_MARKERS, config.write_markers) if config else WRITE_MARKERS
@@ -751,6 +764,11 @@ def analyze_ot_commands(
     control_timestamps: list[float] = []
     errors: list[str] = []
 
+    def _analyze(func, *args, **kwargs):
+        return call_with_packet_view(
+            func, path, *args, packets=packets, meta=meta, **kwargs
+        )
+
     def _protocol_extra(label: str, extra: tuple[str, ...] = ()) -> tuple[str, ...]:
         return _merge_markers(protocol_markers.get(label.upper(), ()), extra)
 
@@ -761,7 +779,7 @@ def analyze_ot_commands(
             return command
         return command
 
-    modbus = analyze_modbus(path, show_status=show_status)
+    modbus = _analyze(analyze_modbus, show_status=show_status)
     modbus_extra = _protocol_extra("Modbus")
     _count_from_counter(
         modbus.func_counts, "Modbus", command_counts, modbus_extra, base_markers
@@ -787,7 +805,7 @@ def analyze_ot_commands(
             )
             _add_control_target(control_targets, "Modbus", dst, detail)
 
-    dnp3 = analyze_dnp3(path, show_status=show_status)
+    dnp3 = _analyze(analyze_dnp3, show_status=show_status)
     dnp3_extra = _protocol_extra("DNP3")
     for key, count in dnp3.func_counts.items():
         key_text = str(key)
@@ -819,7 +837,7 @@ def analyze_ot_commands(
             )
             _add_control_target(control_targets, "DNP3", dst, detail)
 
-    cip = analyze_cip(path, show_status=show_status)
+    cip = _analyze(analyze_cip, show_status=show_status)
     cip_extra = _protocol_extra("CIP")
     enip_extra = _protocol_extra("ENIP")
     _count_from_counter(
@@ -852,7 +870,7 @@ def analyze_ot_commands(
             detail = str(getattr(art, "detail", "") or "tag_write")
             _add_control_target(control_targets, "CIP", dst, detail)
 
-    iec = analyze_iec104(path, show_status=show_status)
+    iec = _analyze(analyze_iec104, show_status=show_status)
     iec_extra = _protocol_extra("IEC-104")
     _count_from_industrial(
         iec,
@@ -870,7 +888,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(iec, "errors", []) or [])
 
-    s7 = analyze_s7(path, show_status=show_status)
+    s7 = _analyze(analyze_s7, show_status=show_status)
     s7_extra = _protocol_extra("S7")
     _count_from_industrial(
         s7,
@@ -887,7 +905,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(s7, "errors", []) or [])
 
-    opc = analyze_opc(path, show_status=show_status)
+    opc = _analyze(analyze_opc, show_status=show_status)
     opc_extra = _protocol_extra("OPC UA")
     _count_from_industrial(
         opc,
@@ -904,7 +922,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(opc, "errors", []) or [])
 
-    codesys = analyze_codesys(path, show_status=show_status)
+    codesys = _analyze(analyze_codesys, show_status=show_status)
     codesys_extra = _protocol_extra("CODESYS")
     _count_from_industrial(
         codesys,
@@ -921,7 +939,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(codesys, "errors", []) or [])
 
-    pccc = analyze_pccc(path, show_status=show_status)
+    pccc = _analyze(analyze_pccc, show_status=show_status)
     pccc_extra = _protocol_extra("PCCC")
     _count_from_industrial(
         pccc,
@@ -938,7 +956,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(pccc, "errors", []) or [])
 
-    niagara = analyze_niagara(path, show_status=show_status)
+    niagara = _analyze(analyze_niagara, show_status=show_status)
     niagara_extra = _protocol_extra("Niagara")
     _count_from_industrial(
         niagara,
@@ -955,7 +973,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(niagara, "errors", []) or [])
 
-    mqtt = analyze_mqtt(path, show_status=show_status)
+    mqtt = _analyze(analyze_mqtt, show_status=show_status)
     mqtt_extra = _protocol_extra("MQTT")
     _count_from_industrial(
         mqtt,
@@ -972,7 +990,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(mqtt, "errors", []) or [])
 
-    bacnet = analyze_bacnet(path, show_status=show_status)
+    bacnet = _analyze(analyze_bacnet, show_status=show_status)
     bacnet_extra = _protocol_extra("BACnet")
     _count_from_industrial(
         bacnet,
@@ -989,7 +1007,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(bacnet, "errors", []) or [])
 
-    coap = analyze_coap(path, show_status=show_status)
+    coap = _analyze(analyze_coap, show_status=show_status)
     coap_extra = _merge_markers(_protocol_extra("CoAP"), COAP_WRITE_MARKERS)
     _count_from_industrial(
         coap,
@@ -1006,7 +1024,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(coap, "errors", []) or [])
 
-    df1 = analyze_df1(path, show_status=show_status)
+    df1 = _analyze(analyze_df1, show_status=show_status)
     df1_extra = _protocol_extra("DF1")
     _count_from_industrial(
         df1,
@@ -1023,7 +1041,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(df1, "errors", []) or [])
 
-    ethercat = analyze_ethercat(path, show_status=show_status)
+    ethercat = _analyze(analyze_ethercat, show_status=show_status)
     ethercat_extra = _merge_markers(_protocol_extra("EtherCAT"), ETHERCAT_WRITE_MARKERS)
     _count_from_industrial(
         ethercat,
@@ -1040,7 +1058,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(ethercat, "errors", []) or [])
 
-    fins = analyze_fins(path, show_status=show_status)
+    fins = _analyze(analyze_fins, show_status=show_status)
     fins_extra = _protocol_extra("FINS")
     _count_from_industrial(
         fins,
@@ -1057,7 +1075,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(fins, "errors", []) or [])
 
-    melsec = analyze_melsec(path, show_status=show_status)
+    melsec = _analyze(analyze_melsec, show_status=show_status)
     melsec_extra = _protocol_extra("MELSEC")
     _count_from_industrial(
         melsec,
@@ -1074,7 +1092,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(melsec, "errors", []) or [])
 
-    mms = analyze_mms(path, show_status=show_status)
+    mms = _analyze(analyze_mms, show_status=show_status)
     mms_extra = _protocol_extra("MMS")
     _count_from_industrial(
         mms,
@@ -1091,7 +1109,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(mms, "errors", []) or [])
 
-    modicon = analyze_modicon(path, show_status=show_status)
+    modicon = _analyze(analyze_modicon, show_status=show_status)
     modicon_extra = _protocol_extra("Modicon")
     _count_from_industrial(
         modicon,
@@ -1108,7 +1126,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(modicon, "errors", []) or [])
 
-    profinet = analyze_profinet(path, show_status=show_status)
+    profinet = _analyze(analyze_profinet, show_status=show_status)
     profinet_extra = _protocol_extra("Profinet")
     _count_from_industrial(
         profinet,
@@ -1125,7 +1143,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(profinet, "errors", []) or [])
 
-    srtp = analyze_srtp(path, show_status=show_status)
+    srtp = _analyze(analyze_srtp, show_status=show_status)
     srtp_extra = _protocol_extra("SRTP")
     _count_from_industrial(
         srtp,
@@ -1142,7 +1160,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(srtp, "errors", []) or [])
 
-    yokogawa = analyze_yokogawa(path, show_status=show_status)
+    yokogawa = _analyze(analyze_yokogawa, show_status=show_status)
     yokogawa_extra = _protocol_extra("Yokogawa")
     _count_from_industrial(
         yokogawa,
@@ -1159,7 +1177,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(yokogawa, "errors", []) or [])
 
-    pcworx = analyze_pcworx(path, show_status=show_status)
+    pcworx = _analyze(analyze_pcworx, show_status=show_status)
     pcworx_markers = _merge_markers(base_markers, _protocol_extra("PCWorx"))
     _count_from_artifacts(
         getattr(pcworx, "artifacts", []) or [],
@@ -1171,7 +1189,7 @@ def analyze_ot_commands(
     )
     errors.extend(getattr(pcworx, "errors", []) or [])
 
-    prconos = analyze_prconos(path, show_status=show_status)
+    prconos = _analyze(analyze_prconos, show_status=show_status)
     prconos_markers = _merge_markers(base_markers, _protocol_extra("ProConOS"))
     _count_from_artifacts(
         getattr(prconos, "artifacts", []) or [],

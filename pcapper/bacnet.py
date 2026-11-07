@@ -380,10 +380,13 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
     # "issue" avoids flagging hundreds of non-BACnet packets as "BACnet
     # Malformed Frame". Genuine structural problems (bad BVLC length, truncated
     # NPDU, etc.) on real 0x81 frames are still recorded below.
-    if len(payload) < 4 or payload[0] != 0x81:
+    if not payload or payload[0] != 0x81:
         return info
 
     info["valid"] = True
+    if len(payload) < 4:
+        issues.append("Truncated BVLC header.")
+        return info
     bvlc_func = payload[1]
     bvlc_len = int.from_bytes(payload[2:4], "big")
     info["bvlc_type"] = payload[0]
@@ -397,8 +400,9 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
         issues.append(
             f"BVLC length {bvlc_len} does not match UDP payload length {len(payload)}."
         )
-    body_end = min(len(payload), bvlc_len) if bvlc_len >= 4 else len(payload)
-    body = payload[4:body_end]
+    body_end = min(len(payload), bvlc_len) if bvlc_len >= 4 else 4
+    frame = payload[:body_end]
+    body = frame[4:]
 
     if bvlc_func == 0x00 and len(body) >= 2:
         result_code = int.from_bytes(body[:2], "big")
@@ -431,11 +435,11 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
 
     npdu_start = 4
     if bvlc_func == 0x04:
-        if len(payload) < 10:
+        if len(frame) < 10:
             issues.append("Forwarded-NPDU is missing 6-byte origin address.")
             return info
-        origin_ip = ".".join(str(part) for part in payload[4:8])
-        origin_port = int.from_bytes(payload[8:10], "big")
+        origin_ip = ".".join(str(part) for part in frame[4:8])
+        origin_port = int.from_bytes(frame[8:10], "big")
         info["forwarded_from"] = f"{origin_ip}:{origin_port}"
         info["forwarded_ip"] = origin_ip
         info["forwarded_port"] = origin_port
@@ -444,66 +448,66 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
     if bvlc_func not in {0x04, 0x08, 0x09, 0x0A}:
         return info
 
-    if npdu_start + 2 > len(payload):
+    if npdu_start + 2 > len(frame):
         issues.append("Truncated NPDU header.")
         return info
-    npdu_version = payload[npdu_start]
+    npdu_version = frame[npdu_start]
     if npdu_version != 0x01:
         issues.append(f"Unexpected NPDU version 0x{npdu_version:02x}.")
         return info
 
     idx = npdu_start + 1
-    npdu_control = payload[idx]
+    npdu_control = frame[idx]
     idx += 1
     info["npdu_control"] = npdu_control
     info["npdu_expect_reply"] = bool(npdu_control & 0x04)
     info["npdu_network_message"] = bool(npdu_control & 0x80)
 
     if npdu_control & 0x20:
-        if idx + 3 > len(payload):
+        if idx + 3 > len(frame):
             issues.append("Truncated NPDU destination specifier.")
             return info
-        dnet = int.from_bytes(payload[idx : idx + 2], "big")
-        dlen = payload[idx + 2]
+        dnet = int.from_bytes(frame[idx : idx + 2], "big")
+        dlen = frame[idx + 2]
         idx += 3
         info["dnet"] = dnet
-        if idx + dlen > len(payload):
+        if idx + dlen > len(frame):
             issues.append("Truncated NPDU destination address.")
             return info
         idx += dlen
-        if idx >= len(payload):
+        if idx >= len(frame):
             issues.append("Truncated NPDU hop-count.")
             return info
         idx += 1
 
     if npdu_control & 0x08:
-        if idx + 3 > len(payload):
+        if idx + 3 > len(frame):
             issues.append("Truncated NPDU source specifier.")
             return info
-        snet = int.from_bytes(payload[idx : idx + 2], "big")
-        slen = payload[idx + 2]
+        snet = int.from_bytes(frame[idx : idx + 2], "big")
+        slen = frame[idx + 2]
         idx += 3
         info["snet"] = snet
-        if idx + slen > len(payload):
+        if idx + slen > len(frame):
             issues.append("Truncated NPDU source address.")
             return info
         idx += slen
 
     if npdu_control & 0x80:
-        if idx >= len(payload):
+        if idx >= len(frame):
             issues.append("Truncated NPDU network message type.")
             return info
-        msg_type = payload[idx]
+        msg_type = frame[idx]
         info["npdu_message_type"] = msg_type
         info["npdu_message_name"] = NPDU_NETWORK_MESSAGES.get(
             msg_type, f"NPDU-Message-0x{msg_type:02x}"
         )
         return info
 
-    if idx >= len(payload):
+    if idx >= len(frame):
         return info
 
-    apdu = payload[idx:]
+    apdu = frame[idx:]
     pdu_type = (apdu[0] >> 4) & 0x0F
     info["apdu_type"] = pdu_type
     info["apdu_name"] = APDU_TYPES.get(pdu_type, f"APDU {pdu_type}")
@@ -541,7 +545,7 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
         segmented = bool(apdu[0] & 0x08)
         if len(apdu) >= 2:
             info["invoke_id"] = apdu[1]
-        offset = 5 if segmented else 3
+        offset = 4 if segmented else 2
         if offset < len(apdu):
             service_choice = apdu[offset]
             info["service_name"] = CONFIRMED_SERVICE_CHOICES.get(
@@ -660,7 +664,10 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
 
     service_name = str(info.get("service_name") or "")
     if service_name:
-        if service_name in CONTROL_SERVICES:
+        if (
+            service_name in CONTROL_SERVICES
+            and info.get("apdu_type") in {0, 1}
+        ):
             kind = "bacnet_control_service"
         elif service_name in DISCOVERY_SERVICES:
             kind = "bacnet_discovery"
@@ -690,6 +697,10 @@ def _detect_anomalies(
     anomalies: list[IndustrialAnomaly] = []
     info = _parse_bacnet_payload(payload)
     command_set = set(commands)
+    if info.get("apdu_type") not in {0, 1}:
+        command_set.difference_update(CONTROL_SERVICES)
+        command_set.discard("ConfirmedPrivateTransfer")
+        command_set.discard("UnconfirmedPrivateTransfer")
 
     target_suffix = _format_target(info)
     if target_suffix:

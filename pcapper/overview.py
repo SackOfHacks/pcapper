@@ -36,6 +36,7 @@ from .scan import analyze_scan
 from .services import analyze_services
 from .sv import analyze_sv
 from .threats import analyze_threats
+from .utils import call_with_packet_view
 
 
 @dataclass(frozen=True)
@@ -1847,10 +1848,17 @@ def analyze_overview(
     vt_lookup: bool = False,
     ot_commands_fast: bool = False,
     ot_commands_config: OtControlConfig | None = None,
+    packets: list[object] | None = None,
+    meta=None,
 ) -> OverviewSummary:
-    base_summary = analyze_pcap(path, show_status=show_status)
-    protocol_summary = analyze_protocols(path, show_status=show_status)
-    services_summary = analyze_services(path, show_status=show_status)
+    def _analyze(func, *args, **kwargs):
+        return call_with_packet_view(
+            func, path, *args, packets=packets, meta=meta, **kwargs
+        )
+
+    base_summary = _analyze(analyze_pcap, show_status=show_status)
+    protocol_summary = _analyze(analyze_protocols, show_status=show_status)
+    services_summary = _analyze(analyze_services, show_status=show_status)
 
     top_protocols = [
         (str(name), int(count))
@@ -1864,7 +1872,9 @@ def analyze_overview(
     try:
         from .netbios import analyze_netbios, collect_netbios_host_intel
 
-        _nb_intel = collect_netbios_host_intel(analyze_netbios(path, show_status=False))
+        _nb_intel = collect_netbios_host_intel(
+            _analyze(analyze_netbios, show_status=False)
+        )
     except Exception:
         _nb_intel = {}
     if _nb_intel:
@@ -1963,24 +1973,24 @@ def analyze_overview(
     add_module(
         "threats",
         "Correlate detections across IT and OT protocols for hunt triage.",
-        lambda: analyze_threats(path, show_status=show_status, vt_lookup=vt_lookup),
+        lambda: _analyze(analyze_threats, show_status=show_status, vt_lookup=vt_lookup),
     )
     add_module(
         "scan",
         "Expose reconnaissance and lateral movement setup indicators.",
-        lambda: analyze_scan(path, show_status=show_status),
+        lambda: _analyze(analyze_scan, show_status=show_status),
     )
     add_module(
         "ctf",
         "Find potential flags/tokens and decode-able artifacts for challenge workflows.",
-        lambda: analyze_ctf(path, show_status=show_status),
+        lambda: _analyze(analyze_ctf, show_status=show_status),
     )
 
     if has_file_hints:
         add_module(
             "files",
             "Protocol/service mix suggests transferable artifacts worth carving.",
-            lambda: analyze_files(path, show_status=show_status),
+            lambda: _analyze(analyze_files, show_status=show_status),
         )
 
     if detected_ot_steps:
@@ -1992,40 +2002,42 @@ def analyze_overview(
                 show_status=show_status,
                 fast=ot_commands_fast,
                 config=ot_commands_config,
+                packets=packets,
+                meta=meta,
             ),
         )
         add_module(
             "safety",
             "Check for safety PLC/SIS communications and exposure indicators.",
-            lambda: analyze_safety(path, show_status=show_status),
+            lambda: _analyze(analyze_safety, show_status=show_status),
         )
         if "modbus" in detected_ot_steps or "dnp3" in detected_ot_steps:
             add_module(
                 "control_loop",
                 "Modbus/DNP3 present; evaluate process value changes for control instability.",
-                lambda: analyze_control_loop(path, show_status=show_status),
+                lambda: _analyze(analyze_control_loop, show_status=show_status),
             )
 
     ot_runners: dict[str, Callable[[], object]] = {
-        "modbus": lambda: analyze_modbus(path, show_status=show_status),
-        "dnp3": lambda: analyze_dnp3(path, show_status=show_status),
-        "iec104": lambda: analyze_iec104(path, show_status=show_status),
-        "bacnet": lambda: analyze_bacnet(path, show_status=show_status),
-        "enip": lambda: analyze_enip(path, show_status=show_status),
-        "cip": lambda: analyze_cip(path, show_status=show_status),
-        "profinet": lambda: analyze_profinet(path, show_status=show_status),
-        "s7": lambda: analyze_s7(path, show_status=show_status),
-        "opc": lambda: analyze_opc(path, show_status=show_status),
-        "mms": lambda: analyze_mms(path, show_status=show_status),
-        "goose": lambda: analyze_goose(path, show_status=show_status),
-        "sv": lambda: analyze_sv(path, show_status=show_status),
-        "lldp": lambda: analyze_lldp_dcp(path, show_status=show_status),
-        "ptp": lambda: analyze_ptp(path, show_status=show_status),
-        "mqtt": lambda: analyze_mqtt(path, show_status=show_status),
-        "coap": lambda: analyze_coap(path, show_status=show_status),
-        "hart": lambda: analyze_hart(path, show_status=show_status),
-        "niagara": lambda: analyze_niagara(path, show_status=show_status),
-        "codesys": lambda: analyze_codesys(path, show_status=show_status),
+        "modbus": lambda: _analyze(analyze_modbus, show_status=show_status),
+        "dnp3": lambda: _analyze(analyze_dnp3, show_status=show_status),
+        "iec104": lambda: _analyze(analyze_iec104, show_status=show_status),
+        "bacnet": lambda: _analyze(analyze_bacnet, show_status=show_status),
+        "enip": lambda: _analyze(analyze_enip, show_status=show_status),
+        "cip": lambda: _analyze(analyze_cip, show_status=show_status),
+        "profinet": lambda: _analyze(analyze_profinet, show_status=show_status),
+        "s7": lambda: _analyze(analyze_s7, show_status=show_status),
+        "opc": lambda: _analyze(analyze_opc, show_status=show_status),
+        "mms": lambda: _analyze(analyze_mms, show_status=show_status),
+        "goose": lambda: _analyze(analyze_goose, show_status=show_status),
+        "sv": lambda: _analyze(analyze_sv, show_status=show_status),
+        "lldp": lambda: _analyze(analyze_lldp_dcp, show_status=show_status),
+        "ptp": lambda: _analyze(analyze_ptp, show_status=show_status),
+        "mqtt": lambda: _analyze(analyze_mqtt, show_status=show_status),
+        "coap": lambda: _analyze(analyze_coap, show_status=show_status),
+        "hart": lambda: _analyze(analyze_hart, show_status=show_status),
+        "niagara": lambda: _analyze(analyze_niagara, show_status=show_status),
+        "codesys": lambda: _analyze(analyze_codesys, show_status=show_status),
     }
 
     for step in detected_ot_steps[:_AUTO_OT_DEEP_DIVE_LIMIT]:

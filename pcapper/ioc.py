@@ -218,7 +218,7 @@ def analyze_iocs(
     meta: PcapMeta | None = None,
 ) -> IocSummary:
     errors: list[str] = []
-    ips, domains, hashes, meta = _load_iocs(ioc_path, errors=errors)
+    ips, domains, hashes, indicator_meta = _load_iocs(ioc_path, errors=errors)
     domain_patterns = _compile_domain_patterns(domains)
     ip_hits: Counter[str] = Counter()
     domain_hits: Counter[str] = Counter()
@@ -275,7 +275,7 @@ def analyze_iocs(
     if ip_hits:
 
         def _format_hit(value: str, count: int) -> str:
-            entry = meta.get(value)
+            entry = indicator_meta.get(value)
             if not entry:
                 return f"{value} ({count})"
             parts = []
@@ -303,7 +303,7 @@ def analyze_iocs(
     if domain_hits:
 
         def _format_hit(value: str, count: int) -> str:
-            entry = meta.get(value)
+            entry = indicator_meta.get(value)
             if not entry:
                 return f"{value} ({count})"
             parts = []
@@ -331,7 +331,7 @@ def analyze_iocs(
     if hash_hits:
 
         def _format_hit(value: str, count: int) -> str:
-            entry = meta.get(value)
+            entry = indicator_meta.get(value)
             if not entry:
                 return f"{value} ({count})"
             parts = []
@@ -371,7 +371,7 @@ def analyze_iocs(
     def _accumulate(counter: Counter[str], hit_counter: Counter[str]) -> None:
         nonlocal conf_total, conf_count
         for value, count in hit_counter.items():
-            entry = meta.get(value)
+            entry = indicator_meta.get(value)
             if not entry:
                 continue
             source = entry.get("source")
@@ -406,7 +406,7 @@ def analyze_iocs(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration,
-        indicator_meta=meta,
+        indicator_meta=indicator_meta,
         source_counts=source_counts,
         tag_counts=tag_counts,
         mitre_counts=mitre_counts,

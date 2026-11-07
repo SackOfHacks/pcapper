@@ -427,6 +427,15 @@ def analyze_smb(
         cap_warnings.add(key)
         errors.append(message)
 
+    def _store_capped(
+        store: Dict[Any, Any], key: Any, value: Any, limit: int, name: str
+    ) -> bool:
+        if key in store or len(store) < limit:
+            store[key] = value
+            return True
+        _cap_warn(name, f"SMB {name.replace('_', ' ')} capped at {limit}")
+        return False
+
     def _append_capped(
         items: List[Any], item: Any, limit: int, key: str, message: str
     ) -> None:
@@ -990,7 +999,13 @@ def analyze_smb(
                     "mechs": sorted(mechs),
                 }
                 if user or domain or mechs:
-                    pending_auth[(client, server, int(msg_id))] = auth_details
+                    _store_capped(
+                        pending_auth,
+                        (client, server, int(msg_id)),
+                        auth_details,
+                        MAX_SMB_PENDING,
+                        "pending_auth",
+                    )
                     if sess is None and session_id != 0:
                         if len(sessions) >= MAX_SMB_SESSIONS:
                             _cap_warn(
@@ -1116,6 +1131,11 @@ def analyze_smb(
                         pending_tree_connects[
                             (client, server, int(session_id), int(msg_id))
                         ] = share_path
+                    else:
+                        _cap_warn(
+                            "pending_tree_connects",
+                            f"SMB pending tree connects capped at {MAX_SMB_PENDING}",
+                        )
 
         if cmd == SMB2_COM_TREE_CONNECT and is_response and tree_id != 0:
             share_path = pending_tree_connects.pop(
@@ -1280,11 +1300,13 @@ def analyze_smb(
                     _cap_warn("files", f"SMB file events capped at {MAX_SMB_FILES}")
 
                 if op_index is not None:
-                    pending_io[
-                        (client, server, int(session_id), int(msg_id), int(cmd))
-                    ] = {
-                        "index": op_index,
-                    }
+                    _store_capped(
+                        pending_io,
+                        (client, server, int(session_id), int(msg_id), int(cmd)),
+                        {"index": op_index},
+                        MAX_SMB_PENDING,
+                        "pending_io",
+                    )
 
         if cmd in (SMB2_COM_READ, SMB2_COM_WRITE) and is_response:
             if len(data) >= 8:
@@ -1396,12 +1418,18 @@ def analyze_smb(
                 counter_inc(observed_domains, domain)
             if not is_response:
                 if user or domain or mechs:
-                    smb1_pending_auth[(client, server, mid)] = {
-                        "user": user,
-                        "domain": domain,
-                        "workstation": workstation,
-                        "mechs": sorted(mechs),
-                    }
+                    _store_capped(
+                        smb1_pending_auth,
+                        (client, server, mid),
+                        {
+                            "user": user,
+                            "domain": domain,
+                            "workstation": workstation,
+                            "mechs": sorted(mechs),
+                        },
+                        MAX_SMB_PENDING,
+                        "smb1_pending_auth",
+                    )
             else:
                 pending = smb1_pending_auth.pop((client, server, mid), None)
                 if pending and uid != 0:
@@ -1490,7 +1518,13 @@ def analyze_smb(
                         max_values=MAX_SMB_UNIQUE,
                     )
                     if tid != 0:
-                        smb1_tree_map[(client, server, int(tid))] = share_path
+                        _store_capped(
+                            smb1_tree_map,
+                            (client, server, int(tid)),
+                            share_path,
+                            MAX_SMB_TREE_MAP,
+                            "smb1_tree_map",
+                        )
 
         if cmd in (SMB1_COM_NT_CREATE_ANDX, SMB1_COM_OPEN_ANDX) and not is_response:
             strings = _smb_strings(payload)
@@ -1774,7 +1808,13 @@ def analyze_smb(
                     if (
                         src_port == 139 or dst_port == 139
                     ) and netbios_pair not in netbios_smb_seen:
-                        netbios_smb_seen.add(netbios_pair)
+                        if len(netbios_smb_seen) < MAX_SMB_UNIQUE:
+                            netbios_smb_seen.add(netbios_pair)
+                        else:
+                            _cap_warn(
+                                "netbios_pairs",
+                                f"SMB NetBIOS pair tracking capped at {MAX_SMB_UNIQUE}",
+                            )
                         _append_capped(
                             anomalies,
                             SmbAnomaly(

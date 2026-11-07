@@ -271,7 +271,10 @@ def _krb_reqbody_etypes(payload: bytes) -> list[int]:
             ok = True
             pos = seq_start
             while pos < seq_end:
-                if payload[pos] != 0x02:  # every element must be an INTEGER
+                if (
+                    pos + 1 >= seq_end
+                    or payload[pos] != 0x02
+                ):  # every element must be a complete INTEGER TLV
                     ok = False
                     break
                 int_len = payload[pos + 1]

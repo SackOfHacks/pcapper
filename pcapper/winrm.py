@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
-from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, extract_ascii_strings as _extract_ascii_strings
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, tcp_segment_length, extract_ascii_strings as _extract_ascii_strings
 from .utils import is_public_ip as _is_public_ip
 from .utils import beacon_score as _beaconing_score
+from .utils import env_int
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -25,6 +26,10 @@ except Exception:  # pragma: no cover
 
 
 WINRM_PORTS = {5985, 5986}
+MAX_WINRM_SESSIONS = env_int("PCAPPER_MAX_WINRM_SESSIONS", 50000, minimum=1)
+MAX_WINRM_UNIQUE_VALUES = env_int("PCAPPER_MAX_WINRM_UNIQUE_VALUES", 2000, minimum=1)
+MAX_WINRM_ARTIFACTS = env_int("PCAPPER_MAX_WINRM_ARTIFACTS", 2000, minimum=1)
+MAX_WINRM_MACS_PER_IP = env_int("PCAPPER_MAX_WINRM_MACS_PER_IP", 32, minimum=1)
 HTTP_PORTS = {80, 5985, 8080, 8000}
 HTTPS_PORTS = {443, 5986, 8443}
 # A WinRM port on the *source* side is the service only when the destination
@@ -211,11 +216,7 @@ class _SessionState:
     last_seen: Optional[float] = None
     http_detected: bool = False
     https_detected: bool = False
-    hosts: Counter[str] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.hosts is None:
-            self.hosts = Counter()
+    hosts: Counter[str] = field(default_factory=Counter)
 
 
 def _scan_plaintext(
@@ -228,8 +229,12 @@ def _scan_plaintext(
     user_agents: Counter[str],
     auth_schemes: Counter[str],
     hosts: Counter[str],
-    max_unique: int = 2000,
+    max_unique: int = MAX_WINRM_UNIQUE_VALUES,
 ) -> None:
+    def _increment_limited(counter: Counter[str], key: str) -> None:
+        if key in counter or len(counter) < max_unique:
+            counter[key] += 1
+
     for item in _extract_ascii_strings(payload):
         if not item:
             continue
@@ -237,28 +242,28 @@ def _scan_plaintext(
             plaintext_counter[item] += 1
         for pattern, reason in SUSPICIOUS_PLAINTEXT:
             if pattern.search(item):
-                suspicious_counter[f"{reason}: {item}"] += 1
+                _increment_limited(suspicious_counter, f"{reason}: {item}")
         for match in FILE_NAME_RE.findall(item):
-            file_counter[match] += 1
+            _increment_limited(file_counter, match)
         soap_match = SOAP_ACTION_RE.search(item)
         if soap_match:
-            soap_actions[soap_match.group(1).strip()] += 1
+            _increment_limited(soap_actions, soap_match.group(1).strip())
         # WS-Addressing <a:Action> operation from the SOAP body.
         for action_match in WSMAN_ACTION_RE.finditer(item):
-            soap_actions[action_match.group(1)] += 1
+            _increment_limited(soap_actions, action_match.group(1))
         host_match = HOST_RE.search(item)
         if host_match:
-            hosts[host_match.group(1).strip()] += 1
+            _increment_limited(hosts, host_match.group(1).strip())
         ua_match = USER_AGENT_RE.search(item)
         if ua_match:
-            user_agents[ua_match.group(1).strip()] += 1
+            _increment_limited(user_agents, ua_match.group(1).strip())
         auth_match = AUTH_RE.search(item)
         if auth_match:
             auth_value = auth_match.group(1).strip()
             scheme = auth_value.split()[0] if auth_value else auth_value
             if scheme:
-                auth_schemes[scheme] += 1
-        if WSMAN_RE.search(item):
+                _increment_limited(auth_schemes, scheme)
+        if WSMAN_RE.search(item) and len(artifacts) < MAX_WINRM_ARTIFACTS:
             artifacts.append(item)
 
 
@@ -360,6 +365,7 @@ def analyze_winrm(
     short_session_by_client: Counter[str] = Counter()
     short_session_targets: dict[str, set[str]] = defaultdict(set)
     pair_first_seen: dict[tuple[str, str], list[float]] = defaultdict(list)
+    session_cap_reached = False
 
     try:
         for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
@@ -384,6 +390,12 @@ def analyze_winrm(
                     payload = bytes(pkt[Raw])  # type: ignore[index]
                 except Exception:
                     payload = b""
+            ip_layer = pkt.getlayer(IP) if IP is not None else None
+            if ip_layer is None and IPv6 is not None:
+                ip_layer = pkt.getlayer(IPv6)
+            actual_payload_length = tcp_segment_length(tcp, ip_layer)
+            if actual_payload_length is not None:
+                payload = payload[:actual_payload_length]
             else:
                 try:
                     payload = bytes(tcp.payload)
@@ -427,21 +439,17 @@ def analyze_winrm(
                 src_ip, dst_ip, sport, dport
             )
 
-            server_ports[server_port] += 1
-            client_counts[client_ip] += 1
-            server_counts[server_ip] += 1
-            if eth_src and src_ip:
-                ip_to_macs[src_ip].add(eth_src.lower())
-            if eth_dst and dst_ip:
-                ip_to_macs[dst_ip].add(eth_dst.lower())
-            if eth_src and src_ip == client_ip:
-                client_macs[eth_src.lower()] += 1
-            if eth_dst and dst_ip == server_ip:
-                server_macs[eth_dst.lower()] += 1
-
             session_key = (client_ip, client_port, server_ip, server_port)
             session = sessions.get(session_key)
             if session is None:
+                if len(sessions) >= MAX_WINRM_SESSIONS:
+                    if not session_cap_reached:
+                        errors.append(
+                            f"WinRM session tracking capped at {MAX_WINRM_SESSIONS}; "
+                            "additional session details were omitted."
+                        )
+                        session_cap_reached = True
+                    continue
                 session = _SessionState(
                     client_ip=client_ip,
                     server_ip=server_ip,
@@ -453,6 +461,27 @@ def analyze_winrm(
                     last_seen=ts,
                 )
                 sessions[session_key] = session
+
+            server_ports[server_port] += 1
+            client_counts[client_ip] += 1
+            server_counts[server_ip] += 1
+            if eth_src and src_ip:
+                if (
+                    len(ip_to_macs[src_ip]) < MAX_WINRM_MACS_PER_IP
+                    or eth_src.lower() in ip_to_macs[src_ip]
+                ):
+                    ip_to_macs[src_ip].add(eth_src.lower())
+            if eth_dst and dst_ip:
+                if (
+                    len(ip_to_macs[dst_ip]) < MAX_WINRM_MACS_PER_IP
+                    or eth_dst.lower() in ip_to_macs[dst_ip]
+                ):
+                    ip_to_macs[dst_ip].add(eth_dst.lower())
+            if eth_src and src_ip == client_ip:
+                client_macs[eth_src.lower()] += 1
+            if eth_dst and dst_ip == server_ip:
+                server_macs[eth_dst.lower()] += 1
+
             if session.client_mac is None and eth_src and src_ip == client_ip:
                 session.client_mac = eth_src.lower()
             if session.server_mac is None and eth_dst and dst_ip == server_ip:
@@ -501,7 +530,12 @@ def analyze_winrm(
                 for host in _extract_ascii_strings(payload):
                     host_match = HOST_RE.search(host)
                     if host_match:
-                        session.hosts[host_match.group(1).strip()] += 1
+                        host = host_match.group(1).strip()
+                        if (
+                            host in session.hosts
+                            or len(session.hosts) < MAX_WINRM_UNIQUE_VALUES
+                        ):
+                            session.hosts[host] += 1
 
     except Exception as exc:
         errors.append(str(exc))

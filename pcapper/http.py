@@ -27,6 +27,7 @@ from .utils import (
     env_int,
     extract_packet_endpoints,
     memoize_analysis,
+    network_egress_allowed,
     safe_float,
     set_add_cap,
     setdict_add,
@@ -119,7 +120,8 @@ EXECUTABLE_FILE_TYPES = {"EXE/DLL", "ELF"}
 # "exec" doesn't fire on "/execute", "eval" on "/evaluation", "curl" on "curly",
 # etc. (the old `token in uri` substring test produced heavy false positives).
 SUSPICIOUS_URI_RE = re.compile(
-    r"(?<![a-z0-9])(?:cmd=|exec|eval|powershell|whoami|wget|curl|nc -|/bin/sh|/bin/bash)"
+    r"(?<![a-z0-9])cmd=|(?<![a-z0-9])"
+    r"(?:exec|eval|powershell|whoami|wget|curl|nc -|/bin/sh|/bin/bash)"
     r"(?![a-z0-9])|/(?:shell|webshell|c99|r57|wso|b374k)(?![a-z0-9])",
     re.IGNORECASE,
 )
@@ -158,10 +160,11 @@ COMMON_AUTH_SCHEMES = {
 MAX_HTTP_UNIQUE = env_int("PCAPPER_MAX_HTTP_UNIQUE", 50000, minimum=1)
 MAX_HTTP_CONVERSATIONS = env_int("PCAPPER_MAX_HTTP_CONVERSATIONS", 50000, minimum=1)
 MAX_HTTP_PENDING = env_int("PCAPPER_MAX_HTTP_PENDING", 200, minimum=1)
+MAX_HTTP_CHANNELS = env_int("PCAPPER_MAX_HTTP_CHANNELS", 10000, minimum=1)
 MIN_HTTP_DOWNLOAD_BYTES = env_int("PCAPPER_MIN_HTTP_DOWNLOAD_BYTES", 512, minimum=0)
 MAX_HTTP_DETECTION_EVIDENCE = env_int("PCAPPER_MAX_HTTP_DETECTION_EVIDENCE", 12, minimum=1)
 MAX_VT_CACHE = env_int("PCAPPER_VT_CACHE_SIZE", 2048, minimum=1)
-MAX_VT_LOOKUPS = env_int("PCAPPER_VT_MAX_LOOKUPS", 500)
+MAX_VT_LOOKUPS = env_int("PCAPPER_VT_MAX_LOOKUPS", 500, minimum=1)
 VT_TIMEOUT = float(env_int("PCAPPER_VT_TIMEOUT", 8, minimum=1))
 VT_BUDGET_SECONDS = float(env_int("PCAPPER_VT_BUDGET_SECONDS", 120, minimum=1))
 
@@ -323,6 +326,12 @@ def _safe_urlparse(url: str):
         return urlparse("")
 
 
+def _normalize_host(host: str) -> str:
+    value = host.strip().lower()
+    parsed = _safe_urlparse(f"//{value}")
+    return parsed.hostname or value.split(":", 1)[0]
+
+
 def _parse_referrer(referrer: str) -> tuple[str, str, str]:
     ref = referrer.strip()
     if not ref or ref == "-":
@@ -447,6 +456,8 @@ def _vt_url_id(url: str) -> str:
 def _vt_lookup_domain(
     domain: str, api_key: str
 ) -> tuple[Optional[dict[str, object]], Optional[str]]:
+    if not network_egress_allowed():
+        return None, f"VT lookup skipped for {domain}: network egress is disabled."
     # Wire-derived name: percent-encode so it cannot rewrite the request path.
     vt_url = "https://www.virustotal.com/api/v3/domains/" + urllib.parse.quote(domain, safe="")
     headers = {"x-apikey": api_key}
@@ -485,6 +496,8 @@ def _vt_lookup_domain(
 def _vt_lookup_url(
     url: str, api_key: str
 ) -> tuple[Optional[dict[str, object]], Optional[str]]:
+    if not network_egress_allowed():
+        return None, f"VT lookup skipped for {url}: network egress is disabled."
     url_id = _vt_url_id(url)
     vt_url = f"https://www.virustotal.com/api/v3/urls/{url_id}"
     headers = {"x-apikey": api_key}
@@ -768,6 +781,9 @@ def analyze_http(
     servers: set[str] = set()
 
     skipped_conversations = 0
+    skipped_pending_flows = 0
+    skipped_upload_profiles = 0
+    skipped_channel_keys = 0
 
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -855,7 +871,7 @@ def analyze_http(
                     if version.startswith("HTTP/"):
                         counter_inc(version_counts, version)
                     host = headers.get("host", "")
-                    host_norm = host.lower().split(":", 1)[0] if host else ""
+                    host_norm = _normalize_host(host) if host else ""
                     url = _extract_url(host, uri)
                     uri_lc = uri.lower()
                     if hostname_token:
@@ -877,9 +893,15 @@ def analyze_http(
 
                     channel_key = (src_ip, dst_ip, host_norm or host, uri, method)
                     if ts is not None:
-                        channel_times = request_channel_times[channel_key]
-                        if len(channel_times) < _MAX_CHANNEL_TIMES:
-                            channel_times.append(ts)
+                        if (
+                            channel_key not in request_channel_times
+                            and len(request_channel_times) >= MAX_HTTP_CHANNELS
+                        ):
+                            skipped_channel_keys += 1
+                        else:
+                            channel_times = request_channel_times[channel_key]
+                            if len(channel_times) < _MAX_CHANNEL_TIMES:
+                                channel_times.append(ts)
 
                     auth_header = headers.get("authorization", "")
                     if auth_header:
@@ -944,7 +966,7 @@ def analyze_http(
                             )
 
                     if SUSPICIOUS_URI_RE.search(uri_lc):
-                        suspicious_exec_uri_hits[uri] += 1
+                        counter_inc(suspicious_exec_uri_hits, uri)
                         _append_evidence(
                             webshell_evidence,
                             {
@@ -1163,7 +1185,12 @@ def analyze_http(
                                 },
                             )
                     pending_key = (src_ip, int(sport), dst_ip, int(dport))
-                    if len(pending_requests[pending_key]) < MAX_HTTP_PENDING:
+                    if (
+                        pending_key not in pending_requests
+                        and len(pending_requests) >= MAX_HTTP_CONVERSATIONS
+                    ):
+                        skipped_pending_flows += 1
+                    elif len(pending_requests[pending_key]) < MAX_HTTP_PENDING:
                         pending_requests[pending_key].append(
                             {
                                 "uri": uri,
@@ -1244,9 +1271,9 @@ def analyze_http(
                                 uri,
                                 method,
                             )
-                            profile = upload_profiles.setdefault(
-                                profile_key,
-                                {
+                            profile = upload_profiles.get(profile_key)
+                            if profile is None and len(upload_profiles) < MAX_HTTP_CONVERSATIONS:
+                                profile = {
                                     "src": src_ip,
                                     "dst": dst_ip,
                                     "host": host_norm or host,
@@ -1255,15 +1282,18 @@ def analyze_http(
                                     "requests": 0,
                                     "bytes": 0,
                                     "content_types": set(),
-                                },
-                            )
-                            profile["requests"] = int(profile.get("requests", 0)) + 1
-                            profile["bytes"] = (
-                                int(profile.get("bytes", 0)) + req_body_size
-                            )
-                            cset = profile.get("content_types")
-                            if isinstance(cset, set) and content_type:
-                                cset.add(content_type)
+                                }
+                                upload_profiles[profile_key] = profile
+                            elif profile is None:
+                                skipped_upload_profiles += 1
+                            if profile is not None:
+                                profile["requests"] = int(profile.get("requests", 0)) + 1
+                                profile["bytes"] = (
+                                    int(profile.get("bytes", 0)) + req_body_size
+                                )
+                                cset = profile.get("content_types")
+                                if isinstance(cset, set) and content_type:
+                                    set_add_cap(cset, content_type, max_size=32)
 
                             is_uploadish = any(
                                 key in uri_lc for key in SUSPICIOUS_UPLOAD_PATH_KEYWORDS
@@ -1496,6 +1526,21 @@ def analyze_http(
         errors.append(
             f"HTTP conversation cap reached; {skipped_conversations} updates skipped."
         )
+    if skipped_pending_flows:
+        errors.append(
+            f"HTTP pending-request flow cap reached; {skipped_pending_flows} requests "
+            "were not queued for response correlation."
+        )
+    if skipped_upload_profiles:
+        errors.append(
+            f"HTTP upload-profile cap reached; {skipped_upload_profiles} request "
+            "profile update(s) were omitted."
+        )
+    if skipped_channel_keys:
+        errors.append(
+            f"HTTP beacon-channel cap reached; {skipped_channel_keys} channel "
+            "observation(s) were omitted."
+        )
 
     conversation_rows: list[HttpConversation] = []
     for (client, server), data in conversations.items():
@@ -1513,13 +1558,18 @@ def analyze_http(
             )
         )
 
-    # Use dpkt-based file discovery to align with --files parsing
+    # Reuse --files discovery, sharing the packet view when the caller has one.
     try:
         from .files import analyze_files
 
-        dpkt_summary = analyze_files(path, show_status=False)
-    except Exception:
+        dpkt_summary = analyze_files(
+            path, show_status=False, packets=packets, meta=meta
+        )
+    except Exception as exc:
         dpkt_summary = None
+        errors.append(
+            f"HTTP file discovery failed: {type(exc).__name__}: {exc}"
+        )
 
     if dpkt_summary is not None:
         file_artifacts = Counter()

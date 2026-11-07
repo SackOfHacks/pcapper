@@ -478,11 +478,16 @@ def _rpc_read_u32(payload: bytes, offset: int, le: bool) -> Optional[int]:
 def _rpc_stub_data(rpc_payload: bytes, le: bool) -> bytes:
     if len(rpc_payload) < 24:
         return b""
-    frag_len = _rpc_read_u16(rpc_payload, 8, le) or len(rpc_payload)
+    frag_len = _rpc_read_u16(rpc_payload, 8, le)
+    if frag_len is None or frag_len < 24 or frag_len > len(rpc_payload):
+        return b""
     auth_len = _rpc_read_u16(rpc_payload, 10, le) or 0
-    stub_end = min(len(rpc_payload), frag_len)
-    if auth_len and stub_end >= auth_len + 24:
-        stub_end = max(24, stub_end - auth_len)
+    stub_end = frag_len
+    if auth_len:
+        auth_trailer_len = 8 + auth_len
+        if stub_end < 24 + auth_trailer_len:
+            return b""
+        stub_end -= auth_trailer_len
     return rpc_payload[24:stub_end]
 
 

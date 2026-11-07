@@ -10,10 +10,12 @@ from .device_detection import device_fingerprints_from_text
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_ascii_strings as _extract_ascii_strings
 from .utils import (
+    counter_inc,
     extract_packet_endpoints,
     memoize_analysis,
     packet_length,
     safe_float,
+    setdict_add,
     tcp_segment_length,
 )
 from .utils import beacon_score as _beaconing_score
@@ -32,6 +34,9 @@ except Exception:  # pragma: no cover
 
 
 TELNET_PORTS = {23, 2323, 9923}
+MAX_TELNET_SESSIONS = 50_000
+MAX_TELNET_TRANSCRIPT_BYTES = 64 * 1024 * 1024
+MAX_TELNET_TRANSCRIPT_PER_SESSION = 64 * 1024
 # A Telnet port on the *source* side is the service only when the destination
 # is an ephemeral port; a flow from ephemeral 23 to 443 is not Telnet.
 _EPHEMERAL_MIN = 1024
@@ -39,9 +44,11 @@ _EPHEMERAL_MIN = 1024
 # Negative lookbehind on "last " avoids the ubiquitous "Last login: <weekday>"
 # MOTD banner being mistaken for a login prompt (captured "Thu", "Mon", ...).
 USERNAME_RE = re.compile(
-    r"(?<!last )(?:login|user(name)?|username)\s*[:=]\s*(\S+)", re.IGNORECASE
+    r"(?<!last )\b(?:login|user(name)?|username)\s*[:=]\s*(\S+)", re.IGNORECASE
 )
-PASSWORD_RE = re.compile(r"(?:password|passwd|pass)\s*[:=]\s*(\S+)", re.IGNORECASE)
+PASSWORD_RE = re.compile(
+    r"\b(?:password|passwd|pass)\s*[:=]\s*(\S+)", re.IGNORECASE
+)
 
 SUSPICIOUS_PLAINTEXT = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential indicator"),
@@ -195,7 +202,7 @@ class _SessionState:
     # in any single packet — it must be reassembled, Wireshark-Follow-Stream
     # style, to pair the server's "login:"/"Password:" prompt with the client's
     # typed value.
-    transcript_parts: list = None  # type: ignore[assignment]
+    transcript_parts: bytearray = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.usernames is None:
@@ -203,7 +210,7 @@ class _SessionState:
         if self.passwords is None:
             self.passwords = Counter()
         if self.transcript_parts is None:
-            self.transcript_parts = []
+            self.transcript_parts = bytearray()
 
 
 def _maybe_dedouble(value: str) -> str:
@@ -280,17 +287,21 @@ def _scan_plaintext(
     for item in _extract_ascii_strings(payload):
         if not item:
             continue
-        if len(plaintext_counter) < max_unique or item in plaintext_counter:
-            plaintext_counter[item] += 1
+        counter_inc(plaintext_counter, item, max_keys=max_unique)
         for pattern, reason in SUSPICIOUS_PLAINTEXT:
             if pattern.search(item):
-                suspicious_counter[f"{reason}: {item}"] += 1
+                counter_inc(
+                    suspicious_counter,
+                    f"{reason}: {item}",
+                    max_keys=max_unique,
+                )
         for match in FILE_NAME_RE.findall(item):
-            file_counter[match] += 1
+            counter_inc(file_counter, match, max_keys=max_unique)
         if item.strip().startswith(("$", "#", ">")) or "whoami" in item.lower():
-            commands[item.strip()] += 1
+            counter_inc(commands, item.strip(), max_keys=max_unique)
         if "login:" in item.lower() or "password:" in item.lower():
-            artifacts.append(item)
+            if len(artifacts) < max_unique:
+                artifacts.append(item)
 
 
 def _tcp_payload_bytes(pkt: object, tcp: object) -> bytes:
@@ -406,6 +417,9 @@ def analyze_telnet(
     short_session_by_client: Counter[str] = Counter()
     short_session_targets: dict[str, set[str]] = defaultdict(set)
     pair_first_seen: dict[tuple[str, str], list[float]] = defaultdict(list)
+    transcript_bytes = 0
+    session_limit_reported = False
+    transcript_limit_reported = False
 
     try:
         for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
@@ -459,21 +473,17 @@ def analyze_telnet(
                 src_ip, dst_ip, sport, dport
             )
 
-            server_ports[server_port] += 1
-            client_counts[client_ip] += 1
-            server_counts[server_ip] += 1
-            if eth_src and src_ip:
-                ip_to_macs[src_ip].add(eth_src.lower())
-            if eth_dst and dst_ip:
-                ip_to_macs[dst_ip].add(eth_dst.lower())
-            if eth_src and src_ip == client_ip:
-                client_macs[eth_src.lower()] += 1
-            if eth_dst and dst_ip == server_ip:
-                server_macs[eth_dst.lower()] += 1
-
             session_key = (client_ip, client_port, server_ip, server_port)
             session = sessions.get(session_key)
             if session is None:
+                if len(sessions) >= MAX_TELNET_SESSIONS:
+                    if not session_limit_reported:
+                        errors.append(
+                            "Telnet session tracking limit reached; additional "
+                            "sessions are not decoded."
+                        )
+                        session_limit_reported = True
+                    continue
                 session = _SessionState(
                     client_ip=client_ip,
                     server_ip=server_ip,
@@ -485,6 +495,19 @@ def analyze_telnet(
                     last_seen=ts,
                 )
                 sessions[session_key] = session
+
+            counter_inc(server_ports, server_port)
+            counter_inc(client_counts, client_ip)
+            counter_inc(server_counts, server_ip)
+            if eth_src and src_ip:
+                setdict_add(ip_to_macs, src_ip, eth_src.lower(), max_values=32)
+            if eth_dst and dst_ip:
+                setdict_add(ip_to_macs, dst_ip, eth_dst.lower(), max_values=32)
+            if eth_src and src_ip == client_ip:
+                counter_inc(client_macs, eth_src.lower())
+            if eth_dst and dst_ip == server_ip:
+                counter_inc(server_macs, eth_dst.lower())
+
             if session.client_mac is None and eth_src and src_ip == client_ip:
                 session.client_mac = eth_src.lower()
             if session.server_mac is None and eth_dst and dst_ip == server_ip:
@@ -521,17 +544,30 @@ def analyze_telnet(
                 # Accumulate the reassembled chronological transcript for a
                 # post-loop credential pass (catches character-mode telnet that
                 # the per-packet regex below cannot see).
-                session.transcript_parts.append(text)
+                transcript_room = min(
+                    MAX_TELNET_TRANSCRIPT_PER_SESSION - len(session.transcript_parts),
+                    MAX_TELNET_TRANSCRIPT_BYTES - transcript_bytes,
+                )
+                if transcript_room > 0:
+                    transcript = clean_payload[:transcript_room]
+                    session.transcript_parts.extend(transcript)
+                    transcript_bytes += len(transcript)
+                if len(clean_payload) > transcript_room and not transcript_limit_reported:
+                    errors.append(
+                        "Telnet transcript retention limit reached; extracted "
+                        "credentials may be incomplete."
+                    )
+                    transcript_limit_reported = True
                 user_match = USERNAME_RE.search(text)
                 if user_match:
                     value = user_match.group(2)
-                    session.usernames[value] += 1
-                    usernames[value] += 1
+                    counter_inc(session.usernames, value, max_keys=2000)
+                    counter_inc(usernames, value)
                 pass_match = PASSWORD_RE.search(text)
                 if pass_match:
                     value = pass_match.group(1)
-                    session.passwords[value] += 1
-                    passwords[value] += 1
+                    counter_inc(session.passwords, value, max_keys=2000)
+                    counter_inc(passwords, value)
                 _scan_plaintext(
                     clean_payload,
                     plaintext_strings,
@@ -557,14 +593,14 @@ def analyze_telnet(
         # Reassembled-transcript credential pass: recovers interactive
         # (character-mode) logins the per-packet regex above cannot see.
         if session.transcript_parts:
-            transcript = "".join(session.transcript_parts)
+            transcript = session.transcript_parts.decode("latin-1")
             t_user, t_pass = _extract_transcript_credentials(transcript)
             if t_user and t_user not in session.usernames:
-                session.usernames[t_user] += 1
-                usernames[t_user] += 1
+                counter_inc(session.usernames, t_user, max_keys=2000)
+                counter_inc(usernames, t_user)
             if t_pass and t_pass not in session.passwords:
-                session.passwords[t_pass] += 1
-                passwords[t_pass] += 1
+                counter_inc(session.passwords, t_pass, max_keys=2000)
+                counter_inc(passwords, t_pass)
         conversations.append(
             TelnetConversation(
                 client_ip=session.client_ip,

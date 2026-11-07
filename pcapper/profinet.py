@@ -19,25 +19,19 @@ PROFINET_PORTS = {34962, 34963, 34964}
 PROFINET_ETHERTYPE = 0x8892
 
 DCP_SERVICE_IDS = {
-    0x03: "Identify",
+    0x03: "Get",
     0x04: "Set",
-    0x05: "Get",
+    0x05: "Identify",
     0x06: "Hello",
-    0x07: "Get-Enum",
-    0x08: "Reset",
-}
-
-DCP_SERVICE_TYPES = {
-    0x00: "Request",
-    0x01: "Response",
 }
 
 DCP_OPTIONS = {
     0x01: "IP",
     0x02: "Device",
     0x03: "DHCP",
-    0x04: "Control",
-    0x05: "DeviceInitiative",
+    0x05: "Control",
+    0x06: "DeviceInitiative",
+    0x07: "NME",
 }
 
 DCP_SUBOPTIONS = {
@@ -51,11 +45,17 @@ DCP_SUBOPTIONS = {
     (0x02, 0x05): "Device Options",
     (0x02, 0x06): "Alias Name",
     (0x03, 0x01): "DHCP",
-    (0x04, 0x02): "Reset",
-    (0x04, 0x03): "Control",
+    (0x05, 0x01): "Start Transaction",
+    (0x05, 0x02): "End Transaction",
+    (0x05, 0x03): "Signal",
+    (0x05, 0x04): "Response",
+    (0x05, 0x05): "Reset Factory Settings",
+    (0x05, 0x06): "Reset to Factory",
 }
 
 PNIO_BLOCK_TYPES = {
+    0x0009: "IODReadReqHeader",
+    0x8009: "IODReadResHeader",
     0x0100: "AR",
     0x0101: "IOCR",
     0x0102: "IOCR",
@@ -63,6 +63,10 @@ PNIO_BLOCK_TYPES = {
     0x0105: "ExpectedSubmodule",
     0x0106: "PrmServer",
 }
+
+PNIO_DEVICE_INTERFACE_UUID = bytes.fromhex(
+    "0100a0de976cd111827100a02442df7d"
+)
 
 AR_TYPE_NAMES = {
     0x0001: "IO-Controller",
@@ -95,7 +99,7 @@ def _decode_dcp_blocks(payload: bytes, offset: int) -> list[tuple[int, int, byte
         suboption = payload[ptr + 1]
         block_len = int.from_bytes(payload[ptr + 2 : ptr + 4], "big")
         ptr += 4
-        if block_len <= 0 or ptr + block_len > len(payload):
+        if ptr + block_len > len(payload):
             break
         block = payload[ptr : ptr + block_len]
         ptr += block_len
@@ -115,6 +119,8 @@ def _parse_dcp_block(
     service_name: str,
     data: bytes,
     block_info: Optional[int],
+    block_qualifier: Optional[int],
+    is_request: bool,
 ) -> tuple[list[str], list[tuple[str, str]], list[IndustrialAnomaly]]:
     commands: list[str] = []
     artifacts: list[tuple[str, str]] = []
@@ -128,7 +134,7 @@ def _parse_dcp_block(
         name = data.decode("utf-8", errors="ignore").strip("\x00").strip()
         if name:
             artifacts.append(("dcp_device_name", name))
-            if service_name == "Set":
+            if service_name == "Set" and is_request:
                 anomalies.append(
                     IndustrialAnomaly(
                         severity="HIGH",
@@ -145,7 +151,7 @@ def _parse_dcp_block(
         mask = ".".join(str(b) for b in data[4:8])
         gw = ".".join(str(b) for b in data[8:12])
         artifacts.append(("dcp_ip", f"{ip} mask {mask} gw {gw}"))
-        if service_name == "Set":
+        if service_name == "Set" and is_request:
             anomalies.append(
                 IndustrialAnomaly(
                     severity="HIGH",
@@ -192,13 +198,12 @@ def _parse_dcp_block(
         dhcp = int.from_bytes(data[0:2], "big")
         artifacts.append(("dcp_dhcp", f"0x{dhcp:04x}"))
 
-    if (option, suboption) == (0x04, 0x02):
-        reset_type = int.from_bytes(data[0:2], "big") if len(data) >= 2 else 0
+    if (option, suboption) in {(0x05, 0x05), (0x05, 0x06)} and is_request:
         anomalies.append(
             IndustrialAnomaly(
                 severity="HIGH",
                 title="PROFINET DCP Reset",
-                description=f"DCP reset operation observed (type 0x{reset_type:04x}).",
+                description=f"DCP {sub_name} operation observed.",
                 src="*",
                 dst="*",
                 ts=0.0,
@@ -208,6 +213,13 @@ def _parse_dcp_block(
     if block_info is not None:
         artifacts.append(
             ("dcp_block", f"{option_name}/{sub_name} info=0x{block_info:04x}")
+        )
+    if block_qualifier is not None:
+        artifacts.append(
+            (
+                "dcp_block",
+                f"{option_name}/{sub_name} qualifier=0x{block_qualifier:04x}",
+            )
         )
 
     return commands, artifacts, anomalies
@@ -225,11 +237,12 @@ def _parse_dcp(
     service_id = payload[2]
     service_type = payload[3]
     service_name = DCP_SERVICE_IDS.get(service_id, f"Service 0x{service_id:02x}")
-    service_type_name = DCP_SERVICE_TYPES.get(
-        service_type, f"Type 0x{service_type:02x}"
-    )
+    is_request = not bool(service_type & 0x01)
+    service_type_name = "Request" if is_request else "Response"
+    if service_type & 0x04:
+        service_type_name += " Error"
     commands.append(f"DCP {service_name} {service_type_name}")
-    if service_name in {"Identify", "Get"}:
+    if service_name in {"Identify", "Get"} and is_request:
         anomalies.append(
             IndustrialAnomaly(
                 severity="LOW",
@@ -240,7 +253,7 @@ def _parse_dcp(
                 ts=0.0,
             )
         )
-    if service_name in {"Set", "Reset"}:
+    if service_name == "Set" and is_request:
         anomalies.append(
             IndustrialAnomaly(
                 severity="HIGH",
@@ -254,19 +267,36 @@ def _parse_dcp(
 
     data_len = int.from_bytes(payload[10:12], "big")
     block_start = 12
-    if data_len and block_start + data_len <= len(payload):
-        blocks = _decode_dcp_blocks(payload, block_start)
-    else:
-        blocks = _decode_dcp_blocks(payload, block_start)
+    if block_start + data_len > len(payload):
+        commands.append("DCP Truncated Data")
+        return commands, artifacts, anomalies
+    blocks = _decode_dcp_blocks(payload[block_start : block_start + data_len], 0)
 
     for option, suboption, block in blocks:
         block_info = None
+        block_qualifier = None
         data = block
-        if len(block) >= 2:
-            block_info = int.from_bytes(block[0:2], "big")
+        has_block_info = (
+            (service_id == 0x05 and not is_request)
+            or (service_id == 0x06 and is_request)
+            or (service_id == 0x03 and not is_request)
+        )
+        has_block_qualifier = service_id == 0x04 and is_request
+        if (has_block_info or has_block_qualifier) and len(block) >= 2:
+            prefix = int.from_bytes(block[0:2], "big")
+            if has_block_info:
+                block_info = prefix
+            else:
+                block_qualifier = prefix
             data = block[2:]
         block_cmds, block_artifacts, block_anoms = _parse_dcp_block(
-            option, suboption, service_name, data, block_info
+            option,
+            suboption,
+            service_name,
+            data,
+            block_info,
+            block_qualifier,
+            is_request,
         )
         commands.extend(block_cmds)
         artifacts.extend(block_artifacts)
@@ -306,6 +336,21 @@ def _parse_pnio_blocks(payload: bytes) -> tuple[list[str], list[tuple[str, str]]
             )
         else:
             artifacts.append(("pnio_block", f"{name} len={block_len}"))
+
+        if block_type in {0x0009, 0x8009} and len(block_payload) >= 34:
+            sequence = int.from_bytes(block_payload[0:2], "big")
+            api = int.from_bytes(block_payload[18:22], "big")
+            slot = int.from_bytes(block_payload[22:24], "big")
+            subslot = int.from_bytes(block_payload[24:26], "big")
+            index = int.from_bytes(block_payload[28:30], "big")
+            record_length = int.from_bytes(block_payload[30:34], "big")
+            artifacts.append(
+                (
+                    "pnio_read_record",
+                    f"seq={sequence} api=0x{api:x} slot={slot} "
+                    f"subslot={subslot} index=0x{index:04x} len={record_length}",
+                )
+            )
 
         if block_type == 0x0100 and len(block_payload) >= 2:
             ar_type = int.from_bytes(block_payload[0:2], "big")
@@ -378,6 +423,65 @@ def _parse_alarm(payload: bytes) -> tuple[list[str], list[tuple[str, str]]]:
     return commands, artifacts
 
 
+def _is_pnio_rpc(payload: bytes) -> bool:
+    if (
+        len(payload) < 100
+        or payload[0] != 4
+        or payload[1] not in {0, 2}
+        or payload[4] != 0x10
+        or payload[24:40] != PNIO_DEVICE_INTERFACE_UUID
+    ):
+        return False
+    fragment_len = int.from_bytes(payload[74:76], "little")
+    return fragment_len >= 20 and 80 + fragment_len <= len(payload)
+
+
+def _parse_pnio_rpc(
+    payload: bytes,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    if not _is_pnio_rpc(payload):
+        return [], []
+    operation = int.from_bytes(payload[68:70], "little")
+    operation_name = {5: "Read Implicit"}.get(operation)
+    if operation_name is None:
+        return [], []
+
+    fragment_len = int.from_bytes(payload[74:76], "little")
+    stub = payload[80 : 80 + fragment_len]
+    if len(stub) < 20:
+        return [], []
+    array_max = int.from_bytes(stub[8:12], "little")
+    array_offset = int.from_bytes(stub[12:16], "little")
+    array_length = int.from_bytes(stub[16:20], "little")
+    if (
+        array_offset > array_max
+        or array_length > array_max - array_offset
+        or array_length > len(stub) - 20
+    ):
+        return [], []
+
+    request = payload[1] == 0
+    operation_label = f"PNIO Device {operation_name} {'Request' if request else 'Response'}"
+    block_commands, block_artifacts = _parse_pnio_blocks(
+        stub[20 : 20 + array_length]
+    )
+    commands = [operation_label, *block_commands]
+    return commands, block_artifacts
+
+
+def _parse_port_commands(payload: bytes) -> list[str]:
+    commands, _ = _parse_pnio_rpc(payload)
+    return commands
+
+
+def _parse_port_artifacts(payload: bytes) -> list[tuple[str, str]]:
+    artifacts = default_artifacts(payload)
+    artifacts.extend(equipment_artifacts(payload))
+    _, rpc_artifacts = _parse_pnio_rpc(payload)
+    artifacts.extend(rpc_artifacts)
+    return artifacts
+
+
 def _parse_commands(payload: bytes) -> list[str]:
     if len(payload) < 2:
         return []
@@ -385,7 +489,7 @@ def _parse_commands(payload: bytes) -> list[str]:
     frame_id = int.from_bytes(payload[:2], "big")
     commands.append(f"FrameID 0x{frame_id:04x}")
 
-    if 0xFE00 <= frame_id <= 0xFEFF:
+    if 0xFEFD <= frame_id <= 0xFEFF:
         dcp_commands, _artifacts, _anoms = _parse_dcp(payload)
         commands.extend(dcp_commands)
     elif 0xFC00 <= frame_id <= 0xFDFF:
@@ -404,7 +508,7 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
     if len(payload) >= 2:
         frame_id = int.from_bytes(payload[:2], "big")
         artifacts.append(("frame_id", f"0x{frame_id:04x}"))
-        if 0xFE00 <= frame_id <= 0xFEFF:
+        if 0xFEFD <= frame_id <= 0xFEFF:
             _, dcp_artifacts, _ = _parse_dcp(payload)
             artifacts.extend(dcp_artifacts)
         elif 0xFC00 <= frame_id <= 0xFDFF:
@@ -439,7 +543,7 @@ def _detect_anomalies(
                     ts=ts,
                 )
             )
-        if 0xFE00 <= frame_id <= 0xFEFF:
+        if 0xFEFD <= frame_id <= 0xFEFF:
             dcp_cmds, _artifacts, dcp_anoms = _parse_dcp(payload)
             for anom in dcp_anoms:
                 anomalies.append(
@@ -552,8 +656,9 @@ def analyze_profinet(path: Path, show_status: bool = True) -> IndustrialAnalysis
         protocol_name="Profinet",
         tcp_ports=PROFINET_PORTS,
         udp_ports=PROFINET_PORTS,
-        command_parser=_parse_commands,
-        artifact_parser=_parse_artifacts,
+        signature_matcher=_is_pnio_rpc,
+        command_parser=_parse_port_commands,
+        artifact_parser=_parse_port_artifacts,
         anomaly_detector=_detect_anomalies,
         enable_enrichment=True,
         show_status=show_status,

@@ -17,6 +17,9 @@ except Exception:  # pragma: no cover
 
 
 GOOSE_ETHERTYPE = 0x88B8
+MAX_GOOSE_DETECTIONS = 2000
+MAX_GOOSE_TRACKED_STREAMS = 100000
+MAX_GOOSE_VALUE_SAMPLES = 10000
 
 GOOSE_TAGS = {
     0x80: "gocbRef",
@@ -30,7 +33,7 @@ GOOSE_TAGS = {
     0x88: "confRev",
     0x89: "ndsCom",
     0x8A: "numDatSetEntries",
-    0x8B: "allData",
+    0xAB: "allData",
 }
 
 GOOSE_STRING_TAGS = {"gocbRef", "datSet", "goID"}
@@ -38,17 +41,19 @@ GOOSE_INT_TAGS = {"timeAllowedToLive", "stNum", "sqNum", "confRev", "numDatSetEn
 GOOSE_BOOL_TAGS = {"simulation", "ndsCom"}
 
 GOOSE_DATA_TAGS = {
-    0x80: "boolean",
-    0x81: "bit-string",
-    0x82: "integer",
-    0x83: "unsigned",
-    0x84: "float",
-    0x85: "octet-string",
-    0x86: "visible-string",
-    0x87: "generalized-time",
-    0x88: "binary-time",
-    0x89: "bcd",
-    0x8A: "boolean-array",
+    0x83: "boolean",
+    0x84: "bit-string",
+    0x85: "integer",
+    0x86: "unsigned",
+    0x87: "float",
+    0x89: "octet-string",
+    0x8A: "visible-string",
+    0x8B: "generalized-time",
+    0x8C: "binary-time",
+    0x8D: "bcd",
+    0x8E: "boolean-array",
+    0x90: "visible-string",
+    0x91: "generalized-time",
 }
 
 
@@ -114,7 +119,7 @@ def _parse_goose_tlvs(data: bytes, result: dict[str, object], depth: int = 0) ->
                 result["allData_len"] = len(value)
                 result["allData_preview"] = value[:16].hex()
                 result["allData_values"] = _decode_all_data(value)
-        if tag == 0x61 or (tag & 0x20):
+        if tag == 0x61:
             _parse_goose_tlvs(value, result, depth + 1)
 
 
@@ -131,16 +136,20 @@ def _decode_integer(value: bytes, signed: bool) -> Optional[int]:
 
 
 def _decode_float(value: bytes) -> Optional[float]:
+    if len(value) == 5:
+        try:
+            return struct.unpack(">f", value[1:])[0]
+        except Exception:
+            return None
+    if len(value) == 9:
+        try:
+            return struct.unpack(">d", value[1:])[0]
+        except Exception:
+            return None
     if len(value) == 4:
-        try:
-            return struct.unpack(">f", value)[0]
-        except Exception:
-            return None
+        return struct.unpack(">f", value)[0]
     if len(value) == 8:
-        try:
-            return struct.unpack(">d", value)[0]
-        except Exception:
-            return None
+        return struct.unpack(">d", value)[0]
     return None
 
 
@@ -148,6 +157,8 @@ def _decode_bit_string(value: bytes) -> str:
     if not value:
         return ""
     unused_bits = value[0]
+    if unused_bits > 7:
+        return ""
     bits = "".join(f"{b:08b}" for b in value[1:])
     if unused_bits:
         bits = bits[:-unused_bits]
@@ -286,7 +297,25 @@ def analyze_goose(
     errors: list[str] = []
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
-    state_map: dict[tuple[str, str, str], tuple[int, int]] = {}
+    truncated_header_reported = False
+    invalid_length_reported = False
+    truncated_payload_reported = False
+    detection_limit_reported = False
+    tracking_limit_reported = False
+    value_sample_limit_reported = False
+
+    def add_detection(detection: dict[str, object]) -> None:
+        nonlocal detection_limit_reported
+        if len(detections) < MAX_GOOSE_DETECTIONS:
+            detections.append(detection)
+        elif not detection_limit_reported:
+            errors.append(
+                "GOOSE detection record limit reached; additional findings were omitted."
+            )
+            detection_limit_reported = True
+    state_map: dict[
+        tuple[str, str, str], tuple[int, int, Optional[float], Optional[int]]
+    ] = {}
     conf_map: dict[tuple[str, str, str], int] = {}
     entries_map: dict[tuple[str, str, str], int] = {}
     jump_flagged: set[tuple[str, str, str]] = set()
@@ -296,8 +325,8 @@ def analyze_goose(
     # exactly ONE legitimate publisher MAC; the same gocbRef from a 2nd MAC is
     # the classic publisher-spoofing / injection attack (Industroyer-class,
     # ATT&CK ICS T0856 Spoof Reporting Message / T0832 Manipulation of View).
-    gocbref_macs: dict[str, set[str]] = {}
-    gocbref_spoof_flagged: set[str] = set()
+    gocbref_macs: dict[tuple[str, str, str], set[str]] = {}
+    gocbref_spoof_flagged: set[tuple[str, str, str]] = set()
     data_len_map: dict[tuple[str, str, str], int] = {}
 
     for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
@@ -308,6 +337,13 @@ def analyze_goose(
             continue
         eth = pkt[Ether]  # type: ignore[index]
         eth_type = int(getattr(eth, "type", 0) or 0)
+        goose_layer = eth.payload
+        while eth_type in {0x8100, 0x88A8, 0x9100}:
+            inner_type = getattr(goose_layer, "type", None)
+            if inner_type is None:
+                break
+            eth_type = int(inner_type)
+            goose_layer = goose_layer.payload
         if eth_type != GOOSE_ETHERTYPE:
             continue
 
@@ -329,7 +365,7 @@ def analyze_goose(
         except Exception:
             pass
         try:
-            payload = bytes(eth.payload)
+            payload = bytes(goose_layer)
         except Exception:
             payload = b""
         appid = _extract_appid(payload)
@@ -340,6 +376,22 @@ def analyze_goose(
         length = _extract_length(payload)
         if length is not None:
             lengths[length] += 1
+        if len(payload) < 8:
+            if not truncated_header_reported:
+                errors.append("GOOSE frame is shorter than its 8-byte Ethernet header.")
+                truncated_header_reported = True
+            continue
+        if length is None or length < 8:
+            if not invalid_length_reported:
+                errors.append("GOOSE frame has an invalid declared length.")
+                invalid_length_reported = True
+            continue
+        if length > len(payload):
+            if not truncated_payload_reported:
+                errors.append("GOOSE frame is shorter than its declared length.")
+                truncated_payload_reported = True
+            continue
+        payload = payload[:length]
 
         goose_info = _parse_goose_payload(payload) if payload else {}
         dataset = str(goose_info.get("datSet", "") or "")
@@ -358,8 +410,9 @@ def analyze_goose(
         sim_key = (src_mac, f"0x{appid:04x}" if appid is not None else "-",
                    dataset or gocb_ref or "-")
         if goose_info.get("simulation") and sim_key not in sim_flagged:
-            sim_flagged.add(sim_key)
-            detections.append(
+            if len(sim_flagged) < MAX_GOOSE_TRACKED_STREAMS:
+                sim_flagged.add(sim_key)
+            add_detection(
                 {
                     "severity": "warning",
                     "summary": "GOOSE Simulation/Test Bit Set",
@@ -371,8 +424,9 @@ def analyze_goose(
                 }
             )
         if goose_info.get("ndsCom") and sim_key not in ndscom_flagged:
-            ndscom_flagged.add(sim_key)
-            detections.append(
+            if len(ndscom_flagged) < MAX_GOOSE_TRACKED_STREAMS:
+                ndscom_flagged.add(sim_key)
+            add_detection(
                 {
                     "severity": "info",
                     "summary": "GOOSE needsCommissioning Set",
@@ -387,17 +441,33 @@ def analyze_goose(
             datasets[dataset] += 1
         if gocb_ref:
             gocb_refs[gocb_ref] += 1
-            # Publisher-spoofing: same control block (gocbRef) from >1 MAC.
-            macs = gocbref_macs.setdefault(gocb_ref, set())
-            macs.add(src_mac)
-            if len(macs) >= 2 and gocb_ref not in gocbref_spoof_flagged:
-                gocbref_spoof_flagged.add(gocb_ref)
-                detections.append(
+            # Compare publishers only within the same GOOSE stream identity.
+            spoof_key = (
+                gocb_ref,
+                f"0x{appid:04x}" if appid is not None else "-",
+                dataset or "-",
+            )
+            macs = gocbref_macs.get(spoof_key)
+            if macs is None and len(gocbref_macs) >= MAX_GOOSE_TRACKED_STREAMS:
+                if not tracking_limit_reported:
+                    errors.append(
+                        "GOOSE stream tracking limit reached; additional publisher identities were omitted."
+                    )
+                    tracking_limit_reported = True
+                macs = None
+            else:
+                macs = gocbref_macs.setdefault(spoof_key, set())
+                if len(macs) < 2:
+                    macs.add(src_mac)
+            if macs is not None and len(macs) >= 2 and spoof_key not in gocbref_spoof_flagged:
+                gocbref_spoof_flagged.add(spoof_key)
+                add_detection(
                     {
                         "severity": "high",
                         "summary": "GOOSE Publisher Spoofing",
                         "details": (
-                            f"gocbRef {gocb_ref} published from multiple source "
+                            f"gocbRef {gocb_ref} (APPID {spoof_key[1]}, "
+                            f"dataset {spoof_key[2]}) published from multiple source "
                             f"MACs ({', '.join(sorted(macs))}); a control block has "
                             "one legitimate publisher — likely GOOSE spoofing/"
                             "injection (ATT&CK ICS T0856)."
@@ -418,7 +488,13 @@ def analyze_goose(
             for dtype, value in data_values[:16]:
                 data_type_counts[str(dtype)] += 1
                 sample = f"{dtype}={value}"
-                data_value_samples[sample] += 1
+                if sample in data_value_samples or len(data_value_samples) < MAX_GOOSE_VALUE_SAMPLES:
+                    data_value_samples[sample] += 1
+                elif not value_sample_limit_reported:
+                    errors.append(
+                        "GOOSE value sample limit reached; additional unique samples were omitted."
+                    )
+                    value_sample_limit_reported = True
 
         if (
             appid is not None
@@ -426,60 +502,75 @@ def analyze_goose(
             and isinstance(sq_num, int)
         ):
             key = (src_mac, f"0x{appid:04x}", dataset or gocb_ref or "-")
+            if key not in state_map and len(state_map) >= MAX_GOOSE_TRACKED_STREAMS:
+                if not tracking_limit_reported:
+                    errors.append(
+                        "GOOSE stream tracking limit reached; additional publisher state was omitted."
+                    )
+                    tracking_limit_reported = True
+                continue
             prev = state_map.get(key)
             if prev:
-                prev_st, prev_sq = prev
-                if st_num < prev_st:
-                    detections.append(
-                        {
-                            "severity": "warning",
-                            "summary": "GOOSE State Number Decrease",
-                            "details": f"{key[0]} {key[2]} stNum decreased {prev_st}->{st_num}.",
-                        }
-                    )
-                if st_num == prev_st and sq_num < prev_sq:
-                    detections.append(
-                        {
-                            "severity": "warning",
-                            "summary": "GOOSE Sequence Reset",
-                            "details": f"{key[0]} {key[2]} sqNum decreased {prev_sq}->{sq_num}.",
-                        }
-                    )
-                # Forward-injection coverage: per IEC 61850-8-1, a new
-                # state (stNum increment) restarts sqNum at 0 (some
-                # stacks use 1). A state advance that starts mid-sequence
-                # suggests an injected frame or missed frames; a multi-
-                # state skip likewise. Info severity (capture gaps look
-                # the same) and flagged once per publisher/dataset.
-                if st_num > prev_st and key not in jump_flagged:
-                    skipped_states = st_num - prev_st > 1
-                    high_start_sq = sq_num > 1
-                    if skipped_states or high_start_sq:
-                        jump_flagged.add(key)
-                        reasons = []
-                        if skipped_states:
-                            reasons.append(
-                                f"stNum jumped {prev_st}->{st_num}"
-                            )
-                        if high_start_sq:
-                            reasons.append(
-                                f"new state started at sqNum={sq_num}"
-                            )
-                        detections.append(
+                prev_st, prev_sq, prev_ts, prev_ttl = prev
+                expired = (
+                    ts is not None
+                    and prev_ts is not None
+                    and prev_ttl is not None
+                    and prev_ttl > 0
+                    and ts - prev_ts > prev_ttl / 1000
+                )
+                if not expired:
+                    if st_num < prev_st:
+                        add_detection(
                             {
-                                "severity": "info",
-                                "summary": "GOOSE State Jump",
-                                "details": (
-                                    f"{key[0]} {key[2]} {'; '.join(reasons)} "
-                                    "(possible missed frames or injected GOOSE)."
-                                ),
+                                "severity": "warning",
+                                "summary": "GOOSE State Number Decrease",
+                                "details": f"{key[0]} {key[2]} stNum decreased {prev_st}->{st_num}.",
                             }
                         )
-            state_map[key] = (st_num, sq_num)
+                    if st_num == prev_st and sq_num < prev_sq:
+                        add_detection(
+                            {
+                                "severity": "warning",
+                                "summary": "GOOSE Sequence Reset",
+                                "details": f"{key[0]} {key[2]} sqNum decreased {prev_sq}->{sq_num}.",
+                            }
+                        )
+                    # State advances normally restart sqNum at 0 (some stacks
+                    # use 1). A skipped state or high starting sequence can
+                    # indicate missed or injected GOOSE, but capture gaps look
+                    # the same, so this is informational and emitted once.
+                    if st_num > prev_st and key not in jump_flagged:
+                        skipped_states = st_num - prev_st > 1
+                        high_start_sq = sq_num > 1
+                        if skipped_states or high_start_sq:
+                            jump_flagged.add(key)
+                            reasons = []
+                            if skipped_states:
+                                reasons.append(f"stNum jumped {prev_st}->{st_num}")
+                            if high_start_sq:
+                                reasons.append(f"new state started at sqNum={sq_num}")
+                            add_detection(
+                                {
+                                    "severity": "info",
+                                    "summary": "GOOSE State Jump",
+                                    "details": (
+                                        f"{key[0]} {key[2]} {'; '.join(reasons)} "
+                                        "(possible missed frames or injected GOOSE)."
+                                    ),
+                                }
+                            )
+            ttl = goose_info.get("timeAllowedToLive")
+            state_map[key] = (
+                st_num,
+                sq_num,
+                ts,
+                ttl if isinstance(ttl, int) else None,
+            )
             if isinstance(conf_rev, int):
                 prev_conf = conf_map.get(key)
                 if prev_conf is not None and conf_rev != prev_conf:
-                    detections.append(
+                    add_detection(
                         {
                             "severity": "warning",
                             "summary": "GOOSE Config Revision Change",
@@ -490,7 +581,7 @@ def analyze_goose(
             if isinstance(num_entries_val, int):
                 prev_entries = entries_map.get(key)
                 if prev_entries is not None and num_entries_val != prev_entries:
-                    detections.append(
+                    add_detection(
                         {
                             "severity": "warning",
                             "summary": "GOOSE Dataset Size Change",
@@ -501,7 +592,7 @@ def analyze_goose(
             if isinstance(data_len, int):
                 prev_len = data_len_map.get(key)
                 if prev_len is not None and data_len != prev_len:
-                    detections.append(
+                    add_detection(
                         {
                             "severity": "warning",
                             "summary": "GOOSE Dataset Payload Size Change",
@@ -512,7 +603,7 @@ def analyze_goose(
 
 
     if goose_packets:
-        detections.append(
+        add_detection(
             {
                 "severity": "info",
                 "summary": "IEC 61850 GOOSE traffic observed",
@@ -521,7 +612,7 @@ def analyze_goose(
         )
     for src_mac, appid_set in src_appids.items():
         if len(appid_set) >= 5:
-            detections.append(
+            add_detection(
                 {
                     "severity": "warning",
                     "summary": "GOOSE Source Uses Many AppIDs",
@@ -529,7 +620,7 @@ def analyze_goose(
                 }
             )
     if unicast_dsts:
-        detections.append(
+        add_detection(
             {
                 "severity": "warning",
                 "summary": "GOOSE Unicast Destinations",

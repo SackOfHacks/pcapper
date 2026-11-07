@@ -10,11 +10,11 @@ from .industrial_helpers import (
 from .utils import memoize_analysis
 
 # Bristol Standard Asynchronous Protocol over IP (BSAP-IP) — Emerson/Bristol
-# Babcock SCADA for gas/oil flow computers and RTUs, carried on UDP 1234/1235.
+# Babcock SCADA for gas/oil flow computers and RTUs, carried on UDP 1234.
 # The framing is vendor-specific (no authoritative public function-code map), so
 # this is a presence + internet-exposure detector (an exposed BSAP RTU network
 # is a high-value finding) rather than a command-level decoder.
-BSAP_PORTS = {1234, 1235}
+BSAP_PORT = 1234
 
 
 @memoize_analysis
@@ -22,8 +22,7 @@ def analyze_bsap(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         path=path,
         protocol_name="BSAP-IP",
-        udp_ports=BSAP_PORTS,
-        tcp_ports=BSAP_PORTS,
+        udp_ports={BSAP_PORT},
         enable_enrichment=True,
         show_status=show_status,
     )

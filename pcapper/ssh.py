@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover
 
 
 SSH_PORTS = {22, 2222, 2200}
+MAX_SSH_SESSIONS = 50_000
 SSH_BANNER_RE = re.compile(r"(SSH-[0-9.]+-[^\s\r\n]+)")
 
 SSH_MESSAGE_TYPES = {
@@ -1258,7 +1259,7 @@ def analyze_ssh(
     auth_successes_by_client: Counter[str] = Counter()
 
     # Per (client, server) auth-outcome inference from encrypted sessions.
-    auth_pairs: dict[tuple[str, str], dict[str, object]] = {}
+    auth_pairs: dict[tuple[str, str, int], dict[str, object]] = {}
     # Terrapin (CVE-2023-48795) per (client, server) -> vulnerable cipher modes.
     terrapin_pairs: dict[tuple[str, str], list[str]] = {}
     # (server_ip, server_port) -> {key_type -> {fingerprints}} for host-key-change
@@ -1273,6 +1274,7 @@ def analyze_ssh(
 
     skipped_packets = 0
     first_skip_error: Optional[str] = None
+    session_limit_reported = False
     for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
         pkt_index += 1
         total_packets += 1
@@ -1340,6 +1342,14 @@ def analyze_ssh(
             session_key = (client_ip, client_port, server_ip, server_port)
             session = sessions.get(session_key)
             if session is None:
+                if len(sessions) >= MAX_SSH_SESSIONS:
+                    if not session_limit_reported:
+                        errors.append(
+                            "SSH session tracking limit reached; additional "
+                            "sessions are not decoded."
+                        )
+                        session_limit_reported = True
+                    continue
                 session = _SessionState(
                     client_ip=client_ip,
                     server_ip=server_ip,
@@ -1621,9 +1631,10 @@ def analyze_ssh(
             )
 
         pair = (session.client_ip, session.server_ip)
+        auth_pair = (session.client_ip, session.server_ip, session.server_port)
         # Auth-outcome inference (encrypted): tally per client->server pair.
         outcome = _classify_session_auth(session)
-        stats = auth_pairs.get(pair)
+        stats = auth_pairs.get(auth_pair)
         if stats is None:
             stats = {
                 "sessions": 0,
@@ -1634,9 +1645,8 @@ def analyze_ssh(
                 "client_software": Counter(),
                 "first_seen": session.first_seen,
                 "last_seen": session.last_seen,
-                "server_port": session.server_port,
             }
-            auth_pairs[pair] = stats
+            auth_pairs[auth_pair] = stats
         stats["sessions"] = int(stats["sessions"]) + 1  # type: ignore[arg-type]
         if outcome == "no-kex":
             stats["no_kex"] = int(stats["no_kex"]) + 1  # type: ignore[arg-type]
@@ -1675,12 +1685,11 @@ def analyze_ssh(
     # that complete key exchange and then end immediately (failed/aborted login)
     # vs. sessions that sustain data (successful, interactive/exec session).
     sweep_by_client: dict[str, dict[str, object]] = {}
-    for (client_ip, server_ip), st in auth_pairs.items():
+    for (client_ip, server_ip, port), st in auth_pairs.items():
         sessions_n = int(st["sessions"])  # type: ignore[arg-type]
         reached = int(st["reached_kex"])  # type: ignore[arg-type]
         failed = int(st["failed"])  # type: ignore[arg-type]
         established = int(st["established"])  # type: ignore[arg-type]
-        port = int(st["server_port"])  # type: ignore[arg-type]
         sw_counter = st["client_software"]  # type: ignore[assignment]
         top_sw = sw_counter.most_common(1)[0][0] if sw_counter else None  # type: ignore[union-attr]
         span = _span(st["first_seen"], st["last_seen"])

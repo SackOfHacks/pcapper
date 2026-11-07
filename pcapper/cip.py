@@ -342,8 +342,8 @@ PCCC_COMMANDS = {
     (0x0F, 0x01): "Word Range Read",
     (0x0F, 0x02): "Bit Write",
     (0x0F, 0x26): "Read-Modify-Write",
-    (0x0F, 0x67): "Typed Read",
-    (0x0F, 0x68): "Typed Write",
+    (0x0F, 0x67): "Typed Write",
+    (0x0F, 0x68): "Typed Read",
     (0x0F, 0xA1): "Protected Typed Logical Read (2 addr)",
     (0x0F, 0xA2): "Protected Typed Logical Read (3 addr)",
     (0x0F, 0xA9): "Protected Typed Logical Write w/ mask (2 addr)",
@@ -359,10 +359,26 @@ PCCC_COMMANDS = {
 }
 # PCCC commands that change controller state / logic (write / mode / program).
 PCCC_WRITE_CMDS = frozenset({
-    (0x0F, 0x00), (0x0F, 0x02), (0x0F, 0x26), (0x0F, 0x68), (0x0F, 0xA9),
+    (0x0F, 0x00), (0x0F, 0x02), (0x0F, 0x26), (0x0F, 0x67), (0x0F, 0xA9),
     (0x0F, 0xAA), (0x0F, 0xAB), (0x0F, 0x11), (0x0F, 0x8F), (0x0F, 0x80),
     (0x0F, 0x81), (0x06, 0x00),
 })
+
+
+def _parse_pccc_command(data: bytes) -> tuple[str, bool] | None:
+    if not data:
+        return None
+    id_len = data[0]
+    idx = id_len if 5 <= id_len <= 15 else 7
+    fnc_idx = idx + 4
+    if fnc_idx >= len(data):
+        return None
+    command = (data[idx], data[fnc_idx])
+    name = PCCC_COMMANDS.get(
+        command, f"PCCC CMD 0x{command[0]:02x} FNC 0x{command[1]:02x}"
+    )
+    return name, command in PCCC_WRITE_CMDS
+
 
 CIP_RECON_STATUS_CODES = {
     0x04,  # Path segment error
@@ -672,103 +688,88 @@ def _parse_enip(
     )
 
 
-def _bytes_to_path_string(path_bytes: bytes) -> str:
-    if not path_bytes:
-        return ""
+def _decode_cip_path(
+    path_bytes: bytes,
+) -> tuple[str, Optional[int], Optional[int], Optional[int]]:
     segments = []
     idx = 0
-    current_class_id: Optional[int] = None
+    class_id: Optional[int] = None
+    instance_id: Optional[int] = None
+    attribute_id: Optional[int] = None
     while idx < len(path_bytes):
+        seg_type = path_bytes[idx]
+        if seg_type == 0x00 and idx == len(path_bytes) - 1:
+            break
+        if seg_type in {0x20, 0x21, 0x22, 0x24, 0x25, 0x26, 0x28, 0x29, 0x2A,
+                        0x2C, 0x2D, 0x2E, 0x30, 0x31, 0x32}:
+            base_type = seg_type & 0xFC
+            width_code = seg_type & 0x03
+            value_size = 1 << width_code
+            idx += 1
+            if idx + value_size > len(path_bytes):
+                break
+            value = int.from_bytes(path_bytes[idx : idx + value_size], "little")
+            idx += value_size
+            if base_type == 0x20:
+                class_id = value
+                name = CIP_CLASS_NAMES.get(value)
+                segments.append(f"Class:{value}" + (f"({name})" if name else ""))
+            elif base_type == 0x24:
+                instance_id = value
+                segments.append(f"Instance:{value}")
+            elif base_type == 0x28:
+                segments.append(f"Member:{value}")
+            elif base_type == 0x2C:
+                segments.append(f"ConnectionPoint:{value}")
+            elif base_type == 0x30:
+                attribute_id = value
+                name = CIP_ATTRIBUTE_NAMES.get(class_id or -1, {}).get(value)
+                segments.append(
+                    f"Attribute:{value}" + (f"({name})" if name else "")
+                )
+            continue
+        if seg_type == 0x91:
+            if idx + 1 >= len(path_bytes):
+                break
+            symbol_len = path_bytes[idx + 1]
+            start = idx + 2
+            end = start + symbol_len
+            if end > len(path_bytes):
+                break
+            symbol = path_bytes[start:end].decode("ascii", errors="ignore")
+            segments.append(f"Symbol:{symbol}")
+            idx = end + (symbol_len % 2)
+            continue
+        if seg_type == 0x92:
+            if idx + 2 >= len(path_bytes):
+                break
+            symbol_len = int.from_bytes(path_bytes[idx + 1 : idx + 3], "little")
+            start = idx + 3
+            end = start + symbol_len
+            if end > len(path_bytes):
+                break
+            symbol = path_bytes[start:end].decode("utf-8", errors="ignore")
+            segments.append(f"Symbol:{symbol}")
+            idx = end + (symbol_len % 2)
+            continue
+        if seg_type == 0x34:
+            segments.append("ElectronicKey")
+            idx += 1
+            if idx < len(path_bytes):
+                key_format = path_bytes[idx]
+                key_len = {4: 9}.get(key_format, 0)
+                idx += 1 + key_len
+            continue
         if idx + 1 >= len(path_bytes):
             break
-        seg_type = path_bytes[idx]
         seg_format = path_bytes[idx + 1]
+        segments.append(f"0x{seg_type:02X}:{seg_format}")
         idx += 2
+    return "/".join(segments), class_id, instance_id, attribute_id
 
-        if seg_type & 0xE0 == 0x20:
-            segment_type = seg_type & 0x1F
-            if segment_type == 0x00:
-                if seg_format & 0x80:
-                    if idx + 1 >= len(path_bytes):
-                        break
-                    value = int.from_bytes(path_bytes[idx : idx + 2], "little")
-                    idx += 2
-                else:
-                    value = seg_format
-                current_class_id = value
-                class_name = CIP_CLASS_NAMES.get(value)
-                if class_name:
-                    segments.append(f"Class:{value}({class_name})")
-                else:
-                    segments.append(f"Class:{value}")
-            elif segment_type == 0x01:
-                if seg_format & 0x80:
-                    if idx + 1 >= len(path_bytes):
-                        break
-                    value = int.from_bytes(path_bytes[idx : idx + 2], "little")
-                    idx += 2
-                else:
-                    value = seg_format
-                segments.append(f"Instance:{value}")
-            elif segment_type == 0x02:
-                if seg_format & 0x80:
-                    if idx + 1 >= len(path_bytes):
-                        break
-                    value = int.from_bytes(path_bytes[idx : idx + 2], "little")
-                    idx += 2
-                else:
-                    value = seg_format
-                segments.append(f"Member:{value}")
-            elif segment_type == 0x03:
-                if seg_format & 0x80:
-                    if idx + 1 >= len(path_bytes):
-                        break
-                    value = int.from_bytes(path_bytes[idx : idx + 2], "little")
-                    idx += 2
-                else:
-                    value = seg_format
-                segments.append(f"ConnectionPoint:{value}")
-            elif segment_type == 0x04:
-                if seg_format & 0x80:
-                    if idx + 1 >= len(path_bytes):
-                        break
-                    value = int.from_bytes(path_bytes[idx : idx + 2], "little")
-                    idx += 2
-                else:
-                    value = seg_format
-                attr_name = CIP_ATTRIBUTE_NAMES.get(current_class_id or -1, {}).get(
-                    value
-                )
-                if attr_name:
-                    segments.append(f"Attribute:{value}({attr_name})")
-                else:
-                    segments.append(f"Attribute:{value}")
-            else:
-                segments.append(f"Logical{segment_type}:{seg_format}")
-        elif seg_type == 0x91:
-            symbol_len = seg_format
-            if idx + symbol_len > len(path_bytes):
-                break
-            symbol = path_bytes[idx : idx + symbol_len].decode("ascii", errors="ignore")
-            idx += symbol_len
-            if symbol_len % 2 and idx < len(path_bytes):
-                idx += 1
-            segments.append(f"Symbol:{symbol}")
-        elif seg_type == 0x92:
-            if idx >= len(path_bytes):
-                break
-            symbol_len = int.from_bytes(bytes([seg_format, path_bytes[idx]]), "little")
-            idx += 1
-            if idx + symbol_len > len(path_bytes):
-                break
-            symbol = path_bytes[idx : idx + symbol_len].decode("utf-8", errors="ignore")
-            idx += symbol_len
-            if symbol_len % 2 and idx < len(path_bytes):
-                idx += 1
-            segments.append(f"Symbol:{symbol}")
-        else:
-            segments.append(f"0x{seg_type:02X}:{seg_format}")
-    return "/".join(segments)
+
+def _bytes_to_path_string(path_bytes: bytes) -> str:
+    return _decode_cip_path(path_bytes)[0]
 
 
 def _decode_cip_data_type(code: Optional[int]) -> Optional[str]:
@@ -899,15 +900,6 @@ def _match_sensitive_tag(tag_name: Optional[str]) -> Optional[str]:
     return None
 
 
-def _flatten_path_words(words: bytes) -> bytes:
-    if not words:
-        return b""
-    result = bytearray()
-    for idx in range(0, len(words), 2):
-        result.extend(words[idx : idx + 2])
-    return bytes(result[: len(words)])
-
-
 def _parse_cip_message(
     payload: bytes,
 ) -> tuple[
@@ -956,39 +948,9 @@ def _parse_cip_message(
             path_byte_len = path_size_words * 2
             if len(payload) >= 2 + path_byte_len:
                 path_bytes = payload[2 : 2 + path_byte_len]
-                flattened = _flatten_path_words(path_bytes)
-                path_str = _bytes_to_path_string(flattened)
-                idx = 0
-                while idx + 1 < len(flattened):
-                    seg_type = flattened[idx]
-                    seg_format = flattened[idx + 1]
-                    idx += 2
-                    if seg_type & 0xE0 == 0x20:
-                        segment_type = seg_type & 0x1F
-                        if segment_type == 0x00:
-                            if seg_format & 0x80 and idx + 1 < len(flattened):
-                                class_id = int.from_bytes(
-                                    flattened[idx : idx + 2], "little"
-                                )
-                                idx += 2
-                            else:
-                                class_id = seg_format
-                        elif segment_type == 0x01:
-                            if seg_format & 0x80 and idx + 1 < len(flattened):
-                                instance_id = int.from_bytes(
-                                    flattened[idx : idx + 2], "little"
-                                )
-                                idx += 2
-                            else:
-                                instance_id = seg_format
-                        elif segment_type == 0x04:
-                            if seg_format & 0x80 and idx + 1 < len(flattened):
-                                attribute_id = int.from_bytes(
-                                    flattened[idx : idx + 2], "little"
-                                )
-                                idx += 2
-                            else:
-                                attribute_id = seg_format
+                path_str, class_id, instance_id, attribute_id = _decode_cip_path(
+                    path_bytes
+                )
                 payload = (
                     payload[2 + path_byte_len :]
                     if 2 + path_byte_len < len(payload)
@@ -1129,27 +1091,14 @@ def analyze_cip(
         PCCC request header: requestor-id-len(1) + requestor id + CMD(1) + STS(1)
         + TNS(2) + FNC(1). We locate CMD/FNC and map to a command name; state-
         changing PCCC (write/mode/program) raises a control finding."""
-        if not data or len(data) < 2:
+        parsed = _parse_pccc_command(data)
+        if parsed is None:
             return
-        try:
-            # Requestor ID = Length(1, value = total incl itself, typically 7) +
-            # CIP Vendor(2) + CIP Serial(4). The PCCC command block (CMD, STS,
-            # TNS(2), FNC) starts right after it.
-            id_len = data[0]
-            idx = id_len if 5 <= id_len <= 15 else 7
-            if idx + 1 >= len(data):
-                return
-            cmd = data[idx]
-            # CMD 0x0F (command) and 0x06 (unprotected) carry FNC after STS+TNS.
-            fnc_idx = idx + 4
-            fnc = data[fnc_idx] if fnc_idx < len(data) else 0
-            name = PCCC_COMMANDS.get((cmd, fnc), f"PCCC CMD 0x{cmd:02x} FNC 0x{fnc:02x}")
-            analysis.pccc_commands[name] += 1
-            analysis.pccc_endpoints.setdefault(name, Counter())[f"{s_ip} -> {d_ip}"] += 1
-            if (cmd, fnc) in PCCC_WRITE_CMDS:
-                control_events[(s_ip, d_ip, f"PCCC {name}")] += 1
-        except Exception:
-            return
+        name, is_write = parsed
+        analysis.pccc_commands[name] += 1
+        analysis.pccc_endpoints.setdefault(name, Counter())[f"{s_ip} -> {d_ip}"] += 1
+        if is_write:
+            control_events[(s_ip, d_ip, f"PCCC {name}")] += 1
 
     try:
         for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
@@ -1165,6 +1114,8 @@ def analyze_cip(
                 _extract_transport(pkt)
             )
             if not has_transport:
+                continue
+            if not payload:
                 continue
 
             # OT port counts only as the SERVER side (destination, or source
@@ -1364,10 +1315,11 @@ def analyze_cip(
                         )
                     )
 
-            if is_connected:
-                analysis.connected_packets += 1
-            else:
-                analysis.unconnected_packets += 1
+            if is_cip_carrier:
+                if is_connected:
+                    analysis.connected_packets += 1
+                else:
+                    analysis.unconnected_packets += 1
 
             parse_payload = b""
             if is_cip_carrier and isinstance(cip_payload, (bytes, bytearray)):
