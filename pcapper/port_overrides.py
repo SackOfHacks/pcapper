@@ -95,6 +95,8 @@ PROTOCOL_ALIASES: dict[str, tuple[str, ...]] = {
     "lontalk": ("lontalk",),
     "cnip": ("lontalk",),
     "lon": ("lontalk",),
+    "powerlink": ("powerlink",),
+    "epl": ("powerlink",),
     "rgoose": ("goose",),
     "r-goose": ("goose",),
     "rsv": ("sv",),

@@ -327,6 +327,34 @@ def _rgoose_hit(data: bytes, length: int) -> bool:
     return _rgoose_frame(data, length) and data[2] in (0xA0, 0xA1)
 
 
+# --- ROC Plus (CRC-16/MODBUS), ANSI C12.22 (ACSE), DLMS/COSEM wrapper -------------
+
+
+def _roc_frame(data: bytes, length: int) -> bool:
+    if length > len(data):
+        return False
+    from .rocplus import parse_roc_frames
+
+    return bool(parse_roc_frames(data))
+
+
+def _c1222_frame(data: bytes, length: int) -> bool:
+    if length > len(data) or data[:1] != b"\x60":
+        return False
+    from .c1222 import parse_c1222
+
+    message = parse_c1222(data)
+    return message is not None and bool(message.services or message.security_mode == 2)
+
+
+def _dlms_frame(data: bytes, length: int) -> bool:
+    if length > len(data):
+        return False
+    from .dlms import parse_dlms
+
+    return parse_dlms(data) is not None
+
+
 @dataclass(frozen=True)
 class ProtocolProbe:
     step: str
@@ -352,6 +380,9 @@ PROBES: tuple[ProtocolProbe, ...] = (
     ProtocolProbe("fins", "Omron FINS/TCP", ("tcp",), frozenset({9600}), _fins_tcp_frame, _fins_tcp_frame),
     ProtocolProbe("melsec", "MELSEC SLMP/MC (3E/4E)", ("tcp", "udp"), frozenset({5006, 5007}), _melsec_frame, _melsec_frame),
     ProtocolProbe("hart", "HART-IP", ("tcp", "udp"), frozenset({5094}), _hartip_frame, _hartip_frame),
+    ProtocolProbe("rocplus", "ROC Plus", ("tcp", "udp"), frozenset({4000}), _roc_frame, _roc_frame),
+    ProtocolProbe("c1222", "ANSI C12.22", ("tcp", "udp"), frozenset({1153}), _c1222_frame, _c1222_frame),
+    ProtocolProbe("dlms", "DLMS/COSEM wrapper", ("tcp", "udp"), frozenset({4059}), _dlms_frame, _dlms_frame),
     # The GOOSE analyzer finds R-GOOSE on any UDP port by itself; the probe
     # exists so --overview knows to run it. UDP 102 is R-GOOSE's own port.
     ProtocolProbe("goose", "IEC 61850-90-5 R-GOOSE", ("udp",), frozenset(), _rgoose_frame, _rgoose_hit),
@@ -427,7 +458,15 @@ def detect_nonstandard_ports(
             server = dport
         elif (transport, sport) in syn_servers:
             server = sport
+        elif dport in _KNOWN_SERVER_PORTS and sport not in _KNOWN_SERVER_PORTS:
+            server = dport
+        elif sport in _KNOWN_SERVER_PORTS and dport not in _KNOWN_SERVER_PORTS:
+            server = sport
         else:
+            # Lower port as a last resort. A registered OT port always wins
+            # first: old Windows hands out client ports from 1025-5000, so
+            # "lower" would pick the client of an EtherNet/IP session on
+            # 44818 (tcp/1054 -> 44818) and report EtherNet/IP on tcp/1054.
             server = min(sport, dport) or max(sport, dport)
         key = (transport, server)
         if key not in counts and len(counts) >= MAX_PORTS:
@@ -470,6 +509,22 @@ def detect_nonstandard_ports(
             if best is not None:
                 found.append(best)
     return found
+
+
+def _known_server_ports() -> frozenset[int]:
+    from .ot_ports import OT_PORT_PROTOCOLS
+
+    ports = set(OT_PORT_PROTOCOLS)
+    for probe in PROBES:
+        ports |= probe.default_ports
+    # Common IT services: never the client side of a conversation.
+    ports |= {20, 21, 22, 23, 25, 53, 67, 68, 69, 80, 88, 110, 111, 123, 135, 137,
+              138, 139, 143, 161, 162, 389, 443, 445, 514, 636, 1433, 1883, 3389,
+              5353, 5355, 5985, 5986, 8080, 8883}
+    return frozenset(ports)
+
+
+_KNOWN_SERVER_PORTS = _known_server_ports()
 
 
 _DETECTED: dict[str, list[PortDetection]] = {}

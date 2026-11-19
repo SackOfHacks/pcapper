@@ -61,6 +61,7 @@ from .opc import analyze_opc
 from .opc_classic import analyze_opc_classic
 from .ot_risk import compute_ot_risk_posture, dedupe_findings
 from .capture_parts import capture_parts
+from .ot_extra import OT_EXTRA
 from .port_heuristics import auto_decode
 from .port_overrides import is_standard as is_standard_port
 from .port_overrides import overrides as port_overrides_for
@@ -2729,7 +2730,7 @@ _STEP_THREAT_LABELS = {
     "niagara": "Niagara", "mms": "MMS", "srtp": "SRTP", "hart": "HART-IP",
     "iccp": "ICCP", "mqtt": "MQTT", "coap": "CoAP", "knx": "KNXnet/IP",
     "xgt": "XGT FEnet", "rocplus": "ROC Plus", "ads": "ADS/AMS",
-    "dlms": "DLMS/COSEM", "c1222": "C12.22", "lontalk": "LonTalk",
+    "dlms": "DLMS/COSEM", "c1222": "C12.22", "lontalk": "LonTalk", "powerlink": "POWERLINK",
 }
 
 
@@ -2906,6 +2907,10 @@ def analyze_threats(
         "ICCP": _analyze(analyze_iccp, show_status=show_status),
         "BSAP": _analyze(analyze_bsap, show_status=show_status),
         "Genisys": _analyze(analyze_genisys, show_status=show_status),
+        **{
+            _STEP_THREAT_LABELS.get(spec.step, spec.label): _analyze(spec.analyzer(), show_status=show_status)
+            for spec in OT_EXTRA
+        },
     }
     ot_protocol_counts: Counter[str] = Counter()
     ot_enip_enum_sources: Counter[str] = Counter()

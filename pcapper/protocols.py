@@ -370,6 +370,17 @@ INDUSTRIAL_PORTS = {
     34380: "P-NET",
     5313: "Yokogawa Vnet/IP",
     55565: "Honeywell CDA",
+    1153: "C12.22",
+    1628: "LonTalk CN/IP",
+    1629: "LonTalk CN/IP",
+    2004: "XGT FEnet",
+    2005: "XGT FEnet",
+    3671: "KNXnet/IP",
+    3819: "POWERLINK",
+    4000: "ROC Plus",
+    4059: "DLMS/COSEM",
+    48898: "ADS/AMS",
+    48899: "ADS/AMS",
 }
 
 ETHERTYPE_PROTOCOLS = {

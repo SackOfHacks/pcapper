@@ -68,6 +68,9 @@ from .s7 import _parse_commands as _parse_s7_commands
 from .srtp import analyze_srtp
 from .utils import call_with_packet_view, safe_float
 from .yokogawa import analyze_yokogawa
+from .opc_classic import analyze_opc_classic
+from .ot_extra import OT_EXTRA
+from .safety import analyze_safety
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,37 @@ DNP3_CONTROL_CODES = (
 DNP3_CONTROL_NAMES = {
     DNP3_FUNC_CODES.get(code) for code in DNP3_CONTROL_CODES if code in DNP3_FUNC_CODES
 }
+
+
+_EXTRA_MARKERS: dict[str, tuple[str, ...]] = {
+    "knx": ("reset", "restart", "propwrite", "memorywrite", "keywrite"),
+    "ads": ("writecontrol",),
+    "powerlink": ("nmtstop", "nmtreset", "nmtswreset", "nmtenter"),
+    "lontalk": ("update", "set node mode", "write memory", "leave domain"),
+    "dlms": ("set-request", "action-request"),
+    "c1222": ("write",),
+    "xgt": ("write",),
+    "rocplus": ("write", "set "),
+}
+
+
+def _opc_classic_control_view(summary: object) -> object:
+    """OPC Classic operations that change process values or historian/alarm
+    state (not SetActiveState and other housekeeping that says 'set')."""
+    from types import SimpleNamespace
+
+    def is_control(name: str) -> bool:
+        method = name.split("::", 1)[-1]
+        return method.startswith("Write") or method in {
+            "Insert", "Replace", "InsertReplace", "DeleteRaw", "DeleteAtTime",
+            "DisableConditionByArea", "DisableConditionBySource", "AckCondition",
+        }
+
+    commands = Counter(
+        {name: count for name, count in (getattr(summary, "commands", None) or Counter()).items() if is_control(name)}
+    )
+    events = [e for e in getattr(summary, "command_events", []) or [] if is_control(str(e.command))]
+    return SimpleNamespace(commands=commands, command_events=events, errors=getattr(summary, "errors", []))
 
 
 def _normalize_markers(values: object) -> list[str]:
@@ -1006,6 +1040,35 @@ def analyze_ot_commands(
         control_targets,
     )
     errors.extend(getattr(bacnet, "errors", []) or [])
+
+    # Table-driven analyzers (KNXnet/IP, XGT, ROC Plus, ADS, DLMS, C12.22,
+    # LonTalk, POWERLINK), TriStation and OPC Classic: same plumbing, with
+    # each protocol's own state-changing verbs added to the write markers.
+    extra_sources: list[tuple[str, object, tuple[str, ...]]] = [
+        (spec.label, _analyze(spec.analyzer(), show_status=show_status), _EXTRA_MARKERS.get(spec.step, ()))
+        for spec in OT_EXTRA
+    ]
+    extra_sources.append(
+        ("TriStation", _analyze(analyze_safety, show_status=show_status),
+         ("halt", "allocate", "download", "run program", "disable", "clear", "pause"))
+    )
+    extra_sources.append(("OPC Classic", _opc_classic_control_view(
+        _analyze(analyze_opc_classic, show_status=show_status)), ()))
+    for label, summary, markers in extra_sources:
+        _count_from_industrial(
+            summary,
+            label,
+            command_counts,
+            sources,
+            destinations,
+            command_sessions,
+            command_session_times,
+            _merge_markers(_protocol_extra(label), markers),
+            base_markers,
+            control_timestamps,
+            control_targets,
+        )
+        errors.extend(getattr(summary, "errors", []) or [])
 
     coap = _analyze(analyze_coap, show_status=show_status)
     coap_extra = _merge_markers(_protocol_extra("CoAP"), COAP_WRITE_MARKERS)

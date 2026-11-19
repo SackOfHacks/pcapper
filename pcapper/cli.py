@@ -54,7 +54,9 @@ from .decryption import DecryptConfig, DecryptSummary, decrypt_ssh, decrypt_tls
 from .df1 import analyze_df1
 from .dhcp import analyze_dhcp, merge_dhcp_summaries
 from .capture_parts import capture_size, group_split_captures
+from .ot_extra import BY_STEP as OT_EXTRA_BY_STEP, OT_EXTRA
 from .port_heuristics import auto_decode, set_auto_decode_enabled
+from .reporting.ot_extra import render_ot_extra_summary
 from .port_overrides import DecodeAsError, register_spec as register_decode_as
 from .discovery import find_pcaps, is_supported_pcap
 from .dnp3 import analyze_dnp3
@@ -345,6 +347,12 @@ def _load_plugins_once() -> tuple[list[PluginSpec], list[str]]:
 
 
 def _builtin_flag_map() -> dict[str, str]:
+    flags = _core_flag_map()
+    flags.update({spec.flag: spec.step for spec in OT_EXTRA})
+    return flags
+
+
+def _core_flag_map() -> dict[str, str]:
     return {
         "--search": "search",
         "--decode": "decode",
@@ -2043,6 +2051,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ),
         ("--iec101-103", "Include IEC 60870-5-101/103 heuristic analysis."),
         ("--yokogawa", "Include Yokogawa Vnet/IP analysis."),
+        *((spec.flag, spec.help) for spec in OT_EXTRA),
     ]
     ics_entries: list[tuple[str, dict[str, object]]] = [
         (flag, {"action": "store_true", "help": help_text})
@@ -3712,6 +3721,14 @@ def _analyze_paths(
                 else:
                     print(render_ethercat_summary(summary))
                 export_summaries["ethercat"] = summary
+            elif step in OT_EXTRA_BY_STEP:
+                spec = OT_EXTRA_BY_STEP[step]
+                summary = spec.analyzer()(path, show_status=step_status)
+                if summarize_rollups:
+                    rollups.setdefault(step, []).append(summary)
+                else:
+                    print(render_ot_extra_summary(spec, summary))
+                export_summaries[step] = summary
             elif step == "fins" and show_fins:
                 summary = analyze_fins(path, show_status=step_status)
                 if summarize_rollups:
@@ -4496,6 +4513,7 @@ def _analyze_paths(
             "pcapmeta": "PCAP METADATA",
             "ot_commands": "OT COMMANDS",
             "iec101_103": "IEC 101/103 ANALYSIS",
+            **{spec.step: spec.title for spec in OT_EXTRA},
         }
         for spec in plugin_lookup.values():
             title_map.setdefault(spec.name, spec.title or spec.name.upper())

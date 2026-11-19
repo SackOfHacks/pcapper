@@ -36,6 +36,8 @@ from .scan import analyze_scan
 from .services import analyze_services
 from .sv import analyze_sv
 from .threats import analyze_threats
+from .opc_classic import analyze_opc_classic
+from .ot_extra import OT_EXTRA
 from .port_heuristics import auto_decode
 from .port_overrides import is_standard as is_standard_port
 from .port_overrides import overrides as port_overrides_for
@@ -107,6 +109,7 @@ _OT_PROTOCOL_MATCHERS: list[tuple[str, str, tuple[str, ...]]] = [
     ),
     ("bsap", "BSAP-IP", ("bsap", "bristol")),
     ("genisys", "Genisys", ("genisys",)),
+    *((spec.step, spec.label, spec.tokens) for spec in OT_EXTRA),
 ]
 
 
@@ -155,6 +158,8 @@ _MODULE_LABELS = {
     "synchrophasor": "Synchrophasor",
     "bsap": "BSAP-IP",
     "genisys": "Genisys",
+    "opc_classic": "OPC Classic",
+    **{spec.step: spec.label for spec in OT_EXTRA},
 }
 
 
@@ -184,6 +189,8 @@ _OT_MODULES = {
     "synchrophasor",
     "bsap",
     "genisys",
+    "opc_classic",
+    *(spec.step for spec in OT_EXTRA),
 }
 
 
@@ -208,6 +215,7 @@ _OT_PORT_HINTS: dict[str, tuple[int, ...]] = {
     "codesys": (1217, 2455),
     "synchrophasor": (4712, 4713),
     "bsap": (1234, 1235),
+    **{spec.step: spec.ports for spec in OT_EXTRA},
 }
 
 
@@ -1955,6 +1963,26 @@ def analyze_overview(
             ports=ports,
         )
 
+    # OPC Classic rides DCE/RPC, which every Windows capture has: run the
+    # (memoized) OPC Classic pass only when DCE/RPC is present, and list it as
+    # an OT family only when it actually bound or called an OPC interface.
+    if any(_token_match(labels_blob, token) for token in ("dcerpc", "msrpc", "epmap", "dce/rpc", "135")):
+        try:
+            if _analyze(analyze_opc_classic, show_status=False).opc_packets:
+                _register_detected("opc_classic", label="OPC Classic", inventory=True)
+        except Exception:  # noqa: BLE001 - a probe must not sink the overview
+            pass
+
+    # POWERLINK is Layer 2 (EtherType 0x88AB): scapy files it under "Raw".
+    if _token_match(labels_blob, "raw"):
+        try:
+            from .powerlink import analyze_powerlink
+
+            if _analyze(analyze_powerlink, show_status=False).protocol_packets:
+                _register_detected("powerlink", label="POWERLINK", inventory=True)
+        except Exception:  # noqa: BLE001
+            pass
+
     # OT protocols on non-standard ports: --decode-as entries and ports
     # proven by payload structure (no-op when --no-auto-decode is set).
     try:
@@ -2069,6 +2097,11 @@ def analyze_overview(
         "hart": lambda: _analyze(analyze_hart, show_status=show_status),
         "niagara": lambda: _analyze(analyze_niagara, show_status=show_status),
         "codesys": lambda: _analyze(analyze_codesys, show_status=show_status),
+        "opc_classic": lambda: _analyze(analyze_opc_classic, show_status=show_status),
+        **{
+            spec.step: (lambda _spec=spec: _analyze(_spec.analyzer(), show_status=show_status))
+            for spec in OT_EXTRA
+        },
     }
 
     for step in detected_ot_steps[:_AUTO_OT_DEEP_DIVE_LIMIT]:
@@ -2202,7 +2235,7 @@ def analyze_overview(
     if detected_ot_steps:
         next_flags = []
         for step in detected_ot_steps[:4]:
-            flag = "--lldp" if step == "lldp" else f"--{step}"
+            flag = "--lldp" if step == "lldp" else f"--{step.replace('_', '-')}"
             next_flags.append(flag)
         recommendations.append(
             "Deep-dive detected OT families with: " + " ".join(next_flags)
