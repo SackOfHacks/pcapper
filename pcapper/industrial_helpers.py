@@ -527,45 +527,97 @@ def _extract_transport(pkt: object) -> tuple[bool, str, str, int, int, bytes]:
     return True, src, dst, sport, dport, payload
 
 
-def _match_ports(
-    pkt: object,
-    tcp_ports: set[int],
-    udp_ports: set[int],
-    signature_matcher: SignatureMatcher | None,
-) -> _Matched | None:
-    """Port/signature classification for TCP- and UDP-carried protocols."""
+_TRANSPORT_CACHES: "OrderedDict[int, tuple[list, dict]]" = OrderedDict()
+
+
+def _transport_cache_for(packets: list | None) -> dict | None:
+    """Per-packet transport records shared by every port analyzer's pass.
+
+    Only for an in-memory packet list (the CLI's shared view): the list keeps
+    its packets alive, so ``id(pkt)`` cannot be reused while the cache lives.
+    At most two lists are kept. Each record is filled lazily: transport layer
+    and ports at once, payload and endpoints on first use. Re-serialising the
+    scapy payload for every packet in each of ~40 analyzer passes was the
+    largest single cost of --threats/--overview/--ot-commands.
+    """
+    if not isinstance(packets, list):
+        return None
+    key = id(packets)
+    hit = _TRANSPORT_CACHES.get(key)
+    if hit is not None and hit[0] is packets:
+        _TRANSPORT_CACHES.move_to_end(key)
+        return hit[1]
+    cache: dict = {}
+    _TRANSPORT_CACHES[key] = (packets, cache)
+    while len(_TRANSPORT_CACHES) > 2:
+        _TRANSPORT_CACHES.popitem(last=False)
+    return cache
+
+
+def _transport_record(pkt: object, cache: dict | None) -> list | None:
+    if cache is not None:
+        record = cache.get(id(pkt), False)
+        if record is not False:
+            return record
     getlayer = pkt.getlayer  # type: ignore[attr-defined]
     transport = getlayer(TCP) if TCP is not None else None
     is_tcp = transport is not None
     if transport is None:
         transport = getlayer(UDP) if UDP is not None else None
-        if transport is None:
-            return None
+    record = None
+    if transport is not None:
+        record = [
+            is_tcp,
+            int(getattr(transport, "sport", 0) or 0),
+            int(getattr(transport, "dport", 0) or 0),
+            transport,
+            None,  # payload, filled on first use
+            None,  # endpoints, filled on first use
+        ]
+    if cache is not None:
+        cache[id(pkt)] = record
+    return record
+
+
+def _match_ports(
+    pkt: object,
+    tcp_ports: set[int],
+    udp_ports: set[int],
+    signature_matcher: SignatureMatcher | None,
+    cache: dict | None = None,
+) -> _Matched | None:
+    """Port/signature classification for TCP- and UDP-carried protocols."""
+    record = _transport_record(pkt, cache)
+    if record is None:
+        return None
+    is_tcp, sport, dport = record[0], record[1], record[2]
     server_ports = tcp_ports if is_tcp else udp_ports
-    sport = int(getattr(transport, "sport", 0) or 0)
-    dport = int(getattr(transport, "dport", 0) or 0)
-    payload = _strip_padding(transport.payload)
 
     # Classify by port only when the OT port is the *server* side: the
     # destination (client -> server) or the source with an ephemeral
     # destination (server -> client response). A bare "sport or dport in
     # ports" test misclassifies any flow whose ephemeral source port happens
-    # to equal an OT port number — e.g. a TCP DNS query to 8.8.8.8:53 whose
-    # ephemeral source port is 44818 would otherwise be reported as
-    # EtherNet/IP/CSP/PCCC traffic to a public IP. Signature matches are
-    # always honored.
+    # to equal an OT port number. Signature matches are always honored.
     matches_port = dport in server_ports or (
         sport in server_ports and dport >= _PORT_SERVER_EPHEMERAL_MIN
     )
+    if not matches_port and signature_matcher is None:
+        return None  # no payload work for the ~all packets that cannot match
+    if record[4] is None:
+        record[4] = _strip_padding(record[3].payload)
+    payload = record[4]
     matches_sig = bool(signature_matcher and payload and signature_matcher(payload))
     if not matches_port and not matches_sig:
         return None
 
-    src, dst = extract_packet_endpoints(pkt)
-    if not src or not dst:
-        first = pkt[0]  # type: ignore[index]
-        src = getattr(first, "src", None) or "?"
-        dst = getattr(first, "dst", None) or "?"
+    if record[5] is None:
+        src, dst = extract_packet_endpoints(pkt)
+        if not src or not dst:
+            first = pkt[0]  # type: ignore[index]
+            src = getattr(first, "src", None) or "?"
+            dst = getattr(first, "dst", None) or "?"
+        record[5] = (src, dst)
+    src, dst = record[5]
     return _Matched(
         src=src,
         dst=dst,
@@ -873,12 +925,15 @@ def analyze_port_protocol(
         return IndustrialAnalysis(path=path, errors=["Scapy unavailable (TCP/UDP missing)"])
     from .port_overrides import extra_ports
 
+    from .pcap_cache import get_forced_packet_view
+
+    cache = _transport_cache_for(packets if packets is not None else get_forced_packet_view(path))
     tcp_set = set(tcp_ports or ()) | extra_ports(port_key, "tcp", path)
     udp_set = set(udp_ports or ()) | extra_ports(port_key, "udp", path)
     return _industrial_pass(
         path,
         protocol_name,
-        classify=lambda pkt: _match_ports(pkt, tcp_set, udp_set, signature_matcher),
+        classify=lambda pkt: _match_ports(pkt, tcp_set, udp_set, signature_matcher, cache),
         command_parser=command_parser,
         artifact_parser=artifact_parser,
         anomaly_detector=anomaly_detector,

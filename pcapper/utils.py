@@ -762,7 +762,9 @@ def extract_packet_endpoints(
 
 
 _ANALYSIS_MEMO: "OrderedDict[tuple, Any]" = OrderedDict()
-_ANALYSIS_MEMO_MAX = 24
+# --threats alone runs ~90 memoized analyzers; a cap of 24 evicted results
+# before --overview/--ot-commands reused them (every OT analyzer ran twice).
+_ANALYSIS_MEMO_MAX = 512
 _MEMO_SCALARS = (str, int, float, bool, Path)
 _MEMO_SKIP_KWARGS = {"show_status", "packets", "meta"}
 
@@ -840,6 +842,18 @@ def _analysis_context_key(path: Path) -> tuple:
         return ()
 
 
+@lru_cache(maxsize=None)
+def _memo_defaults(func) -> dict[str, object]:
+    try:
+        return {
+            name: param.default
+            for name, param in inspect.signature(func).parameters.items()
+            if param.default is not inspect.Parameter.empty
+        }
+    except (TypeError, ValueError):
+        return {}
+
+
 def memoize_analysis(func):
     """Memoize an analyze_* function per capture state and arguments.
 
@@ -882,7 +896,15 @@ def memoize_analysis(func):
             return func(path, *args, **kwargs)
 
         packets = kwargs.get("packets")
+        forced_same = False
         if packets is not None:
+            try:
+                from .pcap_cache import get_forced_packet_view
+
+                forced_same = packets is get_forced_packet_view(Path(path))
+            except Exception:
+                forced_same = False
+        if packets is not None and not forced_same:
             view_key: tuple = ("packets", id(packets), len(packets))
         else:
             try:
@@ -898,11 +920,23 @@ def memoize_analysis(func):
             else:
                 view_key = ("disk",)
 
+        # Arguments passed explicitly at their default value (vt_lookup=False,
+        # port_filter=None ...) must not make a second cache entry.
+        defaults = _memo_defaults(func)
+        kwargs_for_key = {
+            name: value
+            for name, value in kwargs.items()
+            if not (
+                name in defaults
+                and type(value) is type(defaults[name])
+                and value == defaults[name]
+            )
+        }
         try:
             key_args = [_memo_key_value(value) for value in args]
             key_kwargs = [
-                (name, _memo_key_value(kwargs[name]))
-                for name in sorted(kwargs)
+                (name, _memo_key_value(kwargs_for_key[name]))
+                for name in sorted(kwargs_for_key)
                 if name not in _MEMO_SKIP_KWARGS
             ]
         except _MemoUnkeyable:
