@@ -4,6 +4,23 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+`--files` on `wannacry-20170515.pcapng` listed neither `wannacry.exe` nor `Procmon.exe`, attached filenames to the wrong responses, and printed colour codes as literal text. Each fix below is pinned by a test.
+
+### Added
+
+- **`--files` checks `known_malware_filename` and `internal_executable_staging`**, both scored by the verdict. The first fires (high) on a transferred file named after an unambiguous malware family or offensive tool (`wannacry`, `wcry`, `mimikatz`, `rubeus`, …; dual-use admin tools are excluded). The second fires (warning) on an executable served over cleartext HTTP by an internal host addressed only by IP, which is the attacker staging pattern; a named internal server does not fire. The WannaCry capture now scores YES (9) instead of NO STRONG SIGNAL (1).
+
+### Fixed
+
+- **Every HTTP response stream over ~18.5 KB was classified as OpenVPN**, so large downloads never reached HTTP file extraction (or were counted as OpenVPN by `--services`, `--vpn`, `--beacon` and `--hostname`). "HT" reads as an OpenVPN-over-TCP length of 18516 and "T" as opcode 10. Control frames longer than 4096 bytes are now rejected; real ones are bounded by `--tls-mtu` (default 1250) and two printable bytes always read as >= 8224.
+- **HTTP filenames shifted onto the wrong responses** when a request had no filename (`/1`, `/`): those requests were not queued, so each later response took the next request's name. Every request is now queued and exactly one is consumed per response, in all three extraction paths.
+- **1xx, 204 and 304 responses were read to end of stream**, swallowing every later response on a keep-alive connection as their "body".
+- Error pages paired with a requested filename are labelled `HTTP 403 Response Body (not the requested file)` instead of passing as the file.
+- `--files` table cells showed `\x1b[1m\x1b[33m...` literally: `format_table` escaped pcapper's own colour codes. Cells now keep SGR colour and still escape every other control sequence (OSC, cursor movement, BEL).
+- `test_sqlite_export_failure_keeps_existing_database` asserted POSIX permission bits on Windows; that assertion now runs on Mac/Linux only.
+
 ## 2.9.0 — 2026-11-19
 
 ICS/OT coverage gaps found while building the ICS-PCAP-Challenges range (331 challenges over 70 public datasets). Each item below was a real capture Pcapper reported as empty or undecoded; each fix is pinned by a test, and the suite grew from 828 to 890 tests.
