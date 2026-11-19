@@ -60,7 +60,8 @@ from .codesys import analyze_codesys
 from .opc import analyze_opc
 from .opc_classic import analyze_opc_classic
 from .ot_risk import compute_ot_risk_posture, dedupe_findings
-from .pcap_cache import PcapMeta, iter_packets
+from .capture_parts import capture_parts
+from .pcap_cache import PcapMeta, capture_hashes, iter_packets
 from .pccc import analyze_pccc
 from .pcworx import analyze_pcworx
 from .powershell import analyze_powershell
@@ -963,7 +964,75 @@ SURICATA_EVE_MAX_LINE_BYTES = env_int(
 )
 
 
+def _merge_suricata_stats(base: dict, extra: dict) -> dict:
+    """Sum the numeric leaves of two Suricata stats dicts (lists concatenate)."""
+    merged = dict(base)
+    for key, value in extra.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_suricata_stats(current, value)
+        elif isinstance(current, bool) or isinstance(value, bool):
+            merged[key] = bool(current) or bool(value)
+        elif isinstance(current, (int, float)) and isinstance(value, (int, float)):
+            merged[key] = current + value
+        elif isinstance(current, list) and isinstance(value, list):
+            merged[key] = current + value
+        elif key not in merged:
+            merged[key] = value
+    return merged
+
+
 def _run_suricata_scan(
+    path: Path,
+    rules_path: Path | None = None,
+    config_path: Path | None = None,
+    eve_types: set[str] | None = None,
+    suppress_sid: set[str] | None = None,
+    only_sid: set[str] | None = None,
+):
+    """Suricata over a capture; a joined split capture is scanned part by part.
+
+    Suricata reads one pcap per run, so each part gets its own run and the
+    alerts, checks and stats are combined. Flows that cross a part boundary
+    are seen by Suricata as two flows (one per part).
+    """
+    parts = capture_parts(path)
+    if len(parts) == 1:
+        return _run_suricata_scan_file(
+            path, rules_path, config_path, eve_types, suppress_sid, only_sid
+        )
+    detections: list[dict[str, object]] = []
+    errors: list[str] = []
+    metadata: dict[str, object] = {}
+    checks: dict[str, list[str]] = {}
+    stats: dict[str, object] = {}
+    for index, part in enumerate(parts):
+        part_detections, part_errors, part_meta, part_checks, part_stats = (
+            _run_suricata_scan_file(
+                part, rules_path, config_path, eve_types, suppress_sid, only_sid
+            )
+        )
+        detections.extend(part_detections)
+        errors.extend(f"part {index:03d}: {err}" for err in part_errors)
+        if not metadata:
+            metadata = dict(part_meta)
+        else:
+            metadata["scan_seconds"] = round(
+                float(metadata.get("scan_seconds", 0) or 0)
+                + float(part_meta.get("scan_seconds", 0) or 0),
+                3,
+            )
+        for key, values in (part_checks or {}).items():
+            checks.setdefault(key, []).extend(values)
+        stats = _merge_suricata_stats(stats, part_stats or {})
+    metadata["parts"] = len(parts)
+    # Same digest the base summary reports for a joined capture: the parts'
+    # bytes in order.
+    metadata["pcap_sha256"] = capture_hashes(path)[0] or "-"
+    return detections, errors, metadata, checks, stats
+
+
+def _run_suricata_scan_file(
     path: Path,
     rules_path: Path | None = None,
     config_path: Path | None = None,

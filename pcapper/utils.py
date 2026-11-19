@@ -39,13 +39,24 @@ except Exception:  # pragma: no cover
 
 PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
 
-# Classic pcap magic numbers, both byte orders, microsecond and nanosecond
-# timestamp variants. Anything else is not a capture this tool can read.
+# Classic pcap magic numbers, both byte orders: microsecond, nanosecond and the
+# Kuznetzov "modified pcap" variant (patched tcpdump on old Red Hat systems; the
+# same 24-byte global header, but 24-byte record headers carrying ifindex,
+# protocol and packet type). Anything else is not a capture this tool can read.
 PCAP_MAGIC: dict[int, str] = {
     0xA1B2C3D4: ">",
     0xD4C3B2A1: "<",
     0xA1B23C4D: ">",
     0x4D3CB2A1: "<",
+    0xA1B2CD34: ">",
+    0x34CDB2A1: "<",
+}
+
+# The modified-pcap magic as it appears on disk, mapped to its byte order.
+# Kept separate because only these need the extended record-header reader.
+PCAP_MODIFIED_MAGIC_BYTES: dict[bytes, str] = {
+    b"\xa1\xb2\xcd\x34": ">",
+    b"\x34\xcd\xb2\xa1": "<",
 }
 
 
@@ -447,11 +458,21 @@ def detect_file_type(path: Path) -> str:
             header = handle.read(4)
     except Exception:
         return "unknown"
-    if header == PCAPNG_MAGIC:
+    return capture_type_from_header(header)
+
+
+def capture_type_from_header(header: bytes) -> str:
+    """``pcapng``, ``pcap`` or ``unknown`` for the first four bytes of a file.
+
+    Detection is by magic number only; the file name is never consulted, so a
+    capture saved without an extension (rotating ``cap_<n>_<timestamp>``
+    files from a capture appliance) is recognised like any other.
+    """
+    if header[:4] == PCAPNG_MAGIC:
         return "pcapng"
-    if len(header) == 4:
-        little = int.from_bytes(header, "little")
-        big = int.from_bytes(header, "big")
+    if len(header) >= 4:
+        little = int.from_bytes(header[:4], "little")
+        big = int.from_bytes(header[:4], "big")
         if little in PCAP_MAGIC or big in PCAP_MAGIC:
             return "pcap"
     return "unknown"

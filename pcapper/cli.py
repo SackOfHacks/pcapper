@@ -53,6 +53,7 @@ from .decode import analyze_decode
 from .decryption import DecryptConfig, DecryptSummary, decrypt_ssh, decrypt_tls
 from .df1 import analyze_df1
 from .dhcp import analyze_dhcp, merge_dhcp_summaries
+from .capture_parts import capture_size, group_split_captures
 from .discovery import find_pcaps, is_supported_pcap
 from .dnp3 import analyze_dnp3
 from .dns import analyze_dns
@@ -1409,6 +1410,17 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Recursively search for pcaps when target is a directory.",
     )
     general.add_argument(
+        "--no-join-parts",
+        dest="no_join_parts",
+        action="store_true",
+        help=(
+            "Analyse split-capture parts (X.pcap.part000.pcap, X.pcap.part001.pcap, ...) "
+            "one by one. By default sibling parts found together are joined and analysed "
+            "as one capture: one timeline, one conversation table, nothing cut at a part "
+            "boundary. A single part named on its own is always analysed alone."
+        ),
+    )
+    general.add_argument(
         "-summarize",
         action="store_true",
         help="Summarize supported analysis across all pcaps (e.g., --modbus, --dnp3). Use single-dash -summarize.",
@@ -2644,10 +2656,7 @@ def _analyze_paths(
             max_file_override = None
             enabled, max_cache, _max_file = get_cache_config()
             if enabled and max_cache > 0 and use_packets:
-                try:
-                    size_bytes = path.stat().st_size
-                except Exception:
-                    size_bytes = 0
+                size_bytes = capture_size(path)
                 if size_bytes and size_bytes <= max_cache:
                     max_file_override = max_cache
             packets, meta = load_packets_if_allowed(
@@ -5083,13 +5092,11 @@ def main() -> int:
             return 2
 
         if target.is_file():
-            if not is_supported_pcap(target):
-                _print_error("Target is not a supported pcap/pcapng file.")
-                return 2
+            # Judged by the file header, never the extension: a capture saved
+            # without one (rotating cap_<n>_<timestamp> files) is accepted, and
+            # a file with a .pcap name but no capture magic is refused instead
+            # of being read as an empty capture and reported as zero packets.
             if detect_file_type(target) == "unknown":
-                # A file with the right extension but no capture magic used
-                # to be read as an empty capture and reported as zero packets
-                # with no error — a compressed or renamed file passed silently.
                 _print_error(
                     f"Target is not a pcap/pcapng capture (unrecognised file "
                     f"header): {raw_target}"
@@ -5101,7 +5108,15 @@ def main() -> int:
                 paths.append(resolved)
             continue
 
-        discovered = find_pcaps(target, recursive=args.recursive)
+        rejected: list[Path] = []
+        discovered = find_pcaps(target, recursive=args.recursive, rejected=rejected)
+        if rejected:
+            shown = ", ".join(str(item) for item in rejected[:3])
+            more = f" (+{len(rejected) - 3} more)" if len(rejected) > 3 else ""
+            _print_error(
+                f"Skipped {len(rejected)} file(s) named like captures but without "
+                f"a pcap/pcapng header: {shown}{more}"
+            )
         for path in discovered:
             if path not in seen_paths:
                 seen_paths.add(path)
@@ -5110,6 +5125,19 @@ def main() -> int:
     if not paths:
         _print_error("No pcap/pcapng files found.")
         return 2
+
+    if not getattr(args, "no_join_parts", False):
+        paths, part_groups = group_split_captures(paths)
+        for group in part_groups:
+            note = (
+                f"Joined {len(group.parts)} split-capture parts as one capture: "
+                f"{group.base} ({group.parts[0].name} .. {group.parts[-1].name})"
+            )
+            if group.missing:
+                shown = ", ".join(f"{index:03d}" for index in group.missing[:8])
+                more = " ..." if len(group.missing) > 8 else ""
+                note += f"; MISSING part(s) {shown}{more} - results have a gap"
+            _print_error(note)
 
     export_json_path = (
         Path(args.json).expanduser() if getattr(args, "json", None) else None

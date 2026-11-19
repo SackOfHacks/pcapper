@@ -7,6 +7,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .capture_parts import capture_parts
 from .utils import env_int, executable_path_warnings, open_private, restrict_dir_permissions
 
 
@@ -218,43 +219,53 @@ def _decrypt_protocol(
             errors.append(f"tshark trust warning: {warning}")
 
     pref = f"{pref_key}:{keylog}"
-    streams, labels, stream_errors = _collect_streams(path, display_filter, pref)
-    errors.extend(stream_errors)
-    if not streams:
-        notes.append(f"No {protocol} streams detected for decryption.")
-
     restrict_dir_permissions(output_dir)
     count = 0
-    for stream_id in streams:
-        if limit and count >= limit:
-            notes.append(f"{protocol} stream limit reached ({limit}).")
+    found_any = False
+    limit_hit = False
+    # tshark reads one file at a time: a joined split capture is decrypted
+    # part by part (a stream cut by a part boundary is followed in each part).
+    parts = capture_parts(path)
+    for part_index, part in enumerate(parts):
+        if limit_hit:
             break
-        label = _stream_label(stream_id, labels)
-        filename = output_dir / f"{tag}_{stream_id}_{label}.txt"
-        stdout = stderr = ""
-        timed_out = False
-        for index, follow_proto in enumerate(follow_protos):
-            followed = _follow_stream(path, stream_id, pref, follow_proto)
-            if followed is None:
-                suffix = f" as {follow_proto}" if index else ""
-                errors.append(
-                    f"tshark timed out after {TSHARK_TIMEOUT:.0f}s following "
-                    f"{protocol} stream {stream_id}{suffix}; skipped."
-                )
-                timed_out = True
+        streams, labels, stream_errors = _collect_streams(part, display_filter, pref)
+        errors.extend(stream_errors)
+        found_any = found_any or bool(streams)
+        part_tag = f"p{part_index:03d}_" if len(parts) > 1 else ""
+        for stream_id in streams:
+            if limit and count >= limit:
+                notes.append(f"{protocol} stream limit reached ({limit}).")
+                limit_hit = True
                 break
-            stdout, stderr = followed
-            if stdout or not stderr:
-                break  # got data, or a clean empty result: no fallback needed
-        if timed_out:
-            continue
-        if stderr.strip():
-            errors.append(stderr.strip())
-        if stdout:
-            with open_private(filename, "w", encoding="utf-8", errors="ignore") as handle:
-                handle.write(stdout)
-            outputs.append(filename)
-            count += 1
+            label = _stream_label(stream_id, labels)
+            filename = output_dir / f"{tag}_{part_tag}{stream_id}_{label}.txt"
+            stdout = stderr = ""
+            timed_out = False
+            for index, follow_proto in enumerate(follow_protos):
+                followed = _follow_stream(part, stream_id, pref, follow_proto)
+                if followed is None:
+                    suffix = f" as {follow_proto}" if index else ""
+                    errors.append(
+                        f"tshark timed out after {TSHARK_TIMEOUT:.0f}s following "
+                        f"{protocol} stream {stream_id}{suffix}; skipped."
+                    )
+                    timed_out = True
+                    break
+                stdout, stderr = followed
+                if stdout or not stderr:
+                    break  # got data, or a clean empty result: no fallback needed
+            if timed_out:
+                continue
+            if stderr.strip():
+                errors.append(stderr.strip())
+            if stdout:
+                with open_private(filename, "w", encoding="utf-8", errors="ignore") as handle:
+                    handle.write(stdout)
+                outputs.append(filename)
+                count += 1
+    if not found_any:
+        notes.append(f"No {protocol} streams detected for decryption.")
 
     return DecryptSummary(
         path=path,

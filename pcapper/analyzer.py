@@ -6,6 +6,7 @@ from numbers import Real
 from pathlib import Path
 from typing import Iterable, Optional
 
+from .capture_parts import capture_size
 from .pcap_cache import PcapMeta, capture_hashes, iter_packets, load_capture_meta
 
 try:
@@ -173,7 +174,7 @@ def analyze_pcap(
             capture_meta = None
 
     file_type = capture_meta.file_type if capture_meta else detect_file_type(path)
-    size_bytes = capture_meta.size_bytes if capture_meta else path.stat().st_size
+    size_bytes = capture_meta.size_bytes if capture_meta else capture_size(path)
     hash_sha256, hash_sha1 = capture_hashes(path)
     packet_count = 0
     truncated_packets = 0
