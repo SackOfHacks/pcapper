@@ -209,6 +209,22 @@ class TestVpn:
             body.extend(data)
         return len(body).to_bytes(2, "big") + bytes(body)
 
+    def test_large_http_response_is_not_openvpn(self) -> None:
+        # "HT" reads as length 18516 and "T" as opcode 10 (HARD_RESET_CLIENT_V3),
+        # so any HTTP response stream over ~18.5 KB used to classify as OpenVPN
+        # and its file (e.g. a downloaded .exe) never reached HTTP extraction.
+        from pcapper.files import _detect_app_protocol_from_stream
+        from pcapper.openvpn import is_openvpn_tcp_control
+
+        stream = (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 30000\r\n"
+            b"Content-Type: application/x-msdos-program\r\n\r\nMZ" + b"\x00" * 30000
+        )
+        assert not is_openvpn_tcp_control(stream)
+        assert _detect_app_protocol_from_stream(stream, 80, 49261) == "HTTP"
+        # Real control frames are still recognised.
+        assert is_openvpn_tcp_control(self._ovpn_tcp(7))
+
     def test_port_match_needs_the_vpn_port_on_the_server_side(self) -> None:
         from pcapper.vpn import _vpn_port_match
 

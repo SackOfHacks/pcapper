@@ -4,7 +4,7 @@ import re
 import textwrap
 from typing import Iterable
 
-from .utils import display_safe
+from .utils import terminal_safe
 
 
 def format_table(rows: Iterable[list[str]]) -> str:
@@ -13,11 +13,13 @@ def format_table(rows: Iterable[list[str]]) -> str:
         return "(none)"
 
     def _cell_text(value: object) -> str:
+        # terminal_safe, not display_safe: renderers colour cells (orange(),
+        # danger()) BEFORE handing them over, and display_safe escaped those
+        # SGR sequences into literal "\x1b[1m" text. terminal_safe keeps SGR
+        # and still escapes every other control byte (OSC, cursor moves, BEL).
         if value is None:
             return ""
-        if isinstance(value, str):
-            return display_safe(value)
-        return display_safe(str(value))
+        return terminal_safe(value if isinstance(value, str) else str(value))
 
     rows = [[_cell_text(cell) for cell in row] for row in rows]
     # A ragged row (a renderer that appended fewer cells than the header)

@@ -5,6 +5,7 @@ from .utils import is_public_ip as _is_public_ip
 import base64
 import email
 import hashlib
+import ipaddress
 import os
 import re
 import socket
@@ -1843,13 +1844,22 @@ def _is_cip_program_or_file_service(service_name: str) -> bool:
 
 
 def _http_body_note(message: Dict[str, Any], body: bytes) -> str:
-    """Artifact note for an HTTP response body, naming a truncated transfer."""
+    """Artifact note for an HTTP response body.
+
+    Names a truncated transfer, and a non-2xx status: a 403/404 error page is
+    paired with the requested filename, so without the status it reads as if
+    the requested file itself was transferred.
+    """
+    note = "HTTP Response Body"
+    status = message.get("status_code")
+    if isinstance(status, int) and not 200 <= status < 300:
+        note = f"HTTP {status} Response Body (not the requested file)"
     if message.get("truncated"):
         declared = message.get("declared_length")
         if isinstance(declared, int) and declared > 0:
-            return f"HTTP Response Body (TRUNCATED: {len(body)} of {declared} declared bytes)"
-        return "HTTP Response Body (TRUNCATED)"
-    return "HTTP Response Body"
+            return f"{note} (TRUNCATED: {len(body)} of {declared} declared bytes)"
+        return f"{note} (TRUNCATED)"
+    return note
 
 
 def _parse_http_stream(stream: bytes) -> List[Dict[str, Any]]:
@@ -1913,6 +1923,20 @@ def _parse_http_stream(stream: bytes) -> List[Dict[str, Any]]:
         next_idx = body_start
         truncated = False
 
+        # RFC 9112 §6.3: 1xx, 204 and 304 responses never carry a body,
+        # whatever their headers say. Reading them to EOF swallowed every
+        # later response on a keep-alive connection as a fake "body".
+        status_code = None
+        if not is_request:
+            parts = start_line.split(" ", 2)
+            if len(parts) >= 2 and parts[1].isdigit():
+                status_code = int(parts[1])
+        if status_code is not None and (
+            100 <= status_code < 200 or status_code in (204, 304)
+        ):
+            content_len = 0
+            is_chunked = False
+
         if content_len is not None and content_len >= 0:
             if body_start + content_len <= len(stream):
                 body = stream[body_start : body_start + content_len]
@@ -1970,6 +1994,7 @@ def _parse_http_stream(stream: bytes) -> List[Dict[str, Any]]:
                 "body": body,
                 "truncated": truncated,
                 "declared_length": content_len,
+                "status_code": status_code,
             }
         )
 
@@ -2645,18 +2670,13 @@ class FileExtractor:
                     hostname = (
                         host_header.split(":")[0].strip() if host_header else None
                     )
-                    if fn:
-                        # Store for the REVERSE direction
-                        # Key: (Dst(Server), DstPort, Src(Client), SrcPort)
-                        # Wait, my keys in tcp_streams are (src, dst, sport, dport)
-                        # So from Client->Server.
-                        # Response will be Server->Client.
-                        # Response Key will be (dst, src, dport, sport)
-                        # Wait, tcp_streams key is (src, dst, sport, dport)
-                        # So I should store it under (dst, src, dport, sport)
-                        pending_requests[(dst, src, dport, sport)].append(
-                            {"filename": fn, "hostname": hostname}
-                        )
+                    # Record EVERY request (filename may be None) under the
+                    # response direction's key, so responses pair with
+                    # requests strictly in order. Skipping nameless requests
+                    # ("/1", "/") shifted every later name onto the wrong body.
+                    pending_requests[(dst, src, dport, sport)].append(
+                        {"filename": fn, "hostname": hostname}
+                    )
 
         # Pass 1b: FTP control parsing (supports non-standard ports)
         ftp_transfers = _collect_ftp_transfers(
@@ -2936,10 +2956,9 @@ class FileExtractor:
             if m["is_request"]:
                 host_header = m["headers"].get("host", "")
                 fn = _extract_request_filename(m["start_line"], host_header)
-                if fn:
-                    pending_requests.append(
-                        {"filename": fn, "hostname": None}
-                    )  # For requests in the same stream
+                pending_requests.append(
+                    {"filename": fn, "hostname": None}
+                )  # For requests in the same stream (fn may be None)
                 auth_header = m["headers"].get("authorization", "")
                 if "ntlm" in auth_header.lower():
                     self.http_ntlm_sources[src] += 1
@@ -2987,13 +3006,14 @@ class FileExtractor:
                         fname = content_location
                         explicit_name = True
 
-                # Check pending requests (Sync logic: Consume regardless of body size/existence to keep order)
-                if fname == "http_response.bin" and pending_requests:
-                    req_info = pending_requests.pop(0)
+                # One request is consumed per response, always, so pairing
+                # stays in order even when this response is named another way.
+                req_info = pending_requests.pop(0) if pending_requests else None
+                if req_info and req_info["hostname"]:
+                    current_hostname = req_info["hostname"]
+                if fname == "http_response.bin" and req_info and req_info["filename"]:
                     fname = req_info["filename"]
                     explicit_name = True
-                    if req_info["hostname"]:
-                        current_hostname = req_info["hostname"]
 
                 if not body:
                     continue
@@ -3063,7 +3083,7 @@ class FileExtractor:
                         (
                             req["filename"]
                             for req in pending_requests
-                            if req["filename"].lower().endswith(".exe")
+                            if (req["filename"] or "").lower().endswith(".exe")
                         ),
                         None,
                     )
@@ -3803,10 +3823,10 @@ def _export_with_dpkt(
                 host = m["headers"].get("host")
                 hostname = host.split(":")[0].strip() if host else None
                 fn = _extract_request_filename(m["start_line"], host)
-                if fn:
-                    pending_requests[(dst, src, dport, sport)].append(
-                        {"filename": fn, "hostname": hostname}
-                    )
+                # Every request, named or not, so responses pair in order.
+                pending_requests[(dst, src, dport, sport)].append(
+                    {"filename": fn, "hostname": hostname}
+                )
 
     # HTTP/IMF/SMB/DICOM/X509/FTP data extraction
     for (src, dst, sport, dport), chunks in tcp_streams.items():
@@ -3983,10 +4003,11 @@ def _export_with_dpkt(
                     if content_location:
                         fname = content_location
                         explicit_name = True
-                if fname == "http_response.bin" and requests:
-                    req_info = requests.pop(0)
-                    fname = req_info["filename"]
+                req_info = requests.pop(0) if requests else None
+                if req_info:
                     hostname = req_info["hostname"]
+                if fname == "http_response.bin" and req_info and req_info["filename"]:
+                    fname = req_info["filename"]
                     explicit_name = True
                 if fname == "http_response.bin":
                     content_type = m["headers"].get("content-type", "")
@@ -4038,7 +4059,7 @@ def _export_with_dpkt(
                         (
                             req["filename"]
                             for req in requests
-                            if req["filename"].lower().endswith(".exe")
+                            if (req["filename"] or "").lower().endswith(".exe")
                         ),
                         None,
                     )
@@ -4860,6 +4881,38 @@ _DANGEROUS_DOWNLOAD_TYPES = {
     "LNK": "Windows shortcut (exec lure)",
     "CAB": "Microsoft Cabinet archive",
 }
+# Unambiguous malware-family / offensive-tool names. A transferred file named
+# after one is a strong triage lead on its own; kept to names with no benign
+# software namesake, so dual-use admin tools (psexec, procdump) are excluded.
+_MALWARE_FILENAME_TOKENS = (
+    "wannacry", "wanacry", "wannacrypt", "wanacrypt", "wcry", "notpetya",
+    "mimikatz", "mimilib", "mimidrv", "lazagne", "rubeus", "sharphound",
+    "cobaltstrike", "beacon_x64", "meterpreter", "emotet", "trickbot",
+    "ryuk", "lockbit", "conti", "qakbot", "qbot", "icedid", "njrat",
+    "darkcomet", "remcos", "agenttesla",
+)
+_EXECUTABLE_DOWNLOAD_TYPES = {"EXE/DLL", "ELF", "MACHO"}
+
+
+def _malware_filename_token(name: str) -> Optional[str]:
+    base = re.sub(r"[^a-z0-9_]", "", _normalize_basename(name or ""))
+    for token in _MALWARE_FILENAME_TOKENS:
+        if token in base:
+            return token
+    return None
+
+
+def _is_ip_literal(value: Optional[str]) -> bool:
+    text = str(value or "").strip().strip("[]")
+    if not text:
+        return False
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
 _SCRIPT_FILE_EXTS = {
     ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta",
     ".bat", ".cmd", ".sh", ".py", ".jar", ".scr",
@@ -4970,6 +5023,67 @@ def _build_files_enrichment(
                     f"{art.filename} ({label}) from {art.src_ip} to {art.dst_ip} "
                     f"over {art.protocol}. Confirm against expected software/update "
                     "sources; correlate the file hash with threat intel."
+                ),
+                "source": "Files",
+            }
+        )
+
+    # 4. A transferred file named after a known malware family / offensive
+    #    tool. Name-only, so it is a lead rather than proof, but the token list
+    #    has no benign namesakes. Direction-independent.
+    for art in artifacts:
+        token = _malware_filename_token(art.filename)
+        if not token:
+            continue
+        evidence = f"{art.filename} ({token}) {art.src_ip}->{art.dst_ip} over {art.protocol}"
+        checks["known_malware_filename"].append(evidence)
+        key = f"malname:{art.filename}:{art.src_ip}->{art.dst_ip}"
+        if key in seen_dropper:
+            continue
+        seen_dropper.add(key)
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "File named after a known malware family / offensive tool",
+                "details": (
+                    f"{evidence}. Hash the file and check it against threat intel; "
+                    "a truncated transfer yields a partial-file hash."
+                ),
+                "source": "Files",
+            }
+        )
+
+    # 5. An executable served over cleartext HTTP by an INTERNAL host that is
+    #    addressed by bare IP (no DNS name) to another internal host. Managed
+    #    software distribution uses names, SMB or a deployment tool; a raw-IP
+    #    web server handing out PEs is the attacker staging pattern
+    #    (python -m http.server / Apache on an attack box).
+    for art in artifacts:
+        ftype = getattr(art, "file_type", "") or ""
+        if ftype not in _EXECUTABLE_DOWNLOAD_TYPES:
+            continue
+        if str(getattr(art, "protocol", "")).upper() != "HTTP":
+            continue
+        src = str(art.src_ip or "")
+        dst = str(art.dst_ip or "")
+        if not src or not dst or _is_public_ip(src) or _is_public_ip(dst):
+            continue
+        hostname = getattr(art, "hostname", None)
+        if hostname and not _is_ip_literal(hostname):
+            continue
+        evidence = f"{art.filename} ({ftype}) {src}->{dst} via http://{hostname or src}/"
+        checks["internal_executable_staging"].append(evidence)
+        key = f"stage:{art.filename}:{src}->{dst}"
+        if key in seen_dropper:
+            continue
+        seen_dropper.add(key)
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "Executable pulled over HTTP from an internal IP-addressed server",
+                "details": (
+                    f"{evidence}. Internal executable staging pattern; confirm the "
+                    "serving host is a sanctioned distribution point."
                 ),
                 "source": "Files",
             }

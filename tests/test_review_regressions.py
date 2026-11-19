@@ -67,7 +67,10 @@ def test_sqlite_export_failure_keeps_existing_database(tmp_path: Path, monkeypat
         exporting.export_sqlite(bundle, target)
 
     assert target.read_bytes() == b"existing valid export"
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    if os.name != "nt":
+        # Windows maps chmod to a read-only flag only, so st_mode reads 0o666
+        # there; the permission bits are only meaningful on POSIX (Mac/Linux).
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert list(tmp_path.glob(f".{target.name}.*.tmp")) == []
 
 

@@ -91,6 +91,8 @@ def render_files_summary(
             "multi_signal_masquerade": 3,
             "archive_container_abuse": 3,
             "macro_script_lolbas_staging": 3,
+            "known_malware_filename": 3,
+            "internal_executable_staging": 2,
             "exfiltration_file_movement": 3,
             "lateral_copy_propagation": 4,
             "auth_file_correlation": 2,
@@ -194,6 +196,8 @@ def render_files_summary(
     check_labels = [
         ("multi_signal_masquerade", "Multi-signal Masquerade"),
         ("macro_script_lolbas_staging", "Macro/Script/LOLBAS Staging"),
+        ("known_malware_filename", "Known Malware/Tool Filename"),
+        ("internal_executable_staging", "Internal Executable Staging"),
     ]
     cleared_checks: list[str] = []
     fired_any = False

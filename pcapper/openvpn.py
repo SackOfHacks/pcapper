@@ -21,6 +21,14 @@ OPENVPN_CONTROL_OPCODES = {1, 2, 3, 4, 5, 7, 8, 10}
 OPENVPN_CLIENT_RESET_OPCODES = {1, 7, 10}
 OPENVPN_SERVER_RESET_OPCODES = {2, 8}
 
+# Upper bound on a plausible OpenVPN-over-TCP *control* frame. Control packets
+# are sized by --tls-mtu (default 1250), so real ones sit far below this. The
+# bound is what stops text protocols from parsing as OpenVPN: two printable
+# ASCII bytes read as a u16 length are always >= 0x2020 (8224), and e.g. an
+# HTTP response ("HT" = 18516, then "T" = opcode 10) otherwise decoded as a
+# P_CONTROL_HARD_RESET_CLIENT_V3 frame once the stream exceeded ~18.5 KB.
+OPENVPN_MAX_TCP_CONTROL_FRAME = 4096
+
 
 @dataclass(frozen=True)
 class OpenVpnFrame:
@@ -83,6 +91,11 @@ def iter_openvpn_tcp_frames(payload: bytes) -> Iterable[OpenVpnFrame]:
         if parsed is None:
             return
         opcode, key_id = parsed
+        if (
+            opcode in OPENVPN_CONTROL_OPCODES
+            and declared_len > OPENVPN_MAX_TCP_CONTROL_FRAME
+        ):
+            return
         yield OpenVpnFrame(opcode, key_id, openvpn_opcode_name(opcode), declared_len)
         offset = frame_end
 
