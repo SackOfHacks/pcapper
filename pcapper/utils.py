@@ -10,7 +10,7 @@ import os
 import re
 import stat
 from collections import Counter, OrderedDict
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -948,9 +948,15 @@ def to_serializable(value: Any, *, redact: bool = False) -> Any:
             return to_serializable(value.to_dict(), redact=redact)
         except Exception:
             pass
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type):
+        # Field by field, not dataclasses.asdict(): asdict rebuilds every dict
+        # subclass by passing it (key, value) pairs, and Counter(pairs) counts
+        # the pairs - every Counter field was exported as {"('k', n)": 1}.
         try:
-            return to_serializable(asdict(value), redact=redact)
+            return {
+                f.name: to_serializable(getattr(value, f.name), redact=redact)
+                for f in fields(value)
+            }
         except Exception:
             pass
     if hasattr(value, "__dict__"):

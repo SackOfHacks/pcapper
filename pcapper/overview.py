@@ -110,6 +110,7 @@ _OT_PROTOCOL_MATCHERS: list[tuple[str, str, tuple[str, ...]]] = [
     ("bsap", "BSAP-IP", ("bsap", "bristol")),
     ("genisys", "Genisys", ("genisys",)),
     *((spec.step, spec.label, spec.tokens) for spec in OT_EXTRA),
+    ("safety", "Safety/SIS (TriStation)", ("tristation", "triconex")),
 ]
 
 
@@ -216,6 +217,7 @@ _OT_PORT_HINTS: dict[str, tuple[int, ...]] = {
     "synchrophasor": (4712, 4713),
     "bsap": (1234, 1235),
     **{spec.step: spec.ports for spec in OT_EXTRA},
+    "safety": (1502,),
 }
 
 
@@ -2098,6 +2100,7 @@ def analyze_overview(
         "niagara": lambda: _analyze(analyze_niagara, show_status=show_status),
         "codesys": lambda: _analyze(analyze_codesys, show_status=show_status),
         "opc_classic": lambda: _analyze(analyze_opc_classic, show_status=show_status),
+        "safety": lambda: _analyze(analyze_safety, show_status=show_status),
         **{
             spec.step: (lambda _spec=spec: _analyze(_spec.analyzer(), show_status=show_status))
             for spec in OT_EXTRA
