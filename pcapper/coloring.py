@@ -74,7 +74,11 @@ def set_color_override(enabled: bool | None) -> None:
 
 def header(text: str, enabled: bool | None = None) -> str:
     if "::" in text:
-        return reverse_header(text, enabled)
+        # "<SECTION> :: <capture name>": a joined split capture is titled by
+        # its original name, not by the file name of its first part.
+        from .capture_parts import apply_display_names
+
+        return reverse_header(apply_display_names(text), enabled)
     return colorize(text, ANSI_CYAN, enabled, bold=True)
 
 

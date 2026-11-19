@@ -294,6 +294,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_mqtt(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="mqtt",
         path=path,
         protocol_name="MQTT",
         tcp_ports=MQTT_PORTS,

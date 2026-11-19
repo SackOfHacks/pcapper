@@ -10,7 +10,7 @@ import os
 import re
 import stat
 from collections import Counter, OrderedDict
-from dataclasses import asdict, is_dataclass
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -39,13 +39,24 @@ except Exception:  # pragma: no cover
 
 PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
 
-# Classic pcap magic numbers, both byte orders, microsecond and nanosecond
-# timestamp variants. Anything else is not a capture this tool can read.
+# Classic pcap magic numbers, both byte orders: microsecond, nanosecond and the
+# Kuznetzov "modified pcap" variant (patched tcpdump on old Red Hat systems; the
+# same 24-byte global header, but 24-byte record headers carrying ifindex,
+# protocol and packet type). Anything else is not a capture this tool can read.
 PCAP_MAGIC: dict[int, str] = {
     0xA1B2C3D4: ">",
     0xD4C3B2A1: "<",
     0xA1B23C4D: ">",
     0x4D3CB2A1: "<",
+    0xA1B2CD34: ">",
+    0x34CDB2A1: "<",
+}
+
+# The modified-pcap magic as it appears on disk, mapped to its byte order.
+# Kept separate because only these need the extended record-header reader.
+PCAP_MODIFIED_MAGIC_BYTES: dict[bytes, str] = {
+    b"\xa1\xb2\xcd\x34": ">",
+    b"\x34\xcd\xb2\xa1": "<",
 }
 
 
@@ -90,9 +101,10 @@ def output_redaction_enabled() -> bool:
 
 
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # key=value, key: value, and JSON "key": "value"
     re.compile(
         r"(?i)\b(password|passwd|pass|pwd|secret|token|api[_-]?key|apikey|session(?:id)?|authorization)\b"
-        r"(\s*[:=]\s*)([^\s,;&]{3,})"
+        r"([\"']?\s*[:=]\s*[\"']?)([^\s,;&\"']{1,})"
     ),
     re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]{8,}\.[A-Za-z0-9._-]{8,}\b"),
@@ -101,6 +113,10 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.DOTALL,
     ),
 )
+
+
+_QUOTED_SECRET = re.compile(r"(?i)\b(password|passwd|pwd|secret|pin)(\s+)('[^']*'|\"[^\"]*\")")
+_PASS_COMMAND = re.compile(r"\b(PASS)\s+(?!\[REDACTED\])(\S+)")
 
 
 def redact_sensitive_text(value: object) -> str:
@@ -112,11 +128,42 @@ def redact_sensitive_text(value: object) -> str:
     def _kv_repl(match: re.Match[str]) -> str:
         return f"{match.group(1)}{match.group(2)}[REDACTED]"
 
-    text = _SECRET_PATTERNS[0].sub(_kv_repl, text)
+    # Bearer/Basic first: the key=value rule would otherwise consume the word
+    # "Basic" after "Authorization:" and leave the token itself in place.
     text = _SECRET_PATTERNS[1].sub(lambda m: f"{m.group(1)} [REDACTED]", text)
+    text = _SECRET_PATTERNS[0].sub(_kv_repl, text)
+    # Analyzer evidence: password 'x' / password "x" (OT credential findings)
+    text = _QUOTED_SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}'[REDACTED]'", text)
+    # FTP/POP3 command form: PASS secret
+    text = _PASS_COMMAND.sub(lambda m: f"{m.group(1)} [REDACTED]", text)
     text = _SECRET_PATTERNS[2].sub("[REDACTED_JWT]", text)
     text = _SECRET_PATTERNS[3].sub("[REDACTED_PRIVATE_KEY]", text)
     return text
+
+
+_SGR = re.compile(r"\x1b\[[0-9;]*m")
+_UNSAFE_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def terminal_safe(text: str) -> str:
+    """Neutralise terminal control sequences in a rendered report.
+
+    Pcapper's own colours are SGR sequences (ESC[...m) and are kept; every
+    other control byte - OSC title/hyperlink sequences, cursor movement,
+    screen clears, BEL, lone ESC - is shown escaped. Applied to every rendered
+    section, so a renderer that forgets ``display_safe`` on packet text (a
+    variable name, a GOOSE dataset, a file name) cannot drive the terminal.
+    """
+    if not text:
+        return text
+    parts = []
+    last = 0
+    for match in _SGR.finditer(text):
+        parts.append(_UNSAFE_CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text[last:match.start()]))
+        parts.append(match.group())
+        last = match.end()
+    parts.append(_UNSAFE_CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text[last:]))
+    return "".join(parts)
 
 
 def display_safe(value: object, *, preserve_newlines: bool = True) -> str:
@@ -447,11 +494,21 @@ def detect_file_type(path: Path) -> str:
             header = handle.read(4)
     except Exception:
         return "unknown"
-    if header == PCAPNG_MAGIC:
+    return capture_type_from_header(header)
+
+
+def capture_type_from_header(header: bytes) -> str:
+    """``pcapng``, ``pcap`` or ``unknown`` for the first four bytes of a file.
+
+    Detection is by magic number only; the file name is never consulted, so a
+    capture saved without an extension (rotating ``cap_<n>_<timestamp>``
+    files from a capture appliance) is recognised like any other.
+    """
+    if header[:4] == PCAPNG_MAGIC:
         return "pcapng"
-    if len(header) == 4:
-        little = int.from_bytes(header, "little")
-        big = int.from_bytes(header, "big")
+    if len(header) >= 4:
+        little = int.from_bytes(header[:4], "little")
+        big = int.from_bytes(header[:4], "big")
         if little in PCAP_MAGIC or big in PCAP_MAGIC:
             return "pcap"
     return "unknown"
@@ -523,7 +580,12 @@ def format_bytes_as_mb(size_bytes: int) -> str:
 def format_ts(ts: Optional[float]) -> str:
     if ts is None:
         return "-"
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    try:
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        # Garbage pcapng timestamps (year 31969 in the ICSC 2021 FINS/S7
+        # captures) used to abort every renderer that prints a time window.
+        return f"<out-of-range timestamp {ts:.0f}>"
     return dt.isoformat().replace("+00:00", "Z")
 
 
@@ -700,7 +762,9 @@ def extract_packet_endpoints(
 
 
 _ANALYSIS_MEMO: "OrderedDict[tuple, Any]" = OrderedDict()
-_ANALYSIS_MEMO_MAX = 24
+# --threats alone runs ~90 memoized analyzers; a cap of 24 evicted results
+# before --overview/--ot-commands reused them (every OT analyzer ran twice).
+_ANALYSIS_MEMO_MAX = 512
 _MEMO_SCALARS = (str, int, float, bool, Path)
 _MEMO_SKIP_KWARGS = {"show_status", "packets", "meta"}
 
@@ -766,6 +830,30 @@ def call_with_packet_view(
     return func(path, *args, **kwargs)
 
 
+def _analysis_context_key(path: Path) -> tuple:
+    """Process-wide state that changes what an analyzer sees for ``path``:
+    decode-as port overrides and split-capture joining."""
+    try:
+        from .capture_parts import capture_parts
+        from .port_overrides import generation
+
+        return (generation(), len(capture_parts(path)))
+    except Exception:
+        return ()
+
+
+@lru_cache(maxsize=None)
+def _memo_defaults(func) -> dict[str, object]:
+    try:
+        return {
+            name: param.default
+            for name, param in inspect.signature(func).parameters.items()
+            if param.default is not inspect.Parameter.empty
+        }
+    except (TypeError, ValueError):
+        return {}
+
+
 def memoize_analysis(func):
     """Memoize an analyze_* function per capture state and arguments.
 
@@ -808,7 +896,15 @@ def memoize_analysis(func):
             return func(path, *args, **kwargs)
 
         packets = kwargs.get("packets")
+        forced_same = False
         if packets is not None:
+            try:
+                from .pcap_cache import get_forced_packet_view
+
+                forced_same = packets is get_forced_packet_view(Path(path))
+            except Exception:
+                forced_same = False
+        if packets is not None and not forced_same:
             view_key: tuple = ("packets", id(packets), len(packets))
         else:
             try:
@@ -824,11 +920,23 @@ def memoize_analysis(func):
             else:
                 view_key = ("disk",)
 
+        # Arguments passed explicitly at their default value (vt_lookup=False,
+        # port_filter=None ...) must not make a second cache entry.
+        defaults = _memo_defaults(func)
+        kwargs_for_key = {
+            name: value
+            for name, value in kwargs.items()
+            if not (
+                name in defaults
+                and type(value) is type(defaults[name])
+                and value == defaults[name]
+            )
+        }
         try:
             key_args = [_memo_key_value(value) for value in args]
             key_kwargs = [
-                (name, _memo_key_value(kwargs[name]))
-                for name in sorted(kwargs)
+                (name, _memo_key_value(kwargs_for_key[name]))
+                for name in sorted(kwargs_for_key)
                 if name not in _MEMO_SKIP_KWARGS
             ]
         except _MemoUnkeyable:
@@ -839,6 +947,7 @@ def memoize_analysis(func):
             func.__qualname__,
             file_key,
             view_key,
+            _analysis_context_key(Path(path)),
             tuple(key_args),
             tuple(key_kwargs),
         )
@@ -892,6 +1001,16 @@ def hexdump(data: bytes, width: int = 16) -> str:
     return "\n".join(lines)
 
 
+_SECRET_FIELD = re.compile(
+    r"(?i)(^|_)(secret|secrets|password|passwords|passwd|pwd|token|tokens|api_?key|credential_value|password_counts|secret_counts)$"
+)
+
+
+def _is_secret_field(name: str) -> bool:
+    """Export field names whose value is a credential (redacted by name)."""
+    return bool(_SECRET_FIELD.search(name))
+
+
 def to_serializable(value: Any, *, redact: bool = False) -> Any:
     if value is None:
         return None
@@ -906,7 +1025,20 @@ def to_serializable(value: Any, *, redact: bool = False) -> Any:
             return {"_bytes_redacted": len(value)}
         return {"_bytes_b64": base64.b64encode(value).decode("ascii")}
     if isinstance(value, dict):
-        return {str(k): to_serializable(v, redact=redact) for k, v in value.items()}
+        if not redact:
+            return {str(k): to_serializable(v) for k, v in value.items()}
+        out: dict[str, Any] = {}
+        for index, (k, v) in enumerate(value.items()):
+            key = str(k)
+            if _is_secret_field(key) and isinstance(v, (str, bytes)) and v:
+                out[key] = "[REDACTED]"
+                continue
+            if _is_secret_field(key) and isinstance(v, dict):
+                # A mapping *named* for secrets keys by them (password counters).
+                out[key] = {f"[REDACTED#{i}]": to_serializable(cv, redact=True) for i, cv in enumerate(v.values())}
+                continue
+            out[redact_sensitive_text(key)] = to_serializable(v, redact=True)
+        return out
     if isinstance(value, (list, tuple, set)):
         return [to_serializable(item, redact=redact) for item in value]
     if hasattr(value, "to_dict") and callable(getattr(value, "to_dict")):
@@ -914,9 +1046,22 @@ def to_serializable(value: Any, *, redact: bool = False) -> Any:
             return to_serializable(value.to_dict(), redact=redact)
         except Exception:
             pass
-    if is_dataclass(value):
+    if is_dataclass(value) and not isinstance(value, type) and redact:
         try:
-            return to_serializable(asdict(value), redact=redact)
+            return to_serializable(
+                {f.name: getattr(value, f.name) for f in fields(value)}, redact=True
+            )
+        except Exception:
+            pass
+    if is_dataclass(value) and not isinstance(value, type):
+        # Field by field, not dataclasses.asdict(): asdict rebuilds every dict
+        # subclass by passing it (key, value) pairs, and Counter(pairs) counts
+        # the pairs - every Counter field was exported as {"('k', n)": 1}.
+        try:
+            return {
+                f.name: to_serializable(getattr(value, f.name), redact=redact)
+                for f in fields(value)
+            }
         except Exception:
             pass
     if hasattr(value, "__dict__"):
@@ -1189,3 +1334,19 @@ def get_packet_ports(pkt: object) -> tuple[Optional[int], Optional[int], str]:
         except Exception:
             return (None, None, "UDP")
     return (None, None, "OTHER")
+
+
+def x509_names(cert: object) -> tuple[str, str]:
+    """(subject, issuer) as RFC 4514 strings, never raising.
+
+    ``cryptography`` parses names lazily: a certificate that loads fine can
+    still raise on ``cert.subject`` (invalid UTF-8 in a UTF8String CN), which
+    used to abort --tls/--certificates/--threats on one hostile handshake.
+    """
+    names = []
+    for attr in ("subject", "issuer"):
+        try:
+            names.append(getattr(cert, attr).rfc4514_string())
+        except Exception:  # noqa: BLE001 - malformed name in an attacker cert
+            names.append("<unparseable name>")
+    return names[0], names[1]

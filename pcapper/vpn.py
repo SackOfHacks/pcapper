@@ -7,6 +7,7 @@ from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
 from .openvpn import OPENVPN_OPCODES, openvpn_tcp_control_opcodes, openvpn_udp_control_opcodes
+from .utils import x509_names
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
@@ -289,8 +290,7 @@ def _extract_tls_certificates(pkt: object) -> list[dict[str, object]]:
         except Exception:
             continue
 
-        subject = cert.subject.rfc4514_string()
-        issuer = cert.issuer.rfc4514_string()
+        subject, issuer = x509_names(cert)
         san_values: list[str] = []
         try:
             san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)

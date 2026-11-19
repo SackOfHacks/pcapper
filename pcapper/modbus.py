@@ -442,6 +442,37 @@ def _parse_device_id_response(pdu: bytes) -> dict[str, str]:
     return fields
 
 
+def _register_text(regs: Dict[int, int], minimum: int = 6) -> str:
+    """Longest printable run across consecutive register addresses.
+
+    Tries one character per register (value < 0x80) and two per register
+    (big-endian bytes): CTF captures hide flags both ways.
+    """
+    best = ""
+    for mode in ("char", "pair"):
+        run = ""
+        previous = None
+        for address in sorted(regs):
+            value = regs[address]
+            if mode == "char":
+                piece = chr(value) if 32 <= value < 127 else ""
+            else:
+                hi, lo = value >> 8, value & 0xFF
+                piece = "".join(chr(b) for b in (hi, lo) if 32 <= b < 127) if all(
+                    b == 0 or 32 <= b < 127 for b in (hi, lo)
+                ) and (hi or lo) else ""
+            if piece and previous is not None and address == previous + 1 and run:
+                run += piece
+            elif piece:
+                run = piece
+            else:
+                run = ""
+            previous = address
+            if len(run) > len(best):
+                best = run
+    return best if len(best) >= minimum else ""
+
+
 @memoize_analysis
 def analyze_modbus(
     path: Path,
@@ -449,6 +480,9 @@ def analyze_modbus(
     packets: list[object] | None = None,
     meta: PcapMeta | None = None,
 ) -> ModbusAnalysis:
+    from .port_overrides import extra_ports
+
+    modbus_ports = frozenset({MODBUS_TCP_PORT}) | extra_ports("modbus", "tcp", path)
     if TCP is None:
         return ModbusAnalysis(
             path=path,
@@ -542,6 +576,10 @@ def analyze_modbus(
     read_then_write_events: Counter[Tuple[str, str, int]] = Counter()
     # Request/response pairing keyed by TCP connection + transaction id + unit.
     pending_tx: Dict[Tuple[str, int, str, int, int], float] = {}
+    # Read requests awaiting their response: (func, start address, quantity),
+    # so response register values land on real addresses (register map).
+    pending_reads: Dict[Tuple[str, int, str, int, int], Tuple[int, int, int]] = {}
+    read_register_values: Dict[Tuple[str, int, int], Dict[int, int]] = defaultdict(dict)
     rtt_samples: Dict[str, List[int]] = defaultdict(list)
     matched_tx = 0
     phantom_responses: Counter[str] = Counter()
@@ -634,25 +672,15 @@ def analyze_modbus(
             # Header Check (MBAP)
             is_modbus = False
 
-            # 1. Port-based check. 502 on the source side only identifies a
+            # Port-based check. 502 on the source side only identifies a
             # server when the destination is ephemeral; a flow from ephemeral
-            # 502 to 80 is not Modbus.
-            if dport == MODBUS_TCP_PORT or (sport == MODBUS_TCP_PORT and dport >= 1024):
+            # 502 to 80 is not Modbus. Ports beyond 502 come from --decode-as
+            # or from payload-structure auto-detection, which requires most of
+            # a port's packets to frame as MBAP (see pcapper.port_heuristics).
+            # A per-packet "protocol id is 0" guess used to stand in for that
+            # and counted fragments of SSH/OPC UA/MELSOFT traffic as Modbus.
+            if dport in modbus_ports or (sport in modbus_ports and dport >= 1024):
                 is_modbus = True
-
-            # 2. Heuristic check (if not standard port)
-            if not is_modbus and payload and len(payload) >= 8:
-                try:
-                    _, proto_id, length, _ = struct.unpack(">HHHB", payload[:7])
-                    # Modbus Protocol ID is 0
-                    # Length should be remaining bytes approx matching
-                    if proto_id == 0:
-                        # Verify length consistency
-                        remaining = len(payload) - 6
-                        if length >= remaining:
-                            is_modbus = True
-                except (TypeError, ValueError, struct.error):
-                    pass
 
             if not is_modbus:
                 continue
@@ -666,7 +694,7 @@ def analyze_modbus(
             # protocol id MUST be 0. A non-zero value = malformed frame,
             # non-Modbus tunnelled over 502, or a fuzzing/exploit attempt.
             if (
-                (sport == MODBUS_TCP_PORT or dport == MODBUS_TCP_PORT)
+                (sport in modbus_ports or dport in modbus_ports)
                 and payload
                 and len(payload) >= 4
             ):
@@ -681,7 +709,7 @@ def analyze_modbus(
             stream_next_seq: Optional[int] = None
             if (
                 payload
-                and (sport == MODBUS_TCP_PORT or dport == MODBUS_TCP_PORT)
+                and (sport in modbus_ports or dport in modbus_ports)
                 and tcp_seq is not None
             ):
                 src_raw, dst_raw = extract_packet_endpoints(pkt)
@@ -793,7 +821,7 @@ def analyze_modbus(
                     func_counts[func_name] += 1
                     unit_ids[unit_id] += 1
 
-                    is_server_response = sport == MODBUS_TCP_PORT
+                    is_server_response = sport in modbus_ports
 
                     src_raw, dst_raw = extract_packet_endpoints(pkt)
                     if src_raw and dst_raw:
@@ -848,6 +876,8 @@ def analyze_modbus(
                         request_detail, reg_type, addr, qty = (
                             _parse_modbus_request_info(original_func, pdu)
                         )
+                        if original_func in (3, 4) and addr is not None and qty and len(pending_reads) < 200000:
+                            pending_reads[tx_key] = (original_func, int(addr), int(qty))
 
                         # --- Register/coil map: read side (process fingerprint) ---
                         if (
@@ -1103,6 +1133,18 @@ def analyze_modbus(
                         # request on the same connection + trans-id + unit.
                         # RTT per server; unmatched = phantom (injection). ---
                         resp_key = (dst_ip, dport, src_ip, trans_id, unit_id)
+                        read_req = pending_reads.pop(resp_key, None)
+                        if (
+                            read_req is not None
+                            and original_func == read_req[0]
+                            and len(pdu) >= 2
+                        ):
+                            byte_count = pdu[1]
+                            values = pdu[2:2 + byte_count]
+                            regs = read_register_values[(src_ip, unit_id, read_req[0])]
+                            for index in range(min(read_req[2], len(values) // 2, 2000)):
+                                if len(regs) < 65536:
+                                    regs[read_req[1] + index] = int.from_bytes(values[2 * index:2 * index + 2], "big")
                         req_ts = pending_tx.pop(resp_key, None)
                         if req_ts is not None:
                             matched_tx += 1
@@ -1242,8 +1284,8 @@ def analyze_modbus(
 
                 if (
                     not parsed_any
-                    and sport != MODBUS_TCP_PORT
-                    and dport != MODBUS_TCP_PORT
+                    and sport not in modbus_ports
+                    and dport not in modbus_ports
                 ):
                     modbus_packets -= 1
 
@@ -1296,9 +1338,9 @@ def analyze_modbus(
         duration_val = max(0.0, float(end) - float(start))
         bucket = _bucketize_duration(duration_val)
         flow_duration_buckets["all"][bucket] += 1
-        if dport == MODBUS_TCP_PORT:
+        if dport in modbus_ports:
             flow_duration_buckets["requests"][bucket] += 1
-        if sport == MODBUS_TCP_PORT:
+        if sport in modbus_ports:
             flow_duration_buckets["responses"][bucket] += 1
 
     for (func_name, unit_id, src_ip, dst_ip), count in write_events.items():
@@ -1573,6 +1615,24 @@ def analyze_modbus(
                     description=f"Modbus signature observed on {session} ({count} packets).",
                     src="*",
                     dst="*",
+                    ts=0.0,
+                )
+            )
+
+    for (server, unit, func), regs in read_register_values.items():
+        text = _register_text(regs)
+        if text and len(anomalies) < max_anomalies:
+            kind = "holding" if func == 3 else "input"
+            anomalies.append(
+                ModbusAnomaly(
+                    severity="MEDIUM",
+                    title=f"Modbus registers decode as text: {text[:64]!r}",
+                    description=(
+                        f"{server} unit {unit} {kind} registers, read in address order, "
+                        f"spell {text!r} (data hidden in process values)."
+                    ),
+                    src="*",
+                    dst=server,
                     ts=0.0,
                 )
             )

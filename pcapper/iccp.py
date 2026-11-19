@@ -93,6 +93,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_iccp(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="iccp",
         path=path,
         protocol_name="ICCP/TASE.2",
         signature_matcher=_looks_iccp,

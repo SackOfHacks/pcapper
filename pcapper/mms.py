@@ -402,6 +402,7 @@ def _detect_mms_anomalies(
 def analyze_mms(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     reassembler = TPKTTCPReassembler("MMS")
     analysis = analyze_port_protocol(
+        port_key="mms",
         path=path,
         protocol_name="IEC 61850 MMS",
         tcp_ports={MMS_PORT},

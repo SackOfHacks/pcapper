@@ -115,6 +115,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_hart(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="hart",
         path=path,
         protocol_name="HART-IP",
         tcp_ports={HART_PORT},

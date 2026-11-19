@@ -463,6 +463,7 @@ def _detect_anomalies(
 def analyze_codesys(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     reassembler = _CodesysTCPReassembler()
     analysis = analyze_port_protocol(
+        port_key="codesys",
         path=path,
         protocol_name="CODESYS",
         tcp_ports=CODESYS_TCP_PORTS,

@@ -15,6 +15,7 @@ from ..coloring import (
 )
 from ..creds import CredentialSummary
 
+from ..utils import output_redaction_enabled
 from ._common import (
     SECTION_BAR,
     SUBSECTION_BAR,
@@ -42,7 +43,7 @@ def render_creds_summary(summary: CredentialSummary) -> str:
     def _display_secret(value: str | None) -> str:
         if value is None:
             return "-"
-        return value
+        return "[REDACTED]" if output_redaction_enabled() else value
 
     def _format_packets(packet_values: set[int]) -> str:
         if not packet_values:

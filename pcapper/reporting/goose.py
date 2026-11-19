@@ -32,17 +32,63 @@ def render_goose_summary(summary: GooseSummary, verbose: bool = False) -> str:
     lines.append(_format_kv("GOOSE Packets", str(summary.goose_packets)))
     # GOOSE is Layer-2 publisher -> multicast group (publish/subscribe), so the
     # source MAC IS the publisher direction; there is no request/response.
-    lines.append(_format_kv("Top Publishers (src MAC)", _format_counter(summary.src_macs, 5)))
-    lines.append(_format_kv("Top Subscriber Groups (dst MAC)", _format_counter(summary.dst_macs, 5)))
+    routed = bool(getattr(summary, "rgoose_packets", 0))
+    lines.append(
+        _format_kv(
+            "Top Publishers (src MAC/IP)" if routed else "Top Publishers (src MAC)",
+            _format_counter(summary.src_macs, 5),
+        )
+    )
+    lines.append(
+        _format_kv(
+            "Top Subscriber Groups (dst MAC/IP)" if routed else "Top Subscriber Groups (dst MAC)",
+            _format_counter(summary.dst_macs, 5),
+        )
+    )
     lines.append(_format_kv("APPIDs", _format_counter(summary.app_ids, 5)))
+    rgoose = int(getattr(summary, "rgoose_packets", 0) or 0)
+    if rgoose:
+        # Routable GOOSE: the publisher is an IP, the subscribers a (multicast)
+        # group, and authentication lives in the session header.
+        lines.append(_format_kv("R-GOOSE Session PDUs", str(rgoose)))
+        lines.append(_format_kv("R-GOOSE Publishers (IP)", _format_counter(summary.rgoose_publishers, 5)))
+        lines.append(_format_kv("R-GOOSE Groups (dst IP)", _format_counter(summary.rgoose_groups, 5)))
+        lines.append(
+            _format_kv(
+                "R-GOOSE UDP Ports",
+                ", ".join(f"{port}({count})" for port, count in summary.rgoose_ports.most_common(5)),
+            )
+        )
+        lines.append(
+            _format_kv(
+                "R-GOOSE Security",
+                f"signed {summary.rgoose_signed}, unsigned {summary.rgoose_unsigned}, "
+                f"encrypted {summary.rgoose_encrypted}; key IDs "
+                + ", ".join(str(k) for k in sorted(summary.rgoose_key_ids)[:6]),
+            )
+        )
+        if getattr(summary, "rsv_packets", 0):
+            lines.append(_format_kv("R-SV APDUs", str(summary.rsv_packets)))
     if getattr(summary, "datasets", None):
         lines.append(_format_kv("Datasets", _format_counter(summary.datasets, 5)))
     if getattr(summary, "gocb_refs", None):
         lines.append(_format_kv("GOCB Refs", _format_counter(summary.gocb_refs, 5)))
     if getattr(summary, "st_nums", None):
-        lines.append(_format_kv("stNum", _format_counter(summary.st_nums, 5)))
+        values = [v for v in summary.st_nums if isinstance(v, int)]
+        lines.append(
+            _format_kv(
+                "stNum",
+                f"{len(values)} distinct, {min(values)}..{max(values)}" if values else "-",
+            )
+        )
     if getattr(summary, "sq_nums", None):
-        lines.append(_format_kv("sqNum", _format_counter(summary.sq_nums, 5)))
+        values = [v for v in summary.sq_nums if isinstance(v, int)]
+        lines.append(
+            _format_kv(
+                "sqNum",
+                f"{len(values)} distinct, {min(values)}..{max(values)}" if values else "-",
+            )
+        )
     if getattr(summary, "conf_revs", None):
         lines.append(_format_kv("confRev", _format_counter(summary.conf_revs, 5)))
     if getattr(summary, "num_entries", None):

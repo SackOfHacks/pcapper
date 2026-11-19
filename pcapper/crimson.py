@@ -15,6 +15,7 @@ CRIMSON_PORT = 789
 @memoize_analysis
 def analyze_crimson(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="crimson",
         path=path,
         protocol_name="Crimson V3",
         tcp_ports={CRIMSON_PORT},

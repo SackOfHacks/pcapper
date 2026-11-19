@@ -167,6 +167,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_modicon(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="modicon",
         path=path,
         protocol_name="Modicon",
         tcp_ports={MODICON_PORT},

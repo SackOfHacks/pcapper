@@ -20,7 +20,7 @@ __all__ = ["__version__"]
 # the banner still said 2.1.0, because the banner reads this attribute and the
 # wheel metadata read pyproject. tests/test_version.py fails if a second copy
 # is ever reintroduced.
-__version__ = "2.8.0"
+__version__ = "2.9.0"
 
 
 # --- Scapy/cryptography deprecation noise (always on) ------------------------
@@ -87,7 +87,10 @@ def _restore_stderr_if_suppressed() -> None:
 
 def _stable_key(value: Any) -> tuple[int, Any]:
     if isinstance(value, (int, float)):
-        return (0, float(value))
+        try:
+            return (0, float(value))
+        except OverflowError:  # an attacker-sized int as a Counter key
+            return (0, float("inf") if value > 0 else float("-inf"))
     return (1, str(value))
 
 

@@ -60,7 +60,12 @@ from .codesys import analyze_codesys
 from .opc import analyze_opc
 from .opc_classic import analyze_opc_classic
 from .ot_risk import compute_ot_risk_posture, dedupe_findings
-from .pcap_cache import PcapMeta, iter_packets
+from .capture_parts import capture_parts
+from .ot_extra import OT_EXTRA
+from .port_heuristics import auto_decode
+from .port_overrides import is_standard as is_standard_port
+from .port_overrides import overrides as port_overrides_for
+from .pcap_cache import PcapMeta, capture_hashes, iter_packets
 from .pccc import analyze_pccc
 from .pcworx import analyze_pcworx
 from .powershell import analyze_powershell
@@ -963,7 +968,75 @@ SURICATA_EVE_MAX_LINE_BYTES = env_int(
 )
 
 
+def _merge_suricata_stats(base: dict, extra: dict) -> dict:
+    """Sum the numeric leaves of two Suricata stats dicts (lists concatenate)."""
+    merged = dict(base)
+    for key, value in extra.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_suricata_stats(current, value)
+        elif isinstance(current, bool) or isinstance(value, bool):
+            merged[key] = bool(current) or bool(value)
+        elif isinstance(current, (int, float)) and isinstance(value, (int, float)):
+            merged[key] = current + value
+        elif isinstance(current, list) and isinstance(value, list):
+            merged[key] = current + value
+        elif key not in merged:
+            merged[key] = value
+    return merged
+
+
 def _run_suricata_scan(
+    path: Path,
+    rules_path: Path | None = None,
+    config_path: Path | None = None,
+    eve_types: set[str] | None = None,
+    suppress_sid: set[str] | None = None,
+    only_sid: set[str] | None = None,
+):
+    """Suricata over a capture; a joined split capture is scanned part by part.
+
+    Suricata reads one pcap per run, so each part gets its own run and the
+    alerts, checks and stats are combined. Flows that cross a part boundary
+    are seen by Suricata as two flows (one per part).
+    """
+    parts = capture_parts(path)
+    if len(parts) == 1:
+        return _run_suricata_scan_file(
+            path, rules_path, config_path, eve_types, suppress_sid, only_sid
+        )
+    detections: list[dict[str, object]] = []
+    errors: list[str] = []
+    metadata: dict[str, object] = {}
+    checks: dict[str, list[str]] = {}
+    stats: dict[str, object] = {}
+    for index, part in enumerate(parts):
+        part_detections, part_errors, part_meta, part_checks, part_stats = (
+            _run_suricata_scan_file(
+                part, rules_path, config_path, eve_types, suppress_sid, only_sid
+            )
+        )
+        detections.extend(part_detections)
+        errors.extend(f"part {index:03d}: {err}" for err in part_errors)
+        if not metadata:
+            metadata = dict(part_meta)
+        else:
+            metadata["scan_seconds"] = round(
+                float(metadata.get("scan_seconds", 0) or 0)
+                + float(part_meta.get("scan_seconds", 0) or 0),
+                3,
+            )
+        for key, values in (part_checks or {}).items():
+            checks.setdefault(key, []).extend(values)
+        stats = _merge_suricata_stats(stats, part_stats or {})
+    metadata["parts"] = len(parts)
+    # Same digest the base summary reports for a joined capture: the parts'
+    # bytes in order.
+    metadata["pcap_sha256"] = capture_hashes(path)[0] or "-"
+    return detections, errors, metadata, checks, stats
+
+
+def _run_suricata_scan_file(
     path: Path,
     rules_path: Path | None = None,
     config_path: Path | None = None,
@@ -2649,6 +2722,65 @@ def _dns_question_names(dns_layer: object) -> list[tuple[str, int]]:
     return dns_questions(dns_layer)
 
 
+# analyzer step -> key of ``ot_summaries`` in analyze_threats
+_STEP_THREAT_LABELS = {
+    "modbus": "Modbus", "dnp3": "DNP3", "iec104": "IEC-104", "bacnet": "BACnet",
+    "enip": "EtherNet/IP", "profinet": "Profinet", "s7": "S7", "opc": "OPC UA",
+    "fins": "FINS", "melsec": "MELSEC", "cip": "CIP", "codesys": "CODESYS",
+    "niagara": "Niagara", "mms": "MMS", "srtp": "SRTP", "hart": "HART-IP",
+    "iccp": "ICCP", "mqtt": "MQTT", "coap": "CoAP", "knx": "KNXnet/IP",
+    "xgt": "XGT FEnet", "rocplus": "ROC Plus", "ads": "ADS/AMS",
+    "dlms": "DLMS/COSEM", "c1222": "C12.22", "lontalk": "LonTalk", "powerlink": "POWERLINK",
+}
+
+
+def _nonstandard_port_detections(
+    path: Path, ot_summaries: dict[str, object] | None = None
+) -> list[dict[str, object]]:
+    """An OT protocol proven (or declared) on a port it does not normally use.
+
+    Port-forwarding/NAT to a controller, a honeypot, a vendor gateway, or an
+    attempt to slip control traffic past port-based monitoring: either way
+    the analyst needs to know the protocol is there and where.
+    """
+    items: list[dict[str, object]] = []
+    for override in port_overrides_for(path):
+        if is_standard_port(override):
+            continue
+        auto = override.origin.startswith("auto")
+        summary = (ot_summaries or {}).get(_STEP_THREAT_LABELS.get(override.step, ""))
+        servers = getattr(summary, "server_ips", None) or getattr(summary, "dst_ips", None)
+        clients = getattr(summary, "client_ips", None) or getattr(summary, "src_ips", None)
+        evidence = [f"{override.transport}/{override.port}: {override.origin}"]
+        if servers:
+            evidence.append(
+                "server(s): " + ", ".join(f"{ip} ({n})" for ip, n in Counter(servers).most_common(4))
+            )
+        items.append(
+            {
+                "evidence": evidence,
+                "top_servers": Counter(servers).most_common(5) if servers else [],
+                "top_clients": Counter(clients).most_common(5) if clients else [],
+                "severity": "warning" if auto else "info",
+                "summary": (
+                    f"OT protocol on non-standard port: {override.step} on "
+                    f"{override.transport}/{override.port}"
+                ),
+                "details": (
+                    (
+                        "Payload structure proves the protocol on a port it does not "
+                        f"normally use ({override.origin.removeprefix('auto: ')}). "
+                        "Check for port-forwarding/NAT to a controller, a honeypot or "
+                        "monitoring evasion (ATT&CK T1571 Non-Standard Port)."
+                    )
+                    if auto
+                    else f"Analysed as {override.step} because of --decode-as."
+                ),
+            }
+        )
+    return items
+
+
 @memoize_analysis
 def analyze_threats(
     path: Path,
@@ -2680,6 +2812,13 @@ def analyze_threats(
         return call_with_packet_view(
             func, path, *args, packets=packets, meta=meta, **kwargs
         )
+
+    # OT protocols on non-standard ports must be registered before the OT
+    # analyzers below run (cached per capture; off with --no-auto-decode).
+    try:
+        auto_decode(path, packets=packets, meta=meta)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"auto decode-as: {type(exc).__name__}: {exc}")
 
     # Aggregate detections from specialized modules
     icmp_summary = _analyze(analyze_icmp, show_status=show_status)
@@ -2768,6 +2907,10 @@ def analyze_threats(
         "ICCP": _analyze(analyze_iccp, show_status=show_status),
         "BSAP": _analyze(analyze_bsap, show_status=show_status),
         "Genisys": _analyze(analyze_genisys, show_status=show_status),
+        **{
+            _STEP_THREAT_LABELS.get(spec.step, spec.label): _analyze(spec.analyzer(), show_status=show_status)
+            for spec in OT_EXTRA
+        },
     }
     ot_protocol_counts: Counter[str] = Counter()
     ot_enip_enum_sources: Counter[str] = Counter()
@@ -2869,6 +3012,9 @@ def analyze_threats(
     _append_detection_items(detections, "IEC-101/103", iec101_103_summary.detections)
     _append_detection_items(detections, "LLDP/DCP", lldp_summary.detections)
     _append_detection_items(detections, "OPC Classic", opc_classic_summary.detections)
+    _append_detection_items(
+        detections, "Decode-as", _nonstandard_port_detections(path, ot_summaries)
+    )
     _append_detection_items(detections, "Obfuscation", obfuscation_summary.detections)
     _append_detection_items(detections, "Carving", carving_summary.detections)
     _append_detection_items(detections, "ControlLoop", control_loop_summary.detections)

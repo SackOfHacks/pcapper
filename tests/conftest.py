@@ -44,6 +44,23 @@ def deterministic_output(monkeypatch: pytest.MonkeyPatch) -> None:
     reporting.set_verbose_output(False)
 
 
+@pytest.fixture(autouse=True)
+def isolated_capture_state():
+    """Reset the process-wide capture registries around every test.
+
+    ``--decode-as`` overrides, auto-detected ports and joined split captures
+    live in module-level registries (the CLI sets them once per run); a test
+    that registers one must not change what a later test's analyzers see.
+    """
+    from pcapper import capture_parts, port_heuristics, port_overrides
+
+    yield
+    port_overrides.clear()
+    port_heuristics.clear_detections()
+    port_heuristics.set_auto_decode_enabled(True)
+    capture_parts.clear_capture_parts()
+
+
 @pytest.fixture(scope="session")
 def data_dir() -> Path:
     if not DATA_DIR.is_dir():

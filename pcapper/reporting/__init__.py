@@ -301,6 +301,9 @@ from .obfuscation import (
 from .opc import (
     render_opc_summary,
 )
+from .ot_extra import (
+    render_ot_extra_summary,
+)
 from .opc_classic import (
     render_opc_classic_summary,
 )

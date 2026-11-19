@@ -20,6 +20,7 @@ BSAP_PORT = 1234
 @memoize_analysis
 def analyze_bsap(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="bsap",
         path=path,
         protocol_name="BSAP-IP",
         udp_ports={BSAP_PORT},

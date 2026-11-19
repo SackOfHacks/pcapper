@@ -10,6 +10,7 @@ from ..coloring import (
     header,
     muted,
 )
+from ..capture_parts import capture_parts
 from ..models import PcapSummary
 from ..utils import (
     format_bytes_as_mb,
@@ -82,6 +83,15 @@ def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
     lines.append(SECTION_BAR)
 
     lines.append(_format_kv("Path", str(summary.path)))
+    parts = capture_parts(summary.path)
+    if len(parts) > 1:
+        lines.append(
+            _format_kv(
+                "Parts",
+                f"{len(parts)} split-capture parts joined as one "
+                f"({parts[0].name} .. {parts[-1].name})",
+            )
+        )
     lines.append(_format_kv("Type", summary.file_type))
     lines.append(_format_kv("Size", format_bytes_as_mb(summary.size_bytes)))
     lines.append(_format_kv("Packets", str(summary.packet_count)))
@@ -109,8 +119,9 @@ def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
             "Encapsulation", ", ".join(encapsulations) if encapsulations else "-"
         )
     )
-    lines.append(_format_kv("Hash (SHA256)", summary.hash_sha256 or "-"))
-    lines.append(_format_kv("Hash (SHA1)", summary.hash_sha1 or "-"))
+    hash_note = " (all parts, in order)" if len(parts) > 1 else ""
+    lines.append(_format_kv("Hash (SHA256)", (summary.hash_sha256 or "-") + hash_note))
+    lines.append(_format_kv("Hash (SHA1)", (summary.hash_sha1 or "-") + hash_note))
 
     def _capture_value(value: object | None) -> str:
         text = str(value or "").strip()

@@ -16,6 +16,7 @@ SRTP_UDP_PORTS = {18246}
 @memoize_analysis
 def analyze_srtp(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="srtp",
         path=path,
         protocol_name="GE SRTP",
         tcp_ports=SRTP_TCP_PORTS,

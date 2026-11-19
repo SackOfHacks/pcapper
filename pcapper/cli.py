@@ -53,6 +53,11 @@ from .decode import analyze_decode
 from .decryption import DecryptConfig, DecryptSummary, decrypt_ssh, decrypt_tls
 from .df1 import analyze_df1
 from .dhcp import analyze_dhcp, merge_dhcp_summaries
+from .capture_parts import capture_size, group_split_captures
+from .ot_extra import BY_STEP as OT_EXTRA_BY_STEP, OT_EXTRA
+from .port_heuristics import auto_decode, set_auto_decode_enabled
+from .reporting.ot_extra import render_ot_extra_summary
+from .port_overrides import DecodeAsError, register_spec as register_decode_as
 from .discovery import find_pcaps, is_supported_pcap
 from .dnp3 import analyze_dnp3
 from .dns import analyze_dns
@@ -342,6 +347,12 @@ def _load_plugins_once() -> tuple[list[PluginSpec], list[str]]:
 
 
 def _builtin_flag_map() -> dict[str, str]:
+    flags = _core_flag_map()
+    flags.update({spec.flag: spec.step for spec in OT_EXTRA})
+    return flags
+
+
+def _core_flag_map() -> dict[str, str]:
     return {
         "--search": "search",
         "--decode": "decode",
@@ -502,6 +513,20 @@ def _ordered_steps(
             ordered.append(step)
             seen.add(step)
     return ordered
+
+
+# Steps that read OT protocols by port, directly or by fanning out: worth one
+# bounded payload-structure pass to find OT protocols on non-standard ports.
+_AUTO_DECODE_STEPS = {
+    "overview", "threats", "mitre", "ot_commands", "control_loop", "timeline",
+    "compromised", "hostdetails", "services", "protocols", "ctf", "safety",
+    "modbus", "dnp3", "iec104", "bacnet", "enip", "profinet", "s7", "opc",
+    "ethercat", "fins", "crimson", "pcworx", "melsec", "cip", "codesys",
+    "niagara", "mms", "srtp", "df1", "pccc", "csp", "modicon", "yokogawa",
+    "honeywell", "mqtt", "coap", "hart", "prconos", "iccp", "goose", "sv",
+    "synchrophasor", "bsap", "genisys", "opc_classic", "iec101_103",
+    "knx", "xgt", "rocplus", "ads", "dlms", "c1222", "lontalk", "powerlink",
+}
 
 
 _FILTER_COMPATIBLE_STEPS = {
@@ -1409,6 +1434,42 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Recursively search for pcaps when target is a directory.",
     )
     general.add_argument(
+        "--decode-as",
+        dest="decode_as",
+        action="append",
+        metavar="SPEC",
+        help=(
+            "Analyse a protocol on a non-standard port, like tshark -d. "
+            "SPEC is tcp/PORT=PROTO (e.g. tcp/10203=s7), tcp.port==PORT,PROTO "
+            "or PORT=PROTO for both transports. PROTO is a pcapper protocol "
+            "flag name or tshark dissector name (s7, tpkt, modbus, dnp3, iec104, "
+            "enip, mms, opcua, knx, xgt, roc, ads ...). Repeatable."
+        ),
+    )
+    general.add_argument(
+        "--no-auto-decode",
+        dest="no_auto_decode",
+        action="store_true",
+        help=(
+            "Do not auto-detect OT protocols on non-standard ports. By default "
+            "the first 50,000 packets are checked: a port is analysed as a "
+            "protocol only when >= 60%% of its payload packets frame exactly as "
+            "that protocol (its own length fields) and >= 3 carry protocol "
+            "content. Each detection is printed and scoped to its capture."
+        ),
+    )
+    general.add_argument(
+        "--no-join-parts",
+        dest="no_join_parts",
+        action="store_true",
+        help=(
+            "Analyse split-capture parts (X.pcap.part000.pcap, X.pcap.part001.pcap, ...) "
+            "one by one. By default sibling parts found together are joined and analysed "
+            "as one capture: one timeline, one conversation table, nothing cut at a part "
+            "boundary. A single part named on its own is always analysed alone."
+        ),
+    )
+    general.add_argument(
         "-summarize",
         action="store_true",
         help="Summarize supported analysis across all pcaps (e.g., --modbus, --dnp3). Use single-dash -summarize.",
@@ -1424,7 +1485,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         "--vt",
         dest="vt",
         action="store_true",
-        help="Enable VirusTotal lookups/enrichment for --dns, --http, --tls/--tlsm, --threats, --webrequests, --timeline, and --compromised (requires VT_API_KEY).",
+        help="Enable VirusTotal lookups/enrichment for --dns, --http, --tls/--tlsm, --threats, --webrequests, --timeline, and --compromised (requires VT_API_KEY). Sends observed domains, IPs and full URLs - query strings included, which can carry credentials - to VirusTotal.",
     )
     general.add_argument(
         "--ip-geo",
@@ -1990,6 +2051,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ),
         ("--iec101-103", "Include IEC 60870-5-101/103 heuristic analysis."),
         ("--yokogawa", "Include Yokogawa Vnet/IP analysis."),
+        *((spec.flag, spec.help) for spec in OT_EXTRA),
     ]
     ics_entries: list[tuple[str, dict[str, object]]] = [
         (flag, {"action": "store_true", "help": help_text})
@@ -2354,6 +2416,7 @@ def _analyze_paths(
     decrypt_config: DecryptConfig | None = None,
     correlate_requested: bool = False,
     correlate_min: int = 2,
+    auto_decode_enabled: bool = True,
 ) -> int:
     if not paths:
         return 1
@@ -2644,10 +2707,7 @@ def _analyze_paths(
             max_file_override = None
             enabled, max_cache, _max_file = get_cache_config()
             if enabled and max_cache > 0 and use_packets:
-                try:
-                    size_bytes = path.stat().st_size
-                except Exception:
-                    size_bytes = 0
+                size_bytes = capture_size(path)
                 if size_bytes and size_bytes <= max_cache:
                     max_file_override = max_cache
             packets, meta = load_packets_if_allowed(
@@ -2672,6 +2732,15 @@ def _analyze_paths(
             # helpers), so chained steps never re-read the pcap from disk.
             set_forced_packet_view(path, packets, meta)
             forced_view_for_path = True
+
+        if auto_decode_enabled and any(
+            step in _AUTO_DECODE_STEPS for step in ordered_steps
+        ):
+            for detection in auto_decode(path, packets=packets, meta=meta):
+                _print_error(
+                    f"Auto decode-as ({path.name}): {detection.describe()}. "
+                    f"Pass --no-auto-decode to disable, or --decode-as to force."
+                )
 
         if render_base_summary:
             summary = analyze_pcap(
@@ -3423,7 +3492,7 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("opc_classic", []).append(opc_summary)
                 else:
-                    print(render_opc_classic_summary(opc_summary))
+                    print(render_opc_classic_summary(opc_summary, verbose=verbose))
                 export_summaries["opc_classic"] = opc_summary
             elif step == "hostnames" and show_hostnames:
                 hostname_summary = analyze_hostname(
@@ -3652,6 +3721,14 @@ def _analyze_paths(
                 else:
                     print(render_ethercat_summary(summary))
                 export_summaries["ethercat"] = summary
+            elif step in OT_EXTRA_BY_STEP:
+                spec = OT_EXTRA_BY_STEP[step]
+                summary = spec.analyzer()(path, show_status=step_status)
+                if summarize_rollups:
+                    rollups.setdefault(step, []).append(summary)
+                else:
+                    print(render_ot_extra_summary(spec, summary))
+                export_summaries[step] = summary
             elif step == "fins" and show_fins:
                 summary = analyze_fins(path, show_status=step_status)
                 if summarize_rollups:
@@ -4436,6 +4513,7 @@ def _analyze_paths(
             "pcapmeta": "PCAP METADATA",
             "ot_commands": "OT COMMANDS",
             "iec101_103": "IEC 101/103 ANALYSIS",
+            **{spec.step: spec.title for spec in OT_EXTRA},
         }
         for spec in plugin_lookup.values():
             title_map.setdefault(spec.name, spec.title or spec.name.upper())
@@ -5083,13 +5161,11 @@ def main() -> int:
             return 2
 
         if target.is_file():
-            if not is_supported_pcap(target):
-                _print_error("Target is not a supported pcap/pcapng file.")
-                return 2
+            # Judged by the file header, never the extension: a capture saved
+            # without one (rotating cap_<n>_<timestamp> files) is accepted, and
+            # a file with a .pcap name but no capture magic is refused instead
+            # of being read as an empty capture and reported as zero packets.
             if detect_file_type(target) == "unknown":
-                # A file with the right extension but no capture magic used
-                # to be read as an empty capture and reported as zero packets
-                # with no error — a compressed or renamed file passed silently.
                 _print_error(
                     f"Target is not a pcap/pcapng capture (unrecognised file "
                     f"header): {raw_target}"
@@ -5101,7 +5177,15 @@ def main() -> int:
                 paths.append(resolved)
             continue
 
-        discovered = find_pcaps(target, recursive=args.recursive)
+        rejected: list[Path] = []
+        discovered = find_pcaps(target, recursive=args.recursive, rejected=rejected)
+        if rejected:
+            shown = ", ".join(str(item) for item in rejected[:3])
+            more = f" (+{len(rejected) - 3} more)" if len(rejected) > 3 else ""
+            _print_error(
+                f"Skipped {len(rejected)} file(s) named like captures but without "
+                f"a pcap/pcapng header: {shown}{more}"
+            )
         for path in discovered:
             if path not in seen_paths:
                 seen_paths.add(path)
@@ -5110,6 +5194,28 @@ def main() -> int:
     if not paths:
         _print_error("No pcap/pcapng files found.")
         return 2
+
+    set_auto_decode_enabled(not getattr(args, "no_auto_decode", False))
+    for spec in getattr(args, "decode_as", None) or []:
+        try:
+            for override in register_decode_as(spec):
+                _print_error(f"Decode-as: {override.describe()}")
+        except DecodeAsError as exc:
+            _print_error(str(exc))
+            return 2
+
+    if not getattr(args, "no_join_parts", False):
+        paths, part_groups = group_split_captures(paths)
+        for group in part_groups:
+            note = (
+                f"Joined {len(group.parts)} split-capture parts as one capture: "
+                f"{group.base} ({group.parts[0].name} .. {group.parts[-1].name})"
+            )
+            if group.missing:
+                shown = ", ".join(f"{index:03d}" for index in group.missing[:8])
+                more = " ..." if len(group.missing) > 8 else ""
+                note += f"; MISSING part(s) {shown}{more} - results have a gap"
+            _print_error(note)
 
     export_json_path = (
         Path(args.json).expanduser() if getattr(args, "json", None) else None
@@ -5350,6 +5456,7 @@ def main() -> int:
             decrypt_config=decrypt_config,
             correlate_requested=getattr(args, "correlate", False),
             correlate_min=getattr(args, "correlate_min", 2),
+            auto_decode_enabled=not getattr(args, "no_auto_decode", False),
         )
 
     def _write_case_metadata(end_time: datetime) -> None:

@@ -233,6 +233,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_coap(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="coap",
         path=path,
         protocol_name="CoAP",
         udp_ports=COAP_PORTS,

@@ -23,6 +23,7 @@ from .tls_fingerprints import (
     _ja4_from_client_hello,
     _ja4s_from_server_hello,
 )
+from .utils import x509_names
 from .utils import (
     counter_inc,
     allow_plaintext_egress,
@@ -886,8 +887,7 @@ def _tls_cert_risks_from_payload(cert_payload: object) -> list[dict[str, object]
         except Exception:
             continue
 
-        subject = cert.subject.rfc4514_string()
-        issuer = cert.issuer.rfc4514_string()
+        subject, issuer = x509_names(cert)
         if subject == issuer:
             risks.append({"type": "self_signed", "details": subject})
 

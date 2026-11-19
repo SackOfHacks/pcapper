@@ -26,8 +26,9 @@ except Exception:  # pragma: no cover
     IP = None  # type: ignore
     IPv6 = None  # type: ignore
 
+from .capture_parts import capture_parts, capture_size
 from .progress import build_busy_statusbar, build_statusbar
-from .utils import PCAP_MAGIC, detect_file_type
+from .utils import PCAP_MAGIC, PCAP_MODIFIED_MAGIC_BYTES, detect_file_type
 
 _PACKET_CACHE: "OrderedDict[Path, tuple[list[object], 'PcapMeta']]" = OrderedDict()
 _CACHE_BYTES = 0
@@ -68,7 +69,7 @@ def _cached_packets(path: Path) -> tuple[list[object], PcapMeta] | None:
     try:
         stat = key.stat()
         valid = (
-            cached[1].size_bytes == stat.st_size
+            cached[1].size_bytes == capture_size(key)
             and cached[1].modified_ns == stat.st_mtime_ns
         )
     except OSError:
@@ -93,6 +94,7 @@ def _read_pcap_header(path: Path) -> tuple[object | None, object | None]:
             b"\xd4\xc3\xb2\xa1": "<",
             b"\xa1\xb2\x3c\x4d": ">",
             b"\x4d\x3c\xb2\xa1": "<",
+            **PCAP_MODIFIED_MAGIC_BYTES,
         }
         endian = endian_by_magic.get(magic_bytes)
         if endian is None:
@@ -422,6 +424,212 @@ def is_scapy_available() -> bool:
     return PcapReader is not None and PcapNgReader is not None
 
 
+def _modified_pcap_record_size(path: Path, endian: str, snaplen: int) -> int:
+    """24 or 28: the record-header size under which a modified-pcap file's
+    first records are self-consistent (caplen within snaplen and wirelen,
+    microseconds below one second, each record ending where the next begins).
+    """
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(1 << 16)
+    except OSError:
+        return 24
+    cap_limit = snaplen if 0 < snaplen <= 262144 else 262144
+
+    def _walks(size: int) -> int:
+        offset = 24
+        records = 0
+        while offset + size <= len(data) and records < 32:
+            _sec, usec, caplen, wirelen = struct.unpack(
+                endian + "IIII", data[offset : offset + 16]
+            )
+            if usec >= 1_000_000 or caplen > cap_limit or caplen > max(wirelen, 1):
+                return -1
+            offset += size + caplen
+            records += 1
+        # A clean walk ends exactly at the end of what was read, or runs past
+        # it only because the buffer was cut short.
+        if offset == len(data) or len(data) == (1 << 16):
+            return records
+        return -1
+
+    best_size, best_records = 24, -1
+    for size in (24, 28):
+        records = _walks(size)
+        if records > best_records:
+            best_size, best_records = size, records
+    return best_size
+
+
+if PcapReader is not None:
+
+    class ModifiedPcapReader(PcapReader):  # type: ignore[misc, valid-type]
+        """Reader for the Kuznetzov "modified pcap" format (magic a1b2cd34).
+
+        Same global header as classic pcap, but every record header is 24
+        bytes: the classic ts_sec/ts_usec/caplen/len followed by ifindex (4),
+        protocol (2), packet type (1) and one pad byte. scapy rejects the
+        magic outright, so the format used to be unreadable; tshark and
+        libpcap both read it.
+        """
+
+        _RECORD_HEADER = 24
+
+        def __init__(self, filename, fdesc=None, magic=None):  # type: ignore[no-untyped-def]
+            endian = PCAP_MODIFIED_MAGIC_BYTES.get(bytes(magic or b""))
+            if endian is None:
+                from scapy.error import Scapy_Exception  # type: ignore
+
+                raise Scapy_Exception("Not a modified-pcap capture file")
+            # Hand scapy the classic magic of the same byte order: everything
+            # it parses from the global header is identical.
+            classic = b"\xa1\xb2\xc3\xd4" if endian == ">" else b"\xd4\xc3\xb2\xa1"
+            super().__init__(filename, fdesc, classic)
+            # The same magic is shared by two record layouts: 24-byte headers
+            # (Kuznetzov ss991029, the common one) and 28-byte headers (SuSE
+            # 6.3's ss990915, two extra CPU bytes + padding). Pick the layout
+            # under which the first records walk cleanly, as Wireshark does.
+            self._RECORD_HEADER = _modified_pcap_record_size(
+                Path(str(filename)), self.endian, int(self.snaplen or 0)
+            )
+
+        def read_packet(self, size=None, **kwargs):  # type: ignore[no-untyped-def, override]
+            from decimal import Decimal
+
+            from scapy.config import conf  # type: ignore
+            from scapy.utils import EDecimal  # type: ignore
+
+            try:
+                hdr = self.f.read(self._RECORD_HEADER)
+            except (OSError, OverflowError) as exc:
+                raise EOFError from exc
+            if len(hdr) < self._RECORD_HEADER:
+                raise EOFError
+            sec, usec, caplen, wirelen = struct.unpack(self.endian + "IIII", hdr[:16])
+            # Bound the read like scapy does: a corrupt caplen must not make
+            # one record swallow gigabytes.
+            limit = 262144
+            data = self.f.read(min(caplen, limit))
+            remaining = caplen - len(data)
+            while remaining > 0:
+                skipped = self.f.read(min(remaining, limit))
+                if not skipped:
+                    break
+                remaining -= len(skipped)
+            if size:
+                data = data[:size]
+            try:
+                pkt = self.LLcls(data, **kwargs)
+            except Exception:
+                pkt = conf.raw_layer(data)
+            pkt.time = EDecimal(sec + Decimal(10) ** Decimal(-6) * usec)
+            pkt.wirelen = wirelen
+            return pkt
+
+else:  # pragma: no cover - scapy missing
+    ModifiedPcapReader = None  # type: ignore[assignment, misc]
+
+
+class _ChainedStream:
+    """``tell()`` across the parts of a joined capture, for the progress bar."""
+
+    def __init__(self, owner: "ChainedCaptureReader") -> None:
+        self._owner = owner
+
+    def tell(self) -> int:
+        return self._owner.tell()
+
+
+class ChainedCaptureReader:
+    """Stream the parts of a split capture back to back as one capture.
+
+    Each part is a complete capture (its own global header), opened only when
+    the previous one is exhausted, so memory use is that of a single reader.
+    Link type and snap length are taken from the first part; a part whose link
+    type differs is still read (every packet carries its own dissection).
+    """
+
+    def __init__(self, parts: tuple[Path, ...]) -> None:
+        self._parts = parts
+        first = _open_single_capture(parts[0])
+        self._current = first
+        self._index = 0
+        self._done_bytes = 0
+        self.linktype = getattr(first, "linktype", None)
+        self.snaplen = getattr(first, "snaplen", None)
+        self.interfaces = getattr(first, "interfaces", None)
+        self.f = _ChainedStream(self)
+
+    def __iter__(self) -> Iterator[object]:
+        while self._current is not None:
+            try:
+                for pkt in self._current:
+                    yield pkt
+            finally:
+                self._close_current()
+            self._index += 1
+            if self._index >= len(self._parts):
+                break
+            self._current = _open_single_capture(self._parts[self._index])
+
+    def _close_current(self) -> None:
+        current = self._current
+        if current is None:
+            return
+        try:
+            self._done_bytes += self._parts[self._index].stat().st_size
+        except OSError:
+            pass
+        try:
+            current.close()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        self._current = None
+
+    def tell(self) -> int:
+        current = self._current
+        stream = _reader_stream(current) if current is not None else None
+        try:
+            offset = int(stream.tell()) if stream is not None else 0  # type: ignore[attr-defined]
+        except Exception:
+            offset = 0
+        return self._done_bytes + offset
+
+    def close(self) -> None:
+        self._close_current()
+
+
+def open_capture_reader(path: Path, file_type: str | None = None) -> object:
+    """A scapy packet reader for ``path``, chosen by the file's magic number.
+
+    The single place a capture is opened for reading, so every reader path
+    (streaming, cached, BPF-filtered fallback) supports the same formats:
+    pcapng, classic pcap (micro- and nanosecond, either byte order), the
+    modified-pcap variant, and split captures joined with
+    :func:`pcapper.capture_parts.group_split_captures`.
+    """
+    _require_scapy()
+    parts = capture_parts(path)
+    if len(parts) > 1:
+        return ChainedCaptureReader(parts)
+    return _open_single_capture(path, file_type)
+
+
+def _open_single_capture(path: Path, file_type: str | None = None) -> object:
+    """Reader for exactly one file, ignoring any split-capture group it heads."""
+    kind = file_type or detect_file_type(path)
+    if kind == "pcapng":
+        return PcapNgReader(str(path))
+    try:
+        with path.open("rb") as handle:
+            magic = handle.read(4)
+    except OSError:
+        magic = b""
+    if magic in PCAP_MODIFIED_MAGIC_BYTES and ModifiedPcapReader is not None:
+        return ModifiedPcapReader(str(path))
+    return PcapReader(str(path))
+
+
 def _require_scapy() -> None:
     if not is_scapy_available():
         raise RuntimeError(
@@ -432,7 +640,7 @@ def _require_scapy() -> None:
 def load_capture_meta(path: Path) -> PcapMeta:
     file_type = detect_file_type(path)
     try:
-        size_bytes = path.stat().st_size
+        size_bytes = capture_size(path)
     except Exception:
         size_bytes = 0
     return _finalize_meta(
@@ -450,11 +658,11 @@ def load_packets(path: Path, show_status: bool = True) -> tuple[list[object], Pc
     file_type = detect_file_type(path)
     size_bytes = 0
     try:
-        size_bytes = path.stat().st_size
+        size_bytes = capture_size(path)
     except Exception:
         size_bytes = 0
 
-    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
+    reader = open_capture_reader(path, file_type)
     status = build_statusbar(path, enabled=show_status)
     stream = _reader_stream(reader)
 
@@ -534,7 +742,7 @@ def load_packets_if_allowed(
     if not enabled or max_cache <= 0 or max_file <= 0:
         return None, None
     try:
-        size_bytes = path.stat().st_size
+        size_bytes = capture_size(path)
     except Exception:
         size_bytes = 0
     if size_bytes and size_bytes > max_file:
@@ -561,7 +769,7 @@ def load_filtered_packets(
     file_type = detect_file_type(path)
     host_only_ip = _extract_host_only_bpf_ip(bpf)
     try:
-        size_bytes = path.stat().st_size
+        size_bytes = capture_size(path)
     except Exception:
         size_bytes = 0
 
@@ -587,8 +795,11 @@ def load_filtered_packets(
             # and then filtering the list a second time.
             packets = []
             with status:
+                parts = capture_parts(path)
                 sniff(
-                    offline=str(path),
+                    offline=(
+                        [str(part) for part in parts] if len(parts) > 1 else str(path)
+                    ),
                     filter=bpf,
                     store=False,
                     lfilter=_in_window,
@@ -614,7 +825,7 @@ def load_filtered_packets(
         bpf_status["used_bpf"] = False
         bpf_status["error"] = "Scapy sniff unavailable (libpcap/BPF not available)."
 
-    reader = PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
+    reader = open_capture_reader(path, file_type)
     status = build_statusbar(path, enabled=show_status)
     stream = _reader_stream(reader)
     linktype = getattr(reader, "linktype", None)
@@ -676,7 +887,7 @@ def has_cached_packets(path: Path) -> bool:
     return _cached_packets(path) is not None
 
 
-_HASH_CACHE: dict[tuple[str, int, int], tuple[str | None, str | None]] = {}
+_HASH_CACHE: dict[tuple[str, int, int, int], tuple[str | None, str | None]] = {}
 
 
 def capture_hashes(path: Path) -> tuple[str | None, str | None]:
@@ -686,10 +897,15 @@ def capture_hashes(path: Path) -> tuple[str | None, str | None]:
     base summary and the case-metadata writer both need these; before this
     each made its own full pass over the file.
     """
+    # A joined split capture hashes its parts' bytes in order: reproducible
+    # with `cat part000 part001 ... | sha256sum`, and it changes if any part
+    # does. (It is not the hash of the original, pre-split file — splitting
+    # rewrites every part's global header.)
+    parts = capture_parts(path)
     try:
         key_path = _path_key(path)
         st = key_path.stat()
-        key = (str(key_path), st.st_size, st.st_mtime_ns)
+        key = (str(key_path), capture_size(path), st.st_mtime_ns, len(parts))
     except OSError:
         return None, None
     cached = _HASH_CACHE.get(key)
@@ -698,10 +914,11 @@ def capture_hashes(path: Path) -> tuple[str | None, str | None]:
     sha256 = hashlib.sha256()
     sha1 = hashlib.sha1()
     try:
-        with key_path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                sha256.update(chunk)
-                sha1.update(chunk)
+        for part in parts:
+            with part.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    sha256.update(chunk)
+                    sha1.update(chunk)
     except OSError:
         return None, None
     result = (sha256.hexdigest(), sha1.hexdigest())
@@ -827,7 +1044,7 @@ def get_reader(
     enabled, max_cache, max_file = _cache_config()
     file_type = meta.file_type if meta else detect_file_type(path)
     try:
-        size_bytes = meta.size_bytes if meta else path.stat().st_size
+        size_bytes = meta.size_bytes if meta else capture_size(path)
     except Exception:
         size_bytes = 0
 
@@ -852,9 +1069,7 @@ def get_reader(
             return reader, status, reader, len(cached_packets), cached_meta.file_type
 
         _require_scapy()
-        reader = (
-            PcapNgReader(str(path)) if file_type == "pcapng" else PcapReader(str(path))
-        )
+        reader = open_capture_reader(path, file_type)
         status = build_statusbar(path, enabled=show_status)
         stream = _reader_stream(reader)
         return reader, status, stream, size_bytes, file_type

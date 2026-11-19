@@ -132,3 +132,22 @@ class TestDetectFileTypeBytes:
 
     def test_unrecognised_input_does_not_raise(self) -> None:
         assert isinstance(detect_file_type_bytes(b"\x01\x02\x03\x04"), str)
+
+
+def test_dataclass_counters_serialize_as_mappings() -> None:
+    """dataclasses.asdict() turns Counter fields into {"('k', n)": 1}; the
+    JSON export must keep them as {"k": n} (every summary has Counters)."""
+    from collections import Counter
+    from dataclasses import dataclass, field
+
+    from pcapper.utils import to_serializable
+
+    @dataclass(frozen=True)
+    class Summary:
+        counts: Counter = field(default_factory=lambda: Counter({"Get CP status": 338, "Run program": 1}))
+        nested: list = field(default_factory=lambda: [Counter({"a": 2})])
+
+    assert to_serializable(Summary()) == {
+        "counts": {"Get CP status": 338, "Run program": 1},
+        "nested": [{"a": 2}],
+    }

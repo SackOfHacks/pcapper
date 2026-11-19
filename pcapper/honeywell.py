@@ -39,6 +39,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_honeywell(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="honeywell",
         path=path,
         protocol_name="Honeywell CDA",
         tcp_ports={HONEYWELL_CDA_PORT},

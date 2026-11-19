@@ -41,6 +41,7 @@ from .aim import analyze_aim
 from .cip import CIP_SERVICE_NAMES
 from .nfs import analyze_nfs
 from .openvpn import iter_openvpn_tcp_control_payloads, openvpn_tcp_control_opcodes
+from .capture_parts import capture_parts
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     detect_file_type_bytes,
@@ -1255,7 +1256,10 @@ def _safe_decompress(
         else:
             return data
         out = decompressor.decompress(data, max_output + 1)
-        out += decompressor.flush()
+        # flush() inflates whatever input is left with no limit: a gzip bomb
+        # (1 GB of zeros in ~1 MB) used to be fully inflated before the cut.
+        if not decompressor.unconsumed_tail and len(out) <= max_output:
+            out += decompressor.flush()  # input fully consumed under the cap
         if len(out) > max_output:
             return out[:max_output]
         return out
@@ -3536,6 +3540,20 @@ def _compute_imphash(payload: bytes) -> Optional[str]:
     return None
 
 
+def _dpkt_can_read(path: Path) -> bool:
+    """dpkt reads classic pcap and pcapng, but not the modified-pcap variant."""
+    from .utils import PCAP_MODIFIED_MAGIC_BYTES
+
+    for part in capture_parts(path):
+        try:
+            with part.open("rb") as handle:
+                if handle.read(4) in PCAP_MODIFIED_MAGIC_BYTES:
+                    return False
+        except OSError:
+            return False
+    return True
+
+
 def _export_with_dpkt(
     path: Path,
     extract_name: Optional[str],
@@ -3619,62 +3637,69 @@ def _export_with_dpkt(
             return True
         return filter_ip in {str(src_ip), str(dst_ip)}
 
+    if packets is None and not _dpkt_can_read(path):
+        # dpkt cannot open every format pcapper reads (modified pcap); stream
+        # those through scapy instead of reporting a parse failure.
+        packets = iter_packets(path, show_status=False)  # type: ignore[assignment]
     if packets is None:
         if dpkt is None:
             return None
         try:
-            with path.open("rb") as handle:
-                try:
-                    reader = dpkt.pcapng.Reader(handle)
-                except Exception:
-                    handle.seek(0)
-                    reader = dpkt.pcap.Reader(handle)
-                datalink = None
-                try:
-                    datalink = reader.datalink()
-                except Exception:
+            idx = 0
+            # A joined split capture is read part by part, in order; packet
+            # indices continue across parts so they match the joined view.
+            for part in capture_parts(path):
+                with part.open("rb") as handle:
+                    try:
+                        reader = dpkt.pcapng.Reader(handle)
+                    except Exception:
+                        handle.seek(0)
+                        reader = dpkt.pcap.Reader(handle)
                     datalink = None
-                idx = 0
-                for ts, buf in reader:
-                    idx += 1
-                    ip = _decode_dpkt_ip_packet(buf, datalink)
-                    if ip is None:
-                        continue
+                    try:
+                        datalink = reader.datalink()
+                    except Exception:
+                        datalink = None
+                    for ts, buf in reader:
+                        idx += 1
+                        ip = _decode_dpkt_ip_packet(buf, datalink)
+                        if ip is None:
+                            continue
 
-                    if isinstance(ip, dpkt.ip.IP):
-                        src_ip = _dpkt_ip_to_str(ip.src)
-                        dst_ip = _dpkt_ip_to_str(ip.dst)
-                    elif isinstance(ip, dpkt.ip6.IP6):
-                        src_ip = _dpkt_ip_to_str(ip.src)
-                        dst_ip = _dpkt_ip_to_str(ip.dst)
-                    else:
-                        continue
-                    if not _in_scope(src_ip, dst_ip):
-                        continue
+                        if isinstance(ip, dpkt.ip.IP):
+                            src_ip = _dpkt_ip_to_str(ip.src)
+                            dst_ip = _dpkt_ip_to_str(ip.dst)
+                        elif isinstance(ip, dpkt.ip6.IP6):
+                            src_ip = _dpkt_ip_to_str(ip.src)
+                            dst_ip = _dpkt_ip_to_str(ip.dst)
+                        else:
+                            continue
+                        if not _in_scope(src_ip, dst_ip):
+                            continue
 
-                    if isinstance(ip.data, dpkt.tcp.TCP):
-                        tcp = ip.data
-                        payload = bytes(tcp.data or b"")
-                        payload = _retain_payload_budget(payload, idx)
-                        if payload:
-                            tcp_streams[
-                                (src_ip, dst_ip, int(tcp.sport), int(tcp.dport))
-                            ].append((int(tcp.seq), payload, idx))
-                    elif isinstance(ip.data, dpkt.udp.UDP):
-                        udp = ip.data
-                        payload = bytes(udp.data or b"")
-                        payload = _retain_payload_budget(payload, idx)
-                        if payload:
-                            udp_packets.append(
-                                (
-                                    src_ip,
-                                    dst_ip,
-                                    int(udp.sport),
-                                    int(udp.dport),
-                                    payload,
-                                    idx,
+                        if isinstance(ip.data, dpkt.tcp.TCP):
+                            tcp = ip.data
+                            payload = bytes(tcp.data or b"")
+                            payload = _retain_payload_budget(payload, idx)
+                            if payload:
+                                tcp_streams[
+                                    (src_ip, dst_ip, int(tcp.sport), int(tcp.dport))
+                                ].append((int(tcp.seq), payload, idx))
+                        elif isinstance(ip.data, dpkt.udp.UDP):
+                            udp = ip.data
+                            payload = bytes(udp.data or b"")
+                            payload = _retain_payload_budget(payload, idx)
+                            if payload:
+                                udp_packets.append(
+                                    (
+                                        src_ip,
+                                        dst_ip,
+                                        int(udp.sport),
+                                        int(udp.dport),
+                                        payload,
+                                        idx,
+                                    )
                                 )
-                            )
         except Exception as exc:
             return FileTransferSummary(path, 0, [], [], [], [], [], [str(exc)])
     else:

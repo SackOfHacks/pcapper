@@ -95,6 +95,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_niagara(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="niagara",
         path=path,
         protocol_name="Niagara Fox",
         tcp_ports=NIAGARA_PORTS,
