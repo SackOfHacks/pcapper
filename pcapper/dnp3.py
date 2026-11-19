@@ -1392,9 +1392,13 @@ def analyze_dnp3(
     except Exception as e:
         errors.append(f"{type(e).__name__}: {e}")
 
-    if tcp_streams:
+    # Off-port streams are buffered speculatively (a payload ending in 0x05
+    # might start a frame), so only DNP3-port streams are real leftovers; the
+    # rest made a pure Modbus capture report "incomplete DNP3 TCP streams".
+    leftover = sum(1 for key in tcp_streams if key[2] in dnp3_ports or key[3] in dnp3_ports)
+    if leftover:
         errors.append(
-            f"{len(tcp_streams)} incomplete DNP3 TCP frame stream(s) remained at end of capture."
+            f"{leftover} incomplete DNP3 TCP frame stream(s) remained at end of capture."
         )
     if reassembly_buffers:
         errors.append(

@@ -580,7 +580,12 @@ def format_bytes_as_mb(size_bytes: int) -> str:
 def format_ts(ts: Optional[float]) -> str:
     if ts is None:
         return "-"
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    try:
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        # Garbage pcapng timestamps (year 31969 in the ICSC 2021 FINS/S7
+        # captures) used to abort every renderer that prints a time window.
+        return f"<out-of-range timestamp {ts:.0f}>"
     return dt.isoformat().replace("+00:00", "Z")
 
 

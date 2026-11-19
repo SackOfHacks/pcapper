@@ -82,10 +82,20 @@ def render_ot_commands_summary(
             _format_kv("Top Destinations", _format_counter(summary.destinations, 5))
         )
     else:
-        lines.append(ok(
-            "None observed — traffic is read-only / monitoring "
-            "(no writes, control, restart, or program transfers)."
-        ))
+        streams = list(getattr(summary, "unnormalized_streams", []) or [])
+        if streams:
+            flags = " ".join(f"--{s.lower().replace('c37.118', 'synchrophasor')}" for s in streams)
+            lines.append(warn(
+                "None observed in the command protocols; "
+                + ", ".join(streams)
+                + " traffic is present but is publish/subscribe signalling, not "
+                f"commands - evaluate it with {flags} (trips, state changes, injection)."
+            ))
+        else:
+            lines.append(ok(
+                "None observed — traffic is read-only / monitoring "
+                "(no writes, control, restart, or program transfers)."
+            ))
     if getattr(summary, "control_rate_per_min", None) is not None:
         rate = float(summary.control_rate_per_min or 0.0)
         lines.append(_format_kv("Control Rate", f"{rate:.2f}/min"))

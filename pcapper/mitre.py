@@ -849,6 +849,36 @@ def _executive_assessment(
     )
 
 
+# ATT&CK for ICS: each technique's primary tactic. Used when a detection
+# names a technique explicitly but no keyword rule covers it; the fallback
+# used to file every such technique under Command and Control (TA0101), so a
+# TriStation "Change Operating Mode" became C2 and broke sequence checks.
+_ICS_TACTICS = {
+    "TA0108": "Initial Access", "TA0104": "Execution", "TA0110": "Persistence",
+    "TA0111": "Privilege Escalation", "TA0103": "Evasion", "TA0102": "Discovery",
+    "TA0109": "Lateral Movement", "TA0100": "Collection", "TA0101": "Command and Control",
+    "TA0107": "Inhibit Response Function", "TA0106": "Impair Process Control", "TA0105": "Impact",
+}
+_ICS_TECHNIQUE_TACTIC = {
+    "T0800": "TA0107", "T0801": "TA0100", "T0802": "TA0100", "T0803": "TA0107",
+    "T0804": "TA0107", "T0806": "TA0106", "T0807": "TA0104", "T0809": "TA0107",
+    "T0811": "TA0100", "T0812": "TA0109", "T0813": "TA0105", "T0814": "TA0107",
+    "T0815": "TA0105", "T0816": "TA0107", "T0819": "TA0108", "T0821": "TA0104",
+    "T0822": "TA0108", "T0826": "TA0105", "T0827": "TA0105", "T0828": "TA0105",
+    "T0829": "TA0105", "T0830": "TA0100", "T0831": "TA0105", "T0832": "TA0105",
+    "T0835": "TA0106", "T0836": "TA0106", "T0837": "TA0105", "T0838": "TA0107",
+    "T0839": "TA0110", "T0840": "TA0102", "T0842": "TA0102", "T0843": "TA0109",
+    "T0845": "TA0100", "T0846": "TA0102", "T0848": "TA0108", "T0849": "TA0103",
+    "T0851": "TA0103", "T0852": "TA0100", "T0853": "TA0104", "T0855": "TA0106",
+    "T0856": "TA0103", "T0857": "TA0110", "T0858": "TA0104", "T0859": "TA0110",
+    "T0861": "TA0100", "T0866": "TA0108", "T0867": "TA0109", "T0868": "TA0100",
+    "T0869": "TA0101", "T0872": "TA0103", "T0877": "TA0100", "T0878": "TA0107",
+    "T0879": "TA0105", "T0880": "TA0105", "T0881": "TA0107", "T0883": "TA0108",
+    "T0885": "TA0101", "T0886": "TA0109", "T0888": "TA0102", "T0890": "TA0111",
+    "T0891": "TA0109",
+}
+
+
 def _fallback_from_explicit_ids(
     tactic_ids: list[str],
     technique_ids: list[str],
@@ -857,8 +887,11 @@ def _fallback_from_explicit_ids(
 ) -> tuple[str, str, str, str] | None:
     if not tactic_ids and not technique_ids:
         return None
+    known = _ICS_TECHNIQUE_TACTIC.get(technique_ids[0]) if technique_ids else None
     tactic_id = (
-        tactic_ids[0] if tactic_ids else ("TA0101" if framework == "ics" else "TA0007")
+        tactic_ids[0]
+        if tactic_ids
+        else known or ("TA0101" if framework == "ics" else "TA0007")
     )
     technique_id = (
         technique_ids[0]
@@ -875,6 +908,8 @@ def _fallback_from_explicit_ids(
         if rule.technique_id == technique_id:
             technique = rule.technique
             break
+    if tactic == "Mapped Tactic" and tactic_id in _ICS_TACTICS:
+        tactic = _ICS_TACTICS[tactic_id]
     if tactic == "Mapped Tactic" and framework == "ics":
         tactic = "ICS ATT&CK"
     if tactic == "Mapped Tactic" and framework != "ics":

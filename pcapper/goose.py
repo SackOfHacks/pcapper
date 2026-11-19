@@ -511,6 +511,13 @@ def analyze_goose(
 
     routable_sq_seen: dict[tuple[str, str, str], tuple[int, set[int]]] = {}
     routable_reordered: Counter[tuple[str, str, str]] = Counter()
+    frame_data: dict[tuple[str, str, str], dict[tuple[int, int], tuple]] = {}
+    state_data: dict[tuple[str, str, str], tuple[int, tuple]] = {}
+    manip_counts: Counter[tuple[str, str, str]] = Counter()
+    manip_samples: dict[tuple[str, str, str], str] = {}
+    stream_frames: Counter[tuple[str, str, str]] = Counter()
+    within_state: Counter[tuple[str, str, str]] = Counter()
+    within_samples: dict[tuple[str, str, str], str] = {}
 
     def _process_frame(
         src_mac: str, dst_mac: str, payload: bytes, ts: Optional[float], routable: bool
@@ -688,7 +695,23 @@ def analyze_goose(
                     and ts - prev_ts > prev_ttl / 1000
                 )
                 if not expired:
-                    if st_num < prev_st:
+                    if st_num < prev_st and prev_st - st_num >= 100:
+                        # A frame with an inflated stNum makes subscribers
+                        # discard the genuine publisher's lower stNums: the
+                        # message-suppression attack (ADSC AS1/AS2: 9999).
+                        add_detection(
+                            {
+                                "severity": "high",
+                                "summary": "GOOSE message suppression (inflated stNum injected)",
+                                "details": (
+                                    f"{key[0]} {key[2]} stNum jumped to {prev_st} and fell back to "
+                                    f"{st_num}: a frame with an inflated state number was injected so "
+                                    "subscribers ignore the real publisher (ATT&CK for ICS T0804 Block "
+                                    "Reporting Message, T0856 Spoof Reporting Message)."
+                                ),
+                            }
+                        )
+                    elif st_num < prev_st:
                         add_detection(
                             {
                                 "severity": "warning",
@@ -739,6 +762,29 @@ def analyze_goose(
                                     ),
                                 }
                             )
+            # IEC 61850-8-1: a dataset value change MUST increment stNum (and
+            # restart sqNum). The same (stNum, sqNum) carrying different data,
+            # or data that changes while stNum stays, is a forged/injected
+            # frame - the classic GOOSE data-manipulation attack.
+            data_sig = tuple(data_values[:64])
+            frame_key = (st_num, sq_num)
+            seen_frames = frame_data.setdefault(key, {})
+            earlier = seen_frames.get(frame_key)
+            if earlier is not None and earlier != data_sig:
+                manip_counts[key] += 1
+                manip_samples.setdefault(
+                    key, f"stNum {st_num} sqNum {sq_num} sent twice with different allData"
+                )
+            elif earlier is None and len(seen_frames) < 8192:
+                seen_frames[frame_key] = data_sig
+            last = state_data.get(key)
+            stream_frames[key] += 1
+            if last is not None and last[0] == st_num and last[1] != data_sig and data_sig:
+                within_state[key] += 1
+                within_samples.setdefault(
+                    key, f"allData changed within stNum {st_num} (sqNum {sq_num})"
+                )
+            state_data[key] = (st_num, data_sig)
             if routable:
                 seen_sqs = routable_sq_seen.get(key)
                 if seen_sqs is None or seen_sqs[0] != st_num:
@@ -924,6 +970,26 @@ def analyze_goose(
                     f"{goose_packets} GOOSE PDUs"
                     + (f", {rgoose_packets} of them in R-GOOSE session PDUs on UDP" if rgoose_packets else " at L2")
                     + "."
+                ),
+            }
+        )
+    # A value change inside one state is only evidence when it is rare for the
+    # stream: measurement datasets (analog values) legitimately change on
+    # every frame without an stNum increment.
+    for key, count in within_state.items():
+        if count <= max(1, stream_frames[key] // 20):
+            manip_counts[key] += count
+            manip_samples.setdefault(key, within_samples[key])
+    for key, count in manip_counts.most_common(10):
+        add_detection(
+            {
+                "severity": "high",
+                "summary": "GOOSE data manipulation (value changed without stNum increment)",
+                "details": (
+                    f"{key[0]} {key[2]} (APPID {key[1]}): {count} frame(s) - "
+                    f"{manip_samples.get(key, '')}. A legitimate publisher increments stNum "
+                    "on every value change; this is an injected or forged GOOSE frame "
+                    "(ATT&CK for ICS T0856 Spoof Reporting Message, T0832 Manipulation of View)."
                 ),
             }
         )

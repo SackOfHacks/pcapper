@@ -74,9 +74,21 @@ def render_goose_summary(summary: GooseSummary, verbose: bool = False) -> str:
     if getattr(summary, "gocb_refs", None):
         lines.append(_format_kv("GOCB Refs", _format_counter(summary.gocb_refs, 5)))
     if getattr(summary, "st_nums", None):
-        lines.append(_format_kv("stNum", _format_counter(summary.st_nums, 5)))
+        values = [v for v in summary.st_nums if isinstance(v, int)]
+        lines.append(
+            _format_kv(
+                "stNum",
+                f"{len(values)} distinct, {min(values)}..{max(values)}" if values else "-",
+            )
+        )
     if getattr(summary, "sq_nums", None):
-        lines.append(_format_kv("sqNum", _format_counter(summary.sq_nums, 5)))
+        values = [v for v in summary.sq_nums if isinstance(v, int)]
+        lines.append(
+            _format_kv(
+                "sqNum",
+                f"{len(values)} distinct, {min(values)}..{max(values)}" if values else "-",
+            )
+        )
     if getattr(summary, "conf_revs", None):
         lines.append(_format_kv("confRev", _format_counter(summary.conf_revs, 5)))
     if getattr(summary, "num_entries", None):

@@ -71,6 +71,10 @@ from .yokogawa import analyze_yokogawa
 from .opc_classic import analyze_opc_classic
 from .ot_extra import OT_EXTRA
 from .safety import analyze_safety
+from .goose import analyze_goose
+from .hart import analyze_hart
+from .sv import analyze_sv
+from .synchrophasor import analyze_synchrophasor
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,10 @@ class OtCommandSummary:
     # control/write subset — so the view is useful on read-only/monitoring
     # captures instead of showing empty. Keyed "Protocol:Command".
     all_command_counts: Counter[str] = field(default_factory=Counter)
+    # Publish/subscribe OT streams present but not command-normalized
+    # (GOOSE, SV, C37.118): their protection/measurement logic lives in
+    # --goose/--sv/--synchrophasor.
+    unnormalized_streams: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -296,6 +304,10 @@ def _is_write_command(
     base_markers: tuple[str, ...] = WRITE_MARKERS,
 ) -> bool:
     lowered = text.lower()
+    # A reply to a write is not a write: counting "Write response" made the
+    # PLC look like a writer (XGT, ROC Plus, ADS ...).
+    if "response" in lowered or "(reply)" in lowered:
+        return False
     return any(marker in lowered for marker in base_markers) or any(
         marker in lowered for marker in extra_markers
     )
@@ -1052,6 +1064,9 @@ def analyze_ot_commands(
         ("TriStation", _analyze(analyze_safety, show_status=show_status),
          ("halt", "allocate", "download", "run program", "disable", "clear", "pause"))
     )
+    extra_sources.append(
+        ("HART-IP", _analyze(analyze_hart, show_status=show_status), ("write", "reset", "lock"))
+    )
     extra_sources.append(("OPC Classic", _opc_classic_control_view(
         _analyze(analyze_opc_classic, show_status=show_status)), ()))
     for label, summary, markers in extra_sources:
@@ -1293,6 +1308,21 @@ def analyze_ot_commands(
         ("PCWorx", getattr(pcworx, "commands", Counter())),
         ("ProConOS", getattr(prconos, "commands", Counter())),
     ]
+    _all_sources.extend(
+        (label, getattr(summary, "commands", Counter())) for label, summary, _m in extra_sources
+    )
+    # Publish/subscribe streams carry no commands; record that they were seen
+    # so the report does not call an IEC 61850 capture "read-only".
+    unnormalized: list[str] = []
+    for label, func in (("GOOSE", analyze_goose), ("SV", analyze_sv), ("C37.118", analyze_synchrophasor)):
+        try:
+            seen = _analyze(func, show_status=False)
+        except Exception:  # noqa: BLE001
+            continue
+        count = int(getattr(seen, "goose_packets", 0) or getattr(seen, "sv_packets", 0)
+                    or getattr(seen, "synchrophasor_packets", 0) or 0)
+        if count:
+            unnormalized.append(label)
     for _label, _ctr in _all_sources:
         for _cmd, _cnt in (_ctr or Counter()).items():
             all_command_counts[f"{_label}:{_cmd}"] += _cnt
@@ -1327,4 +1357,5 @@ def analyze_ot_commands(
         detections=detections,
         errors=errors,
         all_command_counts=all_command_counts,
+        unnormalized_streams=unnormalized,
     )

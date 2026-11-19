@@ -987,6 +987,8 @@ def _ot_command_risk(name: str) -> str:
     """Classify an OT command name as CONTROL (state-changing), REVIEW
     (recon/config/session), or Normal (read/poll/monitor)."""
     low = str(name or "").lower()
+    if "response" in low:  # the device answering a write is not a write
+        return "Normal"
     is_read = any(k in low for k in _OT_CMD_READ_KW)
     has_write_verb = any(k in low for k in _OT_CMD_WRITE_VERB)
     if is_read and not has_write_verb:
@@ -1156,7 +1158,9 @@ def _render_industrial_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Sessions"))
         rows = [["Session", "Packets"]]
-        for sess, count in sessions.most_common(_limit_value(10)):
+        # Capped even in OT full-output mode: a UDP flood or one-packet-per-
+        # session protocol (HART-IP CTF: 3,590 sessions) printed 178 KB here.
+        for sess, count in sessions.most_common(_FULL_OUTPUT_LIMIT if _verbose_output() else 25):
             rows.append([str(sess), str(count)])
         lines.append(_format_table(rows))
 
@@ -1387,7 +1391,9 @@ def _render_ot_protocol_summary(
         lines.append(SUBSECTION_BAR)
         lines.append(header("Top Sessions"))
         rows = [["Session", "Packets"]]
-        for sess, count in sessions.most_common(_limit_value(10)):
+        # Capped even in OT full-output mode: a UDP flood or one-packet-per-
+        # session protocol (HART-IP CTF: 3,590 sessions) printed 178 KB here.
+        for sess, count in sessions.most_common(_FULL_OUTPUT_LIMIT if _verbose_output() else 25):
             rows.append([str(sess), str(count)])
         lines.append(_format_table(rows))
 

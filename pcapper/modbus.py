@@ -442,6 +442,37 @@ def _parse_device_id_response(pdu: bytes) -> dict[str, str]:
     return fields
 
 
+def _register_text(regs: Dict[int, int], minimum: int = 6) -> str:
+    """Longest printable run across consecutive register addresses.
+
+    Tries one character per register (value < 0x80) and two per register
+    (big-endian bytes): CTF captures hide flags both ways.
+    """
+    best = ""
+    for mode in ("char", "pair"):
+        run = ""
+        previous = None
+        for address in sorted(regs):
+            value = regs[address]
+            if mode == "char":
+                piece = chr(value) if 32 <= value < 127 else ""
+            else:
+                hi, lo = value >> 8, value & 0xFF
+                piece = "".join(chr(b) for b in (hi, lo) if 32 <= b < 127) if all(
+                    b == 0 or 32 <= b < 127 for b in (hi, lo)
+                ) and (hi or lo) else ""
+            if piece and previous is not None and address == previous + 1 and run:
+                run += piece
+            elif piece:
+                run = piece
+            else:
+                run = ""
+            previous = address
+            if len(run) > len(best):
+                best = run
+    return best if len(best) >= minimum else ""
+
+
 @memoize_analysis
 def analyze_modbus(
     path: Path,
@@ -545,6 +576,10 @@ def analyze_modbus(
     read_then_write_events: Counter[Tuple[str, str, int]] = Counter()
     # Request/response pairing keyed by TCP connection + transaction id + unit.
     pending_tx: Dict[Tuple[str, int, str, int, int], float] = {}
+    # Read requests awaiting their response: (func, start address, quantity),
+    # so response register values land on real addresses (register map).
+    pending_reads: Dict[Tuple[str, int, str, int, int], Tuple[int, int, int]] = {}
+    read_register_values: Dict[Tuple[str, int, int], Dict[int, int]] = defaultdict(dict)
     rtt_samples: Dict[str, List[int]] = defaultdict(list)
     matched_tx = 0
     phantom_responses: Counter[str] = Counter()
@@ -841,6 +876,8 @@ def analyze_modbus(
                         request_detail, reg_type, addr, qty = (
                             _parse_modbus_request_info(original_func, pdu)
                         )
+                        if original_func in (3, 4) and addr is not None and qty and len(pending_reads) < 200000:
+                            pending_reads[tx_key] = (original_func, int(addr), int(qty))
 
                         # --- Register/coil map: read side (process fingerprint) ---
                         if (
@@ -1096,6 +1133,18 @@ def analyze_modbus(
                         # request on the same connection + trans-id + unit.
                         # RTT per server; unmatched = phantom (injection). ---
                         resp_key = (dst_ip, dport, src_ip, trans_id, unit_id)
+                        read_req = pending_reads.pop(resp_key, None)
+                        if (
+                            read_req is not None
+                            and original_func == read_req[0]
+                            and len(pdu) >= 2
+                        ):
+                            byte_count = pdu[1]
+                            values = pdu[2:2 + byte_count]
+                            regs = read_register_values[(src_ip, unit_id, read_req[0])]
+                            for index in range(min(read_req[2], len(values) // 2, 2000)):
+                                if len(regs) < 65536:
+                                    regs[read_req[1] + index] = int.from_bytes(values[2 * index:2 * index + 2], "big")
                         req_ts = pending_tx.pop(resp_key, None)
                         if req_ts is not None:
                             matched_tx += 1
@@ -1566,6 +1615,24 @@ def analyze_modbus(
                     description=f"Modbus signature observed on {session} ({count} packets).",
                     src="*",
                     dst="*",
+                    ts=0.0,
+                )
+            )
+
+    for (server, unit, func), regs in read_register_values.items():
+        text = _register_text(regs)
+        if text and len(anomalies) < max_anomalies:
+            kind = "holding" if func == 3 else "input"
+            anomalies.append(
+                ModbusAnomaly(
+                    severity="MEDIUM",
+                    title=f"Modbus registers decode as text: {text[:64]!r}",
+                    description=(
+                        f"{server} unit {unit} {kind} registers, read in address order, "
+                        f"spell {text!r} (data hidden in process values)."
+                    ),
+                    src="*",
+                    dst=server,
                     ts=0.0,
                 )
             )
