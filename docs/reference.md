@@ -53,11 +53,27 @@ python -m pcapper capture.pcap --control-loop
 
 ## Safety PLC Detection
 
-Detect safety PLC/SIS protocol traffic (Triconex/TriStation heuristics).
+`--safety` reports Triconex/TriStation traffic (TCP/UDP 1500-1502) and decodes TriStation (layout and codes per Nozomi Networks' tricotools dissector): the request/reply/reject mix, the key switch position and program state from CP status replies, the project name, and a timeline of logic and state-changing commands. Findings: TRITON-pattern reprogramming (logic upload, download change/allocate program, run), program download, OVD disable, point writes, run-state changes and a key switch left in PROGRAM/REMOTE.
 
 ```bash
 python -m pcapper capture.pcap --safety
 ```
+
+## Capture Input
+
+- A target is a capture when its header says so (pcap, nanosecond pcap, modified pcap, pcapng); the extension is never consulted, so `cap_00001_20210318035345` is accepted. A directory scan names any `*.pcap` file without a capture header instead of dropping it.
+- Split captures (`X.pcap.part000.pcap`, `X.pcap.part001.pcap` ...) found together are analysed as one capture, streamed part by part: one timeline, one conversation table, titled `X.pcap [N parts joined]`, hashed over the parts in order. Suricata and `--decrypt` run per part. `--no-join-parts` analyses them one by one; a single part named on its own is always analysed alone.
+
+## OT Protocols on Non-Standard Ports
+
+Every OT analyzer selects traffic by port. `--decode-as` adds ports (repeatable):
+
+```bash
+python -m pcapper plc.pcap --s7 --decode-as tcp/10203=s7
+python -m pcapper plc.pcap --s7 --decode-as 'tcp.port==10203,s7comm'   # tshark -d syntax
+```
+
+Without it, the busiest server ports in the first 50,000 packets are tested against S7/MMS (TPKT), Modbus, DNP3, EtherNet/IP, IEC-104, OPC UA, BACnet, KNXnet/IP, ADS, XGT, FINS, MELSEC, HART-IP, ROC Plus, C12.22, DLMS and R-GOOSE. A port is assigned only when the protocol's own length fields frame at least 60% of its payload packets exactly and at least 3 carry protocol content; each detection is printed, scoped to its capture, shown in `--overview` and reported by `--threats` (T1571). `--no-auto-decode` turns it off.
 
 ## Kill-Chain Timeline Tags
 
@@ -241,6 +257,7 @@ python -m pcapper --help
 - `--correlate-min N`
 - `--csv PATH`
 - `--decode INPUT`
+- `--decode-as SPEC`
 - `--decrypt`
 - `--decrypt-limit N`
 - `--decrypt-out DIR`
@@ -250,7 +267,9 @@ python -m pcapper --help
 - `--list-plugins`
 - `--log-file PATH`
 - `--log-json`
+- `--no-auto-decode`
 - `--no-color`
+- `--no-join-parts`
 - `--no-status`
 - `--packet N`
 - `--profile`
@@ -376,13 +395,16 @@ Count: 78 flags
 
 ### OT/ICS/Industrial functions (alphabetical)
 
+- `--ads`
 - `--bacnet`
+- `--c1222`
 - `--cip`
 - `--coap`
 - `--control-loop`
 - `--crimson`
 - `--csp`
 - `--df1`
+- `--dlms`
 - `--dnp3`
 - `--enip`
 - `--ethercat`
@@ -393,7 +415,9 @@ Count: 78 flags
 - `--iccp`
 - `--iec101-103`
 - `--iec104`
+- `--knx`
 - `--lldp`
+- `--lontalk`
 - `--melsec`
 - `--mms`
 - `--modbus`
@@ -408,16 +432,19 @@ Count: 78 flags
 - `--ot-commands-sessions`
 - `--pccc`
 - `--pcworx`
+- `--powerlink`
 - `--prconos`
 - `--profinet`
 - `--ptp`
+- `--rocplus`
 - `--s7`
 - `--safety`
 - `--srtp`
 - `--sv`
+- `--xgt`
 - `--yokogawa`
 
-Count: 40 flags
+Count: 48 flags
 
 ## Phone Over IP (VoIP)
 

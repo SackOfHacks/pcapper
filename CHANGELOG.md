@@ -4,6 +4,30 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 2.9.0 — 2026-11-19
+
+ICS/OT coverage gaps found while building the ICS-PCAP-Challenges range (331 challenges over 70 public datasets). Each item below was a real capture Pcapper reported as empty or undecoded; each fix is pinned by a test, and the suite grew from 828 to 890 tests.
+
+### Added
+
+- **Eight OT analyzers** (`--knx`, `--xgt`, `--rocplus`, `--ads`, `--dlms`, `--c1222`, `--lontalk`, `--powerlink`), registered in `pcapper/ot_extra.py` and wired into `--overview`, `--threats`, `--ot-commands` and `--mitre`. KNXnet/IP decodes cEMI (APCI, group/individual addresses, values) on any port by structure and only counts telegrams a host *sends*, so the KNX/IP interface relaying the bus is never blamed; findings cover write floods/fuzzing, read sweeps, bus/net scans, M_PropRead fuzzing, M_Reset and device writes. XGT FEnet decodes variable reads/writes and reassembles written bytes as text. ROC Plus frames are validated by CRC-16/MODBUS and expose cleartext opcode-17 logins. ADS covers AMS/TCP commands, ADS state changes and the TwinCAT AddRoute credentials. DLMS/COSEM, C12.22, LonTalk (CN/IP) and POWERLINK (EtherType, UDP and v1) each report their dangerous operations.
+- **`--decode-as`** (`tcp/10203=s7`, tshark's `tcp.port==10203,s7comm`, or `PORT=PROTO`) and **payload-structure auto-detection** of OT protocols on non-standard ports (`--no-auto-decode` to disable): a port is accepted only when the protocol's own length fields frame >= 60% of its payload packets exactly and >= 3 carry protocol content. Detections are scoped to their capture, listed by `--overview` and reported by `--threats` (T1571). MAPNA CTF 2024 PLC I/II and ICSNPP `s7comm_plus_port_change` now decode.
+- **R-GOOSE** (IEC 61850-90-5): session PDUs on any UDP port are parsed and their GOOSE PDUs analysed like L2 GOOSE; adds routed-GOOSE exposure, unsigned sessions, SPDU-number replay (told apart from reordering and duplicates), public exposure.
+- **TriStation decoding** in `--safety`: functions, replies and rejects, key switch, program state, project name, command timeline, and a critical TRITON-sequence finding.
+- **Split captures**: `X.pcap.part000.pcap ...` found together are one capture (`--no-join-parts` to opt out).
+
+### Changed
+
+- **`--opc-classic` is a stateful DCE/RPC decoder**: per-connection context tables, `Interface::Method` names for ~35 OPC DA/Common/OPCEnum/A&E/HDA interfaces, item IDs and handles from AddItems/SetClientHandles, VARIANT values for writes, reads and callbacks. Two IIDs in the old table were not OPC interfaces and are gone.
+- **Captures are recognised by header, not extension**; modified pcap (both record layouts) is readable.
+- The Modbus analyzer no longer counts off-port packets because bytes 2-3 are zero; non-standard Modbus ports come from decode-as/auto-detection.
+
+### Fixed
+
+- Every Counter field in `--json`/CSV exports was serialized as `{"('key', n)": 1}` (`dataclasses.asdict` rebuilds Counters from pairs).
+- Ethernet padding of short ACKs was fed to the OPC Classic reassembler as payload and silently dropped 1,566 of 1,574 callbacks on the ICSC 2021 capture.
+- `--overview` printed `--opc_classic` as the follow-up flag, never ran OPC Classic, TriStation or L2 POWERLINK deep dives.
+
 ## 2.5.0 — 2026-09-14
 
 Third pass of the 2026-09 production-readiness review: the roll-ups, the beacon detector and the compromise assessment. Every item below is a report that was wrong rather than failing, pinned by a test on a synthetic capture; the suite grew from 572 to 584 tests.

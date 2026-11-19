@@ -4,7 +4,7 @@
 ![CI](https://github.com/SackOfHacks/pcapper/actions/workflows/ci.yml/badge.svg)
 ![Tests](https://img.shields.io/badge/tests-584%20passing-1B5E20)
 ![Analyzers](https://img.shields.io/badge/analyzers-120%2B-3D5A80)
-![Version](https://img.shields.io/badge/release-v2.8.0-7C3AED)
+![Version](https://img.shields.io/badge/release-v2.9.0-7C3AED)
 ![License](https://img.shields.io/badge/license-MIT-6C757D)
 ![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
 ![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
@@ -135,6 +135,8 @@ flowchart LR
 | Track lateral movement | `--hostnames --services --protocols --tcp --timeline -ip <host>` |
 | Investigate phone calls (VoIP) | `--voip` (add `--voip-out DIR` to recover call audio) |
 | Run OT/ICS-specific triage | `--modbus --dnp3 --iec104 --s7 --ot-commands --safety` |
+| Find OT protocols on moved ports | `--overview` (auto-detects), or `--decode-as tcp/10203=s7` |
+| Building automation / metering | `--knx --lontalk --bacnet` / `--dlms --c1222` |
 | Build IR exports and evidence packs | `--json --csv --sqlite --case-dir` |
 
 ## Sample Analyst Report
@@ -198,6 +200,17 @@ Promotional highlights:
 - Phone-over-IP forensics (`--voip`): SIP/SDP, Skinny, MGCP, MEGACO, IAX2 and H.323 signalling; RTP/RTCP/SRTP and T.38 fax media; DTMF keypad digits; recovered credentials; and G.711 call audio to WAV.
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
+
+## What's New in v2.9.0 🏭
+
+Built against a 331-challenge ICS/OT PCAP range, where every gap below was a capture Pcapper reported as empty.
+
+- **Eight new OT analyzers:** `--knx` (KNXnet/IP + cEMI), `--xgt` (LS XGT FEnet), `--rocplus` (Emerson ROC Plus), `--ads` (Beckhoff ADS/AMS + TwinCAT AddRoute), `--dlms` (DLMS/COSEM), `--c1222` (ANSI C12.22), `--lontalk` (LonTalk over CN/IP), `--powerlink` (Ethernet POWERLINK). All feed `--overview`, `--threats`, `--ot-commands` and `--mitre`.
+- **OT protocols on moved ports:** `--decode-as tcp/10203=s7` (tshark's `tcp.port==10203,s7comm` works too), plus auto-detection that only accepts a port when the protocol's own length fields frame most of its packets exactly.
+- **TriStation decoded:** `--safety` names every Triconex function, the key switch and the project, and flags the TRITON sequence (logic upload, download change, run).
+- **OPC DA over DCOM:** `--opc-classic` follows DCE/RPC binds per connection, names `IOPCSyncIO::Write` and friends, and decodes item IDs and written/read/callback values.
+- **R-GOOSE:** IEC 61850-90-5 routable GOOSE on any UDP port is analysed as GOOSE, with session-layer replay and authentication checks.
+- **Capture input:** captures are recognised by header (no extension needed), modified pcap is readable, and `X.pcap.part000.pcap ...` splits are joined into one capture.
 
 ## What's New in v2.5.0 📡
 
@@ -352,12 +365,13 @@ What you get:
 - Analyst-friendly outputs tuned for plant floors, substations, and mixed IT/OT environments.
 - Control-command visibility for safety/availability impacts (writes, downloads, starts/stops).
 - Control-loop validation on Modbus/DNP3 value changes (rate-of-change, oscillation, outliers).
-- Safety PLC/SIS protocol detection (Triconex/TriStation heuristics).
+- Safety PLC/SIS analysis: TriStation decoded (functions, key switch, project) with TRITON-sequence detection.
 - OT/ICS-centric threat and anomaly rollups with evidence lines for fast triage.
 - Device fingerprinting across IT/OT/IoT traffic (vendor/model/OS/firmware/software) for asset-aware triage.
 - Remote-access session visibility (RDP/SSH/WinRM/VNC/TeamViewer/Telnet) with endpoints, timing, and data volume.
 - Phone-over-IP forensics (`--voip`): SIP/SDP, Skinny, MGCP, MEGACO, IAX2 and H.323 signalling; RTP/RTCP/SRTP and T.38 fax media; DTMF keypad digits; recovered credentials; and G.711 call audio to WAV.
-- Deeper OT protocol decoding for DNP3, IEC 61850 GOOSE/SV, Modbus, BACnet, OPC UA, CoAP, MQTT, and CIP/ENIP.
+- Deeper OT protocol decoding for DNP3, IEC 61850 GOOSE/R-GOOSE/SV, Modbus, BACnet, OPC UA, OPC DA (DCOM), CoAP, MQTT, CIP/ENIP, KNXnet/IP, LonTalk, XGT FEnet, ROC Plus, Beckhoff ADS, DLMS/COSEM, ANSI C12.22 and POWERLINK.
+- OT protocols on non-standard ports: `--decode-as` and payload-structure auto-detection.
 - Routing protocol forensics (OSPF/BGP/IS-IS/PIM) with route-change, auth, and control-plane health visibility.
 
 ## Install
