@@ -10,7 +10,7 @@ import os
 import re
 import stat
 from collections import Counter, OrderedDict
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path

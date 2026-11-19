@@ -14,7 +14,7 @@ import sys
 import zlib
 from collections import Counter
 
-from scapy.all import Ether, IP, TCP, UDP, Raw, wrpcap  # type: ignore
+from scapy.all import Ether, IP, TCP, Raw, wrpcap  # type: ignore
 
 from pcapper import cli
 from pcapper.files import _safe_decompress

@@ -130,7 +130,7 @@ def _segments(src, sport, dst, dport, seq, chunks):
 
 
 def _build_capture(path) -> None:
-    c2s, s2c = [], []
+    c2s: list = []
     cseq, sseq = 1000, 5000
     conn = (CLIENT, 1042, SERVER, 1249)
     back = (SERVER, 1249, CLIENT, 1042)
