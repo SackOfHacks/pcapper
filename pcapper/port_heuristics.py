@@ -454,13 +454,16 @@ def detect_nonstandard_ports(
         payload = _strip_padding(layer.payload)
         if not payload:
             continue
-        if (transport, dport) in syn_servers:
-            server = dport
-        elif (transport, sport) in syn_servers:
-            server = sport
-        elif dport in _KNOWN_SERVER_PORTS and sport not in _KNOWN_SERVER_PORTS:
+        # A registered OT/IT server port decides first: one stray SYN to a
+        # client port (a scan, a reset storm) must not turn every client of
+        # tcp/502 into a "Modbus server" on its ephemeral port.
+        if dport in _KNOWN_SERVER_PORTS and sport not in _KNOWN_SERVER_PORTS:
             server = dport
         elif sport in _KNOWN_SERVER_PORTS and dport not in _KNOWN_SERVER_PORTS:
+            server = sport
+        elif (transport, dport) in syn_servers:
+            server = dport
+        elif (transport, sport) in syn_servers:
             server = sport
         else:
             # Lower port as a last resort. A registered OT port always wins

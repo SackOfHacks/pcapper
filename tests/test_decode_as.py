@@ -116,6 +116,20 @@ class TestDetection:
         assert detect_nonstandard_ports(capture) == []
         assert analyze_modbus(capture, show_status=False).modbus_packets == 0
 
+    def test_clients_of_a_registered_port_are_not_servers(self, tmp_path) -> None:
+        # Old Windows/odd stacks use client ports like 1054 or even 1/3/5, and
+        # a stray SYN *to* that client port (scan, reset) must not make it the
+        # "server" of the Modbus flow to 502 (Cyber4OT, S4x15 Modicon).
+        capture = tmp_path / "clients.pcap"
+        request = bytes.fromhex("000100000006010300000002")
+        response = bytes.fromhex("0001000000070103040001000a")
+        pkts = [Ether() / IP(src=PLC, dst=CLIENT) / TCP(sport=40000, dport=5, flags="S")]
+        for i in range(4):
+            pkts.append(Ether() / IP(src=CLIENT, dst=PLC) / TCP(sport=5, dport=502, flags="PA") / Raw(request))
+            pkts.append(Ether() / IP(src=PLC, dst=CLIENT) / TCP(sport=502, dport=5, flags="PA") / Raw(response))
+        wrpcap(str(capture), pkts)
+        assert detect_nonstandard_ports(capture) == []
+
     def test_framed_modbus_on_moved_port(self, tmp_path) -> None:
         capture = tmp_path / "modbus5020.pcap"
         request = bytes.fromhex("000100000006010300000002")
