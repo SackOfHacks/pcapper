@@ -3432,7 +3432,7 @@ def _analyze_paths(
                 if summarize_rollups:
                     rollups.setdefault("opc_classic", []).append(opc_summary)
                 else:
-                    print(render_opc_classic_summary(opc_summary))
+                    print(render_opc_classic_summary(opc_summary, verbose=verbose))
                 export_summaries["opc_classic"] = opc_summary
             elif step == "hostnames" and show_hostnames:
                 hostname_summary = analyze_hostname(
