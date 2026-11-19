@@ -1485,7 +1485,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         "--vt",
         dest="vt",
         action="store_true",
-        help="Enable VirusTotal lookups/enrichment for --dns, --http, --tls/--tlsm, --threats, --webrequests, --timeline, and --compromised (requires VT_API_KEY).",
+        help="Enable VirusTotal lookups/enrichment for --dns, --http, --tls/--tlsm, --threats, --webrequests, --timeline, and --compromised (requires VT_API_KEY). Sends observed domains, IPs and full URLs - query strings included, which can carry credentials - to VirusTotal.",
     )
     general.add_argument(
         "--ip-geo",

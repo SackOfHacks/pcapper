@@ -11,6 +11,7 @@ from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
 from .openvpn import iter_openvpn_tcp_control_payloads
+from .utils import x509_names
 from .utils import extract_packet_endpoints, memoize_analysis
 
 try:
@@ -456,8 +457,7 @@ def analyze_certificates(
             _record_error(exc_text)
             return
 
-        subject = cert.subject.rfc4514_string()
-        issuer = cert.issuer.rfc4514_string()
+        subject, issuer = x509_names(cert)
         serial = hex(cert.serial_number)
         if hasattr(cert, "not_valid_before_utc"):
             not_before = cert.not_valid_before_utc.isoformat()  # type: ignore[attr-defined]

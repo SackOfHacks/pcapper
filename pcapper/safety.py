@@ -241,8 +241,10 @@ def analyze_safety(
             if len(public_evidence_hits) < 8:
                 public_evidence_hits.append(hit)
 
-    try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    skipped = 0
+    first_error = None
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        try:
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", None))
 
@@ -279,9 +281,14 @@ def analyze_safety(
                     )
                     if service == "Triconex/TriStation":
                         decode_tristation(_strip_padding(udp.payload), src_ip, dst_ip, ts)
-
-    except Exception as exc:
-        errors.append(f"{type(exc).__name__}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - one bad packet must not end the pass
+            skipped += 1
+            if first_error is None:
+                first_error = f"{type(exc).__name__}: {exc}"
+    if skipped:
+        errors.append(
+            f"{skipped} packet(s) skipped by the safety parser (first error: {first_error})."
+        )
 
     detections: list[dict[str, object]] = []
     if total_hits:

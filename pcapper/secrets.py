@@ -172,7 +172,10 @@ def _maybe_decompress(
         try:
             decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
             out = decompressor.decompress(data, max_output + 1)
-            out += decompressor.flush()
+            # flush() inflates leftover input with no limit (gzip bomb): only
+            # call it once the bounded decompress() consumed everything.
+            if not decompressor.unconsumed_tail and len(out) <= max_output:
+                out += decompressor.flush()
             if len(out) > max_output:
                 return out[:max_output]
             return out
@@ -182,7 +185,10 @@ def _maybe_decompress(
         try:
             decompressor = zlib.decompressobj()
             out = decompressor.decompress(data, max_output + 1)
-            out += decompressor.flush()
+            # flush() inflates leftover input with no limit (gzip bomb): only
+            # call it once the bounded decompress() consumed everything.
+            if not decompressor.unconsumed_tail and len(out) <= max_output:
+                out += decompressor.flush()
             if len(out) > max_output:
                 return out[:max_output]
             return out

@@ -87,7 +87,10 @@ def _restore_stderr_if_suppressed() -> None:
 
 def _stable_key(value: Any) -> tuple[int, Any]:
     if isinstance(value, (int, float)):
-        return (0, float(value))
+        try:
+            return (0, float(value))
+        except OverflowError:  # an attacker-sized int as a Counter key
+            return (0, float("inf") if value > 0 else float("-inf"))
     return (1, str(value))
 
 

@@ -62,6 +62,8 @@ def _ber_len(data: bytes, pos: int) -> tuple[int, int]:
 
 
 def _oid(data: bytes) -> str:
+    if len(data) > 64:  # an AP title is a short OID; refuse to build huge ints
+        return data[:16].hex() + "..."
     parts: list[int] = []
     value = 0
     for byte in data:

@@ -1256,7 +1256,10 @@ def _safe_decompress(
         else:
             return data
         out = decompressor.decompress(data, max_output + 1)
-        out += decompressor.flush()
+        # flush() inflates whatever input is left with no limit: a gzip bomb
+        # (1 GB of zeros in ~1 MB) used to be fully inflated before the cut.
+        if not decompressor.unconsumed_tail and len(out) <= max_output:
+            out += decompressor.flush()  # input fully consumed under the cap
         if len(out) > max_output:
             return out[:max_output]
         return out

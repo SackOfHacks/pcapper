@@ -86,7 +86,9 @@ def _parse_sv_tlvs(data: bytes, result: dict[str, object], depth: int = 0) -> No
             if tag_name in SV_STRING_TAGS:
                 result[tag_name] = value.decode("utf-8", errors="ignore").strip("\x00")
             elif tag_name in SV_INT_TAGS:
-                result[tag_name] = int.from_bytes(value, "big") if value else 0
+                # IEC 61850 header integers are <= 8 bytes; a longer one is malformed
+                # (and a 2 KB INTEGER used to crash rendering and export).
+                result[tag_name] = int.from_bytes(value, "big") if 0 < len(value) <= 8 else (0 if not value else None)
             elif tag_name == "seqOfData":
                 result["seqOfData_len"] = len(value)
                 result["seqOfData_preview"] = value[:16].hex()

@@ -101,9 +101,10 @@ def output_redaction_enabled() -> bool:
 
 
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # key=value, key: value, and JSON "key": "value"
     re.compile(
         r"(?i)\b(password|passwd|pass|pwd|secret|token|api[_-]?key|apikey|session(?:id)?|authorization)\b"
-        r"(\s*[:=]\s*)([^\s,;&]{3,})"
+        r"([\"']?\s*[:=]\s*[\"']?)([^\s,;&\"']{1,})"
     ),
     re.compile(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]{8,}\.[A-Za-z0-9._-]{8,}\b"),
@@ -112,6 +113,10 @@ _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.DOTALL,
     ),
 )
+
+
+_QUOTED_SECRET = re.compile(r"(?i)\b(password|passwd|pwd|secret|pin)(\s+)('[^']*'|\"[^\"]*\")")
+_PASS_COMMAND = re.compile(r"\b(PASS)\s+(?!\[REDACTED\])(\S+)")
 
 
 def redact_sensitive_text(value: object) -> str:
@@ -123,11 +128,42 @@ def redact_sensitive_text(value: object) -> str:
     def _kv_repl(match: re.Match[str]) -> str:
         return f"{match.group(1)}{match.group(2)}[REDACTED]"
 
-    text = _SECRET_PATTERNS[0].sub(_kv_repl, text)
+    # Bearer/Basic first: the key=value rule would otherwise consume the word
+    # "Basic" after "Authorization:" and leave the token itself in place.
     text = _SECRET_PATTERNS[1].sub(lambda m: f"{m.group(1)} [REDACTED]", text)
+    text = _SECRET_PATTERNS[0].sub(_kv_repl, text)
+    # Analyzer evidence: password 'x' / password "x" (OT credential findings)
+    text = _QUOTED_SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}'[REDACTED]'", text)
+    # FTP/POP3 command form: PASS secret
+    text = _PASS_COMMAND.sub(lambda m: f"{m.group(1)} [REDACTED]", text)
     text = _SECRET_PATTERNS[2].sub("[REDACTED_JWT]", text)
     text = _SECRET_PATTERNS[3].sub("[REDACTED_PRIVATE_KEY]", text)
     return text
+
+
+_SGR = re.compile(r"\x1b\[[0-9;]*m")
+_UNSAFE_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def terminal_safe(text: str) -> str:
+    """Neutralise terminal control sequences in a rendered report.
+
+    Pcapper's own colours are SGR sequences (ESC[...m) and are kept; every
+    other control byte - OSC title/hyperlink sequences, cursor movement,
+    screen clears, BEL, lone ESC - is shown escaped. Applied to every rendered
+    section, so a renderer that forgets ``display_safe`` on packet text (a
+    variable name, a GOOSE dataset, a file name) cannot drive the terminal.
+    """
+    if not text:
+        return text
+    parts = []
+    last = 0
+    for match in _SGR.finditer(text):
+        parts.append(_UNSAFE_CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text[last:match.start()]))
+        parts.append(match.group())
+        last = match.end()
+    parts.append(_UNSAFE_CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text[last:]))
+    return "".join(parts)
 
 
 def display_safe(value: object, *, preserve_newlines: bool = True) -> str:
@@ -926,6 +962,16 @@ def hexdump(data: bytes, width: int = 16) -> str:
     return "\n".join(lines)
 
 
+_SECRET_FIELD = re.compile(
+    r"(?i)(^|_)(secret|secrets|password|passwords|passwd|pwd|token|tokens|api_?key|credential_value|password_counts|secret_counts)$"
+)
+
+
+def _is_secret_field(name: str) -> bool:
+    """Export field names whose value is a credential (redacted by name)."""
+    return bool(_SECRET_FIELD.search(name))
+
+
 def to_serializable(value: Any, *, redact: bool = False) -> Any:
     if value is None:
         return None
@@ -940,12 +986,32 @@ def to_serializable(value: Any, *, redact: bool = False) -> Any:
             return {"_bytes_redacted": len(value)}
         return {"_bytes_b64": base64.b64encode(value).decode("ascii")}
     if isinstance(value, dict):
-        return {str(k): to_serializable(v, redact=redact) for k, v in value.items()}
+        if not redact:
+            return {str(k): to_serializable(v) for k, v in value.items()}
+        out: dict[str, Any] = {}
+        for index, (k, v) in enumerate(value.items()):
+            key = str(k)
+            if _is_secret_field(key) and isinstance(v, (str, bytes)) and v:
+                out[key] = "[REDACTED]"
+                continue
+            if _is_secret_field(key) and isinstance(v, dict):
+                # A mapping *named* for secrets keys by them (password counters).
+                out[key] = {f"[REDACTED#{i}]": to_serializable(cv, redact=True) for i, cv in enumerate(v.values())}
+                continue
+            out[redact_sensitive_text(key)] = to_serializable(v, redact=True)
+        return out
     if isinstance(value, (list, tuple, set)):
         return [to_serializable(item, redact=redact) for item in value]
     if hasattr(value, "to_dict") and callable(getattr(value, "to_dict")):
         try:
             return to_serializable(value.to_dict(), redact=redact)
+        except Exception:
+            pass
+    if is_dataclass(value) and not isinstance(value, type) and redact:
+        try:
+            return to_serializable(
+                {f.name: getattr(value, f.name) for f in fields(value)}, redact=True
+            )
         except Exception:
             pass
     if is_dataclass(value) and not isinstance(value, type):
@@ -1229,3 +1295,19 @@ def get_packet_ports(pkt: object) -> tuple[Optional[int], Optional[int], str]:
         except Exception:
             return (None, None, "UDP")
     return (None, None, "OTHER")
+
+
+def x509_names(cert: object) -> tuple[str, str]:
+    """(subject, issuer) as RFC 4514 strings, never raising.
+
+    ``cryptography`` parses names lazily: a certificate that loads fine can
+    still raise on ``cert.subject`` (invalid UTF-8 in a UTF8String CN), which
+    used to abort --tls/--certificates/--threats on one hostile handshake.
+    """
+    names = []
+    for attr in ("subject", "issuer"):
+        try:
+            names.append(getattr(cert, attr).rfc4514_string())
+        except Exception:  # noqa: BLE001 - malformed name in an attacker cert
+            names.append("<unparseable name>")
+    return names[0], names[1]

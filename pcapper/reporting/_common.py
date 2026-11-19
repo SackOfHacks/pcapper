@@ -32,6 +32,7 @@ from ..utils import (
     format_ts,
     output_redaction_enabled,
     redact_sensitive_text,
+    terminal_safe,
     safe_float,
     sparkline,
 )
@@ -697,7 +698,10 @@ def _finalize_output(lines: list[str], show_truncation_note: bool = True) -> str
         lines.append(
             muted("Output is summarized/truncated. Use -v to view all output.")
         )
-    return _highlight_public_ips("\n".join(lines))
+    text = "\n".join(lines)
+    if output_redaction_enabled():
+        text = redact_sensitive_text(text)
+    return terminal_safe(_highlight_public_ips(text))
 
 
 _PROTO_SEV_RANK = {

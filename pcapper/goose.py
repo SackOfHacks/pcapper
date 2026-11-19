@@ -288,7 +288,9 @@ def _parse_goose_tlvs(data: bytes, result: dict[str, object], depth: int = 0) ->
             if tag_name in GOOSE_STRING_TAGS:
                 result[tag_name] = value.decode("utf-8", errors="ignore").strip("\x00")
             elif tag_name in GOOSE_INT_TAGS:
-                result[tag_name] = int.from_bytes(value, "big") if value else 0
+                # IEC 61850 header integers are <= 8 bytes; a longer one is malformed
+                # (and a 2 KB INTEGER used to crash rendering and export).
+                result[tag_name] = int.from_bytes(value, "big") if 0 < len(value) <= 8 else (0 if not value else None)
             elif tag_name in GOOSE_BOOL_TAGS:
                 result[tag_name] = bool(value[0]) if value else False
             elif tag_name == "allData":
@@ -306,7 +308,9 @@ def _decode_boolean(value: bytes) -> Optional[bool]:
 
 
 def _decode_integer(value: bytes, signed: bool) -> Optional[int]:
-    if not value:
+    # MMS INTEGER/UNSIGNED data are at most 64 bits; anything longer is
+    # malformed and str() of it can exceed Python's int-to-str digit limit.
+    if not value or len(value) > 8:
         return None
     return int.from_bytes(value, "big", signed=signed)
 
