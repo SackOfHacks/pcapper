@@ -601,6 +601,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_opc(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="opc",
         path=path,
         protocol_name="OPC UA",
         tcp_ports={OPC_UA_PORT},

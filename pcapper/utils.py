@@ -787,6 +787,18 @@ def call_with_packet_view(
     return func(path, *args, **kwargs)
 
 
+def _analysis_context_key(path: Path) -> tuple:
+    """Process-wide state that changes what an analyzer sees for ``path``:
+    decode-as port overrides and split-capture joining."""
+    try:
+        from .capture_parts import capture_parts
+        from .port_overrides import generation
+
+        return (generation(), len(capture_parts(path)))
+    except Exception:
+        return ()
+
+
 def memoize_analysis(func):
     """Memoize an analyze_* function per capture state and arguments.
 
@@ -860,6 +872,7 @@ def memoize_analysis(func):
             func.__qualname__,
             file_key,
             view_key,
+            _analysis_context_key(Path(path)),
             tuple(key_args),
             tuple(key_kwargs),
         )

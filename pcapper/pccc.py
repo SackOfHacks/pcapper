@@ -63,6 +63,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_pccc(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="pccc",
         path=path,
         protocol_name="PCCC",
         signature_matcher=_match_signature,

@@ -91,6 +91,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_prconos(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="prconos",
         path=path,
         protocol_name="ProConOS",
         tcp_ports={PRCONOS_PORT},

@@ -692,6 +692,11 @@ def analyze_dnp3(
     packets: list[object] | None = None,
     meta: PcapMeta | None = None,
 ) -> Dnp3Analysis:
+    from .port_overrides import extra_ports
+
+    dnp3_ports = (
+        frozenset({DNP3_PORT}) | extra_ports("dnp3", "tcp", path) | extra_ports("dnp3", "udp", path)
+    )
     if TCP is None:
         return Dnp3Analysis(path=path, errors=["Scapy unavailable (TCP missing)"])
 
@@ -850,7 +855,7 @@ def analyze_dnp3(
             if not has_transport:
                 continue
 
-            on_dnp3_port = dport == DNP3_PORT or (sport == DNP3_PORT and dport >= 1024)
+            on_dnp3_port = dport in dnp3_ports or (sport in dnp3_ports and dport >= 1024)
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip:
                 src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
@@ -947,7 +952,7 @@ def analyze_dnp3(
                 # mismatch as corruption on the actual DNP3 port (where the
                 # traffic really is DNP3), and never parse its app layer.
                 if not crc_ok:
-                    on_dnp3_port = sport == DNP3_PORT or dport == DNP3_PORT
+                    on_dnp3_port = sport in dnp3_ports or dport in dnp3_ports
                     if on_dnp3_port and len(anomalies) < max_anomalies:
                         anomalies.append(
                             Dnp3Anomaly(

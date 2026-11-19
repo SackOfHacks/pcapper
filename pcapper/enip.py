@@ -548,6 +548,11 @@ def analyze_enip(
     packets: list[object] | None = None,
     meta: PcapMeta | None = None,
 ) -> ENIPAnalysis:
+    from .port_overrides import extra_ports
+
+    enip_ports = (
+        _ENIP_PORTS | extra_ports("enip", "tcp", path) | extra_ports("enip", "udp", path)
+    )
     if TCP is None and UDP is None:
         return ENIPAnalysis(path=path, errors=["Scapy unavailable (TCP/UDP missing)"])
 
@@ -671,8 +676,8 @@ def analyze_enip(
             # whose ephemeral source port happens to equal 44818 (e.g. a DNS
             # query to 8.8.8.8). Real ENIP on a nonstandard port is still
             # caught by the command-signature path below.
-            matches_port = dport in _ENIP_PORTS or (
-                sport in _ENIP_PORTS and dport >= 32768
+            matches_port = dport in enip_ports or (
+                sport in enip_ports and dport >= 32768
             )
             # Signature match for ENIP on a non-standard port must validate
             # the full 24-byte encapsulation header, not just the 2-byte
@@ -700,7 +705,7 @@ def analyze_enip(
             # ENIP, not a non-standard-port flow: gate on both-ports-foreign
             # so those legitimate responses stop raising a bogus finding.
             both_ports_nonstandard = (
-                sport not in _ENIP_PORTS and dport not in _ENIP_PORTS
+                sport not in enip_ports and dport not in enip_ports
             )
             if matches_signature and both_ports_nonstandard:
                 nonstandard_sessions[f"{src_ip}:{sport} -> {dst_ip}:{dport}"] += 1
@@ -759,11 +764,11 @@ def analyze_enip(
                 session_last_ts[session_key] = ts
 
             request_like = (
-                dport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
-            ) and (sport not in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT})
+                dport in enip_ports
+            ) and (sport not in enip_ports)
             response_like = (
-                sport in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT}
-            ) and (dport not in {ENIP_TCP_PORT, ENIP_UDP_PORT, ENIP_SECURITY_PORT})
+                sport in enip_ports
+            ) and (dport not in enip_ports)
             # True operational master = sent TO an ENIP port. Unambiguous at
             # the TCP layer, unlike the CIP-direction heuristic used for
             # request/response accounting below.

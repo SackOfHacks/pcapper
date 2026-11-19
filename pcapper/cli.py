@@ -54,6 +54,8 @@ from .decryption import DecryptConfig, DecryptSummary, decrypt_ssh, decrypt_tls
 from .df1 import analyze_df1
 from .dhcp import analyze_dhcp, merge_dhcp_summaries
 from .capture_parts import capture_size, group_split_captures
+from .port_heuristics import auto_decode, set_auto_decode_enabled
+from .port_overrides import DecodeAsError, register_spec as register_decode_as
 from .discovery import find_pcaps, is_supported_pcap
 from .dnp3 import analyze_dnp3
 from .dns import analyze_dns
@@ -503,6 +505,20 @@ def _ordered_steps(
             ordered.append(step)
             seen.add(step)
     return ordered
+
+
+# Steps that read OT protocols by port, directly or by fanning out: worth one
+# bounded payload-structure pass to find OT protocols on non-standard ports.
+_AUTO_DECODE_STEPS = {
+    "overview", "threats", "mitre", "ot_commands", "control_loop", "timeline",
+    "compromised", "hostdetails", "services", "protocols", "ctf", "safety",
+    "modbus", "dnp3", "iec104", "bacnet", "enip", "profinet", "s7", "opc",
+    "ethercat", "fins", "crimson", "pcworx", "melsec", "cip", "codesys",
+    "niagara", "mms", "srtp", "df1", "pccc", "csp", "modicon", "yokogawa",
+    "honeywell", "mqtt", "coap", "hart", "prconos", "iccp", "goose", "sv",
+    "synchrophasor", "bsap", "genisys", "opc_classic", "iec101_103",
+    "knx", "xgt", "rocplus", "ads", "dlms", "c1222", "lontalk", "powerlink",
+}
 
 
 _FILTER_COMPATIBLE_STEPS = {
@@ -1408,6 +1424,31 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         "--recursive",
         action="store_true",
         help="Recursively search for pcaps when target is a directory.",
+    )
+    general.add_argument(
+        "--decode-as",
+        dest="decode_as",
+        action="append",
+        metavar="SPEC",
+        help=(
+            "Analyse a protocol on a non-standard port, like tshark -d. "
+            "SPEC is tcp/PORT=PROTO (e.g. tcp/10203=s7), tcp.port==PORT,PROTO "
+            "or PORT=PROTO for both transports. PROTO is a pcapper protocol "
+            "flag name or tshark dissector name (s7, tpkt, modbus, dnp3, iec104, "
+            "enip, mms, opcua, knx, xgt, roc, ads ...). Repeatable."
+        ),
+    )
+    general.add_argument(
+        "--no-auto-decode",
+        dest="no_auto_decode",
+        action="store_true",
+        help=(
+            "Do not auto-detect OT protocols on non-standard ports. By default "
+            "the first 50,000 packets are checked: a port is analysed as a "
+            "protocol only when >= 60%% of its payload packets frame exactly as "
+            "that protocol (its own length fields) and >= 3 carry protocol "
+            "content. Each detection is printed and scoped to its capture."
+        ),
     )
     general.add_argument(
         "--no-join-parts",
@@ -2366,6 +2407,7 @@ def _analyze_paths(
     decrypt_config: DecryptConfig | None = None,
     correlate_requested: bool = False,
     correlate_min: int = 2,
+    auto_decode_enabled: bool = True,
 ) -> int:
     if not paths:
         return 1
@@ -2681,6 +2723,15 @@ def _analyze_paths(
             # helpers), so chained steps never re-read the pcap from disk.
             set_forced_packet_view(path, packets, meta)
             forced_view_for_path = True
+
+        if auto_decode_enabled and any(
+            step in _AUTO_DECODE_STEPS for step in ordered_steps
+        ):
+            for detection in auto_decode(path, packets=packets, meta=meta):
+                _print_error(
+                    f"Auto decode-as ({path.name}): {detection.describe()}. "
+                    f"Pass --no-auto-decode to disable, or --decode-as to force."
+                )
 
         if render_base_summary:
             summary = analyze_pcap(
@@ -5126,6 +5177,15 @@ def main() -> int:
         _print_error("No pcap/pcapng files found.")
         return 2
 
+    set_auto_decode_enabled(not getattr(args, "no_auto_decode", False))
+    for spec in getattr(args, "decode_as", None) or []:
+        try:
+            for override in register_decode_as(spec):
+                _print_error(f"Decode-as: {override.describe()}")
+        except DecodeAsError as exc:
+            _print_error(str(exc))
+            return 2
+
     if not getattr(args, "no_join_parts", False):
         paths, part_groups = group_split_captures(paths)
         for group in part_groups:
@@ -5378,6 +5438,7 @@ def main() -> int:
             decrypt_config=decrypt_config,
             correlate_requested=getattr(args, "correlate", False),
             correlate_min=getattr(args, "correlate_min", 2),
+            auto_decode_enabled=not getattr(args, "no_auto_decode", False),
         )
 
     def _write_case_metadata(end_time: datetime) -> None:

@@ -177,6 +177,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_melsec(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="melsec",
         path=path,
         protocol_name="MELSEC-Q",
         tcp_ports={MELSEC_TCP_PORT, MELSOFT_TCP_PORT},

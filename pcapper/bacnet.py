@@ -1095,6 +1095,7 @@ def _append_behavioral_anomalies(analysis: IndustrialAnalysis) -> None:
 @memoize_analysis
 def analyze_bacnet(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="bacnet",
         path=path,
         protocol_name="BACnet",
         tcp_ports={BACNET_PORT},

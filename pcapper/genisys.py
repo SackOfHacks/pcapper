@@ -38,6 +38,7 @@ def _match_signature(payload: bytes) -> bool:
 @memoize_analysis
 def analyze_genisys(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="genisys",
         path=path,
         protocol_name="Genisys",
         signature_matcher=_match_signature,

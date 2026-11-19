@@ -36,6 +36,9 @@ from .scan import analyze_scan
 from .services import analyze_services
 from .sv import analyze_sv
 from .threats import analyze_threats
+from .port_heuristics import auto_decode
+from .port_overrides import is_standard as is_standard_port
+from .port_overrides import overrides as port_overrides_for
 from .utils import call_with_packet_view
 
 
@@ -1952,6 +1955,34 @@ def analyze_overview(
             ports=ports,
         )
 
+    # OT protocols on non-standard ports: --decode-as entries and ports
+    # proven by payload structure (no-op when --no-auto-decode is set).
+    try:
+        auto_decode(path, packets=packets, meta=meta)
+    except Exception as exc:  # noqa: BLE001 - detection must not sink the overview
+        decode_as_error = f"auto decode-as: {type(exc).__name__}: {exc}"
+    else:
+        decode_as_error = ""
+    decode_as_notes: list[str] = []
+    for override in port_overrides_for(path):
+        if override.step not in _MODULE_LABELS and override.step not in ("iccp",):
+            continue
+        _register_detected(
+            override.step,
+            label=_MODULE_LABELS.get(override.step, override.step.upper()),
+            inventory=False,
+        )
+        entries = detected_meta[override.step].setdefault("decode_as", [])
+        entry = f"{override.transport}/{override.port}"
+        if entry not in entries and not is_standard_port(override):
+            entries.append(entry)
+            detected_meta[override.step].setdefault("decode_as_ports", []).append(override.port)
+            origin = "payload structure" if override.origin.startswith("auto") else "--decode-as"
+            decode_as_notes.append(
+                f"{_MODULE_LABELS.get(override.step, override.step)} on non-standard "
+                f"{entry} ({origin}: {override.origin.removeprefix('auto: ')})"
+            )
+
     detected_ot_labels = [
         str(detected_meta.get(step, {}).get("label") or _MODULE_LABELS.get(step, step))
         for step in detected_ot_steps
@@ -2052,6 +2083,9 @@ def analyze_overview(
         port_hits = [int(v) for v in list(meta.get("ports", []) or [])]
         if port_hits:
             reason_parts.append("well-known ports " + ",".join(str(v) for v in port_hits[:4]))
+        decode_as_ports = list(meta.get("decode_as", []) or [])
+        if decode_as_ports:
+            reason_parts.append("decode-as on " + ",".join(decode_as_ports[:4]))
         reason = f"Detected {label} in protocol/service inventory."
         if reason_parts:
             reason = f"Detected {label} via " + " and ".join(reason_parts) + "."
@@ -2101,6 +2135,11 @@ def analyze_overview(
         for step in detected_ot_steps
         for port in _OT_PORT_HINTS.get(step, ())
     }
+    ot_iot_ports |= {
+        int(port)
+        for step in detected_ot_steps
+        for port in list(detected_meta.get(step, {}).get("decode_as_ports", []) or [])
+    }
     cross_zone_ot_iot_flows = _cross_zone_ot_iot_flow_count(
         notable_flows=notable_flows,
         ot_markers=ot_markers,
@@ -2108,6 +2147,10 @@ def analyze_overview(
     )
 
     ot_highlights: list[str] = []
+    for note in decode_as_notes[:4]:
+        ot_highlights.append(f"Non-standard port: {note}")
+    if decode_as_error:
+        all_errors.append(decode_as_error)
     if detected_ot_labels:
         ot_highlights.append(
             "Detected OT/ICS protocol families: " + ", ".join(detected_ot_labels[:10])

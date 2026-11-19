@@ -15,6 +15,7 @@ YOKOGAWA_VNET_IP_UDP_PORT = 5313
 @memoize_analysis
 def analyze_yokogawa(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="yokogawa",
         path=path,
         protocol_name="Yokogawa Vnet/IP",
         udp_ports={YOKOGAWA_VNET_IP_UDP_PORT},

@@ -460,6 +460,7 @@ def _detect_anomalies(
 def analyze_iec104(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     reassembler = _IEC104TCPReassembler()
     analysis = analyze_port_protocol(
+        port_key="iec104",
         path=path,
         protocol_name="IEC-104",
         tcp_ports={IEC104_PORT},

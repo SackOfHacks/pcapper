@@ -449,6 +449,9 @@ def analyze_modbus(
     packets: list[object] | None = None,
     meta: PcapMeta | None = None,
 ) -> ModbusAnalysis:
+    from .port_overrides import extra_ports
+
+    modbus_ports = frozenset({MODBUS_TCP_PORT}) | extra_ports("modbus", "tcp", path)
     if TCP is None:
         return ModbusAnalysis(
             path=path,
@@ -634,25 +637,15 @@ def analyze_modbus(
             # Header Check (MBAP)
             is_modbus = False
 
-            # 1. Port-based check. 502 on the source side only identifies a
+            # Port-based check. 502 on the source side only identifies a
             # server when the destination is ephemeral; a flow from ephemeral
-            # 502 to 80 is not Modbus.
-            if dport == MODBUS_TCP_PORT or (sport == MODBUS_TCP_PORT and dport >= 1024):
+            # 502 to 80 is not Modbus. Ports beyond 502 come from --decode-as
+            # or from payload-structure auto-detection, which requires most of
+            # a port's packets to frame as MBAP (see pcapper.port_heuristics).
+            # A per-packet "protocol id is 0" guess used to stand in for that
+            # and counted fragments of SSH/OPC UA/MELSOFT traffic as Modbus.
+            if dport in modbus_ports or (sport in modbus_ports and dport >= 1024):
                 is_modbus = True
-
-            # 2. Heuristic check (if not standard port)
-            if not is_modbus and payload and len(payload) >= 8:
-                try:
-                    _, proto_id, length, _ = struct.unpack(">HHHB", payload[:7])
-                    # Modbus Protocol ID is 0
-                    # Length should be remaining bytes approx matching
-                    if proto_id == 0:
-                        # Verify length consistency
-                        remaining = len(payload) - 6
-                        if length >= remaining:
-                            is_modbus = True
-                except (TypeError, ValueError, struct.error):
-                    pass
 
             if not is_modbus:
                 continue
@@ -666,7 +659,7 @@ def analyze_modbus(
             # protocol id MUST be 0. A non-zero value = malformed frame,
             # non-Modbus tunnelled over 502, or a fuzzing/exploit attempt.
             if (
-                (sport == MODBUS_TCP_PORT or dport == MODBUS_TCP_PORT)
+                (sport in modbus_ports or dport in modbus_ports)
                 and payload
                 and len(payload) >= 4
             ):
@@ -681,7 +674,7 @@ def analyze_modbus(
             stream_next_seq: Optional[int] = None
             if (
                 payload
-                and (sport == MODBUS_TCP_PORT or dport == MODBUS_TCP_PORT)
+                and (sport in modbus_ports or dport in modbus_ports)
                 and tcp_seq is not None
             ):
                 src_raw, dst_raw = extract_packet_endpoints(pkt)
@@ -793,7 +786,7 @@ def analyze_modbus(
                     func_counts[func_name] += 1
                     unit_ids[unit_id] += 1
 
-                    is_server_response = sport == MODBUS_TCP_PORT
+                    is_server_response = sport in modbus_ports
 
                     src_raw, dst_raw = extract_packet_endpoints(pkt)
                     if src_raw and dst_raw:
@@ -1242,8 +1235,8 @@ def analyze_modbus(
 
                 if (
                     not parsed_any
-                    and sport != MODBUS_TCP_PORT
-                    and dport != MODBUS_TCP_PORT
+                    and sport not in modbus_ports
+                    and dport not in modbus_ports
                 ):
                     modbus_packets -= 1
 
@@ -1296,9 +1289,9 @@ def analyze_modbus(
         duration_val = max(0.0, float(end) - float(start))
         bucket = _bucketize_duration(duration_val)
         flow_duration_buckets["all"][bucket] += 1
-        if dport == MODBUS_TCP_PORT:
+        if dport in modbus_ports:
             flow_duration_buckets["requests"][bucket] += 1
-        if sport == MODBUS_TCP_PORT:
+        if sport in modbus_ports:
             flow_duration_buckets["responses"][bucket] += 1
 
     for (func_name, unit_id, src_ip, dst_ip), count in write_events.items():

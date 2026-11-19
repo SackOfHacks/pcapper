@@ -860,13 +860,21 @@ def analyze_port_protocol(
     packets: list[object] | None = None,
     meta: PcapMeta | None = None,
     payload_reassembler: PayloadReassembler | None = None,
+    port_key: str | None = None,
 ) -> IndustrialAnalysis:
     """Analyse a TCP/UDP-carried OT protocol. Returns a fresh object every
-    call (not memoized) so callers may post-process it in place."""
+    call (not memoized) so callers may post-process it in place.
+
+    ``port_key`` names the analyzer step (``"s7"``, ``"fins"`` ...) so ports
+    registered with ``--decode-as`` (or by payload-structure auto-detection)
+    are matched as server ports exactly like the protocol's registered ones.
+    """
     if TCP is None and UDP is None:
         return IndustrialAnalysis(path=path, errors=["Scapy unavailable (TCP/UDP missing)"])
-    tcp_set = set(tcp_ports or ())
-    udp_set = set(udp_ports or ())
+    from .port_overrides import extra_ports
+
+    tcp_set = set(tcp_ports or ()) | extra_ports(port_key, "tcp", path)
+    udp_set = set(udp_ports or ()) | extra_ports(port_key, "udp", path)
     return _industrial_pass(
         path,
         protocol_name,

@@ -63,6 +63,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_pcworx(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="pcworx",
         path=path,
         protocol_name="PCWorx",
         tcp_ports={PCWORX_PORT},

@@ -143,6 +143,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_fins(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="fins",
         path=path,
         protocol_name="Omron FINS",
         tcp_ports={FINS_PORT},

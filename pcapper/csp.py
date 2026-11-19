@@ -73,6 +73,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_csp(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="csp",
         path=path,
         protocol_name="CSP",
         tcp_ports={CSP_PORT},

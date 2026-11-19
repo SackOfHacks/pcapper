@@ -203,6 +203,7 @@ def _detect_anomalies(
 @memoize_analysis
 def analyze_df1(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
+        port_key="df1",
         path=path,
         protocol_name="DF1",
         signature_matcher=_match_signature,

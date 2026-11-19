@@ -1007,6 +1007,11 @@ def analyze_cip(
     packets: list[object] | None = None,
     meta: PcapMeta | None = None,
 ) -> CIPAnalysis:
+    from .port_overrides import extra_ports
+
+    cip_ports = (
+        _CIP_PORTS | extra_ports("cip", "tcp", path) | extra_ports("cip", "udp", path)
+    )
     if TCP is None and UDP is None:
         return CIPAnalysis(path=path, errors=["Scapy unavailable (TCP/UDP missing)"])
 
@@ -1123,8 +1128,8 @@ def analyze_cip(
             # ephemeral range, so a bare port match misclassifies unrelated
             # flows whose ephemeral source port equals 44818; real CIP on a
             # nonstandard port is still caught by the signature path below.
-            matches_port = dport in _CIP_PORTS or (
-                sport in _CIP_PORTS and dport >= 32768
+            matches_port = dport in cip_ports or (
+                sport in cip_ports and dport >= 32768
             )
             # Validate the full 24-byte encapsulation header for a
             # non-standard-port match, not just the 2-byte command, so
@@ -1147,7 +1152,7 @@ def analyze_cip(
             # response from :44818 to a low client ephemeral port is standard
             # CIP, not a non-standard-port flow.
             both_ports_nonstandard = (
-                sport not in _CIP_PORTS and dport not in _CIP_PORTS
+                sport not in cip_ports and dport not in cip_ports
             )
             if matches_signature and both_ports_nonstandard:
                 nonstandard_sessions[f"{src_ip}:{sport} -> {dst_ip}:{dport}"] += 1
@@ -1206,11 +1211,11 @@ def analyze_cip(
                 session_last_ts[session_key] = ts
 
             request_like = (
-                dport in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}
-            ) and (sport not in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT})
+                dport in cip_ports
+            ) and (sport not in cip_ports)
             response_like = (
-                sport in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT}
-            ) and (dport not in {CIP_TCP_PORT, CIP_UDP_PORT, CIP_SECURITY_PORT})
+                sport in cip_ports
+            ) and (dport not in cip_ports)
             if request_like:
                 analysis.request_sources[src_ip] += 1
 

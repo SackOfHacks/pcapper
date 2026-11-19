@@ -1018,6 +1018,7 @@ def analyze_s7(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     state = _S7State()
     reassembler = TPKTTCPReassembler("S7")
     analysis = analyze_port_protocol(
+        port_key="s7",
         path=path,
         protocol_name="S7",
         tcp_ports={S7_PORT},

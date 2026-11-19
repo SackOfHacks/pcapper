@@ -652,6 +652,7 @@ def _merge_size_buckets(left: list, right: list) -> list:
 @memoize_analysis
 def analyze_profinet(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     port_analysis = analyze_port_protocol(
+        port_key="profinet",
         path=path,
         protocol_name="Profinet",
         tcp_ports=PROFINET_PORTS,
